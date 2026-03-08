@@ -1,0 +1,6 @@
+describe("types", function()
+  it("module loads", function()
+    local types = require("lunarblock.types")
+    assert.is_table(types)
+  end)
+end)
