@@ -20,7 +20,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Block storage (RocksDB with column families, batch writes, iterators)
 - [x] Block & transaction validation (txid/wtxid, sigops, sighash, PoW, merkle root)
 - [x] P2P message serialization (version, verack, ping, inv, headers, block, tx, addr)
-- [ ] P2P networking (peer connections)
+- [x] P2P networking (peer connections, version/verack handshake, ping/pong)
 - [ ] Initial block download
 - [ ] Mempool
 - [ ] RPC server
@@ -53,6 +53,7 @@ src/
   storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
   validation.lua - Block & transaction validation (PoW, merkle root, sighash)
   p2p.lua        - P2P protocol message serialization
+  peer.lua       - TCP peer connection management and handshake
 spec/
   *_spec.lua     - Test files
 lib/
@@ -62,6 +63,6 @@ lib/
 ## Running tests
 
 ```bash
-# Requires: luajit, busted, rocksdb, openssl
+# Requires: luajit, busted, luasocket, rocksdb, openssl
 LD_LIBRARY_PATH=./lib busted spec/
 ```
