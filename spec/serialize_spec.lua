@@ -1,0 +1,6 @@
+describe("serialize", function()
+  it("module loads", function()
+    local serialize = require("lunarblock.serialize")
+    assert.is_table(serialize)
+  end)
+end)
