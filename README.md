@@ -15,7 +15,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Binary serialization (buffer reader/writer, varint, block/tx serialization)
 - [x] Cryptographic operations (SHA256, RIPEMD160, secp256k1, Schnorr)
 - [x] Address encoding (Base58Check, Bech32/Bech32m for P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-- [ ] Script interpreter
+- [x] Script interpreter (stack-based VM, all standard opcodes, P2SH support)
 - [ ] Block storage (RocksDB)
 - [ ] P2P networking
 - [ ] Initial block download
@@ -45,7 +45,7 @@ src/
   serialize.lua  - Binary serialization/deserialization
   crypto.lua     - Hash functions and secp256k1 bindings (OpenSSL + libsecp256k1)
   address.lua    - Address encoding (Base58Check, Bech32/Bech32m)
-  script.lua     - Script interpreter
+  script.lua     - Bitcoin Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
   consensus.lua  - Consensus rules
   storage.lua    - Block/UTXO storage
   p2p.lua        - P2P network manager
