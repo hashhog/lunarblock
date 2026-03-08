@@ -18,6 +18,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Script interpreter (stack-based VM, all standard opcodes, P2SH support)
 - [x] Consensus parameters (block rewards, difficulty, network configs)
 - [x] Block storage (RocksDB with column families, batch writes, iterators)
+- [x] Block & transaction validation (txid/wtxid, sigops, sighash, PoW, merkle root)
 - [ ] P2P networking
 - [ ] Initial block download
 - [ ] Mempool
@@ -49,6 +50,7 @@ src/
   script.lua     - Bitcoin Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
   consensus.lua  - Consensus parameters, difficulty, network configs
   storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
+  validation.lua - Block & transaction validation (PoW, merkle root, sighash)
 spec/
   *_spec.lua     - Test files
 lib/
