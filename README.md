@@ -19,7 +19,8 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Consensus parameters (block rewards, difficulty, network configs)
 - [x] Block storage (RocksDB with column families, batch writes, iterators)
 - [x] Block & transaction validation (txid/wtxid, sigops, sighash, PoW, merkle root)
-- [ ] P2P networking
+- [x] P2P message serialization (version, verack, ping, inv, headers, block, tx, addr)
+- [ ] P2P networking (peer connections)
 - [ ] Initial block download
 - [ ] Mempool
 - [ ] RPC server
@@ -51,6 +52,7 @@ src/
   consensus.lua  - Consensus parameters, difficulty, network configs
   storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
   validation.lua - Block & transaction validation (PoW, merkle root, sighash)
+  p2p.lua        - P2P protocol message serialization
 spec/
   *_spec.lua     - Test files
 lib/
