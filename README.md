@@ -11,8 +11,8 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 ## Current status
 
 - [x] Project scaffold and CLI entry point
-- [ ] Bitcoin primitive types (hashes, keys, scripts)
-- [ ] Transaction/block serialization
+- [x] Bitcoin primitive types (hash256, hash160, outpoint, txin, txout, transaction, block)
+- [x] Binary serialization (buffer reader/writer, varint, block/tx serialization)
 - [ ] Cryptographic operations (SHA256, RIPEMD160, secp256k1)
 - [ ] Script interpreter
 - [ ] Block storage (RocksDB)
@@ -40,8 +40,8 @@ luajit src/main.lua --testnet
 ```
 src/
   main.lua       - CLI entry point
-  types.lua      - Bitcoin primitive types
-  serialize.lua  - Transaction/block serialization
+  types.lua      - Bitcoin primitive types (hash256, transactions, blocks)
+  serialize.lua  - Binary serialization/deserialization
   crypto.lua     - Hash functions and secp256k1 bindings
   address.lua    - Address encoding/decoding
   script.lua     - Script interpreter
