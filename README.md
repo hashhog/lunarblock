@@ -13,7 +13,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Project scaffold and CLI entry point
 - [x] Bitcoin primitive types (hash256, hash160, outpoint, txin, txout, transaction, block)
 - [x] Binary serialization (buffer reader/writer, varint, block/tx serialization)
-- [ ] Cryptographic operations (SHA256, RIPEMD160, secp256k1)
+- [x] Cryptographic operations (SHA256, RIPEMD160, secp256k1, Schnorr)
 - [ ] Script interpreter
 - [ ] Block storage (RocksDB)
 - [ ] P2P networking
@@ -42,7 +42,7 @@ src/
   main.lua       - CLI entry point
   types.lua      - Bitcoin primitive types (hash256, transactions, blocks)
   serialize.lua  - Binary serialization/deserialization
-  crypto.lua     - Hash functions and secp256k1 bindings
+  crypto.lua     - Hash functions and secp256k1 bindings (OpenSSL + libsecp256k1)
   address.lua    - Address encoding/decoding
   script.lua     - Script interpreter
   consensus.lua  - Consensus rules
@@ -55,10 +55,12 @@ src/
   wallet.lua     - Wallet functionality
 spec/
   *_spec.lua     - Test files
+lib/
+  libsecp256k1   - ECDSA/Schnorr library (build from source if needed)
 ```
 
 ## Running tests
 
 ```bash
-busted spec/
+LD_LIBRARY_PATH=./lib busted spec/
 ```
