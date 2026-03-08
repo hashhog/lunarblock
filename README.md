@@ -17,7 +17,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Address encoding (Base58Check, Bech32/Bech32m for P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Script interpreter (stack-based VM, all standard opcodes, P2SH support)
 - [x] Consensus parameters (block rewards, difficulty, network configs)
-- [ ] Block storage (RocksDB)
+- [x] Block storage (RocksDB with column families, batch writes, iterators)
 - [ ] P2P networking
 - [ ] Initial block download
 - [ ] Mempool
@@ -47,22 +47,17 @@ src/
   crypto.lua     - Hash functions and secp256k1 bindings (OpenSSL + libsecp256k1)
   address.lua    - Address encoding (Base58Check, Bech32/Bech32m)
   script.lua     - Bitcoin Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-  consensus.lua  - Consensus parameters, difficulty, network configs (mainnet/testnet/regtest)
-  storage.lua    - Block/UTXO storage
-  p2p.lua        - P2P network manager
-  peer.lua       - Individual peer connection
-  sync.lua       - Block synchronization
-  mempool.lua    - Transaction mempool
-  rpc.lua        - JSON-RPC server
-  wallet.lua     - Wallet functionality
+  consensus.lua  - Consensus parameters, difficulty, network configs
+  storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
 spec/
   *_spec.lua     - Test files
 lib/
-  libsecp256k1   - ECDSA/Schnorr library (build from source if needed)
+  libsecp256k1   - ECDSA/Schnorr library
 ```
 
 ## Running tests
 
 ```bash
+# Requires: luajit, busted, rocksdb, openssl
 LD_LIBRARY_PATH=./lib busted spec/
 ```
