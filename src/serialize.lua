@@ -1,4 +1,3 @@
-local ffi = require("ffi")
 local M = {}
 
 -- BufferWriter: accumulates binary data for serialization
@@ -12,6 +11,10 @@ function M.buffer_writer()
 
   function writer.write_u16le(val)
     parts[#parts + 1] = string.char(val % 256, math.floor(val / 256) % 256)
+  end
+
+  function writer.write_u16be(val)
+    parts[#parts + 1] = string.char(math.floor(val / 256) % 256, val % 256)
   end
 
   function writer.write_u32le(val)
@@ -117,6 +120,13 @@ function M.buffer_reader(data)
     local b1, b2 = data:byte(pos, pos + 1)
     pos = pos + 2
     return b1 + b2 * 256
+  end
+
+  function reader.read_u16be()
+    assert(pos + 1 <= #data, "read_u16be: unexpected end of data")
+    local b1, b2 = data:byte(pos, pos + 1)
+    pos = pos + 2
+    return b1 * 256 + b2
   end
 
   function reader.read_u32le()
