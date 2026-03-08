@@ -26,6 +26,7 @@ build = {
     ["lunarblock.script"] = "src/script.lua",
     ["lunarblock.consensus"] = "src/consensus.lua",
     ["lunarblock.storage"] = "src/storage.lua",
+    ["lunarblock.validation"] = "src/validation.lua",
     ["lunarblock.p2p"] = "src/p2p.lua",
     ["lunarblock.peer"] = "src/peer.lua",
     ["lunarblock.sync"] = "src/sync.lua",
