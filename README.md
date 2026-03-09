@@ -31,6 +31,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] HD Wallet (BIP32/BIP44/BIP84, key derivation, tx signing, WIF import/export)
 - [x] CLI & main event loop (ties all modules together, 20Hz tick rate)
 - [x] Testing & verification (busted framework, luacheck, Bitcoin Core test vectors)
+- [x] Performance optimization (buffer pools, LRU cache, JIT profiling, FFI best practices)
 
 ## Quick start
 
@@ -43,6 +44,9 @@ luajit src/main.lua --help
 
 # Run with regtest (for local testing)
 LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
+
+# Enable JIT profiling (outputs to data dir)
+LD_LIBRARY_PATH=./lib luajit src/main.lua --jitprofile --jitverbose
 
 # Using make
 make run-regtest
@@ -66,6 +70,7 @@ src/
   peerman.lua    - Peer manager with connection pooling, discovery, bans
   sync.lua       - Header/block sync (headers-first IBD, block downloader)
   utxo.lua       - UTXO set, CoinView cache, chain state manager
+  perf.lua       - Performance utilities (buffer pool, LRU cache, fast serialize)
   mempool.lua    - Transaction memory pool (RBF, CPFP, fee policies)
   fee.lua        - Fee rate estimation (bucketed tracking, smart fee targets)
   mining.lua     - Block template construction and mining (BIP22, coinbase)
