@@ -25,6 +25,8 @@ local function parse_args(argv)
     nowalletcreate = false,
     reindex = false,
     daemon = false,
+    jitprofile = false,
+    jitverbose = false,
   }
 
   local i = 1
@@ -51,6 +53,8 @@ local function parse_args(argv)
       print("      --nowalletcreate    Do not create wallet on first run")
       print("      --reindex           Rebuild UTXO set from blocks")
       print("      --daemon            Run as daemon")
+      print("      --jitprofile        Enable JIT profiling output")
+      print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -97,6 +101,10 @@ local function parse_args(argv)
       args.reindex = true
     elseif arg == "--daemon" then
       args.daemon = true
+    elseif arg == "--jitprofile" then
+      args.jitprofile = true
+    elseif arg == "--jitverbose" then
+      args.jitverbose = true
     else
       io.stderr:write("Unknown option: " .. arg .. "\n")
       os.exit(1)
@@ -167,6 +175,26 @@ local function main()
   print("LunarBlock v" .. VERSION .. " starting...")
   print("Network: " .. args.network)
   print("Data directory: " .. datadir)
+
+  -- Enable JIT profiling if requested
+  if args.jitprofile then
+    local ok, jit_p = pcall(require, "jit.p")
+    if ok then
+      jit_p.start("vl", datadir .. "/jit_profile.txt")
+      print("JIT profiling enabled, output to " .. datadir .. "/jit_profile.txt")
+    else
+      print("Warning: JIT profiling not available")
+    end
+  end
+  if args.jitverbose then
+    local ok, jit_v = pcall(require, "jit.v")
+    if ok then
+      jit_v.on(datadir .. "/jit_verbose.txt")
+      print("JIT verbose logging enabled, output to " .. datadir .. "/jit_verbose.txt")
+    else
+      print("Warning: JIT verbose logging not available")
+    end
+  end
 
   -- Initialize database
   print("Opening database...")
@@ -365,6 +393,23 @@ local function main()
 
   -- Cleanup
   print("Shutting down...")
+
+  -- Stop JIT profiling
+  if args.jitprofile then
+    local ok, jit_p = pcall(require, "jit.p")
+    if ok then
+      jit_p.stop()
+      print("JIT profile written to " .. datadir .. "/jit_profile.txt")
+    end
+  end
+  if args.jitverbose then
+    local ok, jit_v = pcall(require, "jit.v")
+    if ok then
+      jit_v.off()
+      print("JIT verbose log written to " .. datadir .. "/jit_verbose.txt")
+    end
+  end
+
   peer_manager:stop()
   rpc_server:stop()
   if wallet then wallet:save(wallet_path) end
@@ -401,6 +446,8 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --nowalletcreate    Do not create wallet on first run")
       print("      --reindex           Rebuild UTXO set from blocks")
       print("      --daemon            Run as daemon")
+      print("      --jitprofile        Enable JIT profiling output")
+      print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
