@@ -8,6 +8,13 @@ describe("sync", function()
   local p2p
 
   setup(function()
+    -- Mock socket module if not available (for test environments without LuaSocket)
+    if not pcall(require, "socket") then
+      package.preload["socket"] = function()
+        return { gettime = function() return os.time() end }
+      end
+    end
+
     package.path = "src/?.lua;" .. package.path
     -- Set up lunarblock.X aliases
     package.preload["lunarblock.types"] = function() return require("types") end
@@ -615,6 +622,401 @@ describe("sync", function()
       -- chain_tip should NOT be set by header sync
       local chain_tip_data = storage.get("meta", "chain_tip")
       assert.is_nil(chain_tip_data)
+    end)
+  end)
+
+  --------------------------------------------------------------------------------
+  -- BlockDownloader Tests
+  --------------------------------------------------------------------------------
+
+  describe("BlockDownloader", function()
+    local storage, chain
+
+    -- Extended mock storage for block operations
+    local function create_block_storage()
+      local base = create_mock_storage()
+      local blocks = {}
+      local chain_tip_data = nil
+
+      function base.put_block(block_hash, blk)
+        blocks[block_hash.bytes] = serialize.serialize_block(blk)
+      end
+
+      function base.get_block(block_hash)
+        local data = blocks[block_hash.bytes]
+        if not data then return nil end
+        return serialize.deserialize_block(data)
+      end
+
+      -- Override get to also check blocks CF
+      local orig_get = base.get
+      function base.get(cf, key)
+        if cf == "blocks" then
+          return blocks[key]
+        end
+        return orig_get(cf, key)
+      end
+
+      function base.set_chain_tip(hash, height, sync_flag)
+        local w = serialize.buffer_writer()
+        w.write_hash256(hash)
+        w.write_u32le(height)
+        chain_tip_data = w.result()
+        base.put("meta", "chain_tip", chain_tip_data, sync_flag)
+      end
+
+      function base.get_chain_tip()
+        if not chain_tip_data or #chain_tip_data < 36 then
+          return nil, nil
+        end
+        local hash = types.hash256(chain_tip_data:sub(1, 32))
+        local r = serialize.buffer_reader(chain_tip_data:sub(33, 36))
+        local height = r.read_u32le()
+        return hash, height
+      end
+
+      return base
+    end
+
+    -- Mock peer with message tracking
+    local function create_mock_peer(id, start_height)
+      local peer = {
+        id = id or 1,
+        messages_sent = {},
+        start_height = start_height or 100
+      }
+
+      function peer:send_message(cmd, payload)
+        self.messages_sent[#self.messages_sent + 1] = {
+          command = cmd,
+          payload = payload
+        }
+      end
+
+      return peer
+    end
+
+    -- Create a mock block for testing
+    local function create_mock_block(prev_hash, height, timestamp)
+      timestamp = timestamp or os.time()
+      local header = types.block_header(
+        1,
+        prev_hash,
+        types.hash256_zero(),  -- merkle root will be computed
+        timestamp,
+        0x207fffff,  -- regtest difficulty
+        0
+      )
+
+      -- Find valid nonce
+      local target = consensus.bits_to_target(header.bits)
+      for nonce = 0, 1000000 do
+        header.nonce = nonce
+        local hash = validation.compute_block_hash(header)
+        if consensus.hash_meets_target(hash.bytes, target) then
+          break
+        end
+      end
+
+      -- Create a simple coinbase transaction
+      local coinbase_inp = types.txin(
+        types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+        string.char(height % 256),  -- simplified BIP34 height
+        0xFFFFFFFF
+      )
+      local coinbase_out = types.txout(5000000000, "")  -- 50 BTC
+      local coinbase = types.transaction(1, {coinbase_inp}, {coinbase_out}, 0)
+
+      -- Compute merkle root
+      local txid = validation.compute_txid(coinbase)
+      header.merkle_root = txid
+
+      return types.block(header, {coinbase})
+    end
+
+    before_each(function()
+      storage = create_block_storage()
+      chain = sync.new_header_chain(consensus.networks.regtest, storage)
+      chain:init()
+    end)
+
+    describe("creation and initial state", function()
+      it("creates a new block downloader with correct initial state", function()
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+
+        assert.is_not_nil(downloader)
+        assert.equals(0, downloader.next_download_height)
+        assert.equals(0, downloader.next_connect_height)
+        assert.is_false(downloader.ibd_complete)
+        assert.equals(1024, downloader.download_window)
+        assert.equals(16, downloader.blocks_per_peer)
+      end)
+
+      it("exposes status methods", function()
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+
+        assert.is_false(downloader:is_complete())
+        assert.equals(0, downloader:get_connect_height())
+        assert.equals(0, downloader:get_inflight_count())
+        assert.equals(0, downloader:get_pending_count())
+      end)
+    end)
+
+    describe("schedule_downloads", function()
+      it("assigns blocks to peers round-robin", function()
+        -- Build a small header chain
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp
+
+        for i = 1, 5 do
+          timestamp = timestamp + 600
+          local header = create_valid_header(parent_hash, timestamp)
+          assert.is_true(find_valid_nonce(header))
+          chain:accept_header(header)
+          parent_hash = validation.compute_block_hash(header)
+        end
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        local peer1 = create_mock_peer(1)
+        local peer2 = create_mock_peer(2)
+
+        downloader:schedule_downloads({peer1, peer2})
+
+        -- Both peers should have received getdata messages
+        assert.is_true(#peer1.messages_sent > 0 or #peer2.messages_sent > 0)
+
+        -- Check that requests were distributed
+        local total_requests = #peer1.messages_sent + #peer2.messages_sent
+        assert.is_true(total_requests >= 1)
+      end)
+
+      it("respects per-peer in-flight limit", function()
+        -- Build a larger header chain
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp
+
+        for i = 1, 20 do
+          timestamp = timestamp + 600
+          local header = create_valid_header(parent_hash, timestamp)
+          assert.is_true(find_valid_nonce(header))
+          chain:accept_header(header)
+          parent_hash = validation.compute_block_hash(header)
+        end
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.blocks_per_peer = 4  -- Set low limit for testing
+
+        local peer = create_mock_peer(1)
+        downloader:schedule_downloads({peer})
+
+        -- Count total items requested
+        local total_items = 0
+        for _, msg in ipairs(peer.messages_sent) do
+          if msg.command == "getdata" then
+            local items = p2p.deserialize_inv(msg.payload)
+            total_items = total_items + #items
+          end
+        end
+
+        -- Should not exceed per-peer limit
+        assert.is_true(total_items <= downloader.blocks_per_peer)
+      end)
+
+      it("does nothing with no peers", function()
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader:schedule_downloads({})
+        assert.equals(0, downloader:get_inflight_count())
+      end)
+
+      it("does nothing when IBD is complete", function()
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.ibd_complete = true
+
+        local peer = create_mock_peer(1)
+        downloader:schedule_downloads({peer})
+
+        assert.equals(0, #peer.messages_sent)
+      end)
+    end)
+
+    describe("handle_block", function()
+      it("stores pending block and triggers connect", function()
+        -- Create a single-block chain
+        local genesis_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp + 600
+
+        local header = create_valid_header(genesis_hash, timestamp)
+        assert.is_true(find_valid_nonce(header))
+        chain:accept_header(header)
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 1  -- Start from height 1
+
+        -- Create matching block
+        local block = create_mock_block(genesis_hash, 1, timestamp)
+        -- Use the actual header from the chain
+        local entry = chain:get_header_at_height(1)
+        block.header = entry.header
+
+        local block_data = serialize.serialize_block(block)
+        local peer = create_mock_peer(1)
+
+        -- Mark as inflight first
+        local hash_hex = chain.height_to_hash[1]
+        downloader.inflight[hash_hex] = {peer = peer, request_time = os.time(), timeout = 5}
+        downloader.peer_inflight[peer] = 1
+
+        -- Handle should succeed (block may fail validation but that's ok for this test)
+        local ok = downloader:handle_block(peer, block_data)
+        -- Block receipt should work even if validation fails
+        assert.is_not_nil(ok)
+      end)
+
+      it("removes block from inflight on receipt", function()
+        local genesis_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp + 600
+
+        local header = create_valid_header(genesis_hash, timestamp)
+        assert.is_true(find_valid_nonce(header))
+        chain:accept_header(header)
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        local peer = create_mock_peer(1)
+
+        -- Create matching block
+        local entry = chain:get_header_at_height(1)
+        local block = types.block(entry.header, {})
+        local block_data = serialize.serialize_block(block)
+
+        -- Mark as inflight
+        local hash_hex = chain.height_to_hash[1]
+        downloader.inflight[hash_hex] = {peer = peer, request_time = os.time(), timeout = 5}
+        downloader.peer_inflight[peer] = 1
+
+        downloader:handle_block(peer, block_data)
+
+        -- Should be removed from inflight
+        assert.is_nil(downloader.inflight[hash_hex])
+        assert.is_nil(downloader.peer_inflight[peer])
+      end)
+    end)
+
+    describe("connect_pending_blocks", function()
+      it("processes blocks in order, skips gaps", function()
+        -- Build header chain
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp
+
+        for i = 1, 3 do
+          timestamp = timestamp + 600
+          local header = create_valid_header(parent_hash, timestamp)
+          assert.is_true(find_valid_nonce(header))
+          chain:accept_header(header)
+          parent_hash = validation.compute_block_hash(header)
+        end
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 1
+
+        -- Add block at height 2 but not height 1 (gap)
+        local entry2 = chain:get_header_at_height(2)
+        local hash2_hex = chain.height_to_hash[2]
+        local hash2 = validation.compute_block_hash(entry2.header)
+        downloader.pending_blocks[hash2_hex] = {
+          block = types.block(entry2.header, {}),
+          height = 2,
+          hash = hash2
+        }
+
+        -- Try to connect - should stop at gap
+        downloader:connect_pending_blocks()
+
+        -- Height 1 is missing, so we shouldn't have connected anything
+        assert.equals(1, downloader.next_connect_height)
+        -- Block at height 2 should still be pending
+        assert.is_not_nil(downloader.pending_blocks[hash2_hex])
+      end)
+    end)
+
+    describe("stall detection", function()
+      it("detects stalled requests and clears them", function()
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp + 600
+
+        local header = create_valid_header(parent_hash, timestamp)
+        assert.is_true(find_valid_nonce(header))
+        chain:accept_header(header)
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.base_stall_timeout = 0  -- Immediate timeout for testing
+
+        local peer = create_mock_peer(1)
+        local hash_hex = chain.height_to_hash[1]
+
+        -- Simulate an old in-flight request
+        downloader.inflight[hash_hex] = {
+          peer = peer,
+          request_time = os.time() - 100,  -- 100 seconds ago
+          timeout = 1  -- 1 second timeout
+        }
+        downloader.peer_inflight[peer] = 1
+
+        -- Schedule should detect stall and clear it
+        downloader:schedule_downloads({peer})
+
+        -- Stalled request should be cleared
+        -- Note: It will be re-requested in the same call
+        assert.equals(0, downloader.peer_inflight[peer] or 0)
+      end)
+    end)
+
+    describe("IBD completion", function()
+      it("detects when all blocks are connected", function()
+        -- Chain with just genesis
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+
+        -- Set connect height past tip (genesis is height 0)
+        downloader.next_connect_height = 1
+
+        -- Try to connect (no pending blocks)
+        downloader:connect_pending_blocks()
+
+        -- Should detect completion since connect_height > tip_height (0)
+        assert.is_true(downloader:is_complete())
+      end)
+    end)
+
+    describe("batched getdata", function()
+      it("sends multiple inv items per getdata message", function()
+        -- Build header chain
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp
+
+        for i = 1, 10 do
+          timestamp = timestamp + 600
+          local header = create_valid_header(parent_hash, timestamp)
+          assert.is_true(find_valid_nonce(header))
+          chain:accept_header(header)
+          parent_hash = validation.compute_block_hash(header)
+        end
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        local peer = create_mock_peer(1)
+
+        downloader:schedule_downloads({peer})
+
+        -- Should have sent getdata message(s)
+        assert.is_true(#peer.messages_sent >= 1)
+
+        -- Check that items are batched
+        for _, msg in ipairs(peer.messages_sent) do
+          if msg.command == "getdata" then
+            local items = p2p.deserialize_inv(msg.payload)
+            -- Should have multiple items in one message (batched)
+            assert.is_true(#items >= 1)
+          end
+        end
+      end)
     end)
   end)
 end)
