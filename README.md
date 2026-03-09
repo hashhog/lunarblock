@@ -30,6 +30,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] RPC server (JSON-RPC 1.0/2.0 over HTTP, Bitcoin Core-compatible methods)
 - [x] HD Wallet (BIP32/BIP44/BIP84, key derivation, tx signing, WIF import/export)
 - [x] CLI & main event loop (ties all modules together, 20Hz tick rate)
+- [x] Testing & verification (busted framework, luacheck, Bitcoin Core test vectors)
 
 ## Quick start
 
@@ -40,18 +41,18 @@ LD_LIBRARY_PATH=./lib luajit src/main.lua
 # Show help
 luajit src/main.lua --help
 
-# Run with testnet
-LD_LIBRARY_PATH=./lib luajit src/main.lua --testnet
-
 # Run with regtest (for local testing)
 LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
+
+# Using make
+make run-regtest
 ```
 
 ## Project structure
 
 ```
 src/
-  main.lua       - CLI entry point
+  main.lua       - CLI entry point and event loop
   types.lua      - Bitcoin primitive types (hash256, transactions, blocks)
   serialize.lua  - Binary serialization/deserialization
   crypto.lua     - Hash functions and secp256k1 bindings (OpenSSL + libsecp256k1)
@@ -71,7 +72,8 @@ src/
   rpc.lua        - JSON-RPC server (HTTP Basic auth, Bitcoin Core methods)
   wallet.lua     - HD wallet (BIP32/44/84, address generation, tx signing)
 spec/
-  *_spec.lua     - Test files
+  helpers.lua    - FFI test helpers, mock objects, Bitcoin test vectors
+  *_spec.lua     - Test files (busted framework)
 lib/
   libsecp256k1   - ECDSA/Schnorr library
 ```
@@ -80,5 +82,16 @@ lib/
 
 ```bash
 # Requires: luajit, busted, luasocket, rocksdb, openssl
-LD_LIBRARY_PATH=./lib busted spec/
+make test
+
+# Or run individual test files
+make test-crypto
+make test-handshake
+make test-header-sync
+
+# Run linter
+make lint
+
+# Run both lint and tests
+make check
 ```
