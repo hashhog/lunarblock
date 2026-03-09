@@ -1,0 +1,17 @@
+return {
+  default = {
+    verbose = true,
+    output = "utfTerminal",
+    pattern = "_spec",
+    ROOT = { "spec/" },
+    lua = "luajit",
+  },
+  ci = {
+    verbose = true,
+    output = "TAP",
+    coverage = true,
+    pattern = "_spec",
+    ROOT = { "spec/" },
+    lua = "luajit",
+  },
+}

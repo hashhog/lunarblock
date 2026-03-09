@@ -1,5 +1,7 @@
 std = "luajit"
-globals = {"jit", "bit"}
+include_files = { "src/**/*.lua", "spec/**/*.lua" }
+exclude_files = { "src/vendor/**" }
 max_line_length = 120
-ignore = {"212", "213"}  -- unused arguments, unused loop variables
-exclude_files = {"spec/"}
+globals = { "describe", "it", "before_each", "after_each", "setup", "teardown", "pending", "spy", "stub", "mock" }
+new_read_globals = { "jit", "bit" }
+ignore = { "212", "213" }  -- unused arguments, unused loop variables
