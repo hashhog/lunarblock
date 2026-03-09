@@ -22,7 +22,8 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] P2P message serialization (version, verack, ping, inv, headers, block, tx, addr)
 - [x] P2P networking (peer connections, version/verack handshake, ping/pong)
 - [x] Peer manager (connection pooling, DNS discovery, ban management, event loop)
-- [ ] Initial block download
+- [x] Header synchronization (headers-first IBD, PoW validation, difficulty adjustment)
+- [ ] Block synchronization
 - [ ] Mempool
 - [ ] RPC server
 - [ ] Wallet functionality
@@ -56,6 +57,7 @@ src/
   p2p.lua        - P2P protocol message serialization
   peer.lua       - TCP peer connection management and handshake
   peerman.lua    - Peer manager with connection pooling, discovery, bans
+  sync.lua       - Header chain synchronization (headers-first IBD)
 spec/
   *_spec.lua     - Test files
 lib/
