@@ -35,6 +35,7 @@ build = {
     ["lunarblock.rpc"] = "src/rpc.lua",
     ["lunarblock.wallet"] = "src/wallet.lua",
     ["lunarblock.utxo"] = "src/utxo.lua",
+    ["lunarblock.fee"] = "src/fee.lua",
   },
   install = {
     bin = {
