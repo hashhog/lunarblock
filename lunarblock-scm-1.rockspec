@@ -37,6 +37,7 @@ build = {
     ["lunarblock.wallet"] = "src/wallet.lua",
     ["lunarblock.utxo"] = "src/utxo.lua",
     ["lunarblock.fee"] = "src/fee.lua",
+    ["lunarblock.perf"] = "src/perf.lua",
   },
   install = {
     bin = {
