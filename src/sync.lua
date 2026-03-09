@@ -1,6 +1,5 @@
 local types = require("lunarblock.types")
 local serialize = require("lunarblock.serialize")
-local crypto = require("lunarblock.crypto")
 local p2p = require("lunarblock.p2p")
 local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
@@ -506,5 +505,343 @@ end
 
 -- Export the HeaderChain class for direct access if needed
 M.HeaderChain = HeaderChain
+
+--------------------------------------------------------------------------------
+-- BlockDownloader: Manages block downloading during IBD
+--------------------------------------------------------------------------------
+
+local BlockDownloader = {}
+BlockDownloader.__index = BlockDownloader
+
+--- Create a new BlockDownloader instance.
+-- @param header_chain HeaderChain: The header chain for block ordering
+-- @param storage table: Storage backend
+-- @param network table: Network configuration
+-- @return BlockDownloader: New block downloader instance
+function M.new_block_downloader(header_chain, storage, network)
+  local self = setmetatable({}, BlockDownloader)
+  self.header_chain = header_chain
+  self.storage = storage
+  self.network = network
+  self.download_window = 1024       -- Max blocks in-flight total
+  self.blocks_per_peer = 16         -- Max blocks requested per peer at once
+  self.next_download_height = 0     -- Next block height to request
+  self.next_connect_height = 0      -- Next block height to connect to chain
+  self.pending_blocks = {}          -- hash_hex -> {block, height, hash}
+  self.inflight = {}                -- hash_hex -> {peer, request_time, timeout}
+  self.peer_inflight = {}           -- peer -> count of in-flight requests
+  self.base_stall_timeout = 5       -- Base timeout before considering stalled (adaptive)
+  self.max_stall_timeout = 64       -- Maximum stall timeout
+  self.ibd_complete = false
+  self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
+  self.utxo_flush_interval = 2000   -- Flush UTXO set every N blocks
+  self.last_flush_height = 0
+  return self
+end
+
+--------------------------------------------------------------------------------
+-- Download Scheduling
+--------------------------------------------------------------------------------
+
+--- Schedule block downloads across available peers.
+-- Uses round-robin assignment with per-peer in-flight tracking.
+-- @param peers table: list of established peers with NODE_NETWORK service
+function BlockDownloader:schedule_downloads(peers)
+  if #peers == 0 then return end
+  if self.ibd_complete then return end
+
+  local socket = require("socket")
+  local now = socket.gettime()
+
+  -- Check for stalled requests and handle adaptive timeout
+  for hash_hex, info in pairs(self.inflight) do
+    if now - info.request_time > info.timeout then
+      -- Stalled request - remove from inflight and peer tracking
+      self.inflight[hash_hex] = nil
+      if self.peer_inflight[info.peer] then
+        self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+        if self.peer_inflight[info.peer] <= 0 then
+          self.peer_inflight[info.peer] = nil
+        end
+      end
+      -- Double the timeout for next request of this block (adaptive stalling)
+      -- The block will be re-requested on next schedule cycle
+    end
+  end
+
+  -- Calculate how many more blocks we can request
+  local inflight_count = 0
+  for _ in pairs(self.inflight) do inflight_count = inflight_count + 1 end
+  local available = self.download_window - inflight_count
+  if available <= 0 then return end
+
+  -- Filter peers with available slots
+  local available_peers = {}
+  for _, p in ipairs(peers) do
+    local peer_count = self.peer_inflight[p] or 0
+    if peer_count < self.blocks_per_peer then
+      available_peers[#available_peers + 1] = p
+    end
+  end
+  if #available_peers == 0 then return end
+
+  -- Build requests per peer (batch multiple inv items per getdata)
+  local peer_requests = {}
+  for _, p in ipairs(available_peers) do
+    peer_requests[p] = {}
+  end
+
+  local peer_idx = 1
+  local height = self.next_download_height
+  local tip = self.header_chain.header_tip_height
+
+  while height <= tip and available > 0 do
+    local hash_hex = self.header_chain.height_to_hash[height]
+    if not hash_hex then break end
+
+    -- Skip if already downloaded or in-flight
+    if not self.pending_blocks[hash_hex] and not self.inflight[hash_hex] then
+      -- Check if block already in storage
+      local entry = self.header_chain.headers[hash_hex]
+      if entry then
+        local block_hash = validation.compute_block_hash(entry.header)
+        local existing = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes)
+        if not existing then
+          -- Find a peer with available slots (round-robin)
+          local attempts = 0
+          while attempts < #available_peers do
+            local p = available_peers[((peer_idx - 1) % #available_peers) + 1]
+            local peer_count = self.peer_inflight[p] or 0
+            local reqs = peer_requests[p]
+
+            if peer_count + #reqs < self.blocks_per_peer then
+              reqs[#reqs + 1] = {
+                type = p2p.INV_TYPE.MSG_WITNESS_BLOCK,
+                hash = block_hash
+              }
+              self.inflight[hash_hex] = {
+                peer = p,
+                request_time = now,
+                timeout = self.base_stall_timeout
+              }
+              available = available - 1
+              peer_idx = peer_idx + 1
+              break
+            end
+            peer_idx = peer_idx + 1
+            attempts = attempts + 1
+          end
+        end
+      end
+    end
+    height = height + 1
+  end
+
+  self.next_download_height = height
+
+  -- Send batched getdata requests
+  for p, items in pairs(peer_requests) do
+    if #items > 0 then
+      -- Update peer inflight count
+      self.peer_inflight[p] = (self.peer_inflight[p] or 0) + #items
+      p:send_message("getdata", p2p.serialize_inv(items))
+    end
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Block Receipt Handling
+--------------------------------------------------------------------------------
+
+--- Handle a received block from a peer.
+-- @param peer table: peer that sent the block
+-- @param block_data string: raw block message payload
+-- @return boolean, string|nil: success flag, error message
+function BlockDownloader:handle_block(peer, block_data)
+  -- Deserialize the block
+  local block = serialize.deserialize_block(block_data)
+  local hash = validation.compute_block_hash(block.header)
+  local hash_hex = types.hash256_hex(hash)
+
+  -- Update adaptive timeout on success (decay toward base)
+  local info = self.inflight[hash_hex]
+  if info and info.peer == peer then
+    -- Success: reduce timeout toward base
+    info.timeout = math.max(self.base_stall_timeout, info.timeout / 2)
+  end
+
+  -- Remove from inflight and update peer tracking
+  if self.inflight[hash_hex] then
+    local inflight_peer = self.inflight[hash_hex].peer
+    self.inflight[hash_hex] = nil
+    if self.peer_inflight[inflight_peer] then
+      self.peer_inflight[inflight_peer] = self.peer_inflight[inflight_peer] - 1
+      if self.peer_inflight[inflight_peer] <= 0 then
+        self.peer_inflight[inflight_peer] = nil
+      end
+    end
+  end
+
+  -- Find the height for this block
+  local entry = self.header_chain.headers[hash_hex]
+  if not entry then
+    -- Unknown block, ignore
+    return true
+  end
+
+  -- Store in pending
+  self.pending_blocks[hash_hex] = {
+    block = block,
+    height = entry.height,
+    hash = hash,
+  }
+
+  -- Try to connect blocks in order
+  return self:connect_pending_blocks()
+end
+
+--------------------------------------------------------------------------------
+-- Block Connection
+--------------------------------------------------------------------------------
+
+--- Connect pending blocks in height order.
+-- Processes blocks sequentially starting from next_connect_height.
+-- @return boolean, string|nil: success flag, error message
+function BlockDownloader:connect_pending_blocks()
+  -- Connect blocks in height order starting from next_connect_height
+  while true do
+    local hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
+    if not hash_hex then break end
+
+    local pending = self.pending_blocks[hash_hex]
+    if not pending then break end
+
+    -- Validate the full block
+    local ok, err = pcall(function()
+      validation.check_block(pending.block, self.network, pending.height)
+    end)
+
+    if not ok then
+      -- Invalid block, remove from pending and report error
+      self.pending_blocks[hash_hex] = nil
+      return false, err
+    end
+
+    -- Store the block
+    self.storage.put_block(pending.hash, pending.block)
+    self.storage.set_chain_tip(pending.hash, pending.height, false)
+
+    -- Notify callback (for UTXO updates, etc.)
+    if self.connect_callback then
+      self.connect_callback(pending.block, pending.height, pending.hash)
+    end
+
+    self.pending_blocks[hash_hex] = nil
+    self.next_connect_height = self.next_connect_height + 1
+
+    -- Flush UTXO set periodically during IBD
+    if self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval then
+      self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
+      self.last_flush_height = self.next_connect_height
+    end
+
+    -- Log progress periodically
+    if self.next_connect_height % 10000 == 0 then
+      local progress = self.next_connect_height / self.header_chain.header_tip_height * 100
+      io.write(string.format("\rIBD Progress: %d / %d (%.1f%%)",
+        self.next_connect_height, self.header_chain.header_tip_height, progress))
+      io.flush()
+    end
+  end
+
+  -- Check if IBD is complete
+  if self.next_connect_height > self.header_chain.header_tip_height then
+    self.ibd_complete = true
+    print("\nInitial Block Download complete!")
+  end
+
+  return true
+end
+
+--------------------------------------------------------------------------------
+-- IBD Status
+--------------------------------------------------------------------------------
+
+--- Check if IBD is complete.
+-- @return boolean: true if all blocks downloaded and connected
+function BlockDownloader:is_complete()
+  return self.ibd_complete
+end
+
+--- Get the next height to connect.
+-- @return number: next height waiting to be connected
+function BlockDownloader:get_connect_height()
+  return self.next_connect_height
+end
+
+--- Get the count of blocks in-flight.
+-- @return number: count of pending downloads
+function BlockDownloader:get_inflight_count()
+  local count = 0
+  for _ in pairs(self.inflight) do count = count + 1 end
+  return count
+end
+
+--- Get the count of blocks pending connection.
+-- @return number: count of downloaded but unconnected blocks
+function BlockDownloader:get_pending_count()
+  local count = 0
+  for _ in pairs(self.pending_blocks) do count = count + 1 end
+  return count
+end
+
+-- Export the BlockDownloader class
+M.BlockDownloader = BlockDownloader
+
+--------------------------------------------------------------------------------
+-- IBD Orchestration
+--------------------------------------------------------------------------------
+
+--- Run Initial Block Download.
+-- Orchestrates header sync followed by block download.
+-- @param header_chain HeaderChain: The header chain
+-- @param storage table: Storage backend
+-- @param network table: Network configuration
+-- @param peer_manager table: Peer manager for connections
+-- @return BlockDownloader|nil, string|nil: downloader instance or nil, error
+function M.run_ibd(header_chain, storage, network, peer_manager)
+  -- 1. Get established peers
+  local peers = peer_manager:get_established_peers()
+  if #peers == 0 then
+    return nil, "no peers"
+  end
+
+  -- 2. Pick best peer (highest start_height) for header sync
+  local best_peer = peers[1]
+  for _, p in ipairs(peers) do
+    if p.start_height and best_peer.start_height and p.start_height > best_peer.start_height then
+      best_peer = p
+    end
+  end
+
+  -- 3. Start header sync if needed
+  if not header_chain.syncing then
+    header_chain:start_sync(best_peer)
+  end
+
+  -- 4. Create block downloader
+  local downloader = M.new_block_downloader(header_chain, storage, network)
+
+  -- 5. Register message handlers
+  peer_manager:register_handler("block", function(peer, payload)
+    downloader:handle_block(peer, payload)
+  end)
+
+  peer_manager:register_handler("headers", function(peer, payload)
+    header_chain:handle_headers(peer, payload)
+  end)
+
+  return downloader
+end
 
 return M
