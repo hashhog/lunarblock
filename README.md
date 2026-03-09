@@ -28,7 +28,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Mempool (tx acceptance, fee validation, RBF, ancestor/descendant limits)
 - [x] Fee estimation (bucketed tracking, decay weighting, confirmation targets)
 - [x] Block template & mining (BIP22 getblocktemplate, coinbase creation, CPU miner)
-- [ ] RPC server
+- [x] RPC server (JSON-RPC 1.0/2.0 over HTTP, Bitcoin Core-compatible methods)
 - [ ] Wallet functionality
 
 ## Quick start
@@ -65,6 +65,7 @@ src/
   mempool.lua    - Transaction memory pool (RBF, CPFP, fee policies)
   fee.lua        - Fee rate estimation (bucketed tracking, smart fee targets)
   mining.lua     - Block template construction and mining (BIP22, coinbase)
+  rpc.lua        - JSON-RPC server (HTTP Basic auth, Bitcoin Core methods)
 spec/
   *_spec.lua     - Test files
 lib/
