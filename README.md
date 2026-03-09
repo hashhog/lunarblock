@@ -29,7 +29,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Fee estimation (bucketed tracking, decay weighting, confirmation targets)
 - [x] Block template & mining (BIP22 getblocktemplate, coinbase creation, CPU miner)
 - [x] RPC server (JSON-RPC 1.0/2.0 over HTTP, Bitcoin Core-compatible methods)
-- [ ] Wallet functionality
+- [x] HD Wallet (BIP32/BIP44/BIP84, key derivation, tx signing, WIF import/export)
 
 ## Quick start
 
@@ -66,6 +66,7 @@ src/
   fee.lua        - Fee rate estimation (bucketed tracking, smart fee targets)
   mining.lua     - Block template construction and mining (BIP22, coinbase)
   rpc.lua        - JSON-RPC server (HTTP Basic auth, Bitcoin Core methods)
+  wallet.lua     - HD wallet (BIP32/44/84, address generation, tx signing)
 spec/
   *_spec.lua     - Test files
 lib/
