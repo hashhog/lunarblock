@@ -29,6 +29,7 @@ build = {
     ["lunarblock.validation"] = "src/validation.lua",
     ["lunarblock.p2p"] = "src/p2p.lua",
     ["lunarblock.peer"] = "src/peer.lua",
+    ["lunarblock.peerman"] = "src/peerman.lua",
     ["lunarblock.sync"] = "src/sync.lua",
     ["lunarblock.mempool"] = "src/mempool.lua",
     ["lunarblock.rpc"] = "src/rpc.lua",
