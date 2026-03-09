@@ -1,7 +1,73 @@
 local socket = require("socket")
 local p2p = require("lunarblock.p2p")
 local bit = require("bit")
+local ffi = require("ffi")
 local M = {}
+
+--------------------------------------------------------------------------------
+-- FFI Poll (avoids callbacks, allows JIT compilation)
+--------------------------------------------------------------------------------
+
+-- Define poll structure and function
+-- This avoids FFI callbacks which prevent JIT compilation of surrounding code
+ffi.cdef[[
+  typedef struct { int fd; short events; short revents; } pollfd_t;
+  int poll(pollfd_t* fds, unsigned long nfds, int timeout);
+]]
+
+local POLLIN = 1   -- Data available to read
+local POLLOUT = 4  -- Writing possible
+
+local pollfd_cache = ffi.new("pollfd_t")
+
+--- Check if a socket is readable without blocking.
+-- Uses direct poll() syscall instead of FFI callbacks to allow JIT compilation.
+-- @param socket_fd number: socket file descriptor
+-- @param timeout_ms number: timeout in milliseconds (default 0 = non-blocking)
+-- @return boolean: true if socket has data available
+function M.poll_readable(socket_fd, timeout_ms)
+  pollfd_cache.fd = socket_fd
+  pollfd_cache.events = POLLIN
+  pollfd_cache.revents = 0
+  local ret = ffi.C.poll(pollfd_cache, 1, timeout_ms or 0)
+  return ret > 0 and bit.band(pollfd_cache.revents, POLLIN) ~= 0
+end
+
+--- Check if a socket is writable without blocking.
+-- @param socket_fd number: socket file descriptor
+-- @param timeout_ms number: timeout in milliseconds (default 0)
+-- @return boolean: true if socket can accept writes
+function M.poll_writable(socket_fd, timeout_ms)
+  pollfd_cache.fd = socket_fd
+  pollfd_cache.events = POLLOUT
+  pollfd_cache.revents = 0
+  local ret = ffi.C.poll(pollfd_cache, 1, timeout_ms or 0)
+  return ret > 0 and bit.band(pollfd_cache.revents, POLLOUT) ~= 0
+end
+
+--- Poll multiple sockets for readability.
+-- Batches poll calls to minimize FFI overhead.
+-- @param fds table: array of socket file descriptors
+-- @param timeout_ms number: timeout in milliseconds
+-- @return table: array of booleans indicating readability
+function M.poll_readable_multi(fds, timeout_ms)
+  local n = #fds
+  if n == 0 then return {} end
+
+  local pollfds = ffi.new("pollfd_t[?]", n)
+  for i = 1, n do
+    pollfds[i - 1].fd = fds[i]
+    pollfds[i - 1].events = POLLIN
+    pollfds[i - 1].revents = 0
+  end
+
+  local ret = ffi.C.poll(pollfds, n, timeout_ms or 0)
+  local results = {}
+  for i = 1, n do
+    results[i] = ret > 0 and bit.band(pollfds[i - 1].revents, POLLIN) ~= 0
+  end
+  return results
+end
 
 --------------------------------------------------------------------------------
 -- Peer States
