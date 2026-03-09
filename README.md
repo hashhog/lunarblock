@@ -10,7 +10,6 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 
 ## Current status
 
-- [x] Project scaffold and CLI entry point
 - [x] Bitcoin primitive types (hash256, hash160, outpoint, txin, txout, transaction, block)
 - [x] Binary serialization (buffer reader/writer, varint, block/tx serialization)
 - [x] Cryptographic operations (SHA256, RIPEMD160, secp256k1, Schnorr)
@@ -30,18 +29,22 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Block template & mining (BIP22 getblocktemplate, coinbase creation, CPU miner)
 - [x] RPC server (JSON-RPC 1.0/2.0 over HTTP, Bitcoin Core-compatible methods)
 - [x] HD Wallet (BIP32/BIP44/BIP84, key derivation, tx signing, WIF import/export)
+- [x] CLI & main event loop (ties all modules together, 20Hz tick rate)
 
 ## Quick start
 
 ```bash
-# Run the node
-luajit src/main.lua
+# Run the node (requires luasocket, rocksdb, openssl)
+LD_LIBRARY_PATH=./lib luajit src/main.lua
 
 # Show help
 luajit src/main.lua --help
 
 # Run with testnet
-luajit src/main.lua --testnet
+LD_LIBRARY_PATH=./lib luajit src/main.lua --testnet
+
+# Run with regtest (for local testing)
+LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
 ```
 
 ## Project structure
