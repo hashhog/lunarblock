@@ -26,6 +26,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Block download & IBD (parallel downloads, per-peer limits, adaptive stalling)
 - [x] UTXO set & chain state (CoinView cache, connect/disconnect blocks, maturity)
 - [x] Mempool (tx acceptance, fee validation, RBF, ancestor/descendant limits)
+- [x] Fee estimation (bucketed tracking, decay weighting, confirmation targets)
 - [ ] RPC server
 - [ ] Wallet functionality
 
@@ -61,6 +62,7 @@ src/
   sync.lua       - Header/block sync (headers-first IBD, block downloader)
   utxo.lua       - UTXO set, CoinView cache, chain state manager
   mempool.lua    - Transaction memory pool (RBF, CPFP, fee policies)
+  fee.lua        - Fee rate estimation (bucketed tracking, smart fee targets)
 spec/
   *_spec.lua     - Test files
 lib/
