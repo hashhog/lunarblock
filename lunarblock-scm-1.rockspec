@@ -34,6 +34,7 @@ build = {
     ["lunarblock.mempool"] = "src/mempool.lua",
     ["lunarblock.rpc"] = "src/rpc.lua",
     ["lunarblock.wallet"] = "src/wallet.lua",
+    ["lunarblock.utxo"] = "src/utxo.lua",
   },
   install = {
     bin = {
