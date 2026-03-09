@@ -32,6 +32,7 @@ build = {
     ["lunarblock.peerman"] = "src/peerman.lua",
     ["lunarblock.sync"] = "src/sync.lua",
     ["lunarblock.mempool"] = "src/mempool.lua",
+    ["lunarblock.mining"] = "src/mining.lua",
     ["lunarblock.rpc"] = "src/rpc.lua",
     ["lunarblock.wallet"] = "src/wallet.lua",
     ["lunarblock.utxo"] = "src/utxo.lua",
