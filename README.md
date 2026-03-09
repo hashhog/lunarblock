@@ -24,6 +24,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Peer manager (connection pooling, DNS discovery, ban management, event loop)
 - [x] Header synchronization (headers-first IBD, PoW validation, difficulty adjustment)
 - [x] Block download & IBD (parallel downloads, per-peer limits, adaptive stalling)
+- [x] UTXO set & chain state (CoinView cache, connect/disconnect blocks, maturity)
 - [ ] Mempool
 - [ ] RPC server
 - [ ] Wallet functionality
@@ -58,6 +59,7 @@ src/
   peer.lua       - TCP peer connection management and handshake
   peerman.lua    - Peer manager with connection pooling, discovery, bans
   sync.lua       - Header/block sync (headers-first IBD, block downloader)
+  utxo.lua       - UTXO set, CoinView cache, chain state manager
 spec/
   *_spec.lua     - Test files
 lib/
