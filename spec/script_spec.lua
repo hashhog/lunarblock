@@ -886,4 +886,303 @@ describe("script", function()
       end
     end)
   end)
+
+  describe("SCRIPT_VERIFY_NULLFAIL (BIP146)", function()
+    describe("OP_CHECKSIG with NULLFAIL flag", function()
+      it("allows empty signature when sig check fails", function()
+        local pk = string.rep("\x01", 33)
+
+        -- Checker that always rejects signatures
+        local checker = {
+          check_sig = function(sig, pubkey)
+            return false
+          end
+        }
+
+        -- Stack: empty_sig, pubkey
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {"", pk}
+
+        -- With NULLFAIL flag, empty sig on failed check should succeed (returns false)
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_false(script.cast_to_bool(result[1]))
+      end)
+
+      it("rejects non-empty signature when sig check fails", function()
+        local pk = string.rep("\x01", 33)
+        local sig = "invalid_sig"
+
+        -- Checker that always rejects signatures
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, pk}
+
+        -- With NULLFAIL flag, non-empty sig on failed check should error
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(result)
+        assert.equals("NULLFAIL", err)
+      end)
+
+      it("allows non-empty signature when sig check succeeds", function()
+        local pk = string.rep("\x01", 33)
+        local sig = "valid_sig"
+
+        -- Checker that accepts specific sig
+        local checker = {
+          check_sig = function(s, pubkey)
+            return s == sig and pubkey == pk
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, pk}
+
+        -- With NULLFAIL flag, valid sig should succeed
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+
+      it("allows non-empty signature when NULLFAIL flag is not set", function()
+        local pk = string.rep("\x01", 33)
+        local sig = "invalid_sig"
+
+        -- Checker that always rejects
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, pk}
+
+        -- Without NULLFAIL flag, non-empty failed sig should still work (returns false)
+        local result, err = script.execute_script(script_pubkey, stack, {}, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_false(script.cast_to_bool(result[1]))
+      end)
+    end)
+
+    describe("OP_CHECKSIGVERIFY with NULLFAIL flag", function()
+      it("rejects non-empty signature when sig check fails", function()
+        local pk = string.rep("\x01", 33)
+        local sig = "invalid_sig"
+
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIGVERIFY, data = nil},
+        })
+        local stack = {sig, pk}
+
+        -- With NULLFAIL flag, should return NULLFAIL error (not CHECKSIGVERIFY failed)
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(result)
+        assert.equals("NULLFAIL", err)
+      end)
+    end)
+
+    describe("OP_CHECKMULTISIG with NULLFAIL flag", function()
+      it("allows empty signatures when multisig fails", function()
+        local pk1 = string.rep("\x01", 33)
+        local pk2 = string.rep("\x02", 33)
+
+        -- Checker that always rejects
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        -- 2-of-2 multisig: OP_2 <pk1> <pk2> OP_2 OP_CHECKMULTISIG
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = 33, data = pk2},
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+
+        -- Stack: dummy, empty_sig1, empty_sig2 (all empty)
+        local stack = {"", "", ""}
+
+        -- With NULLFAIL flag, empty sigs on failed check should succeed (returns false)
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_false(script.cast_to_bool(result[1]))
+      end)
+
+      it("rejects non-empty signature when multisig fails", function()
+        local pk1 = string.rep("\x01", 33)
+        local pk2 = string.rep("\x02", 33)
+
+        -- Checker that always rejects
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        -- 2-of-2 multisig
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = 33, data = pk2},
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+
+        -- Stack: dummy, sig1, sig2 where sig1 is non-empty
+        local stack = {"", "badsig", ""}
+
+        -- With NULLFAIL flag, non-empty sig on failed check should error
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(result)
+        assert.equals("NULLFAIL", err)
+      end)
+
+      it("rejects when any signature is non-empty on failure", function()
+        local pk1 = string.rep("\x01", 33)
+        local pk2 = string.rep("\x02", 33)
+
+        -- Checker that always rejects
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        -- 2-of-2 multisig
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = 33, data = pk2},
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+
+        -- Stack: dummy, empty_sig1, non_empty_sig2
+        local stack = {"", "", "badsig"}
+
+        -- With NULLFAIL flag, should error because second sig is non-empty
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(result)
+        assert.equals("NULLFAIL", err)
+      end)
+
+      it("allows non-empty signatures when multisig succeeds", function()
+        local pk1 = string.rep("\x01", 33)
+        local pk2 = string.rep("\x02", 33)
+        local sig1 = "sig1"
+        local sig2 = "sig2"
+
+        -- Checker that accepts specific sigs
+        local checker = {
+          check_sig = function(s, pubkey)
+            if s == sig1 and pubkey == pk1 then return true end
+            if s == sig2 and pubkey == pk2 then return true end
+            return false
+          end
+        }
+
+        -- 2-of-2 multisig
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = 33, data = pk2},
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+
+        -- Stack: dummy, sig1, sig2 (valid)
+        local stack = {"", sig1, sig2}
+
+        -- With NULLFAIL flag, valid sigs should succeed
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+
+      it("allows non-empty signatures when NULLFAIL flag is not set", function()
+        local pk1 = string.rep("\x01", 33)
+        local pk2 = string.rep("\x02", 33)
+
+        -- Checker that always rejects
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        -- 2-of-2 multisig
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = 33, data = pk2},
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+
+        -- Stack: dummy, sig1, sig2 where sigs are non-empty
+        local stack = {"", "badsig1", "badsig2"}
+
+        -- Without NULLFAIL flag, non-empty failed sigs should still work (returns false)
+        local result, err = script.execute_script(script_pubkey, stack, {}, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_false(script.cast_to_bool(result[1]))
+      end)
+    end)
+
+    describe("OP_CHECKMULTISIGVERIFY with NULLFAIL flag", function()
+      it("rejects non-empty signature when multisig fails", function()
+        local pk1 = string.rep("\x01", 33)
+
+        local checker = {
+          check_sig = function(s, pubkey)
+            return false
+          end
+        }
+
+        -- 1-of-1 multisig verify
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIGVERIFY, data = nil},
+        })
+
+        local stack = {"", "badsig"}
+
+        -- With NULLFAIL flag, should return NULLFAIL error
+        local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
+        assert.is_nil(result)
+        assert.equals("NULLFAIL", err)
+      end)
+    end)
+  end)
 end)
