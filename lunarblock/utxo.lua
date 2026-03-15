@@ -219,6 +219,7 @@ function ChainState:connect_block(block, height, block_hash)
           verify_checksequenceverify = height >= self.network.csv_height,
           verify_witness = height >= self.network.segwit_height,
           verify_nulldummy = height >= self.network.segwit_height,
+          verify_nullfail = height >= self.network.segwit_height,
         }
 
         local checker = validation.make_sig_checker(
