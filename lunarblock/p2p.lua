@@ -28,6 +28,7 @@ M.INV_TYPE = {
   MSG_BLOCK = 2,
   MSG_FILTERED_BLOCK = 3,
   MSG_CMPCT_BLOCK = 4,
+  MSG_WTX = 5,                    -- BIP 339: wtxid-based tx relay
   MSG_WITNESS_TX = 0x40000001,
   MSG_WITNESS_BLOCK = 0x40000002,
 }
@@ -539,12 +540,12 @@ function M.deserialize_feefilter(data)
 end
 
 --------------------------------------------------------------------------------
--- Sendcmpct Message
+-- Sendcmpct Message (BIP152)
 --------------------------------------------------------------------------------
 
 --- Serialize a sendcmpct message.
--- @param announce boolean: whether to announce compact blocks
--- @param version number: compact blocks version
+-- @param announce boolean: whether to announce compact blocks (high-bandwidth mode)
+-- @param version number: compact blocks version (1 = txid, 2 = wtxid)
 -- @return string: serialized sendcmpct payload
 function M.serialize_sendcmpct(announce, version)
   local w = serialize.buffer_writer()
@@ -561,6 +562,200 @@ function M.deserialize_sendcmpct(data)
   return {
     announce = r.read_u8() ~= 0,
     version = r.read_u64le(),
+  }
+end
+
+--------------------------------------------------------------------------------
+-- Compact Block Messages (BIP152)
+--------------------------------------------------------------------------------
+
+-- Short txid length in bytes
+M.SHORTTXIDS_LENGTH = 6
+
+--- Serialize a prefilled transaction for cmpctblock.
+-- Index is encoded as a differential offset from the previous prefilled tx.
+-- @param index number: differential index (offset from previous)
+-- @param tx table: transaction object
+-- @return string: serialized prefilled transaction
+local function serialize_prefilled_tx(index, tx)
+  local w = serialize.buffer_writer()
+  w.write_varint(index)
+  w.write_bytes(serialize.serialize_transaction(tx, true))  -- always include witness
+  return w.result()
+end
+
+--- Serialize a cmpctblock message.
+-- @param header table: block_header object
+-- @param nonce number: 64-bit random nonce for short ID computation
+-- @param short_ids table: list of 6-byte short transaction IDs (as numbers)
+-- @param prefilled_txns table: list of {index, tx} for prefilled transactions
+-- @return string: serialized cmpctblock payload
+function M.serialize_cmpctblock(header, nonce, short_ids, prefilled_txns)
+  local w = serialize.buffer_writer()
+
+  -- Header (80 bytes)
+  w.write_bytes(serialize.serialize_block_header(header))
+
+  -- Nonce (8 bytes)
+  w.write_u64le(nonce)
+
+  -- Short IDs (varint count + 6 bytes each)
+  w.write_varint(#short_ids)
+  for _, short_id in ipairs(short_ids) do
+    -- Write 6 bytes little-endian
+    for i = 0, 5 do
+      local byte = math.floor(short_id / (256 ^ i)) % 256
+      w.write_u8(byte)
+    end
+  end
+
+  -- Prefilled transactions (varint count + each prefilled)
+  w.write_varint(#prefilled_txns)
+  local last_index = -1
+  for _, item in ipairs(prefilled_txns) do
+    -- Differential encoding: index is offset from (last_index + 1)
+    local diff_index = item.index - last_index - 1
+    w.write_varint(diff_index)
+    w.write_bytes(serialize.serialize_transaction(item.tx, true))
+    last_index = item.index
+  end
+
+  return w.result()
+end
+
+--- Deserialize a cmpctblock message.
+-- @param data string: cmpctblock payload
+-- @return table: {header, nonce, short_ids, prefilled_txns}
+function M.deserialize_cmpctblock(data)
+  local r = serialize.buffer_reader(data)
+
+  -- Header (80 bytes)
+  local header = serialize.deserialize_block_header(r)
+
+  -- Nonce (8 bytes)
+  local nonce = r.read_u64le()
+
+  -- Short IDs
+  local short_id_count = r.read_varint()
+  local short_ids = {}
+  for i = 1, short_id_count do
+    -- Read 6 bytes little-endian as a number
+    local short_id = 0
+    for j = 0, 5 do
+      short_id = short_id + r.read_u8() * (256 ^ j)
+    end
+    short_ids[i] = short_id
+  end
+
+  -- Prefilled transactions with differential decoding
+  local prefilled_count = r.read_varint()
+  local prefilled_txns = {}
+  local last_index = -1
+  for i = 1, prefilled_count do
+    local diff_index = r.read_varint()
+    local index = last_index + diff_index + 1
+    local tx = serialize.deserialize_transaction(r)
+    prefilled_txns[i] = { index = index, tx = tx }
+    last_index = index
+  end
+
+  return {
+    header = header,
+    nonce = nonce,
+    short_ids = short_ids,
+    prefilled_txns = prefilled_txns,
+  }
+end
+
+--- Get the total transaction count in a compact block.
+-- @param cmpctblock table: deserialized compact block
+-- @return number: total transaction count
+function M.cmpctblock_tx_count(cmpctblock)
+  return #cmpctblock.short_ids + #cmpctblock.prefilled_txns
+end
+
+--------------------------------------------------------------------------------
+-- GetBlockTxn Message (BIP152)
+--------------------------------------------------------------------------------
+
+--- Serialize a getblocktxn message.
+-- Request missing transactions by their indices.
+-- @param block_hash hash256: block hash
+-- @param indexes table: list of transaction indices to request
+-- @return string: serialized getblocktxn payload
+function M.serialize_getblocktxn(block_hash, indexes)
+  local w = serialize.buffer_writer()
+  w.write_hash256(block_hash)
+
+  -- Differential encoding of indices
+  w.write_varint(#indexes)
+  local last_index = -1
+  for _, index in ipairs(indexes) do
+    local diff = index - last_index - 1
+    w.write_varint(diff)
+    last_index = index
+  end
+
+  return w.result()
+end
+
+--- Deserialize a getblocktxn message.
+-- @param data string: getblocktxn payload
+-- @return table: {block_hash, indexes}
+function M.deserialize_getblocktxn(data)
+  local r = serialize.buffer_reader(data)
+  local block_hash = r.read_hash256()
+
+  -- Differential decoding of indices
+  local count = r.read_varint()
+  local indexes = {}
+  local last_index = -1
+  for i = 1, count do
+    local diff = r.read_varint()
+    local index = last_index + diff + 1
+    indexes[i] = index
+    last_index = index
+  end
+
+  return {
+    block_hash = block_hash,
+    indexes = indexes,
+  }
+end
+
+--------------------------------------------------------------------------------
+-- BlockTxn Message (BIP152)
+--------------------------------------------------------------------------------
+
+--- Serialize a blocktxn message.
+-- Response to getblocktxn with the requested transactions.
+-- @param block_hash hash256: block hash
+-- @param transactions table: list of transaction objects
+-- @return string: serialized blocktxn payload
+function M.serialize_blocktxn(block_hash, transactions)
+  local w = serialize.buffer_writer()
+  w.write_hash256(block_hash)
+  w.write_varint(#transactions)
+  for _, tx in ipairs(transactions) do
+    w.write_bytes(serialize.serialize_transaction(tx, true))  -- always include witness
+  end
+  return w.result()
+end
+
+--- Deserialize a blocktxn message.
+-- @param data string: blocktxn payload
+-- @return table: {block_hash, transactions}
+function M.deserialize_blocktxn(data)
+  local r = serialize.buffer_reader(data)
+  local block_hash = r.read_hash256()
+  local count = r.read_varint()
+  local transactions = {}
+  for i = 1, count do
+    transactions[i] = serialize.deserialize_transaction(r)
+  end
+  return {
+    block_hash = block_hash,
+    transactions = transactions,
   }
 end
 
@@ -606,6 +801,186 @@ function M.serialize_reject(message, ccode, reason, hash)
     w.write_hash256(hash)
   end
   return w.result()
+end
+
+--------------------------------------------------------------------------------
+-- BIP157/158 Compact Block Filter Messages
+--------------------------------------------------------------------------------
+
+-- Filter types
+M.FILTER_TYPE = {
+  BASIC = 0,
+}
+
+--- Serialize a getcfilters message (request compact block filters).
+-- @param filter_type number: filter type (0 = basic)
+-- @param start_height number: start block height
+-- @param stop_hash hash256: stop block hash
+-- @return string: serialized getcfilters payload
+function M.serialize_getcfilters(filter_type, start_height, stop_hash)
+  local w = serialize.buffer_writer()
+  w.write_u8(filter_type)
+  w.write_u32le(start_height)
+  w.write_hash256(stop_hash)
+  return w.result()
+end
+
+--- Deserialize a getcfilters message.
+-- @param data string: getcfilters payload
+-- @return table: {filter_type, start_height, stop_hash}
+function M.deserialize_getcfilters(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    filter_type = r.read_u8(),
+    start_height = r.read_u32le(),
+    stop_hash = r.read_hash256(),
+  }
+end
+
+--- Serialize a cfilter message (compact block filter).
+-- @param filter_type number: filter type
+-- @param block_hash hash256: block hash
+-- @param filter_data string: encoded filter bytes
+-- @return string: serialized cfilter payload
+function M.serialize_cfilter(filter_type, block_hash, filter_data)
+  local w = serialize.buffer_writer()
+  w.write_u8(filter_type)
+  w.write_hash256(block_hash)
+  w.write_varstr(filter_data)
+  return w.result()
+end
+
+--- Deserialize a cfilter message.
+-- @param data string: cfilter payload
+-- @return table: {filter_type, block_hash, filter_data}
+function M.deserialize_cfilter(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    filter_type = r.read_u8(),
+    block_hash = r.read_hash256(),
+    filter_data = r.read_varstr(),
+  }
+end
+
+--- Serialize a getcfheaders message (request filter headers).
+-- @param filter_type number: filter type
+-- @param start_height number: start block height
+-- @param stop_hash hash256: stop block hash
+-- @return string: serialized getcfheaders payload
+function M.serialize_getcfheaders(filter_type, start_height, stop_hash)
+  local w = serialize.buffer_writer()
+  w.write_u8(filter_type)
+  w.write_u32le(start_height)
+  w.write_hash256(stop_hash)
+  return w.result()
+end
+
+--- Deserialize a getcfheaders message.
+-- @param data string: getcfheaders payload
+-- @return table: {filter_type, start_height, stop_hash}
+function M.deserialize_getcfheaders(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    filter_type = r.read_u8(),
+    start_height = r.read_u32le(),
+    stop_hash = r.read_hash256(),
+  }
+end
+
+--- Serialize a cfheaders message (filter headers).
+-- @param filter_type number: filter type
+-- @param stop_hash hash256: stop block hash
+-- @param prev_filter_header hash256: filter header for block at start_height - 1
+-- @param filter_hashes table: list of filter hashes (hash256)
+-- @return string: serialized cfheaders payload
+function M.serialize_cfheaders(filter_type, stop_hash, prev_filter_header, filter_hashes)
+  local w = serialize.buffer_writer()
+  w.write_u8(filter_type)
+  w.write_hash256(stop_hash)
+  w.write_hash256(prev_filter_header)
+  w.write_varint(#filter_hashes)
+  for _, hash in ipairs(filter_hashes) do
+    w.write_hash256(hash)
+  end
+  return w.result()
+end
+
+--- Deserialize a cfheaders message.
+-- @param data string: cfheaders payload
+-- @return table: {filter_type, stop_hash, prev_filter_header, filter_hashes}
+function M.deserialize_cfheaders(data)
+  local r = serialize.buffer_reader(data)
+  local filter_type = r.read_u8()
+  local stop_hash = r.read_hash256()
+  local prev_filter_header = r.read_hash256()
+  local count = r.read_varint()
+  local filter_hashes = {}
+  for i = 1, count do
+    filter_hashes[i] = r.read_hash256()
+  end
+  return {
+    filter_type = filter_type,
+    stop_hash = stop_hash,
+    prev_filter_header = prev_filter_header,
+    filter_hashes = filter_hashes,
+  }
+end
+
+--- Serialize a getcfcheckpt message (request filter checkpoints).
+-- @param filter_type number: filter type
+-- @param stop_hash hash256: stop block hash
+-- @return string: serialized getcfcheckpt payload
+function M.serialize_getcfcheckpt(filter_type, stop_hash)
+  local w = serialize.buffer_writer()
+  w.write_u8(filter_type)
+  w.write_hash256(stop_hash)
+  return w.result()
+end
+
+--- Deserialize a getcfcheckpt message.
+-- @param data string: getcfcheckpt payload
+-- @return table: {filter_type, stop_hash}
+function M.deserialize_getcfcheckpt(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    filter_type = r.read_u8(),
+    stop_hash = r.read_hash256(),
+  }
+end
+
+--- Serialize a cfcheckpt message (filter checkpoints).
+-- @param filter_type number: filter type
+-- @param stop_hash hash256: stop block hash
+-- @param filter_headers table: list of checkpoint filter headers
+-- @return string: serialized cfcheckpt payload
+function M.serialize_cfcheckpt(filter_type, stop_hash, filter_headers)
+  local w = serialize.buffer_writer()
+  w.write_u8(filter_type)
+  w.write_hash256(stop_hash)
+  w.write_varint(#filter_headers)
+  for _, header in ipairs(filter_headers) do
+    w.write_hash256(header)
+  end
+  return w.result()
+end
+
+--- Deserialize a cfcheckpt message.
+-- @param data string: cfcheckpt payload
+-- @return table: {filter_type, stop_hash, filter_headers}
+function M.deserialize_cfcheckpt(data)
+  local r = serialize.buffer_reader(data)
+  local filter_type = r.read_u8()
+  local stop_hash = r.read_hash256()
+  local count = r.read_varint()
+  local filter_headers = {}
+  for i = 1, count do
+    filter_headers[i] = r.read_hash256()
+  end
+  return {
+    filter_type = filter_type,
+    stop_hash = stop_hash,
+    filter_headers = filter_headers,
+  }
 end
 
 return M
