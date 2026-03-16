@@ -447,5 +447,493 @@ describe("p2p", function()
       assert.equals(0x40000001, p2p.INV_TYPE.MSG_WITNESS_TX)
       assert.equals(0x40000002, p2p.INV_TYPE.MSG_WITNESS_BLOCK)
     end)
+
+    it("has correct compact block inventory type", function()
+      assert.equals(4, p2p.INV_TYPE.MSG_CMPCT_BLOCK)
+    end)
+
+    it("has short txid length constant", function()
+      assert.equals(6, p2p.SHORTTXIDS_LENGTH)
+    end)
+  end)
+
+  describe("BIP152 cmpctblock message", function()
+    it("serialize/deserialize round-trip with header and nonce", function()
+      local header = types.block_header(
+        1,
+        types.hash256(string.rep("\x00", 32)),
+        types.hash256(string.rep("\x11", 32)),
+        1231006505,
+        0x1d00ffff,
+        2083236893
+      )
+
+      local short_ids = { 0x112233445566, 0xAABBCCDDEEFF }
+      local nonce = 0x123456789ABCDEF
+
+      -- Create a simple coinbase transaction for prefilled
+      local coinbase_tx = types.transaction(
+        1,
+        {types.txin(types.outpoint(types.hash256(string.rep("\x00", 32)), 0xFFFFFFFF), "\x04\xFF\xFF\x00\x1D", 0xFFFFFFFF)},
+        {types.txout(5000000000, "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac")},
+        0
+      )
+
+      local prefilled_txns = {{ index = 0, tx = coinbase_tx }}
+
+      local payload = p2p.serialize_cmpctblock(header, nonce, short_ids, prefilled_txns)
+      local decoded = p2p.deserialize_cmpctblock(payload)
+
+      assert.equals(header.version, decoded.header.version)
+      assert.equals(header.timestamp, decoded.header.timestamp)
+      assert.equals(header.bits, decoded.header.bits)
+      assert.equals(header.nonce, decoded.header.nonce)
+      assert.equals(nonce, decoded.nonce)
+      assert.equals(2, #decoded.short_ids)
+      assert.equals(short_ids[1], decoded.short_ids[1])
+      assert.equals(short_ids[2], decoded.short_ids[2])
+      assert.equals(1, #decoded.prefilled_txns)
+      assert.equals(0, decoded.prefilled_txns[1].index)
+    end)
+
+    it("handles empty short_ids list", function()
+      local header = types.block_header(
+        1,
+        types.hash256(string.rep("\x00", 32)),
+        types.hash256(string.rep("\x11", 32)),
+        1231006505,
+        0x1d00ffff,
+        1
+      )
+
+      local coinbase_tx = types.transaction(
+        1,
+        {types.txin(types.outpoint(types.hash256(string.rep("\x00", 32)), 0xFFFFFFFF), "\x04", 0xFFFFFFFF)},
+        {types.txout(5000000000, "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac")},
+        0
+      )
+
+      local payload = p2p.serialize_cmpctblock(header, 0, {}, {{ index = 0, tx = coinbase_tx }})
+      local decoded = p2p.deserialize_cmpctblock(payload)
+
+      assert.equals(0, #decoded.short_ids)
+      assert.equals(1, #decoded.prefilled_txns)
+    end)
+
+    it("cmpctblock_tx_count returns correct total", function()
+      local cmpctblock = {
+        short_ids = { 1, 2, 3, 4, 5 },
+        prefilled_txns = {{ index = 0, tx = {} }},
+      }
+      assert.equals(6, p2p.cmpctblock_tx_count(cmpctblock))
+    end)
+  end)
+
+  describe("BIP152 getblocktxn message", function()
+    it("serialize/deserialize round-trip", function()
+      local block_hash = types.hash256(string.rep("\xAB", 32))
+      local indexes = { 1, 3, 5, 10, 100 }
+
+      local payload = p2p.serialize_getblocktxn(block_hash, indexes)
+      local decoded = p2p.deserialize_getblocktxn(payload)
+
+      assert.equals(block_hash.bytes, decoded.block_hash.bytes)
+      assert.equals(5, #decoded.indexes)
+      assert.equals(1, decoded.indexes[1])
+      assert.equals(3, decoded.indexes[2])
+      assert.equals(5, decoded.indexes[3])
+      assert.equals(10, decoded.indexes[4])
+      assert.equals(100, decoded.indexes[5])
+    end)
+
+    it("handles empty indexes", function()
+      local block_hash = types.hash256(string.rep("\xCD", 32))
+      local payload = p2p.serialize_getblocktxn(block_hash, {})
+      local decoded = p2p.deserialize_getblocktxn(payload)
+
+      assert.equals(block_hash.bytes, decoded.block_hash.bytes)
+      assert.equals(0, #decoded.indexes)
+    end)
+
+    it("uses differential encoding for indexes", function()
+      local block_hash = types.hash256(string.rep("\x00", 32))
+      -- Consecutive indexes should compress well
+      local indexes = { 0, 1, 2, 3, 4 }
+
+      local payload = p2p.serialize_getblocktxn(block_hash, indexes)
+      local decoded = p2p.deserialize_getblocktxn(payload)
+
+      for i, idx in ipairs(indexes) do
+        assert.equals(idx, decoded.indexes[i])
+      end
+    end)
+  end)
+
+  describe("BIP152 blocktxn message", function()
+    it("serialize/deserialize round-trip", function()
+      local block_hash = types.hash256(string.rep("\xEF", 32))
+
+      local tx1 = types.transaction(
+        2,
+        {types.txin(types.outpoint(types.hash256(string.rep("\x01", 32)), 0), "", 0xFFFFFFFF)},
+        {types.txout(1000000, "\x00\x14" .. string.rep("\x00", 20))},
+        0
+      )
+      local tx2 = types.transaction(
+        2,
+        {types.txin(types.outpoint(types.hash256(string.rep("\x02", 32)), 1), "", 0xFFFFFFFF)},
+        {types.txout(2000000, "\x00\x14" .. string.rep("\x11", 20))},
+        0
+      )
+
+      local transactions = { tx1, tx2 }
+
+      local payload = p2p.serialize_blocktxn(block_hash, transactions)
+      local decoded = p2p.deserialize_blocktxn(payload)
+
+      assert.equals(block_hash.bytes, decoded.block_hash.bytes)
+      assert.equals(2, #decoded.transactions)
+      assert.equals(tx1.version, decoded.transactions[1].version)
+      assert.equals(tx2.version, decoded.transactions[2].version)
+    end)
+
+    it("handles empty transactions list", function()
+      local block_hash = types.hash256(string.rep("\xFF", 32))
+      local payload = p2p.serialize_blocktxn(block_hash, {})
+      local decoded = p2p.deserialize_blocktxn(payload)
+
+      assert.equals(block_hash.bytes, decoded.block_hash.bytes)
+      assert.equals(0, #decoded.transactions)
+    end)
+  end)
+
+  describe("BIP155 addrv2 message", function()
+    it("has correct network ID constants", function()
+      assert.equals(1, p2p.NET_ID.IPV4)
+      assert.equals(2, p2p.NET_ID.IPV6)
+      assert.equals(3, p2p.NET_ID.TORV2)
+      assert.equals(4, p2p.NET_ID.TORV3)
+      assert.equals(5, p2p.NET_ID.I2P)
+      assert.equals(6, p2p.NET_ID.CJDNS)
+    end)
+
+    it("has correct address size constants", function()
+      assert.equals(4, p2p.NET_ADDR_SIZE[p2p.NET_ID.IPV4])
+      assert.equals(16, p2p.NET_ADDR_SIZE[p2p.NET_ID.IPV6])
+      assert.equals(10, p2p.NET_ADDR_SIZE[p2p.NET_ID.TORV2])
+      assert.equals(32, p2p.NET_ADDR_SIZE[p2p.NET_ID.TORV3])
+      assert.equals(32, p2p.NET_ADDR_SIZE[p2p.NET_ID.I2P])
+      assert.equals(16, p2p.NET_ADDR_SIZE[p2p.NET_ID.CJDNS])
+    end)
+
+    it("serialize/deserialize round-trip with IPv4", function()
+      local addresses = {
+        {
+          timestamp = 1700000000,
+          services = 1033,
+          network_id = p2p.NET_ID.IPV4,
+          addr_bytes = string.char(192, 168, 1, 1),
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.equals(1700000000, decoded[1].timestamp)
+      assert.equals(1033, decoded[1].services)
+      assert.equals(p2p.NET_ID.IPV4, decoded[1].network_id)
+      assert.equals("192.168.1.1", decoded[1].ip)
+      assert.equals(8333, decoded[1].port)
+      assert.is_true(decoded[1].valid)
+    end)
+
+    it("serialize/deserialize round-trip with IPv6", function()
+      local ipv6_bytes = string.rep("\x20\x01", 8)  -- 2001:2001:2001:...
+      local addresses = {
+        {
+          timestamp = 1700000001,
+          services = 9,
+          network_id = p2p.NET_ID.IPV6,
+          addr_bytes = ipv6_bytes,
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.equals(p2p.NET_ID.IPV6, decoded[1].network_id)
+      assert.equals(16, #decoded[1].addr_bytes)
+      assert.is_true(decoded[1].valid)
+    end)
+
+    it("serialize/deserialize round-trip with TorV3", function()
+      local torv3_pubkey = string.rep("\xAB", 32)  -- 32-byte ed25519 pubkey
+      local addresses = {
+        {
+          timestamp = 1700000002,
+          services = 1,
+          network_id = p2p.NET_ID.TORV3,
+          addr_bytes = torv3_pubkey,
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.equals(p2p.NET_ID.TORV3, decoded[1].network_id)
+      assert.equals(32, #decoded[1].addr_bytes)
+      assert.equals(torv3_pubkey, decoded[1].addr_bytes)
+      assert.is_true(decoded[1].valid)
+      -- addr_str should end with .onion
+      assert.truthy(decoded[1].addr_str:match("%.onion$"))
+    end)
+
+    it("serialize/deserialize round-trip with I2P", function()
+      local i2p_hash = string.rep("\xCD", 32)  -- 32-byte SHA256 of destination
+      local addresses = {
+        {
+          timestamp = 1700000003,
+          services = 1,
+          network_id = p2p.NET_ID.I2P,
+          addr_bytes = i2p_hash,
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.equals(p2p.NET_ID.I2P, decoded[1].network_id)
+      assert.equals(32, #decoded[1].addr_bytes)
+      assert.equals(i2p_hash, decoded[1].addr_bytes)
+      assert.is_true(decoded[1].valid)
+      -- addr_str should end with .b32.i2p
+      assert.truthy(decoded[1].addr_str:match("%.b32%.i2p$"))
+    end)
+
+    it("serialize/deserialize round-trip with CJDNS", function()
+      local cjdns_bytes = "\xFC" .. string.rep("\xEF", 15)  -- Must start with 0xFC
+      local addresses = {
+        {
+          timestamp = 1700000004,
+          services = 1,
+          network_id = p2p.NET_ID.CJDNS,
+          addr_bytes = cjdns_bytes,
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.equals(p2p.NET_ID.CJDNS, decoded[1].network_id)
+      assert.equals(16, #decoded[1].addr_bytes)
+      assert.is_true(decoded[1].valid)
+    end)
+
+    it("rejects CJDNS without 0xFC prefix", function()
+      local bad_cjdns = "\x00" .. string.rep("\xEF", 15)  -- Missing 0xFC prefix
+      local addresses = {
+        {
+          timestamp = 1700000005,
+          services = 1,
+          network_id = p2p.NET_ID.CJDNS,
+          addr_bytes = bad_cjdns,
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.is_false(decoded[1].valid)  -- Invalid due to missing 0xFC prefix
+    end)
+
+    it("marks deprecated TORV2 as invalid", function()
+      local torv2_bytes = string.rep("\x12", 10)  -- 10-byte TorV2
+      local addresses = {
+        {
+          timestamp = 1700000006,
+          services = 1,
+          network_id = p2p.NET_ID.TORV2,
+          addr_bytes = torv2_bytes,
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.is_false(decoded[1].valid)  -- TORV2 is deprecated
+    end)
+
+    it("rejects wrong address size for known network types", function()
+      -- IPv4 should be 4 bytes, not 8
+      local addresses = {
+        {
+          timestamp = 1700000007,
+          services = 1,
+          network_id = p2p.NET_ID.IPV4,
+          addr_bytes = string.rep("\x01", 8),  -- Wrong size
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.is_false(decoded[1].valid)  -- Wrong size for IPv4
+    end)
+
+    it("handles multiple addresses with mixed network types", function()
+      local addresses = {
+        {
+          timestamp = 1700000000,
+          services = 1,
+          network_id = p2p.NET_ID.IPV4,
+          addr_bytes = string.char(10, 0, 0, 1),
+          port = 8333,
+        },
+        {
+          timestamp = 1700000001,
+          services = 1,
+          network_id = p2p.NET_ID.TORV3,
+          addr_bytes = string.rep("\xAA", 32),
+          port = 8333,
+        },
+        {
+          timestamp = 1700000002,
+          services = 1,
+          network_id = p2p.NET_ID.I2P,
+          addr_bytes = string.rep("\xBB", 32),
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(3, #decoded)
+      assert.equals(p2p.NET_ID.IPV4, decoded[1].network_id)
+      assert.equals("10.0.0.1", decoded[1].ip)
+      assert.is_true(decoded[1].valid)
+
+      assert.equals(p2p.NET_ID.TORV3, decoded[2].network_id)
+      assert.is_true(decoded[2].valid)
+
+      assert.equals(p2p.NET_ID.I2P, decoded[3].network_id)
+      assert.is_true(decoded[3].valid)
+    end)
+
+    it("handles empty address list", function()
+      local payload = p2p.serialize_addrv2({})
+      local decoded = p2p.deserialize_addrv2(payload)
+      assert.equals(0, #decoded)
+    end)
+
+    it("services field uses compact size encoding", function()
+      -- Large services value should use compact size
+      local addresses = {
+        {
+          timestamp = 1700000000,
+          services = 0x0409,  -- NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
+          network_id = p2p.NET_ID.IPV4,
+          addr_bytes = string.char(127, 0, 0, 1),
+          port = 8333,
+        },
+      }
+
+      local payload = p2p.serialize_addrv2(addresses)
+      local decoded = p2p.deserialize_addrv2(payload)
+
+      assert.equals(1, #decoded)
+      assert.equals(0x0409, decoded[1].services)
+    end)
+
+    it("sendaddrv2 is an empty message", function()
+      local payload = p2p.serialize_sendaddrv2()
+      assert.equals("", payload)
+      local decoded = p2p.deserialize_sendaddrv2(payload)
+      assert.same({}, decoded)
+    end)
+  end)
+
+  describe("BIP155 address compatibility", function()
+    it("IPv4 is compatible with legacy addr", function()
+      local addr = { network_id = p2p.NET_ID.IPV4 }
+      assert.is_true(p2p.is_addr_compatible(false, addr))
+      assert.is_true(p2p.is_addr_compatible(true, addr))
+    end)
+
+    it("IPv6 is compatible with legacy addr", function()
+      local addr = { network_id = p2p.NET_ID.IPV6 }
+      assert.is_true(p2p.is_addr_compatible(false, addr))
+      assert.is_true(p2p.is_addr_compatible(true, addr))
+    end)
+
+    it("TorV3 is not compatible with legacy addr", function()
+      local addr = { network_id = p2p.NET_ID.TORV3 }
+      assert.is_false(p2p.is_addr_compatible(false, addr))
+      assert.is_true(p2p.is_addr_compatible(true, addr))
+    end)
+
+    it("I2P is not compatible with legacy addr", function()
+      local addr = { network_id = p2p.NET_ID.I2P }
+      assert.is_false(p2p.is_addr_compatible(false, addr))
+      assert.is_true(p2p.is_addr_compatible(true, addr))
+    end)
+
+    it("CJDNS is not compatible with legacy addr", function()
+      local addr = { network_id = p2p.NET_ID.CJDNS }
+      assert.is_false(p2p.is_addr_compatible(false, addr))
+      assert.is_true(p2p.is_addr_compatible(true, addr))
+    end)
+
+    it("TORV2 is not compatible with anyone", function()
+      local addr = { network_id = p2p.NET_ID.TORV2 }
+      assert.is_false(p2p.is_addr_compatible(false, addr))
+      assert.is_false(p2p.is_addr_compatible(true, addr))
+    end)
+  end)
+
+  describe("BIP155 address string conversion", function()
+    it("converts IPv4 bytes to string", function()
+      local str = p2p.addr_bytes_to_string(p2p.NET_ID.IPV4, string.char(192, 168, 1, 100))
+      assert.equals("192.168.1.100", str)
+    end)
+
+    it("converts IPv4-mapped IPv6 to IPv4 string", function()
+      local bytes = string.rep("\0", 10) .. "\xff\xff" .. string.char(10, 0, 0, 1)
+      local str = p2p.addr_bytes_to_string(p2p.NET_ID.IPV6, bytes)
+      assert.equals("10.0.0.1", str)
+    end)
+
+    it("converts TorV3 bytes to .onion string", function()
+      local pubkey = string.rep("\xAB", 32)
+      local str = p2p.addr_bytes_to_string(p2p.NET_ID.TORV3, pubkey)
+      assert.truthy(str:match("%.onion$"))
+    end)
+
+    it("converts I2P bytes to .b32.i2p string", function()
+      local hash = string.rep("\xCD", 32)
+      local str = p2p.addr_bytes_to_string(p2p.NET_ID.I2P, hash)
+      assert.truthy(str:match("%.b32%.i2p$"))
+    end)
+
+    it("returns nil for invalid address size", function()
+      local str = p2p.addr_bytes_to_string(p2p.NET_ID.IPV4, "abc")  -- Not 4 bytes
+      assert.is_nil(str)
+    end)
   end)
 end)
