@@ -219,24 +219,35 @@ function Mempool:accept_transaction(tx, allow_rbf)
     end
   end
 
-  -- 7. Check ancestor/descendant limits
-  local ancestor_count = 1
-  local ancestor_size = vsize
-  local ancestor_fees = fee
-  local ancestors = {}
+  -- 7. Compute ancestors (with proper deduplication) and check limits
+  -- Build the full set of unique in-mempool ancestors
+  local ancestors = {}  -- txid_hex -> true (set of all ancestors)
+  local direct_parents = {}  -- txid_hex -> entry (direct parents only)
 
   for _, inp in ipairs(tx.inputs) do
     local prev_hex = types.hash256_hex(inp.prev_out.hash)
     local parent = self.entries[prev_hex]
     if parent then
-      ancestor_count = ancestor_count + 1 + parent.ancestor_count
-      ancestor_size = ancestor_size + parent.vsize + parent.ancestor_size
-      ancestor_fees = ancestor_fees + parent.fee + parent.ancestor_fees
+      direct_parents[prev_hex] = parent
       ancestors[prev_hex] = true
-      -- Include parent's ancestors
+      -- Include all of parent's ancestors (properly deduped via set)
       for anc_hex in pairs(parent.ancestors) do
         ancestors[anc_hex] = true
       end
+    end
+  end
+
+  -- Count unique ancestors and sum their sizes/fees
+  local ancestor_count = 1  -- include self
+  local ancestor_size = vsize  -- include self
+  local ancestor_fees = fee  -- include self
+
+  for anc_hex in pairs(ancestors) do
+    local anc_entry = self.entries[anc_hex]
+    if anc_entry then
+      ancestor_count = ancestor_count + 1
+      ancestor_size = ancestor_size + anc_entry.vsize
+      ancestor_fees = ancestor_fees + anc_entry.fee
     end
   end
 
@@ -247,11 +258,28 @@ function Mempool:accept_transaction(tx, allow_rbf)
     return false, "ancestor size too large: " .. ancestor_size
   end
 
+  -- 7b. Check descendant limits for ALL ancestors
+  -- Adding this transaction would add 1 to descendant_count and vsize to descendant_size
+  -- for every ancestor (including direct parents)
+  for anc_hex in pairs(ancestors) do
+    local anc_entry = self.entries[anc_hex]
+    if anc_entry then
+      local new_desc_count = anc_entry.descendant_count + 1
+      local new_desc_size = anc_entry.descendant_size + vsize
+      if new_desc_count > M.MAX_DESCENDANTS then
+        return false, "too many descendants for ancestor " .. anc_hex:sub(1, 16)
+      end
+      if new_desc_size > M.MAX_DESCENDANT_SIZE then
+        return false, "descendant size too large for ancestor " .. anc_hex:sub(1, 16)
+      end
+    end
+  end
+
   -- 8. Add to mempool
   local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time())
-  entry.ancestor_count = ancestor_count - 1
-  entry.ancestor_size = ancestor_size - vsize
-  entry.ancestor_fees = ancestor_fees - fee
+  entry.ancestor_count = ancestor_count - 1  -- exclude self
+  entry.ancestor_size = ancestor_size - vsize  -- exclude self
+  entry.ancestor_fees = ancestor_fees - fee  -- exclude self
   entry.ancestors = ancestors
   self.entries[txid_hex] = entry
   self.tx_count = self.tx_count + 1
@@ -263,21 +291,20 @@ function Mempool:accept_transaction(tx, allow_rbf)
     self.outpoint_to_tx[outpoint_key] = txid_hex
 
     local prev_hex = types.hash256_hex(inp.prev_out.hash)
-    local parent = self.entries[prev_hex]
-    if parent then
+    if direct_parents[prev_hex] then
       entry.spends_from[outpoint_key] = prev_hex
     end
   end
 
-  -- Update parent entries with descendant info
-  for _, inp in ipairs(tx.inputs) do
-    local prev_hex = types.hash256_hex(inp.prev_out.hash)
-    local parent = self.entries[prev_hex]
-    if parent then
-      parent.descendants[txid_hex] = true
-      parent.descendant_count = parent.descendant_count + 1
-      parent.descendant_size = parent.descendant_size + vsize
-      parent.descendant_fees = parent.descendant_fees + fee
+  -- Update ALL ancestors with descendant info (not just direct parents)
+  -- Each ancestor gets this new tx added as a descendant
+  for anc_hex in pairs(ancestors) do
+    local anc_entry = self.entries[anc_hex]
+    if anc_entry then
+      anc_entry.descendants[txid_hex] = true
+      anc_entry.descendant_count = anc_entry.descendant_count + 1
+      anc_entry.descendant_size = anc_entry.descendant_size + vsize
+      anc_entry.descendant_fees = anc_entry.descendant_fees + fee
     end
   end
 
@@ -314,15 +341,15 @@ function Mempool:remove_transaction(txid_hex, reason)
     self.outpoint_to_tx[outpoint_key] = nil
   end
 
-  -- Update parent entries
-  for _, inp in ipairs(entry.tx.inputs) do
-    local prev_hex = types.hash256_hex(inp.prev_out.hash)
-    local parent = self.entries[prev_hex]
-    if parent then
-      parent.descendants[txid_hex] = nil
-      parent.descendant_count = parent.descendant_count - 1
-      parent.descendant_size = parent.descendant_size - entry.vsize
-      parent.descendant_fees = parent.descendant_fees - entry.fee
+  -- Update ALL ancestors (not just direct parents)
+  -- Remove this tx from their descendants set and decrement counts
+  for anc_hex in pairs(entry.ancestors) do
+    local anc_entry = self.entries[anc_hex]
+    if anc_entry then
+      anc_entry.descendants[txid_hex] = nil
+      anc_entry.descendant_count = anc_entry.descendant_count - 1
+      anc_entry.descendant_size = anc_entry.descendant_size - entry.vsize
+      anc_entry.descendant_fees = anc_entry.descendant_fees - entry.fee
     end
   end
 
