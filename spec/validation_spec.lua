@@ -650,4 +650,389 @@ describe("validation", function()
       assert.is_not.equals(hash1, hash2)
     end)
   end)
+
+  describe("find_and_delete", function()
+    it("removes a simple signature from script", function()
+      -- Script: <sig> <pubkey> (push-encoded)
+      local sig = hex_to_bin("304402200102030405060708091011121314151617181920")
+      local pubkey = hex_to_bin("0401020304050607080910111213141516171819202122232425262728293031323334353637383940")
+
+      -- Create script with push-encoded sig and pubkey
+      local script_code = string.char(#sig) .. sig .. string.char(#pubkey) .. pubkey
+
+      -- Remove the signature
+      local result = validation.find_and_delete(script_code, sig)
+
+      -- Should only have the pubkey remaining
+      local expected = string.char(#pubkey) .. pubkey
+      assert.equals(expected, result)
+    end)
+
+    it("removes multiple occurrences of signature", function()
+      local sig = "\x01\x02\x03"
+      -- Script with sig appearing twice
+      local script_code = string.char(3) .. sig .. "\xac" .. string.char(3) .. sig .. "\xac"
+
+      local result = validation.find_and_delete(script_code, sig)
+
+      -- Both occurrences should be removed
+      assert.equals("\xac\xac", result)
+    end)
+
+    it("does nothing if signature not present", function()
+      local sig = "\x01\x02\x03"
+      local script_code = "\x04\x05\x06\x07\xac"
+
+      local result = validation.find_and_delete(script_code, sig)
+
+      assert.equals(script_code, result)
+    end)
+
+    it("handles empty signature gracefully", function()
+      local script_code = "\x01\x02\x03\xac"
+
+      local result = validation.find_and_delete(script_code, "")
+      assert.equals(script_code, result)
+
+      local result2 = validation.find_and_delete(script_code, nil)
+      assert.equals(script_code, result2)
+    end)
+  end)
+
+  describe("remove_codeseparators", function()
+    it("removes OP_CODESEPARATOR bytes", function()
+      -- Script with OP_CODESEPARATOR (0xab) mixed in
+      local script_code = "\x51\xab\x52\xab\xab\x53"  -- OP_1 CODESEP OP_2 CODESEP CODESEP OP_3
+
+      local result = validation.remove_codeseparators(script_code)
+
+      -- All 0xab bytes should be removed
+      assert.equals("\x51\x52\x53", result)
+    end)
+
+    it("handles script with no codeseparators", function()
+      local script_code = "\x51\x52\x53"
+
+      local result = validation.remove_codeseparators(script_code)
+
+      assert.equals(script_code, result)
+    end)
+
+    it("handles empty script", function()
+      local result = validation.remove_codeseparators("")
+      assert.equals("", result)
+    end)
+  end)
+
+  describe("sighash test vectors", function()
+    -- Bitcoin Core sighash.json test vectors
+    -- Format: [raw_transaction_hex, script_hex, input_index, hashType, expected_sighash_hex]
+
+    local test_vectors = {
+      -- Test vector 1
+      {"907c2bc503ade11cc3b04eb2918b6f547b0630ab569273824748c87ea14b0696526c66ba740200000004ab65ababfd1f9bdd4ef073c7afc4ae00da8a66f429c917a0081ad1e1dabce28d373eab81d8628de802000000096aab5253ab52000052ad042b5f25efb33beec9f3364e8a9139e8439d9d7e26529c3c30b6c3fd89f8684cfd68ea0200000009ab53526500636a52ab599ac2fe02a526ed040000000008535300516352515164370e010000000003006300ab2ec229", "", 2, 1864164639, "31af167a6cf3f9d5f6875caa4d31704ceb0eba078d132b78dab52c3b8997317e"},
+      -- Test vector 2
+      {"a0aa3126041621a6dea5b800141aa696daf28408959dfb2df96095db9fa425ad3f427f2f6103000000015360290e9c6063fa26912c2e7fb6a0ad80f1c5fea1771d42f12976092e7a85a4229fdb6e890000000001abc109f6e47688ac0e4682988785744602b8c87228fcef0695085edf19088af1a9db126e93000000000665516aac536affffffff8fe53e0806e12dfd05d67ac68f4768fdbe23fc48ace22a5aa8ba04c96d58e2750300000009ac51abac63ab5153650524aa680455ce7b000000000000499e50030000000008636a00ac526563ac5051ee030000000003abacabd2b6fe000000000003516563910fb6b5", "65", 0, -1391424484, "48d6a1bd2cd9eec54eb866fc71209418a950402b5d7e52363bfb75c98e141175"},
+      -- Test vector 3
+      {"6e7e9d4b04ce17afa1e8546b627bb8d89a6a7fefd9d892ec8a192d79c2ceafc01694a6a7e7030000000953ac6a51006353636a33bced1544f797f08ceed02f108da22cd24c9e7809a446c61eb3895914508ac91f07053a01000000055163ab516affffffff11dc54eee8f9e4ff0bcf6b1a1a35b1cd10d63389571375501af7444073bcec3c02000000046aab53514a821f0ce3956e235f71e4c69d91abe1e93fb703bd33039ac567249ed339bf0ba0883ef300000000090063ab65000065ac654bec3cc504bcf499020000000005ab6a52abac64eb060100000000076a6a5351650053bbbc130100000000056a6aab53abd6e1380100000000026a51c4e509b8", "acab655151", 0, 479279909, "2a3d95b09237b72034b23f2d2bb29fa32a58ab5c6aa72f6aafdfa178ab1dd01c"},
+      -- Test vector 4 - with OP_CODESEPARATOR in script
+      {"73107cbd025c22ebc8c3e0a47b2a760739216a528de8d4dab5d45cbeb3051cebae73b01ca10200000007ab6353656a636affffffffe26816dffc670841e6a6c8c61c586da401df1261a330a6c6b3dd9f9a0789bc9e000000000800ac6552ac6aac51ffffffff0174a8f0010000000004ac52515100000000", "5163ac63635151ac", 1, 1190874345, "06e328de263a87b09beabe222a21627a6ea5c7f560030da31610c4611f4a46bc"},
+      -- Test vector 5
+      {"e93bbf6902be872933cb987fc26ba0f914fcfc2f6ce555258554dd9939d12032a8536c8802030000000453ac5353eabb6451e074e6fef9de211347d6a45900ea5aaf2636ef7967f565dce66fa451805c5cd10000000003525253ffffffff047dc3e6020000000007516565ac656aabec9eea010000000001633e46e600000000000015080a030000000001ab00000000", "5300ac6a53ab6a", 1, -886562767, "f03aa4fc5f97e826323d0daa03343ebf8a34ed67a1ce18631f8b88e5c992e798"},
+      -- Test vector 6
+      {"50818f4c01b464538b1e7e7f5ae4ed96ad23c68c830e78da9a845bc19b5c3b0b20bb82e5e9030000000763526a63655352ffffffff023b3f9c040000000008630051516a6a5163a83caf01000000000553ab65510000000000", "6aac", 0, 946795545, "746306f322de2b4b58ffe7faae83f6a72433c22f88062cdde881d4dd8a5a4e2d"},
+      -- Test vector 7
+      {"a93e93440250f97012d466a6cc24839f572def241c814fe6ae94442cf58ea33eb0fdd9bcc1030000000600636a0065acffffffff5dee3a6e7e5ad6310dea3e5b3ddda1a56bf8de7d3b75889fc024b5e233ec10f80300000007ac53635253ab53ffffffff0160468b04000000000800526a5300ac526a00000000", "ac00636a53", 1, 1773442520, "5c9d3a2ce9365bb72cfabbaa4579c843bb8abf200944612cf8ae4b56a908bcbd"},
+      -- Test vector 8 - empty script
+      {"c363a70c01ab174230bbe4afe0c3efa2d7f2feaf179431359adedccf30d1f69efe0c86ed390200000002ab51558648fe0231318b04000000000151662170000000000008ac5300006a63acac00000000", "", 0, 2146479410, "191ab180b0d753763671717d051f138d4866b7cb0d1d4811472e64de595d2c70"},
+      -- Test vector 9
+      {"d3b7421e011f4de0f1cea9ba7458bf3486bee722519efab711a963fa8c100970cf7488b7bb0200000003525352dcd61b300148be5d05000000000000000000", "535251536aac536a", 0, -1960128125, "29aa6d2d752d3310eba20442770ad345b7f6a35f96161ede5f07b33e92053e2a"},
+      -- Test vector 10
+      {"04bac8c5033460235919a9c63c42b2db884c7c8f2ed8fcd69ff683a0a2cccd9796346a04050200000003655351fcad3a2c5a7cbadeb4ec7acc9836c3f5c3e776e5c566220f7f965cf194f8ef98efb5e3530200000007526a006552526526a2f55ba5f69699ece76692552b399ba908301907c5763d28a15b08581b23179cb01eac03000000075363ab6a516351073942c2025aa98a05000000000765006aabac65abd7ffa6030000000004516a655200000000", "53ac6365ac526a", 1, 764174870, "bf5fdc314ded2372a0ad078568d76c5064bf2affbde0764c335009e56634481b"},
+    }
+
+    for i, vec in ipairs(test_vectors) do
+      it("passes Bitcoin Core test vector " .. i, function()
+        local raw_tx_hex = vec[1]
+        local script_hex = vec[2]
+        local input_index = vec[3]
+        local hash_type = vec[4]
+        local expected_hash_hex = vec[5]
+
+        -- Parse transaction
+        local tx_bytes = hex_to_bin(raw_tx_hex)
+        local tx = serialize.deserialize_transaction(tx_bytes)
+
+        -- Parse script
+        local script_code = hex_to_bin(script_hex)
+
+        -- Handle signed hash_type (convert from signed int32)
+        if hash_type < 0 then
+          hash_type = hash_type + 0x100000000  -- Convert to unsigned
+        end
+
+        -- Compute sighash (without FindAndDelete for test vectors, as they pre-process the script)
+        local sighash = validation.signature_hash_legacy(tx, input_index, script_code, hash_type)
+
+        -- Compare with expected (note: expected is in display order, sighash is in internal order)
+        -- The expected hash is in display byte order (reversed from internal)
+        local expected_bytes = hex_to_bin(expected_hash_hex)
+        local sighash_reversed = sighash:reverse()
+
+        assert.equals(expected_bytes, sighash_reversed,
+          "Test vector " .. i .. ": expected " .. expected_hash_hex ..
+          " but got " .. bin_to_hex(sighash_reversed))
+      end)
+    end
+  end)
+
+  describe("bip68 sequence locks", function()
+    local bit = require("bit")
+
+    -- Constants from consensus module
+    local SEQUENCE_LOCKTIME_DISABLE_FLAG = 0x80000000
+    local SEQUENCE_LOCKTIME_TYPE_FLAG = 0x00400000
+    local SEQUENCE_LOCKTIME_MASK = 0x0000FFFF
+    local SEQUENCE_LOCKTIME_GRANULARITY = 9  -- 512 seconds
+
+    -- Helper to create a test transaction
+    local function make_test_tx(version, sequences)
+      local tx = types.transaction(version, {}, {}, 0)
+      for i, seq in ipairs(sequences) do
+        local prev_hash = types.hash256(string.rep(string.char(i), 32))
+        tx.inputs[i] = types.txin(types.outpoint(prev_hash, 0), "\x00", seq)
+      end
+      tx.outputs[1] = types.txout(50000, string.rep("\x00", 25))
+      return tx
+    end
+
+    describe("calculate_sequence_locks", function()
+      it("returns -1, -1 for version 1 transactions", function()
+        local tx = make_test_tx(1, {10})
+
+        local function get_utxo_height() return 100 end
+        local function get_block_mtp() return 1000000 end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 200, get_utxo_height, get_block_mtp, true
+        )
+
+        assert.equals(-1, min_height)
+        assert.equals(-1, min_time)
+      end)
+
+      it("returns -1, -1 when BIP68 not active", function()
+        local tx = make_test_tx(2, {10})
+
+        local function get_utxo_height() return 100 end
+        local function get_block_mtp() return 1000000 end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 200, get_utxo_height, get_block_mtp, false
+        )
+
+        assert.equals(-1, min_height)
+        assert.equals(-1, min_time)
+      end)
+
+      it("returns -1, -1 when disable flag is set", function()
+        local tx = make_test_tx(2, {bit.bor(SEQUENCE_LOCKTIME_DISABLE_FLAG, 10)})
+
+        local function get_utxo_height() return 100 end
+        local function get_block_mtp() return 1000000 end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 200, get_utxo_height, get_block_mtp, true
+        )
+
+        assert.equals(-1, min_height)
+        assert.equals(-1, min_time)
+      end)
+
+      it("calculates height-based lock correctly", function()
+        -- Sequence = 10 blocks, UTXO at height 100
+        -- min_height = 100 + 10 - 1 = 109 (last invalid)
+        local tx = make_test_tx(2, {10})
+
+        local function get_utxo_height() return 100 end
+        local function get_block_mtp() return 1000000 end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 200, get_utxo_height, get_block_mtp, true
+        )
+
+        assert.equals(109, min_height)
+        assert.equals(-1, min_time)
+      end)
+
+      it("calculates time-based lock correctly", function()
+        -- Sequence = TYPE_FLAG | 10 = time-based, 10 * 512 = 5120 seconds
+        -- UTXO at height 100, MTP at height 99 = 1000000
+        -- min_time = 1000000 + 5120 - 1 = 1005119 (last invalid)
+        local seq = bit.bor(SEQUENCE_LOCKTIME_TYPE_FLAG, 10)
+        local tx = make_test_tx(2, {seq})
+
+        local utxo_height = 100
+        local mtp_at_99 = 1000000
+
+        local function get_utxo_height() return utxo_height end
+        local function get_block_mtp(h)
+          if h == 99 then return mtp_at_99 end
+          return mtp_at_99  -- default
+        end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 200, get_utxo_height, get_block_mtp, true
+        )
+
+        assert.equals(-1, min_height)
+        assert.equals(1000000 + 10 * 512 - 1, min_time)
+      end)
+
+      it("takes maximum across multiple inputs", function()
+        -- Input 1: 10 blocks, UTXO at height 100 -> 109
+        -- Input 2: 20 blocks, UTXO at height 50 -> 69
+        -- Input 3: 5 blocks, UTXO at height 200 -> 204
+        -- max = 204
+        local tx = make_test_tx(2, {10, 20, 5})
+
+        local heights = {100, 50, 200}
+        local call_count = 0
+        local function get_utxo_height(inp)
+          for idx, input in ipairs(tx.inputs) do
+            if input == inp then
+              return heights[idx]
+            end
+          end
+        end
+        local function get_block_mtp() return 1000000 end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 300, get_utxo_height, get_block_mtp, true
+        )
+
+        -- Input 1: 100 + 10 - 1 = 109
+        -- Input 2: 50 + 20 - 1 = 69
+        -- Input 3: 200 + 5 - 1 = 204
+        assert.equals(204, min_height)
+        assert.equals(-1, min_time)
+      end)
+
+      it("handles mixed height and time locks", function()
+        -- Input 1: height-based, 10 blocks, UTXO at height 100 -> 109
+        -- Input 2: time-based, 10 units (5120s), UTXO at height 50, MTP@49 = 1000000 -> 1005119
+        local seq1 = 10
+        local seq2 = bit.bor(SEQUENCE_LOCKTIME_TYPE_FLAG, 10)
+        local tx = make_test_tx(2, {seq1, seq2})
+
+        local heights = {100, 50}
+        local function get_utxo_height(inp)
+          for idx, input in ipairs(tx.inputs) do
+            if input == inp then
+              return heights[idx]
+            end
+          end
+        end
+        local function get_block_mtp(h)
+          if h == 49 then return 1000000 end
+          return 0
+        end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 300, get_utxo_height, get_block_mtp, true
+        )
+
+        assert.equals(109, min_height)
+        assert.equals(1000000 + 10 * 512 - 1, min_time)
+      end)
+
+      it("handles 0xFFFFFFFF sequence (RBF opt-in, BIP68 disabled)", function()
+        -- 0xFFFFFFFF has disable flag set
+        local tx = make_test_tx(2, {0xFFFFFFFF})
+
+        local function get_utxo_height() return 100 end
+        local function get_block_mtp() return 1000000 end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 200, get_utxo_height, get_block_mtp, true
+        )
+
+        assert.equals(-1, min_height)
+        assert.equals(-1, min_time)
+      end)
+
+      it("handles 0xFFFFFFFE sequence (RBF opt-in, BIP68 disabled)", function()
+        -- 0xFFFFFFFE has disable flag set (bit 31 = 1)
+        local tx = make_test_tx(2, {0xFFFFFFFE})
+
+        local function get_utxo_height() return 100 end
+        local function get_block_mtp() return 1000000 end
+
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, 200, get_utxo_height, get_block_mtp, true
+        )
+
+        assert.equals(-1, min_height)
+        assert.equals(-1, min_time)
+      end)
+    end)
+
+    describe("check_sequence_locks", function()
+      it("passes when height requirement is satisfied", function()
+        -- min_height = 109 (last invalid), block_height = 110
+        local result = validation.check_sequence_locks(109, -1, 110, 2000000)
+        assert.is_true(result)
+      end)
+
+      it("fails when height requirement is not satisfied", function()
+        -- min_height = 109 (last invalid), block_height = 109
+        local result = validation.check_sequence_locks(109, -1, 109, 2000000)
+        assert.is_false(result)
+      end)
+
+      it("fails when height is below min_height", function()
+        -- min_height = 109 (last invalid), block_height = 100
+        local result = validation.check_sequence_locks(109, -1, 100, 2000000)
+        assert.is_false(result)
+      end)
+
+      it("passes when time requirement is satisfied", function()
+        -- min_time = 1005119 (last invalid), prev_block_mtp = 1005120
+        local result = validation.check_sequence_locks(-1, 1005119, 200, 1005120)
+        assert.is_true(result)
+      end)
+
+      it("fails when time requirement is not satisfied", function()
+        -- min_time = 1005119 (last invalid), prev_block_mtp = 1005119
+        local result = validation.check_sequence_locks(-1, 1005119, 200, 1005119)
+        assert.is_false(result)
+      end)
+
+      it("fails when time is below min_time", function()
+        -- min_time = 1005119 (last invalid), prev_block_mtp = 1000000
+        local result = validation.check_sequence_locks(-1, 1005119, 200, 1000000)
+        assert.is_false(result)
+      end)
+
+      it("passes when both requirements are satisfied", function()
+        local result = validation.check_sequence_locks(109, 1005119, 200, 2000000)
+        assert.is_true(result)
+      end)
+
+      it("fails when only height requirement is satisfied", function()
+        local result = validation.check_sequence_locks(109, 1005119, 200, 1000000)
+        assert.is_false(result)
+      end)
+
+      it("fails when only time requirement is satisfied", function()
+        local result = validation.check_sequence_locks(109, 1005119, 100, 2000000)
+        assert.is_false(result)
+      end)
+
+      it("passes with -1, -1 (no locks)", function()
+        local result = validation.check_sequence_locks(-1, -1, 0, 0)
+        assert.is_true(result)
+      end)
+    end)
+  end)
 end)
