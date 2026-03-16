@@ -495,6 +495,274 @@ describe("mempool", function()
       entry1 = mp:get_entry(txid1_hex)
       assert.equal(1, entry1.descendant_count)
     end)
+
+    it("rejects 26th transaction in a chain (exceeds MAX_ANCESTORS=25)", function()
+      local chain_state = make_mock_chain_state()
+
+      -- Start with a UTXO
+      local base_txid = types.hash256(string.rep("\x01", 32))
+      local base_txid_hex = types.hash256_hex(base_txid)
+      add_utxo(chain_state, base_txid_hex, 0, 500000000)
+
+      local mp = mempool.new(chain_state)
+
+      -- Build a chain of exactly 25 transactions (MAX_ANCESTORS)
+      local current_txid = base_txid
+      local txids = {}
+      for i = 1, 25 do
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(current_txid, 0)
+        tx.outputs[1] = make_output(500000000 - i * 1000000)
+
+        local ok, txid_hex = mp:accept_transaction(tx)
+        assert.is_true(ok, "Transaction " .. i .. " should be accepted")
+        txids[i] = txid_hex
+        current_txid = validation.compute_txid(tx)
+      end
+
+      assert.equal(25, mp.tx_count)
+
+      -- Verify the last transaction has 24 ancestors (not counting itself)
+      local last_entry = mp:get_entry(txids[25])
+      assert.equal(24, last_entry.ancestor_count)
+
+      -- The 26th transaction should be rejected
+      local tx26 = make_tx(1, {}, {}, 0)
+      tx26.inputs[1] = make_input(current_txid, 0)
+      tx26.outputs[1] = make_output(500000000 - 26 * 1000000)
+
+      local ok26, err26 = mp:accept_transaction(tx26)
+      assert.is_false(ok26)
+      assert.truthy(err26:match("too many ancestors"))
+    end)
+
+    it("rejects transaction when ancestor has too many descendants", function()
+      local chain_state = make_mock_chain_state()
+
+      -- Create root UTXO with many outputs
+      local root_txid = types.hash256(string.rep("\x01", 32))
+      local root_txid_hex = types.hash256_hex(root_txid)
+      for i = 0, 30 do
+        add_utxo(chain_state, root_txid_hex, i, 10000000)
+      end
+
+      local mp = mempool.new(chain_state)
+
+      -- Create a parent transaction
+      local parent_tx = make_tx(1, {}, {}, 0)
+      parent_tx.inputs[1] = make_input(root_txid, 0)
+      parent_tx.outputs = {}
+      for i = 1, 30 do
+        parent_tx.outputs[i] = make_output(300000)
+      end
+
+      local ok_parent, parent_hex = mp:accept_transaction(parent_tx)
+      assert.is_true(ok_parent)
+
+      local parent_txid = validation.compute_txid(parent_tx)
+
+      -- Create 25 child transactions (MAX_DESCENDANTS)
+      for i = 0, 24 do
+        local child_tx = make_tx(1, {}, {}, 0)
+        child_tx.inputs[1] = make_input(parent_txid, i)
+        child_tx.outputs[1] = make_output(290000)
+
+        local ok, hex = mp:accept_transaction(child_tx)
+        assert.is_true(ok, "Child " .. i .. " should be accepted")
+      end
+
+      -- Parent should have 25 descendants now
+      local parent_entry = mp:get_entry(parent_hex)
+      assert.equal(25, parent_entry.descendant_count)
+
+      -- The 26th child should be rejected due to descendant limit
+      local child26 = make_tx(1, {}, {}, 0)
+      child26.inputs[1] = make_input(parent_txid, 25)
+      child26.outputs[1] = make_output(290000)
+
+      local ok26, err26 = mp:accept_transaction(child26)
+      assert.is_false(ok26)
+      assert.truthy(err26:match("too many descendants"))
+    end)
+
+    it("properly deduplicates ancestors with diamond dependency", function()
+      local chain_state = make_mock_chain_state()
+
+      -- Root UTXO with 2 outputs
+      local root_txid = types.hash256(string.rep("\x01", 32))
+      local root_txid_hex = types.hash256_hex(root_txid)
+      add_utxo(chain_state, root_txid_hex, 0, 10000000)
+      add_utxo(chain_state, root_txid_hex, 1, 10000000)
+
+      local mp = mempool.new(chain_state)
+
+      -- Create parent A spending output 0
+      local parent_a = make_tx(1, {}, {}, 0)
+      parent_a.inputs[1] = make_input(root_txid, 0)
+      parent_a.outputs[1] = make_output(9990000)
+
+      local ok_a, hex_a = mp:accept_transaction(parent_a)
+      assert.is_true(ok_a)
+      local txid_a = validation.compute_txid(parent_a)
+
+      -- Create parent B spending output 1
+      local parent_b = make_tx(1, {}, {}, 0)
+      parent_b.inputs[1] = make_input(root_txid, 1)
+      parent_b.outputs[1] = make_output(9990000)
+
+      local ok_b, hex_b = mp:accept_transaction(parent_b)
+      assert.is_true(ok_b)
+      local txid_b = validation.compute_txid(parent_b)
+
+      -- Create child spending both parents (diamond dependency)
+      local child = make_tx(1, {}, {}, 0)
+      child.inputs[1] = make_input(txid_a, 0)
+      child.inputs[2] = make_input(txid_b, 0)
+      child.outputs[1] = make_output(19960000)
+
+      local ok_child, hex_child = mp:accept_transaction(child)
+      assert.is_true(ok_child)
+
+      local child_entry = mp:get_entry(hex_child)
+      -- Child has 2 unique ancestors: parent_a and parent_b
+      assert.equal(2, child_entry.ancestor_count)
+
+      -- Both parents should have 1 descendant (the child)
+      local entry_a = mp:get_entry(hex_a)
+      local entry_b = mp:get_entry(hex_b)
+      assert.equal(1, entry_a.descendant_count)
+      assert.equal(1, entry_b.descendant_count)
+    end)
+
+    it("propagates descendant updates through entire ancestor chain", function()
+      local chain_state = make_mock_chain_state()
+
+      local base_txid = types.hash256(string.rep("\x01", 32))
+      local base_txid_hex = types.hash256_hex(base_txid)
+      add_utxo(chain_state, base_txid_hex, 0, 100000000)
+
+      local mp = mempool.new(chain_state)
+
+      -- Create a chain: tx1 -> tx2 -> tx3
+      local tx1 = make_tx(1, {}, {}, 0)
+      tx1.inputs[1] = make_input(base_txid, 0)
+      tx1.outputs[1] = make_output(99990000)
+      local ok1, hex1 = mp:accept_transaction(tx1)
+      assert.is_true(ok1)
+      local txid1 = validation.compute_txid(tx1)
+
+      local tx2 = make_tx(1, {}, {}, 0)
+      tx2.inputs[1] = make_input(txid1, 0)
+      tx2.outputs[1] = make_output(99980000)
+      local ok2, hex2 = mp:accept_transaction(tx2)
+      assert.is_true(ok2)
+      local txid2 = validation.compute_txid(tx2)
+
+      local tx3 = make_tx(1, {}, {}, 0)
+      tx3.inputs[1] = make_input(txid2, 0)
+      tx3.outputs[1] = make_output(99970000)
+      local ok3, hex3 = mp:accept_transaction(tx3)
+      assert.is_true(ok3)
+
+      -- tx1 should have 2 descendants (tx2 and tx3)
+      local entry1 = mp:get_entry(hex1)
+      assert.equal(2, entry1.descendant_count)
+
+      -- tx2 should have 1 descendant (tx3)
+      local entry2 = mp:get_entry(hex2)
+      assert.equal(1, entry2.descendant_count)
+
+      -- tx3 should have 0 descendants
+      local entry3 = mp:get_entry(hex3)
+      assert.equal(0, entry3.descendant_count)
+    end)
+
+    it("correctly updates all ancestors when removing transaction", function()
+      local chain_state = make_mock_chain_state()
+
+      local base_txid = types.hash256(string.rep("\x01", 32))
+      local base_txid_hex = types.hash256_hex(base_txid)
+      add_utxo(chain_state, base_txid_hex, 0, 100000000)
+
+      local mp = mempool.new(chain_state)
+
+      -- Create a chain: tx1 -> tx2 -> tx3
+      local tx1 = make_tx(1, {}, {}, 0)
+      tx1.inputs[1] = make_input(base_txid, 0)
+      tx1.outputs[1] = make_output(99990000)
+      local ok1, hex1 = mp:accept_transaction(tx1)
+      assert.is_true(ok1)
+      local txid1 = validation.compute_txid(tx1)
+
+      local tx2 = make_tx(1, {}, {}, 0)
+      tx2.inputs[1] = make_input(txid1, 0)
+      tx2.outputs[1] = make_output(99980000)
+      local ok2, hex2 = mp:accept_transaction(tx2)
+      assert.is_true(ok2)
+      local txid2 = validation.compute_txid(tx2)
+
+      local tx3 = make_tx(1, {}, {}, 0)
+      tx3.inputs[1] = make_input(txid2, 0)
+      tx3.outputs[1] = make_output(99970000)
+      local ok3, hex3 = mp:accept_transaction(tx3)
+      assert.is_true(ok3)
+
+      -- Remove tx3 only
+      mp:remove_transaction(hex3, "test")
+
+      -- tx1 should now have 1 descendant (tx2 only)
+      local entry1 = mp:get_entry(hex1)
+      assert.equal(1, entry1.descendant_count)
+
+      -- tx2 should have 0 descendants
+      local entry2 = mp:get_entry(hex2)
+      assert.equal(0, entry2.descendant_count)
+
+      assert.equal(2, mp.tx_count)
+    end)
+
+    it("enforces ancestor size limit", function()
+      local chain_state = make_mock_chain_state()
+
+      -- Create UTXOs for large transactions
+      for i = 0, 30 do
+        local txid = types.hash256(string.rep(string.char(i), 32))
+        local txid_hex = types.hash256_hex(txid)
+        add_utxo(chain_state, txid_hex, 0, 100000000)
+      end
+
+      local mp = mempool.new(chain_state)
+
+      -- Build a chain of large transactions (each ~10KB)
+      -- MAX_ANCESTOR_SIZE = 101000, so after ~10 transactions it should fail
+      local prev_txid = types.hash256(string.rep("\x00", 32))
+      add_utxo(chain_state, types.hash256_hex(prev_txid), 0, 1000000000)
+
+      local accepted_count = 0
+      for i = 1, 15 do
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        -- Create multiple outputs to increase tx size
+        tx.outputs = {}
+        for j = 1, 200 do  -- ~8KB with many outputs
+          tx.outputs[j] = make_output(4000000)
+        end
+
+        local ok, result = mp:accept_transaction(tx)
+        if ok then
+          accepted_count = accepted_count + 1
+          prev_txid = validation.compute_txid(tx)
+        else
+          -- Should eventually fail due to ancestor size
+          assert.truthy(result:match("ancestor size too large"))
+          break
+        end
+      end
+
+      -- Should have accepted some but not all
+      assert.is_true(accepted_count > 0)
+      assert.is_true(accepted_count < 15)
+    end)
   end)
 
   describe("mempool queries", function()
