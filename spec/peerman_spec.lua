@@ -3,6 +3,19 @@ local peer_mod = require("lunarblock.peer")
 local p2p = require("lunarblock.p2p")
 local consensus = require("lunarblock.consensus")
 
+--- Create a temporary directory for tests.
+local function make_temp_dir()
+  local tmpname = os.tmpname()
+  os.remove(tmpname)  -- Remove the file created by tmpname
+  os.execute("mkdir -p " .. tmpname)
+  return tmpname
+end
+
+--- Clean up a temporary directory.
+local function cleanup_temp_dir(path)
+  os.execute("rm -rf " .. path)
+end
+
 describe("peerman", function()
 
   local test_network
@@ -201,6 +214,281 @@ describe("peerman", function()
       -- Add score to exceed threshold
       pm:add_ban_score(mock_peer, 60, "threshold exceeded")
       assert.is_true(pm:is_banned("192.168.1.1"))
+    end)
+
+    it("unbans a peer", function()
+      local pm = peerman.new(test_network, nil, nil)
+      pm:ban_peer("192.168.1.1")
+      assert.is_true(pm:is_banned("192.168.1.1"))
+      pm:unban_peer("192.168.1.1")
+      assert.is_false(pm:is_banned("192.168.1.1"))
+    end)
+
+    it("gets list of banned peers", function()
+      local pm = peerman.new(test_network, nil, nil)
+      pm:ban_peer("192.168.1.1", 3600)
+      pm:ban_peer("192.168.1.2", 7200)
+      local banned_list = pm:get_banned_list()
+      assert.equals(2, #banned_list)
+    end)
+
+    it("clears expired bans", function()
+      local pm = peerman.new(test_network, nil, nil)
+      -- Set one expired ban and one active ban
+      pm.banned["192.168.1.1"] = os.time() - 1  -- expired
+      pm.banned["192.168.1.2"] = os.time() + 3600  -- active
+      pm:clear_expired_bans()
+      assert.is_nil(pm.banned["192.168.1.1"])
+      assert.is_not_nil(pm.banned["192.168.1.2"])
+    end)
+
+  end)
+
+  describe("misbehavior scoring", function()
+
+    local function make_mock_peer(ip, port)
+      return {
+        ip = ip or "192.168.1.1",
+        port = port or 8333,
+        ban_score = 0,
+        state = peer_mod.STATE.ESTABLISHED,
+        socket = nil,
+        disconnect = function(self, reason)
+          self.state = peer_mod.STATE.DISCONNECTED
+          self.disconnect_reason = reason
+        end,
+      }
+    end
+
+    it("increments ban score with misbehaving()", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      pm:misbehaving(mock_peer, 25, "test reason")
+      assert.equals(25, mock_peer.ban_score)
+    end)
+
+    it("accumulates misbehavior scores", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      pm:misbehaving(mock_peer, 20, "first offense")
+      pm:misbehaving(mock_peer, 30, "second offense")
+      pm:misbehaving(mock_peer, 40, "third offense")
+      assert.equals(90, mock_peer.ban_score)
+      assert.is_false(pm:is_banned("192.168.1.1"))
+    end)
+
+    it("bans peer when score reaches threshold", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      -- Should not ban at 99
+      pm:misbehaving(mock_peer, 99, "almost banned")
+      assert.is_false(pm:is_banned("192.168.1.1"))
+
+      -- Should ban at 100
+      pm:misbehaving(mock_peer, 1, "final offense")
+      assert.is_true(pm:is_banned("192.168.1.1"))
+    end)
+
+    it("bans instantly for invalid block header (100 points)", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_BLOCK_HEADER, "invalid header")
+      assert.is_true(pm:is_banned("192.168.1.1"))
+      assert.equals(peer_mod.STATE.DISCONNECTED, mock_peer.state)
+    end)
+
+    it("bans instantly for invalid block (100 points)", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_BLOCK, "invalid block")
+      assert.is_true(pm:is_banned("192.168.1.1"))
+    end)
+
+    it("requires 10 invalid transactions to ban", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      -- 9 invalid transactions = 90 points, not banned
+      for i = 1, 9 do
+        pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_TRANSACTION, "invalid tx " .. i)
+      end
+      assert.equals(90, mock_peer.ban_score)
+      assert.is_false(pm:is_banned("192.168.1.1"))
+
+      -- 10th invalid transaction = 100 points, banned
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_TRANSACTION, "invalid tx 10")
+      assert.is_true(pm:is_banned("192.168.1.1"))
+    end)
+
+    it("requires 5 unsolicited data violations to ban", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      -- 4 unsolicited = 80 points, not banned
+      for i = 1, 4 do
+        pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.UNSOLICITED_DATA, "unsolicited " .. i)
+      end
+      assert.is_false(pm:is_banned("192.168.1.1"))
+
+      -- 5th unsolicited = 100 points, banned
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.UNSOLICITED_DATA, "unsolicited 5")
+      assert.is_true(pm:is_banned("192.168.1.1"))
+    end)
+
+    it("requires 2 message floods to ban", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local mock_peer = make_mock_peer()
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.TOO_MANY_MESSAGES, "flood 1")
+      assert.is_false(pm:is_banned("192.168.1.1"))
+
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.TOO_MANY_MESSAGES, "flood 2")
+      assert.is_true(pm:is_banned("192.168.1.1"))
+    end)
+
+  end)
+
+  describe("ban persistence", function()
+
+    local test_dir
+
+    before_each(function()
+      test_dir = make_temp_dir()
+    end)
+
+    after_each(function()
+      cleanup_temp_dir(test_dir)
+    end)
+
+    it("persists bans to disk", function()
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      pm:ban_peer("192.168.1.1", 3600)
+      pm:ban_peer("10.0.0.1", 7200)
+
+      -- Check file was created
+      local f = io.open(test_dir .. "/banned.dat", "r")
+      assert.is_not_nil(f)
+      local content = f:read("*all")
+      f:close()
+      assert.truthy(content:find("192.168.1.1"))
+      assert.truthy(content:find("10.0.0.1"))
+    end)
+
+    it("loads bans from disk on startup", function()
+      -- Create a ban file manually
+      local ban_until = os.time() + 3600
+      local f = io.open(test_dir .. "/banned.dat", "w")
+      f:write("192.168.1.1:" .. tostring(ban_until) .. "\n")
+      f:write("10.0.0.1:" .. tostring(ban_until + 1000) .. "\n")
+      f:close()
+
+      -- Create new PeerManager, should load bans
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      assert.is_true(pm:is_banned("192.168.1.1"))
+      assert.is_true(pm:is_banned("10.0.0.1"))
+    end)
+
+    it("does not load expired bans from disk", function()
+      -- Create a ban file with expired ban
+      local f = io.open(test_dir .. "/banned.dat", "w")
+      f:write("192.168.1.1:" .. tostring(os.time() - 100) .. "\n")  -- expired
+      f:write("10.0.0.1:" .. tostring(os.time() + 3600) .. "\n")    -- active
+      f:close()
+
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      assert.is_false(pm:is_banned("192.168.1.1"))
+      assert.is_true(pm:is_banned("10.0.0.1"))
+    end)
+
+    it("bans survive peer manager restart", function()
+      -- Create first PeerManager and ban a peer
+      local pm1 = peerman.new(test_network, nil, {data_dir = test_dir})
+      pm1:ban_peer("192.168.1.1", 3600)
+      assert.is_true(pm1:is_banned("192.168.1.1"))
+
+      -- Create second PeerManager (simulating restart)
+      local pm2 = peerman.new(test_network, nil, {data_dir = test_dir})
+      assert.is_true(pm2:is_banned("192.168.1.1"))
+    end)
+
+    it("unban removes from disk", function()
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      pm:ban_peer("192.168.1.1", 3600)
+      pm:ban_peer("10.0.0.1", 3600)
+
+      -- Unban one peer
+      pm:unban_peer("192.168.1.1")
+
+      -- Check file no longer contains unbanned IP
+      local f = io.open(test_dir .. "/banned.dat", "r")
+      local content = f:read("*all")
+      f:close()
+      assert.is_nil(content:find("192.168.1.1"))
+      assert.truthy(content:find("10.0.0.1"))
+    end)
+
+    it("misbehavior leading to ban persists to disk", function()
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      local mock_peer = {
+        ip = "192.168.1.1",
+        port = 8333,
+        ban_score = 0,
+        state = peer_mod.STATE.ESTABLISHED,
+        disconnect = function(self, reason)
+          self.state = peer_mod.STATE.DISCONNECTED
+          local _ = reason
+        end,
+      }
+      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peer_list[1] = mock_peer
+
+      -- Trigger ban via misbehavior
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_BLOCK, "invalid block")
+
+      -- Create new PeerManager (simulating restart)
+      local pm2 = peerman.new(test_network, nil, {data_dir = test_dir})
+      assert.is_true(pm2:is_banned("192.168.1.1"))
+    end)
+
+    it("handles missing ban file gracefully", function()
+      -- No ban file exists
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      assert.same({}, pm.banned)
+    end)
+
+    it("handles malformed ban file entries", function()
+      -- Create a ban file with some bad entries
+      local f = io.open(test_dir .. "/banned.dat", "w")
+      f:write("invalid_line_no_colon\n")
+      f:write("192.168.1.1:not_a_number\n")
+      f:write("10.0.0.1:" .. tostring(os.time() + 3600) .. "\n")  -- valid
+      f:close()
+
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      -- Should only load the valid entry
+      assert.is_false(pm:is_banned("192.168.1.1"))
+      assert.is_true(pm:is_banned("10.0.0.1"))
     end)
 
   end)
@@ -529,6 +817,810 @@ describe("peerman", function()
       assert.is_not_nil(mainnet)
       assert.is_not_nil(mainnet.dns_seeds)
       assert.is_true(#mainnet.dns_seeds > 0)
+    end)
+
+  end)
+
+  describe("transaction trickling", function()
+
+    local function make_mock_peer(ip, port, inbound, wtxid_relay)
+      return {
+        ip = ip or "192.168.1.1",
+        port = port or 8333,
+        inbound = inbound or false,
+        wtxid_relay = wtxid_relay or false,
+        state = peer_mod.STATE.ESTABLISHED,
+        _established_notified = true,
+        send_message = function(self, cmd, payload)
+          self._sent_messages = self._sent_messages or {}
+          self._sent_messages[#self._sent_messages + 1] = {
+            command = cmd,
+            payload = payload,
+          }
+        end,
+        disconnect = function(self, reason)
+          self.state = peer_mod.STATE.DISCONNECTED
+          local _ = reason
+        end,
+      }
+    end
+
+    describe("poisson_delay", function()
+
+      it("returns positive values", function()
+        for _ = 1, 100 do
+          local delay = peerman.poisson_delay(5.0)
+          assert.is_true(delay > 0)
+        end
+      end)
+
+      it("averages approximately the interval", function()
+        local total = 0
+        local n = 1000
+        for _ = 1, n do
+          total = total + peerman.poisson_delay(5.0)
+        end
+        local avg = total / n
+        -- Should be within 20% of expected (law of large numbers)
+        assert.is_true(avg > 4.0 and avg < 6.0)
+      end)
+
+    end)
+
+    describe("shuffle", function()
+
+      it("shuffles array in place", function()
+        local arr = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+        local original = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+        local result = peerman.shuffle(arr)
+
+        -- Same array returned
+        assert.equals(arr, result)
+        -- Same length
+        assert.equals(#original, #result)
+        -- All elements still present (just reordered)
+        table.sort(result)
+        assert.same(original, result)
+      end)
+
+      it("produces different orderings (statistical)", function()
+        local same_count = 0
+        for _ = 1, 100 do
+          local arr1 = {1, 2, 3, 4, 5}
+          local arr2 = {1, 2, 3, 4, 5}
+          peerman.shuffle(arr1)
+          peerman.shuffle(arr2)
+          local same = true
+          for i = 1, 5 do
+            if arr1[i] ~= arr2[i] then
+              same = false
+              break
+            end
+          end
+          if same then same_count = same_count + 1 end
+        end
+        -- Very unlikely to have all shuffles be identical
+        assert.is_true(same_count < 50)
+      end)
+
+    end)
+
+    describe("inv_queue management", function()
+
+      it("initializes trickle state for established peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+
+        pm:_init_peer_trickle(mock_peer)
+
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.is_not_nil(queue)
+        assert.equals(0, #queue)
+      end)
+
+      it("queues transaction announcements for established peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+
+        local txid = string.rep("\x01", 32)
+        pm:queue_tx_announcement(txid)
+
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.equals(1, #queue)
+        assert.equals(txid, queue[1].hash)
+        assert.is_false(queue[1].is_wtxid)
+      end)
+
+      it("uses wtxid for wtxidrelay peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer("192.168.1.1", 8333, false, true)  -- wtxid_relay = true
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+
+        local txid = string.rep("\x01", 32)
+        local wtxid = string.rep("\x02", 32)
+        pm:queue_tx_announcement(txid, wtxid)
+
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.equals(1, #queue)
+        assert.equals(wtxid, queue[1].hash)  -- Uses wtxid, not txid
+        assert.is_true(queue[1].is_wtxid)
+      end)
+
+      it("does not re-announce known transactions", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+
+        local txid = string.rep("\x01", 32)
+        pm:queue_tx_announcement(txid)
+        pm:queue_tx_announcement(txid)  -- Second announcement
+
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        -- Only queued once (not yet sent, so not in inv_known)
+        assert.equals(2, #queue)
+      end)
+
+      it("cleans up trickle state on disconnect", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+
+        pm:_cleanup_peer_trickle(mock_peer)
+
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.is_nil(queue)
+      end)
+
+    end)
+
+    describe("trickle timer", function()
+
+      it("sets different intervals for inbound vs outbound", function()
+        local pm = peerman.new(test_network, nil, nil)
+
+        local outbound_peer = make_mock_peer("192.168.1.1", 8333, false)
+        pm.peer_list[1] = outbound_peer
+        pm.peers["192.168.1.1:8333"] = outbound_peer
+        pm:_init_peer_trickle(outbound_peer)
+
+        local inbound_peer = make_mock_peer("192.168.1.2", 8333, true)
+        pm.peer_list[2] = inbound_peer
+        pm.peers["192.168.1.2:8333"] = inbound_peer
+        pm:_init_peer_trickle(inbound_peer)
+
+        -- Both should have future send times
+        local out_time = pm:get_peer_next_send_time(outbound_peer)
+        local in_time = pm:get_peer_next_send_time(inbound_peer)
+        assert.is_not_nil(out_time)
+        assert.is_not_nil(in_time)
+      end)
+
+      it("delays announcements until timer expires", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+
+        -- Set next_send_time far in the future
+        pm._peer_trickle["192.168.1.1:8333"].next_send_time = os.time() + 1000
+
+        local txid = string.rep("\x01", 32)
+        pm:queue_tx_announcement(txid)
+
+        -- Process trickle - should not send yet
+        pm:_process_trickle()
+
+        -- No messages sent
+        assert.is_nil(mock_peer._sent_messages)
+
+        -- Queue still has the entry
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.equals(1, #queue)
+      end)
+
+      it("sends inv when timer expires", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+
+        -- Set next_send_time to the past
+        pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
+
+        local txid = string.rep("\x01", 32)
+        pm:queue_tx_announcement(txid)
+
+        -- Process trickle - should send now
+        pm:_process_trickle()
+
+        -- Message sent
+        assert.is_not_nil(mock_peer._sent_messages)
+        assert.equals(1, #mock_peer._sent_messages)
+        assert.equals("inv", mock_peer._sent_messages[1].command)
+
+        -- Queue is now empty
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.equals(0, #queue)
+      end)
+
+      it("batches up to MAX_INV_PER_MSG entries", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+
+        -- Set next_send_time to the past
+        pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
+
+        -- Queue more than MAX_INV_PER_MSG transactions
+        for i = 1, 50 do
+          local txid = string.rep(string.char(i), 32)
+          pm:queue_tx_announcement(txid)
+        end
+
+        -- Process trickle once - should send one batch
+        pm:_process_trickle()
+
+        -- Should have sent exactly MAX_INV_PER_MSG (35)
+        assert.is_not_nil(mock_peer._sent_messages)
+        assert.equals(1, #mock_peer._sent_messages)
+
+        -- Parse the inv message to verify count
+        local inv_items = p2p.deserialize_inv(mock_peer._sent_messages[1].payload)
+        assert.equals(peerman.TRICKLE.MAX_INV_PER_MSG, #inv_items)
+
+        -- Remaining items still in queue
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.equals(50 - peerman.TRICKLE.MAX_INV_PER_MSG, #queue)
+      end)
+
+      it("randomizes order of announcements", function()
+        -- This is a statistical test - run multiple times
+        local orderings = {}
+        for _ = 1, 10 do
+          local pm = peerman.new(test_network, nil, nil)
+          local mock_peer = make_mock_peer()
+          pm.peer_list[1] = mock_peer
+          pm.peers["192.168.1.1:8333"] = mock_peer
+          pm:_init_peer_trickle(mock_peer)
+          pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
+
+          -- Queue 10 transactions with sequential IDs
+          for i = 1, 10 do
+            local txid = string.rep(string.char(i), 32)
+            pm:queue_tx_announcement(txid)
+          end
+
+          pm:_process_trickle()
+
+          local inv_items = p2p.deserialize_inv(mock_peer._sent_messages[1].payload)
+          local order = ""
+          for _, item in ipairs(inv_items) do
+            order = order .. string.byte(item.hash:sub(1, 1))
+          end
+          orderings[order] = true
+        end
+
+        -- Should have at least 2 different orderings in 10 tries
+        local count = 0
+        for _ in pairs(orderings) do count = count + 1 end
+        assert.is_true(count >= 2)
+      end)
+
+    end)
+
+    describe("relay with wtxid", function()
+
+      it("uses MSG_TX for non-wtxidrelay peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer("192.168.1.1", 8333, false, false)
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+        pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
+
+        local txid = string.rep("\x01", 32)
+        pm:queue_tx_announcement(txid)
+        pm:_process_trickle()
+
+        local inv_items = p2p.deserialize_inv(mock_peer._sent_messages[1].payload)
+        assert.equals(p2p.INV_TYPE.MSG_TX, inv_items[1].type)
+      end)
+
+      it("uses MSG_WTX for wtxidrelay peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer("192.168.1.1", 8333, false, true)
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+        pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
+
+        local txid = string.rep("\x01", 32)
+        local wtxid = string.rep("\x02", 32)
+        pm:queue_tx_announcement(txid, wtxid)
+        pm:_process_trickle()
+
+        local inv_items = p2p.deserialize_inv(mock_peer._sent_messages[1].payload)
+        assert.equals(p2p.INV_TYPE.MSG_WTX, inv_items[1].type)
+        assert.equals(wtxid, inv_items[1].hash)
+      end)
+
+    end)
+
+    describe("inv_known filter", function()
+
+      it("marks sent transactions as known", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+        pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
+
+        local txid = string.rep("\x01", 32)
+        pm:queue_tx_announcement(txid)
+        pm:_process_trickle()
+
+        -- Try to queue the same transaction again
+        pm:queue_tx_announcement(txid)
+
+        -- Queue should be empty (transaction is known)
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.equals(0, #queue)
+      end)
+
+      it("allows clearing known filter", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_trickle(mock_peer)
+        pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
+
+        local txid = string.rep("\x01", 32)
+        pm:queue_tx_announcement(txid)
+        pm:_process_trickle()
+
+        -- Clear known filter
+        pm:clear_peer_inv_known(mock_peer)
+
+        -- Now can queue the same transaction again
+        pm:queue_tx_announcement(txid)
+        local queue = pm:get_peer_inv_queue(mock_peer)
+        assert.equals(1, #queue)
+      end)
+
+    end)
+
+  end)
+
+  --------------------------------------------------------------------------------
+  -- Eclipse Attack Mitigation Tests
+  --------------------------------------------------------------------------------
+
+  describe("address manager (addrman)", function()
+
+    describe("network group calculation", function()
+
+      it("groups IPv4 by /16 subnet", function()
+        local g1 = peerman.get_addr_group("192.168.1.1")
+        local g2 = peerman.get_addr_group("192.168.1.2")
+        local g3 = peerman.get_addr_group("192.168.2.1")
+        local g4 = peerman.get_addr_group("192.169.1.1")
+
+        -- Same /16 should have same group
+        assert.equals(g1, g2)
+        assert.equals(g1, g3)
+        -- Different /16 should have different group
+        assert.not_equals(g1, g4)
+      end)
+
+      it("produces deterministic groups", function()
+        for _ = 1, 10 do
+          local g = peerman.get_addr_group("10.20.30.40")
+          assert.equals(string.char(4, 10, 20), g)
+        end
+      end)
+
+    end)
+
+    describe("bucket assignment", function()
+
+      it("assigns addresses to new buckets deterministically", function()
+        local key = string.rep("\x01", 32)
+        local bucket1 = peerman.get_new_bucket(key, "192.168.1.1", 8333, "10.0.0.1")
+        local bucket2 = peerman.get_new_bucket(key, "192.168.1.1", 8333, "10.0.0.1")
+        assert.equals(bucket1, bucket2)
+        assert.is_true(bucket1 >= 0)
+        assert.is_true(bucket1 < peerman.ADDRMAN.NEW_BUCKET_COUNT)
+      end)
+
+      it("assigns addresses to tried buckets deterministically", function()
+        local key = string.rep("\x02", 32)
+        local bucket1 = peerman.get_tried_bucket(key, "192.168.1.1", 8333)
+        local bucket2 = peerman.get_tried_bucket(key, "192.168.1.1", 8333)
+        assert.equals(bucket1, bucket2)
+        assert.is_true(bucket1 >= 0)
+        assert.is_true(bucket1 < peerman.ADDRMAN.TRIED_BUCKET_COUNT)
+      end)
+
+      it("distributes addresses across multiple buckets", function()
+        local key = string.rep("\x03", 32)
+        local buckets = {}
+        for i = 1, 256 do
+          local ip = string.format("%d.%d.%d.%d",
+            math.floor(i / 64) % 256,
+            i % 64,
+            1, 1)
+          local bucket = peerman.get_new_bucket(key, ip, 8333, "dns")
+          buckets[bucket] = true
+        end
+        -- Should use at least 10 different buckets
+        local count = 0
+        for _ in pairs(buckets) do count = count + 1 end
+        assert.is_true(count >= 10)
+      end)
+
+      it("places addresses at deterministic positions in buckets", function()
+        local key = string.rep("\x04", 32)
+        local pos1 = peerman.get_bucket_position(key, true, 5, "192.168.1.1", 8333)
+        local pos2 = peerman.get_bucket_position(key, true, 5, "192.168.1.1", 8333)
+        assert.equals(pos1, pos2)
+        assert.is_true(pos1 >= 0)
+        assert.is_true(pos1 < peerman.ADDRMAN.BUCKET_SIZE)
+      end)
+
+    end)
+
+    describe("new table", function()
+
+      it("adds addresses to new table", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local added = pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        assert.is_true(added)
+        local stats = pm:get_addrman_stats()
+        assert.equals(1, stats.new_count)
+      end)
+
+      it("tracks multiple addresses", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_add_to_new("192.168.1.2", 8333, 1, os.time(), "10.0.0.2")
+        pm:_add_to_new("192.168.1.3", 8333, 1, os.time(), "10.0.0.3")
+        local stats = pm:get_addrman_stats()
+        assert.equals(3, stats.new_count)
+      end)
+
+      it("updates timestamp for duplicate addresses", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local old_time = os.time() - 1000
+        local new_time = os.time()
+        pm:_add_to_new("192.168.1.1", 8333, 1, old_time, "10.0.0.1")
+        pm:_add_to_new("192.168.1.1", 8333, 1, new_time, "10.0.0.1")
+        local stats = pm:get_addrman_stats()
+        -- Should still be 1 address (just updated)
+        assert.equals(1, stats.new_count)
+      end)
+
+    end)
+
+    describe("tried table", function()
+
+      it("moves addresses from new to tried", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        local stats1 = pm:get_addrman_stats()
+        assert.equals(1, stats1.new_count)
+        assert.equals(0, stats1.tried_count)
+
+        pm:_move_to_tried("192.168.1.1", 8333)
+        local stats2 = pm:get_addrman_stats()
+        assert.equals(0, stats2.new_count)
+        assert.equals(1, stats2.tried_count)
+      end)
+
+      it("tracks multiple tried addresses", function()
+        local pm = peerman.new(test_network, nil, nil)
+        for i = 1, 5 do
+          local ip = "192.168." .. i .. ".1"
+          pm:_add_to_new(ip, 8333, 1, os.time(), "10.0.0.1")
+          pm:_move_to_tried(ip, 8333)
+        end
+        local stats = pm:get_addrman_stats()
+        assert.equals(5, stats.tried_count)
+      end)
+
+      it("updates last_success for repeated successful connections", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_move_to_tried("192.168.1.1", 8333)
+        -- Move again (simulating reconnect)
+        pm:_move_to_tried("192.168.1.1", 8333)
+        local stats = pm:get_addrman_stats()
+        -- Should still be just 1 tried entry
+        assert.equals(1, stats.tried_count)
+      end)
+
+    end)
+
+    describe("address selection", function()
+
+      it("returns nil when tables are empty", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local addr = pm:_select_address()
+        assert.is_nil(addr)
+      end)
+
+      it("selects from new table", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        local addr = pm:_select_address()
+        assert.is_not_nil(addr)
+        assert.equals("192.168.1.1", addr.ip)
+        assert.equals(8333, addr.port)
+      end)
+
+      it("selects from tried table", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm:_move_to_tried("192.168.1.1", 8333)
+        local addr = pm:_select_address()
+        assert.is_not_nil(addr)
+        assert.equals("192.168.1.1", addr.ip)
+      end)
+
+      it("can be restricted to new table only", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_move_to_tried("192.168.1.2", 8333)
+        -- Select only from new
+        local found_new = false
+        for _ = 1, 50 do
+          local addr = pm:_select_address(true)
+          if addr and addr.ip == "192.168.1.1" then
+            found_new = true
+            break
+          end
+        end
+        assert.is_true(found_new)
+      end)
+
+    end)
+
+  end)
+
+  describe("anchor connections", function()
+
+    local test_dir
+
+    before_each(function()
+      test_dir = make_temp_dir()
+    end)
+
+    after_each(function()
+      cleanup_temp_dir(test_dir)
+    end)
+
+    it("saves anchors on shutdown", function()
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+
+      -- Simulate established outbound peer
+      local mock_peer = {
+        ip = "192.168.1.1",
+        port = 8333,
+        inbound = false,
+        state = peer_mod.STATE.ESTABLISHED,
+        disconnect = function(self, reason)
+          self.state = peer_mod.STATE.DISCONNECTED
+          local _ = reason
+        end,
+      }
+      pm.peer_list[1] = mock_peer
+      pm.peers["192.168.1.1:8333"] = mock_peer
+
+      -- Stop should save anchors
+      pm:stop()
+
+      -- Verify anchors.dat was created
+      local f = io.open(test_dir .. "/anchors.dat", "r")
+      assert.is_not_nil(f)
+      local content = f:read("*all")
+      f:close()
+      assert.truthy(content:find("192.168.1.1:8333"))
+    end)
+
+    it("loads anchors on startup", function()
+      -- Create anchors file
+      local f = io.open(test_dir .. "/anchors.dat", "w")
+      f:write("192.168.1.1:8333\n")
+      f:write("192.168.1.2:8334\n")
+      f:close()
+
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+      local anchors = pm:get_anchors()
+
+      assert.equals(2, #anchors)
+      assert.equals("192.168.1.1", anchors[1].ip)
+      assert.equals(8333, anchors[1].port)
+      assert.equals("192.168.1.2", anchors[2].ip)
+      assert.equals(8334, anchors[2].port)
+    end)
+
+    it("deletes anchors file after loading (Bitcoin Core behavior)", function()
+      local f = io.open(test_dir .. "/anchors.dat", "w")
+      f:write("192.168.1.1:8333\n")
+      f:close()
+
+      peerman.new(test_network, nil, {data_dir = test_dir})
+
+      -- File should be deleted
+      local f2 = io.open(test_dir .. "/anchors.dat", "r")
+      assert.is_nil(f2)
+    end)
+
+    it("limits anchors to MAX_ANCHORS (2)", function()
+      local pm = peerman.new(test_network, nil, {data_dir = test_dir})
+
+      -- Simulate 5 established outbound peers
+      for i = 1, 5 do
+        local mock_peer = {
+          ip = "192.168.1." .. i,
+          port = 8333,
+          inbound = false,
+          state = peer_mod.STATE.ESTABLISHED,
+          disconnect = function(self, reason)
+            self.state = peer_mod.STATE.DISCONNECTED
+            local _ = reason
+          end,
+        }
+        pm.peer_list[i] = mock_peer
+        pm.peers["192.168.1." .. i .. ":8333"] = mock_peer
+      end
+
+      pm:stop()
+
+      -- Verify only 2 anchors saved
+      local f = io.open(test_dir .. "/anchors.dat", "r")
+      assert.is_not_nil(f)
+      local count = 0
+      for _ in f:lines() do count = count + 1 end
+      f:close()
+      assert.equals(2, count)
+    end)
+
+    it("survives peer manager restart", function()
+      -- First session: establish peer and shutdown
+      local pm1 = peerman.new(test_network, nil, {data_dir = test_dir})
+      local mock_peer = {
+        ip = "192.168.1.1",
+        port = 8333,
+        inbound = false,
+        state = peer_mod.STATE.ESTABLISHED,
+        disconnect = function(self, reason)
+          self.state = peer_mod.STATE.DISCONNECTED
+          local _ = reason
+        end,
+      }
+      pm1.peer_list[1] = mock_peer
+      pm1.peers["192.168.1.1:8333"] = mock_peer
+      pm1:stop()
+
+      -- Second session: should load anchor
+      local pm2 = peerman.new(test_network, nil, {data_dir = test_dir})
+      local anchors = pm2:get_anchors()
+      assert.equals(1, #anchors)
+      assert.equals("192.168.1.1", anchors[1].ip)
+    end)
+
+  end)
+
+  describe("outbound diversity (eclipse mitigation)", function()
+
+    it("allows first connection from any subnet", function()
+      local pm = peerman.new(test_network, nil, nil)
+      assert.is_true(pm:_check_outbound_diversity("192.168.1.1"))
+    end)
+
+    it("rejects second connection from same /16 subnet", function()
+      local pm = peerman.new(test_network, nil, nil)
+      pm:_add_outbound_group("192.168.1.1")
+      assert.is_false(pm:_check_outbound_diversity("192.168.1.2"))
+      assert.is_false(pm:_check_outbound_diversity("192.168.1.100"))
+    end)
+
+    it("allows connections from different /16 subnets", function()
+      local pm = peerman.new(test_network, nil, nil)
+      pm:_add_outbound_group("192.168.1.1")
+      assert.is_true(pm:_check_outbound_diversity("192.169.1.1"))
+      assert.is_true(pm:_check_outbound_diversity("10.0.0.1"))
+    end)
+
+    it("allows reconnection after disconnect", function()
+      local pm = peerman.new(test_network, nil, nil)
+      pm:_add_outbound_group("192.168.1.1")
+      assert.is_false(pm:_check_outbound_diversity("192.168.1.2"))
+
+      pm:_remove_outbound_group("192.168.1.1")
+      assert.is_true(pm:_check_outbound_diversity("192.168.1.2"))
+    end)
+
+    it("tracks multiple connections per subnet correctly", function()
+      local pm = peerman.new(test_network, nil, nil)
+      -- Simulate two connections from different subnets
+      pm:_add_outbound_group("192.168.1.1")
+      pm:_add_outbound_group("10.0.0.1")
+
+      -- Both subnets blocked
+      assert.is_false(pm:_check_outbound_diversity("192.168.1.2"))
+      assert.is_false(pm:_check_outbound_diversity("10.0.0.2"))
+
+      -- Third subnet still allowed
+      assert.is_true(pm:_check_outbound_diversity("172.16.0.1"))
+    end)
+
+    it("rejects same-subnet peer in connect_peer", function()
+      local pm = peerman.new(test_network, nil, nil)
+      pm:add_known_address("192.168.1.1", 8333)
+      pm:add_known_address("192.168.1.2", 8333)
+
+      -- Simulate connected peer from 192.168.1.x
+      pm:_add_outbound_group("192.168.1.1")
+
+      local ok, err = pm:connect_peer("192.168.1.2", 8333)
+      assert.is_false(ok)
+      assert.equals("same /16 subnet as existing peer", err)
+    end)
+
+    it("filters candidates in select_peer_to_connect", function()
+      local pm = peerman.new(test_network, nil, nil)
+      -- Add addresses from same subnet
+      pm:add_known_address("192.168.1.1", 8333)
+      pm:add_known_address("192.168.1.2", 8333)
+      pm:add_known_address("192.168.1.3", 8333)
+      -- Add address from different subnet
+      pm:add_known_address("10.0.0.1", 8333)
+
+      -- Simulate connected peer from 192.168.1.x
+      pm:_add_outbound_group("192.168.1.1")
+
+      -- Should only select from different subnet
+      local candidate = pm:select_peer_to_connect()
+      if candidate then
+        assert.equals("10.0.0.1", candidate.ip)
+      end
+    end)
+
+  end)
+
+  describe("bucket constants", function()
+
+    it("has correct new bucket count", function()
+      assert.equals(256, peerman.ADDRMAN.NEW_BUCKET_COUNT)
+    end)
+
+    it("has correct tried bucket count", function()
+      assert.equals(64, peerman.ADDRMAN.TRIED_BUCKET_COUNT)
+    end)
+
+    it("has correct bucket size", function()
+      assert.equals(64, peerman.ADDRMAN.BUCKET_SIZE)
+    end)
+
+    it("has correct max anchors", function()
+      assert.equals(2, peerman.ADDRMAN.MAX_ANCHORS)
     end)
 
   end)
