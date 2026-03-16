@@ -21,6 +21,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] P2P message serialization (version, verack, ping, inv, headers, block, tx, addr)
 - [x] P2P networking (peer connections, version/verack handshake, ping/pong)
 - [x] Peer manager (connection pooling, DNS discovery, ban management, event loop)
+- [x] Eclipse attack mitigations (new/tried bucketed addrman, anchor connections, outbound diversity)
 - [x] Header synchronization (headers-first IBD, PoW validation, difficulty adjustment)
 - [x] Block download & IBD (parallel downloads, per-peer limits, adaptive stalling)
 - [x] UTXO set & chain state (CoinView cache, connect/disconnect blocks, maturity)
@@ -67,7 +68,7 @@ src/
   validation.lua - Block & transaction validation (PoW, merkle root, sighash, BIP68)
   p2p.lua        - P2P protocol message serialization
   peer.lua       - TCP peer connection management and handshake
-  peerman.lua    - Peer manager with connection pooling, discovery, bans
+  peerman.lua    - Peer manager with connection pooling, discovery, bans, eclipse mitigations
   sync.lua       - Header/block sync (headers-first IBD, block downloader)
   utxo.lua       - UTXO set, CoinView cache, chain state manager
   perf.lua       - Performance utilities (buffer pool, LRU cache, fast serialize)
