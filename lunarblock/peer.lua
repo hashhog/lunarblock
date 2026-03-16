@@ -84,6 +84,24 @@ M.STATE = {
 }
 
 --------------------------------------------------------------------------------
+-- Pre-Handshake Allowed Messages (Bitcoin Core: net_processing.cpp)
+--------------------------------------------------------------------------------
+
+-- Messages allowed before handshake completion (fSuccessfullyConnected)
+-- See Bitcoin Core net_processing.cpp: version, verack, and feature negotiation
+-- messages that must be sent between VERSION and VERACK.
+M.PRE_HANDSHAKE_ALLOWED = {
+  version = true,
+  verack = true,
+  wtxidrelay = true,   -- BIP 339: Must be sent before VERACK
+  sendaddrv2 = true,   -- BIP 155: Must be sent before VERACK
+  sendheaders = true,  -- BIP 130: Accepted pre-handshake
+}
+
+-- Handshake timeout in seconds (60 seconds per spec)
+M.HANDSHAKE_TIMEOUT = 60
+
+--------------------------------------------------------------------------------
 -- Peer Object
 --------------------------------------------------------------------------------
 
@@ -120,12 +138,20 @@ function M.new(ip, port, network, our_height)
   self.inbound = false
   self.send_headers = false       -- Peer requested headers announcements
   self.send_compact = false       -- Peer supports compact blocks
+  self.compact_version = 0        -- Compact block version (1 = txid, 2 = wtxid)
+  self.high_bandwidth = false     -- Peer wants high-bandwidth compact blocks
+  self.provides_compact = false   -- Peer will provide compact blocks if requested
   self.fee_filter = 0             -- Minimum fee rate (sat/KB) peer accepts
   self.message_handlers = {}      -- command -> handler function
   self.inflight_blocks = {}       -- block hashes we've requested
   self.inflight_txs = {}          -- tx hashes we've requested
   self.known_blocks = {}          -- block hashes peer has announced
   self.known_txs = {}             -- tx hashes peer has announced
+  self.handshake_complete = false -- True after version/verack exchange
+  self.version_received = false   -- True after receiving their version
+  self.handshake_start_time = 0   -- When connection started (for timeout)
+  self.wtxid_relay = false        -- BIP 339: peer wants wtxid for tx relay
+  self.send_addrv2 = false        -- BIP 155: peer supports addrv2
   return self
 end
 
@@ -149,6 +175,7 @@ function Peer:connect(timeout)
   self.socket:settimeout(0)  -- Non-blocking after connection
   self.state = M.STATE.CONNECTED
   self.last_recv = socket.gettime()
+  self.handshake_start_time = socket.gettime()  -- Start handshake timer
   return true
 end
 
@@ -161,8 +188,23 @@ function Peer:disconnect(reason)
   end
   self.state = M.STATE.DISCONNECTED
   self.recv_buffer = ""
+  self.handshake_complete = false
+  self.version_received = false
   -- reason is available for logging if needed
   self.disconnect_reason = reason
+end
+
+--- Increment misbehavior score and disconnect if threshold exceeded.
+-- @param score number: points to add to ban score
+-- @param reason string: reason for misbehavior
+-- @return boolean: true if peer was disconnected
+function Peer:misbehaving(score, reason)
+  self.ban_score = self.ban_score + score
+  if self.ban_score >= 100 then
+    self:disconnect("misbehaving: " .. (reason or "score exceeded"))
+    return true
+  end
+  return false
 end
 
 --------------------------------------------------------------------------------
@@ -278,12 +320,17 @@ end
 --- Handle a received version message.
 -- @param payload string: version message payload
 function Peer:handle_version(payload)
+  -- Ignore redundant version messages
+  if self.version_received then
+    return
+  end
   -- Deserialize version message
   local ver = p2p.deserialize_version(payload)
   self.version_info = ver
   self.services = ver.services
   self.start_height = ver.start_height
   self.user_agent = ver.user_agent
+  self.version_received = true
   -- Check minimum protocol version (70015 for segwit)
   if ver.version < 70015 then
     self:disconnect("protocol version too old: " .. ver.version)
@@ -300,8 +347,13 @@ end
 
 --- Handle a received verack message.
 function Peer:handle_verack()
+  -- Ignore redundant verack messages (Bitcoin Core: silently ignore)
+  if self.handshake_complete then
+    return
+  end
   if self.state == M.STATE.VERACK_SENT or self.state == M.STATE.VERSION_SENT then
     self.state = M.STATE.ESTABLISHED
+    self.handshake_complete = true
     -- Send post-handshake messages
     self:send_message("sendheaders", "")
     self:send_message("sendcmpct", p2p.serialize_sendcmpct(false, 2))
@@ -341,11 +393,41 @@ end
 -- Message Dispatch
 --------------------------------------------------------------------------------
 
+--- Check if a message is allowed before handshake completion.
+-- @param command string: message command
+-- @return boolean: true if allowed
+function Peer:is_pre_handshake_allowed(command)
+  return M.PRE_HANDSHAKE_ALLOWED[command] == true
+end
+
 --- Process all received messages.
+-- Enforces pre-handshake filtering per Bitcoin Core net_processing.cpp.
 -- @return table: list of processed messages
 function Peer:process_messages()
   local messages = self:recv_messages()
+  local processed = {}
   for _, msg in ipairs(messages) do
+    -- Pre-handshake filtering (Bitcoin Core: fSuccessfullyConnected check)
+    -- Before version: only version allowed
+    -- Before verack: only PRE_HANDSHAKE_ALLOWED messages
+    if not self.version_received then
+      -- Must receive version first (Bitcoin Core: pfrom.nVersion == 0 check)
+      if msg.command ~= "version" then
+        -- Increment misbehavior score and drop message
+        self:misbehaving(10, "non-version message before version: " .. msg.command)
+        goto continue
+      end
+    elseif not self.handshake_complete then
+      -- After version but before verack: only allow specific messages
+      if not self:is_pre_handshake_allowed(msg.command) then
+        -- Increment misbehavior score and drop message
+        self:misbehaving(10, "unsupported message prior to verack: " .. msg.command)
+        goto continue
+      end
+    end
+
+    processed[#processed + 1] = msg
+
     if msg.command == "version" then
       self:handle_version(msg.payload)
     elseif msg.command == "verack" then
@@ -358,9 +440,22 @@ function Peer:process_messages()
       self.send_headers = true
     elseif msg.command == "sendcmpct" then
       local sc = p2p.deserialize_sendcmpct(msg.payload)
+      -- Only accept compact blocks version 2 (wtxid-based, BIP152)
+      if sc.version == 2 then
+        self.provides_compact = true
+        self.high_bandwidth = sc.announce
+        self.compact_version = sc.version
+      end
       self.send_compact = sc.announce
     elseif msg.command == "feefilter" then
       self.fee_filter = p2p.deserialize_feefilter(msg.payload)
+    elseif msg.command == "wtxidrelay" then
+      -- BIP 339: wtxidrelay must be sent before verack
+      -- Just acknowledge, no payload
+      self.wtxid_relay = true
+    elseif msg.command == "sendaddrv2" then
+      -- BIP 155: sendaddrv2 must be sent before verack
+      self.send_addrv2 = true
     else
       -- Dispatch to registered handler
       local handler = self.message_handlers[msg.command]
@@ -368,8 +463,10 @@ function Peer:process_messages()
         handler(self, msg.payload)
       end
     end
+
+    ::continue::
   end
-  return messages
+  return processed
 end
 
 --------------------------------------------------------------------------------
@@ -379,9 +476,10 @@ end
 --- Check for timeouts and send keepalive pings.
 function Peer:check_timeouts()
   local now = socket.gettime()
-  -- Disconnect if no messages received for 90 seconds during handshake
-  if self.state ~= M.STATE.ESTABLISHED and self.state ~= M.STATE.DISCONNECTED then
-    if self.last_recv > 0 and now - self.last_recv > 90 then
+  -- Handshake timeout: 60 seconds from connection start
+  -- This is stricter than the old 90-second inactivity check
+  if not self.handshake_complete and self.state ~= M.STATE.DISCONNECTED then
+    if self.handshake_start_time > 0 and now - self.handshake_start_time > M.HANDSHAKE_TIMEOUT then
       self:disconnect("handshake timeout")
       return
     end
