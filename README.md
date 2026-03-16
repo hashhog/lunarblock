@@ -24,7 +24,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Eclipse attack mitigations (new/tried bucketed addrman, anchor connections, outbound diversity)
 - [x] Header synchronization (headers-first IBD, PoW validation, difficulty adjustment)
 - [x] Block download & IBD (parallel downloads, per-peer limits, adaptive stalling)
-- [x] UTXO set & chain state (CoinView cache, connect/disconnect blocks, maturity)
+- [x] UTXO set & chain state (CoinView cache with dirty/fresh flags, flush strategy, connect/disconnect blocks)
 - [x] Mempool (tx acceptance, fee validation, RBF, ancestor/descendant limits)
 - [x] Fee estimation (bucketed tracking, decay weighting, confirmation targets)
 - [x] Block template & mining (BIP22 getblocktemplate, coinbase creation, CPU miner)
@@ -33,6 +33,8 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] CLI & main event loop (ties all modules together, 20Hz tick rate)
 - [x] Testing & verification (busted framework, luacheck, Bitcoin Core test vectors)
 - [x] Performance optimization (buffer pools, LRU cache, JIT profiling, FFI best practices)
+- [x] BIP152 compact block relay (SipHash-2-4, short txids, high-bandwidth mode)
+- [x] BIP155 addrv2 messages (TorV3, I2P, CJDNS address support)
 
 ## Quick start
 
@@ -70,13 +72,14 @@ src/
   peer.lua       - TCP peer connection management and handshake
   peerman.lua    - Peer manager with connection pooling, discovery, bans, eclipse mitigations
   sync.lua       - Header/block sync (headers-first IBD, block downloader)
-  utxo.lua       - UTXO set, CoinView cache, chain state manager
+  utxo.lua       - UTXO set, CoinView cache with flush strategy, chain state manager
   perf.lua       - Performance utilities (buffer pool, LRU cache, fast serialize)
   mempool.lua    - Transaction memory pool (RBF, CPFP, fee policies)
   fee.lua        - Fee rate estimation (bucketed tracking, smart fee targets)
   mining.lua     - Block template construction and mining (BIP22, coinbase)
   rpc.lua        - JSON-RPC server (HTTP Basic auth, Bitcoin Core methods)
   wallet.lua     - HD wallet (BIP32/44/84, address generation, tx signing)
+  compact_block.lua - BIP152 compact block relay (short IDs, block reconstruction)
 spec/
   helpers.lua    - FFI test helpers, mock objects, Bitcoin test vectors
   *_spec.lua     - Test files (busted framework)
