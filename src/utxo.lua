@@ -47,6 +47,127 @@ function M.deserialize_utxo_entry(data)
 end
 
 --------------------------------------------------------------------------------
+-- Undo Data Types
+--------------------------------------------------------------------------------
+
+-- TxUndo: stores the UTXOs spent by a single transaction's inputs.
+-- Each entry is a UTXO entry (value, script_pubkey, height, is_coinbase).
+-- Format: { prev_outputs = { utxo_entry, ... } }
+function M.tx_undo(prev_outputs)
+  return {
+    prev_outputs = prev_outputs or {},  -- array of utxo_entry
+  }
+end
+
+-- BlockUndo: stores undo data for all non-coinbase transactions in a block.
+-- The coinbase has no inputs to undo, so vtxundo[1] corresponds to block.transactions[2].
+-- Format: { tx_undo = { TxUndo, ... } }
+function M.block_undo(tx_undo)
+  return {
+    tx_undo = tx_undo or {},  -- array of tx_undo (one per non-coinbase tx)
+  }
+end
+
+--------------------------------------------------------------------------------
+-- Undo Data Serialization
+--------------------------------------------------------------------------------
+
+-- Serialize a single undo entry (spent UTXO).
+-- Format matches Bitcoin Core's TxInUndoFormatter:
+--   varint(height * 2 + coinbase_flag) | [dummy byte if height > 0] | value | script
+function M.serialize_undo_entry(entry)
+  local w = serialize.buffer_writer()
+  -- Encode height and coinbase flag together: (height * 2) + coinbase_flag
+  local code = entry.height * 2 + (entry.is_coinbase and 1 or 0)
+  w.write_varint(code)
+  -- For compatibility with older undo format, write a dummy byte if height > 0
+  if entry.height > 0 then
+    w.write_u8(0)  -- version dummy
+  end
+  -- Write the TxOut data: value + script
+  w.write_i64le(entry.value)
+  w.write_varstr(entry.script_pubkey)
+  return w.result()
+end
+
+-- Deserialize a single undo entry (spent UTXO).
+function M.deserialize_undo_entry(reader)
+  if type(reader) == "string" then
+    reader = serialize.buffer_reader(reader)
+  end
+  local code = reader.read_varint()
+  local height = math.floor(code / 2)
+  local is_coinbase = (code % 2) == 1
+  -- Read and discard dummy byte if height > 0
+  if height > 0 then
+    reader.read_u8()  -- version dummy
+  end
+  local value = reader.read_i64le()
+  local script_pubkey = reader.read_varstr()
+  return M.utxo_entry(value, script_pubkey, height, is_coinbase)
+end
+
+-- Serialize TxUndo (undo data for one transaction).
+-- Format: varint(num_inputs) | undo_entry | undo_entry | ...
+function M.serialize_tx_undo(tx_undo)
+  local w = serialize.buffer_writer()
+  w.write_varint(#tx_undo.prev_outputs)
+  for _, entry in ipairs(tx_undo.prev_outputs) do
+    w.write_bytes(M.serialize_undo_entry(entry))
+  end
+  return w.result()
+end
+
+-- Deserialize TxUndo.
+function M.deserialize_tx_undo(reader)
+  if type(reader) == "string" then
+    reader = serialize.buffer_reader(reader)
+  end
+  local count = reader.read_varint()
+  local prev_outputs = {}
+  for i = 1, count do
+    prev_outputs[i] = M.deserialize_undo_entry(reader)
+  end
+  return M.tx_undo(prev_outputs)
+end
+
+-- Serialize BlockUndo (undo data for a full block).
+-- Format: varint(num_tx) | tx_undo | tx_undo | ... | checksum (32 bytes SHA256)
+function M.serialize_block_undo(block_undo)
+  local w = serialize.buffer_writer()
+  w.write_varint(#block_undo.tx_undo)
+  for _, txu in ipairs(block_undo.tx_undo) do
+    w.write_bytes(M.serialize_tx_undo(txu))
+  end
+  local data = w.result()
+  -- Append SHA256 checksum of the data
+  local checksum = crypto.sha256(data)
+  return data .. checksum
+end
+
+-- Deserialize BlockUndo.
+-- Verifies the SHA256 checksum at the end.
+function M.deserialize_block_undo(data)
+  if #data < 33 then  -- At minimum: 1 byte varint + 32 byte checksum
+    return nil, "undo data too short"
+  end
+  -- Split data and checksum
+  local payload = data:sub(1, -33)
+  local stored_checksum = data:sub(-32)
+  local computed_checksum = crypto.sha256(payload)
+  if stored_checksum ~= computed_checksum then
+    return nil, "undo data checksum mismatch"
+  end
+  local reader = serialize.buffer_reader(payload)
+  local count = reader.read_varint()
+  local tx_undo = {}
+  for i = 1, count do
+    tx_undo[i] = M.deserialize_tx_undo(reader)
+  end
+  return M.block_undo(tx_undo)
+end
+
+--------------------------------------------------------------------------------
 -- Outpoint Key
 --------------------------------------------------------------------------------
 
@@ -187,23 +308,65 @@ end
 -- Connect Block
 --------------------------------------------------------------------------------
 
-function ChainState:connect_block(block, height, block_hash)
-  -- 1. Validate all transactions have valid inputs (except coinbase)
+function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp)
+  -- Build undo data as we go - one TxUndo per non-coinbase transaction
+  local block_undo = M.block_undo({})
   local total_fees = 0
+
+  -- Check if BIP68 (CSV) is active at this height
+  local enforce_bip68 = height >= self.network.csv_height
 
   for tx_idx, tx in ipairs(block.transactions) do
     local txid = validation.compute_txid(tx)
     local is_coinbase = (tx_idx == 1)
 
     if not is_coinbase then
-      -- Validate each input
-      local input_total = 0
+      -- First pass: collect UTXOs and check BIP68 sequence locks
+      -- We need to look up all UTXOs before we can check sequence locks
+      local utxo_cache = {}  -- inp_idx -> utxo
 
       for inp_idx, inp in ipairs(tx.inputs) do
         -- Look up the UTXO being spent
         local utxo = self.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
         assert(utxo, string.format("Missing UTXO for input %d of tx %s",
           inp_idx, types.hash256_hex(txid)))
+        utxo_cache[inp_idx] = utxo
+      end
+
+      -- BIP68: Check relative lock-times (sequence locks)
+      -- Only enforce if BIP68 is active and we have the required MTP information
+      if enforce_bip68 and tx.version >= 2 and prev_block_mtp and get_block_mtp then
+        -- Helper to get UTXO height for each input
+        local function get_utxo_height(inp)
+          for idx, input in ipairs(tx.inputs) do
+            if input == inp then
+              return utxo_cache[idx].height
+            end
+          end
+          return nil
+        end
+
+        -- Calculate and check sequence locks
+        local min_height, min_time = validation.calculate_sequence_locks(
+          tx, height, get_utxo_height, get_block_mtp, enforce_bip68
+        )
+
+        assert(validation.check_sequence_locks(min_height, min_time, height, prev_block_mtp),
+          string.format("BIP68 sequence locks not satisfied for tx %s (min_height=%d >= %d or min_time=%d >= %d)",
+            types.hash256_hex(txid), min_height, height, min_time, prev_block_mtp))
+      end
+
+      -- Second pass: validate each input and collect undo data
+      local input_total = 0
+      local tx_undo = M.tx_undo({})
+
+      for inp_idx, inp in ipairs(tx.inputs) do
+        local utxo = utxo_cache[inp_idx]
+
+        -- Save the UTXO for undo data BEFORE spending
+        tx_undo.prev_outputs[inp_idx] = M.utxo_entry(
+          utxo.value, utxo.script_pubkey, utxo.height, utxo.is_coinbase
+        )
 
         -- Coinbase maturity check
         if utxo.is_coinbase then
@@ -220,6 +383,7 @@ function ChainState:connect_block(block, height, block_hash)
           verify_witness = height >= self.network.segwit_height,
           verify_nulldummy = height >= self.network.segwit_height,
           verify_nullfail = height >= self.network.segwit_height,
+          verify_witness_pubkeytype = height >= self.network.segwit_height,
         }
 
         local checker = validation.make_sig_checker(
@@ -243,12 +407,13 @@ function ChainState:connect_block(block, height, block_hash)
             local segwit_flags = {}
             for k, v in pairs(flags) do segwit_flags[k] = v end
             segwit_flags.is_segwit = true
+            segwit_flags.is_witness_v0 = true  -- Enable WITNESS_PUBKEYTYPE check
             local segwit_checker = validation.make_sig_checker(
               tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
             )
-            local result = script.execute_script(synthetic_script, stack, segwit_flags, segwit_checker)
-            assert(#result > 0 and script.cast_to_bool(result[#result]),
-              "P2WPKH script verification failed")
+            -- BIP141: Use execute_witness_script which enforces cleanstack
+            local ok, err = script.execute_witness_script(synthetic_script, stack, segwit_flags, segwit_checker)
+            assert(ok, err or "P2WPKH script verification failed")
           elseif script_type == "p2wsh" then
             -- P2WSH: last witness item is the script
             local witness_script = witness_stack[#witness_stack]
@@ -262,13 +427,14 @@ function ChainState:connect_block(block, height, block_hash)
             local segwit_flags = {}
             for k, v in pairs(flags) do segwit_flags[k] = v end
             segwit_flags.is_segwit = true
+            segwit_flags.is_witness_v0 = true  -- Enable WITNESS_PUBKEYTYPE check
             segwit_flags.witness_script = witness_script
             local segwit_checker = validation.make_sig_checker(
               tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
             )
-            local result = script.execute_script(witness_script, stack, segwit_flags, segwit_checker)
-            assert(#result > 0 and script.cast_to_bool(result[#result]),
-              "P2WSH script verification failed")
+            -- BIP141: Use execute_witness_script which enforces cleanstack
+            local ok, err = script.execute_witness_script(witness_script, stack, segwit_flags, segwit_checker)
+            assert(ok, err or "P2WSH script verification failed")
           end
         else
           -- Legacy or P2SH
@@ -281,6 +447,10 @@ function ChainState:connect_block(block, height, block_hash)
         -- Spend the UTXO
         self.coin_view:spend(inp.prev_out.hash, inp.prev_out.index)
       end
+
+      -- Store this transaction's undo data
+      -- block_undo.tx_undo[1] corresponds to block.transactions[2] (first non-coinbase)
+      block_undo.tx_undo[#block_undo.tx_undo + 1] = tx_undo
 
       -- Check output total <= input total
       local output_total = 0
@@ -313,6 +483,12 @@ function ChainState:connect_block(block, height, block_hash)
     string.format("Coinbase value too high: %d > %d + %d",
       coinbase_value, subsidy, total_fees))
 
+  -- Serialize and store undo data (only if there are non-coinbase transactions)
+  if #block_undo.tx_undo > 0 then
+    local undo_data = M.serialize_block_undo(block_undo)
+    self.storage.put_undo(block_hash, undo_data)
+  end
+
   -- Flush UTXO changes to database
   self.coin_view:flush()
 
@@ -328,29 +504,51 @@ end
 -- Disconnect Block (for chain reorganization)
 --------------------------------------------------------------------------------
 
-function ChainState:disconnect_block(block, height, block_hash, undo_data)
+--- Disconnect a block from the chain tip, restoring the UTXO set.
+-- @param block The block to disconnect
+-- @param height The height of the block
+-- @param block_hash The hash of the block being disconnected
+-- @param prev_hash The hash of the previous block (becomes new tip)
+-- @return true on success, nil and error message on failure
+function ChainState:disconnect_block(block, height, block_hash, prev_hash)
+  -- Load undo data from storage
+  local undo_data_raw = self.storage.get_undo(block_hash)
+  local block_undo = nil
+
+  -- Only non-genesis blocks with spending txs have undo data
+  if undo_data_raw then
+    local err
+    block_undo, err = M.deserialize_block_undo(undo_data_raw)
+    if not block_undo then
+      return nil, "failed to deserialize undo data: " .. (err or "unknown")
+    end
+  end
+
   -- Process transactions in reverse order
+  -- Note: block_undo.tx_undo[i] corresponds to block.transactions[i+1]
+  -- because coinbase (tx index 1) has no undo data
   for tx_idx = #block.transactions, 1, -1 do
     local tx = block.transactions[tx_idx]
     local txid = validation.compute_txid(tx)
     local is_coinbase = (tx_idx == 1)
 
-    -- Remove outputs from UTXO set
+    -- Remove outputs from UTXO set (they were added during connect)
     for vout_idx = 1, #tx.outputs do
       local out = tx.outputs[vout_idx]
-      -- Only spend if we added it (not OP_RETURN)
+      -- Only remove if we added it (not OP_RETURN)
       if #out.script_pubkey == 0 or out.script_pubkey:byte(1) ~= 0x6a then
         self.coin_view:spend(txid, vout_idx - 1)
       end
     end
 
-    -- Restore spent inputs (requires undo data)
-    if not is_coinbase and undo_data then
-      -- undo_data should contain the spent UTXOs for this transaction
-      local tx_undo = undo_data[tx_idx]
+    -- Restore spent inputs using undo data
+    if not is_coinbase and block_undo then
+      -- tx_idx 2 -> block_undo.tx_undo[1], tx_idx 3 -> block_undo.tx_undo[2], etc.
+      local undo_idx = tx_idx - 1
+      local tx_undo = block_undo.tx_undo[undo_idx]
       if tx_undo then
         for inp_idx, inp in ipairs(tx.inputs) do
-          local spent_utxo = tx_undo[inp_idx]
+          local spent_utxo = tx_undo.prev_outputs[inp_idx]
           if spent_utxo then
             self.coin_view:add(inp.prev_out.hash, inp.prev_out.index, spent_utxo)
           end
@@ -359,10 +557,22 @@ function ChainState:disconnect_block(block, height, block_hash, undo_data)
     end
   end
 
+  -- Flush UTXO changes to database
   self.coin_view:flush()
+
+  -- Remove undo data for this block
+  if undo_data_raw then
+    self.storage.delete_undo(block_hash)
+  end
+
+  -- Update chain tip to the previous block
   self.tip_height = height - 1
-  -- tip_hash would need to be set to the previous block's hash
-  -- (caller should provide this)
+  if prev_hash then
+    self.tip_hash = prev_hash
+    self.storage.set_chain_tip(prev_hash, height - 1, true)
+  end
+
+  return true
 end
 
 --------------------------------------------------------------------------------
