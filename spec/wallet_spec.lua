@@ -39,6 +39,7 @@ describe("wallet", function()
   local types
   local consensus
   local address
+  local fee
 
   setup(function()
     setup_loader()
@@ -47,6 +48,7 @@ describe("wallet", function()
     types = require("lunarblock.types")
     consensus = require("lunarblock.consensus")
     address = require("lunarblock.address")
+    fee = require("lunarblock.fee")
   end)
 
   describe("master_key_from_seed", function()
@@ -508,6 +510,1281 @@ describe("wallet", function()
       local addr = w.addresses[1]
       -- Regtest P2WPKH addresses start with bcrt1q
       assert.equals("bcrt", addr:sub(1, 4))
+    end)
+  end)
+
+  describe("AES encryption", function()
+    it("encrypts and decrypts data correctly", function()
+      local plaintext = "Hello, Bitcoin wallet!"
+      local salt = wallet.random_bytes(wallet.CRYPTO_SALT_SIZE)
+      local key, iv = wallet.derive_key("test_passphrase", salt)
+
+      local ciphertext = wallet.aes_encrypt(plaintext, key, iv)
+      assert.is_not_nil(ciphertext)
+      assert.not_equals(plaintext, ciphertext)
+
+      local decrypted = wallet.aes_decrypt(ciphertext, key, iv)
+      assert.equals(plaintext, decrypted)
+    end)
+
+    it("fails decryption with wrong passphrase", function()
+      local plaintext = "Secret data"
+      local salt = wallet.random_bytes(wallet.CRYPTO_SALT_SIZE)
+      local key1, iv1 = wallet.derive_key("correct_passphrase", salt)
+      local key2, iv2 = wallet.derive_key("wrong_passphrase", salt)
+
+      local ciphertext = wallet.aes_encrypt(plaintext, key1, iv1)
+      local decrypted, err = wallet.aes_decrypt(ciphertext, key2, iv2)
+      assert.is_nil(decrypted)
+      assert.is_not_nil(err)
+    end)
+
+    it("generates random bytes", function()
+      local bytes1 = wallet.random_bytes(32)
+      local bytes2 = wallet.random_bytes(32)
+
+      assert.equals(32, #bytes1)
+      assert.equals(32, #bytes2)
+      assert.not_equals(bytes1, bytes2)
+    end)
+  end)
+
+  describe("Wallet encryption", function()
+    it("encrypts wallet with passphrase", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      w:encrypt("my_passphrase")
+
+      assert.is_true(w.is_encrypted)
+      assert.is_false(w.is_locked)
+      assert.is_not_nil(w.encrypted_master_key)
+      assert.is_not_nil(w.encryption_salt)
+    end)
+
+    it("locks and unlocks wallet", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+      local original_key = w.master_key.key
+
+      w:encrypt("my_passphrase")
+      w:lock()
+
+      assert.is_true(w.is_locked)
+      assert.is_nil(w.master_key)
+
+      local ok = w:unlock("my_passphrase")
+      assert.is_true(ok)
+      assert.is_false(w.is_locked)
+      assert.equals(original_key, w.master_key.key)
+    end)
+
+    it("fails unlock with wrong passphrase", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      w:encrypt("correct_passphrase")
+      w:lock()
+
+      local ok, err = w:unlock("wrong_passphrase")
+      assert.is_false(ok)
+      assert.is_not_nil(err)
+      assert.is_true(w.is_locked)
+    end)
+
+    it("changes passphrase", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      w:encrypt("old_passphrase")
+      local ok = w:change_passphrase("old_passphrase", "new_passphrase")
+      assert.is_true(ok)
+
+      w:lock()
+      local unlock_ok = w:unlock("new_passphrase")
+      assert.is_true(unlock_ok)
+    end)
+  end)
+
+  describe("Coin selection - Branch and Bound", function()
+    it("finds exact match when possible", function()
+      local utxos = {
+        {key = "a", utxo = {value = 10000}},
+        {key = "b", utxo = {value = 20000}},
+        {key = "c", utxo = {value = 50000}},
+      }
+
+      -- Target 30000, should select 10000 + 20000
+      local selected = wallet.select_coins_bnb(utxos, 30000, 1)
+      if selected then
+        local total = 0
+        for _, s in ipairs(selected) do
+          total = total + s.utxo.value
+        end
+        -- BnB should find a solution close to target
+        assert.is_true(total >= 30000)
+      end
+    end)
+
+    it("returns nil when insufficient funds", function()
+      local utxos = {
+        {key = "a", utxo = {value = 10000}},
+        {key = "b", utxo = {value = 20000}},
+      }
+
+      local selected = wallet.select_coins_bnb(utxos, 100000, 1)
+      assert.is_nil(selected)
+    end)
+  end)
+
+  describe("Coin selection - Knapsack", function()
+    it("selects coins for target", function()
+      local utxos = {
+        {key = "a", utxo = {value = 10000}},
+        {key = "b", utxo = {value = 20000}},
+        {key = "c", utxo = {value = 50000}},
+        {key = "d", utxo = {value = 100000}},
+      }
+
+      local selected = wallet.select_coins_knapsack(utxos, 25000)
+      assert.is_not_nil(selected)
+
+      local total = 0
+      for _, s in ipairs(selected) do
+        total = total + s.utxo.value
+      end
+      assert.is_true(total >= 25000)
+    end)
+
+    it("prefers single UTXO close to target", function()
+      local utxos = {
+        {key = "a", utxo = {value = 10000}},
+        {key = "b", utxo = {value = 50000}},
+        {key = "c", utxo = {value = 100000}},
+      }
+
+      local selected = wallet.select_coins_knapsack(utxos, 45000)
+      assert.is_not_nil(selected)
+      -- Should select 50000 (close to target)
+      assert.equals(1, #selected)
+      assert.equals(50000, selected[1].utxo.value)
+    end)
+  end)
+
+  describe("Coin selection - Combined", function()
+    it("returns algorithm used", function()
+      local utxos = {
+        {key = "a", utxo = {value = 100000}},
+        {key = "b", utxo = {value = 200000}},
+      }
+
+      local selected, algo = wallet.select_coins(utxos, 50000, 1)
+      assert.is_not_nil(selected)
+      assert.is_not_nil(algo)
+      assert.is_true(algo == "bnb" or algo == "knapsack" or algo == "random")
+    end)
+  end)
+
+  describe("Balance tracking", function()
+    it("tracks confirmed balance", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      -- Manually set up UTXOs
+      local addr = w.addresses[1]
+      local key_info = w.keys[addr]
+      local pubkey_hash = crypto.hash160(key_info.pubkey)
+
+      local fake_txid = types.hash256(string.rep("\x01", 32))
+      local utxo_key = fake_txid.bytes .. "\x00\x00\x00\x00"
+
+      w.utxos[utxo_key] = {
+        value = 100000,
+        script_pubkey = "\x00\x14" .. pubkey_hash,
+        address = addr,
+        txid = fake_txid,
+        vout = 0,
+        height = 100,
+        is_coinbase = false,
+        confirmations = 10,
+      }
+      w.confirmed_balance = 100000
+
+      assert.equals(100000, w:get_balance())
+      local details = w:get_balance_details()
+      assert.equals(100000, details.confirmed)
+      assert.equals(100000, details.spendable)
+    end)
+
+    it("handles coinbase maturity", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      local addr = w.addresses[1]
+      local key_info = w.keys[addr]
+      local pubkey_hash = crypto.hash160(key_info.pubkey)
+
+      local fake_txid = types.hash256(string.rep("\x02", 32))
+      local utxo_key = fake_txid.bytes .. "\x00\x00\x00\x00"
+
+      -- Coinbase with insufficient confirmations
+      w.utxos[utxo_key] = {
+        value = 5000000000,  -- 50 BTC
+        script_pubkey = "\x00\x14" .. pubkey_hash,
+        address = addr,
+        txid = fake_txid,
+        vout = 0,
+        height = 100,
+        is_coinbase = true,
+        confirmations = 50,  -- Less than 100
+      }
+      w.confirmed_balance = 5000000000
+
+      local details = w:get_balance_details()
+      assert.equals(5000000000, details.confirmed)
+      assert.equals(0, details.spendable)  -- Not spendable yet
+
+      -- Now with sufficient confirmations
+      w.utxos[utxo_key].confirmations = 100
+      details = w:get_balance_details()
+      assert.equals(5000000000, details.spendable)
+    end)
+  end)
+
+  describe("Fee estimation integration", function()
+    it("uses fee estimator when available", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      local estimator = fee.new(144)
+      w:set_fee_estimator(estimator)
+
+      local rate = w:estimate_fee_rate(6)
+      assert.is_true(rate >= 1)  -- At least 1 sat/vB
+    end)
+
+    it("falls back to default fee rate", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      -- No fee estimator set
+      local rate = w:estimate_fee_rate(6)
+      assert.equals(1, rate)  -- Default 1 sat/vB
+    end)
+  end)
+
+  describe("Encrypted wallet persistence", function()
+    it("saves and loads encrypted wallet", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w1 = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+      local original_key = w1.master_key.key
+
+      w1:encrypt("test_passphrase")
+      w1:get_new_address()
+
+      local test_path = "/tmp/test_encrypted_wallet_" .. os.time() .. ".dat"
+      local ok = w1:save(test_path)
+      assert.is_true(ok)
+
+      -- Load without passphrase (should be locked)
+      local w2 = wallet.load(test_path, consensus.networks.mainnet, nil)
+      assert.is_not_nil(w2)
+      assert.is_true(w2.is_encrypted)
+      assert.is_true(w2.is_locked)
+
+      -- Unlock with correct passphrase
+      local unlock_ok = w2:unlock("test_passphrase")
+      assert.is_true(unlock_ok)
+      assert.equals(original_key, w2.master_key.key)
+
+      -- Load with passphrase (should be unlocked)
+      local w3 = wallet.load(test_path, consensus.networks.mainnet, nil, "test_passphrase")
+      assert.is_not_nil(w3)
+      assert.is_false(w3.is_locked)
+      assert.equals(original_key, w3.master_key.key)
+
+      -- Clean up
+      os.remove(test_path)
+    end)
+  end)
+
+  describe("Transaction creation with options", function()
+    it("creates transaction with fee rate option", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      -- Set up UTXO
+      local addr = w.addresses[1]
+      local key_info = w.keys[addr]
+      local pubkey_hash = crypto.hash160(key_info.pubkey)
+      local fake_txid = types.hash256(string.rep("\x01", 32))
+      local utxo_key = fake_txid.bytes .. "\x00\x00\x00\x00"
+
+      w.utxos[utxo_key] = {
+        value = 100000,
+        script_pubkey = "\x00\x14" .. pubkey_hash,
+        address = addr,
+        txid = fake_txid,
+        vout = 0,
+        height = 100,
+        is_coinbase = false,
+        confirmations = 10,
+      }
+      w.confirmed_balance = 100000
+
+      local recipient_addr = w:get_new_address()
+      local tx, result, algo = w:create_transaction({
+        {address = recipient_addr, amount = 50000}
+      }, {fee_rate = 5})
+
+      assert.is_not_nil(tx)
+      assert.is_true(result > 0)  -- Fee should be positive
+      assert.is_not_nil(algo)
+    end)
+
+    it("fails when wallet is locked", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      w:encrypt("passphrase")
+      w:lock()
+
+      local tx, err = w:create_transaction({
+        {address = w.addresses[1], amount = 50000}
+      }, {fee_rate = 1})
+
+      assert.is_nil(tx)
+      assert.equals("Wallet is locked", err)
+    end)
+  end)
+
+  describe("Wallet info", function()
+    it("returns wallet info", function()
+      local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
+
+      local info = w:get_info()
+      assert.is_false(info.is_encrypted)
+      assert.is_false(info.is_locked)
+      assert.equals("mainnet", info.network)
+      assert.equals("p2wpkh", info.address_type)
+      assert.is_true(info.address_count > 0)
+    end)
+  end)
+end)
+
+--------------------------------------------------------------------------------
+-- PSBT Tests (BIP174)
+--------------------------------------------------------------------------------
+
+describe("psbt", function()
+  local psbt_mod
+  local types
+  local serialize
+  local crypto
+  local validation
+  local consensus
+  local script
+  local wallet
+
+  setup(function()
+    local loaders = package.loaders or package.searchers
+    table.insert(loaders, 2, function(module)
+      local name = module:match("^lunarblock%.(.+)")
+      if name then
+        local filename = "src/" .. name .. ".lua"
+        local f = io.open(filename)
+        if f then
+          f:close()
+          return function()
+            return dofile(filename)
+          end
+        end
+      end
+      return nil, "not found"
+    end)
+    psbt_mod = require("lunarblock.psbt")
+    types = require("lunarblock.types")
+    serialize = require("lunarblock.serialize")
+    crypto = require("lunarblock.crypto")
+    validation = require("lunarblock.validation")
+    consensus = require("lunarblock.consensus")
+    script = require("lunarblock.script")
+    wallet = require("lunarblock.wallet")
+  end)
+
+  describe("constants", function()
+    it("has correct magic bytes", function()
+      assert.equals("psbt\xff", psbt_mod.MAGIC)
+    end)
+
+    it("has correct key type constants", function()
+      assert.equals(0x00, psbt_mod.GLOBAL_UNSIGNED_TX)
+      assert.equals(0x01, psbt_mod.GLOBAL_XPUB)
+      assert.equals(0x02, psbt_mod.IN_PARTIAL_SIG)
+      assert.equals(0x00, psbt_mod.SEPARATOR)
+    end)
+  end)
+
+  describe("base64 encoding", function()
+    it("encodes and decodes correctly", function()
+      local data = "Hello, PSBT!"
+      local encoded = psbt_mod.base64_encode(data)
+      local decoded = psbt_mod.base64_decode(encoded)
+      assert.equals(data, decoded)
+    end)
+
+    it("handles binary data", function()
+      local data = "\x00\x01\x02\xff\xfe"
+      local encoded = psbt_mod.base64_encode(data)
+      local decoded = psbt_mod.base64_decode(encoded)
+      assert.equals(data, decoded)
+    end)
+
+    it("encodes to valid base64", function()
+      local data = "test"
+      local encoded = psbt_mod.base64_encode(data)
+      assert.equals("dGVzdA==", encoded)
+    end)
+  end)
+
+  describe("PSBT creation", function()
+    it("creates PSBT from unsigned transaction", function()
+      -- Create a simple unsigned transaction
+      local txid = types.hash256(string.rep("\x01", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x02", 20)),  -- P2WPKH
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+
+      local psbt = psbt_mod.new(tx)
+
+      assert.is_not_nil(psbt)
+      assert.equals(0, psbt.version)
+      assert.is_not_nil(psbt.tx)
+      assert.equals(1, #psbt.inputs)
+      assert.equals(1, #psbt.outputs)
+    end)
+
+    it("rejects signed transactions", function()
+      local txid = types.hash256(string.rep("\x01", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "\x01\x02\x03", 0xFFFFFFFF),  -- Has scriptSig
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x02", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+
+      assert.has_error(function()
+        psbt_mod.new(tx)
+      end, "Transaction must be unsigned for PSBT creation")
+    end)
+  end)
+
+  describe("PSBT serialization", function()
+    it("serializes and deserializes round-trip", function()
+      -- Create PSBT
+      local txid = types.hash256(string.rep("\x01", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x02", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+      local psbt = psbt_mod.new(tx)
+
+      -- Serialize
+      local data = psbt_mod.serialize(psbt)
+      assert.is_true(#data > 0)
+      assert.equals("psbt\xff", data:sub(1, 5))
+
+      -- Deserialize
+      local psbt2 = psbt_mod.deserialize(data)
+      assert.is_not_nil(psbt2)
+      assert.equals(1, #psbt2.inputs)
+      assert.equals(1, #psbt2.outputs)
+
+      -- Compare transactions
+      local txid1 = types.hash256_hex(validation.compute_txid(psbt.tx))
+      local txid2 = types.hash256_hex(validation.compute_txid(psbt2.tx))
+      assert.equals(txid1, txid2)
+    end)
+
+    it("base64 round-trip works", function()
+      local txid = types.hash256(string.rep("\x03", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 1), "", 0xFFFFFFFF),
+      }
+      local outputs = {
+        types.txout(100000, "\x76\xa9\x14" .. string.rep("\x04", 20) .. "\x88\xac"),  -- P2PKH
+      }
+      local tx = types.transaction(2, inputs, outputs, 500000)
+      local psbt = psbt_mod.new(tx)
+
+      local b64 = psbt_mod.to_base64(psbt)
+      local psbt2 = psbt_mod.from_base64(b64)
+
+      assert.equals(tx.locktime, psbt2.tx.locktime)
+      assert.equals(tx.version, psbt2.tx.version)
+    end)
+  end)
+
+  describe("PSBT update operations", function()
+    local psbt, txid
+
+    before_each(function()
+      txid = types.hash256(string.rep("\x05", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x06", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+      psbt = psbt_mod.new(tx)
+    end)
+
+    it("adds witness UTXO", function()
+      psbt_mod.update_input_utxo(psbt, 0, {
+        value = 100000,
+        script_pubkey = "\x00\x14" .. string.rep("\x07", 20),
+      }, true)
+
+      assert.is_not_nil(psbt.inputs[1].witness_utxo)
+      assert.equals(100000, psbt.inputs[1].witness_utxo.value)
+    end)
+
+    it("adds redeem script", function()
+      local redeem = "\x52\x21" .. string.rep("\x08", 33) .. "\x21" .. string.rep("\x09", 33) .. "\x52\xae"
+      psbt_mod.update_input_redeem_script(psbt, 0, redeem)
+
+      assert.equals(redeem, psbt.inputs[1].redeem_script)
+    end)
+
+    it("adds BIP32 derivation", function()
+      local pubkey = string.rep("\x0a", 33)
+      local fingerprint = "\x0b\x0c\x0d\x0e"
+      local path = {0x8000002c, 0x80000000, 0x80000000, 0, 0}
+
+      psbt_mod.update_input_bip32(psbt, 0, pubkey, fingerprint, path)
+
+      local pk_hex = psbt_mod.hex_encode(pubkey)
+      assert.is_not_nil(psbt.inputs[1].bip32_derivations[pk_hex])
+      assert.equals(fingerprint, psbt.inputs[1].bip32_derivations[pk_hex].fingerprint)
+      assert.equals(5, #psbt.inputs[1].bip32_derivations[pk_hex].path)
+    end)
+  end)
+
+  describe("PSBT signing", function()
+    it("signs P2WPKH input", function()
+      -- Create keypair
+      local privkey = string.rep("\x11", 32)
+      local pubkey = crypto.pubkey_from_privkey(privkey, true)
+      local pkh = crypto.hash160(pubkey)
+      local script_pubkey = "\x00\x14" .. pkh  -- P2WPKH
+
+      -- Create PSBT
+      local txid = types.hash256(string.rep("\x12", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x13", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+      local psbt = psbt_mod.new(tx)
+
+      -- Add witness UTXO
+      psbt_mod.update_input_utxo(psbt, 0, {
+        value = 100000,
+        script_pubkey = script_pubkey,
+      }, true)
+
+      -- Sign
+      local signed = psbt_mod.sign_input(psbt, 0, privkey, pubkey)
+      assert.is_true(signed)
+
+      -- Check partial sig exists
+      local pk_hex = psbt_mod.hex_encode(pubkey)
+      assert.is_not_nil(psbt.inputs[1].partial_sigs[pk_hex])
+    end)
+  end)
+
+  describe("PSBT combining", function()
+    it("combines two PSBTs with different signatures", function()
+      -- Create base transaction
+      local txid = types.hash256(string.rep("\x14", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x15", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+
+      -- Create two PSBTs
+      local psbt1 = psbt_mod.new(tx)
+      local psbt2 = psbt_mod.deserialize(psbt_mod.serialize(psbt1))  -- Deep copy
+
+      -- Add different signatures to each
+      local pk1 = string.rep("\x16", 33)
+      local pk2 = string.rep("\x17", 33)
+      local sig1 = string.rep("\x18", 72) .. "\x01"
+      local sig2 = string.rep("\x19", 72) .. "\x01"
+
+      psbt1.inputs[1].partial_sigs[psbt_mod.hex_encode(pk1)] = sig1
+      psbt2.inputs[1].partial_sigs[psbt_mod.hex_encode(pk2)] = sig2
+
+      -- Combine
+      local combined = psbt_mod.combine({psbt1, psbt2})
+
+      -- Should have both signatures
+      assert.is_not_nil(combined.inputs[1].partial_sigs[psbt_mod.hex_encode(pk1)])
+      assert.is_not_nil(combined.inputs[1].partial_sigs[psbt_mod.hex_encode(pk2)])
+    end)
+
+    it("rejects PSBTs with different transactions", function()
+      local txid1 = types.hash256(string.rep("\x1a", 32))
+      local txid2 = types.hash256(string.rep("\x1b", 32))
+
+      local tx1 = types.transaction(2, {
+        types.txin(types.outpoint(txid1, 0), "", 0xFFFFFFFF),
+      }, {types.txout(50000, "\x00\x14" .. string.rep("\x1c", 20))}, 0)
+
+      local tx2 = types.transaction(2, {
+        types.txin(types.outpoint(txid2, 0), "", 0xFFFFFFFF),
+      }, {types.txout(50000, "\x00\x14" .. string.rep("\x1d", 20))}, 0)
+
+      local psbt1 = psbt_mod.new(tx1)
+      local psbt2 = psbt_mod.new(tx2)
+
+      assert.has_error(function()
+        psbt_mod.combine({psbt1, psbt2})
+      end)
+    end)
+  end)
+
+  describe("PSBT finalization", function()
+    it("finalizes P2WPKH input", function()
+      -- Create keypair
+      local privkey = string.rep("\x1e", 32)
+      local pubkey = crypto.pubkey_from_privkey(privkey, true)
+      local pkh = crypto.hash160(pubkey)
+      local script_pubkey = "\x00\x14" .. pkh
+
+      -- Create PSBT
+      local txid = types.hash256(string.rep("\x1f", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x20", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+      local psbt = psbt_mod.new(tx)
+
+      -- Add UTXO and sign
+      psbt_mod.update_input_utxo(psbt, 0, {
+        value = 100000,
+        script_pubkey = script_pubkey,
+      }, true)
+      psbt_mod.sign_input(psbt, 0, privkey, pubkey)
+
+      -- Finalize
+      local ok = psbt_mod.finalize_input(psbt, 0)
+      assert.is_true(ok)
+
+      -- Check final witness
+      assert.is_not_nil(psbt.inputs[1].final_script_witness)
+      assert.equals(2, #psbt.inputs[1].final_script_witness)  -- [sig, pubkey]
+    end)
+  end)
+
+  describe("PSBT extraction", function()
+    it("extracts signed transaction from finalized PSBT", function()
+      -- Create keypair
+      local privkey = string.rep("\x21", 32)
+      local pubkey = crypto.pubkey_from_privkey(privkey, true)
+      local pkh = crypto.hash160(pubkey)
+      local script_pubkey = "\x00\x14" .. pkh
+
+      -- Create PSBT
+      local txid = types.hash256(string.rep("\x22", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x23", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+      local psbt = psbt_mod.new(tx)
+
+      -- Update, sign, finalize
+      psbt_mod.update_input_utxo(psbt, 0, {
+        value = 100000,
+        script_pubkey = script_pubkey,
+      }, true)
+      psbt_mod.sign_input(psbt, 0, privkey, pubkey)
+      psbt_mod.finalize(psbt)
+
+      -- Extract
+      local signed_tx = psbt_mod.extract(psbt)
+
+      assert.is_not_nil(signed_tx)
+      assert.is_true(signed_tx.segwit)
+      assert.equals(2, #signed_tx.inputs[1].witness)
+
+      -- Verify signature structure
+      local sig = signed_tx.inputs[1].witness[1]
+      assert.is_true(#sig >= 71 and #sig <= 73)
+      assert.equals(0x01, sig:byte(#sig))  -- SIGHASH_ALL
+    end)
+
+    it("fails extraction on unfinalized PSBT", function()
+      local txid = types.hash256(string.rep("\x24", 32))
+      local tx = types.transaction(2, {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFF),
+      }, {types.txout(50000, "\x00\x14" .. string.rep("\x25", 20))}, 0)
+      local psbt = psbt_mod.new(tx)
+
+      assert.has_error(function()
+        psbt_mod.extract(psbt)
+      end)
+    end)
+  end)
+
+  describe("PSBT decode", function()
+    it("decodes PSBT to human-readable format", function()
+      local txid = types.hash256(string.rep("\x26", 32))
+      local inputs = {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x27", 20)),
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+      local psbt = psbt_mod.new(tx)
+
+      -- Add some data
+      psbt_mod.update_input_utxo(psbt, 0, {
+        value = 100000,
+        script_pubkey = "\x00\x14" .. string.rep("\x28", 20),
+      }, true)
+
+      local decoded = psbt_mod.decode(psbt)
+
+      assert.is_not_nil(decoded.tx)
+      assert.is_not_nil(decoded.tx.txid)
+      assert.equals(2, decoded.tx.version)
+      assert.equals(1, #decoded.inputs)
+      assert.equals(1, #decoded.outputs)
+      assert.is_true(decoded.inputs[1].has_utxo)
+
+      -- Fee should be calculable
+      assert.equals((100000 - 50000) / consensus.COIN, decoded.fee)
+    end)
+  end)
+
+  describe("PSBT status functions", function()
+    it("checks if input is signed", function()
+      local txid = types.hash256(string.rep("\x29", 32))
+      local tx = types.transaction(2, {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFF),
+      }, {types.txout(50000, "\x00\x14" .. string.rep("\x2a", 20))}, 0)
+      local psbt = psbt_mod.new(tx)
+
+      assert.is_false(psbt_mod.input_is_signed(psbt.inputs[1]))
+
+      psbt.inputs[1].final_script_witness = {"sig", "pubkey"}
+      assert.is_true(psbt_mod.input_is_signed(psbt.inputs[1]))
+    end)
+
+    it("checks if PSBT is complete", function()
+      local txid = types.hash256(string.rep("\x2b", 32))
+      local tx = types.transaction(2, {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFF),
+      }, {types.txout(50000, "\x00\x14" .. string.rep("\x2c", 20))}, 0)
+      local psbt = psbt_mod.new(tx)
+
+      assert.is_false(psbt_mod.is_complete(psbt))
+
+      psbt.inputs[1].final_script_sig = "\x00"
+      assert.is_true(psbt_mod.is_complete(psbt))
+    end)
+
+    it("counts unsigned inputs", function()
+      local txid = types.hash256(string.rep("\x2d", 32))
+      local tx = types.transaction(2, {
+        types.txin(types.outpoint(txid, 0), "", 0xFFFFFFFF),
+        types.txin(types.outpoint(txid, 1), "", 0xFFFFFFFF),
+      }, {types.txout(50000, "\x00\x14" .. string.rep("\x2e", 20))}, 0)
+      local psbt = psbt_mod.new(tx)
+
+      assert.equals(2, psbt_mod.count_unsigned(psbt))
+
+      psbt.inputs[1].final_script_witness = {"sig", "pubkey"}
+      assert.equals(1, psbt_mod.count_unsigned(psbt))
+    end)
+  end)
+
+  describe("full PSBT workflow", function()
+    it("create -> update -> sign -> finalize -> extract round-trip", function()
+      -- 1. Create transaction
+      local prev_txid = types.hash256(string.rep("\x30", 32))
+      local inputs = {
+        types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFD),
+      }
+      local outputs = {
+        types.txout(50000, "\x00\x14" .. string.rep("\x31", 20)),
+        types.txout(49000, "\x00\x14" .. string.rep("\x32", 20)),  -- Change
+      }
+      local tx = types.transaction(2, inputs, outputs, 0)
+
+      -- 2. Create PSBT (Creator role)
+      local psbt = psbt_mod.new(tx)
+      assert.is_not_nil(psbt)
+
+      -- Serialize and deserialize to simulate passing to another party
+      local psbt_b64 = psbt_mod.to_base64(psbt)
+      psbt = psbt_mod.from_base64(psbt_b64)
+
+      -- 3. Update PSBT (Updater role)
+      local privkey = string.rep("\x33", 32)
+      local pubkey = crypto.pubkey_from_privkey(privkey, true)
+      local pkh = crypto.hash160(pubkey)
+      local script_pubkey = "\x00\x14" .. pkh
+
+      psbt_mod.update_input_utxo(psbt, 0, {
+        value = 100000,
+        script_pubkey = script_pubkey,
+      }, true)
+
+      -- Add BIP32 derivation
+      psbt_mod.update_input_bip32(psbt, 0, pubkey, "\x00\x00\x00\x00", {0x8000002c, 0x80000000, 0x80000000, 0, 0})
+
+      -- Serialize again
+      psbt_b64 = psbt_mod.to_base64(psbt)
+      psbt = psbt_mod.from_base64(psbt_b64)
+
+      -- 4. Sign PSBT (Signer role)
+      local signed = psbt_mod.sign_input(psbt, 0, privkey, pubkey)
+      assert.is_true(signed)
+
+      -- Check we have a partial signature
+      local pk_hex = psbt_mod.hex_encode(pubkey)
+      assert.is_not_nil(psbt.inputs[1].partial_sigs[pk_hex])
+
+      -- 5. Finalize PSBT (Finalizer role)
+      local finalized = psbt_mod.finalize(psbt)
+      assert.is_true(finalized)
+      assert.is_true(psbt_mod.is_complete(psbt))
+
+      -- 6. Extract signed transaction (Extractor role)
+      local signed_tx = psbt_mod.extract(psbt)
+      assert.is_not_nil(signed_tx)
+      assert.is_true(signed_tx.segwit)
+
+      -- Verify the signed transaction has valid structure
+      assert.equals(1, #signed_tx.inputs)
+      assert.equals(2, #signed_tx.outputs)
+      assert.equals(2, #signed_tx.inputs[1].witness)
+
+      -- Verify outputs match original
+      assert.equals(50000, signed_tx.outputs[1].value)
+      assert.equals(49000, signed_tx.outputs[2].value)
+
+      -- 7. Verify we can serialize the final transaction
+      local tx_hex = psbt_mod.hex_encode(serialize.serialize_transaction(signed_tx, true))
+      assert.is_true(#tx_hex > 0)
+    end)
+  end)
+end)
+
+--------------------------------------------------------------------------------
+-- Output Descriptor Tests (BIP380-386)
+--------------------------------------------------------------------------------
+
+describe("descriptor", function()
+  local address
+
+  setup(function()
+    local loaders = package.loaders or package.searchers
+    table.insert(loaders, 2, function(module)
+      local name = module:match("^lunarblock%.(.+)")
+      if name then
+        local filename = "src/" .. name .. ".lua"
+        local f = io.open(filename)
+        if f then
+          f:close()
+          return function()
+            return dofile(filename)
+          end
+        end
+      end
+      return nil, "not found"
+    end)
+    address = require("lunarblock.address")
+  end)
+
+  describe("descriptor_checksum", function()
+    it("computes checksum for pk() descriptor", function()
+      local desc = "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"
+      local checksum = address.descriptor_checksum(desc)
+      assert.is_not_nil(checksum)
+      assert.equals(8, #checksum)
+    end)
+
+    it("computes checksum for pkh() descriptor", function()
+      local desc = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e)"
+      local checksum = address.descriptor_checksum(desc)
+      assert.is_not_nil(checksum)
+      assert.equals(8, #checksum)
+    end)
+
+    it("computes checksum for wpkh() descriptor", function()
+      local desc = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)"
+      local checksum = address.descriptor_checksum(desc)
+      assert.is_not_nil(checksum)
+      assert.equals(8, #checksum)
+    end)
+
+    it("computes checksum for multi() descriptor", function()
+      local desc = "multi(1,022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4,025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc)"
+      local checksum = address.descriptor_checksum(desc)
+      assert.is_not_nil(checksum)
+      assert.equals(8, #checksum)
+    end)
+
+    it("returns nil for invalid characters", function()
+      local desc = "pk(invalid\x00char)"
+      local checksum, err = address.descriptor_checksum(desc)
+      assert.is_nil(checksum)
+    end)
+  end)
+
+  describe("validate_descriptor_checksum", function()
+    it("validates correct checksum", function()
+      local desc = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)"
+      local checksum = address.descriptor_checksum(desc)
+      local with_checksum = desc .. "#" .. checksum
+
+      local valid, stripped = address.validate_descriptor_checksum(with_checksum)
+      assert.is_true(valid)
+      assert.equals(desc, stripped)
+    end)
+
+    it("rejects incorrect checksum", function()
+      local desc = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)"
+      local with_checksum = desc .. "#aaaaaaaa"
+
+      local valid = address.validate_descriptor_checksum(with_checksum)
+      assert.is_false(valid)
+    end)
+
+    it("returns error for missing checksum", function()
+      local desc = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)"
+
+      local valid, err = address.validate_descriptor_checksum(desc)
+      assert.is_false(valid)
+      assert.equals("no checksum found", err)
+    end)
+  end)
+
+  describe("parse_key_expression", function()
+    it("parses hex compressed pubkey", function()
+      local key_str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00"
+      local key = address.parse_key_expression(key_str)
+
+      assert.is_not_nil(key)
+      assert.equals("pubkey", key.type)
+      assert.equals(33, #key.pubkey)
+      assert.is_false(key.is_range)
+    end)
+
+    it("parses hex uncompressed pubkey", function()
+      local key_str = "04" .. string.rep("ab", 64)  -- 65 bytes = uncompressed
+      local key = address.parse_key_expression(key_str)
+
+      assert.is_not_nil(key)
+      assert.equals("pubkey", key.type)
+      assert.equals(65, #key.pubkey)
+    end)
+
+    it("parses x-only pubkey for taproot", function()
+      local key_str = string.rep("cd", 32)  -- 32 bytes = x-only
+      local key = address.parse_key_expression(key_str)
+
+      assert.is_not_nil(key)
+      assert.equals("xonly", key.type)
+      assert.equals(32, #key.pubkey)
+    end)
+
+    it("parses key with origin info", function()
+      local key_str = "[d34db33f/44h/0h/0h]02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00"
+      local key = address.parse_key_expression(key_str)
+
+      assert.is_not_nil(key)
+      assert.is_not_nil(key.origin)
+      assert.equals(4, #key.origin.fingerprint)
+      assert.equals(3, #key.origin.path)
+    end)
+
+    it("parses key with derivation path", function()
+      local key_str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00/0/1"
+      local key = address.parse_key_expression(key_str)
+
+      assert.is_not_nil(key)
+      assert.equals(2, #key.path)
+      assert.equals(0, key.path[1])
+      assert.equals(1, key.path[2])
+      assert.is_false(key.is_range)
+    end)
+
+    it("parses key with wildcard path", function()
+      local key_str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00/0/*"
+      local key = address.parse_key_expression(key_str)
+
+      assert.is_not_nil(key)
+      assert.is_true(key.is_range)
+      assert.is_false(key.is_hardened_range)
+    end)
+
+    it("parses key with hardened wildcard", function()
+      local key_str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00/0/*'"
+      local key = address.parse_key_expression(key_str)
+
+      assert.is_not_nil(key)
+      assert.is_true(key.is_range)
+      assert.is_true(key.is_hardened_range)
+    end)
+
+    it("returns error for invalid hex length", function()
+      local key_str = "abc123"  -- Invalid length
+      local key, err = address.parse_key_expression(key_str)
+
+      assert.is_nil(key)
+      assert.is_not_nil(err)
+    end)
+  end)
+
+  describe("parse_descriptor", function()
+    it("parses pk() descriptor", function()
+      local desc_str = "pk(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("pk", desc.type)
+      assert.is_not_nil(desc.key)
+      assert.is_false(desc.is_range)
+    end)
+
+    it("parses pkh() descriptor", function()
+      local desc_str = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("pkh", desc.type)
+      assert.is_not_nil(desc.key)
+    end)
+
+    it("parses wpkh() descriptor", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("wpkh", desc.type)
+      assert.is_not_nil(desc.key)
+    end)
+
+    it("parses multi() descriptor", function()
+      local desc_str = "multi(2,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00,02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("multi", desc.type)
+      assert.equals(2, desc.threshold)
+      assert.equals(2, #desc.keys)
+      assert.is_false(desc.sorted)
+    end)
+
+    it("parses sortedmulti() descriptor", function()
+      local desc_str = "sortedmulti(2,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00,02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("sortedmulti", desc.type)
+      assert.equals(2, desc.threshold)
+      assert.is_true(desc.sorted)
+    end)
+
+    it("parses tr() descriptor with x-only key", function()
+      local xonly = string.rep("ab", 32)
+      local desc_str = "tr(" .. xonly .. ")"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("tr", desc.type)
+      assert.is_not_nil(desc.key)
+    end)
+
+    it("parses addr() descriptor", function()
+      local desc_str = "addr(bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("addr", desc.type)
+      assert.equals("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", desc.address)
+    end)
+
+    it("parses raw() descriptor", function()
+      local desc_str = "raw(76a914000000000000000000000000000000000000000088ac)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("raw", desc.type)
+      assert.is_not_nil(desc.script)
+      assert.equals(25, #desc.script)
+    end)
+
+    it("parses combo() descriptor", function()
+      local desc_str = "combo(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local desc = address.parse_descriptor(desc_str)
+
+      assert.is_not_nil(desc)
+      assert.equals("combo", desc.type)
+      assert.is_not_nil(desc.key)
+    end)
+
+    it("validates checksum when present", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local checksum = address.descriptor_checksum(desc_str)
+      local with_checksum = desc_str .. "#" .. checksum
+
+      local desc = address.parse_descriptor(with_checksum)
+      assert.is_not_nil(desc)
+    end)
+
+    it("rejects invalid checksum", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)#aaaaaaaa"
+
+      local desc, err = address.parse_descriptor(desc_str)
+      assert.is_nil(desc)
+      assert.equals("invalid checksum", err)
+    end)
+
+    it("returns error for unknown type", function()
+      local desc_str = "unknown(something)"
+
+      local desc, err = address.parse_descriptor(desc_str)
+      assert.is_nil(desc)
+    end)
+  end)
+
+  describe("get_descriptor_info", function()
+    it("returns info for simple descriptor", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local info = address.get_descriptor_info(desc_str)
+
+      assert.is_not_nil(info)
+      assert.is_not_nil(info.descriptor)
+      assert.is_not_nil(info.checksum)
+      assert.equals(8, #info.checksum)
+      assert.is_false(info.isrange)
+    end)
+
+    it("adds checksum to descriptor", function()
+      local desc_str = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local info = address.get_descriptor_info(desc_str)
+
+      assert.is_true(info.descriptor:find("#") ~= nil)
+    end)
+
+    it("reports ranged descriptor", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00/0/*)"
+      local info = address.get_descriptor_info(desc_str)
+
+      assert.is_not_nil(info)
+      assert.is_true(info.isrange)
+    end)
+
+    it("strips existing checksum before recomputing", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local checksum = address.descriptor_checksum(desc_str)
+      local with_checksum = desc_str .. "#" .. checksum
+
+      local info1 = address.get_descriptor_info(desc_str)
+      local info2 = address.get_descriptor_info(with_checksum)
+
+      assert.equals(info1.checksum, info2.checksum)
+    end)
+  end)
+
+  describe("derive_addresses", function()
+    it("derives single address from non-ranged descriptor", function()
+      local desc_str = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local checksum = address.descriptor_checksum(desc_str)
+      desc_str = desc_str .. "#" .. checksum
+
+      local addresses, err = address.derive_addresses(desc_str, 0, 0, "mainnet")
+
+      assert.is_not_nil(addresses)
+      assert.equals(1, #addresses)
+      -- P2PKH mainnet address starts with '1'
+      assert.equals("1", addresses[1]:sub(1, 1))
+    end)
+
+    it("derives wpkh address", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local checksum = address.descriptor_checksum(desc_str)
+      desc_str = desc_str .. "#" .. checksum
+
+      local addresses = address.derive_addresses(desc_str, 0, 0, "mainnet")
+
+      assert.is_not_nil(addresses)
+      assert.equals(1, #addresses)
+      -- P2WPKH mainnet address starts with 'bc1q'
+      assert.equals("bc1q", addresses[1]:sub(1, 4))
+    end)
+
+    it("derives testnet address", function()
+      local desc_str = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abf2d91d92e47e00)"
+      local checksum = address.descriptor_checksum(desc_str)
+      desc_str = desc_str .. "#" .. checksum
+
+      local addresses = address.derive_addresses(desc_str, 0, 0, "testnet")
+
+      assert.is_not_nil(addresses)
+      -- P2WPKH testnet address starts with 'tb1q'
+      assert.equals("tb1q", addresses[1]:sub(1, 4))
+    end)
+
+    it("derives address from addr() descriptor", function()
+      local addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+      local desc_str = "addr(" .. addr .. ")"
+      local checksum = address.descriptor_checksum(desc_str)
+      desc_str = desc_str .. "#" .. checksum
+
+      local addresses = address.derive_addresses(desc_str, 0, 0, "mainnet")
+
+      assert.is_not_nil(addresses)
+      assert.equals(addr, addresses[1])
+    end)
+
+    it("derives address from raw() descriptor", function()
+      -- P2PKH script: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+      local desc_str = "raw(76a914000000000000000000000000000000000000000088ac)"
+      local checksum = address.descriptor_checksum(desc_str)
+      desc_str = desc_str .. "#" .. checksum
+
+      local addresses = address.derive_addresses(desc_str, 0, 0, "mainnet")
+
+      assert.is_not_nil(addresses)
+      assert.equals(1, #addresses)
     end)
   end)
 end)
