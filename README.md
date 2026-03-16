@@ -35,6 +35,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Performance optimization (buffer pools, LRU cache, JIT profiling, FFI best practices)
 - [x] BIP152 compact block relay (SipHash-2-4, short txids, high-bandwidth mode)
 - [x] BIP155 addrv2 messages (TorV3, I2P, CJDNS address support)
+- [x] Output descriptors (BIP380-386 parsing, checksum validation, address derivation)
 
 ## Quick start
 
@@ -63,7 +64,7 @@ src/
   types.lua      - Bitcoin primitive types (hash256, transactions, blocks)
   serialize.lua  - Binary serialization/deserialization
   crypto.lua     - Hash functions and secp256k1 bindings (OpenSSL + libsecp256k1)
-  address.lua    - Address encoding (Base58Check, Bech32/Bech32m)
+  address.lua    - Address encoding (Base58Check, Bech32/Bech32m, output descriptors)
   script.lua     - Bitcoin Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, BIP146)
   consensus.lua  - Consensus parameters, difficulty, BIP9 versionbits, network configs
   storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
