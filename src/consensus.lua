@@ -180,8 +180,9 @@ end
 --- Calculate the next difficulty target.
 -- @param last_target_bits number: compact bits of previous target
 -- @param actual_timespan number: actual time elapsed for previous 2016 blocks
+-- @param first_block_bits number|nil: bits of first block in period (for BIP94)
 -- @return number: new compact bits
-function M.calculate_next_target(last_target_bits, actual_timespan)
+function M.calculate_next_target(last_target_bits, actual_timespan, first_block_bits)
   -- Clamp timespan to [MIN_TIMESPAN, MAX_TIMESPAN]
   if actual_timespan < M.MIN_TIMESPAN then
     actual_timespan = M.MIN_TIMESPAN
@@ -189,8 +190,12 @@ function M.calculate_next_target(last_target_bits, actual_timespan)
     actual_timespan = M.MAX_TIMESPAN
   end
 
+  -- For BIP94 (testnet4): use the first block's bits instead of last
+  -- This prevents time-warp attacks by preserving real difficulty in the first block
+  local bits_to_use = first_block_bits or last_target_bits
+
   -- Get current target as bytes
-  local old_target = M.bits_to_target(last_target_bits)
+  local old_target = M.bits_to_target(bits_to_use)
 
   -- Multiply by actual_timespan using big-number arithmetic
   -- new_target = old_target * actual_timespan / TARGET_TIMESPAN
@@ -237,10 +242,95 @@ function M.calculate_next_target(last_target_bits, actual_timespan)
   return M.target_to_bits(new_target_str)
 end
 
+--- Get the next required work for a block.
+-- Implements full Bitcoin Core logic including testnet special rules and BIP94.
+-- @param height number: height of the block being validated
+-- @param timestamp number: timestamp of the block being validated
+-- @param network table: network configuration
+-- @param get_ancestor function: fn(height) -> {header={bits, timestamp}} for ancestor lookup
+-- @return number: expected compact bits value
+function M.get_next_work_required(height, timestamp, network, get_ancestor)
+  -- Regtest: always return pow_limit (no retargeting)
+  if network.pow_no_retarget then
+    return network.pow_limit_bits
+  end
+
+  local prev = get_ancestor(height - 1)
+  if not prev then
+    return network.pow_limit_bits
+  end
+
+  -- Check if this is a difficulty adjustment block
+  if height % M.DIFFICULTY_ADJUSTMENT_INTERVAL ~= 0 then
+    -- Not a retarget block
+    if network.pow_allow_min_difficulty then
+      -- Testnet special rules: if block's timestamp is more than 20 minutes
+      -- after previous block, allow minimum difficulty
+      local time_diff = timestamp - prev.header.timestamp
+      if time_diff > M.TARGET_SPACING * 2 then
+        return network.pow_limit_bits
+      else
+        -- Walk back to find the last non-minimum-difficulty block
+        local pindex = prev
+        local pindex_height = height - 1
+        while pindex_height > 0 and
+              pindex_height % M.DIFFICULTY_ADJUSTMENT_INTERVAL ~= 0 and
+              pindex.header.bits == network.pow_limit_bits do
+          pindex_height = pindex_height - 1
+          pindex = get_ancestor(pindex_height)
+          if not pindex then break end
+        end
+        if pindex then
+          return pindex.header.bits
+        end
+      end
+    end
+    -- Not testnet min-diff: bits must match previous block
+    return prev.header.bits
+  end
+
+  -- This is a difficulty adjustment block (height % 2016 == 0)
+  -- Go back 2015 blocks to find the first block of the previous period
+  local first_height = height - M.DIFFICULTY_ADJUSTMENT_INTERVAL
+  local first = get_ancestor(first_height)
+  if not first then
+    return prev.header.bits
+  end
+
+  local actual_timespan = prev.header.timestamp - first.header.timestamp
+
+  -- For BIP94 (testnet4): use the first block's bits for the calculation
+  -- This preserves real difficulty even when min-diff blocks are present
+  if network.enforce_bip94 then
+    return M.calculate_next_target(prev.header.bits, actual_timespan, first.header.bits)
+  else
+    return M.calculate_next_target(prev.header.bits, actual_timespan, nil)
+  end
+end
+
 --------------------------------------------------------------------------------
--- BIP9 Deployment Parameters
+-- BIP9 Versionbits State Machine
 --------------------------------------------------------------------------------
 
+-- Versionbits signaling constants (BIP9)
+M.VERSIONBITS_TOP_BITS = 0x20000000    -- bits 31-30 = 00, bit 29 = 1
+M.VERSIONBITS_TOP_MASK = 0xE0000000    -- mask for top 3 bits
+M.VERSIONBITS_NUM_BITS = 29            -- max deployment bits (0-28)
+
+-- BIP9 deployment states
+M.DEPLOYMENT_STATE = {
+  DEFINED   = "defined",
+  STARTED   = "started",
+  LOCKED_IN = "locked_in",
+  ACTIVE    = "active",
+  FAILED    = "failed"
+}
+
+-- Special start_time values
+M.ALWAYS_ACTIVE = -1     -- deployment always active (for testing)
+M.NEVER_ACTIVE  = -2     -- deployment never active (disabled)
+
+-- Default deployment parameters
 M.DEPLOYMENTS = {
   SEGWIT = {
     bit = 1,
@@ -255,6 +345,185 @@ M.DEPLOYMENTS = {
     min_activation_height = 709632
   },
 }
+
+--- Check if a block version signals for a deployment.
+-- @param version number: nVersion field from block header
+-- @param deployment_bit number: bit position (0-28) for the deployment
+-- @return boolean: true if block signals for the deployment
+function M.versionbits_condition(version, deployment_bit)
+  -- Top 3 bits must be 001 (indicating versionbits signaling)
+  if bit.band(version, M.VERSIONBITS_TOP_MASK) ~= M.VERSIONBITS_TOP_BITS then
+    return false
+  end
+  -- Check if the specific deployment bit is set
+  return bit.band(version, bit.lshift(1, deployment_bit)) ~= 0
+end
+
+--- Get the deployment state for a deployment at a given block.
+-- Implements the BIP9 state machine: DEFINED -> STARTED -> LOCKED_IN -> ACTIVE
+-- States can also transition to FAILED if timeout is reached without lock-in.
+-- @param deployment table: deployment parameters {bit, start_time, timeout, min_activation_height}
+-- @param period number: retarget period (2016 for mainnet)
+-- @param threshold number: minimum signaling blocks required (1815 for mainnet 95%)
+-- @param height number: height of the block to check state for
+-- @param get_block_info function: fn(height) -> {timestamp, mtp, version} for block lookup
+-- @return string: one of "defined", "started", "locked_in", "active", "failed"
+function M.get_deployment_state(deployment, period, threshold, height, get_block_info)
+  local STATE = M.DEPLOYMENT_STATE
+
+  -- Handle special start_time values
+  if deployment.start_time == M.ALWAYS_ACTIVE then
+    return STATE.ACTIVE
+  end
+  if deployment.start_time == M.NEVER_ACTIVE then
+    return STATE.FAILED
+  end
+
+  -- Genesis block is always DEFINED
+  if height == 0 then
+    return STATE.DEFINED
+  end
+
+  -- Align to period boundaries: find the first block of this period
+  -- For block at height h, state is determined by the period ending at or before h
+  -- We calculate states at the END of each period (last block of period)
+  -- Period boundary: blocks where (height + 1) % period == 0
+
+  -- Walk backward to find the state
+  -- Start from the last complete period boundary
+  local current_height = height
+  if (height + 1) % period ~= 0 then
+    -- Not at a period boundary, go to the last period boundary
+    current_height = height - ((height + 1) % period)
+  end
+
+  -- If we're before the first period boundary, we're in DEFINED state
+  if current_height < 0 then
+    return STATE.DEFINED
+  end
+
+  -- Build a stack of period boundaries to process (walking backward)
+  local to_process = {}
+  local state = nil
+  local h = current_height
+
+  while h >= 0 and state == nil do
+    local block = get_block_info(h)
+    if not block then
+      -- No block info available, assume DEFINED
+      state = STATE.DEFINED
+      break
+    end
+
+    -- Check if we can determine the state is DEFINED (optimization)
+    -- If MTP < start_time, state is DEFINED at this point
+    if block.mtp < deployment.start_time then
+      state = STATE.DEFINED
+      break
+    end
+
+    -- We need to compute state for this period
+    table.insert(to_process, h)
+
+    -- Go back one period
+    h = h - period
+  end
+
+  -- If we walked back past genesis, start state is DEFINED
+  if state == nil then
+    state = STATE.DEFINED
+  end
+
+  -- Now process periods forward to compute the final state
+  for i = #to_process, 1, -1 do
+    local period_end_height = to_process[i]
+    local block = get_block_info(period_end_height)
+
+    if state == STATE.DEFINED then
+      -- Check if we should transition to STARTED
+      if block.mtp >= deployment.start_time then
+        state = STATE.STARTED
+      end
+
+    elseif state == STATE.STARTED then
+      -- Check for timeout first (FAILED)
+      if block.mtp >= deployment.timeout then
+        state = STATE.FAILED
+      else
+        -- Count signaling blocks in this period
+        local count = 0
+        local period_start = period_end_height - period + 1
+        for bh = period_start, period_end_height do
+          local b = get_block_info(bh)
+          if b and M.versionbits_condition(b.version, deployment.bit) then
+            count = count + 1
+          end
+        end
+
+        if count >= threshold then
+          state = STATE.LOCKED_IN
+        end
+        -- Otherwise stay in STARTED
+      end
+
+    elseif state == STATE.LOCKED_IN then
+      -- Check if we can activate
+      -- Activation happens when next block height >= min_activation_height
+      local next_block_height = period_end_height + 1
+      if next_block_height >= deployment.min_activation_height then
+        state = STATE.ACTIVE
+      end
+      -- Otherwise stay in LOCKED_IN
+
+    -- ACTIVE and FAILED are terminal states - no transitions
+    end
+  end
+
+  return state
+end
+
+--- Get state for a block that may not be at a period boundary.
+-- Returns the state that applies to blocks in the current period.
+-- @param deployment table: deployment parameters
+-- @param period number: retarget period
+-- @param threshold number: minimum signaling blocks required
+-- @param height number: height of the block
+-- @param get_block_info function: fn(height) -> {timestamp, mtp, version}
+-- @return string: deployment state
+function M.get_deployment_state_for_block(deployment, period, threshold, height, get_block_info)
+  local STATE = M.DEPLOYMENT_STATE
+
+  -- Handle special start_time values
+  if deployment.start_time == M.ALWAYS_ACTIVE then
+    return STATE.ACTIVE
+  end
+  if deployment.start_time == M.NEVER_ACTIVE then
+    return STATE.FAILED
+  end
+
+  -- Genesis block is always DEFINED
+  if height == 0 then
+    return STATE.DEFINED
+  end
+
+  -- Find the last period boundary before this block
+  -- State for blocks in a period is determined by the state at the end of the PREVIOUS period
+  local prev_period_end = height - 1 - ((height) % period)
+
+  if prev_period_end < 0 then
+    -- We're in the first period, state is DEFINED until first period completes
+    -- But we need to check if STARTED based on MTP of prev block
+    local prev_block = get_block_info(height - 1)
+    if prev_block and prev_block.mtp >= deployment.start_time then
+      -- Only the first full period can transition
+      -- For blocks in period 0, always DEFINED
+      return STATE.DEFINED
+    end
+    return STATE.DEFINED
+  end
+
+  return M.get_deployment_state(deployment, period, threshold, prev_period_end, get_block_info)
+end
 
 --------------------------------------------------------------------------------
 -- Median Time Past (BIP113)
@@ -386,10 +655,15 @@ M.networks.mainnet = {
   -- Proof of work
   pow_limit_bits = 0x1d00ffff,
   pow_no_retarget = false,
-  pow_allow_min_difficulty = false
+  pow_allow_min_difficulty = false,
+  enforce_bip94 = false,
+
+  -- BIP9 versionbits parameters
+  versionbits_period = 2016,
+  versionbits_threshold = 1815  -- 95% of 2016
 }
 
--- Testnet
+-- Testnet (testnet3)
 M.networks.testnet = {
   name = "testnet",
   magic_bytes = "\x0b\x11\x09\x07",
@@ -434,7 +708,63 @@ M.networks.testnet = {
   -- Proof of work
   pow_limit_bits = 0x1d00ffff,
   pow_no_retarget = false,
-  pow_allow_min_difficulty = true
+  pow_allow_min_difficulty = true,
+  enforce_bip94 = false,
+
+  -- BIP9 versionbits parameters
+  versionbits_period = 2016,
+  versionbits_threshold = 1512  -- 75% of 2016 (testnet uses lower threshold)
+}
+
+-- Testnet4 (BIP94)
+M.networks.testnet4 = {
+  name = "testnet4",
+  magic_bytes = "\x1c\x16\x3f\x28",
+  port = 48333,
+  rpc_port = 48332,
+  pubkey_address_prefix = 0x6F,
+  script_address_prefix = 0xC4,
+  wif_prefix = 0xEF,
+  bech32_hrp = "tb",
+
+  -- Genesis block (testnet4-specific)
+  genesis = {
+    version = 1,
+    timestamp = 1714777860,
+    bits = 0x1d00ffff,
+    nonce = 393743547,
+    coinbase_message = "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+  },
+  genesis_hash = "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
+
+  -- Checkpoints
+  checkpoints = {
+    [0] = "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+  },
+
+  -- All soft forks active from height 1 (BIP94)
+  bip34_height = 1,
+  bip65_height = 1,
+  bip66_height = 1,
+  csv_height = 1,
+  segwit_height = 1,
+  taproot_height = 1,
+
+  -- DNS seeds
+  dns_seeds = {
+    "seed.testnet4.bitcoin.sprovoost.nl",
+    "seed.testnet4.wiz.biz"
+  },
+
+  -- Proof of work
+  pow_limit_bits = 0x1d00ffff,
+  pow_no_retarget = false,
+  pow_allow_min_difficulty = true,
+  enforce_bip94 = true,
+
+  -- BIP9 versionbits parameters (all forks already active at height 1)
+  versionbits_period = 2016,
+  versionbits_threshold = 1512  -- 75% of 2016
 }
 
 -- Regtest
@@ -477,7 +807,12 @@ M.networks.regtest = {
   -- Proof of work
   pow_limit_bits = 0x207fffff,
   pow_no_retarget = true,
-  pow_allow_min_difficulty = true
+  pow_allow_min_difficulty = true,
+  enforce_bip94 = false,
+
+  -- BIP9 versionbits parameters (use small period for fast testing)
+  versionbits_period = 144,     -- 1 day at 10 min/block
+  versionbits_threshold = 108   -- 75% of 144
 }
 
 -- Convenience function to get network by name
