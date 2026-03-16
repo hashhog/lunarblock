@@ -141,16 +141,84 @@ function M.count_script_sigops(script_bytes, accurate)
 end
 
 --------------------------------------------------------------------------------
+-- FindAndDelete for Legacy Sighash
+--------------------------------------------------------------------------------
+
+--- Serialize data as a push operation (length prefix + data).
+-- For data ≤ 75 bytes: single length byte
+-- For data ≤ 255 bytes: OP_PUSHDATA1 + 1-byte length
+-- For data ≤ 65535 bytes: OP_PUSHDATA2 + 2-byte length
+-- @param data string: The data to serialize as a push
+-- @return string: Push-encoded data
+local function serialize_push_data(data)
+  local len = #data
+  if len <= 75 then
+    return string.char(len) .. data
+  elseif len <= 255 then
+    return string.char(0x4c, len) .. data  -- OP_PUSHDATA1
+  elseif len <= 65535 then
+    local low = len % 256
+    local high = math.floor(len / 256)
+    return string.char(0x4d, low, high) .. data  -- OP_PUSHDATA2
+  else
+    -- OP_PUSHDATA4 for very large data
+    local b1 = len % 256
+    local b2 = math.floor(len / 256) % 256
+    local b3 = math.floor(len / 65536) % 256
+    local b4 = math.floor(len / 16777216) % 256
+    return string.char(0x4e, b1, b2, b3, b4) .. data  -- OP_PUSHDATA4
+  end
+end
+
+--- Escape special pattern characters in a string for Lua pattern matching.
+-- @param str string: The string to escape
+-- @return string: Escaped string safe for use in patterns
+local function escape_pattern(str)
+  return (str:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
+end
+
+--- Find and delete all occurrences of a push-encoded signature from a script.
+-- This is used in legacy sighash computation to remove the signature being
+-- verified from the scriptCode before hashing.
+-- @param script_bytes string: The script bytes
+-- @param sig_bytes string: The signature bytes (without push opcode)
+-- @return string: Script with signature removed
+function M.find_and_delete(script_bytes, sig_bytes)
+  if not sig_bytes or #sig_bytes == 0 then
+    return script_bytes
+  end
+
+  -- The signature is push-encoded in the script: [push_opcode] [data]
+  local push_encoded = serialize_push_data(sig_bytes)
+
+  -- Remove all occurrences of the push-encoded signature
+  local pattern = escape_pattern(push_encoded)
+  local result = script_bytes:gsub(pattern, "")
+
+  return result
+end
+
+--- Remove all OP_CODESEPARATOR (0xab) bytes from a script.
+-- Used in legacy sighash computation.
+-- @param script_bytes string: The script bytes
+-- @return string: Script with OP_CODESEPARATOR removed
+function M.remove_codeseparators(script_bytes)
+  return (script_bytes:gsub("\171", ""))  -- 0xab = 171 decimal
+end
+
+--------------------------------------------------------------------------------
 -- Signature Hash (Legacy)
 --------------------------------------------------------------------------------
 
 --- Compute signature hash for legacy (pre-segwit) transactions.
+-- Implements FindAndDelete and OP_CODESEPARATOR removal per Bitcoin Core.
 -- @param tx transaction: The transaction
 -- @param input_index number: Index of input being signed (0-based)
--- @param script_code string: The script code to sign
+-- @param script_code string: The script code to sign (should start after last OP_CODESEPARATOR)
 -- @param hash_type number: The hash type
+-- @param sig_bytes string|nil: Optional signature bytes to remove via FindAndDelete
 -- @return string: 32-byte hash
-function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
+function M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig_bytes)
   local ht = bit.band(hash_type, 0x1F)
   local anyone_can_pay = bit.band(hash_type, 0x80) ~= 0
 
@@ -158,6 +226,15 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
   if ht == consensus.SIGHASH.SINGLE and input_index >= #tx.outputs then
     return string.rep("\0", 31) .. "\1"
   end
+
+  -- Apply FindAndDelete: remove the signature from scriptCode (legacy only)
+  local processed_script = script_code
+  if sig_bytes and #sig_bytes > 0 then
+    processed_script = M.find_and_delete(processed_script, sig_bytes)
+  end
+
+  -- Remove OP_CODESEPARATOR bytes from the scriptCode
+  processed_script = M.remove_codeseparators(processed_script)
 
   -- Create modified transaction copy
   local modified_inputs = {}
@@ -168,7 +245,7 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
     -- Only include the signing input
     modified_inputs[1] = {
       prev_out = tx.inputs[input_index + 1].prev_out,
-      script_sig = script_code,
+      script_sig = processed_script,
       sequence = tx.inputs[input_index + 1].sequence
     }
   else
@@ -177,7 +254,7 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
       local sequence = inp.sequence
 
       if i == input_index + 1 then
-        script_to_use = script_code
+        script_to_use = processed_script
       else
         -- For SIGHASH_NONE or SIGHASH_SINGLE, zero out sequences for other inputs
         if ht == consensus.SIGHASH.NONE or ht == consensus.SIGHASH.SINGLE then
@@ -544,6 +621,75 @@ function M.check_block(block, network, height)
 end
 
 --------------------------------------------------------------------------------
+-- BIP68 Sequence Locks
+--------------------------------------------------------------------------------
+
+--- Calculate the sequence locks for a transaction (BIP68).
+-- Returns the minimum block height and minimum MTP time for the transaction
+-- to be valid. These are "last invalid" values (the first valid is one more).
+-- @param tx transaction: The transaction
+-- @param height number: Height of the block being validated
+-- @param get_utxo_height function(inp) -> number: Returns the height where each input's UTXO was confirmed
+-- @param get_block_mtp function(height) -> number: Returns the MTP of the block at given height
+-- @param enforce_bip68 boolean: Whether BIP68 is active at this height
+-- @return number, number: min_height (last invalid), min_time (last invalid)
+function M.calculate_sequence_locks(tx, height, get_utxo_height, get_block_mtp, enforce_bip68)
+  -- Initialize to -1: "last invalid" semantics means -1 allows any height/time
+  local min_height = -1
+  local min_time = -1
+
+  -- BIP68 only applies to version >= 2 transactions when active
+  if tx.version < 2 or not enforce_bip68 then
+    return min_height, min_time
+  end
+
+  for i, inp in ipairs(tx.inputs) do
+    local seq = inp.sequence
+
+    -- Check disable flag (bit 31): if set, skip this input
+    if bit.band(seq, consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0 then
+      -- Get the height where this UTXO was confirmed
+      local coin_height = get_utxo_height(inp)
+      assert(coin_height, "Missing UTXO height for input " .. i)
+
+      -- Check type flag (bit 22): time-based or height-based
+      if bit.band(seq, consensus.SEQUENCE_LOCKTIME_TYPE_FLAG) ~= 0 then
+        -- Time-based lock
+        -- Get MTP of the block BEFORE the one containing the UTXO
+        local coin_time = get_block_mtp(math.max(coin_height - 1, 0))
+        -- Lock value in 512-second units, convert to seconds, apply "last invalid" adjustment
+        local lock_value = bit.band(seq, consensus.SEQUENCE_LOCKTIME_MASK)
+        local lock_seconds = bit.lshift(lock_value, consensus.SEQUENCE_LOCKTIME_GRANULARITY)
+        min_time = math.max(min_time, coin_time + lock_seconds - 1)
+      else
+        -- Height-based lock
+        local lock_value = bit.band(seq, consensus.SEQUENCE_LOCKTIME_MASK)
+        min_height = math.max(min_height, coin_height + lock_value - 1)
+      end
+    end
+  end
+
+  return min_height, min_time
+end
+
+--- Check if sequence locks are satisfied for inclusion in a block (BIP68).
+-- @param min_height number: Minimum height from calculate_sequence_locks
+-- @param min_time number: Minimum time from calculate_sequence_locks
+-- @param block_height number: Height of the block being validated
+-- @param prev_block_mtp number: MTP of the previous block
+-- @return boolean: true if locks are satisfied
+function M.check_sequence_locks(min_height, min_time, block_height, prev_block_mtp)
+  -- Using "last invalid" semantics: value must be STRICTLY LESS than threshold
+  if min_height >= block_height then
+    return false
+  end
+  if min_time >= prev_block_mtp then
+    return false
+  end
+  return true
+end
+
+--------------------------------------------------------------------------------
 -- Block Context Validation
 --------------------------------------------------------------------------------
 
@@ -651,9 +797,11 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     -- Compute sighash
     local sighash
     if is_segwit then
+      -- SegWit does NOT use FindAndDelete
       sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
     else
-      sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type)
+      -- Legacy: pass the full signature (with hash type byte) for FindAndDelete
+      sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig)
     end
 
     -- Verify ECDSA signature
