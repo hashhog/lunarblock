@@ -17,7 +17,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Script interpreter (stack-based VM, all standard opcodes, P2SH, BIP146 NULLFAIL)
 - [x] Consensus parameters (block rewards, difficulty, network configs)
 - [x] Block storage (RocksDB with column families, batch writes, iterators)
-- [x] Block & transaction validation (txid/wtxid, sigops, sighash, PoW, merkle root)
+- [x] Block & transaction validation (txid/wtxid, sigops, sighash, PoW, merkle root, BIP68)
 - [x] P2P message serialization (version, verack, ping, inv, headers, block, tx, addr)
 - [x] P2P networking (peer connections, version/verack handshake, ping/pong)
 - [x] Peer manager (connection pooling, DNS discovery, ban management, event loop)
@@ -64,7 +64,7 @@ src/
   script.lua     - Bitcoin Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, BIP146)
   consensus.lua  - Consensus parameters, difficulty, network configs
   storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
-  validation.lua - Block & transaction validation (PoW, merkle root, sighash)
+  validation.lua - Block & transaction validation (PoW, merkle root, sighash, BIP68)
   p2p.lua        - P2P protocol message serialization
   peer.lua       - TCP peer connection management and handshake
   peerman.lua    - Peer manager with connection pooling, discovery, bans
