@@ -15,7 +15,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] Cryptographic operations (SHA256, RIPEMD160, secp256k1, Schnorr)
 - [x] Address encoding (Base58Check, Bech32/Bech32m for P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Script interpreter (stack-based VM, all standard opcodes, P2SH, BIP146 NULLFAIL)
-- [x] Consensus parameters (block rewards, difficulty, network configs)
+- [x] Consensus parameters (block rewards, difficulty, network configs, BIP9 versionbits)
 - [x] Block storage (RocksDB with column families, batch writes, iterators)
 - [x] Block & transaction validation (txid/wtxid, sigops, sighash, PoW, merkle root, BIP68)
 - [x] P2P message serialization (version, verack, ping, inv, headers, block, tx, addr)
@@ -62,7 +62,7 @@ src/
   crypto.lua     - Hash functions and secp256k1 bindings (OpenSSL + libsecp256k1)
   address.lua    - Address encoding (Base58Check, Bech32/Bech32m)
   script.lua     - Bitcoin Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, BIP146)
-  consensus.lua  - Consensus parameters, difficulty, network configs
+  consensus.lua  - Consensus parameters, difficulty, BIP9 versionbits, network configs
   storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
   validation.lua - Block & transaction validation (PoW, merkle root, sighash, BIP68)
   p2p.lua        - P2P protocol message serialization
