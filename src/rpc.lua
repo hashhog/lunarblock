@@ -8,6 +8,8 @@ local serialize = require("lunarblock.serialize")
 local validation = require("lunarblock.validation")
 local consensus = require("lunarblock.consensus")
 local p2p = require("lunarblock.p2p")
+local script_mod = require("lunarblock.script")
+local address_mod = require("lunarblock.address")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -34,6 +36,109 @@ M.ERROR = {
   VERIFY_ALREADY_IN_CHAIN = -27,
   IN_WARMUP = -28,
 }
+
+--------------------------------------------------------------------------------
+-- Script Disassembly
+--------------------------------------------------------------------------------
+
+--- Disassemble a script to human-readable ASM format.
+-- @param script_bytes string: The raw script bytes
+-- @return string: Space-separated assembly representation
+local function disassemble_script(script_bytes)
+  if #script_bytes == 0 then
+    return ""
+  end
+  local ok, ops = pcall(script_mod.parse_script, script_bytes)
+  if not ok then
+    return "[error]"
+  end
+  local parts = {}
+  for _, op in ipairs(ops) do
+    local opcode = op.opcode
+    local data = op.data
+    if data then
+      -- Push data: show as hex
+      parts[#parts + 1] = M.hex_encode(data)
+    elseif opcode == 0x00 then
+      parts[#parts + 1] = "OP_0"
+    elseif opcode >= 0x01 and opcode <= 0x4b then
+      -- Direct push but no data (shouldn't happen with valid parse)
+      parts[#parts + 1] = "OP_PUSHBYTES_" .. opcode
+    elseif script_mod.OP_NAMES[opcode] then
+      parts[#parts + 1] = script_mod.OP_NAMES[opcode]
+    else
+      parts[#parts + 1] = string.format("0x%02x", opcode)
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+--------------------------------------------------------------------------------
+-- ScriptPubKey Decoding
+--------------------------------------------------------------------------------
+
+--- Decode a scriptPubKey into RPC-compatible format.
+-- Returns an object with: type, asm, hex, and optionally address.
+-- @param script_pubkey string: The raw scriptPubKey bytes
+-- @param network table: Network configuration for address encoding
+-- @return table: Decoded scriptPubKey object
+function M.decode_script_pubkey(script_pubkey, network)
+  local result = {
+    asm = disassemble_script(script_pubkey),
+    hex = M.hex_encode(script_pubkey),
+  }
+
+  -- Classify the script type
+  local script_type, program = script_mod.classify_script(script_pubkey)
+
+  -- Map to Bitcoin Core type names
+  local type_map = {
+    p2pkh = "pubkeyhash",
+    p2sh = "scripthash",
+    p2wpkh = "witness_v0_keyhash",
+    p2wsh = "witness_v0_scripthash",
+    p2tr = "witness_v1_taproot",
+    nulldata = "nulldata",
+    nonstandard = "nonstandard",
+  }
+  result.type = type_map[script_type] or "nonstandard"
+
+  -- Check for bare pubkey (P2PK): <pubkey> OP_CHECKSIG
+  -- 33/35 bytes: compressed pubkey (33) + OP_CHECKSIG OR uncompressed pubkey (65) + OP_CHECKSIG
+  if #script_pubkey == 35 and script_pubkey:byte(1) == 0x21 and script_pubkey:byte(35) == 0xac then
+    result.type = "pubkey"
+  elseif #script_pubkey == 67 and script_pubkey:byte(1) == 0x41 and script_pubkey:byte(67) == 0xac then
+    result.type = "pubkey"
+  end
+
+  -- Check for multisig: OP_M <pubkey>... OP_N OP_CHECKMULTISIG
+  if #script_pubkey >= 3 and script_pubkey:byte(#script_pubkey) == 0xae then
+    local first = script_pubkey:byte(1)
+    if first >= 0x51 and first <= 0x60 then  -- OP_1 to OP_16
+      result.type = "multisig"
+    end
+  end
+
+  -- Try to extract address
+  local network_name = network and network.name or "mainnet"
+  local hrp = address_mod.BECH32_HRP[network_name] or "bc"
+
+  if script_type == "p2pkh" and program then
+    local version = network_name == "mainnet" and 0x00 or 0x6F
+    result.address = address_mod.base58check_encode(version, program)
+  elseif script_type == "p2sh" and program then
+    local version = network_name == "mainnet" and 0x05 or 0xC4
+    result.address = address_mod.base58check_encode(version, program)
+  elseif script_type == "p2wpkh" and program then
+    result.address = address_mod.segwit_encode(hrp, 0, program)
+  elseif script_type == "p2wsh" and program then
+    result.address = address_mod.segwit_encode(hrp, 0, program)
+  elseif script_type == "p2tr" and program then
+    result.address = address_mod.segwit_encode(hrp, 1, program)
+  end
+
+  return result
+end
 
 --------------------------------------------------------------------------------
 -- Base64 Encoding/Decoding
@@ -401,27 +506,229 @@ function RPCServer:register_methods()
   self.methods["getrawtransaction"] = function(rpc, params)
     local txid_hex = params[1]
     local verbose = params[2] or false
-    assert(type(txid_hex) == "string", "Transaction ID required")
-    -- Check mempool first
-    if rpc.mempool then
+    local blockhash_hex = params[3]
+
+    -- Validate txid parameter
+    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
+    end
+
+    -- Validate blockhash if provided
+    if blockhash_hex ~= nil and blockhash_hex ~= cjson.null then
+      if type(blockhash_hex) ~= "string" or #blockhash_hex ~= 64 then
+        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid blockhash"})
+      end
+    else
+      blockhash_hex = nil
+    end
+
+    local tx = nil
+    local block = nil
+    local block_height = nil
+    local block_time = nil
+    local found_blockhash = nil
+    local in_mempool = false
+
+    -- Lookup order: mempool first (if no blockhash provided), then storage/txindex
+
+    -- 1. Check mempool first (only if blockhash not specified)
+    if not blockhash_hex and rpc.mempool then
       local entry = rpc.mempool:get_entry(txid_hex)
       if entry then
-        if not verbose then
-          return M.hex_encode(serialize.serialize_transaction(entry.tx, true))
-        end
-        return {
-          txid = txid_hex,
-          size = entry.size,
-          vsize = entry.vsize,
-          weight = entry.weight,
-          version = entry.tx.version,
-          locktime = entry.tx.locktime,
-          vin = {},  -- simplified
-          vout = {}, -- simplified
-        }
+        tx = entry.tx
+        in_mempool = true
       end
     end
-    error({code = M.ERROR.MISC_ERROR, message = "Transaction not found"})
+
+    -- 2. If blockhash provided, search that specific block
+    if not tx and blockhash_hex and rpc.storage then
+      local block_hash = types.hash256_from_hex(blockhash_hex)
+      block = rpc.storage.get_block(block_hash)
+      if not block then
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Block hash not found"})
+      end
+      -- Search for transaction in block
+      for _, btx in ipairs(block.transactions) do
+        local btx_txid = types.hash256_hex(validation.compute_txid(btx))
+        if btx_txid == txid_hex then
+          tx = btx
+          found_blockhash = blockhash_hex
+          -- Look up block height and time
+          local iter = rpc.storage.iterator(rpc.storage._handles and "height" or nil)
+          if rpc.storage.get then
+            -- Try to get height from metadata
+            local height_data = rpc.storage.get("height", block_hash.bytes)
+            if height_data then
+              local r = serialize.buffer_reader(height_data)
+              block_height = r.read_u32le()
+            end
+          end
+          block_time = block.header.timestamp
+          break
+        end
+      end
+      if not tx then
+        error({code = M.ERROR.INVALID_ADDRESS,
+               message = "No such transaction found in the provided block. Use gettransaction for wallet transactions."})
+      end
+    end
+
+    -- 3. Check transaction index if available and tx still not found
+    if not tx and rpc.storage then
+      local txid_bytes = types.hash256_from_hex(txid_hex)
+      -- Try TX_INDEX column family
+      local tx_index_data = rpc.storage.get and rpc.storage.get("tx_index", txid_bytes.bytes)
+      if tx_index_data then
+        -- TX index stores: block_hash (32 bytes) + offset (optional)
+        if #tx_index_data >= 32 then
+          local index_block_hash = types.hash256(tx_index_data:sub(1, 32))
+          found_blockhash = types.hash256_hex(index_block_hash)
+          block = rpc.storage.get_block(index_block_hash)
+          if block then
+            -- Find tx in block
+            for _, btx in ipairs(block.transactions) do
+              local btx_txid = types.hash256_hex(validation.compute_txid(btx))
+              if btx_txid == txid_hex then
+                tx = btx
+                block_time = block.header.timestamp
+                break
+              end
+            end
+          end
+        end
+      end
+    end
+
+    -- If still not found, return error
+    if not tx then
+      local msg
+      if blockhash_hex then
+        msg = "No such transaction found in the provided block. Use gettransaction for wallet transactions."
+      elseif rpc.storage and rpc.storage.get then
+        msg = "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+      else
+        msg = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
+      end
+      error({code = M.ERROR.INVALID_ADDRESS, message = msg})
+    end
+
+    -- Non-verbose: return raw hex
+    if not verbose then
+      return M.hex_encode(serialize.serialize_transaction(tx, true))
+    end
+
+    -- Verbose: build detailed response
+    local weight = validation.get_tx_weight(tx)
+    local size = #serialize.serialize_transaction(tx, true)
+    local base_size = #serialize.serialize_transaction(tx, false)
+    local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+    local txid = validation.compute_txid(tx)
+    local wtxid = validation.compute_wtxid(tx)
+
+    -- Build vin array
+    local vin = {}
+    local is_coinbase = false
+    local null_hash = string.rep("\0", 32)
+    if #tx.inputs == 1 and tx.inputs[1].prev_out.hash.bytes == null_hash and
+       tx.inputs[1].prev_out.index == 0xFFFFFFFF then
+      is_coinbase = true
+    end
+
+    for i, inp in ipairs(tx.inputs) do
+      local vin_entry = {}
+      if is_coinbase and i == 1 then
+        vin_entry.coinbase = M.hex_encode(inp.script_sig)
+        vin_entry.sequence = inp.sequence
+        if inp.witness and #inp.witness > 0 then
+          vin_entry.txinwitness = {}
+          for j, wit in ipairs(inp.witness) do
+            vin_entry.txinwitness[j] = M.hex_encode(wit)
+          end
+        end
+      else
+        vin_entry.txid = types.hash256_hex(inp.prev_out.hash)
+        vin_entry.vout = inp.prev_out.index
+        vin_entry.scriptSig = {
+          asm = disassemble_script(inp.script_sig),
+          hex = M.hex_encode(inp.script_sig),
+        }
+        vin_entry.sequence = inp.sequence
+        if inp.witness and #inp.witness > 0 then
+          vin_entry.txinwitness = {}
+          for j, wit in ipairs(inp.witness) do
+            vin_entry.txinwitness[j] = M.hex_encode(wit)
+          end
+        end
+      end
+      vin[i] = vin_entry
+    end
+
+    -- Build vout array
+    local vout = {}
+    for i, out in ipairs(tx.outputs) do
+      vout[i] = {
+        value = out.value / consensus.COIN,
+        n = i - 1,
+        scriptPubKey = M.decode_script_pubkey(out.script_pubkey, rpc.network),
+      }
+    end
+
+    -- Build result
+    local result = {
+      txid = types.hash256_hex(txid),
+      hash = types.hash256_hex(wtxid),
+      version = tx.version,
+      size = size,
+      vsize = vsize,
+      weight = weight,
+      locktime = tx.locktime,
+      vin = vin,
+      vout = vout,
+      hex = M.hex_encode(serialize.serialize_transaction(tx, true)),
+    }
+
+    -- Add block info if transaction is confirmed
+    if found_blockhash then
+      result.blockhash = found_blockhash
+      if block_time then
+        result.time = block_time
+        result.blocktime = block_time
+      end
+
+      -- Calculate confirmations
+      if rpc.chain_state and rpc.chain_state.tip_height then
+        local tip_height = rpc.chain_state.tip_height
+        -- Try to get block height from storage
+        if not block_height and rpc.storage then
+          local block_hash = types.hash256_from_hex(found_blockhash)
+          -- Look up height from height_index in reverse
+          -- This is expensive - in production, store height in tx_index
+          local iter = rpc.storage.iterator("height")
+          if iter then
+            iter.seek_to_first()
+            while iter.valid() do
+              local k = iter.key()
+              local v = iter.value()
+              if v and #v == 32 and v == block_hash.bytes then
+                -- Decode height from key (4-byte big-endian)
+                block_height = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
+                break
+              end
+              iter.next()
+            end
+            iter.destroy()
+          end
+        end
+
+        if block_height then
+          result.confirmations = tip_height - block_height + 1
+        else
+          result.confirmations = 1  -- Default to 1 if height unknown
+        end
+      end
+    end
+
+    return result
   end
 
   self.methods["decoderawtransaction"] = function(_rpc, params)
