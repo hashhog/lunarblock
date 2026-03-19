@@ -1,6 +1,10 @@
 *.rock
 *.swp
+*.o
+*.so
 .env
 luarocks/
+lib/librocksdb*
+lib/libsecp256k1*
 
 .claude/skills/
