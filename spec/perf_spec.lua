@@ -347,3 +347,120 @@ describe("LRU cache", function()
     assert.is_nil(cache:get("b"))
   end)
 end)
+
+describe("benchmarking utilities", function()
+  it("now() returns increasing time values", function()
+    local t1 = perf.now()
+    -- Small busy loop to ensure time passes
+    local sum = 0
+    for i = 1, 10000 do sum = sum + i end
+    local t2 = perf.now()
+
+    assert.is_number(t1)
+    assert.is_number(t2)
+    assert.is_true(t2 >= t1)
+  end)
+
+  it("benchmark() returns valid results", function()
+    local count = 0
+    local result = perf.benchmark("test", function()
+      count = count + 1
+    end, 100, 5)
+
+    assert.equals("test", result.name)
+    assert.equals(100, result.iterations)
+    assert.is_number(result.total_time)
+    assert.is_number(result.avg_time)
+    assert.is_number(result.ops_per_sec)
+    assert.is_true(result.total_time > 0)
+    assert.is_true(result.ops_per_sec > 0)
+    -- Should have run 100 iterations plus 5 warmup
+    assert.equals(105, count)
+  end)
+
+  it("run_benchmarks() runs multiple benchmarks", function()
+    local results = perf.run_benchmarks({
+      { name = "bench1", fn = function() end, iterations = 10 },
+      { name = "bench2", fn = function() end, iterations = 20 },
+    })
+
+    assert.equals(2, #results)
+    assert.equals("bench1", results[1].name)
+    assert.equals("bench2", results[2].name)
+    assert.equals(10, results[1].iterations)
+    assert.equals(20, results[2].iterations)
+  end)
+
+  it("format_benchmark_results() produces string output", function()
+    local results = {
+      { name = "test1", iterations = 1000, total_time = 0.5, ops_per_sec = 2000 },
+      { name = "test2", iterations = 500, total_time = 0.25, ops_per_sec = 2000 },
+    }
+
+    local output = perf.format_benchmark_results(results)
+    assert.is_string(output)
+    assert.is_true(output:find("test1") ~= nil)
+    assert.is_true(output:find("test2") ~= nil)
+    assert.is_true(output:find("1000") ~= nil)
+  end)
+end)
+
+describe("crypto benchmarks", function()
+  it("benchmark_sha256 completes successfully", function()
+    local result = perf.benchmark_sha256(100)
+    assert.equals("SHA256 (FFI/OpenSSL)", result.name)
+    assert.equals(100, result.iterations)
+    assert.is_true(result.ops_per_sec > 0)
+  end)
+
+  it("benchmark_hash256 completes successfully", function()
+    local result = perf.benchmark_hash256(100)
+    assert.equals("hash256/SHA256d (FFI)", result.name)
+    assert.equals(100, result.iterations)
+  end)
+
+  it("benchmark_ripemd160 completes successfully", function()
+    local result = perf.benchmark_ripemd160(100)
+    assert.equals("RIPEMD160 (FFI/OpenSSL)", result.name)
+    assert.equals(100, result.iterations)
+  end)
+
+  it("benchmark_hash160 completes successfully", function()
+    local result = perf.benchmark_hash160(100)
+    assert.equals("HASH160 (FFI)", result.name)
+    assert.equals(100, result.iterations)
+  end)
+
+  it("benchmark_ecdsa_sign completes successfully", function()
+    local result = perf.benchmark_ecdsa_sign(10)
+    assert.equals("ECDSA sign (libsecp256k1)", result.name)
+    assert.equals(10, result.iterations)
+  end)
+
+  it("benchmark_ecdsa_verify completes successfully", function()
+    local result = perf.benchmark_ecdsa_verify(10)
+    assert.equals("ECDSA verify (libsecp256k1)", result.name)
+    assert.equals(10, result.iterations)
+  end)
+
+  it("benchmark_schnorr_verify completes successfully", function()
+    local result = perf.benchmark_schnorr_verify(10)
+    assert.equals("Schnorr verify (libsecp256k1)", result.name)
+    assert.equals(10, result.iterations)
+  end)
+
+  it("run_crypto_benchmarks returns all benchmark results", function()
+    -- Run with very few iterations for speed
+    local results = {}
+    results[#results + 1] = perf.benchmark_sha256(10)
+    results[#results + 1] = perf.benchmark_hash256(10)
+    results[#results + 1] = perf.benchmark_ripemd160(10)
+    results[#results + 1] = perf.benchmark_hash160(10)
+
+    assert.equals(4, #results)
+    for _, r in ipairs(results) do
+      assert.is_not_nil(r.name)
+      assert.is_number(r.ops_per_sec)
+    end
+  end)
+end)

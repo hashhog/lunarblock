@@ -1324,4 +1324,243 @@ function M.decode_v2_message_type(contents)
   end
 end
 
+--------------------------------------------------------------------------------
+-- Package Relay Messages (BIP 331)
+--------------------------------------------------------------------------------
+
+-- Package relay version
+M.PKG_RELAY_VERSION = 1
+
+--- Serialize a sendpackages message.
+-- Sent during version handshake to negotiate package relay support.
+-- @param version number: package relay version (1)
+-- @return string: serialized sendpackages payload
+function M.serialize_sendpackages(version)
+  local w = serialize.buffer_writer()
+  w.write_u64le(version)
+  return w.result()
+end
+
+--- Deserialize a sendpackages message.
+-- @param data string: sendpackages payload
+-- @return table: {version}
+function M.deserialize_sendpackages(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    version = r.read_u64le(),
+  }
+end
+
+--- Serialize an ancpkginfo message.
+-- Announces that package info is available for a transaction.
+-- Sent for a 1p1c package when we have the parent and announce the child.
+-- @param wtxid hash256: wtxid of the child transaction
+-- @return string: serialized ancpkginfo payload
+function M.serialize_ancpkginfo(wtxid)
+  local w = serialize.buffer_writer()
+  w.write_hash256(wtxid)
+  return w.result()
+end
+
+--- Deserialize an ancpkginfo message.
+-- @param data string: ancpkginfo payload
+-- @return table: {wtxid}
+function M.deserialize_ancpkginfo(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    wtxid = r.read_hash256(),
+  }
+end
+
+--- Serialize a getpkgtxns message.
+-- Request transactions for a package identified by package hash.
+-- @param package_hash hash256: package hash (computed from sorted wtxids)
+-- @param wtxids table: list of wtxids being requested
+-- @return string: serialized getpkgtxns payload
+function M.serialize_getpkgtxns(package_hash, wtxids)
+  local w = serialize.buffer_writer()
+  w.write_hash256(package_hash)
+  w.write_varint(#wtxids)
+  for _, wtxid in ipairs(wtxids) do
+    w.write_hash256(wtxid)
+  end
+  return w.result()
+end
+
+--- Deserialize a getpkgtxns message.
+-- @param data string: getpkgtxns payload
+-- @return table: {package_hash, wtxids}
+function M.deserialize_getpkgtxns(data)
+  local r = serialize.buffer_reader(data)
+  local package_hash = r.read_hash256()
+  local count = r.read_varint()
+  local wtxids = {}
+  for i = 1, count do
+    wtxids[i] = r.read_hash256()
+  end
+  return {
+    package_hash = package_hash,
+    wtxids = wtxids,
+  }
+end
+
+--- Serialize a pkgtxns message.
+-- Response to getpkgtxns with the requested transactions.
+-- @param package_hash hash256: package hash
+-- @param transactions table: list of transaction objects
+-- @return string: serialized pkgtxns payload
+function M.serialize_pkgtxns(package_hash, transactions)
+  local w = serialize.buffer_writer()
+  w.write_hash256(package_hash)
+  w.write_varint(#transactions)
+  for _, tx in ipairs(transactions) do
+    w.write_bytes(serialize.serialize_transaction(tx, true))  -- always include witness
+  end
+  return w.result()
+end
+
+--- Deserialize a pkgtxns message.
+-- @param data string: pkgtxns payload
+-- @return table: {package_hash, transactions}
+function M.deserialize_pkgtxns(data)
+  local r = serialize.buffer_reader(data)
+  local package_hash = r.read_hash256()
+  local count = r.read_varint()
+  local transactions = {}
+  for i = 1, count do
+    transactions[i] = serialize.deserialize_transaction(r)
+  end
+  return {
+    package_hash = package_hash,
+    transactions = transactions,
+  }
+end
+
+--- Serialize a pckginfo1 message.
+-- Package info for 1-parent-1-child (1p1c) packages.
+-- @param parent_wtxid hash256: wtxid of parent transaction
+-- @param child_wtxid hash256: wtxid of child transaction
+-- @return string: serialized pckginfo1 payload
+function M.serialize_pckginfo1(parent_wtxid, child_wtxid)
+  local w = serialize.buffer_writer()
+  w.write_hash256(parent_wtxid)
+  w.write_hash256(child_wtxid)
+  return w.result()
+end
+
+--- Deserialize a pckginfo1 message.
+-- @param data string: pckginfo1 payload
+-- @return table: {parent_wtxid, child_wtxid}
+function M.deserialize_pckginfo1(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    parent_wtxid = r.read_hash256(),
+    child_wtxid = r.read_hash256(),
+  }
+end
+
+--------------------------------------------------------------------------------
+-- BIP330 Erlay Messages
+--------------------------------------------------------------------------------
+
+--- Serialize a sendtxrcncl message.
+-- Sent during handshake to negotiate Erlay transaction reconciliation.
+-- @param version number: Erlay version (currently 1)
+-- @param salt number: 64-bit reconciliation salt
+-- @return string: serialized sendtxrcncl payload
+function M.serialize_sendtxrcncl(version, salt)
+  local w = serialize.buffer_writer()
+  w.write_u32le(version)
+  w.write_u64le(salt)
+  return w.result()
+end
+
+--- Deserialize a sendtxrcncl message.
+-- @param data string: sendtxrcncl payload
+-- @return table: {version, salt}
+function M.deserialize_sendtxrcncl(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    version = r.read_u32le(),
+    salt = r.read_u64le(),
+  }
+end
+
+--- Serialize a reqrecon message (request reconciliation).
+-- @param set_size number: size of our reconciliation set for this peer
+-- @param q number: difference coefficient (scaled by 2^16)
+-- @return string: serialized reqrecon payload
+function M.serialize_reqrecon(set_size, q)
+  local w = serialize.buffer_writer()
+  w.write_varint(set_size)
+  w.write_u16le(math.floor(q * 65536))  -- Q scaled to uint16
+  return w.result()
+end
+
+--- Deserialize a reqrecon message.
+-- @param data string: reqrecon payload
+-- @return table: {set_size, q}
+function M.deserialize_reqrecon(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    set_size = r.read_varint(),
+    q = r.read_u16le() / 65536,
+  }
+end
+
+--- Serialize a sketch message.
+-- @param sketch_bytes string: serialized minisketch
+-- @return string: serialized sketch payload
+function M.serialize_sketch(sketch_bytes)
+  local w = serialize.buffer_writer()
+  w.write_varint(#sketch_bytes)
+  w.write_bytes(sketch_bytes)
+  return w.result()
+end
+
+--- Deserialize a sketch message.
+-- @param data string: sketch payload
+-- @return string: sketch bytes
+function M.deserialize_sketch(data)
+  local r = serialize.buffer_reader(data)
+  local len = r.read_varint()
+  return r.read_bytes(len)
+end
+
+--- Serialize a reconcildiff message.
+-- Sent after reconciliation to request missing transactions.
+-- @param success boolean: whether reconciliation succeeded
+-- @param want_txids table: list of short txids we want (only if success=true)
+-- @return string: serialized reconcildiff payload
+function M.serialize_reconcildiff(success, want_txids)
+  local w = serialize.buffer_writer()
+  w.write_u8(success and 1 or 0)
+  if success then
+    w.write_varint(#want_txids)
+    for _, short_id in ipairs(want_txids) do
+      w.write_u32le(short_id)
+    end
+  end
+  return w.result()
+end
+
+--- Deserialize a reconcildiff message.
+-- @param data string: reconcildiff payload
+-- @return table: {success, want_txids}
+function M.deserialize_reconcildiff(data)
+  local r = serialize.buffer_reader(data)
+  local success = r.read_u8() == 1
+  local want_txids = {}
+  if success then
+    local count = r.read_varint()
+    for i = 1, count do
+      want_txids[i] = r.read_u32le()
+    end
+  end
+  return {
+    success = success,
+    want_txids = want_txids,
+  }
+end
+
 return M

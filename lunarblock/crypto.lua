@@ -2,6 +2,10 @@ local ffi = require("ffi")
 local types = require("lunarblock.types")
 local M = {}
 
+-- SHA-256 hardware acceleration state
+local sha256_accel_lib = nil
+local sha256_hw_type = nil  -- "sha_ni", "avx2", or "generic"
+
 -- OpenSSL FFI declarations
 ffi.cdef[[
   /* EVP digest interface (OpenSSL 1.1+) */
@@ -23,12 +27,96 @@ ffi.cdef[[
   unsigned char *HMAC(const EVP_MD *evp_md, const void *key, int key_len,
                       const unsigned char *d, size_t n,
                       unsigned char *md, unsigned int *md_len);
+
+  /* ChaCha20-Poly1305 AEAD (OpenSSL 1.1+) */
+  typedef struct evp_cipher_st EVP_CIPHER;
+  typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
+
+  const EVP_CIPHER *EVP_chacha20_poly1305(void);
+  EVP_CIPHER_CTX *EVP_CIPHER_CTX_new(void);
+  void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx);
+  int EVP_CIPHER_CTX_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg, void *ptr);
+
+  int EVP_EncryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher,
+                         void *impl, const unsigned char *key, const unsigned char *iv);
+  int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+                        const unsigned char *in, int inl);
+  int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
+
+  int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher,
+                         void *impl, const unsigned char *key, const unsigned char *iv);
+  int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+                        const unsigned char *in, int inl);
+  int EVP_DecryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
+
+  /* ChaCha20 stream cipher */
+  const EVP_CIPHER *EVP_chacha20(void);
+
+  /* Random bytes */
+  int RAND_bytes(unsigned char *buf, int num);
 ]]
 
 local libcrypto = ffi.load("crypto")
 
--- SHA-256: single hash
+-- Hardware-accelerated SHA-256 FFI declarations
+ffi.cdef[[
+  int sha256_accel_init(void);
+  void sha256_accel(const uint8_t* data, size_t len, uint8_t out[32]);
+  void sha256d_accel(const uint8_t* data, size_t len, uint8_t out[32]);
+]]
+
+-- Try to load the hardware-accelerated SHA-256 library
+local function init_sha256_accel()
+  if sha256_accel_lib ~= nil then
+    return sha256_accel_lib
+  end
+
+  -- Try to load the .so from various locations
+  local paths = {
+    "./lib/sha256_accel.so",    -- Project lib directory
+    "lunarblock/sha256_accel",  -- LuaRocks install path
+    "./lunarblock/sha256_accel.so",
+    "./sha256_accel.so",
+    "sha256_accel",
+  }
+
+  for _, path in ipairs(paths) do
+    local ok, lib = pcall(ffi.load, path)
+    if ok then
+      sha256_accel_lib = lib
+      local accel_type = lib.sha256_accel_init()
+      if accel_type == 1 then
+        sha256_hw_type = "sha_ni"
+      elseif accel_type == 2 then
+        sha256_hw_type = "avx2"
+      else
+        sha256_hw_type = "generic"
+      end
+      return sha256_accel_lib
+    end
+  end
+
+  -- Fallback: no acceleration available
+  sha256_hw_type = "generic"
+  return nil
+end
+
+-- Initialize on module load (non-fatal if not available)
+pcall(init_sha256_accel)
+
+-- OpenSSL EVP control constants
+local EVP_CTRL_AEAD_SET_IVLEN = 0x09
+local EVP_CTRL_AEAD_GET_TAG = 0x10
+local EVP_CTRL_AEAD_SET_TAG = 0x11
+
+-- SHA-256: single hash (uses hardware acceleration if available)
 function M.sha256(data)
+  if sha256_accel_lib then
+    local md = ffi.new("uint8_t[32]")
+    sha256_accel_lib.sha256_accel(data, #data, md)
+    return ffi.string(md, 32)
+  end
+  -- Fallback to OpenSSL
   local ctx = libcrypto.EVP_MD_CTX_new()
   assert(ctx ~= nil, "Failed to create EVP_MD_CTX")
   local md = ffi.new("unsigned char[32]")
@@ -40,14 +128,53 @@ function M.sha256(data)
   return ffi.string(md, 32)
 end
 
--- Double SHA-256: hash256 used for block hashes, txids
+-- SHA-256 streaming hasher: for incremental hashing of large data
+-- Usage: local h = crypto.sha256_init(); h.update(data1); h.update(data2); local hash = h.final()
+function M.sha256_init()
+  local ctx = libcrypto.EVP_MD_CTX_new()
+  assert(ctx ~= nil, "Failed to create EVP_MD_CTX")
+  libcrypto.EVP_DigestInit_ex(ctx, libcrypto.EVP_sha256(), nil)
+
+  local hasher = {}
+
+  function hasher.update(data)
+    libcrypto.EVP_DigestUpdate(ctx, data, #data)
+  end
+
+  function hasher.final()
+    local md = ffi.new("unsigned char[32]")
+    local md_len = ffi.new("unsigned int[1]")
+    libcrypto.EVP_DigestFinal_ex(ctx, md, md_len)
+    libcrypto.EVP_MD_CTX_free(ctx)
+    return ffi.string(md, 32)
+  end
+
+  return hasher
+end
+
+-- Double SHA-256: hash256 used for block hashes, txids (uses hardware acceleration if available)
 function M.hash256(data)
+  if sha256_accel_lib then
+    local md = ffi.new("uint8_t[32]")
+    sha256_accel_lib.sha256d_accel(data, #data, md)
+    return ffi.string(md, 32)
+  end
+  -- Fallback to two OpenSSL calls
   return M.sha256(M.sha256(data))
 end
 
 -- Double SHA-256 returning a hash256 type
 function M.hash256_type(data)
   return types.hash256(M.hash256(data))
+end
+
+-- Report which SHA-256 hardware acceleration is being used
+-- Returns: "sha_ni", "avx2", or "generic"
+function M.sha256_hw_info()
+  if sha256_hw_type == nil then
+    init_sha256_accel()
+  end
+  return sha256_hw_type or "generic"
 end
 
 -- RIPEMD-160
@@ -82,6 +209,25 @@ function M.hmac_sha512(key, data)
   )
   assert(result ~= nil, "HMAC-SHA512 failed")
   return ffi.string(md, 64)
+end
+
+-- HMAC-SHA256: used for BIP324 HKDF
+function M.hmac_sha256(key, data)
+  local md = ffi.new("unsigned char[32]")
+  local md_len = ffi.new("unsigned int[1]", 32)
+  local result = libcrypto.HMAC(
+    libcrypto.EVP_sha256(), key, #key, data, #data, md, md_len
+  )
+  assert(result ~= nil, "HMAC-SHA256 failed")
+  return ffi.string(md, 32)
+end
+
+-- Generate cryptographically secure random bytes
+function M.random_bytes(n)
+  local buf = ffi.new("unsigned char[?]", n)
+  local ret = libcrypto.RAND_bytes(buf, n)
+  assert(ret == 1, "RAND_bytes failed")
+  return ffi.string(buf, n)
 end
 
 -- libsecp256k1 FFI declarations
@@ -173,6 +319,35 @@ ffi.cdef[[
     size_t msglen,
     const secp256k1_xonly_pubkey* pubkey
   );
+
+  /* ElligatorSwift for BIP324 */
+  typedef int (*secp256k1_ellswift_xdh_hash_function)(
+    unsigned char *output,
+    const unsigned char *x32,
+    const unsigned char *ell_a64,
+    const unsigned char *ell_b64,
+    void *data
+  );
+
+  extern const secp256k1_ellswift_xdh_hash_function secp256k1_ellswift_xdh_hash_function_bip324;
+
+  int secp256k1_ellswift_create(
+    const secp256k1_context *ctx,
+    unsigned char *ell64,
+    const unsigned char *seckey32,
+    const unsigned char *auxrnd32
+  );
+
+  int secp256k1_ellswift_xdh(
+    const secp256k1_context *ctx,
+    unsigned char *output,
+    const unsigned char *ell_a64,
+    const unsigned char *ell_b64,
+    const unsigned char *seckey32,
+    int party,
+    secp256k1_ellswift_xdh_hash_function hashfp,
+    void *data
+  );
 ]]
 
 local libsecp256k1 = ffi.load("secp256k1")
@@ -245,6 +420,65 @@ function M.schnorr_verify(xonly_pubkey32, sig64, msg)
     secp_ctx, sig64, msg, #msg, pubkey
   )
   return result == 1
+end
+
+--------------------------------------------------------------------------------
+-- ElligatorSwift (BIP324)
+--------------------------------------------------------------------------------
+
+--- Create an ElligatorSwift-encoded public key from a private key.
+-- @param privkey32 string: 32-byte private key
+-- @param auxrnd32 string|nil: optional 32 bytes of randomness
+-- @return string|nil: 64-byte ElligatorSwift public key, or nil on error
+function M.ellswift_create(privkey32, auxrnd32)
+  assert(#privkey32 == 32, "private key must be 32 bytes")
+  local ell64 = ffi.new("unsigned char[64]")
+  local ret = libsecp256k1.secp256k1_ellswift_create(
+    secp_ctx, ell64, privkey32, auxrnd32 and ffi.cast("const unsigned char*", auxrnd32) or nil
+  )
+  if ret ~= 1 then
+    return nil, "ellswift_create failed"
+  end
+  return ffi.string(ell64, 64)
+end
+
+--- Perform ECDH with ElligatorSwift keys using BIP324 hash function.
+-- @param our_privkey string: our 32-byte private key
+-- @param our_ellswift string: our 64-byte ElligatorSwift public key
+-- @param their_ellswift string: their 64-byte ElligatorSwift public key
+-- @param initiator boolean: true if we initiated the connection
+-- @return string|nil: 32-byte shared secret, or nil on error
+function M.ellswift_ecdh(our_privkey, our_ellswift, their_ellswift, initiator)
+  assert(#our_privkey == 32, "private key must be 32 bytes")
+  assert(#our_ellswift == 64, "our ellswift key must be 64 bytes")
+  assert(#their_ellswift == 64, "their ellswift key must be 64 bytes")
+
+  local output = ffi.new("unsigned char[32]")
+  -- party: 0 if we are party A (initiator), 1 if we are party B (responder)
+  -- ell_a64 is always the initiator's key, ell_b64 is always the responder's key
+  local ell_a, ell_b
+  if initiator then
+    ell_a = our_ellswift
+    ell_b = their_ellswift
+  else
+    ell_a = their_ellswift
+    ell_b = our_ellswift
+  end
+
+  local ret = libsecp256k1.secp256k1_ellswift_xdh(
+    secp_ctx,
+    output,
+    ell_a,
+    ell_b,
+    our_privkey,
+    initiator and 0 or 1,
+    libsecp256k1.secp256k1_ellswift_xdh_hash_function_bip324,
+    nil
+  )
+  if ret ~= 1 then
+    return nil, "ellswift_xdh failed"
+  end
+  return ffi.string(output, 32)
 end
 
 --------------------------------------------------------------------------------
@@ -415,6 +649,193 @@ function M.compute_merkle_root(tx_hashes)
   end
 
   return types.hash256(current[1])
+end
+
+--------------------------------------------------------------------------------
+-- ChaCha20-Poly1305 AEAD (BIP324)
+--------------------------------------------------------------------------------
+
+--- ChaCha20 stream cipher for length encryption in BIP324.
+-- @param key string: 32-byte key
+-- @param nonce string: 12-byte nonce
+-- @param data string: data to encrypt/decrypt (XOR with keystream)
+-- @return string: encrypted/decrypted data
+function M.chacha20_crypt(key, nonce, data)
+  assert(#key == 32, "ChaCha20 key must be 32 bytes")
+  assert(#nonce == 12, "ChaCha20 nonce must be 12 bytes")
+
+  local ctx = libcrypto.EVP_CIPHER_CTX_new()
+  assert(ctx ~= nil, "Failed to create EVP_CIPHER_CTX")
+
+  -- Initialize ChaCha20 cipher
+  if libcrypto.EVP_EncryptInit_ex(ctx, libcrypto.EVP_chacha20(), nil, key, nonce) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_EncryptInit_ex failed")
+  end
+
+  local outbuf = ffi.new("unsigned char[?]", #data + 16)
+  local outlen = ffi.new("int[1]")
+
+  if libcrypto.EVP_EncryptUpdate(ctx, outbuf, outlen, data, #data) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_EncryptUpdate failed")
+  end
+
+  local total_len = outlen[0]
+
+  if libcrypto.EVP_EncryptFinal_ex(ctx, outbuf + total_len, outlen) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_EncryptFinal_ex failed")
+  end
+  total_len = total_len + outlen[0]
+
+  libcrypto.EVP_CIPHER_CTX_free(ctx)
+  return ffi.string(outbuf, total_len)
+end
+
+--- ChaCha20-Poly1305 AEAD encryption.
+-- @param key string: 32-byte key
+-- @param nonce string: 12-byte nonce
+-- @param plaintext string: data to encrypt
+-- @param aad string: additional authenticated data (can be empty)
+-- @return string: ciphertext || 16-byte tag
+function M.chacha20poly1305_encrypt(key, nonce, plaintext, aad)
+  assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
+  assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
+  aad = aad or ""
+
+  local ctx = libcrypto.EVP_CIPHER_CTX_new()
+  assert(ctx ~= nil, "Failed to create EVP_CIPHER_CTX")
+
+  -- Initialize cipher
+  if libcrypto.EVP_EncryptInit_ex(ctx, libcrypto.EVP_chacha20_poly1305(), nil, nil, nil) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_EncryptInit_ex failed")
+  end
+
+  -- Set nonce length (12 bytes)
+  if libcrypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nil) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_CIPHER_CTX_ctrl (IVLEN) failed")
+  end
+
+  -- Set key and nonce
+  if libcrypto.EVP_EncryptInit_ex(ctx, nil, nil, key, nonce) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_EncryptInit_ex (key/nonce) failed")
+  end
+
+  local outlen = ffi.new("int[1]")
+
+  -- Process AAD (no output)
+  if #aad > 0 then
+    if libcrypto.EVP_EncryptUpdate(ctx, nil, outlen, aad, #aad) ~= 1 then
+      libcrypto.EVP_CIPHER_CTX_free(ctx)
+      error("EVP_EncryptUpdate (AAD) failed")
+    end
+  end
+
+  -- Encrypt plaintext
+  local ciphertext = ffi.new("unsigned char[?]", #plaintext + 16)
+  if libcrypto.EVP_EncryptUpdate(ctx, ciphertext, outlen, plaintext, #plaintext) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_EncryptUpdate (plaintext) failed")
+  end
+  local cipher_len = outlen[0]
+
+  -- Finalize
+  if libcrypto.EVP_EncryptFinal_ex(ctx, ciphertext + cipher_len, outlen) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_EncryptFinal_ex failed")
+  end
+  cipher_len = cipher_len + outlen[0]
+
+  -- Get tag
+  local tag = ffi.new("unsigned char[16]")
+  if libcrypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("EVP_CIPHER_CTX_ctrl (GET_TAG) failed")
+  end
+
+  libcrypto.EVP_CIPHER_CTX_free(ctx)
+
+  return ffi.string(ciphertext, cipher_len) .. ffi.string(tag, 16)
+end
+
+--- ChaCha20-Poly1305 AEAD decryption.
+-- @param key string: 32-byte key
+-- @param nonce string: 12-byte nonce
+-- @param ciphertext_with_tag string: ciphertext || 16-byte tag
+-- @param aad string: additional authenticated data (can be empty)
+-- @return string|nil, string: plaintext on success, or nil and error message on failure
+function M.chacha20poly1305_decrypt(key, nonce, ciphertext_with_tag, aad)
+  assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
+  assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
+  aad = aad or ""
+
+  if #ciphertext_with_tag < 16 then
+    return nil, "ciphertext too short"
+  end
+
+  local cipher_len = #ciphertext_with_tag - 16
+  local ciphertext = ciphertext_with_tag:sub(1, cipher_len)
+  local tag = ciphertext_with_tag:sub(cipher_len + 1)
+
+  local ctx = libcrypto.EVP_CIPHER_CTX_new()
+  assert(ctx ~= nil, "Failed to create EVP_CIPHER_CTX")
+
+  -- Initialize cipher
+  if libcrypto.EVP_DecryptInit_ex(ctx, libcrypto.EVP_chacha20_poly1305(), nil, nil, nil) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "EVP_DecryptInit_ex failed"
+  end
+
+  -- Set nonce length (12 bytes)
+  if libcrypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nil) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "EVP_CIPHER_CTX_ctrl (IVLEN) failed"
+  end
+
+  -- Set key and nonce
+  if libcrypto.EVP_DecryptInit_ex(ctx, nil, nil, key, nonce) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "EVP_DecryptInit_ex (key/nonce) failed"
+  end
+
+  local outlen = ffi.new("int[1]")
+
+  -- Process AAD (no output)
+  if #aad > 0 then
+    if libcrypto.EVP_DecryptUpdate(ctx, nil, outlen, aad, #aad) ~= 1 then
+      libcrypto.EVP_CIPHER_CTX_free(ctx)
+      return nil, "EVP_DecryptUpdate (AAD) failed"
+    end
+  end
+
+  -- Decrypt ciphertext
+  local plaintext = ffi.new("unsigned char[?]", cipher_len + 16)
+  if libcrypto.EVP_DecryptUpdate(ctx, plaintext, outlen, ciphertext, cipher_len) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "EVP_DecryptUpdate (ciphertext) failed"
+  end
+  local plain_len = outlen[0]
+
+  -- Set expected tag
+  if libcrypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, ffi.cast("void*", tag)) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "EVP_CIPHER_CTX_ctrl (SET_TAG) failed"
+  end
+
+  -- Finalize and verify tag
+  local ret = libcrypto.EVP_DecryptFinal_ex(ctx, plaintext + plain_len, outlen)
+  libcrypto.EVP_CIPHER_CTX_free(ctx)
+
+  if ret ~= 1 then
+    return nil, "authentication failed"
+  end
+
+  plain_len = plain_len + outlen[0]
+  return ffi.string(plaintext, plain_len)
 end
 
 return M

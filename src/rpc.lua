@@ -382,12 +382,47 @@ function M.new(config)
   self.storage = config.storage
   self.network = config.network or consensus.networks.mainnet
   self.fee_estimator = config.fee_estimator
-  self.wallet = config.wallet
+  self.wallet = config.wallet  -- Legacy single wallet (for backward compat)
+  self.wallet_manager = config.wallet_manager  -- Multi-wallet manager
+  self.datadir = config.datadir
   self.mining = config.mining
   self.running = false
+  self.request_wallet = nil  -- Current request's wallet context
   -- Register built-in methods
   self:register_methods()
   return self
+end
+
+--- Get wallet for current request context.
+-- @param name string|nil: Explicit wallet name (optional)
+-- @return Wallet|nil: Wallet instance
+-- @return string|nil: Error message if wallet not found
+function RPCServer:get_request_wallet(name)
+  -- If wallet manager is available, use it
+  if self.wallet_manager then
+    if name then
+      local wallet = self.wallet_manager:get_wallet(name)
+      if not wallet then
+        return nil, "Requested wallet \"" .. name .. "\" does not exist or is not loaded"
+      end
+      return wallet
+    end
+    -- Use request context wallet if set
+    if self.request_wallet then
+      return self.request_wallet
+    end
+    -- Use default wallet
+    local wallet, _ = self.wallet_manager:get_default_wallet()
+    if not wallet then
+      return nil, "No wallet is loaded. Load a wallet with loadwallet or create one with createwallet"
+    end
+    return wallet
+  end
+  -- Legacy single wallet mode
+  if self.wallet then
+    return self.wallet
+  end
+  return nil, "No wallet is loaded"
 end
 
 --------------------------------------------------------------------------------
@@ -862,6 +897,65 @@ function RPCServer:register_methods()
     return types.hash256_hex(types.hash256_zero())
   end
 
+  -- Block invalidation methods
+  self.methods["invalidateblock"] = function(rpc, params)
+    local blockhash = params[1]
+    if type(blockhash) ~= "string" or #blockhash ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+    end
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+
+    local hash = types.hash256_from_hex(blockhash)
+
+    -- Check if the block exists
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+    local header = rpc.storage.get_header(hash)
+    if not header then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+    end
+
+    -- Invalidate the block
+    local ok, err = rpc.chain_state:invalidate_block(hash)
+    if not ok then
+      error({code = M.ERROR.MISC_ERROR, message = err or "Failed to invalidate block"})
+    end
+
+    return cjson.null
+  end
+
+  self.methods["reconsiderblock"] = function(rpc, params)
+    local blockhash = params[1]
+    if type(blockhash) ~= "string" or #blockhash ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+    end
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+
+    local hash = types.hash256_from_hex(blockhash)
+
+    -- Check if the block exists
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+    local header = rpc.storage.get_header(hash)
+    if not header then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+    end
+
+    -- Reconsider the block
+    local ok, err = rpc.chain_state:reconsider_block(hash)
+    if not ok then
+      error({code = M.ERROR.MISC_ERROR, message = err or "Failed to reconsider block"})
+    end
+
+    return cjson.null
+  end
+
   -- Mempool methods
   self.methods["getmempoolinfo"] = function(rpc, _params)
     local info
@@ -1296,6 +1390,72 @@ function RPCServer:register_methods()
       return template
     end
     error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
+  end
+
+  -- Mining RPC: generatetoaddress
+  self.methods["generatetoaddress"] = function(rpc, params)
+    local nblocks = params[1]
+    local address = params[2]
+    if type(nblocks) ~= "number" or nblocks < 1 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid nblocks"})
+    end
+    if type(address) ~= "string" or #address == 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid address"})
+    end
+    if not rpc.mining then
+      error({code = M.ERROR.MISC_ERROR, message = "Mining module not available"})
+    end
+
+    -- Decode address to script_pubkey
+    local addr_type, addr_data = address_mod.decode_address(address, rpc.network.name)
+    if not addr_type then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid address: " .. tostring(addr_data)})
+    end
+
+    local payout_script
+    if addr_type == "p2pkh" then
+      payout_script = script_mod.make_p2pkh_script(addr_data)
+    elseif addr_type == "p2sh" then
+      payout_script = script_mod.make_p2sh_script(addr_data)
+    elseif addr_type == "p2wpkh" then
+      payout_script = script_mod.make_p2wpkh_script(addr_data)
+    elseif addr_type == "p2wsh" then
+      payout_script = script_mod.make_p2wsh_script(addr_data)
+    elseif addr_type == "p2tr" then
+      payout_script = script_mod.make_p2tr_script(addr_data)
+    else
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Unsupported address type: " .. addr_type})
+    end
+
+    local block_hashes = {}
+    for _ = 1, nblocks do
+      -- Create block template
+      local _template, block = rpc.mining.create_block_template(
+        rpc.mempool, rpc.chain_state, rpc.network, payout_script
+      )
+
+      -- Mine the block (CPU mining for regtest)
+      local found, block_hash = rpc.mining.mine_block(block)
+      if not found then
+        error({code = M.ERROR.MISC_ERROR, message = "Failed to mine block (nonce exhausted)"})
+      end
+
+      -- Store the block
+      rpc.storage.put_block(block_hash, block)
+      rpc.storage.put_header(block_hash, block.header)
+      local new_height = rpc.chain_state.tip_height + 1
+      rpc.storage.put_height_index(new_height, block_hash)
+
+      -- Connect the block to chain state (skip full script validation for self-mined blocks)
+      local ok, err = rpc.chain_state:connect_block(block, new_height, block_hash, nil, nil, true)
+      if not ok then
+        error({code = M.ERROR.VERIFY_ERROR, message = "Failed to connect block: " .. tostring(err)})
+      end
+
+      block_hashes[#block_hashes + 1] = types.hash256_hex(block_hash)
+    end
+
+    return block_hashes
   end
 
   -- Utility methods
@@ -1948,6 +2108,826 @@ function RPCServer:register_methods()
 
     return addresses
   end
+
+  ----------------------------------------------------------------------------
+  -- Multi-Wallet Management RPCs
+  ----------------------------------------------------------------------------
+
+  --- createwallet: Create and load a new wallet.
+  -- @param wallet_name string: Name for the new wallet
+  -- @param disable_private_keys boolean: Disable private keys (watch-only)
+  -- @param blank boolean: Create blank wallet (no keys)
+  -- @param passphrase string: Encryption passphrase (optional)
+  -- @param descriptors boolean: Use descriptors (always true)
+  -- @return table: {name, warnings}
+  self.methods["createwallet"] = function(rpc, params)
+    if not rpc.wallet_manager then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
+    end
+
+    local wallet_name = params[1] or params.wallet_name
+    if wallet_name == nil then
+      error({code = M.ERROR.INVALID_PARAMS, message = "wallet_name is required"})
+    end
+
+    -- Parse options
+    local disable_private_keys = params[2] or params.disable_private_keys or false
+    local blank = params[3] or params.blank or false
+    local passphrase = params[4] or params.passphrase
+    -- params[5] descriptors (ignored, always true)
+    -- params[6] load_on_startup (ignored in our implementation)
+
+    local options = {
+      disable_private_keys = disable_private_keys,
+      blank = blank,
+      passphrase = passphrase,
+    }
+
+    local wallet, err = rpc.wallet_manager:create_wallet(wallet_name, options)
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err or "Failed to create wallet"})
+    end
+
+    local warnings = {}
+    if passphrase and passphrase == "" then
+      warnings[#warnings + 1] = "Empty string given as passphrase, wallet will not be encrypted."
+    end
+
+    return {
+      name = wallet_name,
+      warnings = warnings,
+    }
+  end
+
+  --- loadwallet: Load a wallet from a wallet file.
+  -- @param filename string: Wallet name (directory name under wallets/)
+  -- @param load_on_startup boolean: (ignored)
+  -- @return table: {name, warnings}
+  self.methods["loadwallet"] = function(rpc, params)
+    if not rpc.wallet_manager then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
+    end
+
+    local filename = params[1] or params.filename
+    if filename == nil then
+      error({code = M.ERROR.INVALID_PARAMS, message = "filename is required"})
+    end
+
+    local wallet, err = rpc.wallet_manager:load_wallet(filename)
+    if not wallet then
+      -- Check for specific errors
+      if err and err:find("already loaded") then
+        error({code = -35, message = err})  -- RPC_WALLET_ALREADY_LOADED
+      elseif err and err:find("not found") then
+        error({code = -18, message = err})  -- RPC_WALLET_NOT_FOUND
+      else
+        error({code = M.ERROR.WALLET_ERROR, message = err or "Failed to load wallet"})
+      end
+    end
+
+    return {
+      name = filename,
+      warnings = {},
+    }
+  end
+
+  --- unloadwallet: Unload a wallet.
+  -- @param wallet_name string: Wallet name (optional, uses request context)
+  -- @param load_on_startup boolean: (ignored)
+  -- @return table: {warnings}
+  self.methods["unloadwallet"] = function(rpc, params)
+    if not rpc.wallet_manager then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
+    end
+
+    -- Get wallet name from params or request context
+    local wallet_name = params[1] or params.wallet_name
+    if wallet_name == nil then
+      -- Try to get from request context
+      if rpc.request_wallet then
+        -- Find name by matching wallet instance
+        for name, w in pairs(rpc.wallet_manager.wallets) do
+          if w == rpc.request_wallet then
+            wallet_name = name
+            break
+          end
+        end
+      end
+      if wallet_name == nil then
+        -- Use default wallet
+        local _, name = rpc.wallet_manager:get_default_wallet()
+        wallet_name = name
+      end
+    end
+
+    if wallet_name == nil then
+      error({code = M.ERROR.WALLET_ERROR, message = "No wallet specified and no default wallet loaded"})
+    end
+
+    local ok, err = rpc.wallet_manager:unload_wallet(wallet_name)
+    if not ok then
+      if err and err:find("not loaded") then
+        error({code = -18, message = err})  -- RPC_WALLET_NOT_FOUND
+      else
+        error({code = M.ERROR.WALLET_ERROR, message = err or "Failed to unload wallet"})
+      end
+    end
+
+    return {
+      warnings = {},
+    }
+  end
+
+  --- listwallets: List currently loaded wallets.
+  -- @return table: Array of wallet names
+  self.methods["listwallets"] = function(rpc, _params)
+    if not rpc.wallet_manager then
+      -- Legacy mode: return single wallet or empty
+      if rpc.wallet then
+        return {""}
+      end
+      return {}
+    end
+
+    return rpc.wallet_manager:list_wallets()
+  end
+
+  --- listwalletdir: List wallets in the wallet directory.
+  -- @return table: {wallets: [{name, warnings}]}
+  self.methods["listwalletdir"] = function(rpc, _params)
+    if not rpc.wallet_manager then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
+    end
+
+    local wallet_list = rpc.wallet_manager:list_wallet_dir()
+    local wallets = {}
+    for _, info in ipairs(wallet_list) do
+      wallets[#wallets + 1] = {
+        name = info.name,
+      }
+    end
+
+    return {
+      wallets = wallets,
+    }
+  end
+
+  --- getwalletinfo: Get wallet state info.
+  -- @return table: Wallet information
+  self.methods["getwalletinfo"] = function(rpc, _params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    -- Find wallet name
+    local wallet_name = ""
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then
+          wallet_name = name
+          break
+        end
+      end
+    end
+
+    return {
+      walletname = wallet_name,
+      walletversion = 1,
+      format = "json",
+      txcount = 0,  -- TODO: track transactions
+      keypoolsize = wallet.gap_limit - wallet.next_external_index,
+      keypoolsize_hd_internal = wallet.gap_limit - wallet.next_internal_index,
+      private_keys_enabled = not wallet.is_locked and wallet.master_key ~= nil,
+      avoid_reuse = false,
+      scanning = false,
+      descriptors = true,
+      external_signer = false,
+      blank = wallet.master_key == nil and wallet.encrypted_master_key == nil,
+    }
+  end
+
+  --- getnewaddress: Get a new receiving address.
+  -- @param label string: (ignored)
+  -- @param address_type string: Address type (optional)
+  -- @return string: New address
+  self.methods["getnewaddress"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    if wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+
+    -- params[1] is label (ignored), params[2] is address_type
+    local address_type = params[2] or params.address_type
+    if address_type and address_type ~= wallet.address_type then
+      -- Temporarily change address type
+      local old_type = wallet.address_type
+      wallet.address_type = address_type
+      local addr = wallet:get_new_address()
+      wallet.address_type = old_type
+      return addr
+    end
+
+    return wallet:get_new_address()
+  end
+
+  --- getbalance: Get wallet balance.
+  -- @return number: Balance in BTC
+  self.methods["getbalance"] = function(rpc, _params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    -- Rescan UTXOs if chain_state is available
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+    end
+
+    local balance = wallet:get_balance()
+    return balance / 100000000  -- Convert satoshis to BTC
+  end
+
+  --- getbalances: Get detailed balance info.
+  -- @return table: Balance details
+  self.methods["getbalances"] = function(rpc, _params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    -- Rescan UTXOs if chain_state is available
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+    end
+    if rpc.mempool then
+      wallet:scan_mempool(rpc.mempool)
+    end
+
+    local details = wallet:get_balance_details()
+    return {
+      mine = {
+        trusted = details.confirmed / 100000000,
+        untrusted_pending = details.unconfirmed / 100000000,
+        immature = 0,
+      },
+      watchonly = {
+        trusted = 0,
+        untrusted_pending = 0,
+        immature = 0,
+      },
+    }
+  end
+
+  --- listunspent: List unspent transaction outputs.
+  -- @return table: Array of UTXOs
+  self.methods["listunspent"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    -- Rescan UTXOs if chain_state is available
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+    end
+
+    local min_conf = params[1] or params.minconf or 1
+    local include_unconfirmed = min_conf == 0
+
+    local utxos = wallet:list_unspent(include_unconfirmed)
+    local result = {}
+    for _, u in ipairs(utxos) do
+      result[#result + 1] = {
+        txid = u.txid,
+        vout = u.vout,
+        address = u.address,
+        amount = u.value / 100000000,
+        confirmations = u.confirmations or 0,
+        spendable = true,
+        solvable = true,
+        safe = (u.confirmations or 0) >= min_conf,
+      }
+    end
+
+    return result
+  end
+
+  --- sendtoaddress: Send to a Bitcoin address.
+  -- @param address string: Recipient address
+  -- @param amount number: Amount in BTC
+  -- @return string: Transaction ID
+  self.methods["sendtoaddress"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+
+    if wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+
+    local addr = params[1] or params.address
+    local amount = params[2] or params.amount
+
+    if not addr then
+      error({code = M.ERROR.INVALID_PARAMS, message = "address is required"})
+    end
+    if not amount then
+      error({code = M.ERROR.INVALID_PARAMS, message = "amount is required"})
+    end
+
+    -- Convert BTC to satoshis
+    local amount_sat = math.floor(amount * 100000000 + 0.5)
+
+    -- Rescan UTXOs
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+    end
+
+    -- Set mempool for transaction submission
+    if rpc.mempool then
+      wallet:set_mempool(rpc.mempool)
+    end
+
+    -- Create and send transaction
+    local recipients = {{address = addr, amount = amount_sat}}
+    local tx, err = wallet:send_to(recipients)
+    if not tx then
+      error({code = M.ERROR.WALLET_ERROR, message = err or "Failed to create transaction"})
+    end
+
+    -- Return txid as hex
+    local crypto = require("lunarblock.crypto")
+    local txid = crypto.sha256d(rpc.storage and
+      require("lunarblock.serialize").serialize_transaction(tx, false) or
+      tx.txid or "")
+    return M.hex_encode(txid:reverse())
+  end
+
+  --- walletpassphrase: Unlock wallet with passphrase.
+  -- @param passphrase string: Wallet passphrase
+  -- @param timeout number: Seconds to keep unlocked (ignored, stays unlocked)
+  self.methods["walletpassphrase"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    local passphrase = params[1] or params.passphrase
+    if not passphrase then
+      error({code = M.ERROR.INVALID_PARAMS, message = "passphrase is required"})
+    end
+
+    local ok, unlock_err = wallet:unlock(passphrase)
+    if not ok then
+      error({code = M.ERROR.WALLET_ERROR, message = unlock_err or "Wrong passphrase"})
+    end
+
+    return cjson.null
+  end
+
+  --- walletlock: Lock the wallet.
+  self.methods["walletlock"] = function(rpc, _params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    if not wallet.is_encrypted then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is not encrypted"})
+    end
+
+    wallet:lock()
+    return cjson.null
+  end
+
+  --- encryptwallet: Encrypt the wallet with a passphrase.
+  -- @param passphrase string: Encryption passphrase
+  self.methods["encryptwallet"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    if wallet.is_encrypted then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is already encrypted"})
+    end
+
+    local passphrase = params[1] or params.passphrase
+    if not passphrase or passphrase == "" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "passphrase is required"})
+    end
+
+    wallet:encrypt(passphrase)
+
+    -- Save wallet
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then
+          local path = rpc.wallet_manager:get_wallet_path(name)
+          wallet:save(path)
+          break
+        end
+      end
+    end
+
+    return "wallet encrypted; The keypool has been flushed and a new HD seed was generated."
+  end
+
+  --- walletpassphrasechange: Change wallet passphrase.
+  -- @param oldpassphrase string: Current passphrase
+  -- @param newpassphrase string: New passphrase
+  self.methods["walletpassphrasechange"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    local old_pass = params[1] or params.oldpassphrase
+    local new_pass = params[2] or params.newpassphrase
+
+    if not old_pass then
+      error({code = M.ERROR.INVALID_PARAMS, message = "oldpassphrase is required"})
+    end
+    if not new_pass then
+      error({code = M.ERROR.INVALID_PARAMS, message = "newpassphrase is required"})
+    end
+
+    local ok, change_err = wallet:change_passphrase(old_pass, new_pass)
+    if not ok then
+      error({code = M.ERROR.WALLET_ERROR, message = change_err or "Wrong passphrase"})
+    end
+
+    -- Save wallet
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then
+          local path = rpc.wallet_manager:get_wallet_path(name)
+          wallet:save(path)
+          break
+        end
+      end
+    end
+
+    return cjson.null
+  end
+
+  --- dumpprivkey: Dump private key for an address.
+  -- @param address string: Address to dump key for
+  -- @return string: Private key in WIF format
+  self.methods["dumpprivkey"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    if wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+
+    local addr = params[1] or params.address
+    if not addr then
+      error({code = M.ERROR.INVALID_PARAMS, message = "address is required"})
+    end
+
+    local wif, dump_err = wallet:dump_privkey(addr)
+    if not wif then
+      error({code = M.ERROR.WALLET_ERROR, message = dump_err or "Address not found in wallet"})
+    end
+
+    return wif
+  end
+
+  --- importprivkey: Import a private key.
+  -- @param privkey string: Private key in WIF format
+  -- @param label string: (ignored)
+  -- @param rescan boolean: (ignored)
+  self.methods["importprivkey"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    if wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+
+    local wif = params[1] or params.privkey
+    if not wif then
+      error({code = M.ERROR.INVALID_PARAMS, message = "privkey is required"})
+    end
+
+    local addr, import_err = wallet:import_privkey(wif)
+    if not addr then
+      error({code = M.ERROR.WALLET_ERROR, message = import_err or "Invalid private key"})
+    end
+
+    -- Save wallet
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then
+          local path = rpc.wallet_manager:get_wallet_path(name)
+          wallet:save(path)
+          break
+        end
+      end
+    end
+
+    return cjson.null
+  end
+
+  ----------------------------------------------------------------------------
+  -- Additional Blockchain / Mining / Mempool RPCs
+  ----------------------------------------------------------------------------
+
+  --- getblockheader: Return block header by hash.
+  -- @param hash string: Block hash hex
+  -- @param verbose boolean: true for JSON, false for raw hex (default true)
+  self.methods["getblockheader"] = function(rpc, params)
+    local blockhash = params[1]
+    local verbose = params[2]
+    if verbose == nil or verbose == cjson.null then verbose = true end
+
+    if type(blockhash) ~= "string" or #blockhash ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+    end
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    local hash = types.hash256_from_hex(blockhash)
+    local header = rpc.storage.get_header(hash)
+    if not header then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+    end
+
+    -- Verbosity false: return serialized header hex
+    if not verbose then
+      return M.hex_encode(serialize.serialize_block_header(header))
+    end
+
+    -- Look up height
+    local block_height = nil
+    if rpc.chain_state and rpc.chain_state.tip_height and rpc.storage.get_hash_by_height then
+      for h = 0, rpc.chain_state.tip_height do
+        local hh = rpc.storage.get_hash_by_height(h)
+        if hh and hh.bytes == hash.bytes then
+          block_height = h
+          break
+        end
+      end
+    end
+
+    local confirmations = 1
+    if block_height and rpc.chain_state and rpc.chain_state.tip_height then
+      confirmations = rpc.chain_state.tip_height - block_height + 1
+    end
+
+    local difficulty = calculate_difficulty(header.bits)
+    local mediantime = get_median_time_past(rpc.storage, hash)
+
+    local nextblockhash = nil
+    if block_height and rpc.storage.get_hash_by_height then
+      local nh = rpc.storage.get_hash_by_height(block_height + 1)
+      if nh then nextblockhash = types.hash256_hex(nh) end
+    end
+
+    local previousblockhash = nil
+    local zero_hash = string.rep("\0", 32)
+    if header.prev_hash and header.prev_hash.bytes ~= zero_hash then
+      previousblockhash = types.hash256_hex(header.prev_hash)
+    end
+
+    return {
+      hash = blockhash,
+      confirmations = confirmations,
+      height = block_height or 0,
+      version = header.version,
+      versionHex = string.format("%08x", header.version),
+      merkleroot = types.hash256_hex(header.merkle_root),
+      time = header.timestamp,
+      mediantime = mediantime,
+      nonce = header.nonce,
+      bits = string.format("%08x", header.bits),
+      difficulty = difficulty,
+      chainwork = string.rep("0", 64),
+      nTx = 0,
+      previousblockhash = previousblockhash,
+      nextblockhash = nextblockhash,
+    }
+  end
+
+  --- getchaintips: Return information about all known chain tips.
+  self.methods["getchaintips"] = function(rpc, _params)
+    local tip_height = 0
+    local tip_hash = types.hash256_zero()
+    if rpc.chain_state then
+      tip_height = rpc.chain_state.tip_height or 0
+      tip_hash = rpc.chain_state.tip_hash or types.hash256_zero()
+    end
+    return {{
+      height = tip_height,
+      hash = types.hash256_hex(tip_hash),
+      branchlen = 0,
+      status = "active",
+    }}
+  end
+
+  --- getdifficulty: Return the proof-of-work difficulty as a multiple of minimum.
+  self.methods["getdifficulty"] = function(rpc, _params)
+    local current_bits = rpc.network.pow_limit_bits
+    if rpc.chain_state and rpc.storage then
+      local tip_hash = rpc.chain_state.tip_hash
+      if tip_hash then
+        local header = rpc.storage.get_header(tip_hash)
+        if header then
+          current_bits = header.bits
+        end
+      end
+    end
+    return calculate_difficulty(current_bits)
+  end
+
+  --- submitblock: Submit a new block to the network.
+  -- @param hexdata string: Block data in hex
+  self.methods["submitblock"] = function(rpc, params)
+    local hexdata = params[1]
+    if type(hexdata) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Block hex data required"})
+    end
+
+    local raw = M.hex_decode(hexdata)
+    local ok_deser, block = pcall(serialize.deserialize_block, raw)
+    if not ok_deser or not block then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block decode failed"})
+    end
+
+    -- Basic validation
+    local ok_val, val_err = pcall(validation.check_block, block)
+    if not ok_val then
+      return tostring(val_err)
+    end
+    if not val_err then
+      return "invalid"
+    end
+
+    -- If chain_state has a connect_block method, use it
+    if rpc.chain_state and rpc.chain_state.connect_block then
+      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block)
+      if not ok_conn then
+        return tostring(conn_err)
+      end
+      if not conn_err then
+        return "invalid"
+      end
+    end
+
+    -- Notify mempool of new block
+    if rpc.mempool then
+      rpc.mempool:on_block_connected(block)
+    end
+
+    return cjson.null  -- success
+  end
+
+  --- getmininginfo: Return mining-related information.
+  self.methods["getmininginfo"] = function(rpc, _params)
+    local tip_height = 0
+    local difficulty = 1.0
+    local current_bits = rpc.network.pow_limit_bits
+
+    if rpc.chain_state then
+      tip_height = rpc.chain_state.tip_height or 0
+      if rpc.storage and rpc.chain_state.tip_hash then
+        local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
+        if header then
+          current_bits = header.bits
+          difficulty = calculate_difficulty(header.bits)
+        end
+      end
+    end
+
+    local pooledtx = 0
+    if rpc.mempool then
+      pooledtx = rpc.mempool.tx_count or 0
+    end
+
+    return {
+      blocks = tip_height,
+      difficulty = difficulty,
+      networkhashps = 0,
+      pooledtx = pooledtx,
+      chain = rpc.network.name,
+    }
+  end
+
+  --- listtransactions: Return recent transactions for a wallet.
+  -- @param label string: Label filter (unused, "*" for all)
+  -- @param count number: Number of transactions (default 10)
+  -- @param skip number: Number to skip (default 0)
+  self.methods["listtransactions"] = function(rpc, params)
+    local _label = params[1] or "*"
+    local count = params[2] or 10
+    local skip = params[3] or 0
+
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    -- If the wallet has a get_transactions method, use it
+    if wallet.get_transactions then
+      local txns = wallet:get_transactions(count, skip)
+      return txns or {}
+    end
+
+    -- Fallback: return empty list
+    return {}
+  end
+
+  --- testmempoolaccept: Dry-run mempool validation for raw transactions.
+  -- @param rawtxs table: Array of hex-encoded raw transactions
+  self.methods["testmempoolaccept"] = function(rpc, params)
+    local rawtxs = params[1]
+    if type(rawtxs) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "rawtxs must be an array"})
+    end
+
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+
+    local results = {}
+    for _, hex in ipairs(rawtxs) do
+      local entry = {txid = "", allowed = false}
+      local ok_d, tx = pcall(function()
+        local raw = M.hex_decode(hex)
+        return serialize.deserialize_transaction(raw)
+      end)
+      if not ok_d or not tx then
+        entry["reject-reason"] = "decode-failed"
+        results[#results + 1] = entry
+      else
+        local txid = validation.compute_txid(tx)
+        entry.txid = types.hash256_hex(txid)
+        -- Check basic structure
+        local ok_chk, chk_ok, is_coinbase = pcall(validation.check_transaction, tx)
+        if not ok_chk or not chk_ok then
+          entry["reject-reason"] = "invalid-structure"
+        elseif is_coinbase then
+          entry["reject-reason"] = "coinbase"
+        elseif rpc.mempool.entries[entry.txid] then
+          entry["reject-reason"] = "txn-already-in-mempool"
+        else
+          -- Dry-run: attempt acceptance and then roll back
+          -- For simplicity, just check if accept_transaction would succeed
+          -- without actually modifying the mempool.
+          -- We use a lightweight check here.
+          local weight = validation.get_tx_weight(tx)
+          local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+          entry.vsize = vsize
+          entry.allowed = true
+          -- Try to compute fees
+          local input_total = 0
+          local missing = false
+          for _, inp in ipairs(tx.inputs) do
+            local mempool_mod = require("lunarblock.mempool")
+            local outpoint_key = mempool_mod.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+            local utxo = rpc.chain_state and rpc.chain_state.coin_view and
+                         rpc.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+            if utxo then
+              input_total = input_total + utxo.value
+            else
+              missing = true
+            end
+          end
+          if missing then
+            entry.allowed = false
+            entry["reject-reason"] = "missing-inputs"
+          else
+            local output_total = 0
+            for _, out in ipairs(tx.outputs) do
+              output_total = output_total + out.value
+            end
+            local fee = input_total - output_total
+            if fee < 0 then
+              entry.allowed = false
+              entry["reject-reason"] = "outputs-exceed-inputs"
+            else
+              entry.fees = {base = fee / 1e8}
+            end
+          end
+        end
+        results[#results + 1] = entry
+      end
+    end
+    return results
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -2004,9 +2984,6 @@ function RPCServer:tick()
     return
   end
 
-  -- Suppress unused warning
-  local _ = path
-
   -- Check authentication
   if self.password ~= "" and not M.check_auth(headers, self.username, self.password) then
     client:send(M.build_http_response(401, '{"error":"Unauthorized"}'))
@@ -2014,14 +2991,34 @@ function RPCServer:tick()
     return
   end
 
+  -- Extract wallet name from path: /wallet/<name>
+  local wallet_name = nil
+  if path and path:match("^/wallet/") then
+    wallet_name = path:match("^/wallet/(.+)$") or ""
+  elseif path and path == "/wallet/" then
+    wallet_name = ""
+  end
+
+  -- Set request wallet context
+  self.request_wallet = nil
+  if wallet_name and self.wallet_manager then
+    local wallet = self.wallet_manager:get_wallet(wallet_name)
+    if wallet then
+      self.request_wallet = wallet
+    end
+  end
+
   -- Handle JSON-RPC
   if method == "POST" then
-    local response_body, status_override = self:handle_request(body)
+    local response_body, status_override = self:handle_request(body, wallet_name)
     local status = status_override or 200
     client:send(M.build_http_response(status, response_body))
   else
     client:send(M.build_http_response(404, '{"error":"Not found"}'))
   end
+
+  -- Clear request context
+  self.request_wallet = nil
 
   client:close()
 end

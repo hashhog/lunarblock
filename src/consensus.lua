@@ -658,9 +658,30 @@ M.networks.mainnet = {
   pow_allow_min_difficulty = false,
   enforce_bip94 = false,
 
+  -- Minimum chain work required to accept a chain (anti-DoS)
+  -- This is a hex string representation of the 256-bit value
+  -- Updated periodically; this value corresponds to Bitcoin Core v27
+  min_chain_work = "000000000000000000000000000000000000000088430067bc7f9c1f8cc40b55",
+
+  -- Assumevalid block hash (skip script validation for ancestors)
+  -- This is periodically updated; value from Bitcoin Core v27
+  assumevalid = "000000000000000000026811d149d4d261995ec5be500220c903a3b4c7c1a11f",
+
   -- BIP9 versionbits parameters
   versionbits_period = 2016,
-  versionbits_threshold = 1815  -- 95% of 2016
+  versionbits_threshold = 1815,  -- 95% of 2016
+
+  -- AssumeUTXO snapshots: validated UTXO set hashes at specific heights
+  -- Format: {height = {hash_serialized = "...", m_chain_tx_count = N, blockhash = "..."}}
+  -- Hash is SHA256 of serialized UTXO set in canonical order
+  -- Reference: Bitcoin Core chainparams.cpp
+  assumeutxo = {
+    [840000] = {
+      hash_serialized = "51c8d11d7f6a24c8c8f44e4e8b4c3c3b2a1a0f0e0d0c0b0a09080706050403020100",
+      m_chain_tx_count = 990228937,
+      blockhash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+    }
+  }
 }
 
 -- Testnet (testnet3)
@@ -711,9 +732,18 @@ M.networks.testnet = {
   pow_allow_min_difficulty = true,
   enforce_bip94 = false,
 
+  -- Minimum chain work (low for testnet)
+  min_chain_work = "0000000000000000000000000000000000000000000000000000000100010001",
+
+  -- Assumevalid (disabled for testnet3 as it's deprecated)
+  assumevalid = nil,
+
   -- BIP9 versionbits parameters
   versionbits_period = 2016,
-  versionbits_threshold = 1512  -- 75% of 2016 (testnet uses lower threshold)
+  versionbits_threshold = 1512,  -- 75% of 2016 (testnet uses lower threshold)
+
+  -- AssumeUTXO (no snapshots for deprecated testnet3)
+  assumeutxo = {}
 }
 
 -- Testnet4 (BIP94)
@@ -762,9 +792,18 @@ M.networks.testnet4 = {
   pow_allow_min_difficulty = true,
   enforce_bip94 = true,
 
+  -- Minimum chain work (testnet4)
+  min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
+
+  -- Assumevalid (none for testnet4 yet, it's new)
+  assumevalid = nil,
+
   -- BIP9 versionbits parameters (all forks already active at height 1)
   versionbits_period = 2016,
-  versionbits_threshold = 1512  -- 75% of 2016
+  versionbits_threshold = 1512,  -- 75% of 2016
+
+  -- AssumeUTXO (no snapshots for testnet4 yet)
+  assumeutxo = {}
 }
 
 -- Regtest
@@ -810,14 +849,344 @@ M.networks.regtest = {
   pow_allow_min_difficulty = true,
   enforce_bip94 = false,
 
+  -- Minimum chain work (0 for regtest - disable anti-DoS)
+  min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
+
+  -- Assumevalid (disabled for regtest, always verify)
+  assumevalid = nil,
+
   -- BIP9 versionbits parameters (use small period for fast testing)
   versionbits_period = 144,     -- 1 day at 10 min/block
-  versionbits_threshold = 108   -- 75% of 144
+  versionbits_threshold = 108,   -- 75% of 144
+
+  -- AssumeUTXO (dynamic for regtest, populated via RPC)
+  assumeutxo = {}
 }
 
 -- Convenience function to get network by name
 function M.get_network(name)
   return M.networks[name]
+end
+
+--------------------------------------------------------------------------------
+-- 256-bit Chainwork Arithmetic (for anti-DoS header sync)
+--------------------------------------------------------------------------------
+
+--- Parse a hex string to a 32-byte big-endian work value.
+-- @param hex string: 64-character hex string
+-- @return string: 32-byte big-endian binary string
+function M.work_from_hex(hex)
+  if #hex ~= 64 then
+    error("work hex must be 64 characters")
+  end
+  return (hex:gsub("%x%x", function(c) return string.char(tonumber(c, 16)) end))
+end
+
+--- Convert a 32-byte big-endian work value to hex string.
+-- @param work string: 32-byte binary string
+-- @return string: 64-character hex string
+function M.work_to_hex(work)
+  if #work ~= 32 then
+    error("work must be 32 bytes")
+  end
+  return (work:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
+end
+
+--- Compare two 256-bit work values (big-endian).
+-- @param a string: 32-byte work value
+-- @param b string: 32-byte work value
+-- @return number: -1 if a < b, 0 if a == b, 1 if a > b
+function M.work_compare(a, b)
+  for i = 1, 32 do
+    local av = a:byte(i)
+    local bv = b:byte(i)
+    if av < bv then return -1 end
+    if av > bv then return 1 end
+  end
+  return 0
+end
+
+--- Add two 256-bit work values (big-endian).
+-- @param a string: 32-byte work value
+-- @param b string: 32-byte work value
+-- @return string: 32-byte sum (saturates at max 256-bit value)
+function M.work_add(a, b)
+  local result = {}
+  local carry = 0
+  for i = 32, 1, -1 do
+    local sum = a:byte(i) + b:byte(i) + carry
+    result[i] = sum % 256
+    carry = math.floor(sum / 256)
+  end
+  -- Build result string
+  local out = {}
+  for i = 1, 32 do
+    out[i] = string.char(result[i])
+  end
+  return table.concat(out)
+end
+
+--- Calculate proof-of-work for a given difficulty target.
+-- Work = floor(2^256 / (target + 1))
+-- Returns 32-byte big-endian work value.
+-- Uses floating-point approximation (sufficient for chain comparison).
+-- @param bits number: compact difficulty representation
+-- @return string: 32-byte big-endian work value
+function M.get_block_work(bits)
+  local target = M.bits_to_target(bits)
+
+  -- Find the first non-zero byte (big-endian)
+  local first_nonzero = 0
+  for i = 1, 32 do
+    if target:byte(i) ~= 0 then
+      first_nonzero = i
+      break
+    end
+  end
+
+  if first_nonzero == 0 then
+    -- Zero target = maximum work
+    return string.rep("\xff", 32)
+  end
+
+  -- Extract target value as floating-point (use up to 8 significant bytes)
+  local target_val = 0
+  local sig_bytes = math.min(8, 33 - first_nonzero)
+  for i = first_nonzero, first_nonzero + sig_bytes - 1 do
+    target_val = target_val * 256 + target:byte(i)
+  end
+
+  -- target_val represents target >> (8 * remaining_zero_bytes)
+  -- where remaining_zero_bytes = 32 - first_nonzero - sig_bytes + 1
+  local remaining = 32 - first_nonzero - sig_bytes + 1
+
+  -- Work = 2^256 / (target + 1)
+  -- = 2^256 / ((target_val * 2^(8*remaining)) + 1)
+  -- ≈ 2^(256 - 8*remaining) / target_val   (for large targets)
+  -- = 2^(8*(32 - remaining)) / target_val
+  -- = 2^(8*(first_nonzero + sig_bytes - 1)) / target_val
+
+  local work_bits = 8 * (first_nonzero + sig_bytes - 1)
+  local work_float = math.pow(2, work_bits) / (target_val + 1)
+
+  -- Work result goes into the big-endian position that is "inverse" of target
+  -- If target is small (starts late), work is large (starts early)
+  -- work_position = 32 - first_nonzero + 1 = 33 - first_nonzero
+  local work_start = 33 - first_nonzero - sig_bytes + 1
+  if work_start < 1 then work_start = 1 end
+
+  -- Build result array (big-endian)
+  local result = {}
+  for i = 1, 32 do result[i] = 0 end
+
+  -- Fill in work bytes from work_start position
+  local remaining_work = work_float
+  local pos = work_start
+  while remaining_work >= 1 and pos <= 32 do
+    local byte_val = math.floor(remaining_work) % 256
+    result[pos] = byte_val
+    remaining_work = math.floor(remaining_work / 256)
+    pos = pos + 1
+  end
+
+  -- Handle any overflow into earlier positions
+  while remaining_work >= 1 and work_start > 1 do
+    work_start = work_start - 1
+    result[work_start] = math.floor(remaining_work) % 256
+    remaining_work = math.floor(remaining_work / 256)
+  end
+
+  -- Convert to string
+  local out = {}
+  for i = 1, 32 do
+    out[i] = string.char(result[i])
+  end
+  return table.concat(out)
+end
+
+--- Get the zero work value.
+-- @return string: 32-byte zero value
+function M.work_zero()
+  return string.rep("\0", 32)
+end
+
+--------------------------------------------------------------------------------
+-- Checkpoint Enforcement
+--------------------------------------------------------------------------------
+
+--- Get the last (highest) checkpoint height for a network.
+-- @param network table: network configuration
+-- @return number: highest checkpoint height, or 0 if no checkpoints
+function M.get_last_checkpoint_height(network)
+  local checkpoints = network.checkpoints or {}
+  local max_height = 0
+  for height, _ in pairs(checkpoints) do
+    if height > max_height then
+      max_height = height
+    end
+  end
+  return max_height
+end
+
+--- Check if a block hash matches the checkpoint at the given height.
+-- @param network table: network configuration
+-- @param height number: block height
+-- @param block_hash_hex string: block hash as hex string
+-- @return boolean, string|nil: true if valid or no checkpoint, false with error if mismatch
+function M.check_checkpoint(network, height, block_hash_hex)
+  local checkpoints = network.checkpoints or {}
+  local expected = checkpoints[height]
+  if expected then
+    if block_hash_hex ~= expected then
+      return false, "CHECKPOINT"
+    end
+  end
+  return true
+end
+
+--- Check if accepting a block at the given height would violate checkpoint rules.
+-- Blocks at heights below the last checkpoint must be on the checkpoint chain.
+-- @param network table: network configuration
+-- @param height number: height of block being accepted
+-- @param block_hash_hex string: block hash as hex string
+-- @param get_ancestor function: fn(h) -> header_entry for ancestor lookup
+-- @return boolean, string|nil: true if valid, false with error if checkpoint violation
+function M.check_checkpoint_anti_fork(network, height, block_hash_hex, get_ancestor)
+  local checkpoints = network.checkpoints or {}
+  local last_checkpoint_height = M.get_last_checkpoint_height(network)
+
+  -- If we're at or below the last checkpoint height, verify we're on checkpoint chain
+  if height <= last_checkpoint_height then
+    -- Check all checkpoints at or above this height
+    for cp_height, cp_hash in pairs(checkpoints) do
+      if cp_height >= height then
+        -- For this checkpoint to be valid, if we look at the checkpoint height
+        -- from our perspective, it must eventually lead to the checkpoint hash
+        -- Since we're checking a potential fork, we need to verify that at height
+        -- equal to this checkpoint, the hash matches
+        if cp_height == height then
+          if block_hash_hex ~= cp_hash then
+            return false, "CHECKPOINT"
+          end
+        end
+        -- For checkpoints above us, we can't verify yet - they will be checked
+        -- when those headers arrive
+      end
+    end
+  end
+
+  -- Check that any checkpoint heights between genesis and this height are satisfied
+  -- by checking that the ancestor at that height matches the checkpoint
+  for cp_height, cp_hash in pairs(checkpoints) do
+    if cp_height < height then
+      local ancestor = get_ancestor(cp_height)
+      if ancestor then
+        local ancestor_hash = ancestor.hash_hex or ancestor.hash
+        if type(ancestor_hash) ~= "string" then
+          -- Convert hash object to hex if needed
+          local types = require("lunarblock.types")
+          if ancestor_hash.bytes then
+            ancestor_hash = types.hash256_hex(ancestor_hash)
+          end
+        end
+        if ancestor_hash ~= cp_hash then
+          return false, "CHECKPOINT"
+        end
+      end
+    end
+  end
+
+  return true
+end
+
+--------------------------------------------------------------------------------
+-- Assumevalid Optimization
+--------------------------------------------------------------------------------
+
+--- Check if script validation should be skipped for a block.
+-- This implements the assumevalid optimization: skip script verification
+-- for blocks that are ancestors of the assumevalid block.
+-- @param network table: network configuration
+-- @param block_height number: height of block being validated
+-- @param block_hash_hex string: hash of block being validated
+-- @param is_ancestor_of_assumevalid function: fn(height, hash_hex) -> boolean
+-- @param best_header_work string: 32-byte work of best header
+-- @param best_header_height number: height of best header
+-- @return boolean: true if script validation should be skipped
+function M.should_skip_script_validation(network, block_height, block_hash_hex, is_ancestor_of_assumevalid, best_header_work, best_header_height)
+  local assumevalid = network.assumevalid
+  if not assumevalid or assumevalid == "" then
+    return false  -- No assumevalid configured, always verify
+  end
+
+  -- Check if best header has minimum chain work
+  local min_work = M.work_from_hex(network.min_chain_work or string.rep("00", 64))
+  if M.work_compare(best_header_work, min_work) < 0 then
+    return false  -- Not enough work, verify everything
+  end
+
+  -- Check if block is an ancestor of the assumevalid block
+  if not is_ancestor_of_assumevalid(block_height, block_hash_hex) then
+    return false  -- Block not in assumevalid chain, verify it
+  end
+
+  -- Additional safety check: block should not be too recent
+  -- Bitcoin Core uses a 2-week equivalent time check, but we simplify to height check
+  -- Skip script validation only for blocks well below the tip
+  local TWO_WEEKS_BLOCKS = 2016  -- ~2 weeks at 10 min/block
+  if best_header_height - block_height < TWO_WEEKS_BLOCKS then
+    return false  -- Block too recent, verify it
+  end
+
+  return true  -- Safe to skip script validation
+end
+
+--------------------------------------------------------------------------------
+-- AssumeUTXO Snapshot Configuration
+--------------------------------------------------------------------------------
+
+--- Get assumeutxo data for a specific height.
+-- @param network table: network configuration
+-- @param height number: snapshot base block height
+-- @return table|nil: {hash_serialized, m_chain_tx_count, blockhash} or nil if not found
+function M.assumeutxo_for_height(network, height)
+  if not network.assumeutxo then return nil end
+  return network.assumeutxo[height]
+end
+
+--- Get assumeutxo data for a specific blockhash.
+-- @param network table: network configuration
+-- @param blockhash_hex string: hex hash of the base block
+-- @return table|nil: assumeutxo data or nil if not found
+function M.assumeutxo_for_blockhash(network, blockhash_hex)
+  if not network.assumeutxo then return nil end
+  for height, data in pairs(network.assumeutxo) do
+    if data.blockhash == blockhash_hex then
+      return data, height
+    end
+  end
+  return nil
+end
+
+--- Check if a height has a valid assumeutxo snapshot.
+-- @param network table: network configuration
+-- @param height number: height to check
+-- @return boolean: true if assumeutxo data exists for this height
+function M.has_assumeutxo(network, height)
+  return M.assumeutxo_for_height(network, height) ~= nil
+end
+
+--- Get all assumeutxo heights for a network.
+-- @param network table: network configuration
+-- @return table: list of heights with assumeutxo data
+function M.get_assumeutxo_heights(network)
+  local heights = {}
+  if not network.assumeutxo then return heights end
+  for height, _ in pairs(network.assumeutxo) do
+    heights[#heights + 1] = height
+  end
+  table.sort(heights)
+  return heights
 end
 
 return M

@@ -871,6 +871,162 @@ describe("script", function()
     end)
   end)
 
+  describe("is_push_only", function()
+    it("returns true for OP_0", function()
+      assert.is_true(script.is_push_only("\x00"))
+    end)
+
+    it("returns true for direct push (1-75 bytes)", function()
+      -- 5-byte push
+      assert.is_true(script.is_push_only("\x05hello"))
+    end)
+
+    it("returns true for OP_PUSHDATA1", function()
+      -- PUSHDATA1 with 76 bytes
+      local data = string.rep("x", 76)
+      local s = string.char(0x4c, 76) .. data
+      assert.is_true(script.is_push_only(s))
+    end)
+
+    it("returns true for OP_PUSHDATA2", function()
+      -- PUSHDATA2 with 256 bytes
+      local data = string.rep("x", 256)
+      local s = string.char(0x4d, 0x00, 0x01) .. data
+      assert.is_true(script.is_push_only(s))
+    end)
+
+    it("returns true for OP_1NEGATE", function()
+      assert.is_true(script.is_push_only("\x4f"))
+    end)
+
+    it("returns true for OP_RESERVED", function()
+      -- OP_RESERVED (0x50) is considered push-only per Bitcoin Core
+      assert.is_true(script.is_push_only("\x50"))
+    end)
+
+    it("returns true for OP_1 through OP_16", function()
+      for op = 0x51, 0x60 do
+        assert.is_true(script.is_push_only(string.char(op)))
+      end
+    end)
+
+    it("returns true for multiple push ops", function()
+      -- OP_1 <sig> <pubkey>
+      local s = "\x51" .. "\x05hello" .. "\x06world!"
+      assert.is_true(script.is_push_only(s))
+    end)
+
+    it("returns false for OP_NOP (0x61)", function()
+      assert.is_false(script.is_push_only("\x61"))
+    end)
+
+    it("returns false for OP_DUP", function()
+      assert.is_false(script.is_push_only("\x76"))
+    end)
+
+    it("returns false for OP_HASH160", function()
+      assert.is_false(script.is_push_only("\xa9"))
+    end)
+
+    it("returns false for OP_CHECKSIG", function()
+      assert.is_false(script.is_push_only("\xac"))
+    end)
+
+    it("returns false for script with push and non-push ops", function()
+      -- OP_1 OP_DUP
+      assert.is_false(script.is_push_only("\x51\x76"))
+    end)
+
+    it("returns false for P2PKH scriptPubKey", function()
+      local pubkey_hash = string.rep("\x42", 20)
+      local p2pkh = script.make_p2pkh_script(pubkey_hash)
+      assert.is_false(script.is_push_only(p2pkh))
+    end)
+
+    it("returns true for empty script", function()
+      assert.is_true(script.is_push_only(""))
+    end)
+  end)
+
+  describe("P2SH push-only scriptSig enforcement", function()
+    local crypto
+
+    setup(function()
+      crypto = require("lunarblock.crypto")
+    end)
+
+    it("fails P2SH with scriptSig containing OP_DUP", function()
+      -- Create a simple redeem script
+      local redeem_script = "\x51\x87"  -- OP_1 OP_EQUAL
+      local script_hash = crypto.hash160(redeem_script)
+      local script_pubkey = script.make_p2sh_script(script_hash)
+
+      -- scriptSig with OP_DUP (0x76) which is not push-only
+      -- OP_1 OP_DUP OP_DROP <redeem_script>
+      local script_sig = "\x51\x76\x75" .. string.char(#redeem_script) .. redeem_script
+
+      local result, err = script.verify_script(script_sig, script_pubkey, {verify_p2sh = true})
+      assert.is_nil(result)
+      assert.equals("SIG_PUSHONLY", err)
+    end)
+
+    it("fails P2SH with scriptSig containing OP_NOP", function()
+      local redeem_script = "\x51\x87"  -- OP_1 OP_EQUAL
+      local script_hash = crypto.hash160(redeem_script)
+      local script_pubkey = script.make_p2sh_script(script_hash)
+
+      -- scriptSig with OP_NOP (0x61)
+      local script_sig = "\x61\x51" .. string.char(#redeem_script) .. redeem_script
+
+      local result, err = script.verify_script(script_sig, script_pubkey, {verify_p2sh = true})
+      assert.is_nil(result)
+      assert.equals("SIG_PUSHONLY", err)
+    end)
+
+    it("fails P2SH with scriptSig containing OP_CHECKSIG", function()
+      local redeem_script = "\x51\x87"
+      local script_hash = crypto.hash160(redeem_script)
+      local script_pubkey = script.make_p2sh_script(script_hash)
+
+      -- scriptSig with OP_CHECKSIG (0xac)
+      local script_sig = "\xac" .. string.char(#redeem_script) .. redeem_script
+
+      local result, err = script.verify_script(script_sig, script_pubkey, {verify_p2sh = true})
+      assert.is_nil(result)
+      assert.equals("SIG_PUSHONLY", err)
+    end)
+
+    it("succeeds P2SH with valid push-only scriptSig", function()
+      local redeem_script = "\x51\x87"  -- OP_1 OP_EQUAL
+      local script_hash = crypto.hash160(redeem_script)
+      local script_pubkey = script.make_p2sh_script(script_hash)
+
+      -- scriptSig with only pushes: OP_1 <redeem_script>
+      local script_sig = script.build_script({
+        {opcode = script.OP.OP_1, data = nil},
+        {opcode = #redeem_script, data = redeem_script},
+      })
+
+      local result, err = script.verify_script(script_sig, script_pubkey, {verify_p2sh = true})
+      assert.is_nil(err)
+      assert.is_true(result)
+    end)
+
+    it("push-only check is unconditional for P2SH (not flag-gated)", function()
+      -- Even with verify_p2sh = true, the push-only check should happen
+      local redeem_script = "\x51\x87"
+      local script_hash = crypto.hash160(redeem_script)
+      local script_pubkey = script.make_p2sh_script(script_hash)
+
+      -- scriptSig with OP_ADD (non-push)
+      local script_sig = "\x51\x51\x93" .. string.char(#redeem_script) .. redeem_script
+
+      local result, err = script.verify_script(script_sig, script_pubkey, {verify_p2sh = true})
+      assert.is_nil(result)
+      assert.equals("SIG_PUSHONLY", err)
+    end)
+  end)
+
   describe("unknown NOPs are treated as NOP", function()
     it("OP_NOP1 does nothing", function()
       local s = "\x51\xb0\x52"  -- OP_1 OP_NOP1 OP_2
@@ -1182,6 +1338,762 @@ describe("script", function()
         local result, err = script.execute_script(script_pubkey, stack, {verify_nullfail = true}, checker)
         assert.is_nil(result)
         assert.equals("NULLFAIL", err)
+      end)
+    end)
+  end)
+
+  describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE (BIP141)", function()
+    describe("OP_CHECKSIG with witness_pubkeytype flag", function()
+      it("accepts compressed pubkey (33 bytes, 0x02 prefix) in witness v0", function()
+        -- 33-byte compressed pubkey with 0x02 prefix
+        local compressed_pk = "\x02" .. string.rep("\x42", 32)
+        local sig = "validsig"
+
+        local checker = {
+          check_sig = function(s, pk)
+            return s == sig and pk == compressed_pk
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, compressed_pk}
+
+        -- With witness_pubkeytype flag AND is_witness_v0, compressed key should succeed
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+
+      it("accepts compressed pubkey (33 bytes, 0x03 prefix) in witness v0", function()
+        -- 33-byte compressed pubkey with 0x03 prefix
+        local compressed_pk = "\x03" .. string.rep("\x42", 32)
+        local sig = "validsig"
+
+        local checker = {
+          check_sig = function(s, pk)
+            return s == sig and pk == compressed_pk
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, compressed_pk}
+
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+
+      it("rejects uncompressed pubkey (65 bytes, 0x04 prefix) in witness v0", function()
+        -- 65-byte uncompressed pubkey with 0x04 prefix
+        local uncompressed_pk = "\x04" .. string.rep("\x42", 64)
+        local sig = "validsig"
+
+        local checker = {
+          check_sig = function(s, pk)
+            return true  -- Would be valid if pubkey check passed
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, uncompressed_pk}
+
+        -- With witness_pubkeytype flag AND is_witness_v0, uncompressed key should fail
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(result)
+        assert.equals("WITNESS_PUBKEYTYPE", err)
+      end)
+
+      it("allows uncompressed pubkey when not in witness v0", function()
+        -- 65-byte uncompressed pubkey with 0x04 prefix
+        local uncompressed_pk = "\x04" .. string.rep("\x42", 64)
+        local sig = "validsig"
+
+        local checker = {
+          check_sig = function(s, pk)
+            return s == sig and pk == uncompressed_pk
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, uncompressed_pk}
+
+        -- With witness_pubkeytype flag but NOT is_witness_v0, uncompressed key should pass
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = false}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+
+      it("allows uncompressed pubkey when witness_pubkeytype flag not set", function()
+        -- 65-byte uncompressed pubkey
+        local uncompressed_pk = "\x04" .. string.rep("\x42", 64)
+        local sig = "validsig"
+
+        local checker = {
+          check_sig = function(s, pk)
+            return s == sig and pk == uncompressed_pk
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, uncompressed_pk}
+
+        -- Without witness_pubkeytype flag, uncompressed key should pass
+        local flags = {is_witness_v0 = true}  -- witness v0 but no pubkeytype flag
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+
+      it("rejects wrong-length pubkey in witness v0", function()
+        -- 32-byte key (wrong length)
+        local wrong_len_pk = string.rep("\x42", 32)
+        local sig = "validsig"
+
+        local checker = {
+          check_sig = function(s, pk)
+            return true
+          end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIG, data = nil},
+        })
+        local stack = {sig, wrong_len_pk}
+
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(result)
+        assert.equals("WITNESS_PUBKEYTYPE", err)
+      end)
+    end)
+
+    describe("OP_CHECKSIGVERIFY with witness_pubkeytype flag", function()
+      it("rejects uncompressed pubkey in witness v0", function()
+        local uncompressed_pk = "\x04" .. string.rep("\x42", 64)
+        local sig = "validsig"
+
+        local checker = {
+          check_sig = function(s, pk) return true end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_CHECKSIGVERIFY, data = nil},
+        })
+        local stack = {sig, uncompressed_pk}
+
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(result)
+        assert.equals("WITNESS_PUBKEYTYPE", err)
+      end)
+    end)
+
+    describe("OP_CHECKMULTISIG with witness_pubkeytype flag", function()
+      it("accepts all compressed pubkeys in witness v0", function()
+        local pk1 = "\x02" .. string.rep("\x01", 32)
+        local pk2 = "\x03" .. string.rep("\x02", 32)
+        local sig1 = "sig1"
+
+        local checker = {
+          check_sig = function(sig, pk)
+            return sig == sig1 and pk == pk1
+          end
+        }
+
+        -- 1-of-2 multisig
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = 33, data = pk2},
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+        local stack = {"", sig1}  -- dummy, sig1
+
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+
+      it("rejects if any pubkey is uncompressed in witness v0", function()
+        local pk1 = "\x02" .. string.rep("\x01", 32)  -- compressed
+        local pk2 = "\x04" .. string.rep("\x02", 64)  -- uncompressed
+        local sig1 = "sig1"
+
+        local checker = {
+          check_sig = function(sig, pk)
+            return sig == sig1 and pk == pk1
+          end
+        }
+
+        -- 1-of-2 multisig where one key is uncompressed
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = 65, data = pk2},  -- uncompressed key
+          {opcode = script.OP.OP_2, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+        local stack = {"", sig1}
+
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(result)
+        assert.equals("WITNESS_PUBKEYTYPE", err)
+      end)
+
+      it("allows uncompressed pubkey in multisig when not witness v0", function()
+        local pk1 = "\x04" .. string.rep("\x01", 64)  -- uncompressed
+        local sig1 = "sig1"
+
+        local checker = {
+          check_sig = function(sig, pk)
+            return sig == sig1 and pk == pk1
+          end
+        }
+
+        -- 1-of-1 multisig with uncompressed key
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = 65, data = pk1},
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+        })
+        local stack = {"", sig1}
+
+        -- Not witness v0, so uncompressed should be allowed
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = false}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.is_true(script.cast_to_bool(result[1]))
+      end)
+    end)
+
+    describe("OP_CHECKMULTISIGVERIFY with witness_pubkeytype flag", function()
+      it("rejects uncompressed pubkey in witness v0", function()
+        local pk1 = "\x04" .. string.rep("\x01", 64)  -- uncompressed
+        local sig1 = "sig1"
+
+        local checker = {
+          check_sig = function(sig, pk) return true end
+        }
+
+        local script_pubkey = script.build_script({
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = 65, data = pk1},
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIGVERIFY, data = nil},
+        })
+        local stack = {"", sig1}
+
+        local flags = {verify_witness_pubkeytype = true, is_witness_v0 = true}
+        local result, err = script.execute_script(script_pubkey, stack, flags, checker)
+        assert.is_nil(result)
+        assert.equals("WITNESS_PUBKEYTYPE", err)
+      end)
+    end)
+  end)
+
+  describe("SCRIPT_VERIFY_MINIMALIF (BIP341/342)", function()
+    -- MINIMALIF: The argument to OP_IF/OP_NOTIF must be exactly:
+    -- - Empty string "" (false)
+    -- - Exactly "\x01" (true)
+    -- Any other value (including "\x00", "\x02", multi-byte values) must fail.
+    -- For tapscript: mandatory consensus rule
+    -- For witness v0: enforced when verify_minimalif flag is set
+
+    describe("OP_IF with MINIMALIF in tapscript", function()
+      it("accepts empty string (takes else branch)", function()
+        -- OP_0 OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x00\x63\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(3, script.script_num_decode(result[1]))  -- else branch
+      end)
+
+      it("accepts exactly 0x01 (takes if branch)", function()
+        -- Push \x01, OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x01\x01\x63\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(2, script.script_num_decode(result[1]))  -- if branch
+      end)
+
+      it("rejects 0x02 as non-minimal true", function()
+        -- Push \x02, OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x01\x02\x63\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(result)
+        assert.equals("MINIMALIF", err)
+      end)
+
+      it("rejects 0x00 as non-minimal false", function()
+        -- Push single 0x00 byte, OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x01\x00\x63\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(result)
+        assert.equals("MINIMALIF", err)
+      end)
+
+      it("rejects multi-byte value 0x01 0x00", function()
+        -- Push 2 bytes \x01\x00, OP_IF
+        local s = "\x02\x01\x00\x63\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(result)
+        assert.equals("MINIMALIF", err)
+      end)
+
+      it("rejects 0x80 (negative zero)", function()
+        -- Push \x80, OP_IF
+        local s = "\x01\x80\x63\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(result)
+        assert.equals("MINIMALIF", err)
+      end)
+    end)
+
+    describe("OP_NOTIF with MINIMALIF in tapscript", function()
+      it("accepts empty string (takes if branch since NOTIF inverts)", function()
+        -- OP_0 OP_NOTIF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x00\x64\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(2, script.script_num_decode(result[1]))  -- if branch (NOT of false)
+      end)
+
+      it("accepts exactly 0x01 (takes else branch since NOTIF inverts)", function()
+        -- Push \x01, OP_NOTIF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x01\x01\x64\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(3, script.script_num_decode(result[1]))  -- else branch (NOT of true)
+      end)
+
+      it("rejects 0x02 as non-minimal true", function()
+        -- Push \x02, OP_NOTIF
+        local s = "\x01\x02\x64\x52\x67\x53\x68"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(result)
+        assert.equals("MINIMALIF", err)
+      end)
+    end)
+
+    describe("OP_IF with MINIMALIF in witness v0", function()
+      it("enforces MINIMALIF when verify_minimalif flag is set", function()
+        -- Push \x02, OP_IF
+        local s = "\x01\x02\x63\x52\x67\x53\x68"
+        local flags = {is_witness_v0 = true, verify_minimalif = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(result)
+        assert.equals("MINIMALIF", err)
+      end)
+
+      it("does not enforce MINIMALIF when flag is not set", function()
+        -- Push \x02, OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        -- Without MINIMALIF flag, \x02 is truthy and takes IF branch
+        local s = "\x01\x02\x63\x52\x67\x53\x68"
+        local flags = {is_witness_v0 = true}  -- no verify_minimalif
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(2, script.script_num_decode(result[1]))  -- if branch (0x02 is truthy)
+      end)
+
+      it("accepts 0x01 with verify_minimalif flag", function()
+        -- Push \x01, OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x01\x01\x63\x52\x67\x53\x68"
+        local flags = {is_witness_v0 = true, verify_minimalif = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(2, script.script_num_decode(result[1]))
+      end)
+
+      it("accepts empty string with verify_minimalif flag", function()
+        -- OP_0 OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x00\x63\x52\x67\x53\x68"
+        local flags = {is_witness_v0 = true, verify_minimalif = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(3, script.script_num_decode(result[1]))  -- else branch
+      end)
+    end)
+
+    describe("MINIMALIF does not apply to legacy scripts", function()
+      it("allows 0x02 in legacy script without witness flags", function()
+        -- Push \x02, OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF
+        local s = "\x01\x02\x63\x52\x67\x53\x68"
+        local flags = {}  -- no witness flags
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(2, script.script_num_decode(result[1]))  -- if branch (0x02 is truthy)
+      end)
+
+      it("allows multi-byte values in legacy script", function()
+        -- Push 2 bytes \x01\x00 (value 1), OP_IF
+        local s = "\x02\x01\x00\x63\x52\x67\x53\x68"
+        local flags = {}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        -- \x01\x00 is truthy (non-zero), so takes if branch
+        assert.equals(2, script.script_num_decode(result[1]))
+      end)
+    end)
+
+    describe("MINIMALIF in non-executing branches", function()
+      it("does not check MINIMALIF in non-executing IF branch", function()
+        -- OP_0 OP_IF (not executing) OP_0 OP_IF OP_1 OP_ENDIF OP_ENDIF OP_5
+        -- The inner OP_IF's condition is never evaluated, so MINIMALIF doesn't apply
+        local s = "\x00\x63\x00\x63\x51\x68\x68\x55"
+        local flags = {is_tapscript = true}
+        local result, err = script.execute_script(s, {}, flags, {})
+        assert.is_nil(err)
+        assert.equals(1, #result)
+        assert.equals(5, script.script_num_decode(result[1]))
+      end)
+    end)
+  end)
+
+  describe("Witness CLEANSTACK enforcement (BIP141)", function()
+    -- BIP141: Witness scripts implicitly require cleanstack behavior.
+    -- After execution, the stack must have exactly 1 element (the true result).
+    -- This is NOT flag-gated like legacy CLEANSTACK.
+
+    describe("execute_witness_script with cleanstack", function()
+      it("succeeds when stack has exactly 1 true element", function()
+        -- Script: OP_1 (leaves exactly 1 element on stack)
+        local s = "\x51"
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(err)
+        assert.is_true(ok)
+      end)
+
+      it("fails with CLEANSTACK when stack is empty", function()
+        -- Script: OP_1 OP_DROP (leaves 0 elements on stack)
+        local s = "\x51\x75"
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+
+      it("fails with CLEANSTACK when stack has 2 elements", function()
+        -- Script: OP_1 OP_1 (leaves 2 elements on stack)
+        local s = "\x51\x51"
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+
+      it("fails with CLEANSTACK when stack has 3 elements", function()
+        -- Script: OP_1 OP_2 OP_3 (leaves 3 elements on stack)
+        local s = "\x51\x52\x53"
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+
+      it("fails with EVAL_FALSE when single element is empty", function()
+        -- Script: OP_0 (leaves 1 element but it's false)
+        local s = "\x00"
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(ok)
+        assert.equals("EVAL_FALSE", err)
+      end)
+
+      it("fails with EVAL_FALSE when single element is negative zero", function()
+        -- Push negative zero (0x80) and leave on stack
+        local s = "\x01\x80"  -- push 1 byte: 0x80
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(ok)
+        assert.equals("EVAL_FALSE", err)
+      end)
+
+      it("passes cleanstack with arithmetic resulting in true", function()
+        -- Script: OP_1 OP_2 OP_ADD OP_3 OP_EQUAL (1+2=3, leaves OP_TRUE)
+        local s = "\x51\x52\x93\x53\x87"
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(err)
+        assert.is_true(ok)
+      end)
+
+      it("fails cleanstack with arithmetic leaving extra elements", function()
+        -- Script: OP_1 OP_2 OP_ADD (leaves 1 element but also have initial)
+        -- Start with OP_5 on stack, then push 1+2, result is 2 elements
+        local s = "\x51\x52\x93"  -- OP_1 OP_2 OP_ADD leaves 3 on stack
+        local ok, err = script.execute_witness_script(s, {"\x05"}, {}, {})  -- Start with 5
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+    end)
+
+    describe("P2WPKH cleanstack integration", function()
+      local crypto
+
+      setup(function()
+        crypto = require("lunarblock.crypto")
+      end)
+
+      it("succeeds with proper P2PKH execution via witness", function()
+        local pubkey = "\x02" .. string.rep("\x42", 32)  -- compressed pubkey
+        local pubkey_hash = crypto.hash160(pubkey)
+        local sig = "validsig"
+
+        -- P2PKH script executed by P2WPKH: OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY OP_CHECKSIG
+        local synthetic_script = script.make_p2pkh_script(pubkey_hash)
+
+        local checker = {
+          check_sig = function(s, pk)
+            return s == sig and pk == pubkey
+          end
+        }
+
+        -- Witness stack is [sig, pubkey], cleanstack should pass (1 true element left)
+        local ok, err = script.execute_witness_script(synthetic_script, {sig, pubkey}, {}, checker)
+        assert.is_nil(err)
+        assert.is_true(ok)
+      end)
+    end)
+
+    describe("P2WSH cleanstack integration", function()
+      it("fails cleanstack for script leaving extra items", function()
+        -- Witness script that intentionally leaves 2 items
+        -- OP_1 OP_1 (2 items on stack)
+        local witness_script = "\x51\x51"
+        local ok, err = script.execute_witness_script(witness_script, {}, {}, {})
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+
+      it("succeeds for script properly consuming inputs", function()
+        -- Simple script: OP_ADD OP_5 OP_EQUAL
+        -- With initial stack [2, 3], result is 1 true element
+        local witness_script = "\x93\x55\x87"  -- OP_ADD OP_5 OP_EQUAL
+        local stack = {script.script_num_encode(2), script.script_num_encode(3)}
+        local ok, err = script.execute_witness_script(witness_script, stack, {}, {})
+        assert.is_nil(err)
+        assert.is_true(ok)
+      end)
+
+      it("fails cleanstack for multisig leaving extra items", function()
+        local pk1 = "\x02" .. string.rep("\x01", 32)
+        local sig1 = "sig1"
+
+        -- 1-of-1 multisig that succeeds but leaves extra item
+        -- OP_1 <pk> OP_1 OP_CHECKMULTISIG OP_1
+        local witness_script = script.build_script({
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = 33, data = pk1},
+          {opcode = script.OP.OP_1, data = nil},
+          {opcode = script.OP.OP_CHECKMULTISIG, data = nil},
+          {opcode = script.OP.OP_1, data = nil},  -- Extra push!
+        })
+
+        local checker = {
+          check_sig = function(s, pk) return s == sig1 and pk == pk1 end
+        }
+
+        -- Stack: dummy, sig1
+        local stack = {"", sig1}
+        local ok, err = script.execute_witness_script(witness_script, stack, {}, checker)
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+    end)
+
+    describe("cleanstack is NOT flag-gated for witness", function()
+      it("cleanstack is enforced even without CLEANSTACK flag", function()
+        -- Without any flags, cleanstack should still be enforced
+        local s = "\x51\x51"  -- OP_1 OP_1 (2 elements)
+        local ok, err = script.execute_witness_script(s, {}, {}, {})
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+
+      it("cleanstack is enforced with various flag combinations", function()
+        local s = "\x51\x51"  -- OP_1 OP_1 (2 elements)
+        local flags = {
+          verify_p2sh = true,
+          verify_witness = true,
+          verify_nullfail = true,
+        }
+        local ok, err = script.execute_witness_script(s, {}, flags, {})
+        assert.is_nil(ok)
+        assert.equals("CLEANSTACK", err)
+      end)
+    end)
+  end)
+
+  describe("pay-to-anchor (P2A)", function()
+    describe("is_pay_to_anchor", function()
+      it("returns true for exact P2A script", function()
+        -- P2A script: OP_1 (0x51), PUSH 2 bytes (0x02), 0x4e, 0x73
+        local p2a_script = "\x51\x02\x4e\x73"
+        assert.is_true(script.is_pay_to_anchor(p2a_script))
+      end)
+
+      it("returns true for P2A_SCRIPT constant", function()
+        assert.is_true(script.is_pay_to_anchor(script.P2A_SCRIPT))
+      end)
+
+      it("returns false for P2TR script (34 bytes)", function()
+        -- P2TR: OP_1 (0x51), PUSH 32 bytes (0x20), <32 bytes>
+        local p2tr_script = "\x51\x20" .. string.rep("\x00", 32)
+        assert.is_false(script.is_pay_to_anchor(p2tr_script))
+      end)
+
+      it("returns false for P2WPKH script", function()
+        local p2wpkh = "\x00\x14" .. string.rep("\x00", 20)
+        assert.is_false(script.is_pay_to_anchor(p2wpkh))
+      end)
+
+      it("returns false for P2WSH script", function()
+        local p2wsh = "\x00\x20" .. string.rep("\x00", 32)
+        assert.is_false(script.is_pay_to_anchor(p2wsh))
+      end)
+
+      it("returns false for empty script", function()
+        assert.is_false(script.is_pay_to_anchor(""))
+      end)
+
+      it("returns false for wrong witness version", function()
+        -- witness v0 with 2-byte program (invalid but distinct from P2A)
+        local wrong_version = "\x00\x02\x4e\x73"
+        assert.is_false(script.is_pay_to_anchor(wrong_version))
+      end)
+
+      it("returns false for wrong anchor bytes", function()
+        -- OP_1 PUSH 2 bytes, but different program
+        local wrong_bytes = "\x51\x02\x00\x00"
+        assert.is_false(script.is_pay_to_anchor(wrong_bytes))
+      end)
+
+      it("returns false for partial match (prefix only)", function()
+        local partial = "\x51\x02\x4e"
+        assert.is_false(script.is_pay_to_anchor(partial))
+      end)
+
+      it("returns false for P2A with extra bytes appended", function()
+        local extended = "\x51\x02\x4e\x73\x00"
+        assert.is_false(script.is_pay_to_anchor(extended))
+      end)
+    end)
+
+    describe("is_pay_to_anchor_witness", function()
+      it("returns true for witness v1 with correct 2-byte program", function()
+        assert.is_true(script.is_pay_to_anchor_witness(1, "\x4e\x73"))
+      end)
+
+      it("returns false for witness v0", function()
+        assert.is_false(script.is_pay_to_anchor_witness(0, "\x4e\x73"))
+      end)
+
+      it("returns false for witness v2", function()
+        assert.is_false(script.is_pay_to_anchor_witness(2, "\x4e\x73"))
+      end)
+
+      it("returns false for wrong program", function()
+        assert.is_false(script.is_pay_to_anchor_witness(1, "\x00\x00"))
+      end)
+
+      it("returns false for longer program (32 bytes like P2TR)", function()
+        assert.is_false(script.is_pay_to_anchor_witness(1, string.rep("\x00", 32)))
+      end)
+    end)
+
+    describe("make_p2a_script", function()
+      it("creates correct P2A script", function()
+        local p2a = script.make_p2a_script()
+        assert.equals("\x51\x02\x4e\x73", p2a)
+        assert.equals(4, #p2a)
+      end)
+
+      it("creates script that is recognized as P2A", function()
+        local p2a = script.make_p2a_script()
+        assert.is_true(script.is_pay_to_anchor(p2a))
+      end)
+
+      it("equals P2A_SCRIPT constant", function()
+        assert.equals(script.P2A_SCRIPT, script.make_p2a_script())
+      end)
+    end)
+
+    describe("classify_script for P2A", function()
+      it("classifies P2A script correctly", function()
+        local script_type, hash = script.classify_script(script.P2A_SCRIPT)
+        assert.equals("p2a", script_type)
+        assert.is_nil(hash)  -- P2A has no hash payload
+      end)
+
+      it("distinguishes P2A from P2TR", function()
+        -- P2TR: 34 bytes
+        local p2tr_script = "\x51\x20" .. string.rep("\xab", 32)
+        local script_type = script.classify_script(p2tr_script)
+        assert.equals("p2tr", script_type)
+      end)
+
+      it("P2A classification takes precedence over other OP_1 scripts", function()
+        -- P2A is specifically 4 bytes: 51 02 4e 73
+        local script_type = script.classify_script("\x51\x02\x4e\x73")
+        assert.equals("p2a", script_type)
+      end)
+    end)
+
+    describe("P2A script bytes", function()
+      it("has correct byte values", function()
+        local p2a = script.P2A_SCRIPT
+        assert.equals(0x51, p2a:byte(1))  -- OP_1
+        assert.equals(0x02, p2a:byte(2))  -- PUSH 2 bytes
+        assert.equals(0x4e, p2a:byte(3))  -- First anchor byte
+        assert.equals(0x73, p2a:byte(4))  -- Second anchor byte
+      end)
+
+      it("represents witness v1 program with 2-byte data", function()
+        -- Witness v1 (OP_1 = 0x51) with 2-byte program (0x4e73)
+        local p2a = script.P2A_SCRIPT
+        -- Verify it's a valid witness program format
+        local version = p2a:byte(1) - 0x50  -- OP_1 = 0x51, so version = 1
+        local program_len = p2a:byte(2)
+        local program = p2a:sub(3)
+        assert.equals(1, version)
+        assert.equals(2, program_len)
+        assert.equals("\x4e\x73", program)
       end)
     end)
   end)

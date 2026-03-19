@@ -17,6 +17,33 @@ M.MAX_ANCESTOR_SIZE = 101000      -- Max total vsize of ancestor chain
 M.MAX_DESCENDANT_SIZE = 101000    -- Max total vsize of descendant chain
 M.REPLACEMENT_MIN_FEE_BUMP = 1000 -- Minimum fee increase for RBF (sat/KB)
 
+-- BIP125 RBF Constants
+M.MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD  -- Sequence number signaling RBF
+M.MAX_REPLACEMENT_CANDIDATES = 100       -- Max transactions that can be evicted by RBF
+M.INCREMENTAL_RELAY_FEE = 1000           -- 1 sat/vB incremental relay fee (sat/KB)
+
+-- Package Relay Constants (BIP 331)
+M.MAX_PACKAGE_COUNT = 25                 -- Max transactions in a package
+M.MAX_PACKAGE_WEIGHT = 404000            -- Max total weight (101KB vsize)
+M.MAX_PACKAGE_VSIZE = 101000             -- Max total vsize (weight / 4)
+
+--------------------------------------------------------------------------------
+-- BIP125 RBF Signaling
+--------------------------------------------------------------------------------
+
+--- Check if a transaction signals opt-in RBF (BIP125).
+-- A transaction signals RBF if any input has nSequence <= MAX_BIP125_RBF_SEQUENCE.
+-- @param tx transaction: The transaction to check
+-- @return boolean: True if the transaction signals RBF
+function M.signals_rbf(tx)
+  for _, inp in ipairs(tx.inputs) do
+    if inp.sequence <= M.MAX_BIP125_RBF_SEQUENCE then
+      return true
+    end
+  end
+  return false
+end
+
 --------------------------------------------------------------------------------
 -- Outpoint Key Helper
 --------------------------------------------------------------------------------
@@ -194,28 +221,88 @@ function Mempool:accept_transaction(tx, allow_rbf)
       fee_rate_per_kb, self.min_relay_fee)
   end
 
-  -- 6. Handle RBF conflicts
+  -- 6. Handle RBF conflicts (BIP125)
+  local all_conflicts = {}  -- All txs to be evicted (conflicts + descendants)
   if next(conflicts) then
-    -- BIP125: check that new tx pays higher fee
-    local old_total_fee = 0
+    -- BIP125 Rule #1: All conflicting transactions must be replaceable
+    -- (signal RBF directly or have an ancestor that does)
     for conflict_txid_hex in pairs(conflicts) do
+      if not self:is_replaceable(conflict_txid_hex) then
+        return false, "conflicting tx does not signal RBF"
+      end
+    end
+
+    -- Collect all descendants of conflicting transactions
+    local conflict_descendants = {}  -- All descendants to be evicted
+    for conflict_txid_hex in pairs(conflicts) do
+      all_conflicts[conflict_txid_hex] = true
       local conflict_entry = self.entries[conflict_txid_hex]
       if conflict_entry then
-        old_total_fee = old_total_fee + conflict_entry.fee
-        -- All conflicting txs must signal replaceability (sequence < 0xFFFFFFFE)
-        for _, inp in ipairs(conflict_entry.tx.inputs) do
-          if inp.sequence >= 0xFFFFFFFE then
-            return false, "conflicting tx does not signal RBF"
-          end
+        for desc_hex in pairs(conflict_entry.descendants) do
+          conflict_descendants[desc_hex] = true
         end
       end
     end
-    if fee <= old_total_fee then
-      return false, "replacement fee not higher than original"
+    for desc_hex in pairs(conflict_descendants) do
+      all_conflicts[desc_hex] = true
     end
-    -- Remove conflicting transactions
-    for conflict_txid_hex in pairs(conflicts) do
-      self:remove_transaction(conflict_txid_hex, "replaced")
+
+    -- BIP125 Rule #5: Don't evict more than MAX_REPLACEMENT_CANDIDATES transactions
+    local eviction_count = 0
+    for _ in pairs(all_conflicts) do
+      eviction_count = eviction_count + 1
+    end
+    if eviction_count > M.MAX_REPLACEMENT_CANDIDATES then
+      return false, string.format("too many potential replacements: %d > %d",
+        eviction_count, M.MAX_REPLACEMENT_CANDIDATES)
+    end
+
+    -- BIP125 Rule #3: New tx must pay higher fee than all conflicting txs combined
+    local conflicting_fees = 0
+    for conflict_hex in pairs(all_conflicts) do
+      local entry = self.entries[conflict_hex]
+      if entry then
+        conflicting_fees = conflicting_fees + entry.fee
+      end
+    end
+    if fee <= conflicting_fees then
+      return false, string.format("replacement fee not higher than conflicting txs: %d <= %d",
+        fee, conflicting_fees)
+    end
+
+    -- BIP125 Rule #4: New tx must pay for its own bandwidth (incremental relay fee)
+    -- Additional fee must be >= incremental_relay_fee * new_tx_vsize
+    local additional_fee = fee - conflicting_fees
+    local required_additional = math.ceil(M.INCREMENTAL_RELAY_FEE * vsize / 1000)
+    if additional_fee < required_additional then
+      return false, string.format("insufficient fee for relay: additional %d < required %d",
+        additional_fee, required_additional)
+    end
+
+    -- BIP125 Rule #2: New tx must not add new unconfirmed inputs
+    -- (spends only confirmed outputs or outputs from transactions being replaced)
+    -- First, collect txids being replaced
+    local replaced_txids = {}
+    for conflict_hex in pairs(all_conflicts) do
+      replaced_txids[conflict_hex] = true
+    end
+
+    -- Check each input of the new transaction
+    for _, inp in ipairs(tx.inputs) do
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      local prev_entry = self.entries[prev_hex]
+      -- If input references a mempool tx that is NOT being replaced, reject
+      if prev_entry and not replaced_txids[prev_hex] then
+        return false, "replacement adds new unconfirmed input"
+      end
+    end
+
+    -- All checks passed, remove conflicting transactions and their descendants
+    for conflict_hex in pairs(all_conflicts) do
+      -- Only remove if still in mempool (descendants may have been removed already)
+      if self.entries[conflict_hex] then
+        self:remove_transaction(conflict_hex, "replaced")
+      end
     end
   end
 
@@ -480,6 +567,474 @@ function Mempool:check_descendant_limits(parent_txid_hex, child_vsize)
     return false
   end
   return true
+end
+
+--- Check if a mempool transaction is replaceable (BIP125).
+-- A transaction is replaceable if it or any of its unconfirmed ancestors signal RBF.
+-- @param txid_hex string: Transaction id as hex string
+-- @return boolean: True if transaction is replaceable
+function Mempool:is_replaceable(txid_hex)
+  local entry = self.entries[txid_hex]
+  if not entry then return false end
+
+  -- Check if the transaction itself signals RBF
+  if M.signals_rbf(entry.tx) then
+    return true
+  end
+
+  -- Check if any ancestor signals RBF
+  for anc_hex in pairs(entry.ancestors) do
+    local anc_entry = self.entries[anc_hex]
+    if anc_entry and M.signals_rbf(anc_entry.tx) then
+      return true
+    end
+  end
+
+  return false
+end
+
+--------------------------------------------------------------------------------
+-- Package Validation (BIP 331)
+--------------------------------------------------------------------------------
+
+--- Check if a package is topologically sorted (parents before children).
+-- @param txns table: Array of transactions
+-- @return boolean, string|nil: success, error message
+function M.is_topo_sorted_package(txns)
+  -- Build a set of txids that appear later in the package
+  local later_txids = {}
+  for _, tx in ipairs(txns) do
+    local txid = validation.compute_txid(tx)
+    local txid_hex = types.hash256_hex(txid)
+    later_txids[txid_hex] = true
+  end
+
+  -- Check each transaction's inputs
+  for _, tx in ipairs(txns) do
+    local txid = validation.compute_txid(tx)
+    local txid_hex = types.hash256_hex(txid)
+
+    for _, inp in ipairs(tx.inputs) do
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      -- If the parent appears later in the package, order is wrong
+      if later_txids[prev_hex] then
+        return false, "package not topologically sorted"
+      end
+    end
+
+    -- Remove this tx from later_txids as we process it
+    later_txids[txid_hex] = nil
+  end
+
+  return true
+end
+
+--- Check if package transactions have conflicting inputs.
+-- @param txns table: Array of transactions
+-- @return boolean, string|nil: success, error message
+function M.is_consistent_package(txns)
+  local inputs_seen = {}  -- outpoint_key -> true
+
+  for _, tx in ipairs(txns) do
+    -- Empty vin is not allowed (unconfirmed tx requirement)
+    if #tx.inputs == 0 then
+      return false, "transaction has no inputs"
+    end
+
+    for _, inp in ipairs(tx.inputs) do
+      local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+      if inputs_seen[outpoint_key] then
+        return false, "conflict in package"
+      end
+    end
+
+    -- Add all inputs from this tx at once
+    for _, inp in ipairs(tx.inputs) do
+      local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+      inputs_seen[outpoint_key] = true
+    end
+  end
+
+  return true
+end
+
+--- Check if a package is well-formed (context-free checks).
+-- @param txns table: Array of transactions
+-- @return boolean, string|nil: success, error message
+function M.is_well_formed_package(txns)
+  -- Check package count
+  if #txns > M.MAX_PACKAGE_COUNT then
+    return false, "package-too-many-transactions"
+  end
+
+  if #txns == 0 then
+    return false, "empty package"
+  end
+
+  -- Check for duplicate transactions and compute total weight
+  local seen_txids = {}
+  local total_weight = 0
+
+  for _, tx in ipairs(txns) do
+    local txid = validation.compute_txid(tx)
+    local txid_hex = types.hash256_hex(txid)
+
+    if seen_txids[txid_hex] then
+      return false, "package-contains-duplicates"
+    end
+    seen_txids[txid_hex] = true
+
+    total_weight = total_weight + validation.get_tx_weight(tx)
+  end
+
+  -- Check total weight (only if > 1 tx, otherwise individual tx check applies)
+  if #txns > 1 and total_weight > M.MAX_PACKAGE_WEIGHT then
+    return false, "package-too-large"
+  end
+
+  -- Check topological sorting
+  local ok, err = M.is_topo_sorted_package(txns)
+  if not ok then
+    return false, "package-not-sorted"
+  end
+
+  -- Check for conflicts (no tx spends same input as another)
+  ok, err = M.is_consistent_package(txns)
+  if not ok then
+    return false, err
+  end
+
+  return true
+end
+
+--- Check if a package is child-with-parents (last tx spends outputs of all others).
+-- @param txns table: Array of transactions (sorted, child last)
+-- @return boolean: true if package is child-with-parents topology
+function M.is_child_with_parents(txns)
+  if #txns < 2 then
+    return false
+  end
+
+  -- The child is the last transaction
+  local child = txns[#txns]
+
+  -- Collect the txids of all inputs of the child
+  local input_txids = {}
+  for _, inp in ipairs(child.inputs) do
+    local prev_hex = types.hash256_hex(inp.prev_out.hash)
+    input_txids[prev_hex] = true
+  end
+
+  -- Every parent (all but the last tx) must be an input of the child
+  for i = 1, #txns - 1 do
+    local parent = txns[i]
+    local parent_txid = validation.compute_txid(parent)
+    local parent_hex = types.hash256_hex(parent_txid)
+    if not input_txids[parent_hex] then
+      return false
+    end
+  end
+
+  return true
+end
+
+--- Calculate package fee rate.
+-- @param txns table: Array of transactions
+-- @param fees table: Array of fees for each transaction (parallel to txns)
+-- @return number: Package fee rate in sat/vB
+function M.calculate_package_fee_rate(txns, fees)
+  local total_fees = 0
+  local total_vsize = 0
+
+  for i, tx in ipairs(txns) do
+    total_fees = total_fees + fees[i]
+    local weight = validation.get_tx_weight(tx)
+    total_vsize = total_vsize + math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+  end
+
+  if total_vsize == 0 then
+    return 0
+  end
+
+  return total_fees / total_vsize
+end
+
+--- Compute package hash (SHA256 of sorted concatenated wtxids).
+-- @param txns table: Array of transactions
+-- @return string: 32-byte package hash
+function M.compute_package_hash(txns)
+  local crypto = require("lunarblock.crypto")
+
+  -- Collect wtxids
+  local wtxids = {}
+  for _, tx in ipairs(txns) do
+    local wtxid = validation.compute_wtxid(tx)
+    wtxids[#wtxids + 1] = wtxid.bytes
+  end
+
+  -- Sort wtxids (comparing as big-endian numbers, but stored little-endian)
+  -- Bitcoin Core compares in reverse byte order (most significant byte first)
+  table.sort(wtxids, function(a, b)
+    -- Compare bytes from end to start (reverse order for little-endian)
+    for i = 32, 1, -1 do
+      local ba = a:byte(i)
+      local bb = b:byte(i)
+      if ba ~= bb then
+        return ba < bb
+      end
+    end
+    return false  -- Equal
+  end)
+
+  -- Hash the concatenated wtxids
+  return crypto.sha256(table.concat(wtxids))
+end
+
+--- Accept a package of transactions into the mempool.
+-- Implements CPFP: a child with high fee can pay for low-fee parents.
+-- @param txns table: Array of transactions (topologically sorted, parents first)
+-- @return boolean, table|string: success, {txid_hexes, package_fee_rate} or error message
+function Mempool:accept_package(txns)
+  -- 1. Well-formed package check
+  local ok, err = M.is_well_formed_package(txns)
+  if not ok then
+    return false, err
+  end
+
+  -- 2. Basic validation for each transaction
+  for i, tx in ipairs(txns) do
+    local pcall_ok, check_ok, is_coinbase = pcall(validation.check_transaction, tx)
+    if not pcall_ok or not check_ok then
+      return false, "invalid transaction at index " .. i
+    end
+    if is_coinbase then
+      return false, "coinbase transactions not accepted"
+    end
+  end
+
+  -- 3. Build map of package txids for intra-package dependency resolution
+  local package_txid_to_idx = {}  -- txid_hex -> index in txns
+  local package_txid_to_tx = {}   -- txid_hex -> tx
+  for i, tx in ipairs(txns) do
+    local txid = validation.compute_txid(tx)
+    local txid_hex = types.hash256_hex(txid)
+    package_txid_to_idx[txid_hex] = i
+    package_txid_to_tx[txid_hex] = tx
+  end
+
+  -- 4. Calculate fees for each transaction
+  local fees = {}
+  local total_fees = 0
+  local total_vsize = 0
+
+  for i, tx in ipairs(txns) do
+    local input_total = 0
+    local missing_inputs = false
+
+    for _, inp in ipairs(tx.inputs) do
+      local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+
+      -- Check for conflicts with existing mempool transactions
+      local existing_spender = self.outpoint_to_tx[outpoint_key]
+      if existing_spender and not package_txid_to_idx[existing_spender] then
+        return false, "conflict with existing mempool tx"
+      end
+
+      -- Look up UTXO (chain state, mempool, or intra-package)
+      local utxo = self.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+
+      if not utxo then
+        -- Check mempool parent
+        local parent_entry = self.entries[prev_hex]
+        if parent_entry and inp.prev_out.index < #parent_entry.tx.outputs then
+          local out = parent_entry.tx.outputs[inp.prev_out.index + 1]
+          utxo = {
+            value = out.value,
+            script_pubkey = out.script_pubkey,
+            height = parent_entry.height,
+            is_coinbase = false,
+          }
+        end
+      end
+
+      if not utxo then
+        -- Check intra-package parent
+        local parent_tx = package_txid_to_tx[prev_hex]
+        if parent_tx and inp.prev_out.index < #parent_tx.outputs then
+          local out = parent_tx.outputs[inp.prev_out.index + 1]
+          utxo = {
+            value = out.value,
+            script_pubkey = out.script_pubkey,
+            height = self.chain_state.tip_height,
+            is_coinbase = false,
+          }
+        end
+      end
+
+      if not utxo then
+        missing_inputs = true
+        break
+      end
+
+      input_total = input_total + utxo.value
+
+      -- Coinbase maturity check
+      if utxo.is_coinbase then
+        if self.chain_state.tip_height - utxo.height < consensus.COINBASE_MATURITY then
+          return false, "spending immature coinbase"
+        end
+      end
+    end
+
+    if missing_inputs then
+      return false, "missing inputs for transaction at index " .. i
+    end
+
+    -- Calculate output total
+    local output_total = 0
+    for _, out in ipairs(tx.outputs) do
+      output_total = output_total + out.value
+    end
+
+    local fee = input_total - output_total
+    if fee < 0 then
+      return false, "outputs exceed inputs at index " .. i
+    end
+
+    fees[i] = fee
+    total_fees = total_fees + fee
+
+    local weight = validation.get_tx_weight(tx)
+    local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+    total_vsize = total_vsize + vsize
+  end
+
+  -- 5. Calculate package fee rate (sat/vB)
+  local package_fee_rate = total_fees / total_vsize
+  local package_fee_rate_per_kb = package_fee_rate * 1000
+
+  -- 6. Check package fee rate meets minimum relay fee
+  if package_fee_rate_per_kb < self.min_relay_fee then
+    return false, string.format("package fee rate too low: %.2f < %d sat/KB",
+      package_fee_rate_per_kb, self.min_relay_fee)
+  end
+
+  -- 7. Accept each transaction into the mempool
+  -- For individual transactions that don't meet min fee rate,
+  -- we accept them anyway because the package as a whole does.
+  local accepted_txids = {}
+
+  for i, tx in ipairs(txns) do
+    local txid = validation.compute_txid(tx)
+    local txid_hex = types.hash256_hex(txid)
+
+    -- Skip if already in mempool
+    if self.entries[txid_hex] then
+      accepted_txids[#accepted_txids + 1] = txid_hex
+      goto continue
+    end
+
+    local weight = validation.get_tx_weight(tx)
+    local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+    local fee = fees[i]
+
+    -- Compute ancestors (including intra-package parents already accepted)
+    local ancestors = {}
+    local direct_parents = {}
+
+    for _, inp in ipairs(tx.inputs) do
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      local parent = self.entries[prev_hex]
+      if parent then
+        direct_parents[prev_hex] = parent
+        ancestors[prev_hex] = true
+        for anc_hex in pairs(parent.ancestors) do
+          ancestors[anc_hex] = true
+        end
+      end
+    end
+
+    -- Count ancestors and sum sizes/fees
+    local ancestor_count = 1  -- include self
+    local ancestor_size = vsize
+    local ancestor_fees = fee
+
+    for anc_hex in pairs(ancestors) do
+      local anc_entry = self.entries[anc_hex]
+      if anc_entry then
+        ancestor_count = ancestor_count + 1
+        ancestor_size = ancestor_size + anc_entry.vsize
+        ancestor_fees = ancestor_fees + anc_entry.fee
+      end
+    end
+
+    -- Check ancestor limits
+    if ancestor_count > M.MAX_ANCESTORS then
+      return false, "too many ancestors for transaction at index " .. i
+    end
+    if ancestor_size > M.MAX_ANCESTOR_SIZE then
+      return false, "ancestor size too large for transaction at index " .. i
+    end
+
+    -- Check descendant limits for all ancestors
+    for anc_hex in pairs(ancestors) do
+      local anc_entry = self.entries[anc_hex]
+      if anc_entry then
+        if anc_entry.descendant_count + 1 > M.MAX_DESCENDANTS then
+          return false, "too many descendants for ancestor"
+        end
+        if anc_entry.descendant_size + vsize > M.MAX_DESCENDANT_SIZE then
+          return false, "descendant size too large for ancestor"
+        end
+      end
+    end
+
+    -- Create mempool entry
+    local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time())
+    entry.ancestor_count = ancestor_count - 1
+    entry.ancestor_size = ancestor_size - vsize
+    entry.ancestor_fees = ancestor_fees - fee
+    entry.ancestors = ancestors
+    self.entries[txid_hex] = entry
+    self.tx_count = self.tx_count + 1
+    self.total_size = self.total_size + entry.size
+
+    -- Track outpoint spending and parent relationships
+    for _, inp in ipairs(tx.inputs) do
+      local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+      self.outpoint_to_tx[outpoint_key] = txid_hex
+
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      if direct_parents[prev_hex] then
+        entry.spends_from[outpoint_key] = prev_hex
+      end
+    end
+
+    -- Update all ancestors with descendant info
+    for anc_hex in pairs(ancestors) do
+      local anc_entry = self.entries[anc_hex]
+      if anc_entry then
+        anc_entry.descendants[txid_hex] = true
+        anc_entry.descendant_count = anc_entry.descendant_count + 1
+        anc_entry.descendant_size = anc_entry.descendant_size + vsize
+        anc_entry.descendant_fees = anc_entry.descendant_fees + fee
+      end
+    end
+
+    accepted_txids[#accepted_txids + 1] = txid_hex
+    ::continue::
+  end
+
+  -- 8. Trim mempool if needed
+  self:trim()
+
+  return true, {
+    txids = accepted_txids,
+    package_fee_rate = package_fee_rate,
+    total_fees = total_fees,
+    total_vsize = total_vsize,
+  }
 end
 
 return M

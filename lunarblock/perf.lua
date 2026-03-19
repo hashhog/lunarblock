@@ -394,4 +394,248 @@ function M.serialize_block_header_fast(header)
   return buf:get()
 end
 
+--------------------------------------------------------------------------------
+-- Benchmarking Utilities
+--------------------------------------------------------------------------------
+
+--- High-precision timer using LuaJIT FFI.
+local clock_gettime
+local CLOCK_MONOTONIC = 1
+
+-- Try to use clock_gettime for sub-microsecond precision
+pcall(function()
+  ffi.cdef[[
+    typedef long time_t;
+    typedef struct timespec { time_t tv_sec; long tv_nsec; } timespec;
+    int clock_gettime(int clk_id, struct timespec *tp);
+  ]]
+  local ts = ffi.new("struct timespec")
+  clock_gettime = function()
+    ffi.C.clock_gettime(CLOCK_MONOTONIC, ts)
+    return tonumber(ts.tv_sec) + tonumber(ts.tv_nsec) / 1e9
+  end
+end)
+
+-- Fallback to os.clock if clock_gettime is not available
+if not clock_gettime then
+  clock_gettime = os.clock
+end
+
+--- Get current time in seconds with high precision.
+-- @return number: current time in seconds
+function M.now()
+  return clock_gettime()
+end
+
+--- Benchmark a function with the given number of iterations.
+-- @param name string: benchmark name
+-- @param fn function: function to benchmark
+-- @param iterations number: number of iterations (default 1000)
+-- @param warmup number: warmup iterations (default 10)
+-- @return table: {name, iterations, total_time, avg_time, ops_per_sec}
+function M.benchmark(name, fn, iterations, warmup)
+  iterations = iterations or 1000
+  warmup = warmup or 10
+
+  -- Warmup: let JIT compile the code
+  for _ = 1, warmup do
+    fn()
+  end
+
+  -- Actual benchmark
+  local start = M.now()
+  for _ = 1, iterations do
+    fn()
+  end
+  local elapsed = M.now() - start
+
+  return {
+    name = name,
+    iterations = iterations,
+    total_time = elapsed,
+    avg_time = elapsed / iterations,
+    ops_per_sec = iterations / elapsed,
+  }
+end
+
+--- Run a series of benchmarks and return results.
+-- @param benchmarks table: array of {name, fn, iterations, warmup}
+-- @return table: array of benchmark results
+function M.run_benchmarks(benchmarks)
+  local results = {}
+  for _, b in ipairs(benchmarks) do
+    results[#results + 1] = M.benchmark(b.name, b.fn, b.iterations, b.warmup)
+  end
+  return results
+end
+
+--- Format benchmark results as a string.
+-- @param results table: array of benchmark results
+-- @return string: formatted results
+function M.format_benchmark_results(results)
+  local lines = { "Benchmark Results:", string.rep("-", 70) }
+  for _, r in ipairs(results) do
+    lines[#lines + 1] = string.format(
+      "%-40s %10d iter %10.3f ms %12.0f ops/s",
+      r.name, r.iterations, r.total_time * 1000, r.ops_per_sec
+    )
+  end
+  lines[#lines + 1] = string.rep("-", 70)
+  return table.concat(lines, "\n")
+end
+
+--------------------------------------------------------------------------------
+-- Crypto Benchmarks
+--------------------------------------------------------------------------------
+
+--- Run SHA256 benchmark comparing FFI implementation.
+-- @param iterations number: number of iterations (default 10000)
+-- @return table: benchmark result
+function M.benchmark_sha256(iterations)
+  iterations = iterations or 10000
+  local crypto = require("lunarblock.crypto")
+
+  -- Generate random test data
+  local test_data = crypto.random_bytes(256)
+
+  return M.benchmark("SHA256 (FFI/OpenSSL)", function()
+    crypto.sha256(test_data)
+  end, iterations)
+end
+
+--- Run double-SHA256 (hash256) benchmark.
+-- @param iterations number: number of iterations (default 10000)
+-- @return table: benchmark result
+function M.benchmark_hash256(iterations)
+  iterations = iterations or 10000
+  local crypto = require("lunarblock.crypto")
+
+  local test_data = crypto.random_bytes(256)
+
+  return M.benchmark("hash256/SHA256d (FFI)", function()
+    crypto.hash256(test_data)
+  end, iterations)
+end
+
+--- Run RIPEMD160 benchmark.
+-- @param iterations number: number of iterations (default 10000)
+-- @return table: benchmark result
+function M.benchmark_ripemd160(iterations)
+  iterations = iterations or 10000
+  local crypto = require("lunarblock.crypto")
+
+  local test_data = crypto.random_bytes(256)
+
+  return M.benchmark("RIPEMD160 (FFI/OpenSSL)", function()
+    crypto.ripemd160(test_data)
+  end, iterations)
+end
+
+--- Run HASH160 benchmark (RIPEMD160(SHA256(x))).
+-- @param iterations number: number of iterations (default 10000)
+-- @return table: benchmark result
+function M.benchmark_hash160(iterations)
+  iterations = iterations or 10000
+  local crypto = require("lunarblock.crypto")
+
+  -- Typical pubkey size
+  local test_data = crypto.random_bytes(33)
+
+  return M.benchmark("HASH160 (FFI)", function()
+    crypto.hash160(test_data)
+  end, iterations)
+end
+
+--- Run ECDSA signature verification benchmark.
+-- @param iterations number: number of iterations (default 1000)
+-- @return table: benchmark result
+function M.benchmark_ecdsa_verify(iterations)
+  iterations = iterations or 1000
+  local crypto = require("lunarblock.crypto")
+
+  -- Generate a keypair and signature for testing
+  local privkey = crypto.random_bytes(32)
+  -- Ensure privkey is valid (not zero, not >= order)
+  local pubkey = crypto.pubkey_from_privkey(privkey, true)
+  if not pubkey then
+    -- Try again with a different key
+    privkey = ("\x00"):rep(31) .. "\x01"
+    pubkey = crypto.pubkey_from_privkey(privkey, true)
+  end
+
+  local msg_hash = crypto.sha256("benchmark test message")
+  local sig = crypto.ecdsa_sign(privkey, msg_hash)
+
+  return M.benchmark("ECDSA verify (libsecp256k1)", function()
+    crypto.ecdsa_verify(pubkey, sig, msg_hash)
+  end, iterations)
+end
+
+--- Run ECDSA signing benchmark.
+-- @param iterations number: number of iterations (default 1000)
+-- @return table: benchmark result
+function M.benchmark_ecdsa_sign(iterations)
+  iterations = iterations or 1000
+  local crypto = require("lunarblock.crypto")
+
+  local privkey = ("\x00"):rep(31) .. "\x01"  -- Private key = 1
+  local msg_hash = crypto.sha256("benchmark test message")
+
+  return M.benchmark("ECDSA sign (libsecp256k1)", function()
+    crypto.ecdsa_sign(privkey, msg_hash)
+  end, iterations)
+end
+
+--- Run Schnorr signature verification benchmark.
+-- @param iterations number: number of iterations (default 1000)
+-- @return table: benchmark result
+function M.benchmark_schnorr_verify(iterations)
+  iterations = iterations or 1000
+  local crypto = require("lunarblock.crypto")
+
+  -- Use a known x-only pubkey (32 bytes) for BIP340 verification
+  -- This is the x-coordinate of generator point G
+  local xonly_pubkey = string.char(
+    0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC,
+    0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07,
+    0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9,
+    0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98
+  )
+
+  -- A valid BIP340 signature (64 bytes) - this is a test vector
+  -- For benchmarking, we just need any valid format signature
+  local sig64 = crypto.random_bytes(64)
+  local msg = crypto.sha256("benchmark schnorr test")
+
+  return M.benchmark("Schnorr verify (libsecp256k1)", function()
+    -- This will return false since sig is random, but still benchmarks the verify path
+    crypto.schnorr_verify(xonly_pubkey, sig64, msg)
+  end, iterations)
+end
+
+--- Run all crypto benchmarks.
+-- @return table: array of benchmark results
+function M.run_crypto_benchmarks()
+  local results = {}
+
+  -- Hash benchmarks
+  results[#results + 1] = M.benchmark_sha256(10000)
+  results[#results + 1] = M.benchmark_hash256(10000)
+  results[#results + 1] = M.benchmark_ripemd160(10000)
+  results[#results + 1] = M.benchmark_hash160(10000)
+
+  -- Signature benchmarks
+  results[#results + 1] = M.benchmark_ecdsa_sign(1000)
+  results[#results + 1] = M.benchmark_ecdsa_verify(1000)
+  results[#results + 1] = M.benchmark_schnorr_verify(1000)
+
+  return results
+end
+
+--- Print all crypto benchmark results to stdout.
+function M.print_crypto_benchmarks()
+  local results = M.run_crypto_benchmarks()
+  print(M.format_benchmark_results(results))
+end
+
 return M
