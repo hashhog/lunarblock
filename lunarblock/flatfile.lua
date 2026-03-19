@@ -20,6 +20,11 @@ local M = {}
 M.MAX_BLOCKFILE_SIZE = 0x8000000  -- 128 MiB
 M.STORAGE_HEADER_BYTES = 8        -- 4-byte magic + 4-byte size
 
+-- Pruning constants
+M.MIN_PRUNE_TARGET = 550 * 1024 * 1024  -- 550 MB minimum prune target
+M.MIN_BLOCKS_TO_KEEP = 288              -- minimum blocks to keep for reorg safety
+M.BLOCKFILE_CHUNK_SIZE = 128 * 1024 * 1024  -- 128 MB per file
+
 -- FFI for efficient file I/O
 ffi.cdef[[
   typedef struct FILE FILE;
@@ -163,6 +168,11 @@ function M.open(blocks_dir, magic_bytes)
     _file_info = {},        -- file_num -> blockfile_info
     _current_file = 0,      -- current block file number
     _current_undo_file = 0, -- current undo file number
+    -- Pruning state
+    _prune_target = 0,      -- 0 = no pruning, 1 = manual only, >= 550MB = auto
+    _have_pruned = false,   -- whether we've ever pruned
+    _check_for_pruning = false, -- flag to check after next write
+    _tip_height = 0,        -- current chain tip height
   }
 
   -- Get path for a block file
@@ -287,6 +297,11 @@ function M.open(blocks_dir, magic_bytes)
       return nil, "block not found in index"
     end
 
+    -- Check if block is pruned
+    if entry.pruned then
+      return nil, "block pruned"
+    end
+
     local path = store.blk_path(entry.file_num)
     local file = ffi.C.fopen(path, "rb")
     if file == nil then
@@ -408,6 +423,11 @@ function M.open(blocks_dir, magic_bytes)
     local entry = store._block_index[hash_hex]
     if not entry then
       return nil, "block not found in index"
+    end
+
+    -- Check if block is pruned
+    if entry.pruned then
+      return nil, "undo data pruned"
     end
 
     if entry.undo_pos == 0 then
@@ -625,6 +645,279 @@ function M.open(blocks_dir, magic_bytes)
   -- @return function: iterator yielding (hash_hex, entry)
   function store.iter_blocks()
     return pairs(store._block_index)
+  end
+
+  --- Check if pruning is enabled
+  -- @return boolean: true if prune_target > 0
+  function store.is_prune_mode()
+    return store._prune_target > 0
+  end
+
+  --- Set prune target
+  -- @param target number: 0=disabled, 1=manual only, >=550MB=auto prune
+  function store.set_prune_target(target)
+    if target < 0 then target = 0 end
+    if target > 1 and target < M.MIN_PRUNE_TARGET then
+      target = M.MIN_PRUNE_TARGET
+    end
+    store._prune_target = target
+  end
+
+  --- Get prune target
+  -- @return number: prune target in bytes
+  function store.get_prune_target()
+    return store._prune_target
+  end
+
+  --- Set tip height (needed for prune calculations)
+  -- @param height number: current chain tip height
+  function store.set_tip_height(height)
+    store._tip_height = height
+  end
+
+  --- Get tip height
+  -- @return number: current tip height
+  function store.get_tip_height()
+    return store._tip_height
+  end
+
+  --- Calculate total disk usage from file info
+  -- @return number: total bytes used by block and undo files
+  function store.calculate_current_usage()
+    local total = 0
+    for _, info in pairs(store._file_info) do
+      total = total + (info.nSize or 0) + (info.nUndoSize or 0)
+    end
+    return total
+  end
+
+  --- Prune one block file: mark all blocks in the file as pruned
+  -- @param file_num number: file number to prune
+  function store.prune_one_block_file(file_num)
+    -- Mark all blocks in this file as pruned in the index
+    for _, entry in pairs(store._block_index) do
+      if entry.file_num == file_num then
+        entry.pruned = true
+        entry.data_pos = 0
+        entry.undo_pos = 0
+      end
+    end
+
+    -- Clear the file info
+    local info = store._file_info[file_num]
+    if info then
+      store._file_info[file_num] = new_blockfile_info()
+    end
+
+    store._have_pruned = true
+  end
+
+  --- Find files to prune automatically (based on prune target)
+  -- @param target_size number|nil: optional target size override
+  -- @return table: list of file numbers to prune
+  function store.find_files_to_prune(target_size)
+    local files_to_prune = {}
+
+    if not store.is_prune_mode() then
+      return files_to_prune
+    end
+
+    -- Don't prune if tip height is too low
+    if store._tip_height < M.MIN_BLOCKS_TO_KEEP then
+      return files_to_prune
+    end
+
+    -- Calculate the prune height: keep at least MIN_BLOCKS_TO_KEEP blocks
+    local last_block_can_prune = store._tip_height - M.MIN_BLOCKS_TO_KEEP
+
+    -- Use provided target or the configured prune target
+    target_size = target_size or store._prune_target
+
+    -- Ensure target is at least minimum
+    if target_size < M.MIN_PRUNE_TARGET then
+      target_size = M.MIN_PRUNE_TARGET
+    end
+
+    local current_usage = store.calculate_current_usage()
+
+    -- Leave a buffer for new allocations
+    local buffer = M.BLOCKFILE_CHUNK_SIZE * 2
+
+    -- Only prune if we're above target
+    if current_usage + buffer < target_size then
+      return files_to_prune
+    end
+
+    -- Collect and sort file numbers from oldest to newest
+    local file_nums = {}
+    for file_num, _ in pairs(store._file_info) do
+      table.insert(file_nums, file_num)
+    end
+    table.sort(file_nums)
+
+    for _, file_num in ipairs(file_nums) do
+      local info = store._file_info[file_num]
+
+      -- Skip empty files (already pruned)
+      if not info or info.nSize == 0 then
+        goto continue
+      end
+
+      -- Check if we're below target now
+      if current_usage + buffer < target_size then
+        break
+      end
+
+      -- Don't prune files containing blocks we need to keep
+      -- The file's highest block must be <= the last prunable height
+      if info.nHeightLast and info.nHeightLast > last_block_can_prune then
+        goto continue
+      end
+
+      -- This file can be pruned
+      local bytes_to_prune = (info.nSize or 0) + (info.nUndoSize or 0)
+      table.insert(files_to_prune, file_num)
+      current_usage = current_usage - bytes_to_prune
+
+      ::continue::
+    end
+
+    return files_to_prune
+  end
+
+  --- Find files to prune manually up to a specific height
+  -- @param prune_height number: maximum block height to prune
+  -- @return table: list of file numbers to prune
+  function store.find_files_to_prune_manual(prune_height)
+    local files_to_prune = {}
+
+    if not store.is_prune_mode() then
+      return files_to_prune
+    end
+
+    if prune_height <= 0 then
+      return files_to_prune
+    end
+
+    -- Don't prune below the safety margin
+    local last_block_can_prune = math.min(prune_height, store._tip_height - M.MIN_BLOCKS_TO_KEEP)
+    if last_block_can_prune <= 0 then
+      return files_to_prune
+    end
+
+    for file_num, info in pairs(store._file_info) do
+      -- Skip empty files
+      if not info or info.nSize == 0 then
+        goto continue
+      end
+
+      -- File can be pruned if all its blocks are at or below the prune height
+      if info.nHeightLast and info.nHeightLast <= last_block_can_prune then
+        table.insert(files_to_prune, file_num)
+      end
+
+      ::continue::
+    end
+
+    table.sort(files_to_prune)
+    return files_to_prune
+  end
+
+  --- Unlink (delete) pruned files from disk
+  -- @param files_to_prune table: list of file numbers to delete
+  -- @return number: count of files deleted
+  function store.unlink_pruned_files(files_to_prune)
+    local deleted = 0
+    for _, file_num in ipairs(files_to_prune) do
+      local blk_path = store.blk_path(file_num)
+      local rev_path = store.rev_path(file_num)
+
+      -- Delete block file
+      local blk_removed = os.remove(blk_path)
+
+      -- Delete undo/rev file
+      local rev_removed = os.remove(rev_path)
+
+      if blk_removed or rev_removed then
+        deleted = deleted + 1
+      end
+    end
+    return deleted
+  end
+
+  --- Main pruning function: find files to prune and delete them
+  -- @param target_size number|nil: optional target size override
+  -- @return number, string|nil: count of deleted files, error message if any
+  function store.prune_block_files(target_size)
+    if not store.is_prune_mode() and target_size == nil then
+      return 0, "pruning not enabled"
+    end
+
+    -- Use target_size if provided (for manual pruning), else use configured target
+    local effective_target = target_size or store._prune_target
+
+    -- Enforce minimum prune target (unless 0 or 1)
+    if effective_target > 1 and effective_target < M.MIN_PRUNE_TARGET then
+      effective_target = M.MIN_PRUNE_TARGET
+    end
+
+    -- Find files to prune
+    local files_to_prune = store.find_files_to_prune(effective_target)
+
+    if #files_to_prune == 0 then
+      return 0
+    end
+
+    -- Update block index metadata for each file
+    for _, file_num in ipairs(files_to_prune) do
+      store.prune_one_block_file(file_num)
+    end
+
+    -- Delete the actual files
+    local deleted = store.unlink_pruned_files(files_to_prune)
+
+    store._check_for_pruning = false
+
+    return deleted
+  end
+
+  --- Check if a block is pruned
+  -- @param hash hash256 or hex string: block hash
+  -- @return boolean: true if block is pruned
+  function store.is_block_pruned(hash)
+    local hash_hex
+    if type(hash) == "string" and #hash == 64 then
+      hash_hex = hash
+    elseif type(hash) == "table" and hash.bytes then
+      hash_hex = types.hash256_hex(hash)
+    else
+      return false
+    end
+
+    local entry = store._block_index[hash_hex]
+    if not entry then
+      return false
+    end
+    return entry.pruned == true
+  end
+
+  --- Check if pruning check is needed
+  -- @return boolean: true if we should check for pruning
+  function store.needs_pruning_check()
+    return store._check_for_pruning
+  end
+
+  --- Mark that pruning check is needed
+  function store.set_needs_pruning_check()
+    if store.is_prune_mode() then
+      store._check_for_pruning = true
+    end
+  end
+
+  --- Check if we have ever pruned
+  -- @return boolean: true if any pruning has occurred
+  function store.have_pruned()
+    return store._have_pruned
   end
 
   return store

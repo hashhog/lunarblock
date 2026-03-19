@@ -163,9 +163,12 @@ M.CF = {
   HEADERS = "headers",       -- block_hash -> serialized header (80 bytes)
   BLOCKS = "blocks",         -- block_hash -> serialized full block
   UTXO = "utxo",             -- outpoint (txid 32 bytes + vout 4 bytes LE) -> utxo entry
-  TX_INDEX = "tx_index",     -- txid -> {block_hash, offset}
+  TX_INDEX = "tx_index",     -- txid -> {file_num, block_pos, tx_offset}
   HEIGHT_INDEX = "height",   -- height (4 bytes big-endian) -> block_hash
   META = "meta",             -- string key -> arbitrary value
+  UNDO = "undo",             -- block_hash -> serialized undo data (spent UTXOs)
+  BLOCK_FILTER = "block_filter",         -- block_hash -> {filter_hash, filter_header, filter_pos}
+  BLOCK_FILTER_HEIGHT = "filter_height", -- height (4B BE) -> block_hash (for filter lookups by height)
 }
 
 -- List of all column families in order
@@ -177,6 +180,9 @@ local CF_LIST = {
   M.CF.TX_INDEX,
   M.CF.HEIGHT_INDEX,
   M.CF.META,
+  M.CF.UNDO,
+  M.CF.BLOCK_FILTER,
+  M.CF.BLOCK_FILTER_HEIGHT,
 }
 
 -- Helper: check error and throw if set
@@ -222,65 +228,95 @@ function M.open(path, cache_size_mb)
   librocksdb.rocksdb_block_based_options_set_block_size(table_options, 16 * 1024)  -- 16KB
   librocksdb.rocksdb_options_set_block_based_table_factory(options, table_options)
 
-  -- Check which column families already exist
-  local existing_cfs = {}
-  local lencf = ffi.new("size_t[1]")
-  local cf_list_ptr = librocksdb.rocksdb_list_column_families(options, path, lencf, errptr)
-  if cf_list_ptr ~= nil then
-    for i = 0, tonumber(lencf[0]) - 1 do
-      existing_cfs[ffi.string(cf_list_ptr[i])] = true
+  -- Check if the database already exists by looking for CURRENT file
+  local db_exists = false
+  local f = io.open(path .. "/CURRENT", "r")
+  if f then
+    f:close()
+    db_exists = true
+  end
+
+  local db, handles
+
+  if not db_exists then
+    -- New database: use simple open first, then create column families
+    db = librocksdb.rocksdb_open(options, path, errptr)
+    check_error(errptr)
+
+    handles = {}
+    -- "default" CF is implicitly created by rocksdb_open
+    -- Create all other column families
+    for _, cf_name in ipairs(CF_LIST) do
+      if cf_name ~= M.CF.DEFAULT then
+        local handle = librocksdb.rocksdb_create_column_family(db, options, cf_name, errptr)
+        check_error(errptr)
+        handles[cf_name] = handle
+      end
     end
-    librocksdb.rocksdb_list_column_families_destroy(cf_list_ptr, lencf[0])
-  else
-    -- Database doesn't exist yet, clear error
-    if errptr[0] ~= nil then
-      librocksdb.rocksdb_free(errptr[0])
-      errptr[0] = nil
+
+    -- Close and reopen with all column families so we get proper handles
+    librocksdb.rocksdb_close(db)
+    db = nil
+    db_exists = true  -- now it exists
+  end
+
+  -- Open (or reopen) with column families
+  if not db then
+    -- List existing column families
+    local existing_cfs = {}
+    local lencf = ffi.new("size_t[1]")
+    local cf_list_ptr = librocksdb.rocksdb_list_column_families(options, path, lencf, errptr)
+    if cf_list_ptr ~= nil then
+      for i = 0, tonumber(lencf[0]) - 1 do
+        existing_cfs[ffi.string(cf_list_ptr[i])] = true
+      end
+      librocksdb.rocksdb_list_column_families_destroy(cf_list_ptr, lencf[0])
+    else
+      if errptr[0] ~= nil then
+        librocksdb.rocksdb_free(errptr[0])
+        errptr[0] = nil
+      end
     end
-  end
 
-  -- Determine which column families to open with
-  local cfs_to_open = {}
-  local have_existing = false
-  for cf_name, _ in pairs(existing_cfs) do
-    cfs_to_open[#cfs_to_open + 1] = cf_name
-    have_existing = true
-  end
+    -- Determine which column families to open with
+    local cfs_to_open = {}
+    for cf_name, _ in pairs(existing_cfs) do
+      cfs_to_open[#cfs_to_open + 1] = cf_name
+    end
+    if #cfs_to_open == 0 then
+      cfs_to_open = { M.CF.DEFAULT }
+    end
 
-  -- If no existing CFs, just use default
-  if not have_existing then
-    cfs_to_open = { M.CF.DEFAULT }
-  end
+    -- Create arrays for column family names and options
+    local num_cfs = #cfs_to_open
+    local cf_names = ffi.new("const char*[?]", num_cfs)
+    local cf_options = ffi.new("const rocksdb_options_t*[?]", num_cfs)
+    local cf_handles = ffi.new("rocksdb_column_family_handle_t*[?]", num_cfs)
 
-  -- Create arrays for column family names and options
-  local num_cfs = #cfs_to_open
-  local cf_names = ffi.new("const char*[?]", num_cfs)
-  local cf_options = ffi.new("const rocksdb_options_t*[?]", num_cfs)
-  local cf_handles = ffi.new("rocksdb_column_family_handle_t*[?]", num_cfs)
+    for i, cf_name in ipairs(cfs_to_open) do
+      cf_names[i - 1] = cf_name
+      cf_options[i - 1] = options
+    end
 
-  for i, cf_name in ipairs(cfs_to_open) do
-    cf_names[i - 1] = cf_name
-    cf_options[i - 1] = options
-  end
+    -- Open database with column families
+    db = librocksdb.rocksdb_open_column_families(
+      options, path, num_cfs, cf_names, cf_options, cf_handles, errptr
+    )
+    check_error(errptr)
 
-  -- Open database with column families
-  local db = librocksdb.rocksdb_open_column_families(
-    options, path, num_cfs, cf_names, cf_options, cf_handles, errptr
-  )
-  check_error(errptr)
+    -- Store handles in a map
+    handles = {}
+    for i, cf_name in ipairs(cfs_to_open) do
+      handles[cf_name] = cf_handles[i - 1]
+    end
 
-  -- Store handles in a map
-  local handles = {}
-  for i, cf_name in ipairs(cfs_to_open) do
-    handles[cf_name] = cf_handles[i - 1]
-  end
-
-  -- Create any missing column families
-  for _, cf_name in ipairs(CF_LIST) do
-    if not handles[cf_name] then
-      local handle = librocksdb.rocksdb_create_column_family(db, options, cf_name, errptr)
-      check_error(errptr)
-      handles[cf_name] = handle
+    -- Create any missing column families
+    for _, cf_name in ipairs(CF_LIST) do
+      if not handles[cf_name] then
+        local handle = librocksdb.rocksdb_create_column_family(db, options, cf_name, errptr)
+        check_error(errptr)
+        handles[cf_name] = handle
+      end
     end
   end
 
@@ -300,6 +336,7 @@ function M.open(path, cache_size_mb)
     _write_opts = write_opts,
     _write_opts_sync = write_opts_sync,
     _handles = handles,
+    CF = M.CF,
   }
 
   -- Get a value from a column family
@@ -497,6 +534,19 @@ function M.open(path, cache_size_mb)
   function dbobj.put_height_index(height, block_hash)
     local key = encode_height(height)
     dbobj.put(M.CF.HEIGHT_INDEX, key, block_hash.bytes)
+  end
+
+  -- High-level helpers: undo data
+  function dbobj.get_undo(block_hash)
+    return dbobj.get(M.CF.UNDO, block_hash.bytes)
+  end
+
+  function dbobj.put_undo(block_hash, undo_data, sync)
+    dbobj.put(M.CF.UNDO, block_hash.bytes, undo_data, sync)
+  end
+
+  function dbobj.delete_undo(block_hash, sync)
+    dbobj.delete(M.CF.UNDO, block_hash.bytes, sync)
   end
 
   -- Close the database

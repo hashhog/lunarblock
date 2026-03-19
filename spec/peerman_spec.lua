@@ -1625,4 +1625,506 @@ describe("peerman", function()
 
   end)
 
+  --------------------------------------------------------------------------------
+  -- Stale Tip Detection & Eviction Tests
+  -- Reference: Bitcoin Core net_processing.cpp ConsiderEviction, EvictExtraOutboundPeers
+  --------------------------------------------------------------------------------
+
+  describe("stale tip detection", function()
+
+    local function make_mock_outbound_peer(ip, port)
+      return {
+        ip = ip or "192.168.1.1",
+        port = port or 8333,
+        inbound = false,
+        state = peer_mod.STATE.ESTABLISHED,
+        _established_notified = true,
+        disconnect = function(self, reason)
+          self.state = peer_mod.STATE.DISCONNECTED
+          self.disconnect_reason = reason
+        end,
+        send_message = function(self, cmd, payload)
+          self._sent_messages = self._sent_messages or {}
+          self._sent_messages[#self._sent_messages + 1] = {command = cmd, payload = payload}
+        end,
+      }
+    end
+
+    describe("stale tip constants", function()
+
+      it("has correct stale check interval", function()
+        assert.equals(600, peerman.STALE_TIP.STALE_CHECK_INTERVAL)
+      end)
+
+      it("has correct chain sync timeout", function()
+        assert.equals(1200, peerman.STALE_TIP.CHAIN_SYNC_TIMEOUT)
+      end)
+
+      it("has correct headers response time", function()
+        assert.equals(120, peerman.STALE_TIP.HEADERS_RESPONSE_TIME)
+      end)
+
+      it("has correct minimum connect time", function()
+        assert.equals(30, peerman.STALE_TIP.MINIMUM_CONNECT_TIME)
+      end)
+
+      it("has correct extra peer check interval", function()
+        assert.equals(45, peerman.STALE_TIP.EXTRA_PEER_CHECK_INTERVAL)
+      end)
+
+    end)
+
+    describe("tip_may_be_stale", function()
+
+      it("returns false when tip was recently updated", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm:record_tip_update()
+        assert.is_false(pm:tip_may_be_stale())
+      end)
+
+      it("returns true when tip is older than 3x block interval", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm.network = {pow_target_spacing = 600}  -- 10 minute blocks
+        -- Simulate old tip (> 30 minutes = 1800 seconds)
+        pm._last_tip_update = pm._last_tip_update - 2000
+        assert.is_true(pm:tip_may_be_stale())
+      end)
+
+      it("returns false when blocks are in-flight even if tip is old", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm.network = {pow_target_spacing = 600}
+        pm._last_tip_update = pm._last_tip_update - 2000
+        -- Simulate blocks in-flight
+        pm:record_block_in_flight("somehash", {})
+        assert.is_false(pm:tip_may_be_stale())
+      end)
+
+      it("updates stale state after tip update", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm.network = {pow_target_spacing = 600}
+        pm._last_tip_update = pm._last_tip_update - 2000
+        assert.is_true(pm:tip_may_be_stale())
+
+        pm:record_tip_update()
+        assert.is_false(pm:tip_may_be_stale())
+      end)
+
+    end)
+
+    describe("peer best block tracking", function()
+
+      it("sets and gets peer best block", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+
+        pm:set_peer_best_block(mock_peer, 100000, "blockhash", 123456)
+        local best = pm:get_peer_best_block(mock_peer)
+
+        assert.equals(100000, best.height)
+        assert.equals("blockhash", best.hash)
+        assert.equals(123456, best.work)
+      end)
+
+      it("returns nil for unknown peer", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+        assert.is_nil(pm:get_peer_best_block(mock_peer))
+      end)
+
+    end)
+
+    describe("peer block announcement tracking", function()
+
+      it("records block announcement timestamp", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+
+        local before = os.time()
+        pm:record_peer_block_announcement(mock_peer, "somehash")
+        local ann_time = pm:get_peer_last_block_announcement(mock_peer)
+
+        assert.is_true(ann_time >= before)
+      end)
+
+      it("returns 0 for peer with no announcements", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+        assert.equals(0, pm:get_peer_last_block_announcement(mock_peer))
+      end)
+
+    end)
+
+    describe("chain sync state", function()
+
+      it("initializes chain sync state for outbound peer", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+
+        pm:_init_peer_chain_sync(mock_peer)
+        local state = pm:get_peer_chain_sync(mock_peer)
+
+        assert.is_not_nil(state)
+        assert.equals(0, state.timeout)
+        assert.is_nil(state.work_header)
+        assert.is_false(state.sent_getheaders)
+        assert.is_false(state.protect)
+      end)
+
+      it("cleans up chain sync state on disconnect", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+
+        pm:_init_peer_chain_sync(mock_peer)
+        pm:set_peer_best_block(mock_peer, 100, "hash", 0)
+        pm:record_peer_block_announcement(mock_peer, "hash")
+
+        pm:_cleanup_peer_chain_sync(mock_peer)
+
+        assert.is_nil(pm:get_peer_chain_sync(mock_peer))
+        assert.is_nil(pm:get_peer_best_block(mock_peer))
+        assert.equals(0, pm:get_peer_last_block_announcement(mock_peer))
+      end)
+
+    end)
+
+    describe("consider_eviction", function()
+
+      it("does nothing for inbound peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+        mock_peer.inbound = true
+
+        pm:_init_peer_chain_sync(mock_peer)
+        pm:consider_eviction(mock_peer, os.time())
+
+        -- Should not set timeout
+        local state = pm:get_peer_chain_sync(mock_peer)
+        assert.equals(0, state.timeout)
+      end)
+
+      it("does nothing for protected peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+
+        pm:_init_peer_chain_sync(mock_peer)
+        local state = pm:get_peer_chain_sync(mock_peer)
+        state.protect = true
+
+        pm.our_height = 100000
+        pm:set_peer_best_block(mock_peer, 50000, "hash", 0)
+        pm:consider_eviction(mock_peer, os.time())
+
+        -- Timeout should not be set for protected peer
+        assert.equals(0, state.timeout)
+      end)
+
+      it("resets timeout when peer catches up to our tip", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+
+        pm:_init_peer_chain_sync(mock_peer)
+        local state = pm:get_peer_chain_sync(mock_peer)
+        state.timeout = 1000  -- Previously set timeout
+
+        pm.our_height = 100000
+        pm:set_peer_best_block(mock_peer, 100001, "hash", 0)  -- Peer is ahead
+        pm:consider_eviction(mock_peer, os.time())
+
+        assert.equals(0, state.timeout)
+      end)
+
+      it("sets timeout when peer is behind our tip", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+
+        pm:_init_peer_chain_sync(mock_peer)
+        pm.our_height = 100000
+        pm:set_peer_best_block(mock_peer, 50000, "hash", 0)
+
+        local now = os.time()
+        pm:consider_eviction(mock_peer, now)
+
+        local state = pm:get_peer_chain_sync(mock_peer)
+        assert.is_true(state.timeout > 0)
+        assert.equals(now + peerman.STALE_TIP.CHAIN_SYNC_TIMEOUT, state.timeout)
+      end)
+
+      it("sends getheaders when timeout exceeded first time", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+
+        pm:_init_peer_chain_sync(mock_peer)
+        pm.our_height = 100000
+        pm:set_peer_best_block(mock_peer, 50000, "hash", 0)
+
+        local state = pm:get_peer_chain_sync(mock_peer)
+        state.timeout = os.time() - 100  -- Timeout already passed
+        state.sent_getheaders = false
+
+        pm:consider_eviction(mock_peer, os.time())
+
+        assert.is_true(state.sent_getheaders)
+        assert.is_not_nil(mock_peer._sent_messages)
+        assert.equals(1, #mock_peer._sent_messages)
+        assert.equals("getheaders", mock_peer._sent_messages[1].command)
+      end)
+
+      it("disconnects peer when timeout exceeded after getheaders sent", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = make_mock_outbound_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+
+        pm:_init_peer_chain_sync(mock_peer)
+        pm.our_height = 100000
+        pm:set_peer_best_block(mock_peer, 50000, "hash", 0)
+
+        local state = pm:get_peer_chain_sync(mock_peer)
+        state.timeout = os.time() - 100
+        state.sent_getheaders = true  -- Already sent getheaders
+
+        pm:consider_eviction(mock_peer, os.time())
+
+        assert.equals(peer_mod.STATE.DISCONNECTED, mock_peer.state)
+        assert.equals("outbound peer has old chain", mock_peer.disconnect_reason)
+      end)
+
+    end)
+
+    describe("evict_extra_outbound_peers", function()
+
+      it("does nothing when at or below target outbound count", function()
+        local pm = peerman.new(test_network, nil, {max_outbound = 8})
+        -- Add 6 outbound peers (below target of 8)
+        for i = 1, 6 do
+          local mock_peer = make_mock_outbound_peer("192.168.1." .. i, 8333)
+          pm.peer_list[i] = mock_peer
+          pm.peers["192.168.1." .. i .. ":8333"] = mock_peer
+          pm:_init_peer_chain_sync(mock_peer)
+        end
+
+        pm:evict_extra_outbound_peers(os.time())
+
+        -- All peers should still be connected
+        for i = 1, 6 do
+          assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[i].state)
+        end
+      end)
+
+      it("evicts peer with oldest block announcement when over target", function()
+        local pm = peerman.new(test_network, nil, {max_outbound = 2})
+        local now = os.time()
+
+        -- Add 3 outbound peers (1 over target)
+        for i = 1, 3 do
+          local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
+          pm.peer_list[i] = mock_peer
+          pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
+          pm:_init_peer_chain_sync(mock_peer)
+          -- Set different announcement times
+          pm._peer_last_block_ann["192.168." .. i .. ".1:8333"] = now - (i * 100)
+          -- Set connect time to past (beyond MINIMUM_CONNECT_TIME)
+          pm._peer_connect_time["192.168." .. i .. ".1:8333"] = now - 1000
+        end
+
+        pm:evict_extra_outbound_peers(now)
+
+        -- Peer 3 has oldest announcement, should be disconnected
+        assert.equals(peer_mod.STATE.DISCONNECTED, pm.peer_list[3].state)
+        assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[1].state)
+        assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[2].state)
+      end)
+
+      it("does not evict peers with blocks in-flight", function()
+        local pm = peerman.new(test_network, nil, {max_outbound = 2})
+        local now = os.time()
+
+        -- Add 3 outbound peers (1 over target)
+        for i = 1, 3 do
+          local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
+          pm.peer_list[i] = mock_peer
+          pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
+          pm:_init_peer_chain_sync(mock_peer)
+          pm._peer_last_block_ann["192.168." .. i .. ".1:8333"] = now - (i * 100)
+          pm._peer_connect_time["192.168." .. i .. ".1:8333"] = now - 1000
+        end
+
+        -- Peer 3 has blocks in-flight
+        pm._blocks_in_flight["somehash"] = {peer = pm.peer_list[3], time = now}
+
+        pm:evict_extra_outbound_peers(now)
+
+        -- No peer should be evicted (worst peer has blocks in-flight)
+        for i = 1, 3 do
+          assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[i].state)
+        end
+      end)
+
+      it("does not evict recently connected peers", function()
+        local pm = peerman.new(test_network, nil, {max_outbound = 2})
+        local now = os.time()
+
+        -- Add 3 outbound peers (1 over target)
+        for i = 1, 3 do
+          local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
+          pm.peer_list[i] = mock_peer
+          pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
+          pm:_init_peer_chain_sync(mock_peer)
+          pm._peer_last_block_ann["192.168." .. i .. ".1:8333"] = now - (i * 100)
+          -- All peers connected very recently
+          pm._peer_connect_time["192.168." .. i .. ".1:8333"] = now - 5
+        end
+
+        pm:evict_extra_outbound_peers(now)
+
+        -- No peer should be evicted (all connected within MINIMUM_CONNECT_TIME)
+        for i = 1, 3 do
+          assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[i].state)
+        end
+      end)
+
+      it("does not evict protected peers", function()
+        local pm = peerman.new(test_network, nil, {max_outbound = 2})
+        local now = os.time()
+
+        -- Add 3 outbound peers
+        for i = 1, 3 do
+          local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
+          pm.peer_list[i] = mock_peer
+          pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
+          pm:_init_peer_chain_sync(mock_peer)
+          pm._peer_last_block_ann["192.168." .. i .. ".1:8333"] = now - (i * 100)
+          pm._peer_connect_time["192.168." .. i .. ".1:8333"] = now - 1000
+        end
+
+        -- Protect peer 3 (the one that would normally be evicted)
+        local key3 = "192.168.3.1:8333"
+        pm._peer_chain_sync[key3].protect = true
+
+        pm:evict_extra_outbound_peers(now)
+
+        -- Peer 2 should be evicted instead (next oldest announcement)
+        assert.equals(peer_mod.STATE.DISCONNECTED, pm.peer_list[2].state)
+        assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[3].state)
+      end)
+
+      it("clears try_new_outbound_peer flag after successful eviction", function()
+        local pm = peerman.new(test_network, nil, {max_outbound = 2})
+        local now = os.time()
+        pm._try_new_outbound_peer = true
+
+        -- Add 3 outbound peers
+        for i = 1, 3 do
+          local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
+          pm.peer_list[i] = mock_peer
+          pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
+          pm:_init_peer_chain_sync(mock_peer)
+          pm._peer_last_block_ann["192.168." .. i .. ".1:8333"] = now - (i * 100)
+          pm._peer_connect_time["192.168." .. i .. ".1:8333"] = now - 1000
+        end
+
+        pm:evict_extra_outbound_peers(now)
+
+        assert.is_false(pm._try_new_outbound_peer)
+      end)
+
+    end)
+
+    describe("check_for_stale_tip_and_evict_peers", function()
+
+      it("runs consider_eviction for outbound peers", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm.network = {pow_target_spacing = 600}
+        pm.our_height = 100000
+        pm._extra_peer_check_time = 0  -- Force check to run
+
+        local mock_peer = make_mock_outbound_peer()
+        pm.peer_list[1] = mock_peer
+        pm.peers["192.168.1.1:8333"] = mock_peer
+        pm:_init_peer_chain_sync(mock_peer)
+        pm:set_peer_best_block(mock_peer, 50000, "hash", 0)
+
+        pm:check_for_stale_tip_and_evict_peers()
+
+        -- Should have set timeout for behind peer
+        local state = pm:get_peer_chain_sync(mock_peer)
+        assert.is_true(state.timeout > 0)
+      end)
+
+      it("enables extra outbound peer when tip is stale", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm.network = {pow_target_spacing = 600}
+        pm._last_tip_update = pm._last_tip_update - 2000  -- Old tip
+        pm._stale_tip_check_time = 0  -- Force check to run
+
+        assert.is_false(pm._try_new_outbound_peer)
+        pm:check_for_stale_tip_and_evict_peers()
+        assert.is_true(pm._try_new_outbound_peer)
+      end)
+
+      it("disables extra outbound peer when tip is no longer stale", function()
+        local pm = peerman.new(test_network, nil, nil)
+        pm.network = {pow_target_spacing = 600}
+        pm._try_new_outbound_peer = true
+        pm._stale_tip_check_time = 0
+
+        pm:record_tip_update()
+        pm:check_for_stale_tip_and_evict_peers()
+
+        assert.is_false(pm._try_new_outbound_peer)
+      end)
+
+    end)
+
+    describe("extra outbound connections", function()
+
+      it("should_try_new_outbound_peer returns correct state", function()
+        local pm = peerman.new(test_network, nil, nil)
+        assert.is_false(pm:should_try_new_outbound_peer())
+        pm:set_try_new_outbound_peer(true)
+        assert.is_true(pm:should_try_new_outbound_peer())
+      end)
+
+      it("maintain_connections allows extra peer when stale", function()
+        local pm = peerman.new(test_network, nil, {max_outbound = 2})
+        pm._try_new_outbound_peer = true
+
+        -- Add 2 known addresses (at target)
+        pm:add_known_address("192.168.1.1", 8333)
+        pm:add_known_address("192.168.2.1", 8333)
+        pm:add_known_address("192.168.3.1", 8333)
+
+        -- Note: We can't fully test maintain_connections without real sockets
+        -- but we can verify the target calculation logic
+        local extra_count = pm:get_extra_full_outbound_count()
+        -- With 0 connected and max_outbound=2, extra count should be 0
+        assert.equals(0, extra_count)
+      end)
+
+    end)
+
+    describe("blocks in-flight tracking", function()
+
+      it("records and removes blocks in-flight", function()
+        local pm = peerman.new(test_network, nil, nil)
+        local mock_peer = {}
+
+        pm:record_block_in_flight("hash1", mock_peer)
+        pm:record_block_in_flight("hash2", mock_peer)
+
+        assert.is_true(pm:is_block_in_flight("hash1"))
+        assert.is_true(pm:is_block_in_flight("hash2"))
+        assert.equals(2, pm:get_blocks_in_flight_count())
+
+        pm:remove_block_in_flight("hash1")
+        assert.is_false(pm:is_block_in_flight("hash1"))
+        assert.equals(1, pm:get_blocks_in_flight_count())
+      end)
+
+    end)
+
+  end)
+
 end)

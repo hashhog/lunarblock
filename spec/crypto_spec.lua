@@ -256,4 +256,168 @@ describe("crypto", function()
       assert.equals(20, #result.bytes)
     end)
   end)
+
+  describe("schnorr (BIP340)", function()
+    -- BIP340 test vector 0
+    -- https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv
+    local bip340_test_vector = {
+      secret_key = "0000000000000000000000000000000000000000000000000000000000000003",
+      public_key = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      message = "0000000000000000000000000000000000000000000000000000000000000000",
+      signature = "e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca821525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c0",
+    }
+
+    it("verifies valid BIP340 signature", function()
+      local pubkey = hex_to_bin(bip340_test_vector.public_key)
+      local sig = hex_to_bin(bip340_test_vector.signature)
+      local msg = hex_to_bin(bip340_test_vector.message)
+
+      local valid = crypto.schnorr_verify(pubkey, sig, msg)
+      assert.is_true(valid)
+    end)
+
+    it("rejects signature with wrong message", function()
+      local pubkey = hex_to_bin(bip340_test_vector.public_key)
+      local sig = hex_to_bin(bip340_test_vector.signature)
+      local wrong_msg = hex_to_bin("0000000000000000000000000000000000000000000000000000000000000001")
+
+      local valid = crypto.schnorr_verify(pubkey, sig, wrong_msg)
+      assert.is_false(valid)
+    end)
+
+    it("rejects signature with wrong public key", function()
+      -- Different x-only pubkey (from privkey = 2)
+      local wrong_pubkey = hex_to_bin("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+      local sig = hex_to_bin(bip340_test_vector.signature)
+      local msg = hex_to_bin(bip340_test_vector.message)
+
+      local valid = crypto.schnorr_verify(wrong_pubkey, sig, msg)
+      assert.is_false(valid)
+    end)
+
+    it("rejects invalid public key", function()
+      -- All zeros is not a valid x-only pubkey
+      local invalid_pubkey = string.rep("\x00", 32)
+      local sig = hex_to_bin(bip340_test_vector.signature)
+      local msg = hex_to_bin(bip340_test_vector.message)
+
+      local valid, err = crypto.schnorr_verify(invalid_pubkey, sig, msg)
+      assert.is_false(valid)
+      assert.equals("invalid x-only public key", err)
+    end)
+  end)
+
+  describe("sha256_init streaming", function()
+    it("produces same result as single-call sha256", function()
+      local data1 = "hello "
+      local data2 = "world"
+      local full_data = data1 .. data2
+
+      local hasher = crypto.sha256_init()
+      hasher.update(data1)
+      hasher.update(data2)
+      local streaming_result = hasher.final()
+
+      local single_result = crypto.sha256(full_data)
+
+      assert.equals(bin_to_hex(single_result), bin_to_hex(streaming_result))
+    end)
+
+    it("handles empty updates", function()
+      local hasher = crypto.sha256_init()
+      hasher.update("")
+      hasher.update("test")
+      hasher.update("")
+      local result = hasher.final()
+
+      assert.equals(bin_to_hex(crypto.sha256("test")), bin_to_hex(result))
+    end)
+  end)
+
+  describe("hmac_sha256", function()
+    it("computes HMAC-SHA256 for known test vector", function()
+      -- Test vector from RFC 4231
+      local key = hex_to_bin("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+      local data = "Hi There"
+      local result = crypto.hmac_sha256(key, data)
+      local expected = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+      assert.equals(expected, bin_to_hex(result))
+    end)
+  end)
+
+  describe("random_bytes", function()
+    it("returns requested number of bytes", function()
+      local bytes16 = crypto.random_bytes(16)
+      local bytes32 = crypto.random_bytes(32)
+      local bytes64 = crypto.random_bytes(64)
+
+      assert.equals(16, #bytes16)
+      assert.equals(32, #bytes32)
+      assert.equals(64, #bytes64)
+    end)
+
+    it("returns different values on successive calls", function()
+      local r1 = crypto.random_bytes(32)
+      local r2 = crypto.random_bytes(32)
+      local r3 = crypto.random_bytes(32)
+
+      assert.is_not.equals(r1, r2)
+      assert.is_not.equals(r2, r3)
+      assert.is_not.equals(r1, r3)
+    end)
+  end)
+
+  describe("siphash24", function()
+    it("computes SipHash-2-4 for known test vector", function()
+      local ffi = require("ffi")
+      -- Test vector from SipHash paper
+      -- Key: 00 01 02 ... 0f
+      -- Data: 00 01 02 ... 0e (15 bytes)
+      -- Expected: a129ca61 49be45e5
+      local k0 = ffi.new("uint64_t", 0x0706050403020100ULL)
+      local k1 = ffi.new("uint64_t", 0x0f0e0d0c0b0a0908ULL)
+      local data = string.char(
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e
+      )
+
+      local result = crypto.siphash24(k0, k1, data)
+
+      -- Expected: 0xa129ca6149be45e5 (little-endian)
+      local expected = ffi.new("uint64_t", 0xa129ca6149be45e5ULL)
+      assert.equals(tostring(expected), tostring(result))
+    end)
+  end)
+
+  describe("ffi buffer reuse", function()
+    it("multiple hash calls work correctly without interference", function()
+      -- Ensure FFI buffers are properly managed
+      local results = {}
+      for i = 1, 100 do
+        results[i] = crypto.sha256("test" .. i)
+      end
+
+      -- Verify each hash is unique and correct
+      for i = 1, 100 do
+        local expected = crypto.sha256("test" .. i)
+        assert.equals(bin_to_hex(expected), bin_to_hex(results[i]))
+      end
+    end)
+
+    it("interleaved hash operations work correctly", function()
+      -- SHA256 then RIPEMD160 then SHA256 again
+      local sha1 = crypto.sha256("first")
+      local ripe = crypto.ripemd160("second")
+      local sha2 = crypto.sha256("third")
+
+      assert.equals(32, #sha1)
+      assert.equals(20, #ripe)
+      assert.equals(32, #sha2)
+
+      -- Verify results are correct
+      assert.equals(bin_to_hex(crypto.sha256("first")), bin_to_hex(sha1))
+      assert.equals(bin_to_hex(crypto.ripemd160("second")), bin_to_hex(ripe))
+      assert.equals(bin_to_hex(crypto.sha256("third")), bin_to_hex(sha2))
+    end)
+  end)
 end)

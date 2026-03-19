@@ -22,6 +22,33 @@ M.SERVICES = {
   NODE_NETWORK_LIMITED = 1024,
 }
 
+--------------------------------------------------------------------------------
+-- BIP155 Network IDs and Address Sizes
+--------------------------------------------------------------------------------
+
+-- BIP155 network identifiers
+M.NET_ID = {
+  IPV4 = 1,    -- 4-byte IPv4 address
+  IPV6 = 2,    -- 16-byte IPv6 address
+  TORV2 = 3,   -- 10-byte TorV2 address (deprecated, no longer relayed)
+  TORV3 = 4,   -- 32-byte TorV3 address (ed25519 public key)
+  I2P = 5,     -- 32-byte I2P address (SHA256 of destination)
+  CJDNS = 6,   -- 16-byte CJDNS address
+}
+
+-- Expected address sizes for each network type
+M.NET_ADDR_SIZE = {
+  [M.NET_ID.IPV4] = 4,
+  [M.NET_ID.IPV6] = 16,
+  [M.NET_ID.TORV2] = 10,  -- deprecated
+  [M.NET_ID.TORV3] = 32,
+  [M.NET_ID.I2P] = 32,
+  [M.NET_ID.CJDNS] = 16,
+}
+
+-- Maximum address size (BIP155)
+M.MAX_ADDRV2_SIZE = 512
+
 M.INV_TYPE = {
   ERROR = 0,
   MSG_TX = 1,
@@ -332,6 +359,8 @@ M.serialize_sendheaders = M.serialize_empty
 M.deserialize_sendheaders = M.deserialize_empty
 M.serialize_getaddr = M.serialize_empty
 M.deserialize_getaddr = M.deserialize_empty
+M.serialize_sendaddrv2 = M.serialize_empty   -- BIP155: empty payload
+M.deserialize_sendaddrv2 = M.deserialize_empty
 
 --------------------------------------------------------------------------------
 -- Ping/Pong Messages
@@ -516,6 +545,216 @@ function M.deserialize_addr(data)
     }
   end
   return addresses
+end
+
+--------------------------------------------------------------------------------
+-- BIP155 Addrv2 Message (variable-length network addresses)
+--------------------------------------------------------------------------------
+
+--- Convert raw address bytes to a displayable string for various network types.
+-- @param network_id number: BIP155 network identifier
+-- @param addr_bytes string: raw address bytes
+-- @return string: displayable address string
+function M.addr_bytes_to_string(network_id, addr_bytes)
+  if network_id == M.NET_ID.IPV4 then
+    if #addr_bytes ~= 4 then return nil end
+    return string.format("%d.%d.%d.%d",
+      addr_bytes:byte(1), addr_bytes:byte(2),
+      addr_bytes:byte(3), addr_bytes:byte(4))
+  elseif network_id == M.NET_ID.IPV6 then
+    if #addr_bytes ~= 16 then return nil end
+    -- Check for IPv4-mapped IPv6 (::ffff:a.b.c.d)
+    local prefix = addr_bytes:sub(1, 12)
+    if prefix == string.rep("\0", 10) .. "\xff\xff" then
+      return string.format("%d.%d.%d.%d",
+        addr_bytes:byte(13), addr_bytes:byte(14),
+        addr_bytes:byte(15), addr_bytes:byte(16))
+    end
+    -- Full IPv6 representation
+    local parts = {}
+    for i = 1, 16, 2 do
+      local high, low = addr_bytes:byte(i, i + 1)
+      parts[#parts + 1] = string.format("%x", high * 256 + low)
+    end
+    return table.concat(parts, ":")
+  elseif network_id == M.NET_ID.TORV3 then
+    -- TorV3: 32-byte ed25519 pubkey, displayed as base32 + ".onion"
+    if #addr_bytes ~= 32 then return nil end
+    -- For display, we just show hex (full base32 encoding would require checksum)
+    local hex = ""
+    for i = 1, #addr_bytes do
+      hex = hex .. string.format("%02x", addr_bytes:byte(i))
+    end
+    return hex .. ".onion"
+  elseif network_id == M.NET_ID.I2P then
+    -- I2P: 32-byte SHA256, displayed as base32 + ".b32.i2p"
+    if #addr_bytes ~= 32 then return nil end
+    local hex = ""
+    for i = 1, #addr_bytes do
+      hex = hex .. string.format("%02x", addr_bytes:byte(i))
+    end
+    return hex .. ".b32.i2p"
+  elseif network_id == M.NET_ID.CJDNS then
+    -- CJDNS: 16-byte address (must start with 0xFC)
+    if #addr_bytes ~= 16 then return nil end
+    -- Display as IPv6-style hex
+    local parts = {}
+    for i = 1, 16, 2 do
+      local high, low = addr_bytes:byte(i, i + 1)
+      parts[#parts + 1] = string.format("%x", high * 256 + low)
+    end
+    return table.concat(parts, ":")
+  end
+  -- Unknown network type
+  return nil
+end
+
+--- Convert a displayable address string to raw bytes for various network types.
+-- @param network_id number: BIP155 network identifier
+-- @param addr_str string: displayable address string
+-- @return string|nil: raw address bytes, or nil if invalid
+function M.string_to_addr_bytes(network_id, addr_str)
+  if network_id == M.NET_ID.IPV4 then
+    local a, b, c, d = addr_str:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not a then return nil end
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+    return string.char(a, b, c, d)
+  elseif network_id == M.NET_ID.IPV6 then
+    -- Simplified: parse colon-separated hex groups
+    local parts = {}
+    for part in (addr_str .. ":"):gmatch("([^:]*):") do
+      parts[#parts + 1] = part
+    end
+    if #parts ~= 8 then return nil end
+    local bytes = {}
+    for _, part in ipairs(parts) do
+      local val = tonumber(part, 16) or 0
+      bytes[#bytes + 1] = string.char(math.floor(val / 256), val % 256)
+    end
+    return table.concat(bytes)
+  end
+  -- For TORV3, I2P, CJDNS: expect raw bytes (32 or 16)
+  return nil
+end
+
+--- Serialize an addrv2 message (BIP155).
+-- @param addresses table: list of {timestamp, services, network_id, addr_bytes, port}
+-- @return string: serialized addrv2 payload
+function M.serialize_addrv2(addresses)
+  local w = serialize.buffer_writer()
+  w.write_varint(#addresses)
+  for _, addr in ipairs(addresses) do
+    -- timestamp (uint32)
+    w.write_u32le(addr.timestamp or os.time())
+    -- services (compact size)
+    w.write_varint(addr.services or 0)
+    -- network_id (uint8)
+    local net_id = addr.network_id or M.NET_ID.IPV4
+    w.write_u8(net_id)
+    -- addr_bytes (compact size + bytes)
+    local addr_bytes = addr.addr_bytes
+    if not addr_bytes and addr.ip then
+      -- Convert from IP string if addr_bytes not provided
+      if net_id == M.NET_ID.IPV4 then
+        addr_bytes = M.string_to_addr_bytes(M.NET_ID.IPV4, addr.ip)
+      elseif net_id == M.NET_ID.IPV6 then
+        -- Check if it's an IPv4 address being sent as IPv6
+        local a, b, c, d = addr.ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+        if a then
+          -- IPv4 address - send as IPv4
+          net_id = M.NET_ID.IPV4
+          addr_bytes = string.char(tonumber(a), tonumber(b), tonumber(c), tonumber(d))
+        end
+      end
+    end
+    addr_bytes = addr_bytes or string.rep("\0", 4)
+    w.write_varint(#addr_bytes)
+    w.write_bytes(addr_bytes)
+    -- port (uint16 big-endian)
+    w.write_u16be(addr.port or 8333)
+  end
+  return w.result()
+end
+
+--- Deserialize an addrv2 message (BIP155).
+-- @param data string: addrv2 payload
+-- @return table: list of {timestamp, services, network_id, addr_bytes, addr_str, port, valid}
+function M.deserialize_addrv2(data)
+  local r = serialize.buffer_reader(data)
+  local count = r.read_varint()
+  local addresses = {}
+  for i = 1, count do
+    local timestamp = r.read_u32le()
+    local services = r.read_varint()
+    local network_id = r.read_u8()
+    local addr_len = r.read_varint()
+
+    -- Validate address length
+    local valid = true
+    local expected_len = M.NET_ADDR_SIZE[network_id]
+    if expected_len and addr_len ~= expected_len then
+      valid = false  -- Wrong size for known network type
+    end
+    if addr_len > M.MAX_ADDRV2_SIZE then
+      valid = false  -- Address too long
+    end
+
+    local addr_bytes = r.read_bytes(addr_len)
+    local port = r.read_u16be()
+
+    -- Skip deprecated TORV2 addresses
+    if network_id == M.NET_ID.TORV2 then
+      valid = false
+    end
+
+    -- Validate CJDNS prefix (must start with 0xFC)
+    if network_id == M.NET_ID.CJDNS and valid then
+      if #addr_bytes < 1 or addr_bytes:byte(1) ~= 0xFC then
+        valid = false
+      end
+    end
+
+    -- Convert to displayable string
+    local addr_str = nil
+    if valid then
+      addr_str = M.addr_bytes_to_string(network_id, addr_bytes)
+    end
+
+    -- For IPv4/IPv6, also set the ip field for backwards compatibility
+    local ip = nil
+    if valid and (network_id == M.NET_ID.IPV4 or network_id == M.NET_ID.IPV6) then
+      ip = addr_str
+    end
+
+    addresses[i] = {
+      timestamp = timestamp,
+      services = services,
+      network_id = network_id,
+      addr_bytes = addr_bytes,
+      addr_str = addr_str,
+      ip = ip,
+      port = port,
+      valid = valid,
+    }
+  end
+  return addresses
+end
+
+--- Check if an address is compatible with a peer (for addr relay).
+-- Peers without addrv2 can only receive IPv4/IPv6 addresses.
+-- @param peer_wants_addrv2 boolean: whether peer sent sendaddrv2
+-- @param addr table: address entry with network_id field
+-- @return boolean: true if address can be sent to this peer
+function M.is_addr_compatible(peer_wants_addrv2, addr)
+  local net_id = addr.network_id or M.NET_ID.IPV4
+  if peer_wants_addrv2 then
+    -- Addrv2 peers can receive all address types (except deprecated TORV2)
+    return net_id ~= M.NET_ID.TORV2
+  else
+    -- Non-addrv2 peers can only receive IPv4 and IPv6
+    return net_id == M.NET_ID.IPV4 or net_id == M.NET_ID.IPV6
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -980,6 +1219,243 @@ function M.deserialize_cfcheckpt(data)
     filter_type = filter_type,
     stop_hash = stop_hash,
     filter_headers = filter_headers,
+  }
+end
+
+--------------------------------------------------------------------------------
+-- BIP324 V2 Transport Support
+--------------------------------------------------------------------------------
+
+-- Short message type IDs for v2 transport (BIP324)
+-- ID 0 means 12-byte string encoding follows
+M.V2_MESSAGE_IDS = {
+  [0] = "",            -- Long encoding follows
+  [1] = "addr",
+  [2] = "block",
+  [3] = "blocktxn",
+  [4] = "cmpctblock",
+  [5] = "feefilter",
+  [6] = "filteradd",
+  [7] = "filterclear",
+  [8] = "filterload",
+  [9] = "getblocks",
+  [10] = "getblocktxn",
+  [11] = "getdata",
+  [12] = "getheaders",
+  [13] = "headers",
+  [14] = "inv",
+  [15] = "mempool",
+  [16] = "merkleblock",
+  [17] = "notfound",
+  [18] = "ping",
+  [19] = "pong",
+  [20] = "sendcmpct",
+  [21] = "tx",
+  [22] = "getcfilters",
+  [23] = "cfilter",
+  [24] = "getcfheaders",
+  [25] = "cfheaders",
+  [26] = "getcfcheckpt",
+  [27] = "cfcheckpt",
+  [28] = "addrv2",
+  -- 29-32 reserved
+}
+
+-- Reverse map: message type string to 1-byte ID
+M.V2_MESSAGE_MAP = {}
+for id, name in pairs(M.V2_MESSAGE_IDS) do
+  if name ~= "" then
+    M.V2_MESSAGE_MAP[name] = id
+  end
+end
+
+--- Encode a message type for v2 transport.
+-- Uses short 1-byte encoding if available, otherwise 12-byte string.
+-- @param msg_type string: message type (e.g., "ping", "version")
+-- @return string: encoded message type prefix
+function M.encode_v2_message_type(msg_type)
+  local short_id = M.V2_MESSAGE_MAP[msg_type]
+  if short_id then
+    -- Short encoding: 1-byte ID
+    return string.char(short_id)
+  else
+    -- Long encoding: 0x00 + 12-byte null-padded command
+    local cmd = msg_type:sub(1, 12)
+    cmd = cmd .. string.rep("\0", 12 - #cmd)
+    return "\0" .. cmd
+  end
+end
+
+--- Decode message type from v2 transport contents.
+-- @param contents string: packet contents (starts with type prefix)
+-- @return string|nil, number: message type and bytes consumed, or nil on error
+function M.decode_v2_message_type(contents)
+  if #contents == 0 then
+    return nil, 0
+  end
+
+  local first_byte = contents:byte(1)
+  if first_byte ~= 0 then
+    -- Short encoding
+    local msg_type = M.V2_MESSAGE_IDS[first_byte]
+    if not msg_type or msg_type == "" then
+      return nil, 0  -- Unknown short ID
+    end
+    return msg_type, 1
+  else
+    -- Long encoding: 12-byte null-padded command
+    if #contents < 13 then
+      return nil, 0  -- Not enough data
+    end
+    local cmd = contents:sub(2, 13)
+    -- Find end of command (first null or end of 12 bytes)
+    local cmd_end = cmd:find("\0")
+    if cmd_end then
+      cmd = cmd:sub(1, cmd_end - 1)
+    end
+    -- Validate command characters (printable ASCII)
+    for i = 1, #cmd do
+      local c = cmd:byte(i)
+      if c < 0x20 or c > 0x7F then
+        return nil, 0  -- Invalid character
+      end
+    end
+    return cmd, 13
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Package Relay Messages (BIP 331)
+--------------------------------------------------------------------------------
+
+-- Package relay version
+M.PKG_RELAY_VERSION = 1
+
+--- Serialize a sendpackages message.
+-- Sent during version handshake to negotiate package relay support.
+-- @param version number: package relay version (1)
+-- @return string: serialized sendpackages payload
+function M.serialize_sendpackages(version)
+  local w = serialize.buffer_writer()
+  w.write_u64le(version)
+  return w.result()
+end
+
+--- Deserialize a sendpackages message.
+-- @param data string: sendpackages payload
+-- @return table: {version}
+function M.deserialize_sendpackages(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    version = r.read_u64le(),
+  }
+end
+
+--- Serialize an ancpkginfo message.
+-- Announces that package info is available for a transaction.
+-- Sent for a 1p1c package when we have the parent and announce the child.
+-- @param wtxid hash256: wtxid of the child transaction
+-- @return string: serialized ancpkginfo payload
+function M.serialize_ancpkginfo(wtxid)
+  local w = serialize.buffer_writer()
+  w.write_hash256(wtxid)
+  return w.result()
+end
+
+--- Deserialize an ancpkginfo message.
+-- @param data string: ancpkginfo payload
+-- @return table: {wtxid}
+function M.deserialize_ancpkginfo(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    wtxid = r.read_hash256(),
+  }
+end
+
+--- Serialize a getpkgtxns message.
+-- Request transactions for a package identified by package hash.
+-- @param package_hash hash256: package hash (computed from sorted wtxids)
+-- @param wtxids table: list of wtxids being requested
+-- @return string: serialized getpkgtxns payload
+function M.serialize_getpkgtxns(package_hash, wtxids)
+  local w = serialize.buffer_writer()
+  w.write_hash256(package_hash)
+  w.write_varint(#wtxids)
+  for _, wtxid in ipairs(wtxids) do
+    w.write_hash256(wtxid)
+  end
+  return w.result()
+end
+
+--- Deserialize a getpkgtxns message.
+-- @param data string: getpkgtxns payload
+-- @return table: {package_hash, wtxids}
+function M.deserialize_getpkgtxns(data)
+  local r = serialize.buffer_reader(data)
+  local package_hash = r.read_hash256()
+  local count = r.read_varint()
+  local wtxids = {}
+  for i = 1, count do
+    wtxids[i] = r.read_hash256()
+  end
+  return {
+    package_hash = package_hash,
+    wtxids = wtxids,
+  }
+end
+
+--- Serialize a pkgtxns message.
+-- Response to getpkgtxns with the requested transactions.
+-- @param package_hash hash256: package hash
+-- @param transactions table: list of transaction objects
+-- @return string: serialized pkgtxns payload
+function M.serialize_pkgtxns(package_hash, transactions)
+  local w = serialize.buffer_writer()
+  w.write_hash256(package_hash)
+  w.write_varint(#transactions)
+  for _, tx in ipairs(transactions) do
+    w.write_bytes(serialize.serialize_transaction(tx, true))  -- always include witness
+  end
+  return w.result()
+end
+
+--- Deserialize a pkgtxns message.
+-- @param data string: pkgtxns payload
+-- @return table: {package_hash, transactions}
+function M.deserialize_pkgtxns(data)
+  local r = serialize.buffer_reader(data)
+  local package_hash = r.read_hash256()
+  local count = r.read_varint()
+  local transactions = {}
+  for i = 1, count do
+    transactions[i] = serialize.deserialize_transaction(r)
+  end
+  return {
+    package_hash = package_hash,
+    transactions = transactions,
+  }
+end
+
+--- Serialize a pckginfo1 message.
+-- Package info for 1-parent-1-child (1p1c) packages.
+-- @param parent_wtxid hash256: wtxid of parent transaction
+-- @param child_wtxid hash256: wtxid of child transaction
+-- @return string: serialized pckginfo1 payload
+function M.serialize_pckginfo1(parent_wtxid, child_wtxid)
+  local w = serialize.buffer_writer()
+  w.write_hash256(parent_wtxid)
+  w.write_hash256(child_wtxid)
+  return w.result()
+end
+
+--- Deserialize a pckginfo1 message.
+-- @param data string: pckginfo1 payload
+-- @return table: {parent_wtxid, child_wtxid}
+function M.deserialize_pckginfo1(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    parent_wtxid = r.read_hash256(),
+    child_wtxid = r.read_hash256(),
   }
 end
 

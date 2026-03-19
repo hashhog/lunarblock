@@ -43,6 +43,9 @@ test-sync:
 test-header-sync:
 	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/header_sync_spec.lua
 
+test-miniscript:
+	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/miniscript_spec.lua
+
 # Run luacheck linter
 lint:
 	luacheck src/ spec/

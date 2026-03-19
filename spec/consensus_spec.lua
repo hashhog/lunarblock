@@ -1009,4 +1009,187 @@ describe("consensus", function()
       end)
     end)
   end)
+
+  describe("checkpoint enforcement", function()
+    local test_network
+
+    before_each(function()
+      -- Create a test network with checkpoints
+      test_network = {
+        name = "test",
+        checkpoints = {
+          [0] = "0000000000000000000000000000000000000000000000000000000000000000",
+          [1000] = "0000000000000000000000000000000000000000000000000000000000001000",
+          [5000] = "0000000000000000000000000000000000000000000000000000000000005000",
+          [10000] = "0000000000000000000000000000000000000000000000000000000000010000",
+        },
+      }
+    end)
+
+    describe("get_last_checkpoint_height", function()
+      it("returns the highest checkpoint height", function()
+        local height = consensus.get_last_checkpoint_height(test_network)
+        assert.equals(10000, height)
+      end)
+
+      it("returns 0 for empty checkpoints", function()
+        local empty_network = { checkpoints = {} }
+        local height = consensus.get_last_checkpoint_height(empty_network)
+        assert.equals(0, height)
+      end)
+
+      it("returns 0 for nil checkpoints", function()
+        local no_checkpoints_network = {}
+        local height = consensus.get_last_checkpoint_height(no_checkpoints_network)
+        assert.equals(0, height)
+      end)
+    end)
+
+    describe("check_checkpoint", function()
+      it("returns true when hash matches checkpoint", function()
+        local ok, err = consensus.check_checkpoint(test_network, 1000,
+          "0000000000000000000000000000000000000000000000000000000000001000")
+        assert.is_true(ok)
+        assert.is_nil(err)
+      end)
+
+      it("returns CHECKPOINT error when hash does not match checkpoint", function()
+        local ok, err = consensus.check_checkpoint(test_network, 1000,
+          "0000000000000000000000000000000000000000000000000000000000000bad")
+        assert.is_false(ok)
+        assert.equals("CHECKPOINT", err)
+      end)
+
+      it("returns true for heights without checkpoints", function()
+        local ok, err = consensus.check_checkpoint(test_network, 500,
+          "any_hash_is_fine_here")
+        assert.is_true(ok)
+        assert.is_nil(err)
+      end)
+    end)
+
+    describe("check_checkpoint_anti_fork", function()
+      it("returns true when all ancestors match checkpoints", function()
+        local get_ancestor = function(h)
+          if h == 0 then
+            return { hash_hex = "0000000000000000000000000000000000000000000000000000000000000000" }
+          elseif h == 1000 then
+            return { hash_hex = "0000000000000000000000000000000000000000000000000000000000001000" }
+          end
+          return nil
+        end
+
+        local ok, err = consensus.check_checkpoint_anti_fork(
+          test_network, 2000,
+          "any_hash_here",
+          get_ancestor
+        )
+        assert.is_true(ok)
+        assert.is_nil(err)
+      end)
+
+      it("returns CHECKPOINT error when ancestor does not match checkpoint", function()
+        local get_ancestor = function(h)
+          if h == 0 then
+            return { hash_hex = "0000000000000000000000000000000000000000000000000000000000000000" }
+          elseif h == 1000 then
+            -- Wrong hash!
+            return { hash_hex = "0000000000000000000000000000000000000000000000000000000000000bad" }
+          end
+          return nil
+        end
+
+        local ok, err = consensus.check_checkpoint_anti_fork(
+          test_network, 2000,
+          "some_hash",
+          get_ancestor
+        )
+        assert.is_false(ok)
+        assert.equals("CHECKPOINT", err)
+      end)
+
+      it("rejects block at checkpoint height with wrong hash", function()
+        local get_ancestor = function(h)
+          if h == 0 then
+            return { hash_hex = "0000000000000000000000000000000000000000000000000000000000000000" }
+          end
+          return nil
+        end
+
+        -- Block at checkpoint height 1000 with wrong hash
+        local ok, err = consensus.check_checkpoint_anti_fork(
+          test_network, 1000,
+          "0000000000000000000000000000000000000000000000000000000000000bad",
+          get_ancestor
+        )
+        assert.is_false(ok)
+        assert.equals("CHECKPOINT", err)
+      end)
+    end)
+  end)
+
+  describe("assumevalid optimization", function()
+    local test_network
+
+    before_each(function()
+      test_network = {
+        name = "test",
+        assumevalid = "0000000000000000000000000000000000000000000000000000000000001000",
+        min_chain_work = "0000000000000000000000000000000000000000000000000000000000000001",
+      }
+    end)
+
+    describe("should_skip_script_validation", function()
+      it("returns false when assumevalid is nil", function()
+        local network = { assumevalid = nil, min_chain_work = "0000000000000000000000000000000000000000000000000000000000000001" }
+        local skip = consensus.should_skip_script_validation(
+          network, 100, "somehash",
+          function() return true end,
+          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
+          5000
+        )
+        assert.is_false(skip)
+      end)
+
+      it("returns false when best header work is below minimum", function()
+        local skip = consensus.should_skip_script_validation(
+          test_network, 100, "somehash",
+          function() return true end,
+          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000000"),
+          5000
+        )
+        assert.is_false(skip)
+      end)
+
+      it("returns false when block is not ancestor of assumevalid", function()
+        local skip = consensus.should_skip_script_validation(
+          test_network, 100, "somehash",
+          function() return false end,  -- not an ancestor
+          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
+          5000
+        )
+        assert.is_false(skip)
+      end)
+
+      it("returns false when block is too recent (within 2016 blocks of tip)", function()
+        local skip = consensus.should_skip_script_validation(
+          test_network, 4000, "somehash",
+          function() return true end,
+          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
+          5000  -- only 1000 blocks behind, < 2016
+        )
+        assert.is_false(skip)
+      end)
+
+      it("returns true when all conditions are met", function()
+        local skip = consensus.should_skip_script_validation(
+          test_network, 100, "somehash",
+          function() return true end,  -- is ancestor
+          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
+          5000  -- 4900 blocks behind, > 2016
+        )
+        assert.is_true(skip)
+      end)
+    end)
+  end)
 end)

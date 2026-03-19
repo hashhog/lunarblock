@@ -546,4 +546,251 @@ describe("mining", function()
     end)
   end)
 
+  describe("is_final_tx", function()
+    it("returns true for locktime 0", function()
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 0)
+      assert.is_true(mining.is_final_tx(tx, 100, 1700000000))
+    end)
+
+    it("returns true when height-based locktime is satisfied", function()
+      -- locktime 50 < height 100, so final
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 50)
+      assert.is_true(mining.is_final_tx(tx, 100, 1700000000))
+    end)
+
+    it("returns false when height-based locktime is not satisfied", function()
+      -- locktime 150 > height 100, and sequence is not final
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 150)
+      assert.is_false(mining.is_final_tx(tx, 100, 1700000000))
+    end)
+
+    it("returns true when time-based locktime is satisfied", function()
+      -- locktime 500000001 (>= 500000000 so time-based)
+      -- mtp = 600000000, locktime < mtp, so final
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 500000001)
+      assert.is_true(mining.is_final_tx(tx, 100, 600000000))
+    end)
+
+    it("returns false when time-based locktime is not satisfied", function()
+      -- locktime 700000000, mtp = 600000000, locktime > mtp
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 700000000)
+      assert.is_false(mining.is_final_tx(tx, 100, 600000000))
+    end)
+
+    it("returns true when all inputs have SEQUENCE_FINAL even if locktime not satisfied", function()
+      -- locktime 150 > height 100, but all inputs have sequence 0xFFFFFFFF
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFF)}, {make_output(9000)}, 150)
+      assert.is_true(mining.is_final_tx(tx, 100, 1700000000))
+    end)
+
+    it("returns false if any input has non-final sequence and locktime not satisfied", function()
+      -- Two inputs: one final, one not final
+      local inputs = {
+        make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFF),
+        make_input(types.hash256(string.rep("\x02", 32)), 0, 0xFFFFFFFE)
+      }
+      local tx = make_tx(1, inputs, {make_output(9000)}, 150)
+      assert.is_false(mining.is_final_tx(tx, 100, 1700000000))
+    end)
+
+    it("handles locktime threshold boundary correctly", function()
+      -- locktime exactly at threshold (500000000) is height-based
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 499999999)
+      assert.is_true(mining.is_final_tx(tx, 500000000, 1700000000))
+
+      -- locktime at threshold is time-based
+      local tx2 = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 500000000)
+      -- With height 100 and mtp 600000000, locktime 500000000 < mtp 600000000
+      assert.is_true(mining.is_final_tx(tx2, 100, 600000000))
+    end)
+  end)
+
+  describe("locktime filtering in block template", function()
+    it("excludes transactions with unsatisfied height-based locktime", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      chain_state.mtp = 1700000000
+      local network = consensus.networks.regtest
+
+      -- Create a tx with locktime 150 (not satisfied at height 101)
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 150)
+      local entry = make_mempool_entry(tx, 1000)
+
+      local mempool = make_mock_mempool({entry})
+      local template, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+
+      -- Transaction should be excluded
+      assert.equal(1, #block.transactions)  -- Only coinbase
+      assert.equal(0, #template.transactions)
+    end)
+
+    it("includes transactions with satisfied height-based locktime", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      chain_state.mtp = 1700000000
+      local network = consensus.networks.regtest
+
+      -- Create a tx with locktime 50 (satisfied at height 101)
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 50)
+      local entry = make_mempool_entry(tx, 1000)
+
+      local mempool = make_mock_mempool({entry})
+      local template, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+
+      -- Transaction should be included
+      assert.equal(2, #block.transactions)  -- Coinbase + tx
+      assert.equal(1, #template.transactions)
+    end)
+
+    it("excludes transactions with unsatisfied time-based locktime", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      chain_state.mtp = 1600000000
+      local network = consensus.networks.regtest
+
+      -- Create a tx with locktime 1700000000 (time-based, > mtp)
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFE)}, {make_output(9000)}, 1700000000)
+      local entry = make_mempool_entry(tx, 1000)
+
+      local mempool = make_mock_mempool({entry})
+      local template, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+
+      -- Transaction should be excluded
+      assert.equal(1, #block.transactions)
+      assert.equal(0, #template.transactions)
+    end)
+
+    it("includes transactions with SEQUENCE_FINAL despite unsatisfied locktime", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      chain_state.mtp = 1700000000
+      local network = consensus.networks.regtest
+
+      -- Create a tx with locktime 150 but all inputs have SEQUENCE_FINAL
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFF)}, {make_output(9000)}, 150)
+      local entry = make_mempool_entry(tx, 1000)
+
+      local mempool = make_mock_mempool({entry})
+      local template, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+
+      -- Transaction should be included (SEQUENCE_FINAL makes it final)
+      assert.equal(2, #block.transactions)
+      assert.equal(1, #template.transactions)
+    end)
+  end)
+
+  describe("coinbase transaction", function()
+    it("has sequence 0xFFFFFFFF", function()
+      local payout_script = make_payout_script()
+      local coinbase = mining.create_coinbase_tx(100, 5000000000, nil, nil, payout_script)
+
+      assert.equal(0xFFFFFFFF, coinbase.inputs[1].sequence)
+    end)
+
+    it("has locktime 0", function()
+      local payout_script = make_payout_script()
+      local coinbase = mining.create_coinbase_tx(100, 5000000000, nil, nil, payout_script)
+
+      assert.equal(0, coinbase.locktime)
+    end)
+  end)
+
+  describe("witness commitment", function()
+    it("includes correct witness commitment format in coinbase", function()
+      local witness_commitment = string.rep("\xab", 32)
+      local payout_script = make_payout_script()
+      local coinbase = mining.create_coinbase_tx(100, 5000000000, nil, witness_commitment, payout_script)
+
+      -- Should have 2 outputs
+      assert.equal(2, #coinbase.outputs)
+
+      -- Second output is witness commitment
+      local commitment_out = coinbase.outputs[2]
+      assert.equal(0, commitment_out.value)
+
+      -- Format: OP_RETURN (0x6a) + PUSH 36 (0x24) + marker (aa21a9ed) + 32-byte hash
+      local script = commitment_out.script_pubkey
+      assert.equal(38, #script)
+      assert.equal(0x6a, script:byte(1))  -- OP_RETURN
+      assert.equal(0x24, script:byte(2))  -- push 36 bytes
+      assert.equal("\xaa\x21\xa9\xed", script:sub(3, 6))  -- marker
+      assert.equal(witness_commitment, script:sub(7, 38))
+    end)
+
+    it("sets witness nonce to 32 zero bytes", function()
+      local witness_commitment = string.rep("\xab", 32)
+      local payout_script = make_payout_script()
+      local coinbase = mining.create_coinbase_tx(100, 5000000000, nil, witness_commitment, payout_script)
+
+      assert.is_true(coinbase.segwit)
+      assert.equal(1, #coinbase.inputs[1].witness)
+      assert.equal(string.rep("\0", 32), coinbase.inputs[1].witness[1])
+    end)
+
+    it("computes witness commitment correctly in block template", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      local network = consensus.networks.regtest  -- segwit enabled
+
+      local mempool = make_mock_mempool({})
+      local template, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+
+      -- Coinbase should have witness commitment
+      local coinbase = block.transactions[1]
+      assert.is_true(coinbase.segwit)
+      assert.equal(2, #coinbase.outputs)
+
+      -- Template should have default_witness_commitment
+      assert.truthy(template.default_witness_commitment)
+      -- Should be hex-encoded: 6a24aa21a9ed + 64 hex chars (32 bytes)
+      assert.equal(76, #template.default_witness_commitment)  -- 38 bytes * 2
+      assert.equal("6a24aa21a9ed", template.default_witness_commitment:sub(1, 12))
+    end)
+  end)
+
+  describe("apply_anti_fee_sniping", function()
+    it("sets locktime to current height", function()
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFF)}, {make_output(9000)}, 0)
+      assert.equal(0, tx.locktime)
+
+      mining.apply_anti_fee_sniping(tx, 100)
+
+      assert.equal(100, tx.locktime)
+    end)
+
+    it("sets final sequences to non-final", function()
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFF)}, {make_output(9000)}, 0)
+      assert.equal(0xFFFFFFFF, tx.inputs[1].sequence)
+
+      mining.apply_anti_fee_sniping(tx, 100)
+
+      assert.equal(0xFFFFFFFE, tx.inputs[1].sequence)
+    end)
+
+    it("preserves already non-final sequences", function()
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFD)}, {make_output(9000)}, 0)
+
+      mining.apply_anti_fee_sniping(tx, 100)
+
+      -- Should remain unchanged since it's already non-final
+      assert.equal(0xFFFFFFFD, tx.inputs[1].sequence)
+    end)
+
+    it("handles multiple inputs", function()
+      local inputs = {
+        make_input(types.hash256(string.rep("\x01", 32)), 0, 0xFFFFFFFF),
+        make_input(types.hash256(string.rep("\x02", 32)), 0, 0xFFFFFFFE),
+        make_input(types.hash256(string.rep("\x03", 32)), 0, 0xFFFFFFFF)
+      }
+      local tx = make_tx(1, inputs, {make_output(9000)}, 0)
+
+      mining.apply_anti_fee_sniping(tx, 500)
+
+      assert.equal(500, tx.locktime)
+      assert.equal(0xFFFFFFFE, tx.inputs[1].sequence)  -- Changed from FINAL
+      assert.equal(0xFFFFFFFE, tx.inputs[2].sequence)  -- Already non-final
+      assert.equal(0xFFFFFFFE, tx.inputs[3].sequence)  -- Changed from FINAL
+    end)
+  end)
+
 end)

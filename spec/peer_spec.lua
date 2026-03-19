@@ -564,4 +564,273 @@ describe("peer", function()
       assert.equal("ping", messages[2].command)
     end)
   end)
+
+  describe("pre-handshake filtering", function()
+    local mock_socket = function()
+      return setmetatable({}, {
+        __index = function(_, key)
+          if key == "receive" then
+            return function() return nil, "timeout", "" end
+          end
+        end
+      })
+    end
+
+    it("rejects non-version message before version received", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.CONNECTED
+      p.socket = mock_socket()
+      assert.is_false(p.version_received)
+      assert.is_false(p.handshake_complete)
+
+      -- Send ping before version - should be rejected
+      local ping_msg = p2p.make_message(mainnet.magic_bytes, "ping", p2p.serialize_ping(123))
+      p.recv_buffer = ping_msg
+
+      local processed = p:process_messages()
+      assert.equal(0, #processed)  -- Message dropped
+      assert.equal(10, p.ban_score)  -- Misbehavior scored
+    end)
+
+    it("allows version message before handshake", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERSION_SENT
+      p.socket = mock_socket()
+
+      local version_payload = p2p.serialize_version({
+        version = 70016,
+        services = 9,
+        timestamp = os.time(),
+        recv_services = 0,
+        recv_ip = "0.0.0.0",
+        recv_port = 0,
+        from_services = 9,
+        from_ip = "0.0.0.0",
+        from_port = 0,
+        nonce = 12345,
+        user_agent = "/Test/",
+        start_height = 800000,
+        relay = true,
+      })
+      local msg = p2p.make_message(mainnet.magic_bytes, "version", version_payload)
+      p.recv_buffer = msg
+
+      local processed = p:process_messages()
+      assert.equal(1, #processed)
+      assert.is_true(p.version_received)
+      assert.equal(0, p.ban_score)
+    end)
+
+    it("allows pre-handshake messages after version but before verack", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERACK_SENT
+      p.version_received = true
+      p.socket = mock_socket()
+
+      -- sendheaders is allowed before handshake complete
+      local msg = p2p.make_message(mainnet.magic_bytes, "sendheaders", "")
+      p.recv_buffer = msg
+
+      local processed = p:process_messages()
+      assert.equal(1, #processed)
+      assert.is_true(p.send_headers)
+      assert.equal(0, p.ban_score)
+    end)
+
+    it("rejects data messages before verack", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERACK_SENT
+      p.version_received = true
+      p.handshake_complete = false
+      p.socket = mock_socket()
+
+      -- inv message is not allowed before handshake
+      -- (using empty payload for simplicity)
+      local msg = p2p.make_message(mainnet.magic_bytes, "inv", "\x00")
+      p.recv_buffer = msg
+
+      local processed = p:process_messages()
+      assert.equal(0, #processed)  -- Message dropped
+      assert.equal(10, p.ban_score)
+    end)
+
+    it("allows all messages after handshake complete", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.ESTABLISHED
+      p.version_received = true
+      p.handshake_complete = true
+      p.socket = mock_socket()
+
+      -- ping should be allowed after handshake
+      local ping_msg = p2p.make_message(mainnet.magic_bytes, "ping", p2p.serialize_ping(123))
+      p.recv_buffer = ping_msg
+
+      local processed = p:process_messages()
+      assert.equal(1, #processed)
+      assert.equal("ping", processed[1].command)
+      assert.equal(0, p.ban_score)
+    end)
+
+    it("handles wtxidrelay before verack", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERACK_SENT
+      p.version_received = true
+      p.socket = mock_socket()
+
+      -- wtxidrelay is allowed (and expected) before verack
+      local msg = p2p.make_message(mainnet.magic_bytes, "wtxidrelay", "")
+      p.recv_buffer = msg
+
+      local processed = p:process_messages()
+      assert.equal(1, #processed)
+      assert.is_true(p.wtxid_relay)
+      assert.equal(0, p.ban_score)
+    end)
+
+    it("handles sendaddrv2 before verack", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERACK_SENT
+      p.version_received = true
+      p.socket = mock_socket()
+
+      -- sendaddrv2 is allowed before verack
+      local msg = p2p.make_message(mainnet.magic_bytes, "sendaddrv2", "")
+      p.recv_buffer = msg
+
+      local processed = p:process_messages()
+      assert.equal(1, #processed)
+      assert.is_true(p.send_addrv2)
+      assert.equal(0, p.ban_score)
+    end)
+
+    it("accumulates misbehavior score and disconnects at threshold", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.CONNECTED
+      p.socket = mock_socket()
+
+      -- Send 10 invalid messages (10 points each = 100 total = disconnect)
+      for i = 1, 10 do
+        local ping_msg = p2p.make_message(mainnet.magic_bytes, "ping", p2p.serialize_ping(i))
+        p.recv_buffer = ping_msg
+        p:process_messages()
+        if p.state == peer_module.STATE.DISCONNECTED then
+          break
+        end
+      end
+
+      assert.equal(peer_module.STATE.DISCONNECTED, p.state)
+      assert.is_true(p.disconnect_reason:find("misbehaving") ~= nil)
+    end)
+
+    it("sets handshake_complete after full version/verack exchange", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERSION_SENT
+      p.socket = mock_socket()
+
+      -- Receive version from peer
+      local version_payload = p2p.serialize_version({
+        version = 70016,
+        services = 9,
+        timestamp = os.time(),
+        recv_services = 0,
+        recv_ip = "0.0.0.0",
+        recv_port = 0,
+        from_services = 9,
+        from_ip = "0.0.0.0",
+        from_port = 0,
+        nonce = 12345,
+        user_agent = "/Test/",
+        start_height = 800000,
+        relay = true,
+      })
+      local version_msg = p2p.make_message(mainnet.magic_bytes, "version", version_payload)
+      p.recv_buffer = version_msg
+      p:process_messages()
+
+      assert.is_true(p.version_received)
+      assert.is_false(p.handshake_complete)
+
+      -- Receive verack from peer
+      local verack_msg = p2p.make_message(mainnet.magic_bytes, "verack", "")
+      p.recv_buffer = verack_msg
+      p:process_messages()
+
+      assert.is_true(p.handshake_complete)
+      assert.equal(peer_module.STATE.ESTABLISHED, p.state)
+    end)
+  end)
+
+  describe("handshake timeout", function()
+    it("disconnects if handshake not complete within 60 seconds", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERSION_SENT
+      p.handshake_start_time = socket.gettime() - 61  -- 61 seconds ago
+      p.last_recv = socket.gettime() - 10
+      p.handshake_complete = false
+
+      p:check_timeouts()
+      assert.equal(peer_module.STATE.DISCONNECTED, p.state)
+      assert.equal("handshake timeout", p.disconnect_reason)
+    end)
+
+    it("does not timeout if handshake completes in time", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.VERSION_SENT
+      p.handshake_start_time = socket.gettime() - 30  -- 30 seconds ago
+      p.last_recv = socket.gettime()
+      p.handshake_complete = false
+
+      p:check_timeouts()
+      assert.equal(peer_module.STATE.VERSION_SENT, p.state)  -- Still connected
+    end)
+
+    it("does not timeout established connections", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.ESTABLISHED
+      p.handshake_start_time = socket.gettime() - 100  -- 100 seconds ago
+      p.handshake_complete = true
+      p.last_recv = socket.gettime()
+
+      p:check_timeouts()
+      assert.equal(peer_module.STATE.ESTABLISHED, p.state)
+    end)
+
+    it("uses HANDSHAKE_TIMEOUT constant of 60 seconds", function()
+      assert.equal(60, peer_module.HANDSHAKE_TIMEOUT)
+    end)
+  end)
+
+  describe("PRE_HANDSHAKE_ALLOWED list", function()
+    it("contains version", function()
+      assert.is_true(peer_module.PRE_HANDSHAKE_ALLOWED.version)
+    end)
+
+    it("contains verack", function()
+      assert.is_true(peer_module.PRE_HANDSHAKE_ALLOWED.verack)
+    end)
+
+    it("contains wtxidrelay", function()
+      assert.is_true(peer_module.PRE_HANDSHAKE_ALLOWED.wtxidrelay)
+    end)
+
+    it("contains sendaddrv2", function()
+      assert.is_true(peer_module.PRE_HANDSHAKE_ALLOWED.sendaddrv2)
+    end)
+
+    it("contains sendheaders", function()
+      assert.is_true(peer_module.PRE_HANDSHAKE_ALLOWED.sendheaders)
+    end)
+
+    it("does not contain inv", function()
+      assert.is_nil(peer_module.PRE_HANDSHAKE_ALLOWED.inv)
+    end)
+
+    it("does not contain tx", function()
+      assert.is_nil(peer_module.PRE_HANDSHAKE_ALLOWED.tx)
+    end)
+
+    it("does not contain block", function()
+      assert.is_nil(peer_module.PRE_HANDSHAKE_ALLOWED.block)
+    end)
+  end)
 end)

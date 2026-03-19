@@ -490,4 +490,56 @@ describe("storage", function()
       remove_dir(path)
     end)
   end)
+
+  describe("undo data storage", function()
+    local db, path
+
+    before_each(function()
+      path = make_temp_dir()
+      db = storage.open(path, 16)
+    end)
+
+    after_each(function()
+      db.close()
+      remove_dir(path)
+    end)
+
+    it("returns nil for non-existent undo data", function()
+      local hash = types.hash256(string.rep("\x77", 32))
+      local undo = db.get_undo(hash)
+      assert.is_nil(undo)
+    end)
+
+    it("puts and gets undo data round-trip", function()
+      local block_hash = types.hash256(string.rep("\x88", 32))
+      local undo_data = "test undo data here with binary \x00\x01\x02"
+
+      db.put_undo(block_hash, undo_data)
+
+      local retrieved = db.get_undo(block_hash)
+      assert.is_not_nil(retrieved)
+      assert.equal(undo_data, retrieved)
+    end)
+
+    it("deletes undo data", function()
+      local block_hash = types.hash256(string.rep("\x99", 32))
+      local undo_data = "undo data to delete"
+
+      db.put_undo(block_hash, undo_data)
+      assert.is_not_nil(db.get_undo(block_hash))
+
+      db.delete_undo(block_hash)
+      assert.is_nil(db.get_undo(block_hash))
+    end)
+
+    it("handles empty undo data", function()
+      local block_hash = types.hash256(string.rep("\xaa", 32))
+      local undo_data = ""
+
+      db.put_undo(block_hash, undo_data)
+
+      local retrieved = db.get_undo(block_hash)
+      assert.equal("", retrieved)
+    end)
+  end)
 end)

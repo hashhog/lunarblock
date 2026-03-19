@@ -10,6 +10,390 @@ local validation = require("lunarblock.validation")
 local M = {}
 
 --------------------------------------------------------------------------------
+-- AES-256-CBC Encryption via OpenSSL FFI
+--------------------------------------------------------------------------------
+
+ffi.cdef[[
+  /* AES encryption via EVP interface */
+  typedef struct evp_cipher_st EVP_CIPHER;
+  typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
+
+  const EVP_CIPHER *EVP_aes_256_cbc(void);
+  EVP_CIPHER_CTX *EVP_CIPHER_CTX_new(void);
+  void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx);
+
+  int EVP_EncryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type,
+                         void *impl, const unsigned char *key, const unsigned char *iv);
+  int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+                        const unsigned char *in, int inl);
+  int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
+
+  int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type,
+                         void *impl, const unsigned char *key, const unsigned char *iv);
+  int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+                        const unsigned char *in, int inl);
+  int EVP_DecryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
+
+  /* PBKDF2 for key derivation */
+  int PKCS5_PBKDF2_HMAC(const char *pass, int passlen,
+                        const unsigned char *salt, int saltlen, int iter,
+                        const void *digest, int keylen, unsigned char *out);
+  const void *EVP_sha512(void);
+
+  /* Random bytes */
+  int RAND_bytes(unsigned char *buf, int num);
+]]
+
+local libcrypto = ffi.load("crypto")
+
+-- Encryption constants
+M.CRYPTO_KEY_SIZE = 32      -- AES-256 key size
+M.CRYPTO_IV_SIZE = 16       -- AES block size
+M.CRYPTO_SALT_SIZE = 8      -- Salt size for key derivation
+M.CRYPTO_ROUNDS = 25000     -- PBKDF2 iterations
+
+--- Generate cryptographically secure random bytes.
+-- @param n number: Number of bytes to generate
+-- @return string: Random bytes
+function M.random_bytes(n)
+  local buf = ffi.new("unsigned char[?]", n)
+  if libcrypto.RAND_bytes(buf, n) ~= 1 then
+    -- Fallback to /dev/urandom
+    local f = io.open("/dev/urandom", "rb")
+    if f then
+      local data = f:read(n)
+      f:close()
+      return data
+    end
+    error("Failed to generate random bytes")
+  end
+  return ffi.string(buf, n)
+end
+
+--- Derive a key from passphrase using PBKDF2-SHA512.
+-- @param passphrase string: The passphrase
+-- @param salt string: Salt bytes (8 bytes)
+-- @param rounds number: Number of iterations (default CRYPTO_ROUNDS)
+-- @return string: 32-byte key, string: 16-byte IV
+function M.derive_key(passphrase, salt, rounds)
+  rounds = rounds or M.CRYPTO_ROUNDS
+  local key = ffi.new("unsigned char[32]")
+  local iv = ffi.new("unsigned char[16]")
+  local combined = ffi.new("unsigned char[48]")
+
+  if libcrypto.PKCS5_PBKDF2_HMAC(
+    passphrase, #passphrase,
+    salt, #salt, rounds,
+    libcrypto.EVP_sha512(), 48, combined
+  ) ~= 1 then
+    error("PBKDF2 key derivation failed")
+  end
+
+  ffi.copy(key, combined, 32)
+  ffi.copy(iv, combined + 32, 16)
+  return ffi.string(key, 32), ffi.string(iv, 16)
+end
+
+--- Encrypt data using AES-256-CBC.
+-- @param plaintext string: Data to encrypt
+-- @param key string: 32-byte encryption key
+-- @param iv string: 16-byte initialization vector
+-- @return string: Encrypted data (with PKCS7 padding)
+function M.aes_encrypt(plaintext, key, iv)
+  local ctx = libcrypto.EVP_CIPHER_CTX_new()
+  if ctx == nil then error("Failed to create cipher context") end
+
+  local max_len = #plaintext + 16  -- Space for padding
+  local out = ffi.new("unsigned char[?]", max_len)
+  local outl = ffi.new("int[1]")
+  local total_len = 0
+
+  if libcrypto.EVP_EncryptInit_ex(ctx, libcrypto.EVP_aes_256_cbc(), nil, key, iv) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("Failed to initialize encryption")
+  end
+
+  if libcrypto.EVP_EncryptUpdate(ctx, out, outl, plaintext, #plaintext) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("Failed to encrypt data")
+  end
+  total_len = outl[0]
+
+  if libcrypto.EVP_EncryptFinal_ex(ctx, out + total_len, outl) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    error("Failed to finalize encryption")
+  end
+  total_len = total_len + outl[0]
+
+  libcrypto.EVP_CIPHER_CTX_free(ctx)
+  return ffi.string(out, total_len)
+end
+
+--- Decrypt data using AES-256-CBC.
+-- @param ciphertext string: Encrypted data
+-- @param key string: 32-byte encryption key
+-- @param iv string: 16-byte initialization vector
+-- @return string|nil: Decrypted data, or nil on failure
+-- @return string|nil: Error message on failure
+function M.aes_decrypt(ciphertext, key, iv)
+  local ctx = libcrypto.EVP_CIPHER_CTX_new()
+  if ctx == nil then return nil, "Failed to create cipher context" end
+
+  local out = ffi.new("unsigned char[?]", #ciphertext)
+  local outl = ffi.new("int[1]")
+  local total_len = 0
+
+  if libcrypto.EVP_DecryptInit_ex(ctx, libcrypto.EVP_aes_256_cbc(), nil, key, iv) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "Failed to initialize decryption"
+  end
+
+  if libcrypto.EVP_DecryptUpdate(ctx, out, outl, ciphertext, #ciphertext) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "Failed to decrypt data"
+  end
+  total_len = outl[0]
+
+  if libcrypto.EVP_DecryptFinal_ex(ctx, out + total_len, outl) ~= 1 then
+    libcrypto.EVP_CIPHER_CTX_free(ctx)
+    return nil, "Invalid passphrase or corrupted data"
+  end
+  total_len = total_len + outl[0]
+
+  libcrypto.EVP_CIPHER_CTX_free(ctx)
+  return ffi.string(out, total_len)
+end
+
+--------------------------------------------------------------------------------
+-- Coin Selection: Branch and Bound with Random Fallback
+--------------------------------------------------------------------------------
+
+-- Constants for coin selection
+M.COST_OF_CHANGE = 148     -- vbytes for a change output + future input spend
+M.MAX_BNB_TRIES = 100000   -- Maximum iterations for BnB algorithm
+M.DUST_THRESHOLD = 546     -- Minimum output value (sat)
+
+--- Calculate effective value (value minus cost to spend).
+-- @param value number: UTXO value in satoshis
+-- @param fee_rate number: Fee rate in sat/vB
+-- @param input_vsize number: Virtual size of input (default 68 for P2WPKH)
+-- @return number: Effective value
+local function effective_value(value, fee_rate, input_vsize)
+  input_vsize = input_vsize or 68  -- P2WPKH input
+  return value - math.ceil(input_vsize * fee_rate)
+end
+
+--- Branch and Bound coin selection algorithm.
+-- Searches for an exact match (no change needed).
+-- Based on Murch's algorithm: https://murch.one/wp-content/uploads/2016/11/erhardt2016coinselection.pdf
+-- @param utxos table: Array of {key=string, utxo={value=number, ...}}
+-- @param target number: Target amount in satoshis
+-- @param fee_rate number: Fee rate in sat/vB
+-- @param cost_of_change number: Cost to create and spend change (default COST_OF_CHANGE * fee_rate)
+-- @return table|nil: Selected UTXOs, or nil if no solution found
+function M.select_coins_bnb(utxos, target, fee_rate, cost_of_change)
+  cost_of_change = cost_of_change or math.ceil(M.COST_OF_CHANGE * fee_rate)
+
+  -- Calculate effective values and filter out negative
+  local candidates = {}
+  for _, item in ipairs(utxos) do
+    local eff_val = effective_value(item.utxo.value, fee_rate)
+    if eff_val > 0 then
+      candidates[#candidates + 1] = {
+        key = item.key,
+        utxo = item.utxo,
+        effective_value = eff_val,
+        value = item.utxo.value,
+      }
+    end
+  end
+
+  -- Sort by effective value descending
+  table.sort(candidates, function(a, b) return a.effective_value > b.effective_value end)
+
+  -- Calculate total available
+  local total_available = 0
+  for _, c in ipairs(candidates) do
+    total_available = total_available + c.effective_value
+  end
+
+  if total_available < target then
+    return nil  -- Insufficient funds
+  end
+
+  -- BnB search
+  local curr_selection = {}
+  local curr_value = 0
+  local best_selection = nil
+  local best_waste = math.huge
+
+  local function calculate_waste(selection, sel_value)
+    return sel_value - target
+  end
+
+  -- Depth-first search
+  local tries = 0
+  local idx = 1
+  local available = total_available
+
+  while tries < M.MAX_BNB_TRIES do
+    tries = tries + 1
+
+    -- Check if we should backtrack
+    local backtrack = false
+    if curr_value + available < target then
+      -- Cannot reach target
+      backtrack = true
+    elseif curr_value > target + cost_of_change then
+      -- Too much (exceeds target + change cost)
+      backtrack = true
+    elseif curr_value >= target and curr_value <= target + cost_of_change then
+      -- Found a valid solution!
+      local waste = calculate_waste(curr_selection, curr_value)
+      if waste < best_waste then
+        best_waste = waste
+        best_selection = {}
+        for _, s in ipairs(curr_selection) do
+          best_selection[#best_selection + 1] = s
+        end
+      end
+      backtrack = true
+    elseif idx > #candidates then
+      -- No more candidates
+      backtrack = true
+    end
+
+    if backtrack then
+      if #curr_selection == 0 then
+        break  -- Searched everything
+      end
+
+      -- Backtrack: remove last selected item and skip it
+      local last = curr_selection[#curr_selection]
+      curr_selection[#curr_selection] = nil
+      curr_value = curr_value - last.effective_value
+
+      -- Restore available for items after last's index
+      idx = 1
+      for i, c in ipairs(candidates) do
+        if c == last then
+          idx = i + 1
+          break
+        end
+      end
+
+      -- Recalculate available
+      available = 0
+      for i = idx, #candidates do
+        available = available + candidates[i].effective_value
+      end
+    else
+      -- Include current candidate
+      local candidate = candidates[idx]
+      curr_selection[#curr_selection + 1] = candidate
+      curr_value = curr_value + candidate.effective_value
+      available = available - candidate.effective_value
+      idx = idx + 1
+    end
+  end
+
+  return best_selection
+end
+
+--- Random selection fallback (simple largest-first with randomization).
+-- Used when BnB fails to find an exact match.
+-- @param utxos table: Array of {key=string, utxo={value=number, ...}}
+-- @param target number: Target amount including fees
+-- @return table|nil: Selected UTXOs
+function M.select_coins_random(utxos, target)
+  -- Shuffle the UTXOs
+  local shuffled = {}
+  for i, item in ipairs(utxos) do
+    shuffled[i] = item
+  end
+  for i = #shuffled, 2, -1 do
+    local j = math.random(1, i)
+    shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+  end
+
+  -- Select until we have enough
+  local selected = {}
+  local total = 0
+  for _, item in ipairs(shuffled) do
+    selected[#selected + 1] = item
+    total = total + item.utxo.value
+    if total >= target then
+      return selected
+    end
+  end
+
+  return nil  -- Insufficient funds
+end
+
+--- Knapsack coin selection (greedy with some randomization).
+-- @param utxos table: Array of {key=string, utxo={value=number, ...}}
+-- @param target number: Target amount including fees
+-- @return table|nil: Selected UTXOs
+function M.select_coins_knapsack(utxos, target)
+  -- Sort by value descending
+  local sorted = {}
+  for i, item in ipairs(utxos) do
+    sorted[i] = item
+  end
+  table.sort(sorted, function(a, b) return a.utxo.value > b.utxo.value end)
+
+  -- First pass: try to find a single UTXO close to target
+  for _, item in ipairs(sorted) do
+    if item.utxo.value >= target and item.utxo.value < target * 2 then
+      return {item}
+    end
+  end
+
+  -- Second pass: greedy selection
+  local selected = {}
+  local total = 0
+  for _, item in ipairs(sorted) do
+    if total >= target then break end
+    selected[#selected + 1] = item
+    total = total + item.utxo.value
+  end
+
+  if total >= target then
+    return selected
+  end
+
+  return nil
+end
+
+--- Combined coin selection: tries BnB first, then falls back to knapsack/random.
+-- @param utxos table: Array of {key=string, utxo={value=number, ...}}
+-- @param target number: Target amount (output + estimated fees)
+-- @param fee_rate number: Fee rate in sat/vB
+-- @return table|nil: Selected UTXOs
+-- @return string: Algorithm used ("bnb", "knapsack", or "random")
+function M.select_coins(utxos, target, fee_rate)
+  -- Try Branch and Bound first (for changeless transactions)
+  local selected = M.select_coins_bnb(utxos, target, fee_rate)
+  if selected then
+    return selected, "bnb"
+  end
+
+  -- Fall back to knapsack
+  selected = M.select_coins_knapsack(utxos, target)
+  if selected then
+    return selected, "knapsack"
+  end
+
+  -- Last resort: random selection
+  selected = M.select_coins_random(utxos, target)
+  if selected then
+    return selected, "random"
+  end
+
+  return nil, "insufficient_funds"
+end
+
+--------------------------------------------------------------------------------
 -- Utility Functions
 --------------------------------------------------------------------------------
 
@@ -275,40 +659,56 @@ function M.new(network, storage)
   self.network = network or consensus.networks.mainnet
   self.storage = storage
   self.master_key = nil
+  self.encrypted_master_key = nil  -- Encrypted master key (if locked)
+  self.encryption_salt = nil       -- Salt for key derivation
+  self.is_encrypted = false        -- Whether wallet is encrypted
+  self.is_locked = true            -- Whether wallet is locked (keys unavailable)
   self.keys = {}                   -- address -> {privkey, pubkey, path, type}
   self.addresses = {}              -- ordered list of addresses
   self.utxos = {}                  -- outpoint_key -> {value, script_pubkey, address, txid, vout}
+  self.pending_utxos = {}          -- Unconfirmed UTXOs (in mempool)
+  self.spent_pending = {}          -- Outpoints spent in pending transactions
   self.transactions = {}           -- txid_hex -> {tx, height, time, fee}
-  self.balance = 0
+  self.confirmed_balance = 0       -- Balance from confirmed transactions
+  self.unconfirmed_balance = 0     -- Balance from unconfirmed transactions
   self.next_external_index = 0     -- BIP44 external chain index
   self.next_internal_index = 0     -- BIP44 internal (change) chain index
   self.gap_limit = 20              -- BIP44 address gap limit
   self.account = 0
   self.address_type = "p2wpkh"     -- Default address type
+  self.fee_estimator = nil         -- Optional fee estimator
+  self.mempool = nil               -- Optional mempool reference
   return self
 end
 
+--- Set the fee estimator for this wallet.
+-- @param estimator FeeEstimator: Fee estimator instance from fee.lua
+function Wallet:set_fee_estimator(estimator)
+  self.fee_estimator = estimator
+end
+
+--- Set the mempool for transaction submission.
+-- @param mempool Mempool: Mempool instance from mempool.lua
+function Wallet:set_mempool(mempool)
+  self.mempool = mempool
+end
+
 -- Create a new wallet from a random seed
-function M.create(network, storage)
+function M.create(network, storage, passphrase)
   local wallet = M.new(network, storage)
 
-  -- Generate 32 bytes of random seed using /dev/urandom
-  local f = io.open("/dev/urandom", "rb")
-  local seed
-  if f then
-    seed = f:read(32)
-    f:close()
-  else
-    -- Fallback to Lua random (NOT cryptographically secure)
-    math.randomseed(os.time() + os.clock() * 1000000)
-    local seed_bytes = {}
-    for i = 1, 32 do
-      seed_bytes[i] = string.char(math.random(0, 255))
-    end
-    seed = table.concat(seed_bytes)
-  end
+  -- Generate 32 bytes of random seed using secure random
+  local seed = M.random_bytes(32)
 
   wallet.master_key = M.master_key_from_seed(seed)
+  wallet.is_locked = false
+
+  -- Encrypt if passphrase provided
+  if passphrase and #passphrase > 0 then
+    wallet:encrypt(passphrase)
+  else
+    wallet.is_encrypted = false
+  end
 
   -- Generate initial addresses
   wallet:generate_addresses(wallet.gap_limit)
@@ -317,11 +717,129 @@ function M.create(network, storage)
 end
 
 -- Restore wallet from seed
-function M.from_seed(seed, network, storage)
+function M.from_seed(seed, network, storage, passphrase)
   local wallet = M.new(network, storage)
   wallet.master_key = M.master_key_from_seed(seed)
+  wallet.is_locked = false
+
+  -- Encrypt if passphrase provided
+  if passphrase and #passphrase > 0 then
+    wallet:encrypt(passphrase)
+  else
+    wallet.is_encrypted = false
+  end
+
   wallet:generate_addresses(wallet.gap_limit)
   return wallet
+end
+
+--------------------------------------------------------------------------------
+-- Wallet Encryption
+--------------------------------------------------------------------------------
+
+--- Encrypt the wallet with a passphrase.
+-- @param passphrase string: The encryption passphrase
+function Wallet:encrypt(passphrase)
+  if not self.master_key then
+    error("No master key to encrypt")
+  end
+
+  -- Generate salt
+  self.encryption_salt = M.random_bytes(M.CRYPTO_SALT_SIZE)
+
+  -- Derive key from passphrase
+  local key, iv = M.derive_key(passphrase, self.encryption_salt)
+
+  -- Encrypt master key and chain code
+  local plaintext = self.master_key.key .. self.master_key.chain_code
+  self.encrypted_master_key = M.aes_encrypt(plaintext, key, iv)
+
+  self.is_encrypted = true
+  self.is_locked = false  -- Still unlocked after encryption
+end
+
+--- Lock the wallet (clear private keys from memory).
+function Wallet:lock()
+  if not self.is_encrypted then
+    error("Cannot lock unencrypted wallet")
+  end
+
+  -- Clear private keys from memory
+  if self.master_key then
+    self.master_key.key = nil
+    self.master_key = nil
+  end
+
+  for addr, key_info in pairs(self.keys) do
+    key_info.privkey = nil
+  end
+
+  self.is_locked = true
+end
+
+--- Unlock the wallet with passphrase.
+-- @param passphrase string: The encryption passphrase
+-- @return boolean: true on success
+-- @return string|nil: Error message on failure
+function Wallet:unlock(passphrase)
+  if not self.is_encrypted then
+    return true  -- Not encrypted, already unlocked
+  end
+
+  if not self.encrypted_master_key or not self.encryption_salt then
+    return false, "Wallet encryption data missing"
+  end
+
+  -- Derive key from passphrase
+  local key, iv = M.derive_key(passphrase, self.encryption_salt)
+
+  -- Decrypt master key
+  local plaintext, err = M.aes_decrypt(self.encrypted_master_key, key, iv)
+  if not plaintext then
+    return false, err or "Decryption failed"
+  end
+
+  if #plaintext ~= 64 then
+    return false, "Invalid decrypted key length"
+  end
+
+  -- Restore master key
+  local seed_key = plaintext:sub(1, 32)
+  local chain_code = plaintext:sub(33, 64)
+  self.master_key = M.extended_key(seed_key, chain_code, 0, "\0\0\0\0", 0, true)
+
+  -- Regenerate private keys for all addresses
+  for addr, key_info in pairs(self.keys) do
+    if key_info.change ~= nil and key_info.index >= 0 then
+      local derived
+      if key_info.type == "p2wpkh" then
+        derived = M.derive_bip84_key(self.master_key, self.account, key_info.change, key_info.index)
+      else
+        derived = M.derive_bip44_key(self.master_key, self.account, key_info.change, key_info.index)
+      end
+      key_info.privkey = derived.key
+    end
+  end
+
+  self.is_locked = false
+  return true
+end
+
+--- Change the wallet passphrase.
+-- @param old_passphrase string: Current passphrase
+-- @param new_passphrase string: New passphrase
+-- @return boolean: true on success
+-- @return string|nil: Error message on failure
+function Wallet:change_passphrase(old_passphrase, new_passphrase)
+  -- Unlock with old passphrase
+  local ok, err = self:unlock(old_passphrase)
+  if not ok then
+    return false, err
+  end
+
+  -- Re-encrypt with new passphrase
+  self:encrypt(new_passphrase)
+  return true
 end
 
 --------------------------------------------------------------------------------
@@ -379,12 +897,14 @@ function Wallet:get_change_address()
 end
 
 --------------------------------------------------------------------------------
--- UTXO Scanning
+-- UTXO Scanning and Balance Tracking
 --------------------------------------------------------------------------------
 
+--- Scan the UTXO set for wallet addresses (confirmed balance).
+-- @param chain_state table: Optional chain state for current tip info
 function Wallet:scan_utxos(chain_state)
   self.utxos = {}
-  self.balance = 0
+  self.confirmed_balance = 0
 
   if not self.storage then
     return  -- No storage, skip scan
@@ -395,6 +915,8 @@ function Wallet:scan_utxos(chain_state)
   local utxo_mod = require("lunarblock.utxo")
   local iter = self.storage.iterator(storage_mod.CF.UTXO)
   iter.seek_to_first()
+
+  local tip_height = chain_state and chain_state.tip_height or 0
 
   while iter.valid() do
     local key = iter.key()
@@ -419,6 +941,12 @@ function Wallet:scan_utxos(chain_state)
       local reader = serialize.buffer_reader(key:sub(33, 36))
       local vout = reader.read_u32le()
 
+      -- Calculate confirmations
+      local confirmations = 0
+      if tip_height > 0 and entry.height > 0 then
+        confirmations = tip_height - entry.height + 1
+      end
+
       self.utxos[key] = {
         value = entry.value,
         script_pubkey = entry.script_pubkey,
@@ -427,8 +955,9 @@ function Wallet:scan_utxos(chain_state)
         vout = vout,
         height = entry.height,
         is_coinbase = entry.is_coinbase,
+        confirmations = confirmations,
       }
-      self.balance = self.balance + entry.value
+      self.confirmed_balance = self.confirmed_balance + entry.value
     end
 
     iter.next()
@@ -436,14 +965,145 @@ function Wallet:scan_utxos(chain_state)
   iter.destroy()
 end
 
+--- Scan mempool for unconfirmed transactions affecting the wallet.
+-- @param mempool table: Mempool instance
+function Wallet:scan_mempool(mempool)
+  if not mempool then return end
+
+  self.pending_utxos = {}
+  self.spent_pending = {}
+  self.unconfirmed_balance = 0
+
+  for txid_hex, entry in pairs(mempool.entries) do
+    local tx = entry.tx
+
+    -- Check inputs (spending our confirmed UTXOs)
+    for _, inp in ipairs(tx.inputs) do
+      local key = inp.prev_out.hash.bytes .. string.char(
+        bit.band(inp.prev_out.index, 0xFF),
+        bit.band(bit.rshift(inp.prev_out.index, 8), 0xFF),
+        bit.band(bit.rshift(inp.prev_out.index, 16), 0xFF),
+        bit.band(bit.rshift(inp.prev_out.index, 24), 0xFF)
+      )
+      if self.utxos[key] then
+        -- This input spends one of our confirmed UTXOs
+        self.spent_pending[key] = txid_hex
+        self.unconfirmed_balance = self.unconfirmed_balance - self.utxos[key].value
+      end
+    end
+
+    -- Check outputs (receiving to our addresses)
+    local txid = entry.txid
+    for vout_idx, out in ipairs(tx.outputs) do
+      local script_type, hash_or_program = script.classify_script(out.script_pubkey)
+      local addr = nil
+
+      if script_type == "p2wpkh" then
+        local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
+        addr = address.segwit_encode(hrp, 0, hash_or_program)
+      elseif script_type == "p2pkh" then
+        local version = self.network.pubkey_address_prefix
+        addr = address.base58check_encode(version, hash_or_program)
+      end
+
+      if addr and self.keys[addr] then
+        local key = txid.bytes .. string.char(
+          bit.band(vout_idx - 1, 0xFF),
+          bit.band(bit.rshift(vout_idx - 1, 8), 0xFF),
+          bit.band(bit.rshift(vout_idx - 1, 16), 0xFF),
+          bit.band(bit.rshift(vout_idx - 1, 24), 0xFF)
+        )
+        self.pending_utxos[key] = {
+          value = out.value,
+          script_pubkey = out.script_pubkey,
+          address = addr,
+          txid = txid,
+          vout = vout_idx - 1,
+          height = 0,
+          is_coinbase = false,
+          confirmations = 0,
+        }
+        self.unconfirmed_balance = self.unconfirmed_balance + out.value
+      end
+    end
+  end
+end
+
+--- Get available UTXOs (confirmed and optionally unconfirmed).
+-- @param include_unconfirmed boolean: Whether to include pending UTXOs (default true)
+-- @param min_confirmations number: Minimum confirmations required (default 0)
+-- @return table: Array of {key=string, utxo=table}
+function Wallet:get_available_utxos(include_unconfirmed, min_confirmations)
+  include_unconfirmed = include_unconfirmed ~= false
+  min_confirmations = min_confirmations or 0
+
+  local result = {}
+
+  -- Add confirmed UTXOs that are not spent in pending transactions
+  for key, utxo in pairs(self.utxos) do
+    if not self.spent_pending[key] then
+      if utxo.confirmations >= min_confirmations then
+        -- Check coinbase maturity
+        if utxo.is_coinbase then
+          if utxo.confirmations >= consensus.COINBASE_MATURITY then
+            result[#result + 1] = {key = key, utxo = utxo}
+          end
+        else
+          result[#result + 1] = {key = key, utxo = utxo}
+        end
+      end
+    end
+  end
+
+  -- Add pending UTXOs if requested
+  if include_unconfirmed and min_confirmations == 0 then
+    for key, utxo in pairs(self.pending_utxos) do
+      result[#result + 1] = {key = key, utxo = utxo}
+    end
+  end
+
+  return result
+end
+
 --------------------------------------------------------------------------------
 -- Transaction Creation and Signing
 --------------------------------------------------------------------------------
 
-function Wallet:create_transaction(recipients, fee_rate, change_address)
-  -- recipients: list of {address=string, amount=number (satoshis)}
-  -- fee_rate: sat/vB
-  -- Returns: signed transaction, fee
+--- Estimate fee rate for a transaction.
+-- @param conf_target number: Desired confirmation target in blocks (default 6)
+-- @return number: Fee rate in sat/vB
+function Wallet:estimate_fee_rate(conf_target)
+  conf_target = conf_target or 6
+
+  if self.fee_estimator then
+    local fee_rate = self.fee_estimator:estimate_smart_fee(conf_target)
+    if fee_rate then
+      return fee_rate
+    end
+  end
+
+  -- Fallback: use default minimum relay fee
+  return 1  -- 1 sat/vB
+end
+
+--- Create and sign a transaction.
+-- @param recipients table: List of {address=string, amount=number (satoshis)}
+-- @param options table: Optional settings {fee_rate=number, change_address=string, conf_target=number, include_unconfirmed=boolean, subtract_fee_from_amount=boolean}
+-- @return transaction|nil: Signed transaction
+-- @return number|string: Fee in satoshis, or error message
+-- @return string|nil: Coin selection algorithm used
+function Wallet:create_transaction(recipients, options, change_address_legacy)
+  options = options or {}
+
+  -- Handle legacy API: create_transaction(recipients, fee_rate, change_address)
+  if type(options) == "number" then
+    options = {fee_rate = options, change_address = change_address_legacy}
+  end
+
+  -- Check wallet is unlocked
+  if self.is_encrypted and self.is_locked then
+    return nil, "Wallet is locked"
+  end
 
   -- 1. Calculate total output amount
   local total_out = 0
@@ -453,45 +1113,60 @@ function Wallet:create_transaction(recipients, fee_rate, change_address)
     total_out = total_out + r.amount
   end
 
-  -- 2. Select inputs (simple: largest first)
-  local selected = {}
-  local total_in = 0
-  local sorted_utxos = {}
-  for key, utxo in pairs(self.utxos) do
-    sorted_utxos[#sorted_utxos + 1] = {key = key, utxo = utxo}
-  end
-  table.sort(sorted_utxos, function(a, b) return a.utxo.value > b.utxo.value end)
+  -- 2. Get fee rate
+  local fee_rate = options.fee_rate or self:estimate_fee_rate(options.conf_target)
 
-  -- Estimate transaction size for fee calculation
+  -- 3. Get available UTXOs
+  local include_unconfirmed = options.include_unconfirmed ~= false
+  local available_utxos = self:get_available_utxos(include_unconfirmed)
+
+  if #available_utxos == 0 then
+    return nil, "No available UTXOs"
+  end
+
+  -- 4. Estimate transaction size for initial target
   -- P2WPKH input: ~68 vbytes, output: ~31 vbytes, overhead: ~11 vbytes
   local est_input_vsize = 68
   local est_output_vsize = 31
   local est_overhead = 11
 
-  for _, item in ipairs(sorted_utxos) do
-    selected[#selected + 1] = item
-    total_in = total_in + item.utxo.value
+  -- Initial target (output + estimated fees for minimum inputs)
+  local min_inputs = 1
+  local est_vsize = est_overhead + min_inputs * est_input_vsize + (#recipients + 1) * est_output_vsize
+  local initial_target = total_out + math.ceil(est_vsize * fee_rate)
 
-    -- Estimate fee with current selection
-    local est_vsize = est_overhead + #selected * est_input_vsize
-      + (#recipients + 1) * est_output_vsize  -- +1 for change
-    local est_fee = math.ceil(est_vsize * fee_rate)
-
-    if total_in >= total_out + est_fee then
-      break
-    end
-  end
-
-  -- 3. Calculate actual fee
-  local est_vsize = est_overhead + #selected * est_input_vsize
-    + (#recipients + 1) * est_output_vsize
-  local fee = math.ceil(est_vsize * fee_rate)
-
-  if total_in < total_out + fee then
+  -- 5. Run coin selection
+  local selected, algo = M.select_coins(available_utxos, initial_target, fee_rate)
+  if not selected then
     return nil, "Insufficient funds"
   end
 
-  -- 4. Build transaction
+  -- 6. Calculate actual fee with selected inputs
+  local total_in = 0
+  for _, item in ipairs(selected) do
+    total_in = total_in + item.utxo.value
+  end
+
+  est_vsize = est_overhead + #selected * est_input_vsize + (#recipients + 1) * est_output_vsize
+  local fee = math.ceil(est_vsize * fee_rate)
+
+  -- Verify we have enough
+  if total_in < total_out + fee then
+    -- Try again with higher target
+    initial_target = total_out + fee
+    selected, algo = M.select_coins(available_utxos, initial_target, fee_rate)
+    if not selected then
+      return nil, "Insufficient funds"
+    end
+    total_in = 0
+    for _, item in ipairs(selected) do
+      total_in = total_in + item.utxo.value
+    end
+    est_vsize = est_overhead + #selected * est_input_vsize + (#recipients + 1) * est_output_vsize
+    fee = math.ceil(est_vsize * fee_rate)
+  end
+
+  -- 7. Build transaction
   local inputs = {}
   for _, item in ipairs(selected) do
     inputs[#inputs + 1] = types.txin(
@@ -523,12 +1198,16 @@ function Wallet:create_transaction(recipients, fee_rate, change_address)
 
   -- Change output
   local change = total_in - total_out - fee
-  if change > 546 then  -- Dust threshold
-    change_address = change_address or self:get_change_address()
+  if change > M.DUST_THRESHOLD then
+    local change_address = options.change_address or self:get_change_address()
     local change_type, change_program = address.decode_address(change_address, self.network.name)
     local change_spk
     if change_type == "p2wpkh" then
       change_spk = script.make_p2wpkh_script(change_program)
+    elseif change_type == "p2wsh" then
+      change_spk = script.make_p2wsh_script(change_program)
+    elseif change_type == "p2tr" then
+      change_spk = script.make_p2tr_script(change_program)
     else
       change_spk = script.make_p2pkh_script(change_program)
     end
@@ -540,10 +1219,15 @@ function Wallet:create_transaction(recipients, fee_rate, change_address)
   local tx = types.transaction(2, inputs, outputs, 0)
   tx.segwit = true
 
-  -- 5. Sign inputs
+  -- 8. Sign inputs
   for i, item in ipairs(selected) do
     local key_info = self.keys[item.utxo.address]
-    assert(key_info, "No key for address: " .. item.utxo.address)
+    if not key_info then
+      return nil, "No key for address: " .. item.utxo.address
+    end
+    if not key_info.privkey then
+      return nil, "Private key not available (wallet locked?)"
+    end
 
     if key_info.type == "p2wpkh" then
       -- P2WPKH signing
@@ -570,32 +1254,155 @@ function Wallet:create_transaction(recipients, fee_rate, change_address)
     end
   end
 
-  return tx, fee
+  return tx, fee, algo
+end
+
+--- Send a transaction to the mempool.
+-- @param tx transaction: Signed transaction
+-- @return boolean: true on success
+-- @return string|nil: Error message on failure
+function Wallet:send_transaction(tx)
+  if not self.mempool then
+    return false, "No mempool configured"
+  end
+
+  local ok, err = self.mempool:accept_transaction(tx, true)
+  if not ok then
+    return false, err
+  end
+
+  -- Track the transaction
+  local txid = validation.compute_txid(tx)
+  self.transactions[types.hash256_hex(txid)] = {
+    tx = tx,
+    height = 0,  -- unconfirmed
+    time = os.time(),
+    fee = 0,  -- TODO: calculate from inputs - outputs
+  }
+
+  -- Rescan mempool to update balances
+  self:scan_mempool(self.mempool)
+
+  return true
+end
+
+--- Create and send a transaction in one step.
+-- @param recipients table: List of {address=string, amount=number (satoshis)}
+-- @param options table: Optional settings
+-- @return transaction|nil: Sent transaction
+-- @return string|nil: Error message on failure
+function Wallet:send_to(recipients, options)
+  local tx, result, algo = self:create_transaction(recipients, options)
+  if not tx then
+    return nil, result  -- result is error message
+  end
+
+  local ok, err = self:send_transaction(tx)
+  if not ok then
+    return nil, err
+  end
+
+  return tx
 end
 
 --------------------------------------------------------------------------------
 -- Wallet Info Queries
 --------------------------------------------------------------------------------
 
+--- Get confirmed balance.
+-- @return number: Balance in satoshis
 function Wallet:get_balance()
-  return self.balance
+  return self.confirmed_balance
 end
 
-function Wallet:list_unspent()
+--- Get unconfirmed balance.
+-- @return number: Pending balance in satoshis (can be negative)
+function Wallet:get_unconfirmed_balance()
+  return self.unconfirmed_balance
+end
+
+--- Get total balance (confirmed + unconfirmed).
+-- @return number: Total balance in satoshis
+function Wallet:get_total_balance()
+  return self.confirmed_balance + self.unconfirmed_balance
+end
+
+--- Get detailed balance breakdown.
+-- @return table: {confirmed=number, unconfirmed=number, total=number, spendable=number}
+function Wallet:get_balance_details()
+  local spendable = 0
+  for key, utxo in pairs(self.utxos) do
+    if not self.spent_pending[key] then
+      -- Check coinbase maturity
+      if utxo.is_coinbase then
+        if utxo.confirmations >= consensus.COINBASE_MATURITY then
+          spendable = spendable + utxo.value
+        end
+      else
+        spendable = spendable + utxo.value
+      end
+    end
+  end
+
+  return {
+    confirmed = self.confirmed_balance,
+    unconfirmed = self.unconfirmed_balance,
+    total = self.confirmed_balance + self.unconfirmed_balance,
+    spendable = spendable,
+  }
+end
+
+--- List unspent outputs.
+-- @param include_unconfirmed boolean: Include pending UTXOs (default true)
+-- @return table: Array of UTXO info
+function Wallet:list_unspent(include_unconfirmed)
+  include_unconfirmed = include_unconfirmed ~= false
+
   local result = {}
-  for _, utxo in pairs(self.utxos) do
+
+  -- Add confirmed UTXOs
+  for key, utxo in pairs(self.utxos) do
+    local spendable = true
+    if self.spent_pending[key] then
+      spendable = false
+    end
+    if utxo.is_coinbase and utxo.confirmations < consensus.COINBASE_MATURITY then
+      spendable = false
+    end
+
     result[#result + 1] = {
       txid = types.hash256_hex(utxo.txid),
       vout = utxo.vout,
       address = utxo.address,
       amount = utxo.value / consensus.COIN,
       satoshis = utxo.value,
-      confirmations = 0,  -- would need chain state
+      confirmations = utxo.confirmations or 0,
+      spendable = spendable,
+      safe = not self.spent_pending[key],
     }
   end
+
+  -- Add pending UTXOs
+  if include_unconfirmed then
+    for key, utxo in pairs(self.pending_utxos) do
+      result[#result + 1] = {
+        txid = types.hash256_hex(utxo.txid),
+        vout = utxo.vout,
+        address = utxo.address,
+        amount = utxo.value / consensus.COIN,
+        satoshis = utxo.value,
+        confirmations = 0,
+        spendable = true,
+        safe = false,
+      }
+    end
+  end
+
   return result
 end
 
+--- Get all wallet addresses.
+-- @return table: Array of address info
 function Wallet:get_addresses()
   local result = {}
   for _, addr in ipairs(self.addresses) do
@@ -608,6 +1415,22 @@ function Wallet:get_addresses()
     }
   end
   return result
+end
+
+--- Get wallet info summary.
+-- @return table: Wallet status information
+function Wallet:get_info()
+  return {
+    is_encrypted = self.is_encrypted,
+    is_locked = self.is_locked,
+    network = self.network.name,
+    address_type = self.address_type,
+    address_count = #self.addresses,
+    utxo_count = 0,  -- Will be calculated
+    balance = self:get_balance_details(),
+    next_external_index = self.next_external_index,
+    next_internal_index = self.next_internal_index,
+  }
 end
 
 --------------------------------------------------------------------------------
@@ -649,8 +1472,61 @@ function Wallet:import_privkey(wif)
 end
 
 --------------------------------------------------------------------------------
--- Wallet Serialization
+-- Wallet Serialization with File Locking
 --------------------------------------------------------------------------------
+
+-- File locking via FFI (POSIX fcntl)
+ffi.cdef[[
+  struct flock {
+    short l_type;
+    short l_whence;
+    long long l_start;
+    long long l_len;
+    int l_pid;
+  };
+
+  int open(const char *pathname, int flags, ...);
+  int close(int fd);
+  int fcntl(int fd, int cmd, ...);
+  int ftruncate(int fd, long long length);
+  long long write(int fd, const void *buf, unsigned long count);
+  long long read(int fd, void *buf, unsigned long count);
+  long long lseek(int fd, long long offset, int whence);
+]]
+
+-- fcntl constants
+local F_SETLK = 6
+local F_SETLKW = 7
+local F_WRLCK = 1
+local F_UNLCK = 2
+local O_RDWR = 2
+local O_CREAT = 64
+local O_TRUNC = 512
+local SEEK_SET = 0
+local SEEK_END = 2
+
+--- Acquire an exclusive lock on a file descriptor.
+-- @param fd number: File descriptor
+-- @return boolean: true on success
+local function lock_file(fd)
+  local lock = ffi.new("struct flock")
+  lock.l_type = F_WRLCK
+  lock.l_whence = SEEK_SET
+  lock.l_start = 0
+  lock.l_len = 0  -- Lock entire file
+  return ffi.C.fcntl(fd, F_SETLKW, lock) == 0
+end
+
+--- Release lock on a file descriptor.
+-- @param fd number: File descriptor
+local function unlock_file(fd)
+  local lock = ffi.new("struct flock")
+  lock.l_type = F_UNLCK
+  lock.l_whence = SEEK_SET
+  lock.l_start = 0
+  lock.l_len = 0
+  ffi.C.fcntl(fd, F_SETLK, lock)
+end
 
 -- Simple JSON encoding (for wallet data which has simple structure)
 local function simple_json_encode(tbl)
@@ -706,34 +1582,102 @@ local function get_json()
   return simple_json_encode, simple_json_decode
 end
 
+--- Serialize wallet to JSON string.
+-- @return string: JSON representation
 function Wallet:serialize()
   local encode = get_json()
   local data = {
-    master_key = M.hex_encode(self.master_key.key),
-    master_chain_code = M.hex_encode(self.master_key.chain_code),
+    version = 1,
+    network = self.network.name,
+    address_type = self.address_type,
+    account = self.account,
     next_external_index = self.next_external_index,
     next_internal_index = self.next_internal_index,
-    account = self.account,
-    address_type = self.address_type,
-    network = self.network.name,
+    is_encrypted = self.is_encrypted,
   }
+
+  if self.is_encrypted then
+    -- Store encrypted key
+    data.encrypted_master_key = M.hex_encode(self.encrypted_master_key)
+    data.encryption_salt = M.hex_encode(self.encryption_salt)
+  else
+    -- Store unencrypted (for non-encrypted wallets)
+    if self.master_key then
+      data.master_key = M.hex_encode(self.master_key.key)
+      data.master_chain_code = M.hex_encode(self.master_key.chain_code)
+    end
+  end
+
   return encode(data)
 end
 
+--- Save wallet to file with exclusive locking.
+-- @param filepath string: Path to wallet file
+-- @return boolean: true on success
+-- @return string|nil: Error message on failure
 function Wallet:save(filepath)
   local data = self:serialize()
-  local f = io.open(filepath, "w")
-  assert(f, "Cannot open wallet file for writing")
-  f:write(data)
-  f:close()
+
+  -- Open file with exclusive lock
+  local fd = ffi.C.open(filepath, bit.bor(O_RDWR, O_CREAT, O_TRUNC), 0x180)  -- 0600
+  if fd < 0 then
+    return false, "Cannot open wallet file for writing"
+  end
+
+  if not lock_file(fd) then
+    ffi.C.close(fd)
+    return false, "Cannot acquire lock on wallet file"
+  end
+
+  -- Write data
+  local written = ffi.C.write(fd, data, #data)
+  if written ~= #data then
+    unlock_file(fd)
+    ffi.C.close(fd)
+    return false, "Failed to write wallet data"
+  end
+
+  unlock_file(fd)
+  ffi.C.close(fd)
+  return true
 end
 
-function M.load(filepath, network, storage)
+--- Load wallet from file with locking.
+-- @param filepath string: Path to wallet file
+-- @param network table: Network configuration (optional, uses file value if not provided)
+-- @param storage table: Storage backend (optional)
+-- @param passphrase string: Passphrase for encrypted wallets (optional)
+-- @return Wallet|nil: Loaded wallet
+-- @return string|nil: Error message on failure
+function M.load(filepath, network, storage, passphrase)
   local _, decode = get_json()
-  local f = io.open(filepath, "r")
-  if not f then return nil, "Wallet file not found" end
-  local raw = f:read("*a")
-  f:close()
+
+  -- Open and lock file
+  local fd = ffi.C.open(filepath, O_RDWR, 0)
+  if fd < 0 then
+    return nil, "Wallet file not found"
+  end
+
+  if not lock_file(fd) then
+    ffi.C.close(fd)
+    return nil, "Cannot acquire lock on wallet file"
+  end
+
+  -- Get file size
+  local size = ffi.C.lseek(fd, 0, SEEK_END)
+  ffi.C.lseek(fd, 0, SEEK_SET)
+
+  -- Read data
+  local buf = ffi.new("char[?]", size + 1)
+  local bytes_read = ffi.C.read(fd, buf, size)
+  unlock_file(fd)
+  ffi.C.close(fd)
+
+  if bytes_read ~= size then
+    return nil, "Failed to read wallet file"
+  end
+
+  local raw = ffi.string(buf, size)
   local data = decode(raw)
 
   -- Use network from file if not provided
@@ -742,30 +1686,369 @@ function M.load(filepath, network, storage)
   end
 
   local wallet = M.new(network, storage)
-  local seed_key = M.hex_decode(data.master_key)
-  local chain_code = M.hex_decode(data.master_chain_code)
-  wallet.master_key = M.extended_key(seed_key, chain_code, 0, "\0\0\0\0", 0, true)
   wallet.next_external_index = data.next_external_index or 0
   wallet.next_internal_index = data.next_internal_index or 0
   wallet.account = data.account or 0
   wallet.address_type = data.address_type or "p2wpkh"
+  wallet.is_encrypted = data.is_encrypted or false
 
-  -- Regenerate all addresses
-  local max_index = math.max(wallet.next_external_index, wallet.next_internal_index)
-  if max_index > 0 then
-    -- Reset indices to regenerate from 0
-    local ext = wallet.next_external_index
-    local int = wallet.next_internal_index
-    wallet.next_external_index = 0
-    wallet.next_internal_index = 0
-    wallet:generate_addresses(ext)
-    wallet.next_external_index = ext
-    wallet.next_internal_index = int
+  if data.is_encrypted then
+    -- Load encrypted key
+    wallet.encrypted_master_key = M.hex_decode(data.encrypted_master_key)
+    wallet.encryption_salt = M.hex_decode(data.encryption_salt)
+    wallet.is_locked = true
+
+    -- Try to unlock if passphrase provided
+    if passphrase then
+      local ok, err = wallet:unlock(passphrase)
+      if not ok then
+        return nil, err
+      end
+    end
   else
-    wallet:generate_addresses(wallet.gap_limit)
+    -- Load unencrypted key
+    if data.master_key and data.master_chain_code then
+      local seed_key = M.hex_decode(data.master_key)
+      local chain_code = M.hex_decode(data.master_chain_code)
+      wallet.master_key = M.extended_key(seed_key, chain_code, 0, "\0\0\0\0", 0, true)
+      wallet.is_locked = false
+    end
+  end
+
+  -- Regenerate addresses
+  if not wallet.is_locked then
+    local max_index = math.max(wallet.next_external_index, wallet.next_internal_index)
+    if max_index > 0 then
+      -- Reset indices to regenerate from 0
+      local ext = wallet.next_external_index
+      local int = wallet.next_internal_index
+      wallet.next_external_index = 0
+      wallet.next_internal_index = 0
+      wallet:generate_addresses(ext)
+      wallet.next_external_index = ext
+      wallet.next_internal_index = int
+    else
+      wallet:generate_addresses(wallet.gap_limit)
+    end
   end
 
   return wallet
 end
+
+--- Check if wallet file exists.
+-- @param filepath string: Path to wallet file
+-- @return boolean: true if file exists
+function M.exists(filepath)
+  local f = io.open(filepath, "r")
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+--------------------------------------------------------------------------------
+-- Wallet Manager (Multi-Wallet Support)
+--------------------------------------------------------------------------------
+
+local WalletManager = {}
+WalletManager.__index = WalletManager
+
+--- Create a new wallet manager.
+-- @param datadir string: Base data directory
+-- @param network table: Network configuration
+-- @param storage table: Storage backend (optional)
+-- @return WalletManager: New wallet manager instance
+function M.new_manager(datadir, network, storage)
+  local self = setmetatable({}, WalletManager)
+  self.datadir = datadir
+  self.wallets_dir = datadir .. "/wallets"
+  self.network = network or consensus.networks.mainnet
+  self.storage = storage
+  self.wallets = {}       -- name -> wallet instance
+  self.wallet_locks = {}  -- name -> file descriptor (for locking)
+  self.default_wallet = nil  -- default wallet name
+  return self
+end
+
+--- Ensure wallets directory exists.
+-- @return boolean: true on success
+function WalletManager:ensure_wallets_dir()
+  -- Try to create directory
+  local ok = os.execute("mkdir -p '" .. self.wallets_dir .. "'")
+  return ok == true or ok == 0
+end
+
+--- Get wallet directory path for a wallet name.
+-- @param name string: Wallet name
+-- @return string: Path to wallet directory
+function WalletManager:get_wallet_dir(name)
+  if name == "" then
+    -- Default wallet is in root data directory (backward compatible)
+    return self.datadir
+  end
+  return self.wallets_dir .. "/" .. name
+end
+
+--- Get wallet file path for a wallet name.
+-- @param name string: Wallet name
+-- @return string: Path to wallet.json file
+function WalletManager:get_wallet_path(name)
+  return self:get_wallet_dir(name) .. "/wallet.json"
+end
+
+--- Check if a wallet is loaded.
+-- @param name string: Wallet name
+-- @return boolean: true if wallet is loaded
+function WalletManager:is_loaded(name)
+  return self.wallets[name] ~= nil
+end
+
+--- Get list of loaded wallet names.
+-- @return table: Array of wallet names
+function WalletManager:list_wallets()
+  local names = {}
+  for name, _ in pairs(self.wallets) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  return names
+end
+
+--- Get a loaded wallet by name.
+-- @param name string: Wallet name (empty string for default)
+-- @return Wallet|nil: Wallet instance, or nil if not loaded
+function WalletManager:get_wallet(name)
+  return self.wallets[name]
+end
+
+--- Get default wallet (first loaded or named "").
+-- @return Wallet|nil: Default wallet, or nil if no wallets loaded
+function WalletManager:get_default_wallet()
+  if self.default_wallet and self.wallets[self.default_wallet] then
+    return self.wallets[self.default_wallet], self.default_wallet
+  end
+  -- Fallback: empty string wallet or first loaded
+  if self.wallets[""] then
+    return self.wallets[""], ""
+  end
+  -- Return first loaded wallet
+  for name, wallet in pairs(self.wallets) do
+    return wallet, name
+  end
+  return nil, nil
+end
+
+--- Try to acquire a file lock for a wallet.
+-- @param name string: Wallet name
+-- @return boolean: true if lock acquired
+-- @return string|nil: Error message if failed
+function WalletManager:acquire_lock(name)
+  local wallet_dir = self:get_wallet_dir(name)
+  local lock_path = wallet_dir .. "/.lock"
+
+  -- Create lock file if it doesn't exist
+  local fd = ffi.C.open(lock_path, bit.bor(O_RDWR, O_CREAT), 0x180)  -- 0600
+  if fd < 0 then
+    return false, "Cannot open lock file: " .. lock_path
+  end
+
+  -- Try to get exclusive lock (non-blocking)
+  if not lock_file(fd) then
+    ffi.C.close(fd)
+    return false, "Wallet is locked by another process"
+  end
+
+  self.wallet_locks[name] = fd
+  return true
+end
+
+--- Release file lock for a wallet.
+-- @param name string: Wallet name
+function WalletManager:release_lock(name)
+  local fd = self.wallet_locks[name]
+  if fd then
+    unlock_file(fd)
+    ffi.C.close(fd)
+    self.wallet_locks[name] = nil
+  end
+end
+
+--- Create a new wallet.
+-- @param name string: Wallet name
+-- @param options table: Options {disable_private_keys, blank, passphrase, descriptors}
+-- @return Wallet|nil: New wallet, or nil on error
+-- @return string|nil: Error message
+function WalletManager:create_wallet(name, options)
+  options = options or {}
+
+  -- Validate name
+  if name:find("[/\\:*?\"<>|]") then
+    return nil, "Invalid wallet name: contains illegal characters"
+  end
+
+  -- Check if already loaded
+  if self.wallets[name] then
+    return nil, "Wallet \"" .. name .. "\" is already loaded"
+  end
+
+  -- Check if wallet already exists
+  local wallet_path = self:get_wallet_path(name)
+  if M.exists(wallet_path) then
+    return nil, "Wallet \"" .. name .. "\" already exists"
+  end
+
+  -- Ensure wallets directory exists
+  if name ~= "" then
+    self:ensure_wallets_dir()
+    local wallet_dir = self:get_wallet_dir(name)
+    os.execute("mkdir -p '" .. wallet_dir .. "'")
+  end
+
+  -- Acquire lock
+  local lock_ok, lock_err = self:acquire_lock(name)
+  if not lock_ok then
+    return nil, lock_err
+  end
+
+  -- Create wallet
+  local wallet
+  if options.blank or options.disable_private_keys then
+    -- Create blank wallet (no keys)
+    wallet = M.new(self.network, self.storage)
+    wallet.is_locked = not options.disable_private_keys
+  else
+    -- Create with new seed
+    wallet = M.create(self.network, self.storage, options.passphrase)
+  end
+
+  -- Save wallet
+  local save_ok, save_err = wallet:save(wallet_path)
+  if not save_ok then
+    self:release_lock(name)
+    return nil, save_err
+  end
+
+  -- Add to loaded wallets
+  self.wallets[name] = wallet
+
+  -- Set as default if first wallet
+  if self.default_wallet == nil then
+    self.default_wallet = name
+  end
+
+  return wallet
+end
+
+--- Load an existing wallet.
+-- @param name string: Wallet name (or path for backward compat)
+-- @param passphrase string: Passphrase for encrypted wallets (optional)
+-- @return Wallet|nil: Loaded wallet, or nil on error
+-- @return string|nil: Error message
+function WalletManager:load_wallet(name, passphrase)
+  -- Check if already loaded
+  if self.wallets[name] then
+    return nil, "Wallet \"" .. name .. "\" is already loaded"
+  end
+
+  -- Check if wallet exists
+  local wallet_path = self:get_wallet_path(name)
+  if not M.exists(wallet_path) then
+    return nil, "Wallet file not found: " .. wallet_path
+  end
+
+  -- Acquire lock
+  local lock_ok, lock_err = self:acquire_lock(name)
+  if not lock_ok then
+    return nil, lock_err
+  end
+
+  -- Load wallet
+  local wallet, load_err = M.load(wallet_path, self.network, self.storage, passphrase)
+  if not wallet then
+    self:release_lock(name)
+    return nil, load_err
+  end
+
+  -- Add to loaded wallets
+  self.wallets[name] = wallet
+
+  -- Set as default if first wallet
+  if self.default_wallet == nil then
+    self.default_wallet = name
+  end
+
+  return wallet
+end
+
+--- Unload a wallet.
+-- @param name string: Wallet name
+-- @return boolean: true on success
+-- @return string|nil: Error message
+function WalletManager:unload_wallet(name)
+  local wallet = self.wallets[name]
+  if not wallet then
+    return false, "Wallet \"" .. name .. "\" is not loaded"
+  end
+
+  -- Save wallet before unloading
+  local wallet_path = self:get_wallet_path(name)
+  local save_ok, save_err = wallet:save(wallet_path)
+  if not save_ok then
+    return false, "Failed to save wallet: " .. (save_err or "unknown error")
+  end
+
+  -- Remove from loaded wallets
+  self.wallets[name] = nil
+
+  -- Release lock
+  self:release_lock(name)
+
+  -- Update default wallet if needed
+  if self.default_wallet == name then
+    self.default_wallet = nil
+    -- Set new default to first available
+    for new_name, _ in pairs(self.wallets) do
+      self.default_wallet = new_name
+      break
+    end
+  end
+
+  return true
+end
+
+--- List wallets in wallet directory (loaded and unloaded).
+-- @return table: Array of {name=string, loaded=boolean}
+function WalletManager:list_wallet_dir()
+  local wallets = {}
+
+  -- Check for default wallet in data dir
+  if M.exists(self.datadir .. "/wallet.json") then
+    wallets[#wallets + 1] = {
+      name = "",
+      loaded = self.wallets[""] ~= nil,
+    }
+  end
+
+  -- Scan wallets directory
+  local handle = io.popen("ls -1 '" .. self.wallets_dir .. "' 2>/dev/null")
+  if handle then
+    for dir in handle:lines() do
+      local wallet_path = self.wallets_dir .. "/" .. dir .. "/wallet.json"
+      if M.exists(wallet_path) then
+        wallets[#wallets + 1] = {
+          name = dir,
+          loaded = self.wallets[dir] ~= nil,
+        }
+      end
+    end
+    handle:close()
+  end
+
+  return wallets
+end
+
+-- Export WalletManager class
+M.WalletManager = WalletManager
 
 return M
