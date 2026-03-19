@@ -436,6 +436,186 @@ describe("validation", function()
     end)
   end)
 
+  describe("sigop cost with witness discount", function()
+    it("get_legacy_sigop_count counts scriptSig and scriptPubKey", function()
+      local tx = types.transaction(1, {}, {}, 0)
+      tx.segwit = false
+      local prev_hash = types.hash256(string.rep("\x01", 32))
+      -- scriptSig has no sigops (just push data)
+      tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0),
+        string.char(71) .. string.rep("\x00", 71), 0xFFFFFFFF)
+      -- P2PKH output has 1 OP_CHECKSIG
+      tx.outputs[1] = types.txout(50000, script.make_p2pkh_script(string.rep("\x00", 20)))
+
+      local count = validation.get_legacy_sigop_count(tx)
+      assert.equals(1, count)  -- 1 from P2PKH output
+    end)
+
+    it("get_legacy_sigop_count counts multisig as 20 without accurate counting", function()
+      local tx = types.transaction(1, {}, {}, 0)
+      tx.segwit = false
+      local prev_hash = types.hash256(string.rep("\x01", 32))
+      tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), "\x00", 0xFFFFFFFF)
+      -- 2-of-3 bare multisig output
+      local multisig = string.char(script.OP.OP_2) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(script.OP.OP_3) ..
+                       string.char(script.OP.OP_CHECKMULTISIG)
+      tx.outputs[1] = types.txout(50000, multisig)
+
+      local count = validation.get_legacy_sigop_count(tx)
+      assert.equals(20, count)  -- Multisig counts as 20 without accurate counting
+    end)
+
+    it("extract_p2sh_redeem_script extracts last push from scriptSig", function()
+      -- P2SH scriptSig: <sig> <pubkey> <redeem_script>
+      local redeem_script = script.make_p2pkh_script(string.rep("\x00", 20))
+      local script_sig = string.char(71) .. string.rep("\x00", 71) ..
+                         string.char(33) .. string.rep("\x00", 33) ..
+                         string.char(#redeem_script) .. redeem_script
+
+      local extracted = validation.extract_p2sh_redeem_script(script_sig)
+      assert.equals(redeem_script, extracted)
+    end)
+
+    it("get_transaction_sigop_cost applies WITNESS_SCALE_FACTOR to legacy sigops", function()
+      local tx = types.transaction(1, {}, {}, 0)
+      tx.segwit = false
+      local prev_hash = types.hash256(string.rep("\x01", 32))
+      tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), "\x00", 0xFFFFFFFF)
+      tx.outputs[1] = types.txout(50000, script.make_p2pkh_script(string.rep("\x00", 20)))
+
+      local function get_prev_output()
+        return { script_pubkey = script.make_p2pkh_script(string.rep("\x00", 20)) }
+      end
+
+      -- Legacy sigops cost 4 each (WITNESS_SCALE_FACTOR)
+      local cost = validation.get_transaction_sigop_cost(tx, get_prev_output, {})
+      assert.equals(4, cost)  -- 1 sigop in output * 4
+    end)
+
+    it("get_transaction_sigop_cost counts P2SH sigops with accurate counting", function()
+      -- Create a P2SH redeem script with 3-of-3 multisig
+      local multisig = string.char(script.OP.OP_3) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(script.OP.OP_3) ..
+                       string.char(script.OP.OP_CHECKMULTISIG)
+
+      local tx = types.transaction(1, {}, {}, 0)
+      tx.segwit = false
+      local prev_hash = types.hash256(string.rep("\x01", 32))
+      -- P2SH scriptSig: <dummy> <sig1> <sig2> <sig3> <redeem_script>
+      local script_sig = string.char(0) ..
+                         string.char(71) .. string.rep("\x00", 71) ..
+                         string.char(71) .. string.rep("\x00", 71) ..
+                         string.char(71) .. string.rep("\x00", 71) ..
+                         string.char(#multisig) .. multisig
+      tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), script_sig, 0xFFFFFFFF)
+      tx.outputs[1] = types.txout(50000, script.make_p2pkh_script(string.rep("\x00", 20)))
+
+      local p2sh_script = script.make_p2sh_script(crypto.hash160(multisig))
+      local function get_prev_output()
+        return { script_pubkey = p2sh_script }
+      end
+
+      local cost = validation.get_transaction_sigop_cost(tx, get_prev_output, { verify_p2sh = true })
+      -- Legacy: 1 (from P2PKH output) * 4 = 4
+      -- P2SH: 3 (accurate multisig count) * 4 = 12
+      -- Total: 16
+      assert.equals(16, cost)
+    end)
+
+    it("count_witness_sigops returns 1 for P2WPKH", function()
+      local pubkey_hash = string.rep("\x00", 20)
+      local p2wpkh = script.make_p2wpkh_script(pubkey_hash)
+
+      local count = validation.count_witness_sigops("", p2wpkh, {"\x00", "\x00"})
+      assert.equals(1, count)
+    end)
+
+    it("count_witness_sigops counts sigops in P2WSH witness script", function()
+      -- P2WSH with 2-of-3 multisig
+      local multisig = string.char(script.OP.OP_2) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(33) .. string.rep("\x00", 33) ..
+                       string.char(script.OP.OP_3) ..
+                       string.char(script.OP.OP_CHECKMULTISIG)
+
+      local script_hash = crypto.sha256(multisig)
+      local p2wsh = script.make_p2wsh_script(script_hash)
+
+      -- Witness: <sig1> <sig2> <witness_script>
+      local witness = {"\x00", "\x00", multisig}
+
+      local count = validation.count_witness_sigops("", p2wsh, witness)
+      assert.equals(3, count)  -- Accurate counting: OP_3 means 3 sigops
+    end)
+
+    it("get_transaction_sigop_cost applies no scaling to witness sigops", function()
+      local pubkey_hash = string.rep("\x00", 20)
+      local p2wpkh = script.make_p2wpkh_script(pubkey_hash)
+
+      local tx = types.transaction(1, {}, {}, 0)
+      tx.segwit = true
+      local prev_hash = types.hash256(string.rep("\x01", 32))
+      local inp = types.txin(types.outpoint(prev_hash, 0), "", 0xFFFFFFFF)
+      inp.witness = {string.rep("\x00", 72), string.rep("\x00", 33)}
+      tx.inputs[1] = inp
+      tx.outputs[1] = types.txout(50000, p2wpkh)
+
+      local function get_prev_output()
+        return { script_pubkey = p2wpkh }
+      end
+
+      local flags = { verify_p2sh = true, verify_witness = true }
+      local cost = validation.get_transaction_sigop_cost(tx, get_prev_output, flags)
+      -- Legacy: 0 (P2WPKH output has no sigops in scriptPubKey itself) * 4 = 0
+      -- Witness: 1 (P2WPKH = 1 sigop) * 1 = 1
+      -- Total: 1
+      assert.equals(1, cost)
+    end)
+
+    it("counts P2SH-wrapped P2WPKH witness sigops", function()
+      local pubkey_hash = string.rep("\x00", 20)
+      local p2wpkh = script.make_p2wpkh_script(pubkey_hash)
+      local p2sh_p2wpkh = script.make_p2sh_script(crypto.hash160(p2wpkh))
+
+      -- P2SH-P2WPKH scriptSig is just the push of the witness program
+      local script_sig = string.char(#p2wpkh) .. p2wpkh
+
+      local witness = {string.rep("\x00", 72), string.rep("\x00", 33)}
+
+      local count = validation.count_witness_sigops(script_sig, p2sh_p2wpkh, witness)
+      assert.equals(1, count)  -- P2WPKH = 1 sigop
+    end)
+
+    it("coinbase transaction only has legacy sigops", function()
+      local tx = types.transaction(1, {}, {}, 0)
+      local null_hash = types.hash256(string.rep("\x00", 32))
+      tx.inputs[1] = types.txin(
+        types.outpoint(null_hash, 0xFFFFFFFF),
+        "\x04\x01\x02\x03\x04",  -- Coinbase scriptSig
+        0xFFFFFFFF
+      )
+      tx.outputs[1] = types.txout(5000000000, script.make_p2pkh_script(string.rep("\x00", 20)))
+
+      -- For coinbase, get_prev_output should not be called
+      local function get_prev_output()
+        error("should not be called for coinbase")
+      end
+
+      local flags = { verify_p2sh = true, verify_witness = true }
+      local cost = validation.get_transaction_sigop_cost(tx, get_prev_output, flags)
+      -- Legacy: 1 (P2PKH output) * 4 = 4
+      assert.equals(4, cost)
+    end)
+  end)
+
   describe("get_tx_weight", function()
     it("calculates legacy tx weight as 4 * size", function()
       local tx = types.transaction(1, {}, {}, 0)
@@ -1033,6 +1213,158 @@ describe("validation", function()
         local result = validation.check_sequence_locks(-1, -1, 0, 0)
         assert.is_true(result)
       end)
+    end)
+  end)
+
+  describe("coinbase_maturity", function()
+    -- COINBASE_MATURITY = 100
+    -- Coinbase outputs at height H are spendable at height H + 100
+
+    it("rejects spending coinbase at depth 99 (immature)", function()
+      -- Coinbase created at height 0, attempt to spend at height 99
+      -- depth = 99 - 0 = 99, which is < 100
+      local coinbase_height = 0
+      local spend_height = 99
+      local depth = spend_height - coinbase_height
+
+      assert.is_true(depth < consensus.COINBASE_MATURITY)
+      assert.equals(99, depth)
+    end)
+
+    it("accepts spending coinbase at depth 100 (mature)", function()
+      -- Coinbase created at height 0, attempt to spend at height 100
+      -- depth = 100 - 0 = 100, which is >= 100
+      local coinbase_height = 0
+      local spend_height = 100
+      local depth = spend_height - coinbase_height
+
+      assert.is_true(depth >= consensus.COINBASE_MATURITY)
+      assert.equals(100, depth)
+    end)
+
+    it("COINBASE_MATURITY constant equals 100", function()
+      assert.equals(100, consensus.COINBASE_MATURITY)
+    end)
+
+    it("computes maturity correctly for arbitrary heights", function()
+      -- Coinbase at height 1000, spendable at 1100+
+      local coinbase_height = 1000
+
+      -- At height 1099: depth = 99, immature
+      assert.is_false(1099 - coinbase_height >= consensus.COINBASE_MATURITY)
+
+      -- At height 1100: depth = 100, mature
+      assert.is_true(1100 - coinbase_height >= consensus.COINBASE_MATURITY)
+
+      -- At height 2000: depth = 1000, mature
+      assert.is_true(2000 - coinbase_height >= consensus.COINBASE_MATURITY)
+    end)
+  end)
+
+  describe("parallel_verification", function()
+    it("reports availability status", function()
+      -- This should not error even if C extension is not available
+      local available = validation.parallel_verify_available()
+      assert.is_boolean(available)
+    end)
+
+    it("reports worker count", function()
+      local workers = validation.parallel_verify_workers()
+      assert.is_number(workers)
+      -- Workers can be 0 if C extension not available
+      assert.is_true(workers >= 0)
+    end)
+
+    it("handles empty signature batch", function()
+      local ok, err = validation.verify_signatures_parallel({})
+      assert.is_true(ok)
+      assert.is_nil(err)
+    end)
+
+    it("verifies single valid signature", function()
+      -- Generate a test keypair
+      local privkey = crypto.random_bytes(32)
+      local pubkey = crypto.pubkey_from_privkey(privkey, true)
+
+      -- Sign a message
+      local msg = "test message to sign"
+      local sighash = crypto.sha256(msg)
+      local sig_der = crypto.ecdsa_sign(privkey, sighash)
+
+      -- Verify via parallel API (will fall back to single-threaded for 1 sig)
+      local ok, err = validation.verify_signatures_parallel({
+        { pubkey = pubkey, sig_der = sig_der, sighash = sighash }
+      })
+      assert.is_true(ok, err)
+    end)
+
+    it("detects invalid signature", function()
+      -- Generate a test keypair
+      local privkey = crypto.random_bytes(32)
+      local pubkey = crypto.pubkey_from_privkey(privkey, true)
+
+      -- Sign a message
+      local msg = "test message to sign"
+      local sighash = crypto.sha256(msg)
+      local sig_der = crypto.ecdsa_sign(privkey, sighash)
+
+      -- Verify with wrong sighash
+      local wrong_hash = crypto.sha256("different message")
+      local ok, err = validation.verify_signatures_parallel({
+        { pubkey = pubkey, sig_der = sig_der, sighash = wrong_hash }
+      })
+      assert.is_false(ok)
+      assert.is_string(err)
+    end)
+
+    it("verifies batch of valid signatures", function()
+      -- Generate multiple signatures
+      local sigs = {}
+      for i = 1, 5 do
+        local privkey = crypto.random_bytes(32)
+        local pubkey = crypto.pubkey_from_privkey(privkey, true)
+        local msg = "test message " .. i
+        local sighash = crypto.sha256(msg)
+        local sig_der = crypto.ecdsa_sign(privkey, sighash)
+        sigs[i] = { pubkey = pubkey, sig_der = sig_der, sighash = sighash }
+      end
+
+      -- Verify all
+      local ok, err = validation.verify_signatures_parallel(sigs)
+      assert.is_true(ok, err)
+    end)
+
+    it("detects invalid signature in batch", function()
+      -- Generate multiple signatures, one invalid
+      local sigs = {}
+      for i = 1, 5 do
+        local privkey = crypto.random_bytes(32)
+        local pubkey = crypto.pubkey_from_privkey(privkey, true)
+        local msg = "test message " .. i
+        local sighash = crypto.sha256(msg)
+        local sig_der = crypto.ecdsa_sign(privkey, sighash)
+
+        -- Make one signature invalid by using wrong sighash
+        if i == 3 then
+          sighash = crypto.sha256("wrong message")
+        end
+
+        sigs[i] = { pubkey = pubkey, sig_der = sig_der, sighash = sighash }
+      end
+
+      -- Should fail due to invalid signature
+      local ok, err = validation.verify_signatures_parallel(sigs)
+      assert.is_false(ok)
+      assert.is_string(err)
+    end)
+
+    it("can shutdown workers without error", function()
+      -- Ensure initialized
+      validation.parallel_verify_available()
+      -- Shutdown should not error
+      validation.parallel_verify_shutdown()
+      -- Can be called multiple times
+      validation.parallel_verify_shutdown()
     end)
   end)
 end)

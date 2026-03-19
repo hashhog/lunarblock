@@ -2,6 +2,7 @@ local socket = require("socket")
 local peer_mod = require("lunarblock.peer")
 local p2p = require("lunarblock.p2p")
 local crypto = require("lunarblock.crypto")
+local proxy_mod = require("lunarblock.proxy")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -285,6 +286,14 @@ function M.new(network, storage, config)
   self._peer_last_block_ann = {}  -- ip:port -> timestamp of last block announcement
   self._peer_connect_time = {}   -- ip:port -> connection time
 
+  -- Proxy configuration (Tor/I2P support)
+  self.proxy_config = nil      -- ProxyConfig object from proxy module
+
+  -- Initialize proxy if configured
+  if config.proxy then
+    self:_init_proxy(config)
+  end
+
   -- Initialize address manager (eclipse attack mitigation)
   self:_init_addrman()
 
@@ -295,6 +304,61 @@ function M.new(network, storage, config)
   self:_load_anchors()
 
   return self
+end
+
+--------------------------------------------------------------------------------
+-- Proxy Initialization (Tor/I2P Support)
+--------------------------------------------------------------------------------
+
+--- Initialize proxy configuration from config options.
+-- @param config table: configuration with proxy settings
+function PeerManager:_init_proxy(config)
+  self.proxy_config = proxy_mod.new_config()
+
+  -- SOCKS5 proxy for Tor (e.g., -proxy=127.0.0.1:9050)
+  if config.proxy then
+    local host, port = config.proxy:match("^([^:]+):(%d+)$")
+    if host and port then
+      self.proxy_config:set_socks5_proxy(host, tonumber(port), config.proxy_stream_isolation)
+    end
+  end
+
+  -- I2P SAM bridge (e.g., -i2psam=127.0.0.1:7656)
+  if config.i2psam then
+    local host, port = config.i2psam:match("^([^:]+):(%d+)$")
+    if host and port then
+      local keyfile = config.i2p_private_key or (self.data_dir .. "/i2p_private_key")
+      self.proxy_config:set_i2p_sam(host, tonumber(port), keyfile)
+    end
+  end
+
+  -- Network restriction (e.g., -onlynet=onion or -onlynet=i2p)
+  if config.onlynet then
+    self.proxy_config:set_onlynet(config.onlynet)
+  end
+
+  -- DNS over proxy (prevents DNS leaks when using Tor)
+  if config.proxy_dns ~= false then
+    self.proxy_config.proxy_dns = true
+  end
+end
+
+--- Get our advertised addresses for privacy networks.
+-- @return table: {onion = ".onion addr", i2p = ".b32.i2p addr"}
+function PeerManager:get_local_addresses()
+  local addresses = {}
+
+  if self.proxy_config and self.proxy_config.i2p_sam then
+    local i2p_addr = self.proxy_config.i2p_sam:get_my_address()
+    if i2p_addr then
+      addresses.i2p = i2p_addr
+    end
+  end
+
+  -- Tor hidden service address would be configured separately
+  -- (requires reading from torrc or control port)
+
+  return addresses
 end
 
 --------------------------------------------------------------------------------
@@ -689,10 +753,28 @@ end
 --------------------------------------------------------------------------------
 
 --- Discover peer addresses from DNS seeds.
+-- When proxy_dns is enabled, this skips regular DNS and relies on
+-- addresses learned from peer addr/addrv2 messages (no DNS leaks).
 -- @return number: count of new addresses found
 function PeerManager:discover_from_dns()
   if not self.network or not self.network.dns_seeds then
     return 0
+  end
+
+  -- If using proxy with DNS leak prevention, don't do DNS lookups
+  -- Rely on addr messages from connected peers instead
+  if self.proxy_config and self.proxy_config.proxy_dns then
+    -- DNS seeds can't be resolved through SOCKS5 (no DNS query support)
+    -- We rely on connecting to known hardcoded peers or addr gossip
+    return 0
+  end
+
+  -- If onlynet is set to a privacy network, skip DNS (privacy leak)
+  if self.proxy_config and self.proxy_config.onlynet then
+    local onlynet = self.proxy_config.onlynet
+    if onlynet == "onion" or onlynet == "i2p" then
+      return 0
+    end
   end
 
   local count = 0
@@ -779,12 +861,23 @@ function PeerManager:connect_peer(ip, port, skip_diversity)
     return false, "max peers reached"
   end
 
+  -- Check network restriction (onlynet)
+  if self.proxy_config and not self.proxy_config:is_address_allowed(ip) then
+    return false, "address not allowed by onlynet restriction"
+  end
+
   -- Check outbound diversity (eclipse attack mitigation)
-  if not skip_diversity and not self:_check_outbound_diversity(ip) then
+  -- Skip for privacy network addresses (Tor/I2P are in single groups anyway)
+  local net_type = proxy_mod.detect_network_type(ip)
+  local is_privacy_net = net_type == proxy_mod.NETWORK_TYPE.ONION or
+                         net_type == proxy_mod.NETWORK_TYPE.I2P
+  if not skip_diversity and not is_privacy_net and not self:_check_outbound_diversity(ip) then
     return false, "same /16 subnet as existing peer"
   end
 
-  local p = peer_mod.new(ip, port, self.network, self.our_height)
+  -- Create peer with proxy configuration
+  local use_v2 = not self.config.nov2transport
+  local p = peer_mod.new(ip, port, self.network, self.our_height, use_v2, self.proxy_config)
   -- Register all our message handlers
   for cmd, handler in pairs(self.message_handlers) do
     p:on(cmd, handler)
@@ -1222,7 +1315,8 @@ function PeerManager:accept_inbound()
     return
   end
 
-  local p = peer_mod.new(ip, port, self.network, self.our_height)
+  local inbound_v2 = not self.config.nov2transport
+  local p = peer_mod.new(ip, port, self.network, self.our_height, inbound_v2)
   p.socket = client
   p.state = peer_mod.STATE.CONNECTED
   p.inbound = true

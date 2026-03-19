@@ -1,5 +1,8 @@
 local socket = require("socket")
 local p2p = require("lunarblock.p2p")
+local bip324 = require("lunarblock.bip324")
+local proxy_mod = require("lunarblock.proxy")
+local erlay = require("lunarblock.erlay")
 local bit = require("bit")
 local ffi = require("ffi")
 local M = {}
@@ -77,6 +80,9 @@ M.STATE = {
   DISCONNECTED = "disconnected",
   CONNECTING = "connecting",
   CONNECTED = "connected",      -- TCP connected, awaiting handshake
+  V2_KEY_SENT = "v2_key_sent",  -- V2: sent our ElligatorSwift key
+  V2_KEY_RECV = "v2_key_recv",  -- V2: received peer's key, awaiting garbage terminator
+  V2_READY = "v2_ready",        -- V2: encryption ready, awaiting version packet
   VERSION_SENT = "version_sent",
   VERACK_SENT = "verack_sent",
   ESTABLISHED = "established",  -- Handshake complete, ready for messages
@@ -96,6 +102,7 @@ M.PRE_HANDSHAKE_ALLOWED = {
   wtxidrelay = true,   -- BIP 339: Must be sent before VERACK
   sendaddrv2 = true,   -- BIP 155: Must be sent before VERACK
   sendheaders = true,  -- BIP 130: Accepted pre-handshake
+  sendtxrcncl = true,  -- BIP 330: Must be sent before VERACK
 }
 
 -- Handshake timeout in seconds (60 seconds per spec)
@@ -113,8 +120,10 @@ Peer.__index = Peer
 -- @param port number: peer port (optional, defaults to network.port)
 -- @param network table: network configuration from consensus module
 -- @param our_height number: our current blockchain height (optional)
+-- @param use_v2 boolean: use BIP324 v2 encrypted transport (optional, default true)
+-- @param proxy_config table: proxy configuration (optional)
 -- @return Peer: new peer object
-function M.new(ip, port, network, our_height)
+function M.new(ip, port, network, our_height, use_v2, proxy_config)
   local self = setmetatable({}, Peer)
   self.ip = ip
   self.port = port or (network and network.port) or 8333
@@ -152,6 +161,27 @@ function M.new(ip, port, network, our_height)
   self.handshake_start_time = 0   -- When connection started (for timeout)
   self.wtxid_relay = false        -- BIP 339: peer wants wtxid for tx relay
   self.send_addrv2 = false        -- BIP 155: peer supports addrv2
+
+  -- Erlay (BIP330)
+  self.erlay_enabled = false      -- True if Erlay was negotiated
+  self.erlay_version = 0          -- Negotiated Erlay version
+  self.erlay_salt = 0             -- Our Erlay salt
+  self.erlay_their_salt = 0       -- Their Erlay salt
+  self.erlay_combined_salt = 0    -- Combined salt for reconciliation
+  self.erlay_last_recon = 0       -- Time of last reconciliation
+  self.erlay_recon_pending = false -- Waiting for reconciliation response
+
+  -- V2 transport (BIP324)
+  self.use_v2 = (use_v2 ~= false) -- Default to v2, can disable with false
+  self.v2_transport = nil         -- V2Transport object (created on connect)
+  self.v2_active = false          -- True when v2 encryption is active
+  self.v2_handshake_done = false  -- True after v2 crypto handshake complete
+  self.session_id = nil           -- BIP324 session ID (32 bytes)
+
+  -- Proxy configuration
+  self.proxy_config = proxy_config -- ProxyConfig object from proxy module
+  self.network_type = proxy_mod.detect_network_type(ip) -- Network type (ipv4, ipv6, onion, i2p)
+  self.connected_via_proxy = false -- True if connected through a proxy
   return self
 end
 
@@ -165,18 +195,131 @@ end
 -- @return string: error message on failure
 function Peer:connect(timeout)
   self.state = M.STATE.CONNECTING
-  self.socket = socket.tcp()
-  self.socket:settimeout(timeout or 5)
-  local ok, err = self.socket:connect(self.ip, self.port)
-  if not ok then
-    self:disconnect("connect failed: " .. (err or "unknown"))
-    return false, err
+  local ok, err
+
+  -- Determine if we need to use a proxy
+  local need_proxy = false
+  if self.proxy_config then
+    -- Check network restriction
+    if not self.proxy_config:is_address_allowed(self.ip) then
+      self:disconnect("address not allowed by onlynet restriction")
+      return false, "address not allowed by onlynet restriction"
+    end
+
+    -- Onion and I2P addresses require proxy
+    if self.network_type == proxy_mod.NETWORK_TYPE.ONION or
+       self.network_type == proxy_mod.NETWORK_TYPE.I2P then
+      need_proxy = true
+    end
+
+    -- Use proxy for all connections if proxy_dns is enabled (DNS leak prevention)
+    if self.proxy_config.proxy_dns then
+      need_proxy = true
+    end
   end
-  self.socket:settimeout(0)  -- Non-blocking after connection
+
+  if need_proxy and self.proxy_config then
+    -- Connect through proxy
+    self.socket, err = self.proxy_config:connect(self.ip, self.port)
+    if not self.socket then
+      self:disconnect("proxy connect failed: " .. (err or "unknown"))
+      return false, err
+    end
+    self.connected_via_proxy = true
+
+    -- For onion/I2P addresses, disable v2 transport (already encrypted)
+    if self.network_type == proxy_mod.NETWORK_TYPE.ONION or
+       self.network_type == proxy_mod.NETWORK_TYPE.I2P then
+      self.use_v2 = false
+    end
+  else
+    -- Direct connection
+    self.socket = socket.tcp()
+    self.socket:settimeout(timeout or 5)
+    ok, err = self.socket:connect(self.ip, self.port)
+    if not ok then
+      self:disconnect("connect failed: " .. (err or "unknown"))
+      return false, err
+    end
+    self.socket:settimeout(0)  -- Non-blocking after connection
+  end
+
   self.state = M.STATE.CONNECTED
   self.last_recv = socket.gettime()
   self.handshake_start_time = socket.gettime()  -- Start handshake timer
+
+  -- Initialize v2 transport if enabled
+  if self.use_v2 then
+    self.v2_transport = bip324.V2Transport(self.network.magic_bytes, true)
+  end
+
   return true
+end
+
+--- Start v2 handshake (send ElligatorSwift key + garbage).
+function Peer:start_v2_handshake()
+  if not self.v2_transport then return false end
+
+  -- Send our public key + garbage
+  local handshake_bytes = self.v2_transport:get_handshake_bytes()
+  local sent, err = self.socket:send(handshake_bytes)
+  if not sent then
+    self:disconnect("v2 handshake send failed: " .. (err or "unknown"))
+    return false
+  end
+  self.state = M.STATE.V2_KEY_SENT
+  self.last_send = socket.gettime()
+  return true
+end
+
+--- Process v2 handshake data.
+-- @return boolean: true if handshake complete, false if need more data
+-- @return string|nil: error message on failure
+function Peer:process_v2_handshake()
+  if not self.v2_transport then return false, "no v2 transport" end
+
+  local ok, err = self.v2_transport:recv_bytes(self.recv_buffer)
+  self.recv_buffer = ""  -- V2Transport handles its own buffering
+
+  if not ok then
+    self:disconnect("v2 handshake failed: " .. (err or "unknown"))
+    return false, err
+  end
+
+  -- Check for v1 fallback
+  if self.v2_transport:is_v1() then
+    -- Peer is using v1, fallback
+    self.use_v2 = false
+    self.v2_active = false
+    self.recv_buffer = self.v2_transport:get_v1_prefix()
+    self.v2_transport = nil
+    self.state = M.STATE.CONNECTED
+    return true  -- Continue with v1
+  end
+
+  -- Check if v2 cipher is ready
+  if self.v2_transport:ready_to_send() and not self.v2_handshake_done then
+    -- Cipher initialized, send garbage terminator + version packet
+    local version_bytes = self.v2_transport:make_version_packet()
+    local sent, send_err = self.socket:send(version_bytes)
+    if not sent then
+      self:disconnect("v2 version send failed: " .. (send_err or "unknown"))
+      return false, send_err
+    end
+    self.state = M.STATE.V2_READY
+    self.last_send = socket.gettime()
+    self.v2_handshake_done = true
+    self.session_id = self.v2_transport:get_session_id()
+  end
+
+  -- Check if v2 handshake is complete (ready to send and have received version)
+  if self.v2_transport.recv_state >= bip324.RecvState.APP then
+    self.v2_active = true
+    self.state = M.STATE.CONNECTED  -- Ready for normal handshake
+    return true
+  end
+
+  return false  -- Need more data
 end
 
 --- Disconnect from the peer.
@@ -219,7 +362,16 @@ function Peer:send_message(command, payload)
   if self.state == M.STATE.DISCONNECTED then return false end
   if not self.socket then return false end
   payload = payload or ""
-  local msg = p2p.make_message(self.network.magic_bytes, command, payload)
+
+  local msg
+  if self.v2_active and self.v2_transport then
+    -- V2 encrypted transport
+    msg = self.v2_transport:encrypt_message(command, payload)
+  else
+    -- V1 plaintext transport
+    msg = p2p.make_message(self.network.magic_bytes, command, payload)
+  end
+
   local sent, err = self.socket:send(msg)
   if not sent then
     self:disconnect("send failed: " .. (err or "unknown"))
@@ -254,7 +406,31 @@ function Peer:recv_messages()
     return messages
   end
 
-  -- Parse complete messages
+  -- V2 encrypted transport
+  if self.v2_active and self.v2_transport then
+    -- Feed data to v2 transport
+    local ok, v2_err = self.v2_transport:recv_bytes(self.recv_buffer)
+    self.recv_buffer = ""  -- V2 transport handles buffering
+    if not ok then
+      self:disconnect("v2 recv failed: " .. (v2_err or "unknown"))
+      return messages
+    end
+
+    -- Get all ready messages
+    while self.v2_transport:message_ready() do
+      local cmd, payload, decode_err = self.v2_transport:get_message()
+      if cmd then
+        messages[#messages + 1] = {command = cmd, payload = payload}
+      else
+        self:disconnect("v2 decode failed: " .. (decode_err or "unknown"))
+        return messages
+      end
+    end
+
+    return messages
+  end
+
+  -- V1 plaintext transport
   while #self.recv_buffer >= p2p.HEADER_SIZE do
     local header = p2p.parse_header(self.recv_buffer:sub(1, p2p.HEADER_SIZE))
     if not header then
@@ -294,7 +470,13 @@ end
 --------------------------------------------------------------------------------
 
 --- Start the version handshake (called by outbound peer).
+-- For v2 peers, this is called after v2 crypto handshake completes.
 function Peer:start_handshake()
+  -- If v2 is enabled but not yet established, start v2 handshake first
+  if self.use_v2 and not self.v2_active and self.v2_transport then
+    return self:start_v2_handshake()
+  end
+
   -- Generate random nonce for this connection
   self.nonce = math.random(1, 2^52)
   -- Send version message
@@ -338,6 +520,15 @@ function Peer:handle_version(payload)
   end
   -- Check for self-connection via nonce
   -- (caller should check nonce against known connections)
+
+  -- Send feature negotiation messages BEFORE verack (BIP330, BIP155, BIP339)
+  -- SENDTXRCNCL (BIP330): Erlay transaction reconciliation
+  -- Only send to outbound full relay peers (not block-only connections)
+  if not self.inbound and ver.relay then
+    self.erlay_salt = erlay.generate_salt()
+    self:send_message("sendtxrcncl", p2p.serialize_sendtxrcncl(erlay.VERSION, self.erlay_salt))
+  end
+
   -- Send verack
   self:send_message("verack", "")
   if self.state == M.STATE.VERSION_SENT then
@@ -404,6 +595,33 @@ end
 -- Enforces pre-handshake filtering per Bitcoin Core net_processing.cpp.
 -- @return table: list of processed messages
 function Peer:process_messages()
+  -- Handle v2 handshake states
+  if self.state == M.STATE.V2_KEY_SENT or
+     self.state == M.STATE.V2_KEY_RECV or
+     self.state == M.STATE.V2_READY then
+    -- Read data for v2 handshake
+    local data, err, partial = self.socket:receive(65536)
+    data = data or partial
+    if data and #data > 0 then
+      self.recv_buffer = self.recv_buffer .. data
+      self.last_recv = socket.gettime()
+    elseif err == "closed" then
+      self:disconnect("connection closed by peer")
+      return {}
+    end
+
+    -- Process v2 handshake
+    local complete, v2_err = self:process_v2_handshake()
+    if v2_err then
+      return {}  -- Disconnected
+    end
+    if complete and self.v2_active then
+      -- V2 handshake complete, now start version handshake
+      self:start_handshake()
+    end
+    return {}  -- No application messages yet
+  end
+
   local messages = self:recv_messages()
   local processed = {}
   for _, msg in ipairs(messages) do
@@ -456,6 +674,23 @@ function Peer:process_messages()
     elseif msg.command == "sendaddrv2" then
       -- BIP 155: sendaddrv2 must be sent before verack
       self.send_addrv2 = true
+    elseif msg.command == "sendtxrcncl" then
+      -- BIP 330: Erlay transaction reconciliation
+      -- Must be received before verack, only from outbound peers for us
+      if not self.handshake_complete then
+        local rcncl = p2p.deserialize_sendtxrcncl(msg.payload)
+        self.erlay_their_salt = rcncl.salt
+        -- If we also sent sendtxrcncl, Erlay is now negotiated
+        if self.erlay_salt > 0 then
+          self.erlay_enabled = true
+          self.erlay_version = math.min(rcncl.version, erlay.VERSION)
+          -- Combined salt: XOR of both salts
+          self.erlay_combined_salt = bit.bxor(
+            tonumber(bit.band(self.erlay_salt, 0xFFFFFFFF)),
+            tonumber(bit.band(self.erlay_their_salt, 0xFFFFFFFF))
+          )
+        end
+      end
     else
       -- Dispatch to registered handler
       local handler = self.message_handlers[msg.command]
@@ -493,6 +728,119 @@ function Peer:check_timeouts()
   if self.state == M.STATE.ESTABLISHED and now - self.last_send > 120 then
     self:send_ping()
   end
+end
+
+--------------------------------------------------------------------------------
+-- Erlay Reconciliation (BIP330)
+--------------------------------------------------------------------------------
+
+--- Check if Erlay reconciliation should be initiated.
+-- Only outbound peers initiate reconciliation (~2 second interval).
+-- @return boolean: true if should initiate reconciliation
+function Peer:should_reconcile()
+  if not self.erlay_enabled then
+    return false
+  end
+  if self.inbound then
+    return false  -- Only outbound peers initiate
+  end
+  if self.erlay_recon_pending then
+    return false  -- Already waiting for response
+  end
+  local now = socket.gettime()
+  if now - self.erlay_last_recon < erlay.RECON_INTERVAL then
+    return false  -- Too soon
+  end
+  return true
+end
+
+--- Initiate Erlay reconciliation with this peer.
+-- Builds and sends a sketch of pending transactions.
+-- @param wtxids table: list of wtxids to reconcile
+-- @return boolean: true if reconciliation was initiated
+function Peer:initiate_reconciliation(wtxids)
+  if not self.erlay_enabled or self.erlay_recon_pending then
+    return false
+  end
+
+  -- Compute short txids using combined salt
+  local short_ids = erlay.compute_short_txids(self.erlay_combined_salt, wtxids)
+
+  -- Estimate capacity and build sketch
+  local capacity = erlay.estimate_capacity(#wtxids)
+  local sketch = erlay.build_sketch(short_ids, capacity)
+  local sketch_bytes = sketch:serialize()
+  sketch:destroy()
+
+  -- Send sketch message
+  self:send_message("sketch", p2p.serialize_sketch(sketch_bytes))
+
+  self.erlay_recon_pending = true
+  self.erlay_last_recon = socket.gettime()
+
+  return true
+end
+
+--- Handle a received sketch message during reconciliation.
+-- Decodes differences and sends reconcildiff response.
+-- @param sketch_bytes string: serialized remote sketch
+-- @param local_wtxids table: our wtxids
+-- @return table|nil, table|nil: have_wtxids (to send), want_short_ids (to request)
+function Peer:handle_sketch(sketch_bytes, local_wtxids)
+  if not self.erlay_enabled then
+    return nil, nil
+  end
+
+  -- Compute local short txids
+  local local_shorts = erlay.compute_short_txids(self.erlay_combined_salt, local_wtxids)
+
+  -- Build short -> wtxid map
+  local short_to_wtxid = {}
+  for i, wtxid in ipairs(local_wtxids) do
+    short_to_wtxid[local_shorts[i]] = wtxid
+  end
+
+  -- Reconcile sketches
+  local have, want, err = erlay.reconcile_sketches(sketch_bytes, local_shorts, erlay.DEFAULT_CAPACITY)
+
+  if not have then
+    -- Reconciliation failed, send failure response
+    self:send_message("reconcildiff", p2p.serialize_reconcildiff(false, {}))
+    return nil, nil, err
+  end
+
+  -- Convert 'have' short IDs to wtxids (transactions we have that peer wants)
+  local have_wtxids = {}
+  for _, short in ipairs(have) do
+    local wtxid = short_to_wtxid[short]
+    if wtxid then
+      have_wtxids[#have_wtxids + 1] = wtxid
+    end
+  end
+
+  -- Send success response with short IDs we want
+  self:send_message("reconcildiff", p2p.serialize_reconcildiff(true, want))
+
+  self.erlay_recon_pending = false
+
+  return have_wtxids, want
+end
+
+--- Handle a received reconcildiff response.
+-- @param success boolean: whether reconciliation succeeded
+-- @param want_short_ids table: short txids the peer wants from us
+-- @return boolean: success status
+function Peer:handle_reconcildiff(success, want_short_ids)
+  self.erlay_recon_pending = false
+
+  if not success then
+    -- Reconciliation failed on peer side, fall back to flooding
+    return false
+  end
+
+  -- want_short_ids contains the transactions we need to send to peer
+  -- The caller should convert these to wtxids and send via getdata
+  return true
 end
 
 --------------------------------------------------------------------------------

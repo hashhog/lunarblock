@@ -1787,4 +1787,385 @@ describe("descriptor", function()
       assert.equals(1, #addresses)
     end)
   end)
+
+  ----------------------------------------------------------------------------
+  -- Multi-Wallet Support Tests
+  ----------------------------------------------------------------------------
+
+  describe("multi_wallet manager", function()
+    local test_datadir
+
+    setup(function()
+      test_datadir = "/tmp/test_wallets_" .. os.time()
+      os.execute("mkdir -p '" .. test_datadir .. "'")
+    end)
+
+    teardown(function()
+      os.execute("rm -rf '" .. test_datadir .. "'")
+    end)
+
+    it("creates wallet manager", function()
+      local manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+
+      assert.is_not_nil(manager)
+      assert.equals(test_datadir, manager.datadir)
+      assert.equals(test_datadir .. "/wallets", manager.wallets_dir)
+    end)
+
+    it("creates wallet directory", function()
+      local manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+      local ok = manager:ensure_wallets_dir()
+
+      assert.is_true(ok)
+
+      -- Check directory exists
+      local handle = io.open(test_datadir .. "/wallets", "r")
+      if handle then
+        handle:close()
+        assert.is_true(true)
+      else
+        -- Directory should exist, checking with ls
+        local result = os.execute("test -d '" .. test_datadir .. "/wallets'")
+        assert.is_true(result == true or result == 0)
+      end
+    end)
+  end)
+
+  describe("createwallet", function()
+    local test_datadir
+    local manager
+
+    setup(function()
+      test_datadir = "/tmp/test_createwallet_" .. os.time()
+      os.execute("mkdir -p '" .. test_datadir .. "'")
+      manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+      manager:ensure_wallets_dir()
+    end)
+
+    teardown(function()
+      -- Release all locks before cleanup
+      for name, _ in pairs(manager.wallets) do
+        manager:release_lock(name)
+      end
+      os.execute("rm -rf '" .. test_datadir .. "'")
+    end)
+
+    it("creates new wallet", function()
+      local w, err = manager:create_wallet("test1", {})
+
+      assert.is_nil(err)
+      assert.is_not_nil(w)
+      assert.is_true(manager:is_loaded("test1"))
+    end)
+
+    it("creates default wallet with empty name", function()
+      local w, err = manager:create_wallet("", {})
+
+      assert.is_nil(err)
+      assert.is_not_nil(w)
+      assert.is_true(manager:is_loaded(""))
+    end)
+
+    it("creates encrypted wallet", function()
+      local w, err = manager:create_wallet("encrypted1", {
+        passphrase = "test_password"
+      })
+
+      assert.is_nil(err)
+      assert.is_not_nil(w)
+      assert.is_true(w.is_encrypted)
+    end)
+
+    it("creates blank wallet", function()
+      local w, err = manager:create_wallet("blank1", {
+        blank = true
+      })
+
+      assert.is_nil(err)
+      assert.is_not_nil(w)
+      -- Blank wallet has no master key
+      assert.is_nil(w.master_key)
+    end)
+
+    it("fails on duplicate wallet name", function()
+      manager:create_wallet("duplicate_test", {})
+      local w, err = manager:create_wallet("duplicate_test", {})
+
+      assert.is_nil(w)
+      assert.is_not_nil(err)
+      assert.is_true(err:find("already") ~= nil)
+    end)
+
+    it("fails on invalid wallet name", function()
+      local w, err = manager:create_wallet("test/invalid", {})
+
+      assert.is_nil(w)
+      assert.is_not_nil(err)
+      assert.is_true(err:find("illegal") ~= nil)
+    end)
+  end)
+
+  describe("loadwallet", function()
+    local test_datadir
+    local manager
+
+    setup(function()
+      test_datadir = "/tmp/test_loadwallet_" .. os.time()
+      os.execute("mkdir -p '" .. test_datadir .. "'")
+      manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+      manager:ensure_wallets_dir()
+
+      -- Create a wallet to load later
+      local w = manager:create_wallet("toload", {})
+      manager:unload_wallet("toload")
+    end)
+
+    teardown(function()
+      for name, _ in pairs(manager.wallets) do
+        manager:release_lock(name)
+      end
+      os.execute("rm -rf '" .. test_datadir .. "'")
+    end)
+
+    it("loads existing wallet", function()
+      local w, err = manager:load_wallet("toload")
+
+      assert.is_nil(err)
+      assert.is_not_nil(w)
+      assert.is_true(manager:is_loaded("toload"))
+    end)
+
+    it("fails on non-existent wallet", function()
+      local w, err = manager:load_wallet("nonexistent")
+
+      assert.is_nil(w)
+      assert.is_not_nil(err)
+      assert.is_true(err:find("not found") ~= nil)
+    end)
+
+    it("fails on already loaded wallet", function()
+      manager:load_wallet("toload")
+      local w, err = manager:load_wallet("toload")
+
+      assert.is_nil(w)
+      assert.is_not_nil(err)
+      assert.is_true(err:find("already loaded") ~= nil)
+    end)
+  end)
+
+  describe("listwallets", function()
+    local test_datadir
+    local manager
+
+    setup(function()
+      test_datadir = "/tmp/test_listwallets_" .. os.time()
+      os.execute("mkdir -p '" .. test_datadir .. "'")
+      manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+      manager:ensure_wallets_dir()
+    end)
+
+    teardown(function()
+      for name, _ in pairs(manager.wallets) do
+        manager:release_lock(name)
+      end
+      os.execute("rm -rf '" .. test_datadir .. "'")
+    end)
+
+    it("returns empty list when no wallets loaded", function()
+      local names = manager:list_wallets()
+
+      assert.equals(0, #names)
+    end)
+
+    it("returns loaded wallet names", function()
+      manager:create_wallet("wallet_a", {})
+      manager:create_wallet("wallet_b", {})
+
+      local names = manager:list_wallets()
+
+      assert.equals(2, #names)
+      -- Names are sorted
+      assert.equals("wallet_a", names[1])
+      assert.equals("wallet_b", names[2])
+    end)
+
+    it("updates after unload", function()
+      manager:create_wallet("wallet_c", {})
+      local before = #manager:list_wallets()
+
+      manager:unload_wallet("wallet_c")
+      local after = #manager:list_wallets()
+
+      assert.equals(before - 1, after)
+    end)
+  end)
+
+  describe("unloadwallet", function()
+    local test_datadir
+    local manager
+
+    setup(function()
+      test_datadir = "/tmp/test_unloadwallet_" .. os.time()
+      os.execute("mkdir -p '" .. test_datadir .. "'")
+      manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+      manager:ensure_wallets_dir()
+    end)
+
+    teardown(function()
+      for name, _ in pairs(manager.wallets) do
+        manager:release_lock(name)
+      end
+      os.execute("rm -rf '" .. test_datadir .. "'")
+    end)
+
+    it("unloads wallet", function()
+      manager:create_wallet("to_unload", {})
+      assert.is_true(manager:is_loaded("to_unload"))
+
+      local ok, err = manager:unload_wallet("to_unload")
+
+      assert.is_nil(err)
+      assert.is_true(ok)
+      assert.is_false(manager:is_loaded("to_unload"))
+    end)
+
+    it("fails on non-loaded wallet", function()
+      local ok, err = manager:unload_wallet("never_loaded")
+
+      assert.is_false(ok)
+      assert.is_not_nil(err)
+      assert.is_true(err:find("not loaded") ~= nil)
+    end)
+
+    it("saves wallet on unload", function()
+      -- Create wallet and modify it
+      local w = manager:create_wallet("save_test", {})
+      local addr1 = w:get_new_address()
+
+      manager:unload_wallet("save_test")
+
+      -- Reload and verify
+      local w2 = manager:load_wallet("save_test")
+      assert.equals(addr1, w2.addresses[1])
+    end)
+  end)
+
+  describe("default wallet", function()
+    local test_datadir
+    local manager
+
+    setup(function()
+      test_datadir = "/tmp/test_default_wallet_" .. os.time()
+      os.execute("mkdir -p '" .. test_datadir .. "'")
+      manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+      manager:ensure_wallets_dir()
+    end)
+
+    teardown(function()
+      for name, _ in pairs(manager.wallets) do
+        manager:release_lock(name)
+      end
+      os.execute("rm -rf '" .. test_datadir .. "'")
+    end)
+
+    it("returns nil when no wallets", function()
+      local w, name = manager:get_default_wallet()
+
+      assert.is_nil(w)
+      assert.is_nil(name)
+    end)
+
+    it("returns first created wallet as default", function()
+      manager:create_wallet("first", {})
+      manager:create_wallet("second", {})
+
+      local w, name = manager:get_default_wallet()
+
+      assert.is_not_nil(w)
+      assert.equals("first", name)
+    end)
+
+    it("prefers empty string wallet as default", function()
+      manager:create_wallet("named", {})
+      manager:create_wallet("", {})
+
+      local w, name = manager:get_default_wallet()
+
+      assert.is_not_nil(w)
+      assert.equals("", name)
+    end)
+
+    it("updates default after unload", function()
+      manager:create_wallet("only_one", {})
+      manager:unload_wallet("only_one")
+
+      local w, name = manager:get_default_wallet()
+
+      assert.is_nil(w)
+    end)
+  end)
+
+  describe("wallet directory listing", function()
+    local test_datadir
+    local manager
+
+    setup(function()
+      test_datadir = "/tmp/test_walletdir_" .. os.time()
+      os.execute("mkdir -p '" .. test_datadir .. "'")
+      manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
+      manager:ensure_wallets_dir()
+    end)
+
+    teardown(function()
+      for name, _ in pairs(manager.wallets) do
+        manager:release_lock(name)
+      end
+      os.execute("rm -rf '" .. test_datadir .. "'")
+    end)
+
+    it("lists wallets on disk", function()
+      manager:create_wallet("disk1", {})
+      manager:create_wallet("disk2", {})
+      manager:unload_wallet("disk1")
+
+      local list = manager:list_wallet_dir()
+
+      assert.is_true(#list >= 2)
+
+      -- Find disk1 and disk2 in list
+      local found_disk1 = false
+      local found_disk2 = false
+      for _, info in ipairs(list) do
+        if info.name == "disk1" then
+          found_disk1 = true
+          assert.is_false(info.loaded)
+        end
+        if info.name == "disk2" then
+          found_disk2 = true
+          assert.is_true(info.loaded)
+        end
+      end
+
+      assert.is_true(found_disk1)
+      assert.is_true(found_disk2)
+    end)
+  end)
+
+  describe("wallet paths", function()
+    it("default wallet uses data dir root", function()
+      local manager = wallet.new_manager("/test/data", consensus.networks.mainnet, nil)
+
+      local path = manager:get_wallet_path("")
+
+      assert.equals("/test/data/wallet.json", path)
+    end)
+
+    it("named wallet uses wallets subdirectory", function()
+      local manager = wallet.new_manager("/test/data", consensus.networks.mainnet, nil)
+
+      local path = manager:get_wallet_path("mywallet")
+
+      assert.equals("/test/data/wallets/mywallet/wallet.json", path)
+    end)
+  end)
 end)

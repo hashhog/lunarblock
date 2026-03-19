@@ -2,3 +2,5 @@
 *.swp
 .env
 luarocks/
+
+.claude/skills/

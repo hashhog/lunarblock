@@ -3,7 +3,416 @@ local serialize = require("lunarblock.serialize")
 local p2p = require("lunarblock.p2p")
 local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
+local crypto = require("lunarblock.crypto")
 local M = {}
+
+--------------------------------------------------------------------------------
+-- HeadersSyncState: Anti-DoS header synchronization (PRESYNC/REDOWNLOAD)
+--------------------------------------------------------------------------------
+-- Implements a two-phase header download to prevent memory exhaustion attacks
+-- where a peer sends millions of low-work headers.
+--
+-- PRESYNC phase: Accept headers without storing them; track only:
+--   - Cumulative work (256-bit)
+--   - Last header hash
+--   - Header count
+--   - 1-bit commitments (salted hash) at periodic intervals
+--
+-- Once cumulative work reaches min_chain_work, transition to REDOWNLOAD:
+--   - Request all headers again from genesis
+--   - Verify commitments match
+--   - Store headers permanently
+--
+-- Reference: Bitcoin Core headerssync.cpp/h
+
+local HeadersSyncState = {}
+HeadersSyncState.__index = HeadersSyncState
+
+-- Sync states
+HeadersSyncState.STATE = {
+  PRESYNC = "presync",
+  REDOWNLOAD = "redownload",
+  FINAL = "final"
+}
+
+-- Parameters for commitment tracking
+local COMMITMENT_PERIOD = 584  -- Store 1 commitment every N headers
+local REDOWNLOAD_BUFFER_SIZE = 144  -- Buffer headers before accepting
+
+--- Create a new HeadersSyncState instance for a peer.
+-- @param peer_id number|string: identifier for the peer
+-- @param network table: network configuration
+-- @param chain_start table: {hash, height, work} of the chain start point
+-- @return HeadersSyncState: new sync state instance
+function M.new_headers_sync_state(peer_id, network, chain_start)
+  local self = setmetatable({}, HeadersSyncState)
+
+  self.peer_id = peer_id
+  self.network = network
+
+  -- Parse minimum required work from network config
+  self.min_required_work = consensus.work_from_hex(
+    network.min_chain_work or string.rep("00", 64)
+  )
+
+  -- Chain start point (where we begin syncing from)
+  self.chain_start_hash = chain_start.hash
+  self.chain_start_height = chain_start.height
+  self.chain_start_work = chain_start.work or consensus.work_zero()
+
+  -- Current state
+  self.state = HeadersSyncState.STATE.PRESYNC
+
+  -- PRESYNC tracking (memory-efficient)
+  self.presync = {
+    work = self.chain_start_work,  -- Accumulated work (32-byte big-endian)
+    last_hash = chain_start.hash,  -- Hash of last processed header
+    last_bits = network.genesis.bits,  -- bits of last header (for difficulty check)
+    last_timestamp = network.genesis.timestamp,  -- timestamp of last header
+    count = 0,  -- Number of headers processed
+    height = chain_start.height,  -- Current height
+    commitments = {},  -- 1-bit commitments (boolean array)
+  }
+
+  -- Random salt for commitment hashing (anti-grinding)
+  -- Use /dev/urandom for secure random bytes
+  local f = io.open("/dev/urandom", "rb")
+  if f then
+    self.commitment_salt = f:read(32)
+    f:close()
+  else
+    -- Fallback to Lua random (NOT cryptographically secure)
+    math.randomseed(os.time() + os.clock() * 1000000)
+    local bytes = {}
+    for i = 1, 32 do
+      bytes[i] = string.char(math.random(0, 255))
+    end
+    self.commitment_salt = table.concat(bytes)
+  end
+
+  -- Random offset for commitment positions (0 to COMMITMENT_PERIOD-1)
+  self.commitment_offset = math.random(0, COMMITMENT_PERIOD - 1)
+
+  -- REDOWNLOAD tracking
+  self.redownload = {
+    work = self.chain_start_work,
+    last_hash = chain_start.hash,
+    last_bits = network.genesis.bits,
+    last_timestamp = network.genesis.timestamp,
+    height = chain_start.height,
+    buffer = {},  -- Buffered headers awaiting acceptance
+    commitment_idx = 1,  -- Next commitment to verify
+    work_threshold_reached = false,
+  }
+
+  return self
+end
+
+--- Get the current sync state.
+-- @return string: "presync", "redownload", or "final"
+function HeadersSyncState:get_state()
+  return self.state
+end
+
+--- Get PRESYNC statistics for display/logging.
+-- @return table: {work_hex, height, count, state}
+function HeadersSyncState:get_stats()
+  if self.state == HeadersSyncState.STATE.PRESYNC then
+    return {
+      work_hex = consensus.work_to_hex(self.presync.work),
+      height = self.presync.height,
+      count = self.presync.count,
+      state = self.state
+    }
+  else
+    return {
+      work_hex = consensus.work_to_hex(self.redownload.work),
+      height = self.redownload.height,
+      count = #self.redownload.buffer,
+      state = self.state
+    }
+  end
+end
+
+--- Compute a 1-bit commitment for a header hash.
+-- Uses salted hashing to prevent attacker from pre-computing collisions.
+-- @param block_hash hash256: block hash to commit to
+-- @return boolean: commitment bit (true or false)
+function HeadersSyncState:compute_commitment(block_hash)
+  -- Hash: SHA256(salt || block_hash)
+  local data = self.commitment_salt .. block_hash.bytes
+  local hash = crypto.sha256(data)
+  -- Take LSB of first byte as commitment
+  return (hash:byte(1) % 2) == 1
+end
+
+--- Check if difficulty transition is permitted.
+-- Simplified check: ensure bits don't change by more than 4x in either direction.
+-- @param prev_bits number: previous block's bits
+-- @param next_bits number: next block's bits
+-- @param height number: height of next block
+-- @return boolean: true if transition is valid
+function HeadersSyncState:permitted_difficulty_transition(prev_bits, next_bits, height)
+  -- At difficulty adjustment boundary, allow any valid transition
+  if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
+    return true
+  end
+
+  -- For testnet with min difficulty rules
+  if self.network.pow_allow_min_difficulty then
+    -- Allow transition to min difficulty
+    if next_bits == self.network.pow_limit_bits then
+      return true
+    end
+    -- Also allow returning to prev difficulty
+    return true  -- Simplified for testnet
+  end
+
+  -- Non-adjustment block: bits must match previous
+  return prev_bits == next_bits
+end
+
+--------------------------------------------------------------------------------
+-- PRESYNC Phase
+--------------------------------------------------------------------------------
+
+--- Process headers in PRESYNC phase.
+-- Validates PoW and accumulates work without storing headers.
+-- @param headers table: list of block_header objects
+-- @return boolean, string|nil: success, error message
+function HeadersSyncState:process_presync(headers)
+  for _, header in ipairs(headers) do
+    -- Verify continuity (header connects to last)
+    local prev_hex = types.hash256_hex(header.prev_hash)
+    local last_hex = types.hash256_hex(self.presync.last_hash)
+    if prev_hex ~= last_hex then
+      return false, "non-continuous header in presync"
+    end
+
+    local next_height = self.presync.height + 1
+
+    -- Check difficulty transition
+    if not self:permitted_difficulty_transition(
+      self.presync.last_bits, header.bits, next_height
+    ) then
+      return false, "invalid difficulty transition in presync"
+    end
+
+    -- Verify PoW
+    local hash = validation.compute_block_hash(header)
+    local target = consensus.bits_to_target(header.bits)
+    if not consensus.hash_meets_target(hash.bytes, target) then
+      return false, "invalid proof of work in presync"
+    end
+
+    -- Check timestamp > previous timestamp (simplified MTP check)
+    if header.timestamp <= self.presync.last_timestamp - 7200 then
+      return false, "timestamp too old in presync"
+    end
+
+    -- Accumulate work
+    local block_work = consensus.get_block_work(header.bits)
+    self.presync.work = consensus.work_add(self.presync.work, block_work)
+
+    -- Store commitment at periodic intervals
+    if (next_height % COMMITMENT_PERIOD) == self.commitment_offset then
+      local commitment = self:compute_commitment(hash)
+      self.presync.commitments[#self.presync.commitments + 1] = commitment
+    end
+
+    -- Update state
+    self.presync.last_hash = hash
+    self.presync.last_bits = header.bits
+    self.presync.last_timestamp = header.timestamp
+    self.presync.height = next_height
+    self.presync.count = self.presync.count + 1
+  end
+
+  -- Check if we've reached minimum required work
+  if consensus.work_compare(self.presync.work, self.min_required_work) >= 0 then
+    -- Transition to REDOWNLOAD
+    self:transition_to_redownload()
+  end
+
+  return true
+end
+
+--- Transition from PRESYNC to REDOWNLOAD phase.
+function HeadersSyncState:transition_to_redownload()
+  self.state = HeadersSyncState.STATE.REDOWNLOAD
+
+  -- Reset redownload state to chain start
+  self.redownload = {
+    work = self.chain_start_work,
+    last_hash = self.chain_start_hash,
+    last_bits = self.network.genesis.bits,
+    last_timestamp = self.network.genesis.timestamp,
+    height = self.chain_start_height,
+    buffer = {},
+    commitment_idx = 1,
+    work_threshold_reached = false,
+  }
+end
+
+--- Check if PRESYNC is complete and ready for REDOWNLOAD.
+-- @return boolean: true if work threshold reached
+function HeadersSyncState:presync_complete()
+  return self.state == HeadersSyncState.STATE.REDOWNLOAD
+end
+
+--- Get the getheaders request parameters for current state.
+-- @return table: {locator_hashes, stop_hash}
+function HeadersSyncState:get_getheaders_request()
+  if self.state == HeadersSyncState.STATE.PRESYNC then
+    -- Continue from last PRESYNC header
+    return {
+      locator_hashes = {self.presync.last_hash},
+      stop_hash = types.hash256_zero()
+    }
+  elseif self.state == HeadersSyncState.STATE.REDOWNLOAD then
+    -- Start from chain start for REDOWNLOAD
+    return {
+      locator_hashes = {self.chain_start_hash},
+      stop_hash = types.hash256_zero()
+    }
+  else
+    return nil
+  end
+end
+
+--------------------------------------------------------------------------------
+-- REDOWNLOAD Phase
+--------------------------------------------------------------------------------
+
+--- Process headers in REDOWNLOAD phase.
+-- Validates headers and verifies commitments match PRESYNC.
+-- @param headers table: list of block_header objects
+-- @return table|nil, string|nil: accepted headers ready for storage, error
+function HeadersSyncState:process_redownload(headers)
+  local accepted = {}
+
+  for _, header in ipairs(headers) do
+    -- Verify continuity
+    local prev_hex = types.hash256_hex(header.prev_hash)
+    local last_hex = types.hash256_hex(self.redownload.last_hash)
+    if prev_hex ~= last_hex then
+      return nil, "non-continuous header in redownload"
+    end
+
+    local next_height = self.redownload.height + 1
+
+    -- Check difficulty transition
+    if not self:permitted_difficulty_transition(
+      self.redownload.last_bits, header.bits, next_height
+    ) then
+      return nil, "invalid difficulty transition in redownload"
+    end
+
+    -- Verify PoW
+    local hash = validation.compute_block_hash(header)
+    local target = consensus.bits_to_target(header.bits)
+    if not consensus.hash_meets_target(hash.bytes, target) then
+      return nil, "invalid proof of work in redownload"
+    end
+
+    -- Accumulate work
+    local block_work = consensus.get_block_work(header.bits)
+    self.redownload.work = consensus.work_add(self.redownload.work, block_work)
+
+    -- Check if we've reached work threshold
+    if not self.redownload.work_threshold_reached then
+      if consensus.work_compare(self.redownload.work, self.min_required_work) >= 0 then
+        self.redownload.work_threshold_reached = true
+      end
+    end
+
+    -- Verify commitment at periodic intervals
+    if not self.redownload.work_threshold_reached then
+      if (next_height % COMMITMENT_PERIOD) == self.commitment_offset then
+        local idx = self.redownload.commitment_idx
+        if idx > #self.presync.commitments then
+          return nil, "commitment overrun in redownload"
+        end
+
+        local expected = self.presync.commitments[idx]
+        local actual = self:compute_commitment(hash)
+        if expected ~= actual then
+          return nil, "commitment mismatch in redownload"
+        end
+
+        self.redownload.commitment_idx = idx + 1
+      end
+    end
+
+    -- Update state
+    self.redownload.last_hash = hash
+    self.redownload.last_bits = header.bits
+    self.redownload.last_timestamp = header.timestamp
+    self.redownload.height = next_height
+
+    -- Add to buffer
+    self.redownload.buffer[#self.redownload.buffer + 1] = {
+      header = header,
+      hash = hash,
+      height = next_height
+    }
+  end
+
+  -- Release buffered headers that have sufficient commitments verified
+  -- (or all if work threshold reached)
+  if self.redownload.work_threshold_reached or
+     #self.redownload.buffer > REDOWNLOAD_BUFFER_SIZE then
+    -- Release headers from buffer
+    if self.redownload.work_threshold_reached then
+      -- Release all
+      for _, entry in ipairs(self.redownload.buffer) do
+        accepted[#accepted + 1] = entry
+      end
+      self.redownload.buffer = {}
+      self.state = HeadersSyncState.STATE.FINAL
+    else
+      -- Release oldest entries, keeping REDOWNLOAD_BUFFER_SIZE
+      while #self.redownload.buffer > REDOWNLOAD_BUFFER_SIZE do
+        local entry = table.remove(self.redownload.buffer, 1)
+        accepted[#accepted + 1] = entry
+      end
+    end
+  end
+
+  return accepted
+end
+
+--- Process headers based on current state.
+-- @param headers table: list of block_header objects
+-- @return table|nil, string|nil: accepted headers (for storage), error
+function HeadersSyncState:process_headers(headers)
+  if self.state == HeadersSyncState.STATE.PRESYNC then
+    local ok, err = self:process_presync(headers)
+    if not ok then
+      return nil, err
+    end
+    return {}, nil  -- No headers accepted yet in PRESYNC
+  elseif self.state == HeadersSyncState.STATE.REDOWNLOAD then
+    return self:process_redownload(headers)
+  else
+    return nil, "sync already complete"
+  end
+end
+
+--- Check if sync is complete.
+-- @return boolean: true if FINAL state
+function HeadersSyncState:is_complete()
+  return self.state == HeadersSyncState.STATE.FINAL
+end
+
+--- Check if we need to request more headers.
+-- @return boolean: true if more headers needed
+function HeadersSyncState:needs_headers()
+  return self.state ~= HeadersSyncState.STATE.FINAL
+end
+
+-- Export the class
+M.HeadersSyncState = HeadersSyncState
 
 --------------------------------------------------------------------------------
 -- HeaderChain: In-memory index for block headers
@@ -137,10 +546,34 @@ end
 --- Add genesis block to the chain.
 function HeaderChain:add_genesis()
   local gen = self.network.genesis
+
+  -- Build genesis coinbase exactly matching Bitcoin Core to compute correct merkle root
+  local msg = gen.coinbase_message
+  -- scriptSig: PUSH4(486604799_le) PUSH1(0x04) PUSH_N(message)
+  -- 486604799 = 0x1d00ffff, always hardcoded in Bitcoin Core's CreateGenesisBlock
+  local script_sig = "\x04\xff\xff\x00\x1d\x01\x04" .. string.char(#msg) .. msg
+  local coinbase_input = types.txin(
+    types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+    script_sig, 0xFFFFFFFF
+  )
+  local satoshi_pubkey_hex = "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"
+  local satoshi_pubkey = ""
+  for i = 1, #satoshi_pubkey_hex, 2 do
+    satoshi_pubkey = satoshi_pubkey .. string.char(tonumber(satoshi_pubkey_hex:sub(i, i+1), 16))
+  end
+  local output_script = string.char(65) .. satoshi_pubkey .. "\xac"
+  local subsidy = consensus.get_block_subsidy(0)
+  local coinbase_tx = types.transaction(1,
+    {coinbase_input},
+    {types.txout(subsidy, output_script)},
+    0)
+  local txid = validation.compute_txid(coinbase_tx)
+  local merkle_root = txid  -- single tx: merkle root == txid
+
   local header = types.block_header(
     gen.version,
     types.hash256_zero(),  -- prev_hash (genesis has no parent)
-    types.hash256_zero(),  -- merkle root (computed later for full block)
+    merkle_root,
     gen.timestamp,
     gen.bits,
     gen.nonce
@@ -257,28 +690,47 @@ function HeaderChain:accept_header(header)
     return false, "timestamp not greater than median time past"
   end
 
-  -- 6. Check difficulty target
-  if not self.network.pow_no_retarget then
-    if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
-      local expected_bits = self:calculate_next_work_required(height, header)
-      if header.bits ~= expected_bits then
-        return false, string.format("wrong difficulty: expected 0x%08x got 0x%08x",
-          expected_bits, header.bits)
-      end
-    elseif not self.network.pow_allow_min_difficulty then
-      if header.bits ~= parent.header.bits then
-        return false, "unexpected difficulty change"
-      end
+  -- 6. Check difficulty target using consensus.get_next_work_required
+  -- This handles mainnet, testnet3 walk-back, BIP94/testnet4, and regtest
+  local chain = self
+  local expected_bits = consensus.get_next_work_required(
+    height,
+    header.timestamp,
+    self.network,
+    function(h)
+      local hex = chain.height_to_hash[h]
+      if hex then return chain.headers[hex] end
+      return nil
     end
+  )
+  if header.bits ~= expected_bits then
+    return false, string.format("wrong difficulty: expected 0x%08x got 0x%08x",
+      expected_bits, header.bits)
   end
 
   -- 7. Check against checkpoints
-  local checkpoints = self.network.checkpoints or {}
-  local expected_checkpoint = checkpoints[height]
-  if expected_checkpoint then
-    if hash_hex ~= expected_checkpoint then
-      return false, "checkpoint mismatch at height " .. height
+  local ok, cp_err = consensus.check_checkpoint(self.network, height, hash_hex)
+  if not ok then
+    return false, cp_err
+  end
+
+  -- 7b. Check anti-fork: reject headers that would create a fork before last checkpoint
+  local chain = self
+  local ok2, fork_err = consensus.check_checkpoint_anti_fork(
+    self.network, height, hash_hex,
+    function(h)
+      local hex = chain.height_to_hash[h]
+      if hex then
+        local entry = chain.headers[hex]
+        if entry then
+          return { hash_hex = hex, header = entry.header }
+        end
+      end
+      return nil
     end
+  )
+  if not ok2 then
+    return false, fork_err
   end
 
   -- 8. Accept the header
@@ -317,25 +769,20 @@ end
 
 --- Calculate the next required difficulty target.
 -- @param height number: height of the block being validated
--- @param header block_header: header being validated (unused but for consistency)
+-- @param header block_header: header being validated
 -- @return number: expected compact bits value
 function HeaderChain:calculate_next_work_required(height, header)
-  -- Find the block 2016 blocks ago
-  local first_height = height - consensus.DIFFICULTY_ADJUSTMENT_INTERVAL
-  local first_hex = self.height_to_hash[first_height]
-  local first = self.headers[first_hex]
-
-  local last_hex = self.height_to_hash[height - 1]
-  local last = self.headers[last_hex]
-
-  if not first or not last then
-    -- Shouldn't happen if chain is continuous
-    return header.bits
-  end
-
-  local actual_timespan = last.header.timestamp - first.header.timestamp
-  local new_target = consensus.calculate_next_target(last.header.bits, actual_timespan)
-  return new_target
+  local chain = self
+  return consensus.get_next_work_required(
+    height,
+    header.timestamp,
+    self.network,
+    function(h)
+      local hex = chain.height_to_hash[h]
+      if hex then return chain.headers[hex] end
+      return nil
+    end
+  )
 end
 
 --------------------------------------------------------------------------------
@@ -433,14 +880,54 @@ function HeaderChain:get_tip_height()
 end
 
 --------------------------------------------------------------------------------
--- Sync Controller
+-- Sync Controller with Anti-DoS (PRESYNC/REDOWNLOAD)
 --------------------------------------------------------------------------------
+
+--- Check if a chain's work is below the minimum threshold.
+-- @param total_work string: 32-byte cumulative work
+-- @return boolean: true if below minimum
+function HeaderChain:is_low_work_chain(total_work)
+  local min_work = consensus.work_from_hex(
+    self.network.min_chain_work or string.rep("00", 64)
+  )
+  return consensus.work_compare(total_work, min_work) < 0
+end
+
+--- Get the current chain work as a 32-byte big-endian value.
+-- @return string: 32-byte cumulative work
+function HeaderChain:get_chain_work()
+  if self.header_tip_hash then
+    local tip_hex = types.hash256_hex(self.header_tip_hash)
+    local entry = self.headers[tip_hex]
+    if entry then
+      -- Convert floating-point work to approximate 32-byte value
+      -- This is a simplification; for full precision we'd track work as bytes
+      local work_float = entry.total_work
+      local result = {}
+      for i = 1, 32 do result[i] = 0 end
+      -- Approximate conversion (sufficient for comparison with min_chain_work)
+      local remaining = work_float
+      for i = 32, 1, -1 do
+        if remaining <= 0 then break end
+        result[i] = math.floor(remaining % 256)
+        remaining = math.floor(remaining / 256)
+      end
+      local out = {}
+      for i = 1, 32 do out[i] = string.char(result[i]) end
+      return table.concat(out)
+    end
+  end
+  return consensus.work_zero()
+end
 
 --- Start header synchronization with a peer.
 -- @param peer table: peer connection to sync from
 function HeaderChain:start_sync(peer)
   self.syncing = true
   self.sync_peer = peer
+
+  -- Initialize per-peer sync state tracking if not present
+  self.peer_sync_states = self.peer_sync_states or {}
 
   local locator = self:get_block_locator()
   local payload = p2p.serialize_getheaders(
@@ -450,6 +937,94 @@ function HeaderChain:start_sync(peer)
   )
 
   peer:send_message("getheaders", payload)
+end
+
+--- Try to initiate low-work header sync (PRESYNC/REDOWNLOAD).
+-- Called when headers from peer would extend our chain but we haven't
+-- verified they have sufficient work yet.
+-- @param peer table: peer sending headers
+-- @param headers table: headers received
+-- @return boolean: true if low-work sync was initiated
+function HeaderChain:try_low_work_sync(peer, headers)
+  -- Get peer ID for tracking
+  local peer_id = peer.id or tostring(peer)
+
+  -- Check if we already have a sync state for this peer
+  self.peer_sync_states = self.peer_sync_states or {}
+  if self.peer_sync_states[peer_id] then
+    return false  -- Already syncing with this peer
+  end
+
+  -- Calculate claimed work from headers
+  local claimed_work = self:get_chain_work()
+  for _, header in ipairs(headers) do
+    local block_work = consensus.get_block_work(header.bits)
+    claimed_work = consensus.work_add(claimed_work, block_work)
+  end
+
+  -- Check if claimed work is below minimum
+  local min_work = consensus.work_from_hex(
+    self.network.min_chain_work or string.rep("00", 64)
+  )
+
+  if consensus.work_compare(claimed_work, min_work) >= 0 then
+    -- Chain has sufficient work, use normal sync
+    return false
+  end
+
+  -- Only initiate low-work sync if we got a full batch (peer may have more)
+  if #headers < 2000 then
+    -- Chain doesn't have enough work and peer has no more headers
+    return false
+  end
+
+  -- Create HeadersSyncState for this peer
+  local chain_start = {
+    hash = self.header_tip_hash,
+    height = self.header_tip_height,
+    work = self:get_chain_work()
+  }
+
+  local sync_state = M.new_headers_sync_state(peer_id, self.network, chain_start)
+  self.peer_sync_states[peer_id] = sync_state
+
+  -- Process the headers through PRESYNC
+  local ok, err = sync_state:process_presync(headers)
+  if not ok then
+    -- Invalid headers - remove sync state
+    self.peer_sync_states[peer_id] = nil
+    return false
+  end
+
+  return true
+end
+
+--- Continue low-work header sync for a peer.
+-- @param peer table: peer sending headers
+-- @param headers table: headers received
+-- @return table|nil, string|nil: accepted headers, error
+function HeaderChain:continue_low_work_sync(peer, headers)
+  local peer_id = peer.id or tostring(peer)
+  local sync_state = self.peer_sync_states[peer_id]
+
+  if not sync_state then
+    return nil, "no sync state for peer"
+  end
+
+  -- Process headers based on current state
+  local accepted, err = sync_state:process_headers(headers)
+  if err then
+    -- Invalid headers - remove sync state
+    self.peer_sync_states[peer_id] = nil
+    return nil, err
+  end
+
+  -- If sync is complete, cleanup
+  if sync_state:is_complete() then
+    self.peer_sync_states[peer_id] = nil
+  end
+
+  return accepted
 end
 
 --- Handle incoming headers message from a peer.
@@ -467,8 +1042,75 @@ function HeaderChain:handle_headers(peer, payload)
     return 0
   end
 
+  -- Check if this peer is in low-work sync mode (PRESYNC/REDOWNLOAD)
+  local peer_id = peer.id or tostring(peer)
+  self.peer_sync_states = self.peer_sync_states or {}
+  local sync_state = self.peer_sync_states[peer_id]
+
+  if sync_state then
+    -- Continue low-work sync
+    local accepted_entries, err = self:continue_low_work_sync(peer, headers)
+    if err then
+      return -1, err
+    end
+
+    -- Add accepted headers from REDOWNLOAD to our chain
+    local accepted_count = 0
+    if accepted_entries then
+      for _, entry in ipairs(accepted_entries) do
+        local ok, accept_err = self:accept_header(entry.header)
+        if not ok then
+          return accepted_count, accept_err
+        end
+        accepted_count = accepted_count + 1
+      end
+    end
+
+    -- Request more headers if still syncing
+    if sync_state:needs_headers() then
+      local req = sync_state:get_getheaders_request()
+      if req then
+        local send_payload = p2p.serialize_getheaders(
+          p2p.PROTOCOL_VERSION,
+          req.locator_hashes,
+          req.stop_hash
+        )
+        peer:send_message("getheaders", send_payload)
+      end
+    else
+      -- Sync complete
+      self.syncing = false
+      self.sync_peer = nil
+    end
+
+    if accepted_count > 0 then
+      self:set_header_tip(self.header_tip_hash, self.header_tip_height, false)
+    end
+
+    return accepted_count
+  end
+
+  -- Normal sync path - process headers directly
   local accepted, err = self:process_headers(headers, peer)
   if err then
+    -- Check if this is just an unknown parent due to low-work chain
+    -- In that case, try to initiate PRESYNC
+    if err:match("unknown parent") and self:try_low_work_sync(peer, headers) then
+      -- Low-work sync initiated, request more headers
+      local new_sync_state = self.peer_sync_states[peer_id]
+      if new_sync_state then
+        local req = new_sync_state:get_getheaders_request()
+        if req then
+          local send_payload = p2p.serialize_getheaders(
+            p2p.PROTOCOL_VERSION,
+            req.locator_hashes,
+            req.stop_hash
+          )
+          peer:send_message("getheaders", send_payload)
+        end
+      end
+      return 0  -- Headers queued in PRESYNC, not yet accepted
+    end
     -- Invalid headers - caller should ban peer
     return -1, err
   end
@@ -501,6 +1143,23 @@ end
 function HeaderChain:stop_sync()
   self.syncing = false
   self.sync_peer = nil
+end
+
+--- Get the low-work sync state for a peer.
+-- @param peer table: peer to query
+-- @return HeadersSyncState|nil: sync state or nil
+function HeaderChain:get_peer_sync_state(peer)
+  local peer_id = peer.id or tostring(peer)
+  self.peer_sync_states = self.peer_sync_states or {}
+  return self.peer_sync_states[peer_id]
+end
+
+--- Clear the low-work sync state for a peer.
+-- @param peer table: peer to clear
+function HeaderChain:clear_peer_sync_state(peer)
+  local peer_id = peer.id or tostring(peer)
+  self.peer_sync_states = self.peer_sync_states or {}
+  self.peer_sync_states[peer_id] = nil
 end
 
 -- Export the HeaderChain class for direct access if needed

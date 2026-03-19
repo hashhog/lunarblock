@@ -84,6 +84,29 @@ local MAX_STACK_SIZE = 1000
 local MAX_SCRIPT_ELEMENT_SIZE = 520
 local MAX_SCRIPT_SIZE = 10000
 
+-- Check if a public key is compressed (33 bytes, starts with 0x02 or 0x03)
+local function is_compressed_pubkey(pubkey)
+  if #pubkey ~= 33 then
+    return false
+  end
+  local first_byte = pubkey:byte(1)
+  return first_byte == 0x02 or first_byte == 0x03
+end
+
+--- Check public key encoding for witness v0 programs.
+-- In witness v0, only compressed public keys are allowed.
+-- @param pubkey string: The public key bytes
+-- @param flags table: Verification flags (must have verify_witness_pubkeytype and is_witness_v0)
+-- @return boolean, string|nil: true if valid, false and error message if not
+function M.check_pubkey_encoding_witness(pubkey, flags)
+  if flags and flags.verify_witness_pubkeytype and flags.is_witness_v0 then
+    if not is_compressed_pubkey(pubkey) then
+      return false, "WITNESS_PUBKEYTYPE"
+    end
+  end
+  return true
+end
+
 -- Encode a number as Bitcoin Script's variable-length little-endian signed integer
 -- If n==0, return empty string
 -- Otherwise encode absolute value as little-endian bytes, then set MSB of last byte if negative
@@ -383,6 +406,24 @@ function M.classify_script(script)
   return "nonstandard", nil
 end
 
+--- Check if a script contains only push operations.
+-- A script is push-only if every opcode is <= OP_16 (0x60).
+-- This includes: OP_0, direct pushes (0x01-0x4b), PUSHDATA1/2/4,
+-- OP_1NEGATE, OP_RESERVED, and OP_1 through OP_16.
+-- Note: OP_RESERVED is considered push-only per Bitcoin Core, but execution
+-- of OP_RESERVED fails, so it's irrelevant for P2SH validation.
+-- @param script_bytes string: The raw script bytes
+-- @return boolean: true if script contains only push operations
+function M.is_push_only(script_bytes)
+  local ops = M.parse_script(script_bytes)
+  for _, op in ipairs(ops) do
+    if op.opcode > M.OP.OP_16 then
+      return false
+    end
+  end
+  return true
+end
+
 -- Check if an opcode counts towards the 201 limit (non-push opcodes)
 local function is_counted_opcode(opcode)
   return opcode > M.OP.OP_16
@@ -497,6 +538,20 @@ function M.execute_script(script_bytes, stack, flags, checker)
     if opcode == M.OP.OP_IF then
       if is_executing() then
         local val = pop()
+        -- MINIMALIF: For tapscript (is_tapscript), enforce unconditionally.
+        -- For witness v0 (is_witness_v0), enforce when verify_minimalif flag is set.
+        -- The input must be exactly "" (empty) or exactly "\x01".
+        if flags.is_tapscript then
+          -- Tapscript: MINIMALIF is mandatory consensus rule
+          if #val > 1 or (#val == 1 and val:byte(1) ~= 1) then
+            return nil, "MINIMALIF"
+          end
+        elseif flags.is_witness_v0 and flags.verify_minimalif then
+          -- Witness v0: MINIMALIF is policy, enforced via flag
+          if #val > 1 or (#val == 1 and val:byte(1) ~= 1) then
+            return nil, "MINIMALIF"
+          end
+        end
         if_stack[#if_stack + 1] = M.cast_to_bool(val)
       else
         if_stack[#if_stack + 1] = false
@@ -506,6 +561,18 @@ function M.execute_script(script_bytes, stack, flags, checker)
     elseif opcode == M.OP.OP_NOTIF then
       if is_executing() then
         local val = pop()
+        -- MINIMALIF: Same rules as OP_IF
+        if flags.is_tapscript then
+          -- Tapscript: MINIMALIF is mandatory consensus rule
+          if #val > 1 or (#val == 1 and val:byte(1) ~= 1) then
+            return nil, "MINIMALIF"
+          end
+        elseif flags.is_witness_v0 and flags.verify_minimalif then
+          -- Witness v0: MINIMALIF is policy, enforced via flag
+          if #val > 1 or (#val == 1 and val:byte(1) ~= 1) then
+            return nil, "MINIMALIF"
+          end
+        end
         if_stack[#if_stack + 1] = not M.cast_to_bool(val)
       else
         if_stack[#if_stack + 1] = false
@@ -783,6 +850,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
       -- Pop pubkey first (top of stack), then signature (deeper)
       local pubkey = pop()
       local sig = pop()
+      -- BIP141: Witness v0 requires compressed public keys
+      local pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
+      if not pk_ok then
+        return nil, pk_err
+      end
       local valid = false
       if checker.check_sig then
         valid = checker.check_sig(sig, pubkey)
@@ -795,6 +867,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
     elseif opcode == M.OP.OP_CHECKSIGVERIFY then
       local pubkey = pop()
       local sig = pop()
+      -- BIP141: Witness v0 requires compressed public keys
+      local pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
+      if not pk_ok then
+        return nil, pk_err
+      end
       local valid = false
       if checker.check_sig then
         valid = checker.check_sig(sig, pubkey)
@@ -816,6 +893,14 @@ function M.execute_script(script_bytes, stack, flags, checker)
       local pubkeys = {}
       for j = 1, n do
         pubkeys[j] = pop()
+      end
+
+      -- BIP141: Witness v0 requires compressed public keys for ALL pubkeys
+      for j = 1, n do
+        local pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkeys[j], flags)
+        if not pk_ok then
+          return nil, pk_err
+        end
       end
 
       -- Pop m signatures
@@ -945,6 +1030,37 @@ function M.execute_script(script_bytes, stack, flags, checker)
   return stack
 end
 
+--- Execute a witness script with cleanstack enforcement.
+-- BIP141: Witness scripts implicitly require cleanstack behavior.
+-- After execution, the stack must have exactly 1 element and it must be true.
+-- This function is NOT flag-gated - cleanstack is always enforced for witness.
+-- @param script_bytes string: The witness script to execute
+-- @param stack table: Initial stack (witness items)
+-- @param flags table: Verification flags
+-- @param checker table: Signature checker
+-- @return boolean: true if script succeeds and cleanstack is satisfied
+-- @return string|nil: Error message on failure
+function M.execute_witness_script(script_bytes, stack, flags, checker)
+  -- Execute the script
+  local result, err = M.execute_script(script_bytes, stack, flags, checker)
+  if not result then
+    return nil, err
+  end
+
+  -- BIP141: Witness scripts implicitly require cleanstack
+  -- Check that stack has exactly 1 element (CLEANSTACK)
+  if #result ~= 1 then
+    return nil, "CLEANSTACK"
+  end
+
+  -- Check that the single element is true (not empty, not false/negative-zero)
+  if not M.cast_to_bool(result[1]) then
+    return nil, "EVAL_FALSE"
+  end
+
+  return true
+end
+
 -- Verify script execution (scriptSig + scriptPubKey)
 function M.verify_script(script_sig, script_pubkey, flags, checker)
   flags = flags or {}
@@ -973,8 +1089,10 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
   if flags.verify_p2sh then
     local script_type = M.classify_script(script_pubkey)
     if script_type == "p2sh" then
-      -- The scriptSig must be push-only for P2SH
-      -- (We assume it is, since we're just validating, not checking policy)
+      -- BIP16: scriptSig must be push-only for P2SH (consensus rule, unconditional)
+      if not M.is_push_only(script_sig) then
+        return nil, "SIG_PUSHONLY"
+      end
 
       -- The top element of stack_copy is the serialized redeem script
       if #stack_copy == 0 then

@@ -862,6 +862,369 @@ function RPCServer:register_methods()
     return types.hash256_hex(types.hash256_zero())
   end
 
+  self.methods["getblockheader"] = function(rpc, params)
+    local blockhash = params[1]
+    local verbose = params[2]
+    -- Default verbose to true (like Bitcoin Core)
+    if verbose == nil or verbose == cjson.null then
+      verbose = true
+    end
+
+    if type(blockhash) ~= "string" or #blockhash ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+    end
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    local hash = types.hash256_from_hex(blockhash)
+    local header = rpc.storage.get_header(hash)
+    if not header then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Block header not found"})
+    end
+
+    -- Non-verbose: return 80-byte header as hex
+    if not verbose then
+      local header_data = serialize.serialize_block_header(header)
+      return M.hex_encode(header_data)
+    end
+
+    -- Get block height
+    local block_height = nil
+    if rpc.storage.get_hash_by_height then
+      -- Search height index
+      local tip_height = rpc.chain_state and rpc.chain_state.tip_height or 0
+      for h = 0, tip_height do
+        local h_hash = rpc.storage.get_hash_by_height(h)
+        if h_hash and types.hash256_eq(h_hash, hash) then
+          block_height = h
+          break
+        end
+      end
+    end
+
+    -- Calculate confirmations
+    local confirmations = 1
+    if block_height and rpc.chain_state and rpc.chain_state.tip_height then
+      confirmations = rpc.chain_state.tip_height - block_height + 1
+    end
+
+    -- Calculate difficulty from bits
+    local difficulty = calculate_difficulty(header.bits)
+
+    -- Get nextblockhash if we have height
+    local nextblockhash = nil
+    if block_height and rpc.storage then
+      local next_hash = rpc.storage.get_hash_by_height(block_height + 1)
+      if next_hash then
+        nextblockhash = types.hash256_hex(next_hash)
+      end
+    end
+
+    -- Get previousblockhash
+    local previousblockhash = nil
+    local zero_hash = string.rep("\0", 32)
+    if header.prev_hash.bytes ~= zero_hash then
+      previousblockhash = types.hash256_hex(header.prev_hash)
+    end
+
+    -- Get median time past
+    local mediantime = get_median_time_past(rpc.storage, hash)
+
+    local result = {
+      hash = blockhash,
+      confirmations = confirmations,
+      height = block_height or 0,
+      version = header.version,
+      versionHex = string.format("%08x", header.version),
+      merkleroot = types.hash256_hex(header.merkle_root),
+      time = header.timestamp,
+      mediantime = mediantime,
+      nonce = header.nonce,
+      bits = string.format("%08x", header.bits),
+      difficulty = difficulty,
+      chainwork = calculate_chainwork_from_bits(header.bits),
+      nTx = 0,  -- We don't store tx count in header
+    }
+
+    if previousblockhash then
+      result.previousblockhash = previousblockhash
+    end
+    if nextblockhash then
+      result.nextblockhash = nextblockhash
+    end
+
+    return result
+  end
+
+  self.methods["getchaintips"] = function(rpc, _params)
+    -- In our simple implementation, we only track the main chain
+    -- Return just the active tip
+    local tips = {}
+
+    if rpc.chain_state and rpc.chain_state.tip_hash then
+      tips[1] = {
+        height = rpc.chain_state.tip_height or 0,
+        hash = types.hash256_hex(rpc.chain_state.tip_hash),
+        branchlen = 0,
+        status = "active",
+      }
+    end
+
+    return tips
+  end
+
+  self.methods["getdifficulty"] = function(rpc, _params)
+    local difficulty = 1.0
+
+    if rpc.chain_state and rpc.chain_state.tip_hash and rpc.storage then
+      local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
+      if header then
+        difficulty = calculate_difficulty(header.bits)
+      end
+    end
+
+    return difficulty
+  end
+
+  self.methods["submitblock"] = function(rpc, params)
+    local hexdata = params[1]
+
+    if type(hexdata) ~= "string" or #hexdata < 160 then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block decode failed"})
+    end
+
+    -- Decode the block
+    local ok, block = pcall(function()
+      return serialize.deserialize_block(M.hex_decode(hexdata))
+    end)
+    if not ok then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block decode failed: " .. tostring(block)})
+    end
+
+    -- Compute block hash
+    local block_hash = validation.compute_block_hash(block.header)
+
+    -- Check if block already exists
+    if rpc.storage then
+      local existing = rpc.storage.get_header(block_hash)
+      if existing then
+        return "duplicate"
+      end
+    end
+
+    -- Basic header validation (PoW)
+    local pow_ok = pcall(function()
+      validation.check_proof_of_work(block.header, rpc.network)
+    end)
+    if not pow_ok then
+      return "high-hash"
+    end
+
+    -- Check that prev_hash connects to our chain
+    if rpc.storage then
+      local prev_header = rpc.storage.get_header(block.header.prev_hash)
+      if not prev_header then
+        return "prev-blk-not-found"
+      end
+    end
+
+    -- Full block validation would go here
+    -- For now, store the block if we have storage
+    if rpc.storage then
+      rpc.storage.put_block(block_hash, block)
+      rpc.storage.put_header(block_hash, block.header)
+
+      -- Determine height from parent and store height index
+      local prev_header = rpc.storage.get_header(block.header.prev_hash)
+      if prev_header then
+        local prev_height = rpc.storage.get_height_by_hash and
+          rpc.storage.get_height_by_hash(block.header.prev_hash) or
+          (rpc.chain_state and rpc.chain_state.tip_height or 0)
+        local height = prev_height + 1
+        rpc.storage.put_height_index(height, block_hash)
+
+        -- Update chain state tip
+        if rpc.chain_state then
+          rpc.chain_state.tip_hash = block_hash
+          rpc.chain_state.tip_height = height
+        end
+      end
+    end
+
+    -- Notify mempool of new block
+    if rpc.mempool and rpc.mempool.on_block_connected then
+      rpc.mempool:on_block_connected(block)
+    end
+
+    -- Return null on success (Bitcoin Core convention)
+    return cjson.null
+  end
+
+  self.methods["getmininginfo"] = function(rpc, _params)
+    local blocks = 0
+    local difficulty = 1.0
+    local networkhashps = 0
+
+    if rpc.chain_state then
+      blocks = rpc.chain_state.tip_height or 0
+
+      if rpc.chain_state.tip_hash and rpc.storage then
+        local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
+        if header then
+          difficulty = calculate_difficulty(header.bits)
+          -- Estimate network hashrate: difficulty * 2^32 / 600
+          networkhashps = difficulty * 4294967296 / 600
+        end
+      end
+    end
+
+    return {
+      blocks = blocks,
+      difficulty = difficulty,
+      networkhashps = networkhashps,
+      pooledtx = rpc.mempool and rpc.mempool:get_info().size or 0,
+      chain = rpc.network.name or "main",
+      warnings = "",
+    }
+  end
+
+  self.methods["listtransactions"] = function(rpc, params)
+    local label = params[1] or "*"
+    local count = params[2] or 10
+    local skip = params[3] or 0
+
+    -- Suppress unused warning
+    local _ = label
+
+    local result = {}
+
+    -- If we have a wallet, get transactions from there
+    if rpc.wallet and rpc.wallet.get_transactions then
+      local txs = rpc.wallet:get_transactions()
+      -- Sort by time descending
+      table.sort(txs, function(a, b) return (a.time or 0) > (b.time or 0) end)
+
+      -- Apply skip and count
+      local start_idx = skip + 1
+      local end_idx = math.min(skip + count, #txs)
+      for i = start_idx, end_idx do
+        result[#result + 1] = txs[i]
+      end
+    end
+
+    return result
+  end
+
+  self.methods["testmempoolaccept"] = function(rpc, params)
+    local rawtxs = params[1]
+    local maxfeerate = params[2]
+
+    if type(rawtxs) ~= "table" or #rawtxs == 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid rawtxs parameter"})
+    end
+
+    -- Default max fee rate: 0.10 BTC/kvB = 10000 sat/vB
+    if maxfeerate == nil or maxfeerate == cjson.null then
+      maxfeerate = 0.10
+    end
+
+    local results = {}
+
+    for i, hex in ipairs(rawtxs) do
+      local entry = {
+        txid = nil,
+        wtxid = nil,
+        allowed = false,
+      }
+
+      -- Basic validation
+      if type(hex) ~= "string" then
+        entry["reject-reason"] = "invalid-hex"
+        results[i] = entry
+        goto continue
+      end
+
+      if #hex < 20 then
+        entry["reject-reason"] = "tx-size-too-small"
+        results[i] = entry
+        goto continue
+      end
+
+      if #hex % 2 ~= 0 then
+        entry["reject-reason"] = "invalid-hex-length"
+        results[i] = entry
+        goto continue
+      end
+
+      -- Try to decode the transaction
+      local ok, tx = pcall(function()
+        return serialize.deserialize_transaction(M.hex_decode(hex))
+      end)
+      if not ok then
+        entry["reject-reason"] = "decode-failed"
+        results[i] = entry
+        goto continue
+      end
+
+      -- Compute txid and wtxid
+      local txid = validation.compute_txid(tx)
+      local wtxid = validation.compute_wtxid(tx)
+      entry.txid = types.hash256_hex(txid)
+      entry.wtxid = types.hash256_hex(wtxid)
+
+      -- Check if already in mempool
+      if rpc.mempool then
+        local existing = rpc.mempool:get_entry(entry.txid)
+        if existing then
+          entry["reject-reason"] = "txn-already-in-mempool"
+          results[i] = entry
+          goto continue
+        end
+      end
+
+      -- Calculate weight and vsize
+      local weight = validation.get_tx_weight(tx)
+      local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+
+      -- Estimate fee (would need UTXO lookup for accurate value)
+      -- For test purposes, assume minimum fee
+      local fee = 1000  -- Placeholder
+
+      -- Check max fee rate if specified
+      if maxfeerate > 0 then
+        local feerate_btc_kvb = (fee / vsize) / 100000  -- sat/vB to BTC/kvB
+        if feerate_btc_kvb > maxfeerate then
+          entry["reject-reason"] = "max-fee-exceeded"
+          results[i] = entry
+          goto continue
+        end
+      end
+
+      -- If we have mempool, try dry-run accept
+      if rpc.mempool and rpc.mempool.test_accept then
+        local accept_ok, reject_reason = rpc.mempool:test_accept(tx)
+        if not accept_ok then
+          entry["reject-reason"] = reject_reason or "rejected"
+          results[i] = entry
+          goto continue
+        end
+      end
+
+      -- Passed all checks
+      entry.allowed = true
+      entry.vsize = vsize
+      entry.fees = {
+        base = fee / consensus.COIN,
+      }
+      results[i] = entry
+
+      ::continue::
+    end
+
+    return results
+  end
+
   -- Mempool methods
   self.methods["getmempoolinfo"] = function(rpc, _params)
     local info
@@ -1296,6 +1659,89 @@ function RPCServer:register_methods()
       return template
     end
     error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
+  end
+
+  --- generatetoaddress: Mine blocks to a given address (regtest only).
+  -- @param nblocks number: Number of blocks to mine
+  -- @param address string: Address to pay coinbase reward to
+  -- @param maxtries number: Maximum nonce attempts per block (default 1000000)
+  self.methods["generatetoaddress"] = function(rpc, params)
+    local mining_mod = require("lunarblock.mining")
+    local nblocks = params[1]
+    local addr = params[2]
+    local maxtries = params[3] or 1000000
+
+    if type(nblocks) ~= "number" or nblocks < 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid nblocks"})
+    end
+    if type(addr) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid address"})
+    end
+
+    -- Only allow on regtest
+    if rpc.network.name ~= "regtest" then
+      error({code = M.ERROR.MISC_ERROR, message = "generatetoaddress is only available on regtest"})
+    end
+
+    if not rpc.mining then
+      error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
+    end
+
+    -- Decode address to scriptPubKey
+    local addr_type, addr_hash = address_mod.decode_address(addr, rpc.network.name)
+    if not addr_type then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid address"})
+    end
+    local payout_script
+    if addr_type == "p2wpkh" then
+      payout_script = script_mod.make_p2wpkh_script(addr_hash)
+    elseif addr_type == "p2wsh" then
+      payout_script = script_mod.make_p2wsh_script(addr_hash)
+    elseif addr_type == "p2tr" then
+      payout_script = script_mod.make_p2tr_script(addr_hash)
+    elseif addr_type == "p2pkh" then
+      payout_script = script_mod.make_p2pkh_script(addr_hash)
+    elseif addr_type == "p2sh" then
+      payout_script = script_mod.make_p2sh_script(addr_hash)
+    else
+      error({code = M.ERROR.INVALID_PARAMS, message = "Unsupported address type: " .. tostring(addr_type)})
+    end
+
+    local block_hashes = {}
+    for _i = 1, nblocks do
+      -- Create a block template using current chain state
+      local _template, block = mining_mod.create_block_template(
+        rpc.mempool, rpc.chain_state, rpc.network, payout_script
+      )
+
+      -- Mine the block (find valid nonce)
+      local success, block_hash = mining_mod.mine_block(block, maxtries)
+      if not success then
+        error({code = M.ERROR.MISC_ERROR, message = "Block mining failed (max tries exceeded)"})
+      end
+
+      -- Store the block in the database
+      if rpc.storage then
+        rpc.storage.put_block(block_hash, block)
+        rpc.storage.put_header(block_hash, block.header)
+
+        local height = rpc.chain_state.tip_height + 1
+        rpc.storage.put_height_index(height, block_hash)
+
+        -- Update chain state tip
+        rpc.chain_state.tip_hash = block_hash
+        rpc.chain_state.tip_height = height
+      end
+
+      -- Notify mempool of new block
+      if rpc.mempool and rpc.mempool.on_block_connected then
+        rpc.mempool:on_block_connected(block)
+      end
+
+      block_hashes[#block_hashes + 1] = types.hash256_hex(block_hash)
+    end
+
+    return block_hashes
   end
 
   -- Utility methods
