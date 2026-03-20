@@ -146,12 +146,22 @@ function M.script_num_encode(n)
 end
 
 -- Decode Bitcoin Script number from bytes
-function M.script_num_decode(bytes, max_len)
+function M.script_num_decode(bytes, max_len, require_minimal)
   max_len = max_len or 4
   if #bytes == 0 then
     return 0
   end
   assert(#bytes <= max_len, "script number too long")
+
+  -- Check minimal encoding when MINIMALDATA flag is set
+  if require_minimal and #bytes > 1 then
+    local last = bytes:byte(#bytes)
+    if last % 128 == 0 then
+      if bytes:byte(#bytes - 1) < 128 then
+        error("non-minimal script number encoding")
+      end
+    end
+  end
 
   -- Read as little-endian
   local result = 0
@@ -530,7 +540,7 @@ function M.execute_script(script_bytes, stack, flags, checker)
   -- Helper: pop a number from stack
   local function pop_num(max_len)
     local bytes = pop()
-    return M.script_num_decode(bytes, max_len or 4)
+    return M.script_num_decode(bytes, max_len or 4, flags and flags.verify_minimaldata)
   end
 
   -- Helper: push a number to stack
@@ -635,15 +645,15 @@ function M.execute_script(script_bytes, stack, flags, checker)
       goto continue
     end
 
+    -- Check for disabled opcodes - must fail even in unexecuted branches
+    if is_disabled_opcode(opcode) then
+      error("disabled opcode: " .. (M.OP_NAMES[opcode] or string.format("0x%02x", opcode)))
+    end
+
     -- Skip non-executing branches (but OP_RETURN must NOT terminate)
     if not is_executing() then
       i = i + 1
       goto continue
-    end
-
-    -- Check for disabled opcodes
-    if is_disabled_opcode(opcode) then
-      error("disabled opcode: " .. (M.OP_NAMES[opcode] or string.format("0x%02x", opcode)))
     end
 
     -- Handle push operations
@@ -651,6 +661,35 @@ function M.execute_script(script_bytes, stack, flags, checker)
       push("")
     elseif opcode >= 0x01 and opcode <= 0x4e then
       -- All push variants (direct push, PUSHDATA1/2/4)
+      -- MINIMALDATA: Check that push uses minimal encoding
+      if flags.verify_minimaldata then
+        local dlen = data and #data or 0
+        if dlen == 0 then
+          -- Should have used OP_0
+          error("non-minimal push: empty data should use OP_0")
+        elseif dlen == 1 then
+          local b = data:byte(1)
+          if b >= 1 and b <= 16 then
+            -- Should have used OP_1 through OP_16
+            error("non-minimal push: single byte 1-16 should use OP_N")
+          elseif b == 0x81 then
+            -- Should have used OP_1NEGATE
+            error("non-minimal push: 0x81 should use OP_1NEGATE")
+          end
+        end
+        if dlen <= 0x4b and opcode ~= dlen then
+          -- Direct push should be used for data <= 75 bytes
+          if opcode == 0x4c or opcode == 0x4d or opcode == 0x4e then
+            error("non-minimal push: data fits in direct push")
+          end
+        elseif dlen <= 0xff and (opcode == 0x4d or opcode == 0x4e) then
+          -- PUSHDATA1 should be used for data <= 255 bytes
+          error("non-minimal push: data fits in PUSHDATA1")
+        elseif dlen <= 0xffff and opcode == 0x4e then
+          -- PUSHDATA2 should be used for data <= 65535 bytes
+          error("non-minimal push: data fits in PUSHDATA2")
+        end
+      end
       push(data)
     elseif opcode == M.OP.OP_1NEGATE then
       push_num(-1)
@@ -1001,8 +1040,12 @@ function M.execute_script(script_bytes, stack, flags, checker)
             error("CHECKLOCKTIMEVERIFY failed")
           end
         end
+      else
+        -- When CLTV is not active, it acts as NOP2
+        if flags.verify_discourage_upgradable_nops then
+          error("DISCOURAGE_UPGRADABLE_NOPS")
+        end
       end
-      -- Otherwise treat as NOP
     elseif opcode == M.OP.OP_CHECKSEQUENCEVERIFY then
       if flags.verify_checksequenceverify then
         assert(#stack > 0, "CHECKSEQUENCEVERIFY requires stack value")
@@ -1021,8 +1064,12 @@ function M.execute_script(script_bytes, stack, flags, checker)
         else
           error("negative sequence")
         end
+      else
+        -- When CSV is not active, it acts as NOP3
+        if flags.verify_discourage_upgradable_nops then
+          error("DISCOURAGE_UPGRADABLE_NOPS")
+        end
       end
-      -- Otherwise treat as NOP
 
     -- Taproot
     elseif opcode == M.OP.OP_CHECKSIGADD then
@@ -1048,7 +1095,10 @@ function M.execute_script(script_bytes, stack, flags, checker)
     -- Unknown NOPs (0xb0, 0xb3-0xb9): treat as NOP for softfork compatibility
     elseif opcode == M.OP.OP_NOP1 or
            (opcode >= 0xb3 and opcode <= 0xb9) then
-      -- Do nothing
+      -- DISCOURAGE_UPGRADABLE_NOPS: error on unused NOPs when flag is set
+      if flags.verify_discourage_upgradable_nops then
+        error("DISCOURAGE_UPGRADABLE_NOPS")
+      end
 
     else
       error("unknown opcode: " .. string.format("0x%02x", opcode))
@@ -1099,8 +1149,16 @@ end
 function M.verify_script(script_sig, script_pubkey, flags, checker)
   flags = flags or {}
 
+  -- SIG_PUSHONLY: scriptSig must contain only push operations
+  if flags.verify_sigpushonly and not M.is_push_only(script_sig) then
+    return nil, "SIG_PUSHONLY"
+  end
+
   -- Execute scriptSig to get initial stack
-  local stack = M.execute_script(script_sig, {}, flags, checker)
+  local stack, err = M.execute_script(script_sig, {}, flags, checker)
+  if not stack then
+    return nil, err
+  end
 
   -- Save a copy of the stack for P2SH
   local stack_copy = {}
@@ -1109,7 +1167,10 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
   end
 
   -- Execute scriptPubKey with the resulting stack
-  stack = M.execute_script(script_pubkey, stack, flags, checker)
+  stack, err = M.execute_script(script_pubkey, stack, flags, checker)
+  if not stack then
+    return nil, err
+  end
 
   -- Check result
   if #stack == 0 then
@@ -1138,7 +1199,10 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
       table.remove(stack_copy)
 
       -- Execute the redeem script
-      local redeem_stack = M.execute_script(redeem_script, stack_copy, flags, checker)
+      local redeem_stack, redeem_err = M.execute_script(redeem_script, stack_copy, flags, checker)
+      if not redeem_stack then
+        return nil, redeem_err
+      end
 
       if #redeem_stack == 0 then
         return false
