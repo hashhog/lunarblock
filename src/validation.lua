@@ -552,12 +552,75 @@ function M.find_and_delete(script_bytes, sig_bytes)
   return result
 end
 
---- Remove all OP_CODESEPARATOR (0xab) bytes from a script.
+--- Remove all OP_CODESEPARATOR (0xab) opcodes from a script.
 -- Used in legacy sighash computation.
+-- Must properly parse the script to avoid stripping 0xab bytes that appear
+-- inside data pushes (e.g., within public key data).
 -- @param script_bytes string: The script bytes
--- @return string: Script with OP_CODESEPARATOR removed
+-- @return string: Script with OP_CODESEPARATOR opcodes removed
 function M.remove_codeseparators(script_bytes)
-  return (script_bytes:gsub("\171", ""))  -- 0xab = 171 decimal
+  local parts = {}
+  local pos = 1
+  local len = #script_bytes
+
+  while pos <= len do
+    local opcode = script_bytes:byte(pos)
+
+    if opcode == 0xab then
+      -- OP_CODESEPARATOR: skip it (don't add to parts)
+      pos = pos + 1
+    elseif opcode >= 0x01 and opcode <= 0x4b then
+      -- Direct push: opcode is the number of bytes to push
+      local data_len = opcode
+      local end_pos = pos + data_len
+      if end_pos > len then end_pos = len end
+      parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+      pos = end_pos + 1
+    elseif opcode == 0x4c then
+      -- OP_PUSHDATA1: 1-byte length follows
+      if pos + 1 > len then
+        parts[#parts + 1] = script_bytes:sub(pos, pos)
+        pos = pos + 1
+      else
+        local data_len = script_bytes:byte(pos + 1)
+        local end_pos = pos + 1 + data_len
+        if end_pos > len then end_pos = len end
+        parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+        pos = end_pos + 1
+      end
+    elseif opcode == 0x4d then
+      -- OP_PUSHDATA2: 2-byte length follows (little-endian)
+      if pos + 2 > len then
+        parts[#parts + 1] = script_bytes:sub(pos, len)
+        pos = len + 1
+      else
+        local data_len = script_bytes:byte(pos + 1) + script_bytes:byte(pos + 2) * 256
+        local end_pos = pos + 2 + data_len
+        if end_pos > len then end_pos = len end
+        parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+        pos = end_pos + 1
+      end
+    elseif opcode == 0x4e then
+      -- OP_PUSHDATA4: 4-byte length follows (little-endian)
+      if pos + 4 > len then
+        parts[#parts + 1] = script_bytes:sub(pos, len)
+        pos = len + 1
+      else
+        local b1, b2, b3, b4 = script_bytes:byte(pos + 1, pos + 4)
+        local data_len = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+        local end_pos = pos + 4 + data_len
+        if end_pos > len then end_pos = len end
+        parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+        pos = end_pos + 1
+      end
+    else
+      -- Regular opcode (not a push, not OP_CODESEPARATOR)
+      parts[#parts + 1] = script_bytes:sub(pos, pos)
+      pos = pos + 1
+    end
+  end
+
+  return table.concat(parts)
 end
 
 --------------------------------------------------------------------------------
@@ -1294,7 +1357,13 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     end
 
     -- Verify ECDSA signature
-    return crypto.ecdsa_verify(pubkey, sig_der, sighash)
+    -- Use strict DER parsing when DERSIG/STRICTENC/LOW_S flags require it,
+    -- otherwise use lax DER parsing for pre-BIP66 compatibility
+    if flags.verify_dersig or flags.verify_strictenc or flags.verify_low_s then
+      return crypto.ecdsa_verify(pubkey, sig_der, sighash)
+    else
+      return crypto.ecdsa_verify_lax(pubkey, sig_der, sighash)
+    end
   end
 
   --- Check locktime (BIP65 CLTV).

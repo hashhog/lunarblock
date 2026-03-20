@@ -12,6 +12,7 @@ ffi.cdef[[
   typedef struct evp_md_st EVP_MD;
   typedef struct evp_md_ctx_st EVP_MD_CTX;
 
+  const EVP_MD *EVP_sha1(void);
   const EVP_MD *EVP_sha256(void);
   const EVP_MD *EVP_sha512(void);
   const EVP_MD *EVP_ripemd160(void);
@@ -126,6 +127,19 @@ function M.sha256(data)
   libcrypto.EVP_DigestFinal_ex(ctx, md, md_len)
   libcrypto.EVP_MD_CTX_free(ctx)
   return ffi.string(md, 32)
+end
+
+-- SHA-1 (for OP_SHA1)
+function M.sha1(data)
+  local ctx = libcrypto.EVP_MD_CTX_new()
+  assert(ctx ~= nil, "Failed to create EVP_MD_CTX")
+  local md = ffi.new("unsigned char[20]")
+  local md_len = ffi.new("unsigned int[1]")
+  libcrypto.EVP_DigestInit_ex(ctx, libcrypto.EVP_sha1(), nil)
+  libcrypto.EVP_DigestUpdate(ctx, data, #data)
+  libcrypto.EVP_DigestFinal_ex(ctx, md, md_len)
+  libcrypto.EVP_MD_CTX_free(ctx)
+  return ffi.string(md, 20)
 end
 
 -- SHA-256 streaming hasher: for incremental hashing of large data
@@ -303,6 +317,18 @@ ffi.cdef[[
     const secp256k1_ecdsa_signature* sig
   );
 
+  int secp256k1_ecdsa_signature_parse_compact(
+    const secp256k1_context* ctx,
+    secp256k1_ecdsa_signature* sig,
+    const unsigned char* input64
+  );
+
+  int secp256k1_ecdsa_signature_normalize(
+    const secp256k1_context* ctx,
+    secp256k1_ecdsa_signature* sigout,
+    const secp256k1_ecdsa_signature* sigin
+  );
+
   /* Schnorr / BIP340 (if available in your libsecp256k1 build) */
   typedef struct { unsigned char data[96]; } secp256k1_xonly_pubkey;
 
@@ -392,6 +418,144 @@ function M.ecdsa_verify(pubkey_bytes, sig_der, msg_hash32)
   ) ~= 1 then
     return false, "invalid DER signature"
   end
+
+  local result = libsecp256k1.secp256k1_ecdsa_verify(secp_ctx, sig, msg_hash32, pubkey)
+  return result == 1
+end
+
+--- Lax DER parsing: extract R and S from a non-strict DER signature.
+-- Mimics Bitcoin Core's ecdsa_signature_parse_der_lax from pubkey.cpp.
+-- Extracts R and S integers, right-pads or left-truncates to 32 bytes each,
+-- and feeds the resulting 64-byte compact signature to secp256k1.
+-- @param sig_der string: DER-encoded signature bytes (potentially non-strict)
+-- @return cdata|nil: parsed secp256k1_ecdsa_signature, or nil on failure
+local function lax_der_parse(sig_der)
+  local len = #sig_der
+  if len < 1 then return nil end
+  local pos = 1
+
+  -- Read sequence tag
+  if sig_der:byte(pos) ~= 0x30 then return nil end
+  pos = pos + 1
+  if pos > len then return nil end
+
+  -- Read sequence length (skip it, we don't strictly validate)
+  local lenbyte = sig_der:byte(pos)
+  pos = pos + 1
+  if lenbyte >= 0x80 then
+    -- Long form length
+    local n_lenbytes = lenbyte - 0x80
+    if n_lenbytes > #sig_der - pos + 1 then return nil end
+    pos = pos + n_lenbytes  -- skip the length bytes
+  end
+
+  -- Read R integer tag
+  if pos > len or sig_der:byte(pos) ~= 0x02 then return nil end
+  pos = pos + 1
+  if pos > len then return nil end
+
+  -- Read R length
+  local rlen = sig_der:byte(pos)
+  pos = pos + 1
+  if rlen >= 0x80 then
+    -- Long form
+    local n_lenbytes = rlen - 0x80
+    if n_lenbytes > len - pos + 1 then return nil end
+    rlen = 0
+    for ii = 1, n_lenbytes do
+      rlen = rlen * 256 + sig_der:byte(pos)
+      pos = pos + 1
+    end
+  end
+
+  if rlen > len - pos + 1 then return nil end
+  local rdata = sig_der:sub(pos, pos + rlen - 1)
+  pos = pos + rlen
+
+  -- Read S integer tag
+  if pos > len or sig_der:byte(pos) ~= 0x02 then return nil end
+  pos = pos + 1
+  if pos > len then return nil end
+
+  -- Read S length
+  local slen = sig_der:byte(pos)
+  pos = pos + 1
+  if slen >= 0x80 then
+    local n_lenbytes = slen - 0x80
+    if n_lenbytes > len - pos + 1 then return nil end
+    slen = 0
+    for ii = 1, n_lenbytes do
+      slen = slen * 256 + sig_der:byte(pos)
+      pos = pos + 1
+    end
+  end
+
+  if slen > len - pos + 1 then return nil end
+  local sdata = sig_der:sub(pos, pos + slen - 1)
+
+  -- Strip leading zeros from R and S, then pad to 32 bytes
+  -- (same logic as Bitcoin Core's lax parser)
+  local function to_32_bytes(data)
+    -- Skip leading zero bytes
+    local start = 1
+    while start < #data and data:byte(start) == 0 do
+      start = start + 1
+    end
+    data = data:sub(start)
+    if #data > 32 then
+      return nil  -- too large even after stripping
+    end
+    -- Left-pad with zeros to 32 bytes
+    return string.rep("\0", 32 - #data) .. data
+  end
+
+  local r32 = to_32_bytes(rdata)
+  local s32 = to_32_bytes(sdata)
+  if not r32 or not s32 then return nil end
+
+  local compact = r32 .. s32
+  local sig = ffi.new("secp256k1_ecdsa_signature")
+  if libsecp256k1.secp256k1_ecdsa_signature_parse_compact(
+    secp_ctx, sig, compact
+  ) ~= 1 then
+    return nil
+  end
+
+  -- Normalize S to low-S form (secp256k1 requires this for verification)
+  libsecp256k1.secp256k1_ecdsa_signature_normalize(secp_ctx, sig, sig)
+  return sig
+end
+
+--- Verify ECDSA signature with lax DER parsing (pre-BIP66 compatibility).
+-- Uses lax DER parsing that accepts OpenSSL-compatible non-strict DER.
+-- Always uses our lax parser because secp256k1_ecdsa_signature_parse_der
+-- may return success for certain non-standard DER signatures (e.g., R with
+-- high bit set but no leading 0x00 padding) while silently zeroing values,
+-- causing verification to fail even though the signature is mathematically valid.
+-- @param pubkey_bytes string: public key bytes
+-- @param sig_der string: DER-encoded signature (potentially non-strict)
+-- @param msg_hash32 string: 32-byte message hash
+-- @return boolean: true if signature is valid
+function M.ecdsa_verify_lax(pubkey_bytes, sig_der, msg_hash32)
+  local pubkey = ffi.new("secp256k1_pubkey")
+  if libsecp256k1.secp256k1_ec_pubkey_parse(
+    secp_ctx, pubkey, pubkey_bytes, #pubkey_bytes
+  ) ~= 1 then
+    return false, "invalid public key"
+  end
+
+  -- Always use the lax DER parser. We cannot try secp256k1_ecdsa_signature_parse_der
+  -- first because it may return success but silently zero out R/S values for
+  -- signatures with non-standard DER encoding (e.g., negative integers without
+  -- proper 0x00 padding), causing verification to fail incorrectly.
+  local sig = lax_der_parse(sig_der)
+  if not sig then
+    return false, "invalid DER signature"
+  end
+
+  -- Normalize S to low-S form before verification
+  -- (required by secp256k1_ecdsa_verify which only accepts low-S)
+  libsecp256k1.secp256k1_ecdsa_signature_normalize(secp_ctx, sig, sig)
 
   local result = libsecp256k1.secp256k1_ecdsa_verify(secp_ctx, sig, msg_hash32, pubkey)
   return result == 1
