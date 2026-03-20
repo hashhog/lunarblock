@@ -1,11 +1,16 @@
 #!/usr/bin/env luajit
 -- Test harness for Bitcoin Core script_tests.json vectors
 -- Parses ASM notation, assembles to raw bytes, and runs verify_script
+-- Uses real signature verification via secp256k1 (crediting/spending tx approach)
 
 package.path = "lunarblock/?.lua;src/?.lua;" .. package.path
 
 local cjson = require("cjson")
 local script = require("lunarblock.script")
+local types = require("lunarblock.types")
+local serialize = require("lunarblock.serialize")
+local crypto = require("lunarblock.crypto")
+local validation = require("lunarblock.validation")
 
 --------------------------------------------------------------------------------
 -- Hex encode/decode helpers
@@ -225,6 +230,54 @@ assert(json_text, "Cannot open script_tests.json from any known path")
 local vectors = cjson.decode(json_text)
 
 --------------------------------------------------------------------------------
+-- Transaction builders (Bitcoin Core's crediting/spending tx approach)
+--------------------------------------------------------------------------------
+
+--- Build a "crediting transaction" per Bitcoin Core's script test framework.
+-- Version 1, locktime 0, one input (null prevout, scriptSig = OP_0 OP_0,
+-- sequence 0xFFFFFFFF), one output (scriptPubKey = test's scriptPubKey, value = 0).
+-- @param script_pubkey string: raw scriptPubKey bytes
+-- @return transaction: the crediting transaction
+local function build_crediting_tx(script_pubkey)
+  local null_hash = types.hash256(string.rep("\0", 32))
+  local credit_script_sig = string.char(0x00, 0x00) -- OP_0 OP_0
+  local tx = types.transaction(1, {}, {}, 0)
+  tx.inputs[1] = types.txin(
+    types.outpoint(null_hash, 0xFFFFFFFF),
+    credit_script_sig,
+    0xFFFFFFFF
+  )
+  tx.outputs[1] = types.txout(0, script_pubkey)
+  return tx
+end
+
+--- Compute the txid (hash256 of non-witness serialization) of a transaction.
+-- @param tx transaction: the transaction
+-- @return hash256: the transaction hash
+local function compute_txid(tx)
+  local raw = serialize.serialize_transaction(tx, false)
+  return crypto.hash256_type(raw)
+end
+
+--- Build a "spending transaction" per Bitcoin Core's script test framework.
+-- Version 1, locktime 0, one input (prevout = crediting txid : 0,
+-- scriptSig = test's scriptSig, sequence 0xFFFFFFFF), one output (empty, value = 0).
+-- @param credit_tx transaction: the crediting transaction
+-- @param script_sig string: raw scriptSig bytes
+-- @return transaction: the spending transaction
+local function build_spending_tx(credit_tx, script_sig)
+  local credit_txid = compute_txid(credit_tx)
+  local tx = types.transaction(1, {}, {}, 0)
+  tx.inputs[1] = types.txin(
+    types.outpoint(credit_txid, 0),
+    script_sig,
+    0xFFFFFFFF
+  )
+  tx.outputs[1] = types.txout(0, "")
+  return tx
+end
+
+--------------------------------------------------------------------------------
 -- Run tests
 --------------------------------------------------------------------------------
 
@@ -256,12 +309,18 @@ for idx, entry in ipairs(vectors) do
         local script_pubkey_bytes = assemble_script(script_pubkey_asm)
         local flags = parse_flags(flags_str)
 
-        -- Use a dummy checker that always fails sig checks
-        local checker = {
-          check_sig = function() return false end,
-          check_locktime = function() return false end,
-          check_sequence = function() return false end,
-        }
+        -- Build crediting and spending transactions (Bitcoin Core approach)
+        local credit_tx = build_crediting_tx(script_pubkey_bytes)
+        local spending_tx = build_spending_tx(credit_tx, script_sig_bytes)
+
+        -- Create a real signature checker with transaction context
+        local checker = validation.make_sig_checker(
+          spending_tx,       -- the spending transaction
+          0,                 -- input index (0-based)
+          0,                 -- prev output value (0 satoshis)
+          script_pubkey_bytes, -- scriptPubKey of the output being spent
+          flags              -- verification flags
+        )
 
         local result, err = script.verify_script(script_sig_bytes, script_pubkey_bytes, flags, checker)
         -- Note: verify_script returns true on success, false/nil on failure
