@@ -1,3 +1,4 @@
+local bit = require("bit")
 local crypto = require("lunarblock.crypto")
 local serialize = require("lunarblock.serialize")
 local types = require("lunarblock.types")
@@ -93,6 +94,172 @@ local function is_compressed_pubkey(pubkey)
   return first_byte == 0x02 or first_byte == 0x03
 end
 
+--- Check if a public key is compressed or uncompressed (valid encoding).
+-- Accepts 02/03 (33 bytes) and 04 (65 bytes). Rejects 06/07 (hybrid).
+local function is_compressed_or_uncompressed_pubkey(pk)
+  if #pk < 1 then return false end
+  local first = pk:byte(1)
+  if first == 0x02 or first == 0x03 then
+    return #pk == 33
+  elseif first == 0x04 then
+    return #pk == 65
+  end
+  return false
+end
+
+--- Strict DER signature encoding check (BIP66).
+-- sig includes the hashtype byte at the end.
+-- Returns true if valid, false otherwise.
+local function is_valid_signature_encoding(sig)
+  -- Minimum and maximum size constraints
+  -- A DER signature is: 30 <len> 02 <rlen> <r> 02 <slen> <s> <hashtype>
+  -- Min: 30 06 02 01 <r> 02 01 <s> <ht> = 9 bytes
+  -- Max: 30 44 02 21 <r(33)> 02 21 <s(33)> <ht> = 73 bytes
+  local len = #sig
+  if len < 9 or len > 73 then return false end
+
+  -- Hashtype byte is at the end (not part of DER)
+  -- The DER portion is sig:sub(1, -2)
+  -- Check compound type tag
+  if sig:byte(1) ~= 0x30 then return false end
+
+  -- Check length covers remaining bytes (excluding hashtype)
+  if sig:byte(2) ~= len - 3 then return false end
+
+  -- Extract R length
+  local lenR = sig:byte(4)
+  -- Check R length doesn't exceed remaining
+  if 5 + lenR >= len then return false end
+
+  -- Extract S length
+  local lenS = sig:byte(6 + lenR)
+  -- Verify total length: 4 + lenR + 2 + lenS + 1(hashtype) == len
+  -- i.e. lenR + lenS + 7 == len
+  if lenR + lenS + 7 ~= len then return false end
+
+  -- Check R tag
+  if sig:byte(3) ~= 0x02 then return false end
+
+  -- Check R length is not zero
+  if lenR == 0 then return false end
+
+  -- Check R is not negative (high bit of first byte)
+  if bit.band(sig:byte(5), 0x80) ~= 0 then return false end
+
+  -- Check R has no excessive leading zeros
+  if lenR > 1 and sig:byte(5) == 0x00 and bit.band(sig:byte(6), 0x80) == 0 then
+    return false
+  end
+
+  -- Check S tag
+  if sig:byte(lenR + 5) ~= 0x02 then return false end
+
+  -- Check S length is not zero
+  if lenS == 0 then return false end
+
+  -- Check S is not negative
+  if bit.band(sig:byte(lenR + 7), 0x80) ~= 0 then return false end
+
+  -- Check S has no excessive leading zeros
+  if lenS > 1 and sig:byte(lenR + 7) == 0x00 and bit.band(sig:byte(lenR + 8), 0x80) == 0 then
+    return false
+  end
+
+  return true
+end
+
+--- Check if a signature has a defined hashtype.
+-- The hashtype is the last byte of the signature.
+-- The base type (ignoring ANYONECANPAY bit 0x80) must be 1, 2, or 3.
+local function is_defined_hashtype(sig)
+  if #sig == 0 then return false end
+  local ht = bit.band(sig:byte(#sig), bit.bnot(0x80))
+  return ht >= 1 and ht <= 3
+end
+
+--- Check Low S - the S value must be at most half the curve order.
+-- We check by looking at the DER-encoded S value.
+-- The secp256k1 half-order is:
+-- 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+local function is_low_der_s(sig)
+  -- Parse S from the DER signature (sig includes hashtype)
+  if #sig < 9 then return false end
+  local lenR = sig:byte(4)
+  local sstart = lenR + 7  -- first byte of S value
+  local lenS = sig:byte(lenR + 6)
+  if sstart + lenS - 1 > #sig - 1 then return false end  -- -1 for hashtype
+
+  -- Extract S bytes
+  local s_bytes = sig:sub(sstart, sstart + lenS - 1)
+
+  -- Half-order of secp256k1
+  local half_order = "\x7F\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x5D\x57\x6E\x73\x57\xA4\x50\x1D\xDF\xE9\x2F\x46\x68\x1B\x20\xA0"
+
+  -- Strip leading zeros from S
+  local s_start = 1
+  while s_start < #s_bytes and s_bytes:byte(s_start) == 0 do
+    s_start = s_start + 1
+  end
+  local s_trimmed = s_bytes:sub(s_start)
+
+  -- If S is longer than 32 bytes (after stripping), it's > half-order
+  if #s_trimmed > 32 then return false end
+
+  -- Pad to 32 bytes for comparison
+  local s_padded = string.rep("\0", 32 - #s_trimmed) .. s_trimmed
+
+  -- Compare byte by byte
+  for ii = 1, 32 do
+    local sb = s_padded:byte(ii)
+    local hb = half_order:byte(ii)
+    if sb < hb then return true end
+    if sb > hb then return false end
+  end
+  return true  -- equal is ok
+end
+
+--- Check signature encoding against flags.
+-- @param sig string: full signature including hashtype byte
+-- @param flags table: verification flags
+-- @return boolean, string|nil: true if valid, false and error code if not
+local function check_signature_encoding(sig, flags)
+  -- Empty signatures are always valid (they just fail verification)
+  if #sig == 0 then return true end
+
+  if (flags.verify_dersig or flags.verify_strictenc or flags.verify_low_s) then
+    if not is_valid_signature_encoding(sig) then
+      return false, "SIG_DER"
+    end
+  end
+
+  if flags.verify_low_s then
+    if not is_low_der_s(sig) then
+      return false, "SIG_HIGH_S"
+    end
+  end
+
+  if flags.verify_strictenc then
+    if not is_defined_hashtype(sig) then
+      return false, "SIG_HASHTYPE"
+    end
+  end
+
+  return true
+end
+
+--- Check public key encoding against flags.
+-- @param pubkey string: public key bytes
+-- @param flags table: verification flags
+-- @return boolean, string|nil: true if valid, false and error code if not
+local function check_pubkey_encoding(pubkey, flags)
+  if flags.verify_strictenc then
+    if not is_compressed_or_uncompressed_pubkey(pubkey) then
+      return false, "PUBKEYTYPE"
+    end
+  end
+  return true
+end
+
 --- Check public key encoding for witness v0 programs.
 -- In witness v0, only compressed public keys are allowed.
 -- @param pubkey string: The public key bytes
@@ -154,11 +321,17 @@ function M.script_num_decode(bytes, max_len, require_minimal)
   assert(#bytes <= max_len, "script number too long")
 
   -- Check minimal encoding when MINIMALDATA flag is set
-  if require_minimal and #bytes > 1 then
-    local last = bytes:byte(#bytes)
-    if last % 128 == 0 then  -- (last & 0x7f) == 0
-      if bytes:byte(#bytes - 1) < 128 then  -- (prev & 0x80) == 0
-        error("non-minimal script number encoding")
+  if require_minimal then
+    -- Single byte 0x00 or 0x80 (negative zero) is non-minimal: should be empty
+    if #bytes == 1 and (bytes:byte(1) == 0x00 or bytes:byte(1) == 0x80) then
+      error("non-minimal script number encoding")
+    end
+    if #bytes > 1 then
+      local last = bytes:byte(#bytes)
+      if last % 128 == 0 then  -- (last & 0x7f) == 0
+        if bytes:byte(#bytes - 1) < 128 then  -- (prev & 0x80) == 0
+          error("non-minimal script number encoding")
+        end
       end
     end
   end
@@ -467,6 +640,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
   flags = flags or {}
   checker = checker or {}
 
+  -- Script size limit (10,000 bytes)
+  if #script_bytes > MAX_SCRIPT_SIZE then
+    return nil, "SCRIPT_SIZE"
+  end
+
   local altstack = {}
   local if_stack = {}  -- tracks execution state: true = executing, false = not executing
   local op_count = 0
@@ -614,6 +792,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
     -- Check for disabled opcodes - must fail even in unexecuted branches
     if is_disabled_opcode(opcode) then
       error("disabled opcode: " .. (M.OP_NAMES[opcode] or string.format("0x%02x", opcode)))
+    end
+
+    -- PUSH_SIZE: 520-byte limit applies even in unexecuted branches
+    if data and #data > MAX_SCRIPT_ELEMENT_SIZE then
+      return nil, "PUSH_SIZE"
     end
 
     -- Skip non-executing branches (but OP_RETURN must NOT terminate)
@@ -871,9 +1054,7 @@ function M.execute_script(script_bytes, stack, flags, checker)
     elseif opcode == M.OP.OP_RIPEMD160 then
       push(crypto.ripemd160(pop()))
     elseif opcode == M.OP.OP_SHA1 then
-      -- SHA1 not commonly used, but included for completeness
-      -- Use OpenSSL or a Lua implementation
-      error("OP_SHA1 not implemented")
+      push(crypto.sha1(pop()))
     elseif opcode == M.OP.OP_SHA256 then
       push(crypto.sha256(pop()))
     elseif opcode == M.OP.OP_HASH160 then
@@ -889,8 +1070,18 @@ function M.execute_script(script_bytes, stack, flags, checker)
       -- Pop pubkey first (top of stack), then signature (deeper)
       local pubkey = pop()
       local sig = pop()
+      -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
+      local sig_ok, sig_err = check_signature_encoding(sig, flags)
+      if not sig_ok then
+        return nil, sig_err
+      end
+      -- Check pubkey encoding (STRICTENC)
+      local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
+      if not pk_ok then
+        return nil, pk_err
+      end
       -- BIP141: Witness v0 requires compressed public keys
-      local pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
+      pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
       if not pk_ok then
         return nil, pk_err
       end
@@ -906,8 +1097,18 @@ function M.execute_script(script_bytes, stack, flags, checker)
     elseif opcode == M.OP.OP_CHECKSIGVERIFY then
       local pubkey = pop()
       local sig = pop()
+      -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
+      local sig_ok, sig_err = check_signature_encoding(sig, flags)
+      if not sig_ok then
+        return nil, sig_err
+      end
+      -- Check pubkey encoding (STRICTENC)
+      local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
+      if not pk_ok then
+        return nil, pk_err
+      end
       -- BIP141: Witness v0 requires compressed public keys
-      local pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
+      pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
       if not pk_ok then
         return nil, pk_err
       end
@@ -957,24 +1158,48 @@ function M.execute_script(script_bytes, stack, flags, checker)
         error("CHECKMULTISIG dummy must be empty with NULLDUMMY flag")
       end
 
-      -- Verify signatures
-      -- Signatures must be in order matching pubkeys (can skip pubkeys but not reorder)
-      local pk_idx = 1
-      local sigs_valid = 0
-      for j = 1, m do
-        local sig = sigs[j]
-        -- Find a matching pubkey
-        while pk_idx <= n do
-          local pubkey = pubkeys[pk_idx]
-          pk_idx = pk_idx + 1
-          if checker.check_sig and checker.check_sig(sig, pubkey) then
-            sigs_valid = sigs_valid + 1
-            break
-          end
+      -- Verify signatures LAZILY matching Bitcoin Core's exact flow:
+      -- For 0-of-n multisig, the loop doesn't run, so no encoding checks.
+      local ikey = 1
+      local isig = 1
+      local nKeysCount = n
+      local nSigsCount = m
+      local fSuccess = true
+
+      while fSuccess and nSigsCount > 0 do
+        local sig_j = sigs[isig]
+        local pubkey = pubkeys[ikey]
+
+        -- Check signature encoding (only for current sig being consumed)
+        local sig_ok, sig_err = check_signature_encoding(sig_j, flags)
+        if not sig_ok then
+          return nil, sig_err
+        end
+        -- Check pubkey encoding (only for current pubkey being consumed)
+        local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
+        if not pk_ok then
+          return nil, pk_err
+        end
+
+        local fOk = false
+        if checker.check_sig then
+          fOk = checker.check_sig(sig_j, pubkey)
+        end
+
+        if fOk then
+          isig = isig + 1
+          nSigsCount = nSigsCount - 1
+        end
+        ikey = ikey + 1
+        nKeysCount = nKeysCount - 1
+
+        -- If there are more sigs than keys remaining, no way to succeed
+        if nSigsCount > nKeysCount then
+          fSuccess = false
         end
       end
 
-      local success = (sigs_valid == m)
+      local success = fSuccess
 
       -- BIP146 NULLFAIL: if operation failed, ALL signatures must be empty
       if not success and flags.verify_nullfail then
@@ -1019,8 +1244,9 @@ function M.execute_script(script_bytes, stack, flags, checker)
         push(M.script_num_encode(sequence))  -- Don't consume from stack
         -- If the disable flag is set, treat as NOP
         if sequence >= 0 then
-          -- Check disable flag (bit 31)
-          if sequence < 0x80000000 then
+          -- Check disable flag (bit 31) using math for correctness with 5-byte numbers
+          local disable_flag = (math.floor(sequence / 0x80000000) % 2 == 1)
+          if not disable_flag then
             if checker.check_sequence then
               if not checker.check_sequence(sequence) then
                 error("CHECKSEQUENCEVERIFY failed")
@@ -1068,6 +1294,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
 
     else
       error("unknown opcode: " .. string.format("0x%02x", opcode))
+    end
+
+    -- STACK_SIZE: stack + altstack must not exceed 1000 after each operation
+    if (#stack + #altstack) > MAX_STACK_SIZE then
+      return nil, "STACK_SIZE"
     end
 
     i = i + 1
@@ -1147,9 +1378,11 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
   end
 
   -- P2SH handling
+  local did_p2sh = false
   if flags.verify_p2sh then
     local script_type = M.classify_script(script_pubkey)
     if script_type == "p2sh" then
+      did_p2sh = true
       -- BIP16: scriptSig must be push-only for P2SH (consensus rule, unconditional)
       if not M.is_push_only(script_sig) then
         return nil, "SIG_PUSHONLY"
@@ -1176,6 +1409,20 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
       if not M.cast_to_bool(redeem_stack[#redeem_stack]) then
         return false
       end
+
+      -- CLEANSTACK for P2SH: check redeem stack
+      if flags.verify_cleanstack then
+        if #redeem_stack ~= 1 then
+          return nil, "CLEANSTACK"
+        end
+      end
+    end
+  end
+
+  -- CLEANSTACK for non-P2SH: check main stack
+  if flags.verify_cleanstack and not did_p2sh then
+    if #stack ~= 1 then
+      return nil, "CLEANSTACK"
     end
   end
 
