@@ -657,7 +657,13 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     end
 
     -- Verify ECDSA signature
-    return crypto.ecdsa_verify(pubkey, sig_der, sighash)
+    -- Use strict DER parsing when DERSIG/STRICTENC/LOW_S flags require it,
+    -- otherwise use lax DER parsing for pre-BIP66 compatibility
+    if flags.verify_dersig or flags.verify_strictenc or flags.verify_low_s then
+      return crypto.ecdsa_verify(pubkey, sig_der, sighash)
+    else
+      return crypto.ecdsa_verify_lax(pubkey, sig_der, sighash)
+    end
   end
 
   --- Check locktime (BIP65 CLTV).
