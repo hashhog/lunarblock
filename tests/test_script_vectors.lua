@@ -206,8 +206,8 @@ end
 --------------------------------------------------------------------------------
 
 local vector_paths = {
-  "../ouroboros/bitcoin/src/test/data/script_tests.json",
-  "/home/max/hashhog/ouroboros/bitcoin/src/test/data/script_tests.json",
+  "/home/max/hashhog/bitcoin/src/test/data/script_tests.json",
+  "/home/max/hashhog/bitcoin/src/test/data/script_tests.json",
 }
 
 local f, json_text
