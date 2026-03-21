@@ -618,6 +618,30 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
   -- Determine if this is a SegWit spend
   local is_segwit = flags.is_segwit or false
 
+  -- Witness program hash for P2WPKH, witness script for P2WSH
+  local wpkh_program = nil     -- 20-byte witness program for P2WPKH
+  local wsh_script = nil       -- witness script for P2WSH
+
+  --- Set segwit mode dynamically (called by verify_witness_program).
+  -- @param segwit boolean: enable segwit sighash
+  -- @param p2wpkh_program string|nil: 20-byte hash for P2WPKH
+  -- @param p2wsh_witness_script string|nil: witness script for P2WSH
+  function checker.set_segwit(segwit, p2wpkh_program, p2wsh_witness_script)
+    is_segwit = segwit
+    wpkh_program = p2wpkh_program
+    wsh_script = p2wsh_witness_script
+  end
+
+  --- Get witness data from the spending transaction input.
+  -- @return table: witness stack
+  function checker.get_witness()
+    local inp = tx.inputs[input_index + 1]
+    if inp and inp.witness then
+      return inp.witness
+    end
+    return {}
+  end
+
   --- Check a signature against a public key.
   -- @param sig string: DER-encoded signature with hash type byte appended
   -- @param pubkey string: Public key (33 or 65 bytes)
@@ -634,14 +658,20 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     -- Determine script code
     local script_code
     if is_segwit then
-      -- For P2WPKH, construct synthetic P2PKH script from witness program
-      local script_type, hash = script.classify_script(prev_script_pubkey)
-      if script_type == "p2wpkh" then
-        -- Synthetic P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-        script_code = script.make_p2pkh_script(hash)
+      if wpkh_program then
+        -- P2WPKH: synthetic P2PKH script from 20-byte program
+        script_code = script.make_p2pkh_script(wpkh_program)
+      elseif wsh_script then
+        -- P2WSH: use the witness script
+        script_code = wsh_script
       else
-        -- P2WSH or other: use the witness script (passed via flags)
-        script_code = flags.witness_script or prev_script_pubkey
+        -- Fallback: try classifying the scriptPubKey
+        local script_type, hash = script.classify_script(prev_script_pubkey)
+        if script_type == "p2wpkh" then
+          script_code = script.make_p2pkh_script(hash)
+        else
+          script_code = flags.witness_script or prev_script_pubkey
+        end
       end
     else
       -- Legacy: use the script code provided
