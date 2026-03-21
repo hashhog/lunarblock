@@ -8,3 +8,6 @@ lib/librocksdb*
 lib/libsecp256k1*
 
 .claude/skills/
+
+banned.dat
+anchors.dat
