@@ -589,6 +589,37 @@ function M.classify_script(script)
   return "nonstandard", nil
 end
 
+--- Check if a script is a witness program (BIP141).
+-- A witness program is: OP_n (0x00-0x10) followed by a direct push of 2-40 bytes.
+-- Returns version (0-16) and program data, or nil if not a witness program.
+-- @param script_bytes string: The raw script bytes
+-- @return number|nil: witness version (0-16) or nil
+-- @return string|nil: witness program data
+function M.is_witness_program(script_bytes)
+  local len = #script_bytes
+  if len < 4 or len > 42 then return nil, nil end
+
+  local version_byte = script_bytes:byte(1)
+  -- OP_0 = 0x00, OP_1..OP_16 = 0x51..0x60
+  local version
+  if version_byte == 0x00 then
+    version = 0
+  elseif version_byte >= 0x51 and version_byte <= 0x60 then
+    version = version_byte - 0x50
+  else
+    return nil, nil
+  end
+
+  -- Second byte must be a direct push length (2-40 bytes)
+  local prog_len = script_bytes:byte(2)
+  if prog_len < 2 or prog_len > 40 then return nil, nil end
+
+  -- Script length must match exactly: 1 (version) + 1 (push len) + prog_len
+  if len ~= 2 + prog_len then return nil, nil end
+
+  return version, script_bytes:sub(3)
+end
+
 --- Check if a script contains only push operations.
 -- A script is push-only if every opcode is <= OP_16 (0x60).
 -- This includes: OP_0, direct pushes (0x01-0x4b), PUSHDATA1/2/4,
@@ -1342,6 +1373,96 @@ function M.execute_witness_script(script_bytes, stack, flags, checker)
   return true
 end
 
+--- Verify a witness program (BIP141).
+-- @param witness table: Witness stack (list of byte strings)
+-- @param witness_version number: Witness version (0-16)
+-- @param witness_program string: Witness program data
+-- @param flags table: Verification flags
+-- @param checker table: Signature checker
+-- @return boolean: true if valid
+-- @return string|nil: Error message on failure
+function M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
+  if witness_version == 0 then
+    if #witness_program == 20 then
+      -- P2WPKH: witness = [sig, pubkey]
+      if #witness ~= 2 then
+        return nil, "WITNESS_PROGRAM_MISMATCH"
+      end
+
+      -- Verify: HASH160(pubkey) == witness_program
+      local pubkey_hash = crypto.hash160(witness[2])
+      if pubkey_hash ~= witness_program then
+        return nil, "WITNESS_PROGRAM_MISMATCH"
+      end
+
+      -- Build synthetic P2PKH script and execute with witness stack
+      local script_code = M.make_p2pkh_script(witness_program)
+      local wit_stack = {}
+      for i, v in ipairs(witness) do wit_stack[i] = v end
+
+      -- Set witness v0 flags for the execution
+      local wit_flags = {}
+      for k, v in pairs(flags) do wit_flags[k] = v end
+      wit_flags.is_witness_v0 = true
+
+      -- Update checker to use segwit sighash
+      if checker and checker.set_segwit then
+        checker.set_segwit(true, witness_program, nil)
+      end
+
+      return M.execute_witness_script(script_code, wit_stack, wit_flags, checker)
+
+    elseif #witness_program == 32 then
+      -- P2WSH: witness = [item1, item2, ..., witness_script]
+      if #witness == 0 then
+        return nil, "WITNESS_PROGRAM_EMPTY"
+      end
+
+      -- Last witness item is the witness script
+      local witness_script = witness[#witness]
+
+      -- Verify: SHA256(witness_script) == witness_program
+      local script_hash = crypto.sha256(witness_script)
+      if script_hash ~= witness_program then
+        return nil, "WITNESS_PROGRAM_MISMATCH"
+      end
+
+      -- Build stack from witness items (excluding the script)
+      local wit_stack = {}
+      for i = 1, #witness - 1 do
+        wit_stack[i] = witness[i]
+      end
+
+      -- Set witness v0 flags
+      local wit_flags = {}
+      for k, v in pairs(flags) do wit_flags[k] = v end
+      wit_flags.is_witness_v0 = true
+
+      -- Update checker to use segwit sighash with witness script
+      if checker and checker.set_segwit then
+        checker.set_segwit(true, nil, witness_script)
+      end
+
+      -- BIP141: witness script size limit (10,000 bytes)
+      if #witness_script > 10000 then
+        return nil, "SCRIPT_SIZE"
+      end
+
+      return M.execute_witness_script(witness_script, wit_stack, wit_flags, checker)
+
+    else
+      return nil, "WITNESS_PROGRAM_WRONG_LENGTH"
+    end
+  elseif flags.verify_discourage_upgradable_witness then
+    -- Unknown witness version with DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag
+    return nil, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
+  else
+    -- Unknown witness version: anyone-can-spend (future soft fork)
+    -- BIP141: if witness version is unknown, succeed if witness program validates
+    return true
+  end
+end
+
 -- Verify script execution (scriptSig + scriptPubKey)
 function M.verify_script(script_sig, script_pubkey, flags, checker)
   flags = flags or {}
@@ -1379,6 +1500,7 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
 
   -- P2SH handling
   local did_p2sh = false
+  local p2sh_redeem_script = nil
   if flags.verify_p2sh then
     local script_type = M.classify_script(script_pubkey)
     if script_type == "p2sh" then
@@ -1393,6 +1515,7 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
         return false
       end
       local redeem_script = stack_copy[#stack_copy]
+      p2sh_redeem_script = redeem_script
 
       -- Remove the redeem script from stack_copy to get remaining items
       table.remove(stack_copy)
@@ -1410,11 +1533,67 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
         return false
       end
 
-      -- CLEANSTACK for P2SH: check redeem stack
+      -- CLEANSTACK for P2SH: check redeem stack (but defer if witness follows)
+      -- We will check cleanstack after witness processing
       if flags.verify_cleanstack then
-        if #redeem_stack ~= 1 then
-          return nil, "CLEANSTACK"
+        -- Only enforce if not a P2SH-wrapped witness program
+        local wp_ver, wp_prog = M.is_witness_program(redeem_script)
+        if not wp_ver then
+          if #redeem_stack ~= 1 then
+            return nil, "CLEANSTACK"
+          end
         end
+      end
+    end
+  end
+
+  -- Witness handling (BIP141)
+  if flags.verify_witness then
+    local witness_version, witness_program
+    local had_witness = false
+
+    -- Check if scriptPubKey is a native witness program
+    witness_version, witness_program = M.is_witness_program(script_pubkey)
+
+    if witness_version then
+      had_witness = true
+      -- Native witness: scriptSig must be empty
+      if #script_sig > 0 then
+        return nil, "WITNESS_MALLEATED"
+      end
+
+      -- Get witness data from checker
+      local witness = (checker and checker.get_witness and checker.get_witness()) or {}
+
+      local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
+      if not ok then
+        return nil, werr
+      end
+
+    elseif did_p2sh and p2sh_redeem_script then
+      -- Check if P2SH redeem script is a witness program (P2SH-P2WPKH / P2SH-P2WSH)
+      witness_version, witness_program = M.is_witness_program(p2sh_redeem_script)
+      if witness_version then
+        had_witness = true
+        -- P2SH-wrapped witness: scriptSig must be exactly a push of the witness program
+        -- (verified implicitly by P2SH evaluation already succeeding)
+
+        -- Get witness data from checker
+        local witness = (checker and checker.get_witness and checker.get_witness()) or {}
+
+        local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
+        if not ok then
+          return nil, werr
+        end
+      end
+    end
+
+    -- BIP141: If WITNESS flag is set and no witness program was found,
+    -- the witness must be empty (null witness)
+    if not had_witness then
+      local witness = (checker and checker.get_witness and checker.get_witness()) or {}
+      if #witness > 0 then
+        return nil, "WITNESS_UNEXPECTED"
       end
     end
   end

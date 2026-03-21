@@ -235,10 +235,11 @@ local vectors = cjson.decode(json_text)
 
 --- Build a "crediting transaction" per Bitcoin Core's script test framework.
 -- Version 1, locktime 0, one input (null prevout, scriptSig = OP_0 OP_0,
--- sequence 0xFFFFFFFF), one output (scriptPubKey = test's scriptPubKey, value = 0).
+-- sequence 0xFFFFFFFF), one output (scriptPubKey = test's scriptPubKey, value = amount).
 -- @param script_pubkey string: raw scriptPubKey bytes
+-- @param amount number: output value in satoshis (default 0)
 -- @return transaction: the crediting transaction
-local function build_crediting_tx(script_pubkey)
+local function build_crediting_tx(script_pubkey, amount)
   local null_hash = types.hash256(string.rep("\0", 32))
   local credit_script_sig = string.char(0x00, 0x00) -- OP_0 OP_0
   local tx = types.transaction(1, {}, {}, 0)
@@ -247,7 +248,7 @@ local function build_crediting_tx(script_pubkey)
     credit_script_sig,
     0xFFFFFFFF
   )
-  tx.outputs[1] = types.txout(0, script_pubkey)
+  tx.outputs[1] = types.txout(amount or 0, script_pubkey)
   return tx
 end
 
@@ -264,8 +265,9 @@ end
 -- scriptSig = test's scriptSig, sequence 0xFFFFFFFF), one output (empty, value = 0).
 -- @param credit_tx transaction: the crediting transaction
 -- @param script_sig string: raw scriptSig bytes
+-- @param witness table|nil: witness stack (list of byte strings)
 -- @return transaction: the spending transaction
-local function build_spending_tx(credit_tx, script_sig)
+local function build_spending_tx(credit_tx, script_sig, witness)
   local credit_txid = compute_txid(credit_tx)
   local tx = types.transaction(1, {}, {}, 0)
   tx.inputs[1] = types.txin(
@@ -273,7 +275,12 @@ local function build_spending_tx(credit_tx, script_sig)
     script_sig,
     0xFFFFFFFF
   )
-  tx.outputs[1] = types.txout(0, "")
+  if witness and #witness > 0 then
+    tx.inputs[1].witness = witness
+    tx.segwit = true
+  end
+  -- Match Bitcoin Core: spending tx output value = crediting tx output value
+  tx.outputs[1] = types.txout(credit_tx.outputs[1].value, "")
   return tx
 end
 
@@ -286,82 +293,150 @@ local fail_count = 0
 local skip_count = 0
 local error_count = 0
 local total = 0
+local witness_pass = 0
+local witness_fail = 0
+local witness_error = 0
+local witness_total = 0
+
+--- Run a single test vector (shared logic for legacy and witness)
+local function run_test(idx, script_sig_asm, script_pubkey_asm, flags_str, expected, comment, witness_hex_items, amount_satoshis)
+  local is_witness = (witness_hex_items ~= nil)
+  if is_witness then
+    witness_total = witness_total + 1
+  else
+    total = total + 1
+  end
+
+  local ok_call, result_or_err = pcall(function()
+    local script_sig_bytes = assemble_script(script_sig_asm)
+    local script_pubkey_bytes = assemble_script(script_pubkey_asm)
+    local flags = parse_flags(flags_str)
+
+    -- Decode witness items from hex
+    local witness = nil
+    if witness_hex_items then
+      witness = {}
+      for _, hex_item in ipairs(witness_hex_items) do
+        witness[#witness + 1] = hex_decode(hex_item)
+      end
+    end
+
+    local amount = amount_satoshis or 0
+
+    -- Build crediting and spending transactions (Bitcoin Core approach)
+    local credit_tx = build_crediting_tx(script_pubkey_bytes, amount)
+    local spending_tx = build_spending_tx(credit_tx, script_sig_bytes, witness)
+
+    -- Create a real signature checker with transaction context
+    local checker = validation.make_sig_checker(
+      spending_tx,           -- the spending transaction
+      0,                     -- input index (0-based)
+      amount,                -- prev output value
+      script_pubkey_bytes,   -- scriptPubKey of the output being spent
+      flags                  -- verification flags
+    )
+
+    local result, err = script.verify_script(script_sig_bytes, script_pubkey_bytes, flags, checker)
+    -- Note: verify_script returns true on success, false/nil on failure
+    return result == true
+  end)
+
+  local expected_ok = (expected == "OK")
+
+  if ok_call then
+    local got_ok = result_or_err
+    if got_ok == expected_ok then
+      if is_witness then witness_pass = witness_pass + 1 else pass_count = pass_count + 1 end
+    else
+      if is_witness then witness_fail = witness_fail + 1 else fail_count = fail_count + 1 end
+      io.write(string.format("FAIL test %d%s: expected=%s got=%s sig=[%s] pub=[%s] flags=%s %s\n",
+        idx, is_witness and " (witness)" or "",
+        expected, got_ok and "OK" or "FAIL",
+        script_sig_asm, script_pubkey_asm, flags_str, comment))
+    end
+  else
+    -- Exception/error during execution
+    if not expected_ok then
+      if is_witness then witness_pass = witness_pass + 1 else pass_count = pass_count + 1 end
+    else
+      if is_witness then witness_error = witness_error + 1 else error_count = error_count + 1 end
+      io.write(string.format("ERROR test %d%s: %s sig=[%s] pub=[%s] flags=%s %s\n",
+        idx, is_witness and " (witness)" or "",
+        tostring(result_or_err),
+        script_sig_asm, script_pubkey_asm, flags_str, comment))
+    end
+  end
+end
 
 for idx, entry in ipairs(vectors) do
   if type(entry) == "table" then
     local n = #entry
-    -- Skip comments (single-element) and witness tests (6+)
+    -- Skip comments (single-element)
     if n == 1 or n == 2 or n == 3 then
       -- comment or malformed, skip
-    elseif n >= 6 then
-      -- Witness test, skip for now
-      skip_count = skip_count + 1
+    elseif type(entry[1]) == "table" and n >= 5 then
+      -- Witness test vector:
+      -- entry[1] = array: witness hex items, with LAST element being amount in BTC (number)
+      -- entry[2] = scriptSig ASM
+      -- entry[3] = scriptPubKey ASM
+      -- entry[4] = flags
+      -- entry[5] = expected result
+      -- entry[6] = comment (optional)
+      local wit_array = entry[1]
+      local script_sig_asm = entry[2]
+      local script_pubkey_asm = entry[3]
+      local flags_str = entry[4]
+      local expected = entry[5]
+      local comment = entry[6] or ""
+
+      -- Skip TAPROOT vectors (use #TAPROOTOUTPUT# placeholder that can't be assembled)
+      if flags_str:find("TAPROOT") then
+        skip_count = skip_count + 1
+        goto continue
+      end
+
+      -- Last element of witness array is amount in BTC (float)
+      local amount_btc = wit_array[#wit_array]  -- number, e.g. 1e-08 = 1 satoshi
+      local amount_satoshis = math.floor(amount_btc * 1e8 + 0.5)
+
+      -- Witness stack is all elements except the last (which is the amount)
+      local witness_stack = {}
+      for i = 1, #wit_array - 1 do
+        witness_stack[i] = wit_array[i]
+      end
+
+      run_test(idx, script_sig_asm, script_pubkey_asm, flags_str, expected, comment, witness_stack, amount_satoshis)
+      ::continue::
+
     elseif n == 4 or n == 5 then
-      total = total + 1
       local script_sig_asm = entry[1]
       local script_pubkey_asm = entry[2]
       local flags_str = entry[3]
       local expected = entry[4]
       local comment = entry[5] or ""
 
-      local ok_call, result_or_err = pcall(function()
-        local script_sig_bytes = assemble_script(script_sig_asm)
-        local script_pubkey_bytes = assemble_script(script_pubkey_asm)
-        local flags = parse_flags(flags_str)
-
-        -- Build crediting and spending transactions (Bitcoin Core approach)
-        local credit_tx = build_crediting_tx(script_pubkey_bytes)
-        local spending_tx = build_spending_tx(credit_tx, script_sig_bytes)
-
-        -- Create a real signature checker with transaction context
-        local checker = validation.make_sig_checker(
-          spending_tx,       -- the spending transaction
-          0,                 -- input index (0-based)
-          0,                 -- prev output value (0 satoshis)
-          script_pubkey_bytes, -- scriptPubKey of the output being spent
-          flags              -- verification flags
-        )
-
-        local result, err = script.verify_script(script_sig_bytes, script_pubkey_bytes, flags, checker)
-        -- Note: verify_script returns true on success, false/nil on failure
-        return result == true
-      end)
-
-      local expected_ok = (expected == "OK")
-
-      if ok_call then
-        local got_ok = result_or_err
-        if got_ok == expected_ok then
-          pass_count = pass_count + 1
-        else
-          fail_count = fail_count + 1
-          io.write(string.format("FAIL test %d: expected=%s got=%s sig=[%s] pub=[%s] flags=%s %s\n",
-            idx, expected, got_ok and "OK" or "FAIL",
-            script_sig_asm, script_pubkey_asm, flags_str, comment))
-        end
-      else
-        -- Exception/error during execution
-        if not expected_ok then
-          pass_count = pass_count + 1 -- expected failure
-        else
-          error_count = error_count + 1
-          io.write(string.format("ERROR test %d: %s sig=[%s] pub=[%s] flags=%s %s\n",
-            idx, tostring(result_or_err),
-            script_sig_asm, script_pubkey_asm, flags_str, comment))
-        end
-      end
+      run_test(idx, script_sig_asm, script_pubkey_asm, flags_str, expected, comment)
     end
   end
 end
 
 io.write("\n=== Script Test Vector Results ===\n")
-io.write(string.format("Total non-witness tests: %d\n", total))
+io.write(string.format("Legacy tests: %d\n", total))
 io.write(string.format("  PASS:  %d\n", pass_count))
 io.write(string.format("  FAIL:  %d\n", fail_count))
 io.write(string.format("  ERROR: %d\n", error_count))
-io.write(string.format("  Skipped (witness): %d\n", skip_count))
+io.write(string.format("Witness tests: %d\n", witness_total))
+io.write(string.format("  PASS:  %d\n", witness_pass))
+io.write(string.format("  FAIL:  %d\n", witness_fail))
+io.write(string.format("  ERROR: %d\n", witness_error))
+local total_all = total + witness_total
+local pass_all = pass_count + witness_pass
+local fail_all = fail_count + witness_fail
+local error_all = error_count + witness_error
+io.write(string.format("Skipped (taproot): %d\n", skip_count))
+io.write(string.format("Combined: %d/%d passed (%.1f%%)\n", pass_all, total_all, total_all > 0 and (100.0 * pass_all / total_all) or 0))
 
-if fail_count > 0 or error_count > 0 then
+if fail_all > 0 or error_all > 0 then
   os.exit(1)
 else
   os.exit(0)
