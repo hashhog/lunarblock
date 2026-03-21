@@ -2,6 +2,7 @@ local socket = require("socket")
 local peer_mod = require("lunarblock.peer")
 local p2p = require("lunarblock.p2p")
 local crypto = require("lunarblock.crypto")
+local proxy_mod = require("lunarblock.proxy")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -55,16 +56,53 @@ M.ADDRMAN = {
 }
 
 --------------------------------------------------------------------------------
+-- Stale Tip Detection & Eviction Constants
+-- Reference: Bitcoin Core net_processing.cpp
+--------------------------------------------------------------------------------
+
+M.STALE_TIP = {
+  -- Time between stale tip checks (10 minutes)
+  STALE_CHECK_INTERVAL = 600,
+  -- Time to wait before considering a peer for eviction based on chain sync (20 minutes)
+  CHAIN_SYNC_TIMEOUT = 1200,
+  -- Grace period for peer to respond to getheaders (2 minutes)
+  HEADERS_RESPONSE_TIME = 120,
+  -- Minimum time a peer must be connected before eviction (30 seconds)
+  MINIMUM_CONNECT_TIME = 30,
+  -- Interval to check for extra peer eviction (45 seconds)
+  EXTRA_PEER_CHECK_INTERVAL = 45,
+  -- Maximum number of outbound peers that can be protected from eviction
+  MAX_OUTBOUND_PEERS_TO_PROTECT = 4,
+  -- Target outbound full-relay connections
+  TARGET_OUTBOUND_FULL_RELAY = 8,
+  -- Target block-relay-only connections
+  TARGET_BLOCK_RELAY_ONLY = 2,
+}
+
+--------------------------------------------------------------------------------
 -- Network Group Utilities (Eclipse Attack Mitigation)
 -- Reference: Bitcoin Core netgroup.cpp GetGroup()
 --------------------------------------------------------------------------------
 
---- Get the network group for an IP address.
+--- Get the network group for an address.
 -- For IPv4, this is the /16 subnet (first two octets).
 -- For IPv6, this is typically the /32.
+-- For TOR/I2P/CJDNS, the network type itself is the group.
 -- @param ip string: IP address string (e.g., "192.168.1.1")
+-- @param network_id number: BIP155 network ID (optional)
 -- @return string: group identifier bytes
-function M.get_addr_group(ip)
+function M.get_addr_group(ip, network_id)
+  -- For non-IP networks (BIP155), use network type as group
+  if network_id then
+    if network_id == p2p.NET_ID.TORV3 then
+      return string.char(p2p.NET_ID.TORV3)  -- All TorV3 in one group
+    elseif network_id == p2p.NET_ID.I2P then
+      return string.char(p2p.NET_ID.I2P)     -- All I2P in one group
+    elseif network_id == p2p.NET_ID.CJDNS then
+      return string.char(p2p.NET_ID.CJDNS)   -- All CJDNS in one group
+    end
+  end
+
   -- Parse IPv4 address
   local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
   if a and b then
@@ -234,6 +272,28 @@ function M.new(network, storage, config)
     on_peer_established = nil,
   }
 
+  -- Stale tip detection state (Bitcoin Core: CheckForStaleTipAndEvictPeers)
+  self._last_tip_update = socket.gettime()
+  self._stale_tip_check_time = socket.gettime() + M.STALE_TIP.STALE_CHECK_INTERVAL
+  self._extra_peer_check_time = socket.gettime() + M.STALE_TIP.EXTRA_PEER_CHECK_INTERVAL
+  self._try_new_outbound_peer = false
+  self._initial_sync_finished = false
+  self._blocks_in_flight = {}  -- global tracking of block hashes being downloaded
+  self._peer_chain_sync = {}   -- ip:port -> {timeout, work_header, sent_getheaders, protect}
+
+  -- Per-peer best known block tracking
+  self._peer_best_block = {}   -- ip:port -> {hash, height, work}
+  self._peer_last_block_ann = {}  -- ip:port -> timestamp of last block announcement
+  self._peer_connect_time = {}   -- ip:port -> connection time
+
+  -- Proxy configuration (Tor/I2P support)
+  self.proxy_config = nil      -- ProxyConfig object from proxy module
+
+  -- Initialize proxy if configured
+  if config.proxy then
+    self:_init_proxy(config)
+  end
+
   -- Initialize address manager (eclipse attack mitigation)
   self:_init_addrman()
 
@@ -244,6 +304,61 @@ function M.new(network, storage, config)
   self:_load_anchors()
 
   return self
+end
+
+--------------------------------------------------------------------------------
+-- Proxy Initialization (Tor/I2P Support)
+--------------------------------------------------------------------------------
+
+--- Initialize proxy configuration from config options.
+-- @param config table: configuration with proxy settings
+function PeerManager:_init_proxy(config)
+  self.proxy_config = proxy_mod.new_config()
+
+  -- SOCKS5 proxy for Tor (e.g., -proxy=127.0.0.1:9050)
+  if config.proxy then
+    local host, port = config.proxy:match("^([^:]+):(%d+)$")
+    if host and port then
+      self.proxy_config:set_socks5_proxy(host, tonumber(port), config.proxy_stream_isolation)
+    end
+  end
+
+  -- I2P SAM bridge (e.g., -i2psam=127.0.0.1:7656)
+  if config.i2psam then
+    local host, port = config.i2psam:match("^([^:]+):(%d+)$")
+    if host and port then
+      local keyfile = config.i2p_private_key or (self.data_dir .. "/i2p_private_key")
+      self.proxy_config:set_i2p_sam(host, tonumber(port), keyfile)
+    end
+  end
+
+  -- Network restriction (e.g., -onlynet=onion or -onlynet=i2p)
+  if config.onlynet then
+    self.proxy_config:set_onlynet(config.onlynet)
+  end
+
+  -- DNS over proxy (prevents DNS leaks when using Tor)
+  if config.proxy_dns ~= false then
+    self.proxy_config.proxy_dns = true
+  end
+end
+
+--- Get our advertised addresses for privacy networks.
+-- @return table: {onion = ".onion addr", i2p = ".b32.i2p addr"}
+function PeerManager:get_local_addresses()
+  local addresses = {}
+
+  if self.proxy_config and self.proxy_config.i2p_sam then
+    local i2p_addr = self.proxy_config.i2p_sam:get_my_address()
+    if i2p_addr then
+      addresses.i2p = i2p_addr
+    end
+  end
+
+  -- Tor hidden service address would be configured separately
+  -- (requires reading from torrc or control port)
+
+  return addresses
 end
 
 --------------------------------------------------------------------------------
@@ -638,10 +753,28 @@ end
 --------------------------------------------------------------------------------
 
 --- Discover peer addresses from DNS seeds.
+-- When proxy_dns is enabled, this skips regular DNS and relies on
+-- addresses learned from peer addr/addrv2 messages (no DNS leaks).
 -- @return number: count of new addresses found
 function PeerManager:discover_from_dns()
   if not self.network or not self.network.dns_seeds then
     return 0
+  end
+
+  -- If using proxy with DNS leak prevention, don't do DNS lookups
+  -- Rely on addr messages from connected peers instead
+  if self.proxy_config and self.proxy_config.proxy_dns then
+    -- DNS seeds can't be resolved through SOCKS5 (no DNS query support)
+    -- We rely on connecting to known hardcoded peers or addr gossip
+    return 0
+  end
+
+  -- If onlynet is set to a privacy network, skip DNS (privacy leak)
+  if self.proxy_config and self.proxy_config.onlynet then
+    local onlynet = self.proxy_config.onlynet
+    if onlynet == "onion" or onlynet == "i2p" then
+      return 0
+    end
   end
 
   local count = 0
@@ -728,12 +861,23 @@ function PeerManager:connect_peer(ip, port, skip_diversity)
     return false, "max peers reached"
   end
 
+  -- Check network restriction (onlynet)
+  if self.proxy_config and not self.proxy_config:is_address_allowed(ip) then
+    return false, "address not allowed by onlynet restriction"
+  end
+
   -- Check outbound diversity (eclipse attack mitigation)
-  if not skip_diversity and not self:_check_outbound_diversity(ip) then
+  -- Skip for privacy network addresses (Tor/I2P are in single groups anyway)
+  local net_type = proxy_mod.detect_network_type(ip)
+  local is_privacy_net = net_type == proxy_mod.NETWORK_TYPE.ONION or
+                         net_type == proxy_mod.NETWORK_TYPE.I2P
+  if not skip_diversity and not is_privacy_net and not self:_check_outbound_diversity(ip) then
     return false, "same /16 subnet as existing peer"
   end
 
-  local p = peer_mod.new(ip, port, self.network, self.our_height)
+  -- Create peer with proxy configuration
+  local use_v2 = not self.config.nov2transport
+  local p = peer_mod.new(ip, port, self.network, self.our_height, use_v2, self.proxy_config)
   -- Register all our message handlers
   for cmd, handler in pairs(self.message_handlers) do
     p:on(cmd, handler)
@@ -755,6 +899,9 @@ function PeerManager:connect_peer(ip, port, skip_diversity)
 
   -- Track outbound connection group
   self:_add_outbound_group(ip)
+
+  -- Initialize chain sync state for stale tip detection
+  self:_init_peer_chain_sync(p)
 
   p:start_handshake()
 
@@ -792,6 +939,8 @@ function PeerManager:disconnect_peer(p, reason)
   self.our_nonces[p.nonce] = nil
   -- Clean up trickling state
   self:_cleanup_peer_trickle(p)
+  -- Clean up chain sync state
+  self:_cleanup_peer_chain_sync(p)
   if self.callbacks.on_peer_disconnected then
     self.callbacks.on_peer_disconnected(p, reason)
   end
@@ -848,6 +997,7 @@ end
 
 --- Maintain outbound connections by connecting to new peers if below target.
 -- Prioritizes anchor connections on startup for eclipse attack mitigation.
+-- Also opens extra outbound connection when tip is stale (to find better chain).
 function PeerManager:maintain_connections()
   -- Count current outbound connections
   local outbound = 0
@@ -868,8 +1018,14 @@ function PeerManager:maintain_connections()
     end
   end
 
+  -- Determine connection target (allow one extra if tip is stale)
+  local target = self.max_outbound
+  if self._try_new_outbound_peer then
+    target = target + 1  -- Allow one extra outbound when searching for better chain
+  end
+
   -- Connect to more peers if below target
-  while outbound < self.max_outbound do
+  while outbound < target do
     local candidate = self:select_peer_to_connect()
     if not candidate then
       -- No candidates; try DNS discovery
@@ -989,7 +1145,7 @@ function PeerManager:add_ban_score(peer, score, reason)
 end
 
 --------------------------------------------------------------------------------
--- Addr Message Handling
+-- Addr/Addrv2 Message Handling (BIP155)
 --------------------------------------------------------------------------------
 
 --- Handle received addr message.
@@ -1009,6 +1165,7 @@ function PeerManager:handle_addr(peer, payload)
           port = addr.port,
           services = addr.services,
           timestamp = addr.timestamp,
+          network_id = p2p.NET_ID.IPV4,  -- Legacy addr is always IPv4/IPv6
           attempts = 0,
           last_try = 0,
         }
@@ -1016,6 +1173,86 @@ function PeerManager:handle_addr(peer, payload)
       -- Add to address manager new table with source tracking
       self:_add_to_new(addr.ip, addr.port, addr.services, addr.timestamp, src_ip)
     end
+  end
+end
+
+--- Handle received addrv2 message (BIP155).
+-- @param peer Peer: peer that sent the message
+-- @param payload string: addrv2 message payload
+function PeerManager:handle_addrv2(peer, payload)
+  local addresses = p2p.deserialize_addrv2(payload)
+  local now = os.time()
+  local src_ip = peer and peer.ip or "unknown"
+  for _, addr in ipairs(addresses) do
+    -- Skip invalid addresses
+    if not addr.valid then
+      goto continue
+    end
+    -- Only accept addresses with recent timestamps (within 3 hours)
+    if addr.timestamp > now - 10800 and addr.timestamp <= now + 600 then
+      -- For non-IP network types, use addr_str as the key
+      local addr_key = addr.addr_str or addr.ip
+      if addr_key then
+        local key = addr_key .. ":" .. addr.port
+        if not self.known_addresses[key] then
+          self.known_addresses[key] = {
+            ip = addr.ip,                    -- May be nil for TOR/I2P/CJDNS
+            addr_str = addr.addr_str,        -- Full address string
+            addr_bytes = addr.addr_bytes,    -- Raw address bytes
+            port = addr.port,
+            services = addr.services,
+            timestamp = addr.timestamp,
+            network_id = addr.network_id,
+            attempts = 0,
+            last_try = 0,
+          }
+        end
+        -- Only add to connection pool if it's an IP address we can connect to
+        if addr.ip then
+          self:_add_to_new(addr.ip, addr.port, addr.services, addr.timestamp, src_ip)
+        end
+      end
+    end
+    ::continue::
+  end
+end
+
+--- Serialize addresses for a peer, using addrv2 if they support it.
+-- @param peer Peer: peer to send to
+-- @param addresses table: list of address entries from known_addresses
+-- @return string: serialized payload (addr or addrv2 format)
+-- @return string: command name ("addr" or "addrv2")
+function PeerManager:serialize_addr_for_peer(peer, addresses)
+  if peer.send_addrv2 then
+    -- Filter to addresses compatible with addrv2
+    local addrv2_list = {}
+    for _, addr in ipairs(addresses) do
+      if p2p.is_addr_compatible(true, addr) then
+        addrv2_list[#addrv2_list + 1] = {
+          timestamp = addr.timestamp,
+          services = addr.services,
+          network_id = addr.network_id or p2p.NET_ID.IPV4,
+          addr_bytes = addr.addr_bytes,
+          ip = addr.ip,
+          port = addr.port,
+        }
+      end
+    end
+    return p2p.serialize_addrv2(addrv2_list), "addrv2"
+  else
+    -- Legacy addr format: only IPv4/IPv6
+    local addr_list = {}
+    for _, addr in ipairs(addresses) do
+      if p2p.is_addr_compatible(false, addr) and addr.ip then
+        addr_list[#addr_list + 1] = {
+          timestamp = addr.timestamp,
+          services = addr.services,
+          ip = addr.ip,
+          port = addr.port,
+        }
+      end
+    end
+    return p2p.serialize_addr(addr_list), "addr"
   end
 end
 
@@ -1078,7 +1315,8 @@ function PeerManager:accept_inbound()
     return
   end
 
-  local p = peer_mod.new(ip, port, self.network, self.our_height)
+  local inbound_v2 = not self.config.nov2transport
+  local p = peer_mod.new(ip, port, self.network, self.our_height, inbound_v2)
   p.socket = client
   p.state = peer_mod.STATE.CONNECTED
   p.inbound = true
@@ -1136,6 +1374,9 @@ function PeerManager:tick()
 
   -- Process transaction trickling (batched, randomized inv sending)
   self:_process_trickle()
+
+  -- Check for stale tip and evict extra outbound peers
+  self:check_for_stale_tip_and_evict_peers()
 
   -- Maintain outbound connections
   self:maintain_connections()
@@ -1335,6 +1576,329 @@ function PeerManager:clear_peer_inv_known(p)
   if trickle then
     trickle.inv_known = {}
   end
+end
+
+--------------------------------------------------------------------------------
+-- Stale Tip Detection & Extra Outbound Peer Eviction
+-- Reference: Bitcoin Core net_processing.cpp ConsiderEviction, EvictExtraOutboundPeers
+--------------------------------------------------------------------------------
+
+--- Record that the chain tip was updated.
+-- Called when a new block is connected to the best chain.
+function PeerManager:record_tip_update()
+  self._last_tip_update = socket.gettime()
+end
+
+--- Get the time of the last tip update.
+-- @return number: timestamp of last tip update
+function PeerManager:get_last_tip_update()
+  return self._last_tip_update
+end
+
+--- Check if the tip may be stale.
+-- Tip is stale if more than 3x block interval old AND no blocks in-flight.
+-- @return boolean: true if tip may be stale
+function PeerManager:tip_may_be_stale()
+  local now = socket.gettime()
+  local pow_target_spacing = self.network and self.network.pow_target_spacing or 600
+  local stale_threshold = pow_target_spacing * 3  -- 30 minutes for mainnet
+
+  -- Tip is stale if no update in 3x block interval and no blocks in flight
+  local blocks_in_flight_count = 0
+  for _ in pairs(self._blocks_in_flight) do
+    blocks_in_flight_count = blocks_in_flight_count + 1
+  end
+
+  return (now - self._last_tip_update) > stale_threshold and blocks_in_flight_count == 0
+end
+
+--- Update a peer's best known block.
+-- Called when receiving headers or blocks from a peer.
+-- @param p Peer: the peer
+-- @param height number: best known block height
+-- @param hash string: best known block hash (optional)
+-- @param work number: cumulative chain work (optional)
+function PeerManager:set_peer_best_block(p, height, hash, work)
+  local key = p.ip .. ":" .. p.port
+  self._peer_best_block[key] = {
+    height = height,
+    hash = hash,
+    work = work or 0,
+  }
+end
+
+--- Get a peer's best known block info.
+-- @param p Peer: the peer
+-- @return table|nil: {height, hash, work} or nil
+function PeerManager:get_peer_best_block(p)
+  local key = p.ip .. ":" .. p.port
+  return self._peer_best_block[key]
+end
+
+--- Record that a peer announced a new block.
+-- @param p Peer: the peer
+-- @param hash string: block hash (optional)
+function PeerManager:record_peer_block_announcement(p, hash)
+  local _ = hash  -- hash is optional, for future use
+  local key = p.ip .. ":" .. p.port
+  self._peer_last_block_ann[key] = socket.gettime()
+end
+
+--- Get the timestamp of a peer's last block announcement.
+-- @param p Peer: the peer
+-- @return number: timestamp or 0 if never
+function PeerManager:get_peer_last_block_announcement(p)
+  local key = p.ip .. ":" .. p.port
+  return self._peer_last_block_ann[key] or 0
+end
+
+--- Initialize chain sync state for a peer.
+-- Called when peer is connected.
+-- @param p Peer: the peer
+function PeerManager:_init_peer_chain_sync(p)
+  local key = p.ip .. ":" .. p.port
+  self._peer_chain_sync[key] = {
+    timeout = 0,          -- timeout timestamp (0 = not set)
+    work_header = nil,    -- reference header when timeout was set {height, hash}
+    sent_getheaders = false,
+    protect = false,      -- protected from eviction
+  }
+  self._peer_connect_time[key] = socket.gettime()
+end
+
+--- Clean up chain sync state for a peer.
+-- Called when peer is disconnected.
+-- @param p Peer: the peer
+function PeerManager:_cleanup_peer_chain_sync(p)
+  local key = p.ip .. ":" .. p.port
+  self._peer_chain_sync[key] = nil
+  self._peer_best_block[key] = nil
+  self._peer_last_block_ann[key] = nil
+  self._peer_connect_time[key] = nil
+end
+
+--- Get the chain sync state for a peer (for testing).
+-- @param p Peer: the peer
+-- @return table|nil: chain sync state
+function PeerManager:get_peer_chain_sync(p)
+  local key = p.ip .. ":" .. p.port
+  return self._peer_chain_sync[key]
+end
+
+--- Consider evicting a peer based on chain sync state.
+-- Reference: Bitcoin Core net_processing.cpp ConsiderEviction()
+-- @param p Peer: outbound peer to consider
+-- @param now number: current timestamp
+function PeerManager:consider_eviction(p, now)
+  local key = p.ip .. ":" .. p.port
+  local sync_state = self._peer_chain_sync[key]
+
+  -- Only consider outbound peers that have started syncing
+  if not sync_state or p.inbound or sync_state.protect then
+    return
+  end
+
+  -- fSyncStarted equivalent: check if peer is established
+  if p.state ~= peer_mod.STATE.ESTABLISHED then
+    return
+  end
+
+  local peer_best = self._peer_best_block[key]
+  local peer_height = peer_best and peer_best.height or 0
+
+  -- If peer's best known block >= our tip, reset timeout
+  if peer_height >= self.our_height then
+    if sync_state.timeout ~= 0 then
+      sync_state.timeout = 0
+      sync_state.work_header = nil
+      sync_state.sent_getheaders = false
+    end
+    return
+  end
+
+  -- Peer's best block is behind our tip
+  if sync_state.timeout == 0 or
+     (sync_state.work_header and peer_height >= sync_state.work_header.height) then
+    -- Set/reset timeout based on current tip
+    sync_state.timeout = now + M.STALE_TIP.CHAIN_SYNC_TIMEOUT
+    sync_state.work_header = {height = self.our_height}
+    sync_state.sent_getheaders = false
+  elseif sync_state.timeout > 0 and now > sync_state.timeout then
+    -- Timeout exceeded
+    if sync_state.sent_getheaders then
+      -- Already sent getheaders and still behind - disconnect
+      self:disconnect_peer(p, "outbound peer has old chain")
+    else
+      -- Send a getheaders to give peer a chance
+      if p.state == peer_mod.STATE.ESTABLISHED then
+        -- Send getheaders with our tip
+        local getheaders_payload = p2p.serialize_getheaders(
+          p2p.PROTOCOL_VERSION,
+          {},  -- empty locator = from genesis
+          p2p.ZERO_HASH
+        )
+        p:send_message("getheaders", getheaders_payload)
+      end
+      sync_state.sent_getheaders = true
+      -- Extend timeout by HEADERS_RESPONSE_TIME
+      sync_state.timeout = now + M.STALE_TIP.HEADERS_RESPONSE_TIME
+    end
+  end
+end
+
+--- Get count of outbound connections.
+-- @return number, number: full-relay count, block-relay-only count
+function PeerManager:get_outbound_counts()
+  local full_relay = 0
+  local block_only = 0
+  for _, p in ipairs(self.peer_list) do
+    if not p.inbound then
+      -- For now, treat all outbound as full-relay
+      -- A full implementation would track block-relay-only separately
+      full_relay = full_relay + 1
+    end
+  end
+  return full_relay, block_only
+end
+
+--- Check if we have extra outbound peers beyond targets.
+-- @return number: count of extra full-relay peers
+function PeerManager:get_extra_full_outbound_count()
+  local full_relay, _ = self:get_outbound_counts()
+  local target = M.STALE_TIP.TARGET_OUTBOUND_FULL_RELAY
+  return math.max(0, full_relay - target)
+end
+
+--- Evict extra outbound peers.
+-- Reference: Bitcoin Core net_processing.cpp EvictExtraOutboundPeers()
+-- @param now number: current timestamp
+function PeerManager:evict_extra_outbound_peers(now)
+  local extra_count = self:get_extra_full_outbound_count()
+  if extra_count <= 0 then
+    return
+  end
+
+  -- Find the outbound peer with the oldest block announcement
+  local worst_peer = nil
+  local oldest_announcement = math.huge
+
+  for _, p in ipairs(self.peer_list) do
+    if not p.inbound and p.state == peer_mod.STATE.ESTABLISHED then
+      local key = p.ip .. ":" .. p.port
+      local sync_state = self._peer_chain_sync[key]
+
+      -- Skip protected peers
+      if sync_state and sync_state.protect then
+        goto continue
+      end
+
+      local last_ann = self._peer_last_block_ann[key] or 0
+      if last_ann < oldest_announcement then
+        oldest_announcement = last_ann
+        worst_peer = p
+      end
+    end
+    ::continue::
+  end
+
+  if worst_peer then
+    local key = worst_peer.ip .. ":" .. worst_peer.port
+    local connect_time = self._peer_connect_time[key] or 0
+
+    -- Only disconnect if connected for minimum time and no blocks in-flight
+    if (now - connect_time) > M.STALE_TIP.MINIMUM_CONNECT_TIME then
+      -- Check no blocks in-flight from this peer
+      local has_inflight = false
+      for _, info in pairs(self._blocks_in_flight) do
+        if info.peer == worst_peer then
+          has_inflight = true
+          break
+        end
+      end
+
+      if not has_inflight then
+        self:disconnect_peer(worst_peer, "evicting extra outbound peer")
+        -- Stop trying new outbound peers after successful eviction
+        self._try_new_outbound_peer = false
+      end
+    end
+  end
+end
+
+--- Check for stale tip and manage extra outbound peers.
+-- Reference: Bitcoin Core net_processing.cpp CheckForStaleTipAndEvictPeers()
+function PeerManager:check_for_stale_tip_and_evict_peers()
+  local now = socket.gettime()
+
+  -- Run eviction check every EXTRA_PEER_CHECK_INTERVAL
+  if now >= self._extra_peer_check_time then
+    self._extra_peer_check_time = now + M.STALE_TIP.EXTRA_PEER_CHECK_INTERVAL
+
+    -- Consider eviction for each outbound peer
+    for _, p in ipairs(self.peer_list) do
+      if not p.inbound then
+        self:consider_eviction(p, now)
+      end
+    end
+
+    -- Evict extra outbound peers if we have any
+    self:evict_extra_outbound_peers(now)
+  end
+
+  -- Run stale tip check every STALE_CHECK_INTERVAL
+  if now >= self._stale_tip_check_time then
+    self._stale_tip_check_time = now + M.STALE_TIP.STALE_CHECK_INTERVAL
+
+    if self:tip_may_be_stale() then
+      -- Allow extra outbound connections
+      self._try_new_outbound_peer = true
+    elseif self._try_new_outbound_peer then
+      -- Tip is no longer stale, stop trying new peers
+      self._try_new_outbound_peer = false
+    end
+  end
+end
+
+--- Check if we should try connecting to extra outbound peers.
+-- @return boolean: true if extra outbound connection allowed
+function PeerManager:should_try_new_outbound_peer()
+  return self._try_new_outbound_peer
+end
+
+--- Set whether to try new outbound peers (for testing).
+-- @param try_new boolean: whether to try new peers
+function PeerManager:set_try_new_outbound_peer(try_new)
+  self._try_new_outbound_peer = try_new
+end
+
+--- Record that a block is in-flight from a peer.
+-- @param hash string: block hash
+-- @param p Peer: peer downloading from
+function PeerManager:record_block_in_flight(hash, p)
+  self._blocks_in_flight[hash] = {peer = p, time = socket.gettime()}
+end
+
+--- Remove a block from in-flight tracking.
+-- @param hash string: block hash
+function PeerManager:remove_block_in_flight(hash)
+  self._blocks_in_flight[hash] = nil
+end
+
+--- Check if a block is in-flight.
+-- @param hash string: block hash
+-- @return boolean: true if in-flight
+function PeerManager:is_block_in_flight(hash)
+  return self._blocks_in_flight[hash] ~= nil
+end
+
+--- Get count of blocks in-flight.
+-- @return number: count
+function PeerManager:get_blocks_in_flight_count()
+  local count = 0
+  for _ in pairs(self._blocks_in_flight) do
+    count = count + 1
+  end
+  return count
 end
 
 --------------------------------------------------------------------------------

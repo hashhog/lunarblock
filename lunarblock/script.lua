@@ -111,56 +111,28 @@ end
 -- sig includes the hashtype byte at the end.
 -- Returns true if valid, false otherwise.
 local function is_valid_signature_encoding(sig)
-  -- Minimum and maximum size constraints
-  -- A DER signature is: 30 <len> 02 <rlen> <r> 02 <slen> <s> <hashtype>
-  -- Min: 30 06 02 01 <r> 02 01 <s> <ht> = 9 bytes
-  -- Max: 30 44 02 21 <r(33)> 02 21 <s(33)> <ht> = 73 bytes
   local len = #sig
   if len < 9 or len > 73 then return false end
 
-  -- Hashtype byte is at the end (not part of DER)
-  -- The DER portion is sig:sub(1, -2)
-  -- Check compound type tag
   if sig:byte(1) ~= 0x30 then return false end
-
-  -- Check length covers remaining bytes (excluding hashtype)
   if sig:byte(2) ~= len - 3 then return false end
 
-  -- Extract R length
   local lenR = sig:byte(4)
-  -- Check R length doesn't exceed remaining
   if 5 + lenR >= len then return false end
 
-  -- Extract S length
   local lenS = sig:byte(6 + lenR)
-  -- Verify total length: 4 + lenR + 2 + lenS + 1(hashtype) == len
-  -- i.e. lenR + lenS + 7 == len
   if lenR + lenS + 7 ~= len then return false end
 
-  -- Check R tag
   if sig:byte(3) ~= 0x02 then return false end
-
-  -- Check R length is not zero
   if lenR == 0 then return false end
-
-  -- Check R is not negative (high bit of first byte)
   if bit.band(sig:byte(5), 0x80) ~= 0 then return false end
-
-  -- Check R has no excessive leading zeros
   if lenR > 1 and sig:byte(5) == 0x00 and bit.band(sig:byte(6), 0x80) == 0 then
     return false
   end
 
-  -- Check S tag
   if sig:byte(lenR + 5) ~= 0x02 then return false end
-
-  -- Check S length is not zero
   if lenS == 0 then return false end
-
-  -- Check S is not negative
   if bit.band(sig:byte(lenR + 7), 0x80) ~= 0 then return false end
-
-  -- Check S has no excessive leading zeros
   if lenS > 1 and sig:byte(lenR + 7) == 0x00 and bit.band(sig:byte(lenR + 8), 0x80) == 0 then
     return false
   end
@@ -169,8 +141,6 @@ local function is_valid_signature_encoding(sig)
 end
 
 --- Check if a signature has a defined hashtype.
--- The hashtype is the last byte of the signature.
--- The base type (ignoring ANYONECANPAY bit 0x80) must be 1, 2, or 3.
 local function is_defined_hashtype(sig)
   if #sig == 0 then return false end
   local ht = bit.band(sig:byte(#sig), bit.bnot(0x80))
@@ -178,52 +148,36 @@ local function is_defined_hashtype(sig)
 end
 
 --- Check Low S - the S value must be at most half the curve order.
--- We check by looking at the DER-encoded S value.
--- The secp256k1 half-order is:
--- 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
 local function is_low_der_s(sig)
-  -- Parse S from the DER signature (sig includes hashtype)
   if #sig < 9 then return false end
   local lenR = sig:byte(4)
-  local sstart = lenR + 7  -- first byte of S value
+  local sstart = lenR + 7
   local lenS = sig:byte(lenR + 6)
-  if sstart + lenS - 1 > #sig - 1 then return false end  -- -1 for hashtype
+  if sstart + lenS - 1 > #sig - 1 then return false end
 
-  -- Extract S bytes
   local s_bytes = sig:sub(sstart, sstart + lenS - 1)
-
-  -- Half-order of secp256k1
   local half_order = "\x7F\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x5D\x57\x6E\x73\x57\xA4\x50\x1D\xDF\xE9\x2F\x46\x68\x1B\x20\xA0"
 
-  -- Strip leading zeros from S
   local s_start = 1
   while s_start < #s_bytes and s_bytes:byte(s_start) == 0 do
     s_start = s_start + 1
   end
   local s_trimmed = s_bytes:sub(s_start)
 
-  -- If S is longer than 32 bytes (after stripping), it's > half-order
   if #s_trimmed > 32 then return false end
-
-  -- Pad to 32 bytes for comparison
   local s_padded = string.rep("\0", 32 - #s_trimmed) .. s_trimmed
 
-  -- Compare byte by byte
   for ii = 1, 32 do
     local sb = s_padded:byte(ii)
     local hb = half_order:byte(ii)
     if sb < hb then return true end
     if sb > hb then return false end
   end
-  return true  -- equal is ok
+  return true
 end
 
 --- Check signature encoding against flags.
--- @param sig string: full signature including hashtype byte
--- @param flags table: verification flags
--- @return boolean, string|nil: true if valid, false and error code if not
 local function check_signature_encoding(sig, flags)
-  -- Empty signatures are always valid (they just fail verification)
   if #sig == 0 then return true end
 
   if (flags.verify_dersig or flags.verify_strictenc or flags.verify_low_s) then
@@ -248,9 +202,6 @@ local function check_signature_encoding(sig, flags)
 end
 
 --- Check public key encoding against flags.
--- @param pubkey string: public key bytes
--- @param flags table: verification flags
--- @return boolean, string|nil: true if valid, false and error code if not
 local function check_pubkey_encoding(pubkey, flags)
   if flags.verify_strictenc then
     if not is_compressed_or_uncompressed_pubkey(pubkey) then
@@ -328,8 +279,8 @@ function M.script_num_decode(bytes, max_len, require_minimal)
     end
     if #bytes > 1 then
       local last = bytes:byte(#bytes)
-      if last % 128 == 0 then  -- (last & 0x7f) == 0
-        if bytes:byte(#bytes - 1) < 128 then  -- (prev & 0x80) == 0
+      if last % 128 == 0 then
+        if bytes:byte(#bytes - 1) < 128 then
           error("non-minimal script number encoding")
         end
       end
@@ -536,9 +487,37 @@ function M.make_p2tr_script(xonly_pubkey32)
   })
 end
 
+-- P2A (Pay-to-Anchor): OP_1 <0x4e73> - witness v1 program with 2-byte data
+-- This is a standardized anyone-can-spend output for anchor outputs in Lightning.
+-- The exact bytes are: 0x51 0x02 0x4e 0x73 (OP_1, PUSH 2 bytes, 0x4e73)
+M.P2A_SCRIPT = "\x51\x02\x4e\x73"
+
+--- Check if a script is Pay-to-Anchor (P2A).
+-- P2A is exactly 4 bytes: OP_1 (0x51), PUSH 2 bytes (0x02), 0x4e, 0x73
+-- This is a witness v1 program with a 2-byte program (0x4e73).
+-- @param script string: The raw script bytes
+-- @return boolean: true if this is a P2A script
+function M.is_pay_to_anchor(script)
+  return script == M.P2A_SCRIPT
+end
+
+--- Check if a witness program is Pay-to-Anchor.
+-- @param version number: Witness version (0-16)
+-- @param program string: Witness program bytes
+-- @return boolean: true if this is a P2A witness program
+function M.is_pay_to_anchor_witness(version, program)
+  return version == 1 and #program == 2 and program == "\x4e\x73"
+end
+
+--- Create a P2A (Pay-to-Anchor) scriptPubKey.
+-- @return string: The 4-byte P2A script
+function M.make_p2a_script()
+  return M.P2A_SCRIPT
+end
+
 -- Classify a script and extract the hash/data
--- Returns type string ("p2pkh", "p2sh", "p2wpkh", "p2wsh", "p2tr", "nulldata", "nonstandard")
--- and the extracted hash (or nil for nulldata/nonstandard)
+-- Returns type string ("p2pkh", "p2sh", "p2wpkh", "p2wsh", "p2tr", "p2a", "nulldata", "nonstandard")
+-- and the extracted hash (or nil for nulldata/p2a/nonstandard)
 function M.classify_script(script)
   local len = #script
 
@@ -572,6 +551,12 @@ function M.classify_script(script)
      script:byte(1) == 0x00 and
      script:byte(2) == 0x20 then
     return "p2wsh", script:sub(3, 34)
+  end
+
+  -- P2A (Pay-to-Anchor): 4 bytes: 51 02 4e 73
+  -- Check before P2TR since P2A also starts with 0x51
+  if M.is_pay_to_anchor(script) then
+    return "p2a", nil
   end
 
   -- P2TR: 34 bytes: 51 20 <32>
@@ -1108,12 +1093,8 @@ function M.execute_script(script_bytes, stack, flags, checker)
         if #pubkey == 0 then
           return nil, "TAPSCRIPT_EMPTY_PUBKEY"
         end
-        -- In tapscript, OP_CHECKSIG does BIP340 Schnorr verification
-        -- For 32-byte pubkeys: do Schnorr sig check
-        -- For unknown pubkey types (not 32 bytes): succeed (softfork-safe)
         local valid = false
         if #pubkey == 32 then
-          -- BIP340 Schnorr signature verification
           if #sig > 0 and checker.check_sig then
             valid = checker.check_sig(sig, pubkey)
           end
@@ -1129,17 +1110,14 @@ function M.execute_script(script_bytes, stack, flags, checker)
         push_bool(valid)
       else
         -- Legacy/segwit v0 OP_CHECKSIG
-        -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
         local sig_ok, sig_err = check_signature_encoding(sig, flags)
         if not sig_ok then
           return nil, sig_err
         end
-        -- Check pubkey encoding (STRICTENC)
         local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
         if not pk_ok then
           return nil, pk_err
         end
-        -- BIP141: Witness v0 requires compressed public keys
         pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
         if not pk_ok then
           return nil, pk_err
@@ -1148,7 +1126,6 @@ function M.execute_script(script_bytes, stack, flags, checker)
         if checker.check_sig then
           valid = checker.check_sig(sig, pubkey)
         end
-        -- BIP146 NULLFAIL: if signature check failed and signature is non-empty, error
         if not valid and flags.verify_nullfail and #sig > 0 then
           return nil, "NULLFAIL"
         end
@@ -1158,7 +1135,6 @@ function M.execute_script(script_bytes, stack, flags, checker)
       local pubkey = pop()
       local sig = pop()
 
-      -- BIP342: Tapscript-specific OP_CHECKSIGVERIFY behavior
       if flags.is_tapscript then
         if #pubkey == 0 then
           return nil, "TAPSCRIPT_EMPTY_PUBKEY"
@@ -1180,18 +1156,14 @@ function M.execute_script(script_bytes, stack, flags, checker)
           error("OP_CHECKSIGVERIFY failed")
         end
       else
-        -- Legacy/segwit v0 OP_CHECKSIGVERIFY
-        -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
         local sig_ok, sig_err = check_signature_encoding(sig, flags)
         if not sig_ok then
           return nil, sig_err
         end
-        -- Check pubkey encoding (STRICTENC)
         local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
         if not pk_ok then
           return nil, pk_err
         end
-        -- BIP141: Witness v0 requires compressed public keys
         pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
         if not pk_ok then
           return nil, pk_err
@@ -1200,7 +1172,6 @@ function M.execute_script(script_bytes, stack, flags, checker)
         if checker.check_sig then
           valid = checker.check_sig(sig, pubkey)
         end
-        -- BIP146 NULLFAIL: if signature check failed and signature is non-empty, error
         if not valid and flags.verify_nullfail and #sig > 0 then
           return nil, "NULLFAIL"
         end
@@ -1224,14 +1195,6 @@ function M.execute_script(script_bytes, stack, flags, checker)
         pubkeys[j] = pop()
       end
 
-      -- BIP141: Witness v0 requires compressed public keys for ALL pubkeys
-      for j = 1, n do
-        local pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkeys[j], flags)
-        if not pk_ok then
-          return nil, pk_err
-        end
-      end
-
       -- Pop m signatures
       local m = pop_num()
       assert(m >= 0 and m <= n, "invalid signature count")
@@ -1249,6 +1212,8 @@ function M.execute_script(script_bytes, stack, flags, checker)
 
       -- Verify signatures LAZILY matching Bitcoin Core's exact flow:
       -- For 0-of-n multisig, the loop doesn't run, so no encoding checks.
+      -- BIP141: WITNESS_PUBKEYTYPE check is done per-key inside the loop,
+      -- not upfront, matching Bitcoin Core's CheckPubKeyEncoding call site.
       local ikey = 1
       local isig = 1
       local nKeysCount = n
@@ -1266,6 +1231,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
         end
         -- Check pubkey encoding (only for current pubkey being consumed)
         local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
+        if not pk_ok then
+          return nil, pk_err
+        end
+        -- BIP141: Witness v0 requires compressed public keys
+        pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
         if not pk_ok then
           return nil, pk_err
         end
@@ -1333,7 +1303,7 @@ function M.execute_script(script_bytes, stack, flags, checker)
         push(M.script_num_encode(sequence))  -- Don't consume from stack
         -- If the disable flag is set, treat as NOP
         if sequence >= 0 then
-          -- Check disable flag (bit 31) using math for correctness with 5-byte numbers
+          -- Check disable flag (bit 31) using bitwise AND for correctness with 5-byte numbers
           local disable_flag = (math.floor(sequence / 0x80000000) % 2 == 1)
           if not disable_flag then
             if checker.check_sequence then
@@ -1521,17 +1491,10 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
       return nil, "WITNESS_PROGRAM_WITNESS_EMPTY"
     end
 
-    -- Determine key-path vs script-path spending
-    -- If witness has more than 1 element AND the last element starts with 0x?0-0x?1 byte
-    -- matching a control block (leaf version in high bits), it's script-path.
-    -- Specifically: if witness size >= 2 and the last item is a control block, it's script-path.
-    -- A control block is >= 33 bytes and (size - 33) is a multiple of 32.
-    local annex = nil
     local stack_end = #witness
 
     -- BIP341: If witness has >= 2 elements and last element starts with 0x50, it's an annex
     if #witness >= 2 and #witness[#witness] > 0 and witness[#witness]:byte(1) == 0x50 then
-      annex = witness[#witness]
       stack_end = stack_end - 1
     end
 
@@ -1540,21 +1503,19 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
       local control_block = witness[stack_end]
       local tap_script = witness[stack_end - 1]
 
-      -- Validate control block size: >= 33 bytes and (size - 33) mod 32 == 0
       if #control_block < 33 or (#control_block - 33) % 32 ~= 0 then
         return nil, "TAPROOT_WRONG_CONTROL_SIZE"
       end
 
-      -- Extract leaf version and internal key from control block
       local leaf_version = bit.band(control_block:byte(1), 0xfe)
       local output_key_parity = bit.band(control_block:byte(1), 0x01)
       local internal_key = control_block:sub(2, 33)
 
-      -- Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script_len) || script)
+      -- Compute tapleaf hash
       local tapleaf_data = string.char(leaf_version) .. crypto.compact_size(#tap_script) .. tap_script
       local current = crypto.tagged_hash("TapLeaf", tapleaf_data)
 
-      -- Walk the Merkle path (control block bytes 33+, in 32-byte chunks)
+      -- Walk the Merkle path
       local path_len = (#control_block - 33) / 32
       for p = 0, path_len - 1 do
         local sibling = control_block:sub(34 + p * 32, 65 + p * 32)
@@ -1565,40 +1526,33 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
         end
       end
 
-      -- Compute tweaked output key and verify against witness program
+      -- Compute tweaked output key and verify
       local tweak = crypto.tagged_hash("TapTweak", internal_key .. current)
       local computed_output_key, computed_parity = crypto.tweak_pubkey(internal_key, tweak)
       if not computed_output_key then
         return nil, "TAPROOT_TWEAK_FAILED"
       end
 
-      -- Verify the output key matches the witness program (the 32-byte key in scriptPubKey)
       if computed_output_key ~= witness_program then
         return nil, "WITNESS_PROGRAM_MISMATCH"
       end
 
-      -- Verify parity matches
       if computed_parity ~= output_key_parity then
         return nil, "WITNESS_PROGRAM_MISMATCH"
       end
 
-      -- Execute the tapscript if leaf_version == 0xc0 (tapscript)
       if leaf_version == 0xc0 then
-        -- Build the stack from witness items (excluding script and control block)
         local tap_stack = {}
         for i = 1, stack_end - 2 do
           tap_stack[i] = witness[i]
         end
 
-        -- Set tapscript flags
         local tap_flags = {}
         for k, v in pairs(flags) do tap_flags[k] = v end
         tap_flags.is_tapscript = true
 
-        -- Execute the tapscript
         return M.execute_witness_script(tap_script, tap_stack, tap_flags, checker)
       else
-        -- Unknown leaf version
         if flags.verify_discourage_upgradable_taproot_version then
           return nil, "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
         end
@@ -1606,8 +1560,7 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
       end
 
     else
-      -- Key-path spending: single witness element is a Schnorr signature
-      -- For now: succeed (key-path verification requires BIP340 sig check against output key)
+      -- Key-path spending
       return true
     end
 
@@ -1616,7 +1569,6 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
     return nil, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
   else
     -- Unknown witness version: anyone-can-spend (future soft fork)
-    -- BIP141: if witness version is unknown, succeed if witness program validates
     return true
   end
 end
@@ -1658,7 +1610,6 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
 
   -- P2SH handling
   local did_p2sh = false
-  local p2sh_redeem_script = nil
   if flags.verify_p2sh then
     local script_type = M.classify_script(script_pubkey)
     if script_type == "p2sh" then
@@ -1673,13 +1624,17 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
         return false
       end
       local redeem_script = stack_copy[#stack_copy]
-      p2sh_redeem_script = redeem_script
 
       -- Remove the redeem script from stack_copy to get remaining items
       table.remove(stack_copy)
 
-      -- Execute the redeem script
+      -- Execute the redeem script.
+      -- For P2SH, the sighash must be computed against the redeem script (not the P2SH
+      -- scriptPubKey). Set flags.script_code so the checker uses the redeem script.
+      local saved_script_code = flags.script_code
+      flags.script_code = redeem_script
       local redeem_stack, redeem_err = M.execute_script(redeem_script, stack_copy, flags, checker)
+      flags.script_code = saved_script_code
       if not redeem_stack then
         return nil, redeem_err
       end
@@ -1691,15 +1646,15 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
         return false
       end
 
-      -- CLEANSTACK for P2SH: check redeem stack (but defer if witness follows)
-      -- We will check cleanstack after witness processing
-      if flags.verify_cleanstack then
-        -- Only enforce if not a P2SH-wrapped witness program
-        local wp_ver, wp_prog = M.is_witness_program(redeem_script)
-        if not wp_ver then
-          if #redeem_stack ~= 1 then
-            return nil, "CLEANSTACK"
-          end
+      -- CLEANSTACK for P2SH: defer if this is a P2SH-wrapped witness program
+      local is_p2sh_witness = false
+      if flags.verify_witness then
+        local wv, _ = M.is_witness_program(redeem_script)
+        if wv then is_p2sh_witness = true end
+      end
+      if flags.verify_cleanstack and not is_p2sh_witness then
+        if #redeem_stack ~= 1 then
+          return nil, "CLEANSTACK"
         end
       end
     end
@@ -1728,20 +1683,36 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
         return nil, werr
       end
 
-    elseif did_p2sh and p2sh_redeem_script then
+    elseif did_p2sh then
       -- Check if P2SH redeem script is a witness program (P2SH-P2WPKH / P2SH-P2WSH)
-      witness_version, witness_program = M.is_witness_program(p2sh_redeem_script)
-      if witness_version then
-        had_witness = true
-        -- P2SH-wrapped witness: scriptSig must be exactly a push of the witness program
-        -- (verified implicitly by P2SH evaluation already succeeding)
+      -- We need the original redeem script. Re-extract from original scriptSig stack.
+      local sig_stack_copy = {}
+      do
+        local tmp, _ = M.execute_script(script_sig, {}, flags, checker)
+        if tmp then
+          for i, v in ipairs(tmp) do sig_stack_copy[i] = v end
+        end
+      end
+      local p2sh_redeem = sig_stack_copy[#sig_stack_copy]
 
-        -- Get witness data from checker
-        local witness = (checker and checker.get_witness and checker.get_witness()) or {}
+      if p2sh_redeem then
+        witness_version, witness_program = M.is_witness_program(p2sh_redeem)
+        if witness_version then
+          had_witness = true
 
-        local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
-        if not ok then
-          return nil, werr
+          -- P2SH-wrapped witness: scriptSig must be exactly a single push of the witness program
+          -- Verify scriptSig is push-only and contains exactly 1 element
+          if #sig_stack_copy ~= 1 then
+            return nil, "WITNESS_MALLEATED_P2SH"
+          end
+
+          -- Get witness data from checker
+          local witness = (checker and checker.get_witness and checker.get_witness()) or {}
+
+          local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
+          if not ok then
+            return nil, werr
+          end
         end
       end
     end
@@ -1756,7 +1727,7 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
     end
   end
 
-  -- CLEANSTACK for non-P2SH: check main stack
+  -- CLEANSTACK for non-P2SH non-witness: check main stack
   if flags.verify_cleanstack and not did_p2sh then
     if #stack ~= 1 then
       return nil, "CLEANSTACK"
@@ -1764,6 +1735,39 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
   end
 
   return true
+end
+
+--- Execute a tapscript (BIP342) with witness data.
+-- Tapscript is executed with the tapscript-specific rules:
+-- - OP_CHECKSIG/OP_CHECKSIGVERIFY use Schnorr signatures (BIP340)
+-- - OP_CHECKMULTISIG/OP_CHECKMULTISIGVERIFY are disabled
+-- - OP_CHECKSIGADD is enabled
+-- - MINIMALIF is a consensus rule (not just policy)
+-- - SUCCESS opcodes (0x50, 0x62, 0x7e-0x81, 0x83-0x86, 0x95-0x99) cause immediate success
+-- @param tapscript_bytes string: The tapscript to execute
+-- @param witness_stack table: Array of witness stack items (excluding script and control block)
+-- @param checker table: Signature checker with check_sig method for Schnorr verification
+-- @return boolean: true if script succeeds
+-- @return string|nil: Error message on failure
+function M.verify_tapscript(tapscript_bytes, witness_stack, checker)
+  -- BIP342: Max script size is not enforced for tapscript (no 10,000 byte limit)
+  -- but we still enforce individual stack element size (520 bytes)
+
+  -- Copy witness stack
+  local stack = {}
+  for i = 1, #witness_stack do
+    stack[i] = witness_stack[i]
+  end
+
+  local tapscript_flags = {
+    is_tapscript = true,
+    verify_nullfail = true,
+    verify_checklocktimeverify = true,
+    verify_checksequenceverify = true,
+  }
+
+  -- Execute the tapscript using the existing engine with tapscript flags
+  return M.execute_witness_script(tapscript_bytes, stack, tapscript_flags, checker)
 end
 
 return M

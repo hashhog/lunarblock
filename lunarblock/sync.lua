@@ -546,10 +546,35 @@ end
 --- Add genesis block to the chain.
 function HeaderChain:add_genesis()
   local gen = self.network.genesis
+
+  -- Build genesis coinbase exactly matching Bitcoin Core to compute correct merkle root
+  local msg = gen.coinbase_message
+  -- scriptSig: PUSH4(486604799_le) PUSH1(0x04) PUSH_N(message)
+  -- 486604799 = 0x1d00ffff, always hardcoded in Bitcoin Core's CreateGenesisBlock
+  local script_sig = "\x04\xff\xff\x00\x1d\x01\x04" .. string.char(#msg) .. msg
+  local coinbase_input = types.txin(
+    types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+    script_sig, 0xFFFFFFFF
+  )
+  -- Use network-specific pubkey if provided, otherwise default to Satoshi's key
+  local pubkey_hex = gen.coinbase_pubkey_hex or "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"
+  local pubkey = ""
+  for i = 1, #pubkey_hex, 2 do
+    pubkey = pubkey .. string.char(tonumber(pubkey_hex:sub(i, i+1), 16))
+  end
+  local output_script = string.char(#pubkey) .. pubkey .. "\xac"
+  local subsidy = consensus.get_block_subsidy(0)
+  local coinbase_tx = types.transaction(1,
+    {coinbase_input},
+    {types.txout(subsidy, output_script)},
+    0)
+  local txid = validation.compute_txid(coinbase_tx)
+  local merkle_root = txid  -- single tx: merkle root == txid
+
   local header = types.block_header(
     gen.version,
     types.hash256_zero(),  -- prev_hash (genesis has no parent)
-    types.hash256_zero(),  -- merkle root (computed later for full block)
+    merkle_root,
     gen.timestamp,
     gen.bits,
     gen.nonce

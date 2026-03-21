@@ -6,6 +6,7 @@ local validation = require("lunarblock.validation")
 local script = require("lunarblock.script")
 local storage_mod = require("lunarblock.storage")
 local perf = require("lunarblock.perf")
+local sig_cache = require("lunarblock.sig_cache")
 local bit = require("bit")
 local M = {}
 
@@ -166,6 +167,123 @@ function M.deserialize_block_undo(data)
     tx_undo[i] = M.deserialize_tx_undo(reader)
   end
   return M.block_undo(tx_undo)
+end
+
+--------------------------------------------------------------------------------
+-- AssumeUTXO Snapshot Format
+--------------------------------------------------------------------------------
+
+-- Snapshot metadata structure matching Bitcoin Core's SnapshotMetadata
+-- Reference: /home/max/hashhog/bitcoin/src/node/utxo_snapshot.h
+--
+-- Format:
+--   magic_bytes[5]  = 'utxo' + 0xff
+--   version[2]      = uint16 LE
+--   network_magic[4] = 4-byte network identifier
+--   base_blockhash[32] = hash of snapshot base block
+--   coins_count[8]  = uint64 LE total number of UTXOs
+--
+-- Followed by UTXO data:
+--   For each unique txid:
+--     txid[32]         = transaction ID
+--     num_outputs[var] = varint number of outputs for this txid
+--     For each output:
+--       vout_index[var] = varint output index
+--       code[var]       = varint (height * 2 + is_coinbase)
+--       value[8]        = int64 LE amount in satoshis
+--       script[var]     = varstring script_pubkey
+
+-- Snapshot magic bytes (Bitcoin Core compatible)
+M.SNAPSHOT_MAGIC = "utxo\xff"
+M.SNAPSHOT_VERSION = 2
+
+--- Create snapshot metadata structure.
+-- @param network_magic string: 4-byte network identifier
+-- @param base_blockhash hash256: hash of snapshot base block
+-- @param coins_count number: total UTXO count
+-- @return table: snapshot metadata
+function M.snapshot_metadata(network_magic, base_blockhash, coins_count)
+  return {
+    magic = M.SNAPSHOT_MAGIC,
+    version = M.SNAPSHOT_VERSION,
+    network_magic = network_magic,
+    base_blockhash = base_blockhash,
+    coins_count = coins_count,
+  }
+end
+
+--- Serialize snapshot metadata to binary format.
+-- @param metadata table: snapshot metadata
+-- @return string: serialized metadata
+function M.serialize_snapshot_metadata(metadata)
+  local w = serialize.buffer_writer()
+  w.write_bytes(M.SNAPSHOT_MAGIC)  -- 5 bytes
+  w.write_u16le(metadata.version)   -- 2 bytes
+  w.write_bytes(metadata.network_magic)  -- 4 bytes
+  w.write_hash256(metadata.base_blockhash)  -- 32 bytes
+  w.write_u64le(metadata.coins_count)  -- 8 bytes
+  return w.result()  -- Total: 51 bytes
+end
+
+--- Deserialize snapshot metadata from binary format.
+-- @param data string: raw snapshot file header
+-- @return table|nil, string|nil: metadata or nil, error message
+function M.deserialize_snapshot_metadata(data)
+  if #data < 51 then
+    return nil, "snapshot metadata too short"
+  end
+
+  local r = serialize.buffer_reader(data)
+
+  -- Validate magic bytes
+  local magic = r.read_bytes(5)
+  if magic ~= M.SNAPSHOT_MAGIC then
+    return nil, "invalid snapshot magic bytes"
+  end
+
+  local version = r.read_u16le()
+  if version > M.SNAPSHOT_VERSION then
+    return nil, string.format("unsupported snapshot version %d (max %d)",
+      version, M.SNAPSHOT_VERSION)
+  end
+
+  local network_magic = r.read_bytes(4)
+  local base_blockhash = types.hash256(r.read_bytes(32))
+  local coins_count = r.read_u64le()
+
+  return {
+    magic = magic,
+    version = version,
+    network_magic = network_magic,
+    base_blockhash = base_blockhash,
+    coins_count = coins_count,
+  }
+end
+
+--- Serialize a coin for snapshot format.
+-- Uses compact encoding: code (height*2 + coinbase) + value + script
+-- @param entry table: UTXO entry
+-- @return string: serialized coin
+function M.serialize_snapshot_coin(entry)
+  local w = serialize.buffer_writer()
+  -- Encode height and coinbase flag together: (height * 2) + coinbase_flag
+  local code = entry.height * 2 + (entry.is_coinbase and 1 or 0)
+  w.write_varint(code)
+  w.write_i64le(entry.value)
+  w.write_varstr(entry.script_pubkey)
+  return w.result()
+end
+
+--- Deserialize a coin from snapshot format.
+-- @param reader buffer_reader: reader positioned at coin data
+-- @return table: UTXO entry
+function M.deserialize_snapshot_coin(reader)
+  local code = reader.read_varint()
+  local height = math.floor(code / 2)
+  local is_coinbase = (code % 2) == 1
+  local value = reader.read_i64le()
+  local script_pubkey = reader.read_varstr()
+  return M.utxo_entry(value, script_pubkey, height, is_coinbase)
 end
 
 --------------------------------------------------------------------------------
@@ -678,6 +796,15 @@ function M.new_chain_state(storage, network)
   self.coin_view = M.new_coin_view(storage)
   self.tip_hash = nil
   self.tip_height = -1
+  -- Set of invalidated block hashes (keyed by hash bytes for fast lookup)
+  self.invalid_blocks = {}
+  -- Signature verification cache (avoids re-verifying scripts during IBD/reorg)
+  self.sig_cache = sig_cache.new(50000)
+  -- Optional notification callbacks (for ZMQ, etc.)
+  self.callbacks = {
+    on_block_connected = nil,     -- function(block_hash, block_data)
+    on_block_disconnected = nil,  -- function(block_hash)
+  }
   return self
 end
 
@@ -686,7 +813,147 @@ function ChainState:init()
   if hash then
     self.tip_hash = hash
     self.tip_height = height
+  else
+    -- No chain tip stored yet: build and connect the genesis block
+    self:connect_genesis()
   end
+  -- Load invalid blocks set from storage
+  self:load_invalid_blocks()
+end
+
+--- Build and connect the genesis block to initialize the chain.
+-- Called when no chain tip is found in storage (fresh start).
+function ChainState:connect_genesis()
+  local gen = self.network.genesis
+
+  -- Build the genesis coinbase transaction exactly matching Bitcoin Core
+  -- scriptSig: PUSH4(486604799_le) PUSH1(0x04) PUSH_N(message)
+  -- Note: Bitcoin Core always uses 486604799 (0x1d00ffff) in genesis scriptSig
+  -- regardless of network, as it's hardcoded in CreateGenesisBlock.
+  local msg = gen.coinbase_message
+  -- 486604799 = 0x1d00ffff, LE = ff ff 00 1d
+  local bits_le = "\xff\xff\x00\x1d"
+  -- scriptSig: 04 <bits_le> 01 04 <len> <message>
+  local script_sig = "\x04" .. bits_le .. "\x01\x04" .. string.char(#msg) .. msg
+
+  local coinbase_input = types.txin(
+    types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+    script_sig,
+    0xFFFFFFFF
+  )
+
+  -- Genesis coinbase output: 50 BTC to pubkey
+  -- Use network-specific pubkey if provided, otherwise default to Satoshi's key
+  local subsidy = consensus.get_block_subsidy(0)
+  local pubkey_hex = gen.coinbase_pubkey_hex or "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"
+  local pubkey = ""
+  for i = 1, #pubkey_hex, 2 do
+    pubkey = pubkey .. string.char(tonumber(pubkey_hex:sub(i, i+1), 16))
+  end
+  -- OP_PUSH<len> <pubkey> OP_CHECKSIG
+  local output_script = string.char(#pubkey) .. pubkey .. "\xac"
+  local coinbase_output = types.txout(subsidy, output_script)
+
+  local coinbase_tx = types.transaction(1, {coinbase_input}, {coinbase_output}, 0)
+
+  -- Compute merkle root (single tx)
+  local txid = validation.compute_txid(coinbase_tx)
+  local merkle_root = txid  -- single tx: merkle root == txid
+
+  -- Build genesis block header with correct merkle root
+  local header = types.block_header(
+    gen.version,
+    types.hash256_zero(),
+    merkle_root,
+    gen.timestamp,
+    gen.bits,
+    gen.nonce
+  )
+
+  local block_hash = validation.compute_block_hash(header)
+  local block = types.block(header, {coinbase_tx})
+
+  -- Store the full block and header
+  self.storage.put_block(block_hash, block)
+  self.storage.put_header(block_hash, header)
+  self.storage.put_height_index(0, block_hash)
+
+  -- Add the coinbase UTXO to the UTXO set
+  -- Note: genesis coinbase is technically unspendable in Bitcoin Core,
+  -- but we still add it for consistency
+  for vout_idx, out in ipairs(coinbase_tx.outputs) do
+    if #out.script_pubkey == 0 or out.script_pubkey:byte(1) ~= 0x6a then
+      self.coin_view:add(txid, vout_idx - 1, M.utxo_entry(
+        out.value, out.script_pubkey, 0, true
+      ))
+    end
+  end
+  self.coin_view:flush()
+
+  -- Set chain tip to genesis
+  self.tip_hash = block_hash
+  self.tip_height = 0
+  self.storage.set_chain_tip(block_hash, 0, true)
+end
+
+--- Load invalid blocks set from persistent storage.
+function ChainState:load_invalid_blocks()
+  local data = self.storage.get(storage_mod.CF.META, "invalid_blocks")
+  if not data then
+    self.invalid_blocks = {}
+    return
+  end
+
+  -- Format: concatenation of 32-byte hashes
+  self.invalid_blocks = {}
+  local i = 1
+  while i + 31 <= #data do
+    local hash_bytes = data:sub(i, i + 31)
+    self.invalid_blocks[hash_bytes] = true
+    i = i + 32
+  end
+end
+
+--- Save invalid blocks set to persistent storage.
+function ChainState:save_invalid_blocks()
+  local parts = {}
+  for hash_bytes, _ in pairs(self.invalid_blocks) do
+    parts[#parts + 1] = hash_bytes
+  end
+  -- Sort for deterministic ordering
+  table.sort(parts)
+  local data = table.concat(parts)
+  self.storage.put(storage_mod.CF.META, "invalid_blocks", data, true)
+end
+
+--- Check if a block is marked as invalid.
+-- @param block_hash hash256: The block hash to check
+-- @return boolean: true if the block is invalid
+function ChainState:is_block_invalid(block_hash)
+  return self.invalid_blocks[block_hash.bytes] == true
+end
+
+--- Check if a block has an invalid ancestor.
+-- @param block_hash hash256: The block hash to check
+-- @return boolean: true if any ancestor is invalid
+function ChainState:has_invalid_ancestor(block_hash)
+  local current_hash = block_hash
+  while current_hash do
+    if self:is_block_invalid(current_hash) then
+      return true
+    end
+    -- Get parent
+    local header = self.storage.get_header(current_hash)
+    if not header then
+      break
+    end
+    -- Check if we've reached genesis (all-zero prev_hash)
+    if header.prev_hash.bytes == string.rep("\0", 32) then
+      break
+    end
+    current_hash = header.prev_hash
+  end
+  return false
 end
 
 --------------------------------------------------------------------------------
@@ -700,8 +967,9 @@ end
 -- @param prev_block_mtp The median time past of the previous block (for BIP68)
 -- @param get_block_mtp Function to get MTP for a given height (for BIP68)
 -- @param skip_script_validation If true, skip script verification (assumevalid optimization)
+-- @param use_parallel If true, attempt parallel signature verification (default: auto)
 -- @return true on success, nil and error message on failure
-function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation)
+function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel)
   -- Build undo data as we go - one TxUndo per non-coinbase transaction
   local block_undo = M.block_undo({})
   local total_fees = 0
@@ -715,6 +983,26 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     verify_p2sh = height >= self.network.bip34_height,
     verify_witness = height >= self.network.segwit_height,
   }
+
+  -- Determine if we should use parallel verification
+  -- Auto-detect: use parallel if available and block has enough inputs
+  local parallel_available = validation.parallel_verify_available()
+  local use_parallel_verify = false
+  if use_parallel == nil then
+    -- Auto: use parallel if available and block has many inputs
+    if parallel_available and not skip_script_validation then
+      local total_inputs = 0
+      for i = 2, #block.transactions do  -- Skip coinbase
+        total_inputs = total_inputs + #block.transactions[i].inputs
+      end
+      use_parallel_verify = total_inputs >= 16
+    end
+  else
+    use_parallel_verify = use_parallel and parallel_available
+  end
+
+  -- Collect signatures for parallel verification
+  local parallel_sigs = use_parallel_verify and {} or nil
 
   for tx_idx, tx in ipairs(block.transactions) do
     local txid = validation.compute_txid(tx)
@@ -792,6 +1080,20 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
         -- Script verification (skip if assumevalid optimization is active)
         if not skip_script_validation then
+          -- Compute cache key flags as a bitmask
+          local cache_flags = 0
+          if height >= self.network.bip34_height then cache_flags = cache_flags + 1 end     -- P2SH
+          if height >= self.network.bip66_height then cache_flags = cache_flags + 2 end     -- DERSIG
+          if height >= self.network.bip65_height then cache_flags = cache_flags + 4 end     -- CLTV
+          if height >= self.network.csv_height then cache_flags = cache_flags + 8 end       -- CSV
+          if height >= self.network.segwit_height then cache_flags = cache_flags + 16 end   -- WITNESS
+
+          -- Check signature cache first
+          local txid_bytes = txid.bytes
+          if self.sig_cache:lookup(txid_bytes, inp_idx, cache_flags) then
+            goto skip_verification
+          end
+
           local flags = {
             verify_p2sh = height >= self.network.bip34_height,
             verify_dersig = height >= self.network.bip66_height,
@@ -853,11 +1155,119 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               local ok, err = script.execute_witness_script(witness_script, stack, segwit_flags, segwit_checker)
               assert(ok, err or "P2WSH script verification failed")
             end
+
+          elseif script_type == "p2tr" and height >= self.network.taproot_height then
+            -- P2TR (taproot) witness v1: scriptSig must be empty, use witness stack
+            assert(#inp.script_sig == 0, "Taproot input must have empty scriptSig")
+            local witness = inp.witness or {}
+            assert(#witness > 0, "taproot witness empty")
+
+            -- Witness program is the 32-byte x-only output key
+            local witness_program = utxo.script_pubkey:sub(3, 34)
+
+            -- Check for annex (last witness element starting with 0x50)
+            local annex = nil
+            if #witness >= 2 then
+              local last = witness[#witness]
+              if #last > 0 and string.byte(last, 1) == 0x50 then
+                annex = last
+                -- Remove annex from witness for processing
+                local trimmed = {}
+                for wi = 1, #witness - 1 do
+                  trimmed[wi] = witness[wi]
+                end
+                witness = trimmed
+              end
+            end
+
+            -- Collect prev_outputs for taproot sighash (needs all inputs' prevouts)
+            local prev_outputs = {}
+            for pi = 1, #tx.inputs do
+              local pu = utxo_cache[pi]
+              prev_outputs[pi] = { value = pu.value, script_pubkey = pu.script_pubkey }
+            end
+
+            if #witness == 1 then
+              -- Key-path spend: single element is a Schnorr signature
+              local sig = witness[1]
+              assert(#sig == 64 or #sig == 65, "taproot invalid signature length")
+
+              local hash_type = 0x00  -- SIGHASH_DEFAULT
+              local sig_bytes = sig
+              if #sig == 65 then
+                hash_type = string.byte(sig, 65)
+                sig_bytes = string.sub(sig, 1, 64)
+                -- BIP341: 0x00 hash_type must not use 65-byte sig
+                assert(hash_type ~= 0x00, "taproot invalid hash type with 65-byte sig")
+              end
+
+              -- Compute taproot sighash for key-path (ext_flag = 0)
+              local sighash = validation.signature_hash_taproot(
+                tx, inp_idx - 1, hash_type, prev_outputs, 0, annex)
+
+              -- Verify Schnorr signature against the output key (witness_program)
+              local ok = crypto.schnorr_verify(witness_program, sig_bytes, sighash)
+              assert(ok, "taproot key-path signature verification failed")
+            else
+              -- Script-path spend: last element is control block, second-to-last is script
+              local control_block = witness[#witness]
+              local tapscript = witness[#witness - 1]
+
+              assert(#control_block >= 33, "taproot invalid control block size")
+              assert((#control_block - 33) % 32 == 0, "taproot invalid control block size")
+
+              local leaf_version = bit.band(string.byte(control_block, 1), 0xFE)
+              local internal_key = string.sub(control_block, 2, 33)
+
+              -- Compute tapleaf hash
+              local leaf_hash = crypto.tagged_hash("TapLeaf",
+                string.char(leaf_version) .. crypto.compact_size(#tapscript) .. tapscript)
+
+              -- Walk merkle path to compute root
+              local current = leaf_hash
+              for mi = 34, #control_block, 32 do
+                local sibling = string.sub(control_block, mi, mi + 31)
+                if current < sibling then
+                  current = crypto.tagged_hash("TapBranch", current .. sibling)
+                else
+                  current = crypto.tagged_hash("TapBranch", sibling .. current)
+                end
+              end
+
+              -- Compute tweaked key and verify it matches the output key
+              local tweak = crypto.tagged_hash("TapTweak", internal_key .. current)
+              local tweaked_key = crypto.tweak_pubkey(internal_key, tweak)
+              assert(tweaked_key and tweaked_key == witness_program,
+                "taproot commitment mismatch")
+
+              -- Execute tapscript if leaf version is 0xC0 (BIP342)
+              if leaf_version == 0xC0 then
+                -- Build the script witness (all items except script and control block)
+                local script_witness = {}
+                for wi = 1, #witness - 2 do
+                  script_witness[wi] = witness[wi]
+                end
+
+                -- Create tapscript-aware sig checker
+                local tapscript_checker = validation.make_tapscript_checker(
+                  tx, inp_idx - 1, prev_outputs, leaf_hash, annex)
+
+                local ok, err = script.verify_tapscript(
+                  tapscript, script_witness, tapscript_checker)
+                assert(ok, "tapscript execution failed: " .. (err or "unknown"))
+              end
+              -- Other leaf versions: succeed unconditionally (future soft fork)
+            end
+
           else
             -- Legacy or P2SH
             local ok = script.verify_script(inp.script_sig, utxo.script_pubkey, flags, checker)
             assert(ok, "Script verification failed for input " .. inp_idx)
           end
+
+          -- Cache successful verification
+          self.sig_cache:insert(txid_bytes, inp_idx, cache_flags)
+          ::skip_verification::
         end
 
         input_total = input_total + utxo.value
@@ -891,6 +1301,12 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     end
   end
 
+  -- If we collected signatures for parallel verification, verify them now
+  if parallel_sigs and #parallel_sigs > 0 then
+    local ok, err = validation.verify_signatures_parallel(parallel_sigs)
+    assert(ok, "Parallel signature verification failed: " .. (err or "unknown error"))
+  end
+
   -- Check total sigop cost does not exceed limit
   assert(total_sigop_cost <= consensus.MAX_BLOCK_SIGOPS_COST,
     string.format("Block sigop cost %d exceeds maximum %d",
@@ -920,6 +1336,11 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   self.tip_height = height
   self.storage.set_chain_tip(block_hash, height, true)
 
+  -- Invoke callback if registered (for ZMQ notifications, etc.)
+  if self.callbacks.on_block_connected then
+    self.callbacks.on_block_connected(block_hash, block)
+  end
+
   return true, total_fees
 end
 
@@ -934,6 +1355,9 @@ end
 -- @param prev_hash The hash of the previous block (becomes new tip)
 -- @return true on success, nil and error message on failure
 function ChainState:disconnect_block(block, height, block_hash, prev_hash)
+  -- Clear signature cache on reorg to avoid stale entries
+  self.sig_cache:clear()
+
   -- Load undo data from storage
   local undo_data_raw = self.storage.get_undo(block_hash)
   local block_undo = nil
@@ -995,7 +1419,177 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
     self.storage.set_chain_tip(prev_hash, height - 1, true)
   end
 
+  -- Invoke callback if registered (for ZMQ notifications, etc.)
+  if self.callbacks.on_block_disconnected then
+    self.callbacks.on_block_disconnected(block_hash)
+  end
+
   return true
+end
+
+--------------------------------------------------------------------------------
+-- Block Invalidation (invalidateblock / reconsiderblock RPC support)
+--------------------------------------------------------------------------------
+
+--- Invalidate a block and all its descendants, triggering a reorg if needed.
+-- This marks the block as invalid and disconnects it from the active chain.
+-- @param block_hash hash256: The hash of the block to invalidate
+-- @return boolean, string|nil: success flag, error message on failure
+function ChainState:invalidate_block(block_hash)
+  -- Cannot invalidate genesis block
+  local header = self.storage.get_header(block_hash)
+  if not header then
+    return nil, "Block not found"
+  end
+
+  -- Check if this is the genesis block (prev_hash is all zeros)
+  if header.prev_hash.bytes == string.rep("\0", 32) then
+    return nil, "Cannot invalidate genesis block"
+  end
+
+  -- Mark this block as invalid
+  self.invalid_blocks[block_hash.bytes] = true
+
+  -- Check if the block is in the active chain
+  local block_in_chain = false
+  local block_height = nil
+
+  -- Find the height of this block by searching from tip
+  if self.tip_hash and types.hash256_eq(self.tip_hash, block_hash) then
+    block_in_chain = true
+    block_height = self.tip_height
+  else
+    -- Check if the block is an ancestor of the current tip
+    local current_hash = self.tip_hash
+    local current_height = self.tip_height
+    while current_hash and current_height >= 0 do
+      if types.hash256_eq(current_hash, block_hash) then
+        block_in_chain = true
+        block_height = current_height
+        break
+      end
+      local h = self.storage.get_header(current_hash)
+      if not h then
+        break
+      end
+      if h.prev_hash.bytes == string.rep("\0", 32) then
+        break
+      end
+      current_hash = h.prev_hash
+      current_height = current_height - 1
+    end
+  end
+
+  -- If the block is in the active chain, disconnect blocks from tip back to it
+  if block_in_chain then
+    while self.tip_height >= block_height do
+      local tip_block = self.storage.get_block(self.tip_hash)
+      if not tip_block then
+        return nil, "Failed to load block for disconnection"
+      end
+
+      local tip_header = self.storage.get_header(self.tip_hash)
+      if not tip_header then
+        return nil, "Failed to load header for disconnection"
+      end
+
+      local prev_hash = tip_header.prev_hash
+      local ok, err = self:disconnect_block(tip_block, self.tip_height, self.tip_hash, prev_hash)
+      if not ok then
+        return nil, "Failed to disconnect block: " .. (err or "unknown error")
+      end
+    end
+  end
+
+  -- Persist the invalid blocks set
+  self:save_invalid_blocks()
+
+  return true
+end
+
+--- Remove invalidity status from a block and its ancestors/descendants.
+-- This clears the invalid flag and potentially allows re-activation.
+-- @param block_hash hash256: The hash of the block to reconsider
+-- @return boolean, string|nil: success flag, error message on failure
+function ChainState:reconsider_block(block_hash)
+  -- Check if the block exists
+  local header = self.storage.get_header(block_hash)
+  if not header then
+    return nil, "Block not found"
+  end
+
+  -- Remove invalid flag from this block
+  self.invalid_blocks[block_hash.bytes] = nil
+
+  -- Also clear invalid flags from all ancestors
+  local current_hash = header.prev_hash
+  while current_hash and current_hash.bytes ~= string.rep("\0", 32) do
+    self.invalid_blocks[current_hash.bytes] = nil
+    local h = self.storage.get_header(current_hash)
+    if not h then
+      break
+    end
+    current_hash = h.prev_hash
+  end
+
+  -- Clear invalid flags from all descendants
+  -- This requires iterating through all stored headers to find descendants
+  self:clear_descendant_invalid_flags(block_hash)
+
+  -- Persist the invalid blocks set
+  self:save_invalid_blocks()
+
+  return true
+end
+
+--- Clear invalid flags from all descendants of a block.
+-- @param block_hash hash256: The parent block hash
+function ChainState:clear_descendant_invalid_flags(block_hash)
+  -- Iterate through all headers and check if they descend from block_hash
+  local iter = self.storage.iterator(storage_mod.CF.HEADERS)
+  iter.seek_to_first()
+
+  local descendants = {}
+  while iter.valid() do
+    local hash_bytes = iter.key()
+    if self.invalid_blocks[hash_bytes] then
+      -- Check if this is a descendant of block_hash
+      local candidate_hash = types.hash256(hash_bytes)
+      local current = candidate_hash
+      while current do
+        local h = self.storage.get_header(current)
+        if not h then
+          break
+        end
+        if types.hash256_eq(h.prev_hash, block_hash) then
+          -- This is a descendant
+          descendants[hash_bytes] = true
+          break
+        end
+        if h.prev_hash.bytes == string.rep("\0", 32) then
+          break
+        end
+        current = h.prev_hash
+      end
+    end
+    iter.next()
+  end
+  iter.destroy()
+
+  -- Clear the invalid flag for all descendants
+  for hash_bytes, _ in pairs(descendants) do
+    self.invalid_blocks[hash_bytes] = nil
+  end
+end
+
+--- Get the list of currently invalidated block hashes.
+-- @return table: array of hash256 objects
+function ChainState:get_invalid_blocks()
+  local result = {}
+  for hash_bytes, _ in pairs(self.invalid_blocks) do
+    result[#result + 1] = types.hash256(hash_bytes)
+  end
+  return result
 end
 
 --------------------------------------------------------------------------------
@@ -1021,6 +1615,498 @@ function ChainState:get_utxo_stats()
     total_value = total_value,
     total_btc = total_value / consensus.COIN,
   }
+end
+
+--------------------------------------------------------------------------------
+-- AssumeUTXO Snapshot Operations
+--------------------------------------------------------------------------------
+
+--- Compute the serialized UTXO set hash for AssumeUTXO validation.
+-- This iterates all UTXOs in canonical order and computes SHA256 of the serialized set.
+-- @return string: 32-byte hash
+-- @return number: total UTXO count
+function ChainState:compute_utxo_hash()
+  -- Flush any pending changes to ensure we're reading from disk
+  self.coin_view:flush()
+
+  local count = 0
+  local hasher = crypto.sha256_init()
+
+  -- Iterate all UTXOs in key order (txid + vout)
+  local iter = self.storage.iterator(storage_mod.CF.UTXO)
+  iter.seek_to_first()
+
+  while iter.valid() do
+    local key = iter.key()
+    local data = iter.value()
+
+    -- Add key + serialized entry to hash
+    hasher.update(key)
+    hasher.update(data)
+
+    count = count + 1
+    iter.next()
+  end
+  iter.destroy()
+
+  return hasher.final(), count
+end
+
+--- Dump the UTXO set to a snapshot file.
+-- Format matches Bitcoin Core's dumptxoutset output.
+-- @param file_path string: path to write snapshot file
+-- @return table|nil, string|nil: {coins_count, hash} or nil, error message
+function ChainState:dump_snapshot(file_path)
+  -- Ensure coin view is flushed
+  self.coin_view:flush()
+
+  -- Open output file
+  local file, err = io.open(file_path, "wb")
+  if not file then
+    return nil, "failed to open file: " .. (err or "unknown error")
+  end
+
+  -- First pass: count UTXOs and group by txid
+  local utxos_by_txid = {}
+  local total_count = 0
+
+  local iter = self.storage.iterator(storage_mod.CF.UTXO)
+  iter.seek_to_first()
+
+  while iter.valid() do
+    local key = iter.key()
+    local data = iter.value()
+
+    -- Parse outpoint from key: txid (32) + vout (4 LE)
+    local txid_bytes = key:sub(1, 32)
+    local r = serialize.buffer_reader(key:sub(33, 36))
+    local vout = r.read_u32le()
+
+    local entry = M.deserialize_utxo_entry(data)
+
+    if not utxos_by_txid[txid_bytes] then
+      utxos_by_txid[txid_bytes] = {}
+    end
+    utxos_by_txid[txid_bytes][vout] = entry
+    total_count = total_count + 1
+
+    iter.next()
+  end
+  iter.destroy()
+
+  -- Write metadata
+  local metadata = M.snapshot_metadata(
+    self.network.magic_bytes,
+    self.tip_hash,
+    total_count
+  )
+  file:write(M.serialize_snapshot_metadata(metadata))
+
+  -- Second pass: write UTXO data grouped by txid
+  -- Iterate in sorted txid order for determinism
+  local sorted_txids = {}
+  for txid_bytes in pairs(utxos_by_txid) do
+    sorted_txids[#sorted_txids + 1] = txid_bytes
+  end
+  table.sort(sorted_txids)
+
+  for _, txid_bytes in ipairs(sorted_txids) do
+    local outputs = utxos_by_txid[txid_bytes]
+
+    -- Sort output indices
+    local sorted_vouts = {}
+    for vout in pairs(outputs) do
+      sorted_vouts[#sorted_vouts + 1] = vout
+    end
+    table.sort(sorted_vouts)
+
+    -- Write txid
+    file:write(txid_bytes)
+
+    -- Write number of outputs for this txid
+    local w = serialize.buffer_writer()
+    w.write_varint(#sorted_vouts)
+    file:write(w.result())
+
+    -- Write each output
+    for _, vout in ipairs(sorted_vouts) do
+      local entry = outputs[vout]
+
+      local ow = serialize.buffer_writer()
+      ow.write_varint(vout)  -- Output index
+      file:write(ow.result())
+      file:write(M.serialize_snapshot_coin(entry))
+    end
+  end
+
+  file:close()
+
+  -- Compute hash for verification
+  local hash, _ = self:compute_utxo_hash()
+
+  return {
+    coins_count = total_count,
+    hash = hash,
+    base_blockhash = self.tip_hash,
+    base_height = self.tip_height,
+  }
+end
+
+--- Load a UTXO snapshot file into this chainstate.
+-- Validates the snapshot hash against assumeutxo configuration.
+-- @param file_path string: path to snapshot file
+-- @param expected_hash string|nil: expected hash (from assumeutxo config), or nil to skip validation
+-- @return boolean, string|nil: success flag, error message
+function ChainState:load_snapshot(file_path, expected_hash)
+  -- Open snapshot file
+  local file, err = io.open(file_path, "rb")
+  if not file then
+    return false, "failed to open snapshot: " .. (err or "unknown error")
+  end
+
+  -- Read metadata
+  local header = file:read(51)
+  if not header or #header < 51 then
+    file:close()
+    return false, "failed to read snapshot header"
+  end
+
+  local metadata, meta_err = M.deserialize_snapshot_metadata(header)
+  if not metadata then
+    file:close()
+    return false, meta_err
+  end
+
+  -- Validate network magic
+  if metadata.network_magic ~= self.network.magic_bytes then
+    file:close()
+    return false, "snapshot network magic mismatch"
+  end
+
+  -- Clear existing UTXO set
+  self.coin_view:clear_cache()
+  -- Note: For a full implementation, we'd also clear the UTXO column family in storage
+
+  local coins_loaded = 0
+  local coins_total = metadata.coins_count
+
+  -- Read UTXO data
+  while coins_loaded < coins_total do
+    -- Read txid
+    local txid_bytes = file:read(32)
+    if not txid_bytes or #txid_bytes < 32 then
+      file:close()
+      return false, string.format("unexpected end of snapshot at coin %d", coins_loaded)
+    end
+    local txid = types.hash256(txid_bytes)
+
+    -- Read number of outputs for this txid
+    local count_byte = file:read(1)
+    if not count_byte then
+      file:close()
+      return false, "unexpected end reading output count"
+    end
+
+    -- Handle varint reading from file
+    local num_outputs
+    local first = count_byte:byte(1)
+    if first < 0xFD then
+      num_outputs = first
+    elseif first == 0xFD then
+      local extra = file:read(2)
+      if not extra or #extra < 2 then
+        file:close()
+        return false, "truncated varint"
+      end
+      local r = serialize.buffer_reader(extra)
+      num_outputs = r.read_u16le()
+    elseif first == 0xFE then
+      local extra = file:read(4)
+      if not extra or #extra < 4 then
+        file:close()
+        return false, "truncated varint"
+      end
+      local r = serialize.buffer_reader(extra)
+      num_outputs = r.read_u32le()
+    else
+      local extra = file:read(8)
+      if not extra or #extra < 8 then
+        file:close()
+        return false, "truncated varint"
+      end
+      local r = serialize.buffer_reader(extra)
+      num_outputs = r.read_u64le()
+    end
+
+    -- Read each output
+    for _ = 1, num_outputs do
+      -- Read vout index (varint)
+      local vout_byte = file:read(1)
+      if not vout_byte then
+        file:close()
+        return false, "unexpected end reading vout"
+      end
+
+      local vout
+      local vout_first = vout_byte:byte(1)
+      if vout_first < 0xFD then
+        vout = vout_first
+      elseif vout_first == 0xFD then
+        local extra = file:read(2)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        vout = r.read_u16le()
+      elseif vout_first == 0xFE then
+        local extra = file:read(4)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        vout = r.read_u32le()
+      else
+        local extra = file:read(8)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        vout = r.read_u64le()
+      end
+
+      -- Read code (height*2 + coinbase flag) as varint
+      local code_byte = file:read(1)
+      if not code_byte then
+        file:close()
+        return false, "unexpected end reading code"
+      end
+
+      local code
+      local code_first = code_byte:byte(1)
+      if code_first < 0xFD then
+        code = code_first
+      elseif code_first == 0xFD then
+        local extra = file:read(2)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        code = r.read_u16le()
+      elseif code_first == 0xFE then
+        local extra = file:read(4)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        code = r.read_u32le()
+      else
+        local extra = file:read(8)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        code = r.read_u64le()
+      end
+
+      local height = math.floor(code / 2)
+      local is_coinbase = (code % 2) == 1
+
+      -- Read value (8 bytes i64 LE)
+      local value_bytes = file:read(8)
+      if not value_bytes or #value_bytes < 8 then
+        file:close()
+        return false, "unexpected end reading value"
+      end
+      local vr = serialize.buffer_reader(value_bytes)
+      local value = vr.read_i64le()
+
+      -- Read script (varstring)
+      local script_len_byte = file:read(1)
+      if not script_len_byte then
+        file:close()
+        return false, "unexpected end reading script length"
+      end
+
+      local script_len
+      local sl_first = script_len_byte:byte(1)
+      if sl_first < 0xFD then
+        script_len = sl_first
+      elseif sl_first == 0xFD then
+        local extra = file:read(2)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        script_len = r.read_u16le()
+      elseif sl_first == 0xFE then
+        local extra = file:read(4)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        script_len = r.read_u32le()
+      else
+        local extra = file:read(8)
+        if not extra then file:close(); return false, "truncated" end
+        local r = serialize.buffer_reader(extra)
+        script_len = r.read_u64le()
+      end
+
+      local script_pubkey = ""
+      if script_len > 0 then
+        script_pubkey = file:read(script_len)
+        if not script_pubkey or #script_pubkey < script_len then
+          file:close()
+          return false, "unexpected end reading script"
+        end
+      end
+
+      -- Add to UTXO set
+      local entry = M.utxo_entry(value, script_pubkey, height, is_coinbase)
+      self.coin_view:add(txid, vout, entry)
+
+      coins_loaded = coins_loaded + 1
+
+      -- Periodic flush to avoid memory pressure
+      if coins_loaded % 100000 == 0 then
+        self.coin_view:flush()
+      end
+    end
+  end
+
+  file:close()
+
+  -- Final flush
+  self.coin_view:flush()
+
+  -- Validate hash if expected hash is provided
+  if expected_hash then
+    local computed_hash, _ = self:compute_utxo_hash()
+    if computed_hash ~= expected_hash then
+      return false, "snapshot hash mismatch"
+    end
+  end
+
+  -- Update chain tip to snapshot base
+  self.tip_hash = metadata.base_blockhash
+  -- Note: We need to look up the height from storage or header chain
+  -- For now, this will be set by the caller
+
+  return true
+end
+
+--------------------------------------------------------------------------------
+-- Snapshot Chainstate Manager (for AssumeUTXO dual-chainstate)
+--------------------------------------------------------------------------------
+
+-- SnapshotChainstate wraps a ChainState with additional state for background validation
+local SnapshotChainstate = {}
+SnapshotChainstate.__index = SnapshotChainstate
+
+--- Create a new snapshot chainstate for AssumeUTXO.
+-- @param storage table: database handle
+-- @param network table: network configuration
+-- @param snapshot_height number: height of snapshot base block
+-- @param snapshot_hash hash256: hash of snapshot base block
+-- @return SnapshotChainstate
+function M.new_snapshot_chainstate(storage, network, snapshot_height, snapshot_hash)
+  local self = setmetatable({}, SnapshotChainstate)
+  self.chain_state = M.new_chain_state(storage, network)
+  self.snapshot_height = snapshot_height
+  self.snapshot_hash = snapshot_hash
+  self.is_snapshot = true
+  self.background_validated = false
+  return self
+end
+
+--- Check if background validation is complete.
+-- @return boolean
+function SnapshotChainstate:is_validated()
+  return self.background_validated
+end
+
+--- Mark background validation as complete.
+function SnapshotChainstate:set_validated()
+  self.background_validated = true
+end
+
+--- Get the underlying chain state.
+-- @return ChainState
+function SnapshotChainstate:get_chain_state()
+  return self.chain_state
+end
+
+-- Background validation coroutine state
+local BackgroundValidator = {}
+BackgroundValidator.__index = BackgroundValidator
+
+--- Create a background validator for AssumeUTXO.
+-- Validates the chain from genesis to snapshot height using a separate UTXO view.
+-- @param storage table: database handle
+-- @param network table: network configuration
+-- @param target_height number: snapshot height to validate up to
+-- @param target_hash string: expected UTXO hash at target height
+-- @param get_block function: fn(height) -> block, hash
+-- @return BackgroundValidator
+function M.new_background_validator(storage, network, target_height, target_hash, get_block)
+  local self = setmetatable({}, BackgroundValidator)
+  self.chain_state = M.new_chain_state(storage, network)
+  self.chain_state:init()
+  self.target_height = target_height
+  self.target_hash = target_hash
+  self.get_block = get_block
+  self.current_height = 0
+  self.validated = false
+  self.error = nil
+  self.blocks_per_yield = 100  -- Process 100 blocks per coroutine resume
+  return self
+end
+
+--- Run one iteration of background validation.
+-- Processes blocks_per_yield blocks and returns progress.
+-- @return number, number, boolean, string|nil: current_height, target_height, complete, error
+function BackgroundValidator:step()
+  if self.validated or self.error then
+    return self.current_height, self.target_height, self.validated, self.error
+  end
+
+  local blocks_processed = 0
+  while self.current_height < self.target_height and blocks_processed < self.blocks_per_yield do
+    local block, block_hash = self.get_block(self.current_height)
+    if not block then
+      self.error = string.format("failed to get block at height %d", self.current_height)
+      return self.current_height, self.target_height, false, self.error
+    end
+
+    -- Connect block (skip script validation for performance during background sync)
+    local ok, err = pcall(function()
+      self.chain_state:connect_block(block, self.current_height, block_hash, nil, nil, true)
+    end)
+
+    if not ok then
+      self.error = string.format("failed to connect block %d: %s", self.current_height, err)
+      return self.current_height, self.target_height, false, self.error
+    end
+
+    self.current_height = self.current_height + 1
+    blocks_processed = blocks_processed + 1
+  end
+
+  -- Check if we reached target
+  if self.current_height >= self.target_height then
+    -- Compute UTXO hash and validate
+    local computed_hash, _ = self.chain_state:compute_utxo_hash()
+    if computed_hash == self.target_hash then
+      self.validated = true
+    else
+      self.error = "background validation UTXO hash mismatch"
+    end
+  end
+
+  return self.current_height, self.target_height, self.validated, self.error
+end
+
+--- Get validation progress as percentage.
+-- @return number: 0-100
+function BackgroundValidator:progress()
+  if self.target_height == 0 then return 100 end
+  return math.floor(self.current_height / self.target_height * 100)
+end
+
+--- Check if validation is complete.
+-- @return boolean
+function BackgroundValidator:is_complete()
+  return self.validated
+end
+
+--- Check if validation encountered an error.
+-- @return string|nil: error message or nil
+function BackgroundValidator:get_error()
+  return self.error
 end
 
 return M

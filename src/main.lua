@@ -2,6 +2,9 @@
 -- LunarBlock - Bitcoin full node in Lua
 -- CLI & Application Entry Point
 
+io.stdout:setvbuf("line")
+io.stderr:setvbuf("line")
+
 local VERSION = "0.1.0"
 
 --------------------------------------------------------------------------------
