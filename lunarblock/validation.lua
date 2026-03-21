@@ -1,10 +1,178 @@
 local bit = require("bit")
+local ffi = require("ffi")
 local types = require("lunarblock.types")
 local serialize = require("lunarblock.serialize")
 local crypto = require("lunarblock.crypto")
 local script = require("lunarblock.script")
 local consensus = require("lunarblock.consensus")
 local M = {}
+
+--------------------------------------------------------------------------------
+-- Parallel Verification (C Worker Pool)
+--------------------------------------------------------------------------------
+
+-- FFI declarations for parallel verification
+ffi.cdef[[
+  /* Input verification job */
+  typedef struct {
+    const uint8_t *tx_data;
+    size_t tx_len;
+    uint32_t input_index;
+    const uint8_t *prev_script;
+    size_t prev_script_len;
+    int64_t amount;
+    uint32_t flags;
+    int result;
+  } verify_job;
+
+  /* Signature verification job (pre-computed sighash) */
+  typedef struct {
+    const uint8_t *pubkey;
+    size_t pubkey_len;
+    const uint8_t *sig_der;
+    size_t sig_len;
+    const uint8_t *msghash32;
+    int result;
+  } sig_verify_job;
+
+  int pv_init(int num_threads);
+  int pv_verify_batch(verify_job *jobs, int count);
+  int pv_verify_signatures(sig_verify_job *jobs, int count);
+  int pv_get_num_workers(void);
+  void pv_shutdown(void);
+]]
+
+-- Parallel verification library (lazy loaded)
+local pv_lib = nil
+local pv_available = nil
+
+-- Try to load the parallel verification library
+local function init_parallel_verify()
+  if pv_available ~= nil then
+    return pv_available
+  end
+
+  local paths = {
+    "./lib/parallel_verify.so",
+    "lunarblock/parallel_verify",
+    "./lunarblock/parallel_verify.so",
+    "./parallel_verify.so",
+    "parallel_verify",
+  }
+
+  for _, path in ipairs(paths) do
+    local ok, lib = pcall(ffi.load, path)
+    if ok then
+      pv_lib = lib
+      -- Initialize worker pool
+      local num_workers = lib.pv_init(0)  -- Auto-detect thread count
+      if num_workers > 0 then
+        pv_available = true
+        return true
+      end
+    end
+  end
+
+  pv_available = false
+  return false
+end
+
+-- Threshold for using parallel verification
+local PARALLEL_THRESHOLD = 16
+
+--- Check if parallel verification is available.
+-- @return boolean: true if available
+function M.parallel_verify_available()
+  return init_parallel_verify()
+end
+
+--- Get number of parallel verification workers.
+-- @return number: number of worker threads, or 0 if not available
+function M.parallel_verify_workers()
+  if not init_parallel_verify() then
+    return 0
+  end
+  return pv_lib.pv_get_num_workers()
+end
+
+--- Shutdown parallel verification workers.
+-- Call this before exit to clean up resources.
+function M.parallel_verify_shutdown()
+  if pv_lib and pv_available then
+    pv_lib.pv_shutdown()
+    pv_available = false
+  end
+end
+
+--- Verify a batch of signatures in parallel.
+-- Each entry should have: pubkey (string), sig_der (string), sighash (string, 32 bytes)
+-- @param sigs table: array of {pubkey, sig_der, sighash}
+-- @return boolean, string|nil: success, error message if failed
+function M.verify_signatures_parallel(sigs)
+  if #sigs == 0 then
+    return true
+  end
+
+  -- Fall back to single-threaded if parallel not available or batch too small
+  if not init_parallel_verify() or #sigs < PARALLEL_THRESHOLD then
+    for i, sig in ipairs(sigs) do
+      local ok = crypto.ecdsa_verify(sig.pubkey, sig.sig_der, sig.sighash)
+      if not ok then
+        return false, "signature verification failed at index " .. i
+      end
+    end
+    return true
+  end
+
+  -- Prepare FFI job array
+  local jobs = ffi.new("sig_verify_job[?]", #sigs)
+
+  -- We need to keep references to prevent GC
+  local pubkey_ptrs = {}
+  local sig_ptrs = {}
+  local hash_ptrs = {}
+
+  for i, sig in ipairs(sigs) do
+    local j = i - 1  -- 0-indexed
+
+    -- Allocate C buffers and copy data
+    local pubkey_buf = ffi.new("uint8_t[?]", #sig.pubkey)
+    ffi.copy(pubkey_buf, sig.pubkey, #sig.pubkey)
+    pubkey_ptrs[i] = pubkey_buf
+
+    local sig_buf = ffi.new("uint8_t[?]", #sig.sig_der)
+    ffi.copy(sig_buf, sig.sig_der, #sig.sig_der)
+    sig_ptrs[i] = sig_buf
+
+    local hash_buf = ffi.new("uint8_t[32]")
+    ffi.copy(hash_buf, sig.sighash, 32)
+    hash_ptrs[i] = hash_buf
+
+    jobs[j].pubkey = pubkey_buf
+    jobs[j].pubkey_len = #sig.pubkey
+    jobs[j].sig_der = sig_buf
+    jobs[j].sig_len = #sig.sig_der
+    jobs[j].msghash32 = hash_buf
+    jobs[j].result = 0
+  end
+
+  -- Run parallel verification
+  local failures = pv_lib.pv_verify_signatures(jobs, #sigs)
+
+  if failures < 0 then
+    return false, "parallel verification error"
+  elseif failures > 0 then
+    -- Find first failure for error message
+    for i = 0, #sigs - 1 do
+      if jobs[i].result ~= 1 then
+        return false, "signature verification failed at index " .. (i + 1)
+      end
+    end
+    return false, "signature verification failed"
+  end
+
+  return true
+end
 
 --------------------------------------------------------------------------------
 -- Transaction Validation (Context-Free)
@@ -117,7 +285,9 @@ end
 -- @param accurate boolean: If true, use accurate counting for OP_CHECKMULTISIG
 -- @return number: The sigops count
 function M.count_script_sigops(script_bytes, accurate)
-  local ops = script.parse_script(script_bytes)
+  -- Gracefully handle unparseable scripts (e.g. coinbase scriptSig with arbitrary data)
+  local ok, ops = pcall(script.parse_script, script_bytes)
+  if not ok then return 0 end
   local count = 0
   local prev_opcode = nil
 
@@ -140,17 +310,332 @@ function M.count_script_sigops(script_bytes, accurate)
   return count
 end
 
+--- Get legacy sigop count for a transaction.
+-- Counts sigops from scriptSig and scriptPubKey without accurate counting.
+-- @param tx transaction: The transaction
+-- @return number: The legacy sigops count (NOT scaled)
+function M.get_legacy_sigop_count(tx)
+  local count = 0
+  for _, inp in ipairs(tx.inputs) do
+    count = count + M.count_script_sigops(inp.script_sig, false)
+  end
+  for _, out in ipairs(tx.outputs) do
+    count = count + M.count_script_sigops(out.script_pubkey, false)
+  end
+  return count
+end
+
+--- Get P2SH sigop count for a transaction.
+-- For each input spending a P2SH output, extract the redeem script from
+-- scriptSig and count sigops with accurate counting.
+-- @param tx transaction: The transaction
+-- @param get_prev_output function(inp) -> txout: Function to get previous output for input
+-- @return number: The P2SH sigops count (NOT scaled)
+function M.get_p2sh_sigop_count(tx, get_prev_output)
+  -- Coinbase transactions don't have P2SH sigops
+  local null_hash = string.rep("\0", 32)
+  if #tx.inputs == 1 and
+     tx.inputs[1].prev_out.hash.bytes == null_hash and
+     tx.inputs[1].prev_out.index == 0xFFFFFFFF then
+    return 0
+  end
+
+  local count = 0
+  for _, inp in ipairs(tx.inputs) do
+    local prev_out = get_prev_output(inp)
+    if not prev_out then
+      error("missing previous output for input")
+    end
+
+    local script_type = script.classify_script(prev_out.script_pubkey)
+    if script_type == "p2sh" then
+      -- Extract redeem script (last push in scriptSig)
+      local redeem_script = M.extract_p2sh_redeem_script(inp.script_sig)
+      if redeem_script then
+        count = count + M.count_script_sigops(redeem_script, true)
+      end
+    end
+  end
+  return count
+end
+
+--- Extract the redeem script from a P2SH scriptSig.
+-- The redeem script is the last push operation in the scriptSig.
+-- @param script_sig string: The scriptSig bytes
+-- @return string|nil: The redeem script, or nil if not found
+function M.extract_p2sh_redeem_script(script_sig)
+  if #script_sig == 0 then
+    return nil
+  end
+
+  -- Check if scriptSig is push-only
+  if not script.is_push_only(script_sig) then
+    return nil
+  end
+
+  -- Parse and find the last push
+  local ops = script.parse_script(script_sig)
+  if #ops == 0 then
+    return nil
+  end
+
+  local last_op = ops[#ops]
+  -- For OP_0, data is nil but represents empty bytes
+  if last_op.opcode == script.OP.OP_0 then
+    return ""
+  elseif last_op.opcode >= script.OP.OP_1 and last_op.opcode <= script.OP.OP_16 then
+    -- Small number push (1-16) - not a valid redeem script
+    return nil
+  elseif last_op.data then
+    return last_op.data
+  end
+
+  return nil
+end
+
+--- Count witness sigops for a single input.
+-- @param script_sig string: The scriptSig
+-- @param script_pubkey string: The scriptPubKey of the output being spent
+-- @param witness table|nil: The witness stack
+-- @return number: The witness sigops (NOT scaled - witness sigops cost 1)
+function M.count_witness_sigops(script_sig, script_pubkey, witness)
+  witness = witness or {}
+
+  local witness_version, witness_program
+
+  -- Check if scriptPubKey is a witness program directly
+  local script_type, program = script.classify_script(script_pubkey)
+  if script_type == "p2wpkh" then
+    witness_version = 0
+    witness_program = program
+  elseif script_type == "p2wsh" then
+    witness_version = 0
+    witness_program = program
+  elseif script_type == "p2tr" then
+    witness_version = 1
+    witness_program = program
+  elseif script_type == "p2sh" then
+    -- Check if it's P2SH-wrapped witness (P2SH-P2WPKH or P2SH-P2WSH)
+    if script.is_push_only(script_sig) then
+      local redeem_script = M.extract_p2sh_redeem_script(script_sig)
+      if redeem_script then
+        local inner_type, inner_program = script.classify_script(redeem_script)
+        if inner_type == "p2wpkh" then
+          witness_version = 0
+          witness_program = inner_program
+        elseif inner_type == "p2wsh" then
+          witness_version = 0
+          witness_program = inner_program
+        end
+      end
+    end
+  end
+
+  if not witness_version then
+    return 0
+  end
+
+  -- Count sigops based on witness version
+  if witness_version == 0 then
+    if #witness_program == 20 then
+      -- P2WPKH: 1 sigop
+      return 1
+    elseif #witness_program == 32 and #witness > 0 then
+      -- P2WSH: count from witness script (last witness item)
+      local witness_script = witness[#witness]
+      return M.count_script_sigops(witness_script, true)
+    end
+  end
+
+  -- Future witness versions or invalid programs return 0
+  return 0
+end
+
+--- Get total signature operation cost for a transaction.
+-- This implements Bitcoin Core's GetTransactionSigOpCost:
+-- - Legacy sigops (scriptSig + scriptPubKey) are multiplied by WITNESS_SCALE_FACTOR
+-- - P2SH sigops are multiplied by WITNESS_SCALE_FACTOR
+-- - Witness sigops cost 1 each (no scaling)
+-- @param tx transaction: The transaction
+-- @param get_prev_output function(inp) -> txout: Function to get previous output
+-- @param flags table: Script verification flags (needs verify_p2sh, verify_witness)
+-- @return number: The total sigop cost
+function M.get_transaction_sigop_cost(tx, get_prev_output, flags)
+  flags = flags or {}
+
+  -- Start with legacy sigops, scaled by WITNESS_SCALE_FACTOR
+  local cost = M.get_legacy_sigop_count(tx) * consensus.WITNESS_SCALE_FACTOR
+
+  -- Coinbase check
+  local null_hash = string.rep("\0", 32)
+  local is_coinbase = #tx.inputs == 1 and
+                      tx.inputs[1].prev_out.hash.bytes == null_hash and
+                      tx.inputs[1].prev_out.index == 0xFFFFFFFF
+
+  if is_coinbase then
+    return cost
+  end
+
+  -- Add P2SH sigops if P2SH is enabled
+  if flags.verify_p2sh then
+    cost = cost + M.get_p2sh_sigop_count(tx, get_prev_output) * consensus.WITNESS_SCALE_FACTOR
+  end
+
+  -- Add witness sigops (no scaling) if witness is enabled
+  if flags.verify_witness then
+    for _, inp in ipairs(tx.inputs) do
+      local prev_out = get_prev_output(inp)
+      if prev_out then
+        cost = cost + M.count_witness_sigops(inp.script_sig, prev_out.script_pubkey, inp.witness)
+      end
+    end
+  end
+
+  return cost
+end
+
+--------------------------------------------------------------------------------
+-- FindAndDelete for Legacy Sighash
+--------------------------------------------------------------------------------
+
+--- Serialize data as a push operation (length prefix + data).
+-- For data ≤ 75 bytes: single length byte
+-- For data ≤ 255 bytes: OP_PUSHDATA1 + 1-byte length
+-- For data ≤ 65535 bytes: OP_PUSHDATA2 + 2-byte length
+-- @param data string: The data to serialize as a push
+-- @return string: Push-encoded data
+local function serialize_push_data(data)
+  local len = #data
+  if len <= 75 then
+    return string.char(len) .. data
+  elseif len <= 255 then
+    return string.char(0x4c, len) .. data  -- OP_PUSHDATA1
+  elseif len <= 65535 then
+    local low = len % 256
+    local high = math.floor(len / 256)
+    return string.char(0x4d, low, high) .. data  -- OP_PUSHDATA2
+  else
+    -- OP_PUSHDATA4 for very large data
+    local b1 = len % 256
+    local b2 = math.floor(len / 256) % 256
+    local b3 = math.floor(len / 65536) % 256
+    local b4 = math.floor(len / 16777216) % 256
+    return string.char(0x4e, b1, b2, b3, b4) .. data  -- OP_PUSHDATA4
+  end
+end
+
+--- Escape special pattern characters in a string for Lua pattern matching.
+-- @param str string: The string to escape
+-- @return string: Escaped string safe for use in patterns
+local function escape_pattern(str)
+  return (str:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
+end
+
+--- Find and delete all occurrences of a push-encoded signature from a script.
+-- This is used in legacy sighash computation to remove the signature being
+-- verified from the scriptCode before hashing.
+-- @param script_bytes string: The script bytes
+-- @param sig_bytes string: The signature bytes (without push opcode)
+-- @return string: Script with signature removed
+function M.find_and_delete(script_bytes, sig_bytes)
+  if not sig_bytes or #sig_bytes == 0 then
+    return script_bytes
+  end
+
+  -- The signature is push-encoded in the script: [push_opcode] [data]
+  local push_encoded = serialize_push_data(sig_bytes)
+
+  -- Remove all occurrences of the push-encoded signature
+  local pattern = escape_pattern(push_encoded)
+  local result = script_bytes:gsub(pattern, "")
+
+  return result
+end
+
+--- Remove all OP_CODESEPARATOR (0xab) opcodes from a script.
+-- Used in legacy sighash computation.
+-- Must properly parse the script to avoid stripping 0xab bytes that appear
+-- inside data pushes (e.g., within public key data).
+-- @param script_bytes string: The script bytes
+-- @return string: Script with OP_CODESEPARATOR opcodes removed
+function M.remove_codeseparators(script_bytes)
+  local parts = {}
+  local pos = 1
+  local len = #script_bytes
+
+  while pos <= len do
+    local opcode = script_bytes:byte(pos)
+
+    if opcode == 0xab then
+      -- OP_CODESEPARATOR: skip it (don't add to parts)
+      pos = pos + 1
+    elseif opcode >= 0x01 and opcode <= 0x4b then
+      -- Direct push: opcode is the number of bytes to push
+      local data_len = opcode
+      local end_pos = pos + data_len
+      if end_pos > len then end_pos = len end
+      parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+      pos = end_pos + 1
+    elseif opcode == 0x4c then
+      -- OP_PUSHDATA1: 1-byte length follows
+      if pos + 1 > len then
+        parts[#parts + 1] = script_bytes:sub(pos, pos)
+        pos = pos + 1
+      else
+        local data_len = script_bytes:byte(pos + 1)
+        local end_pos = pos + 1 + data_len
+        if end_pos > len then end_pos = len end
+        parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+        pos = end_pos + 1
+      end
+    elseif opcode == 0x4d then
+      -- OP_PUSHDATA2: 2-byte length follows (little-endian)
+      if pos + 2 > len then
+        parts[#parts + 1] = script_bytes:sub(pos, len)
+        pos = len + 1
+      else
+        local data_len = script_bytes:byte(pos + 1) + script_bytes:byte(pos + 2) * 256
+        local end_pos = pos + 2 + data_len
+        if end_pos > len then end_pos = len end
+        parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+        pos = end_pos + 1
+      end
+    elseif opcode == 0x4e then
+      -- OP_PUSHDATA4: 4-byte length follows (little-endian)
+      if pos + 4 > len then
+        parts[#parts + 1] = script_bytes:sub(pos, len)
+        pos = len + 1
+      else
+        local b1, b2, b3, b4 = script_bytes:byte(pos + 1, pos + 4)
+        local data_len = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+        local end_pos = pos + 4 + data_len
+        if end_pos > len then end_pos = len end
+        parts[#parts + 1] = script_bytes:sub(pos, end_pos)
+        pos = end_pos + 1
+      end
+    else
+      -- Regular opcode (not a push, not OP_CODESEPARATOR)
+      parts[#parts + 1] = script_bytes:sub(pos, pos)
+      pos = pos + 1
+    end
+  end
+
+  return table.concat(parts)
+end
+
 --------------------------------------------------------------------------------
 -- Signature Hash (Legacy)
 --------------------------------------------------------------------------------
 
 --- Compute signature hash for legacy (pre-segwit) transactions.
+-- Implements FindAndDelete and OP_CODESEPARATOR removal per Bitcoin Core.
 -- @param tx transaction: The transaction
 -- @param input_index number: Index of input being signed (0-based)
--- @param script_code string: The script code to sign
+-- @param script_code string: The script code to sign (should start after last OP_CODESEPARATOR)
 -- @param hash_type number: The hash type
+-- @param sig_bytes string|nil: Optional signature bytes to remove via FindAndDelete
 -- @return string: 32-byte hash
-function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
+function M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig_bytes)
   local ht = bit.band(hash_type, 0x1F)
   local anyone_can_pay = bit.band(hash_type, 0x80) ~= 0
 
@@ -158,6 +643,15 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
   if ht == consensus.SIGHASH.SINGLE and input_index >= #tx.outputs then
     return string.rep("\0", 31) .. "\1"
   end
+
+  -- Apply FindAndDelete: remove the signature from scriptCode (legacy only)
+  local processed_script = script_code
+  if sig_bytes and #sig_bytes > 0 then
+    processed_script = M.find_and_delete(processed_script, sig_bytes)
+  end
+
+  -- Remove OP_CODESEPARATOR bytes from the scriptCode
+  processed_script = M.remove_codeseparators(processed_script)
 
   -- Create modified transaction copy
   local modified_inputs = {}
@@ -168,7 +662,7 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
     -- Only include the signing input
     modified_inputs[1] = {
       prev_out = tx.inputs[input_index + 1].prev_out,
-      script_sig = script_code,
+      script_sig = processed_script,
       sequence = tx.inputs[input_index + 1].sequence
     }
   else
@@ -177,7 +671,7 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type)
       local sequence = inp.sequence
 
       if i == input_index + 1 then
-        script_to_use = script_code
+        script_to_use = processed_script
       else
         -- For SIGHASH_NONE or SIGHASH_SINGLE, zero out sequences for other inputs
         if ht == consensus.SIGHASH.NONE or ht == consensus.SIGHASH.SINGLE then
@@ -331,6 +825,142 @@ function M.signature_hash_segwit_v0(tx, input_index, script_code, value, hash_ty
   w.write_u32le(hash_type)
 
   return crypto.hash256(w.result())
+end
+
+--------------------------------------------------------------------------------
+-- BIP341 Taproot Signature Hash
+--------------------------------------------------------------------------------
+
+--- Compute taproot sighash (BIP341).
+-- @param tx transaction: The transaction being verified
+-- @param input_index number: 0-based index of the input being signed
+-- @param hash_type number: Sighash type (0x00 = SIGHASH_DEFAULT, or standard types)
+-- @param prev_outputs table: Array of {value=number, script_pubkey=string} for ALL inputs
+-- @param ext_flag number: Extension flag (0 for key-path, 1 for script-path)
+-- @param annex string|nil: Annex data (if present)
+-- @param tapleaf_hash string|nil: 32-byte leaf hash (for script-path spending)
+-- @param codesep_pos number|nil: Code separator position (default 0xFFFFFFFF)
+-- @return string: 32-byte sighash
+function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
+                                   ext_flag, annex, tapleaf_hash, codesep_pos)
+  ext_flag = ext_flag or 0
+  codesep_pos = codesep_pos or 0xFFFFFFFF
+
+  -- Determine effective sighash type
+  local ht = hash_type
+  if ht == 0x00 then
+    ht = 0x01  -- SIGHASH_DEFAULT acts as SIGHASH_ALL
+  end
+  local output_type = bit.band(ht, 0x03)
+  local anyone_can_pay = bit.band(ht, 0x80) ~= 0
+
+  -- Build the epoch + sighash preimage using tagged hash
+  local w = serialize.buffer_writer()
+
+  -- Epoch byte (0x00)
+  w.write_u8(0x00)
+
+  -- Hash type
+  w.write_u8(hash_type)
+
+  -- Transaction data
+  w.write_i32le(tx.version)
+  w.write_u32le(tx.locktime)
+
+  -- If NOT ANYONECANPAY, commit to all inputs
+  if not anyone_can_pay then
+    -- sha_prevouts: SHA256 of all outpoints
+    local pw = serialize.buffer_writer()
+    for _, inp in ipairs(tx.inputs) do
+      pw.write_hash256(inp.prev_out.hash)
+      pw.write_u32le(inp.prev_out.index)
+    end
+    w.write_bytes(crypto.sha256(pw.result()))
+
+    -- sha_amounts: SHA256 of all prev output amounts
+    local aw = serialize.buffer_writer()
+    for _, po in ipairs(prev_outputs) do
+      aw.write_i64le(po.value)
+    end
+    w.write_bytes(crypto.sha256(aw.result()))
+
+    -- sha_scriptpubkeys: SHA256 of all prev output scriptPubKeys (with compact size prefix)
+    local sw = serialize.buffer_writer()
+    for _, po in ipairs(prev_outputs) do
+      sw.write_varstr(po.script_pubkey)
+    end
+    w.write_bytes(crypto.sha256(sw.result()))
+
+    -- sha_sequences: SHA256 of all input sequences
+    local qw = serialize.buffer_writer()
+    for _, inp in ipairs(tx.inputs) do
+      qw.write_u32le(inp.sequence)
+    end
+    w.write_bytes(crypto.sha256(qw.result()))
+  end
+
+  -- If SIGHASH_ALL (output_type == 1 or 0), commit to all outputs
+  if output_type ~= 0x02 and output_type ~= 0x03 then
+    -- sha_outputs: SHA256 of all outputs
+    local ow = serialize.buffer_writer()
+    for _, out in ipairs(tx.outputs) do
+      ow.write_i64le(out.value)
+      ow.write_varstr(out.script_pubkey)
+    end
+    w.write_bytes(crypto.sha256(ow.result()))
+  end
+
+  -- Spend type: (ext_flag * 2) + annex_present
+  local annex_present = annex and 1 or 0
+  w.write_u8(ext_flag * 2 + annex_present)
+
+  -- Input-specific data
+  if anyone_can_pay then
+    -- This input's outpoint
+    local inp = tx.inputs[input_index + 1]
+    w.write_hash256(inp.prev_out.hash)
+    w.write_u32le(inp.prev_out.index)
+
+    -- This input's prev output
+    local po = prev_outputs[input_index + 1]
+    w.write_i64le(po.value)
+    w.write_varstr(po.script_pubkey)
+
+    -- This input's sequence
+    w.write_u32le(inp.sequence)
+  else
+    -- Just the input index
+    w.write_u32le(input_index)
+  end
+
+  -- Annex hash (if present)
+  if annex then
+    local ah = crypto.sha256(crypto.compact_size(#annex) .. annex)
+    w.write_bytes(ah)
+  end
+
+  -- Output-specific data for SIGHASH_SINGLE
+  if output_type == 0x03 then
+    if input_index < #tx.outputs then
+      local ow = serialize.buffer_writer()
+      local out = tx.outputs[input_index + 1]
+      ow.write_i64le(out.value)
+      ow.write_varstr(out.script_pubkey)
+      w.write_bytes(crypto.sha256(ow.result()))
+    else
+      w.write_bytes(string.rep("\0", 32))
+    end
+  end
+
+  -- Script-path extensions (ext_flag == 1)
+  if ext_flag == 1 then
+    assert(tapleaf_hash, "tapleaf_hash required for script-path sighash")
+    w.write_bytes(tapleaf_hash)
+    w.write_u8(0x00)  -- key_version
+    w.write_u32le(codesep_pos)
+  end
+
+  return crypto.tagged_hash("TapSighash", w.result())
 end
 
 --------------------------------------------------------------------------------
@@ -522,24 +1152,102 @@ function M.check_block(block, network, height)
   if height and height >= network.bip34_height then
     local coinbase_sig = block.transactions[1].inputs[1].script_sig
     if #coinbase_sig > 0 then
-      -- First byte tells us how many bytes for the height
-      local height_len = coinbase_sig:byte(1)
-      if height_len >= 1 and height_len <= 4 and #coinbase_sig >= height_len + 1 then
-        -- Read height as little-endian
-        local encoded_height = 0
-        for i = 1, height_len do
+      local first_byte = coinbase_sig:byte(1)
+      local encoded_height
+      if first_byte == 0x00 then
+        -- OP_0 pushes 0
+        encoded_height = 0
+      elseif first_byte >= 0x51 and first_byte <= 0x60 then
+        -- OP_1 through OP_16 push values 1-16
+        encoded_height = first_byte - 0x50
+      elseif first_byte == 0x4f then
+        -- OP_1NEGATE pushes -1
+        encoded_height = -1
+      elseif first_byte >= 1 and first_byte <= 4 and #coinbase_sig >= first_byte + 1 then
+        -- Standard BIP34: first byte is push length (1-4), followed by LE height
+        encoded_height = 0
+        for i = 1, first_byte do
           encoded_height = encoded_height + coinbase_sig:byte(i + 1) * (256 ^ (i - 1))
         end
-        assert(encoded_height == height,
-               "BIP34 height mismatch: expected " .. height .. ", got " .. encoded_height)
       else
         error("invalid BIP34 height encoding")
       end
+      assert(encoded_height == height,
+             "BIP34 height mismatch: expected " .. height .. ", got " .. encoded_height)
     else
       error("empty coinbase scriptSig (BIP34 requires height)")
     end
   end
 
+  return true
+end
+
+--------------------------------------------------------------------------------
+-- BIP68 Sequence Locks
+--------------------------------------------------------------------------------
+
+--- Calculate the sequence locks for a transaction (BIP68).
+-- Returns the minimum block height and minimum MTP time for the transaction
+-- to be valid. These are "last invalid" values (the first valid is one more).
+-- @param tx transaction: The transaction
+-- @param height number: Height of the block being validated
+-- @param get_utxo_height function(inp) -> number: Returns the height where each input's UTXO was confirmed
+-- @param get_block_mtp function(height) -> number: Returns the MTP of the block at given height
+-- @param enforce_bip68 boolean: Whether BIP68 is active at this height
+-- @return number, number: min_height (last invalid), min_time (last invalid)
+function M.calculate_sequence_locks(tx, height, get_utxo_height, get_block_mtp, enforce_bip68)
+  -- Initialize to -1: "last invalid" semantics means -1 allows any height/time
+  local min_height = -1
+  local min_time = -1
+
+  -- BIP68 only applies to version >= 2 transactions when active
+  if tx.version < 2 or not enforce_bip68 then
+    return min_height, min_time
+  end
+
+  for i, inp in ipairs(tx.inputs) do
+    local seq = inp.sequence
+
+    -- Check disable flag (bit 31): if set, skip this input
+    if bit.band(seq, consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0 then
+      -- Get the height where this UTXO was confirmed
+      local coin_height = get_utxo_height(inp)
+      assert(coin_height, "Missing UTXO height for input " .. i)
+
+      -- Check type flag (bit 22): time-based or height-based
+      if bit.band(seq, consensus.SEQUENCE_LOCKTIME_TYPE_FLAG) ~= 0 then
+        -- Time-based lock
+        -- Get MTP of the block BEFORE the one containing the UTXO
+        local coin_time = get_block_mtp(math.max(coin_height - 1, 0))
+        -- Lock value in 512-second units, convert to seconds, apply "last invalid" adjustment
+        local lock_value = bit.band(seq, consensus.SEQUENCE_LOCKTIME_MASK)
+        local lock_seconds = bit.lshift(lock_value, consensus.SEQUENCE_LOCKTIME_GRANULARITY)
+        min_time = math.max(min_time, coin_time + lock_seconds - 1)
+      else
+        -- Height-based lock
+        local lock_value = bit.band(seq, consensus.SEQUENCE_LOCKTIME_MASK)
+        min_height = math.max(min_height, coin_height + lock_value - 1)
+      end
+    end
+  end
+
+  return min_height, min_time
+end
+
+--- Check if sequence locks are satisfied for inclusion in a block (BIP68).
+-- @param min_height number: Minimum height from calculate_sequence_locks
+-- @param min_time number: Minimum time from calculate_sequence_locks
+-- @param block_height number: Height of the block being validated
+-- @param prev_block_mtp number: MTP of the previous block
+-- @return boolean: true if locks are satisfied
+function M.check_sequence_locks(min_height, min_time, block_height, prev_block_mtp)
+  -- Using "last invalid" semantics: value must be STRICTLY LESS than threshold
+  if min_height >= block_height then
+    return false
+  end
+  if min_time >= prev_block_mtp then
+    return false
+  end
   return true
 end
 
@@ -568,32 +1276,22 @@ function M.check_block_context(block, header, prev_header, height, network, medi
          "block timestamp " .. header.timestamp ..
          " not greater than median time past " .. median_time)
 
-  -- Check difficulty target
-  if not network.pow_no_retarget then
-    -- Check if this is a retarget block
-    if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
-      -- This is a retarget block - we need the difficulty to be recalculated
-      -- The actual target calculation requires looking back 2016 blocks
-      -- For now, just verify the bits field is reasonable
-      assert(header.bits > 0, "invalid difficulty bits")
-    else
-      -- Non-retarget block: bits should match previous block
-      -- (unless we allow minimum difficulty on testnet)
-      if network.pow_allow_min_difficulty then
-        -- Testnet special rules: if block took > 20 minutes, allow minimum difficulty
-        local time_diff = header.timestamp - prev_header.timestamp
-        if time_diff > 20 * 60 then
-          -- Allow minimum difficulty (pow_limit_bits)
-          assert(header.bits == network.pow_limit_bits or header.bits == prev_header.bits,
-                 "invalid difficulty for slow testnet block")
-        else
-          assert(header.bits == prev_header.bits,
-                 "non-retarget block has different bits")
-        end
-      else
-        assert(header.bits == prev_header.bits,
-               "non-retarget block has different bits")
-      end
+  -- Check difficulty target bounds
+  -- NOTE: Full difficulty validation is done in sync.lua's HeaderChain:accept_header()
+  -- which has access to ancestor blocks via consensus.get_next_work_required().
+  -- Here we only perform basic sanity checks.
+
+  -- Verify bits is within valid range (not exceeding pow_limit)
+  -- Compare as big-endian byte strings: target must be <= pow_limit
+  local target = consensus.bits_to_target(header.bits)
+  local pow_limit = consensus.bits_to_target(network.pow_limit_bits)
+  for i = 1, 32 do
+    local t = target:byte(i)
+    local p = pow_limit:byte(i)
+    if t > p then
+      error("target exceeds proof-of-work limit")
+    elseif t < p then
+      break  -- target is less, which is valid
     end
   end
 
@@ -681,9 +1379,11 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     -- Compute sighash
     local sighash
     if is_segwit then
+      -- SegWit does NOT use FindAndDelete
       sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
     else
-      sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type)
+      -- Legacy: pass the full signature (with hash type byte) for FindAndDelete
+      sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig)
     end
 
     -- Verify ECDSA signature
@@ -747,6 +1447,96 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     end
 
     -- Script sequence value must be <= input sequence value
+    local script_value = consensus.sequence_lock_value(script_sequence)
+    local input_value = consensus.sequence_lock_value(inp.sequence)
+    return script_value <= input_value
+  end
+
+  return checker
+end
+
+--- Create a signature checker for tapscript (BIP342) script-path execution.
+-- Uses Schnorr signatures and taproot sighash (BIP341).
+-- @param tx transaction: The transaction
+-- @param input_index number: Index of input being verified (0-based)
+-- @param prev_outputs table: Array of {value, script_pubkey} for ALL inputs
+-- @param tapleaf_hash string: 32-byte tapleaf hash for this script
+-- @param annex string|nil: Annex data (if present)
+-- @return table: Checker with check_sig, check_locktime, check_sequence methods
+function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, annex)
+  local checker = {}
+  local codesep_pos = 0xFFFFFFFF
+
+  function checker.set_codesep(pos)
+    codesep_pos = pos
+  end
+
+  --- Check a BIP340 Schnorr signature against an x-only public key.
+  -- @param sig string: 64- or 65-byte Schnorr signature (65 if explicit hash type)
+  -- @param pubkey string: 32-byte x-only public key
+  -- @return boolean: true if valid
+  function checker.check_sig(sig, pubkey)
+    if #sig == 0 then
+      return false
+    end
+
+    -- BIP342: signature must be exactly 64 or 65 bytes
+    if #sig ~= 64 and #sig ~= 65 then
+      return false
+    end
+
+    -- Extract hash type
+    local hash_type = 0x00  -- SIGHASH_DEFAULT
+    local sig_bytes = sig
+    if #sig == 65 then
+      hash_type = sig:byte(65)
+      sig_bytes = sig:sub(1, 64)
+      -- BIP341: hash_type 0x00 must not be used with 65-byte sig
+      if hash_type == 0x00 then
+        return false
+      end
+    end
+
+    -- Compute taproot sighash for script-path (ext_flag = 1)
+    local sighash = M.signature_hash_taproot(
+      tx, input_index, hash_type, prev_outputs,
+      1, annex, tapleaf_hash, codesep_pos
+    )
+
+    -- Verify BIP340 Schnorr signature
+    return crypto.schnorr_verify(pubkey, sig_bytes, sighash)
+  end
+
+  --- Check locktime (BIP65 CLTV).
+  function checker.check_locktime(script_locktime)
+    if tx.inputs[input_index + 1].sequence == 0xFFFFFFFF then
+      return false
+    end
+    local threshold = consensus.LOCKTIME_THRESHOLD
+    local tx_locktime = tx.locktime
+    if (script_locktime < threshold) ~= (tx_locktime < threshold) then
+      return false
+    end
+    return script_locktime <= tx_locktime
+  end
+
+  --- Check sequence (BIP112 CSV).
+  function checker.check_sequence(script_sequence)
+    if not consensus.sequence_locks_active(script_sequence) then
+      return true
+    end
+    local inp = tx.inputs[input_index + 1]
+    if tx.version < 2 then
+      return false
+    end
+    if not consensus.sequence_locks_active(inp.sequence) then
+      return false
+    end
+    local script_is_time = consensus.sequence_lock_is_time_based(script_sequence)
+    local input_is_time = consensus.sequence_lock_is_time_based(inp.sequence)
+    if script_is_time ~= input_is_time then
+      return false
+    end
     local script_value = consensus.sequence_lock_value(script_sequence)
     local input_value = consensus.sequence_lock_value(inp.sequence)
     return script_value <= input_value

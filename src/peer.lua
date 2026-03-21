@@ -615,8 +615,8 @@ function Peer:process_messages()
     if v2_err then
       return {}  -- Disconnected
     end
-    if complete and self.v2_active then
-      -- V2 handshake complete, now start version handshake
+    if complete then
+      -- Handshake complete (v2 or v1 fallback), now start version handshake
       self:start_handshake()
     end
     return {}  -- No application messages yet

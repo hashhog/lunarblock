@@ -842,16 +842,16 @@ function ChainState:connect_genesis()
     0xFFFFFFFF
   )
 
-  -- Genesis coinbase output: 50 BTC to Satoshi's pubkey
-  -- 04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f
+  -- Genesis coinbase output: 50 BTC to pubkey
+  -- Use network-specific pubkey if provided, otherwise default to Satoshi's key
   local subsidy = consensus.get_block_subsidy(0)
-  local satoshi_pubkey_hex = "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"
-  local satoshi_pubkey = ""
-  for i = 1, #satoshi_pubkey_hex, 2 do
-    satoshi_pubkey = satoshi_pubkey .. string.char(tonumber(satoshi_pubkey_hex:sub(i, i+1), 16))
+  local pubkey_hex = gen.coinbase_pubkey_hex or "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"
+  local pubkey = ""
+  for i = 1, #pubkey_hex, 2 do
+    pubkey = pubkey .. string.char(tonumber(pubkey_hex:sub(i, i+1), 16))
   end
-  -- OP_PUSH65 <pubkey> OP_CHECKSIG
-  local output_script = string.char(65) .. satoshi_pubkey .. "\xac"
+  -- OP_PUSH<len> <pubkey> OP_CHECKSIG
+  local output_script = string.char(#pubkey) .. pubkey .. "\xac"
   local coinbase_output = types.txout(subsidy, output_script)
 
   local coinbase_tx = types.transaction(1, {coinbase_input}, {coinbase_output}, 0)

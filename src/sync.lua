@@ -551,17 +551,25 @@ function HeaderChain:add_genesis()
   local msg = gen.coinbase_message
   -- scriptSig: PUSH4(486604799_le) PUSH1(0x04) PUSH_N(message)
   -- 486604799 = 0x1d00ffff, always hardcoded in Bitcoin Core's CreateGenesisBlock
-  local script_sig = "\x04\xff\xff\x00\x1d\x01\x04" .. string.char(#msg) .. msg
+  -- For messages > 75 bytes, use OP_PUSHDATA1 (0x4c) + length byte
+  local msg_push
+  if #msg > 75 then
+    msg_push = "\x4c" .. string.char(#msg) .. msg  -- OP_PUSHDATA1
+  else
+    msg_push = string.char(#msg) .. msg
+  end
+  local script_sig = "\x04\xff\xff\x00\x1d\x01\x04" .. msg_push
   local coinbase_input = types.txin(
     types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
     script_sig, 0xFFFFFFFF
   )
-  local satoshi_pubkey_hex = "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"
-  local satoshi_pubkey = ""
-  for i = 1, #satoshi_pubkey_hex, 2 do
-    satoshi_pubkey = satoshi_pubkey .. string.char(tonumber(satoshi_pubkey_hex:sub(i, i+1), 16))
+  -- Use network-specific pubkey if provided, otherwise default to Satoshi's key
+  local pubkey_hex = gen.coinbase_pubkey_hex or "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"
+  local pubkey = ""
+  for i = 1, #pubkey_hex, 2 do
+    pubkey = pubkey .. string.char(tonumber(pubkey_hex:sub(i, i+1), 16))
   end
-  local output_script = string.char(65) .. satoshi_pubkey .. "\xac"
+  local output_script = string.char(#pubkey) .. pubkey .. "\xac"
   local subsidy = consensus.get_block_subsidy(0)
   local coinbase_tx = types.transaction(1,
     {coinbase_input},

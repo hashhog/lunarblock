@@ -216,7 +216,7 @@ function M.open(path, cache_size_mb)
   librocksdb.rocksdb_options_set_max_open_files(options, 1000)
   librocksdb.rocksdb_options_set_write_buffer_size(options, 64 * 1024 * 1024)  -- 64MB
   librocksdb.rocksdb_options_set_max_write_buffer_number(options, 3)
-  librocksdb.rocksdb_options_set_compression(options, 4)  -- LZ4
+  librocksdb.rocksdb_options_set_compression(options, 0)  -- No compression (LZ4 not linked)
 
   -- Create LRU block cache
   local cache_size = cache_size_mb * 1024 * 1024
@@ -254,6 +254,10 @@ function M.open(path, cache_size_mb)
       end
     end
 
+    -- Destroy column family handles before closing
+    for _, handle in pairs(handles) do
+      librocksdb.rocksdb_column_family_handle_destroy(handle)
+    end
     -- Close and reopen with all column families so we get proper handles
     librocksdb.rocksdb_close(db)
     db = nil
