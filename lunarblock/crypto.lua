@@ -346,6 +346,26 @@ ffi.cdef[[
     const secp256k1_xonly_pubkey* pubkey
   );
 
+  int secp256k1_xonly_pubkey_serialize(
+    const secp256k1_context* ctx,
+    unsigned char* output32,
+    const secp256k1_xonly_pubkey* pubkey
+  );
+
+  int secp256k1_xonly_pubkey_from_pubkey(
+    const secp256k1_context* ctx,
+    secp256k1_xonly_pubkey* xonly_pubkey,
+    int* pk_parity,
+    const secp256k1_pubkey* pubkey
+  );
+
+  int secp256k1_xonly_pubkey_tweak_add(
+    const secp256k1_context* ctx,
+    secp256k1_pubkey* output_pubkey,
+    const secp256k1_xonly_pubkey* internal_pubkey,
+    const unsigned char* tweak32
+  );
+
   /* ElligatorSwift for BIP324 */
   typedef int (*secp256k1_ellswift_xdh_hash_function)(
     unsigned char *output,
@@ -1000,6 +1020,64 @@ function M.chacha20poly1305_decrypt(key, nonce, ciphertext_with_tag, aad)
 
   plain_len = plain_len + outlen[0]
   return ffi.string(plaintext, plain_len)
+end
+
+--------------------------------------------------------------------------------
+-- Taproot Helpers (BIP340/BIP341)
+--------------------------------------------------------------------------------
+
+--- Compute a BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
+function M.tagged_hash(tag, msg)
+  local tag_hash = M.sha256(tag)
+  return M.sha256(tag_hash .. tag_hash .. msg)
+end
+
+--- Encode a length as Bitcoin compact size (varint).
+function M.compact_size(n)
+  if n < 0xFD then
+    return string.char(n)
+  elseif n <= 0xFFFF then
+    return string.char(0xFD,
+      bit.band(n, 0xFF),
+      bit.band(bit.rshift(n, 8), 0xFF))
+  elseif n <= 0xFFFFFFFF then
+    return string.char(0xFE,
+      bit.band(n, 0xFF),
+      bit.band(bit.rshift(n, 8), 0xFF),
+      bit.band(bit.rshift(n, 16), 0xFF),
+      bit.band(bit.rshift(n, 24), 0xFF))
+  else
+    error("compact_size: value too large")
+  end
+end
+
+--- Tweak an x-only public key with a 32-byte tweak using secp256k1.
+function M.tweak_pubkey(xonly_pubkey32, tweak32)
+  assert(#xonly_pubkey32 == 32, "x-only pubkey must be 32 bytes")
+  assert(#tweak32 == 32, "tweak must be 32 bytes")
+
+  local internal_xonly = ffi.new("secp256k1_xonly_pubkey")
+  if libsecp256k1.secp256k1_xonly_pubkey_parse(secp_ctx, internal_xonly, xonly_pubkey32) ~= 1 then
+    return nil, nil
+  end
+
+  local output_pubkey = ffi.new("secp256k1_pubkey")
+  if libsecp256k1.secp256k1_xonly_pubkey_tweak_add(secp_ctx, output_pubkey, internal_xonly, tweak32) ~= 1 then
+    return nil, nil
+  end
+
+  local result_xonly = ffi.new("secp256k1_xonly_pubkey")
+  local parity = ffi.new("int[1]")
+  if libsecp256k1.secp256k1_xonly_pubkey_from_pubkey(secp_ctx, result_xonly, parity, output_pubkey) ~= 1 then
+    return nil, nil
+  end
+
+  local output32 = ffi.new("unsigned char[32]")
+  if libsecp256k1.secp256k1_xonly_pubkey_serialize(secp_ctx, output32, result_xonly) ~= 1 then
+    return nil, nil
+  end
+
+  return ffi.string(output32, 32), tonumber(parity[0])
 end
 
 return M

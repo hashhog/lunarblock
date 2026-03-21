@@ -25,6 +25,130 @@ local function hex_decode(hex)
   return table.concat(bytes)
 end
 
+local function hex_encode(data)
+  local out = {}
+  for i = 1, #data do
+    out[i] = string.format("%02x", data:byte(i))
+  end
+  return table.concat(out)
+end
+
+--------------------------------------------------------------------------------
+-- Taproot placeholder resolution
+--------------------------------------------------------------------------------
+
+-- Internal key: the generator point x-only (BIP341 test convention)
+local INTERNAL_KEY_HEX = "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+local INTERNAL_KEY = hex_decode(INTERNAL_KEY_HEX)
+
+--- Assemble a script from ASM (forward declaration, defined below)
+local assemble_script_fwd
+
+--- Resolve #SCRIPT#, #CONTROLBLOCK#, #TAPROOTOUTPUT# in witness stack.
+-- The witness stack items are hex strings. Items containing #SCRIPT# have the
+-- format: "#SCRIPT# <ASM...>" where ASM is the leaf script.
+-- Items equal to "#CONTROLBLOCK#" get replaced with the computed control block.
+-- The scriptPubKey "#TAPROOTOUTPUT#" is resolved separately.
+--
+-- After resolution, witness_stack items remain as hex strings.
+local function resolve_taproot_placeholders(witness_stack, script_pubkey_asm)
+  -- Step 1: Find the #SCRIPT# item and extract the leaf script ASM
+  local script_idx = nil
+  local leaf_script_asm = nil
+  for i, item in ipairs(witness_stack) do
+    if type(item) == "string" and item:find("#SCRIPT#") then
+      script_idx = i
+      -- The item is "#SCRIPT# <asm...>" — extract the ASM after the prefix
+      leaf_script_asm = item:match("^#SCRIPT#%s*(.+)$")
+      break
+    end
+  end
+
+  if not script_idx or not leaf_script_asm then
+    error("No #SCRIPT# placeholder found in witness stack")
+  end
+
+  -- Step 2: Assemble the leaf script to raw bytes
+  local leaf_script_bytes = assemble_script_fwd(leaf_script_asm)
+
+  -- Step 3: Replace #SCRIPT# item with the assembled script hex
+  witness_stack[script_idx] = hex_encode(leaf_script_bytes)
+
+  -- Step 4: Compute tapleaf hash: tagged_hash("TapLeaf", 0xc0 || compact_size(len) || script)
+  local leaf_version = string.char(0xc0)
+  local tapleaf_data = leaf_version .. crypto.compact_size(#leaf_script_bytes) .. leaf_script_bytes
+  local tapleaf_hash = crypto.tagged_hash("TapLeaf", tapleaf_data)
+
+  -- Step 5: Merkle root = tapleaf hash (single leaf tree)
+  local merkle_root = tapleaf_hash
+
+  -- Step 6: Compute tweaked output key
+  local tweak = crypto.tagged_hash("TapTweak", INTERNAL_KEY .. merkle_root)
+  local output_key, parity = crypto.tweak_pubkey(INTERNAL_KEY, tweak)
+  assert(output_key, "Failed to tweak pubkey")
+
+  -- Step 7: Build control block = (0xc0 | parity) || internal_key (33 bytes)
+  local control_byte = string.char(0xc0 + parity)
+  local control_block = control_byte .. INTERNAL_KEY
+
+  -- Step 8: Replace #CONTROLBLOCK# in witness stack
+  for i, item in ipairs(witness_stack) do
+    if type(item) == "string" and item == "#CONTROLBLOCK#" then
+      witness_stack[i] = hex_encode(control_block)
+      break
+    end
+  end
+end
+
+--- Resolve #TAPROOTOUTPUT# in scriptPubKey ASM.
+-- Returns the modified ASM string with the placeholder replaced.
+local function resolve_taproot_scriptpubkey(script_pubkey_asm, witness_stack)
+  if not script_pubkey_asm:find("#TAPROOTOUTPUT#") then
+    return script_pubkey_asm
+  end
+
+  -- We need to recompute the output key from the witness stack.
+  -- The last witness item is the control block, second-to-last is the leaf script.
+  -- But we already computed it during resolve_taproot_placeholders, so let's
+  -- extract from the control block in the witness stack.
+  --
+  -- Actually, we need to recompute: find the script and control block items.
+  local leaf_script_hex = nil
+  local control_block_hex = nil
+
+  -- In taproot witness: [...data items..., script, controlblock]
+  -- The control block is the last item, script is second-to-last
+  local n = #witness_stack
+  if n >= 2 then
+    control_block_hex = witness_stack[n]
+    leaf_script_hex = witness_stack[n - 1]
+  end
+
+  if not control_block_hex or not leaf_script_hex then
+    error("Cannot resolve #TAPROOTOUTPUT#: missing script/control block in witness")
+  end
+
+  local control_block = hex_decode(control_block_hex)
+  local leaf_script_bytes = hex_decode(leaf_script_hex)
+
+  -- Extract internal key from control block (bytes 2-33)
+  local internal_key = control_block:sub(2, 33)
+
+  -- Compute tapleaf hash
+  local leaf_version = string.char(0xc0)
+  local tapleaf_data = leaf_version .. crypto.compact_size(#leaf_script_bytes) .. leaf_script_bytes
+  local tapleaf_hash = crypto.tagged_hash("TapLeaf", tapleaf_data)
+  local merkle_root = tapleaf_hash
+
+  -- Compute tweaked output key
+  local tweak = crypto.tagged_hash("TapTweak", internal_key .. merkle_root)
+  local output_key = crypto.tweak_pubkey(internal_key, tweak)
+  assert(output_key, "Failed to compute taproot output key")
+
+  -- Replace #TAPROOTOUTPUT# with the hex of the output key (0x prefix for ASM parser)
+  return script_pubkey_asm:gsub("#TAPROOTOUTPUT#", "0x" .. hex_encode(output_key))
+end
+
 --------------------------------------------------------------------------------
 -- ASM parser: convert Bitcoin script assembly notation to raw script bytes
 --------------------------------------------------------------------------------
@@ -166,6 +290,9 @@ local function assemble_script(asm_str)
   end
   return table.concat(buf)
 end
+
+-- Bind forward declaration for taproot resolution
+assemble_script_fwd = assemble_script
 
 --------------------------------------------------------------------------------
 -- Flag parsing: convert flag string to flags table for lunarblock
@@ -389,12 +516,6 @@ for idx, entry in ipairs(vectors) do
       local expected = entry[5]
       local comment = entry[6] or ""
 
-      -- Skip TAPROOT vectors (use #TAPROOTOUTPUT# placeholder that can't be assembled)
-      if flags_str:find("TAPROOT") then
-        skip_count = skip_count + 1
-        goto continue
-      end
-
       -- Last element of witness array is amount in BTC (float)
       local amount_btc = wit_array[#wit_array]  -- number, e.g. 1e-08 = 1 satoshi
       local amount_satoshis = math.floor(amount_btc * 1e8 + 0.5)
@@ -403,6 +524,21 @@ for idx, entry in ipairs(vectors) do
       local witness_stack = {}
       for i = 1, #wit_array - 1 do
         witness_stack[i] = wit_array[i]
+      end
+
+      -- Resolve taproot placeholders if present
+      if flags_str:find("TAPROOT") then
+        local resolved_ok, resolve_err = pcall(function()
+          resolve_taproot_placeholders(witness_stack, script_pubkey_asm)
+        end)
+        if resolved_ok then
+          -- witness_stack now has resolved hex items; script_pubkey_asm needs resolving too
+          script_pubkey_asm = resolve_taproot_scriptpubkey(script_pubkey_asm, witness_stack)
+        else
+          -- Can't resolve, skip
+          skip_count = skip_count + 1
+          goto continue
+        end
       end
 
       run_test(idx, script_sig_asm, script_pubkey_asm, flags_str, expected, comment, witness_stack, amount_satoshis)
