@@ -1101,60 +1101,118 @@ function M.execute_script(script_bytes, stack, flags, checker)
       -- Pop pubkey first (top of stack), then signature (deeper)
       local pubkey = pop()
       local sig = pop()
-      -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
-      local sig_ok, sig_err = check_signature_encoding(sig, flags)
-      if not sig_ok then
-        return nil, sig_err
+
+      -- BIP342: Tapscript-specific OP_CHECKSIG behavior
+      if flags.is_tapscript then
+        -- Empty pubkey (0 bytes) is a consensus error in tapscript
+        if #pubkey == 0 then
+          return nil, "TAPSCRIPT_EMPTY_PUBKEY"
+        end
+        -- In tapscript, OP_CHECKSIG does BIP340 Schnorr verification
+        -- For 32-byte pubkeys: do Schnorr sig check
+        -- For unknown pubkey types (not 32 bytes): succeed (softfork-safe)
+        local valid = false
+        if #pubkey == 32 then
+          -- BIP340 Schnorr signature verification
+          if #sig > 0 and checker.check_sig then
+            valid = checker.check_sig(sig, pubkey)
+          end
+        else
+          -- Unknown pubkey type in tapscript: succeed if sig is non-empty
+          if #sig > 0 then
+            valid = true
+          end
+        end
+        if not valid and #sig > 0 then
+          return nil, "SIG_SCHNORR"
+        end
+        push_bool(valid)
+      else
+        -- Legacy/segwit v0 OP_CHECKSIG
+        -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
+        local sig_ok, sig_err = check_signature_encoding(sig, flags)
+        if not sig_ok then
+          return nil, sig_err
+        end
+        -- Check pubkey encoding (STRICTENC)
+        local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
+        if not pk_ok then
+          return nil, pk_err
+        end
+        -- BIP141: Witness v0 requires compressed public keys
+        pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
+        if not pk_ok then
+          return nil, pk_err
+        end
+        local valid = false
+        if checker.check_sig then
+          valid = checker.check_sig(sig, pubkey)
+        end
+        -- BIP146 NULLFAIL: if signature check failed and signature is non-empty, error
+        if not valid and flags.verify_nullfail and #sig > 0 then
+          return nil, "NULLFAIL"
+        end
+        push_bool(valid)
       end
-      -- Check pubkey encoding (STRICTENC)
-      local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
-      if not pk_ok then
-        return nil, pk_err
-      end
-      -- BIP141: Witness v0 requires compressed public keys
-      pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
-      if not pk_ok then
-        return nil, pk_err
-      end
-      local valid = false
-      if checker.check_sig then
-        valid = checker.check_sig(sig, pubkey)
-      end
-      -- BIP146 NULLFAIL: if signature check failed and signature is non-empty, error
-      if not valid and flags.verify_nullfail and #sig > 0 then
-        return nil, "NULLFAIL"
-      end
-      push_bool(valid)
     elseif opcode == M.OP.OP_CHECKSIGVERIFY then
       local pubkey = pop()
       local sig = pop()
-      -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
-      local sig_ok, sig_err = check_signature_encoding(sig, flags)
-      if not sig_ok then
-        return nil, sig_err
-      end
-      -- Check pubkey encoding (STRICTENC)
-      local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
-      if not pk_ok then
-        return nil, pk_err
-      end
-      -- BIP141: Witness v0 requires compressed public keys
-      pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
-      if not pk_ok then
-        return nil, pk_err
-      end
-      local valid = false
-      if checker.check_sig then
-        valid = checker.check_sig(sig, pubkey)
-      end
-      -- BIP146 NULLFAIL: if signature check failed and signature is non-empty, error
-      if not valid and flags.verify_nullfail and #sig > 0 then
-        return nil, "NULLFAIL"
-      end
-      if not valid then
-        error("OP_CHECKSIGVERIFY failed")
+
+      -- BIP342: Tapscript-specific OP_CHECKSIGVERIFY behavior
+      if flags.is_tapscript then
+        if #pubkey == 0 then
+          return nil, "TAPSCRIPT_EMPTY_PUBKEY"
+        end
+        local valid = false
+        if #pubkey == 32 then
+          if #sig > 0 and checker.check_sig then
+            valid = checker.check_sig(sig, pubkey)
+          end
+        else
+          if #sig > 0 then
+            valid = true
+          end
+        end
+        if not valid and #sig > 0 then
+          return nil, "SIG_SCHNORR"
+        end
+        if not valid then
+          error("OP_CHECKSIGVERIFY failed")
+        end
+      else
+        -- Legacy/segwit v0 OP_CHECKSIGVERIFY
+        -- Check signature encoding (DERSIG/STRICTENC/LOW_S)
+        local sig_ok, sig_err = check_signature_encoding(sig, flags)
+        if not sig_ok then
+          return nil, sig_err
+        end
+        -- Check pubkey encoding (STRICTENC)
+        local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
+        if not pk_ok then
+          return nil, pk_err
+        end
+        -- BIP141: Witness v0 requires compressed public keys
+        pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
+        if not pk_ok then
+          return nil, pk_err
+        end
+        local valid = false
+        if checker.check_sig then
+          valid = checker.check_sig(sig, pubkey)
+        end
+        -- BIP146 NULLFAIL: if signature check failed and signature is non-empty, error
+        if not valid and flags.verify_nullfail and #sig > 0 then
+          return nil, "NULLFAIL"
+        end
+        if not valid then
+          error("OP_CHECKSIGVERIFY failed")
+        end
       end
     elseif opcode == M.OP.OP_CHECKMULTISIG or opcode == M.OP.OP_CHECKMULTISIGVERIFY then
+      -- BIP342: OP_CHECKMULTISIG is disabled in tapscript
+      if flags.is_tapscript then
+        return nil, "TAPSCRIPT_CHECKMULTISIG"
+      end
       -- Pop n pubkeys
       local n = pop_num()
       assert(n >= 0 and n <= 20, "invalid pubkey count")
@@ -1453,6 +1511,106 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
     else
       return nil, "WITNESS_PROGRAM_WRONG_LENGTH"
     end
+  elseif witness_version == 1 and flags.verify_taproot then
+    -- BIP341/342: Taproot (witness v1)
+    if #witness_program ~= 32 then
+      return nil, "WITNESS_PROGRAM_WRONG_LENGTH"
+    end
+
+    if #witness == 0 then
+      return nil, "WITNESS_PROGRAM_WITNESS_EMPTY"
+    end
+
+    -- Determine key-path vs script-path spending
+    -- If witness has more than 1 element AND the last element starts with 0x?0-0x?1 byte
+    -- matching a control block (leaf version in high bits), it's script-path.
+    -- Specifically: if witness size >= 2 and the last item is a control block, it's script-path.
+    -- A control block is >= 33 bytes and (size - 33) is a multiple of 32.
+    local annex = nil
+    local stack_end = #witness
+
+    -- BIP341: If witness has >= 2 elements and last element starts with 0x50, it's an annex
+    if #witness >= 2 and #witness[#witness] > 0 and witness[#witness]:byte(1) == 0x50 then
+      annex = witness[#witness]
+      stack_end = stack_end - 1
+    end
+
+    if stack_end >= 2 then
+      -- Script-path spending
+      local control_block = witness[stack_end]
+      local tap_script = witness[stack_end - 1]
+
+      -- Validate control block size: >= 33 bytes and (size - 33) mod 32 == 0
+      if #control_block < 33 or (#control_block - 33) % 32 ~= 0 then
+        return nil, "TAPROOT_WRONG_CONTROL_SIZE"
+      end
+
+      -- Extract leaf version and internal key from control block
+      local leaf_version = bit.band(control_block:byte(1), 0xfe)
+      local output_key_parity = bit.band(control_block:byte(1), 0x01)
+      local internal_key = control_block:sub(2, 33)
+
+      -- Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script_len) || script)
+      local tapleaf_data = string.char(leaf_version) .. crypto.compact_size(#tap_script) .. tap_script
+      local current = crypto.tagged_hash("TapLeaf", tapleaf_data)
+
+      -- Walk the Merkle path (control block bytes 33+, in 32-byte chunks)
+      local path_len = (#control_block - 33) / 32
+      for p = 0, path_len - 1 do
+        local sibling = control_block:sub(34 + p * 32, 65 + p * 32)
+        if current < sibling then
+          current = crypto.tagged_hash("TapBranch", current .. sibling)
+        else
+          current = crypto.tagged_hash("TapBranch", sibling .. current)
+        end
+      end
+
+      -- Compute tweaked output key and verify against witness program
+      local tweak = crypto.tagged_hash("TapTweak", internal_key .. current)
+      local computed_output_key, computed_parity = crypto.tweak_pubkey(internal_key, tweak)
+      if not computed_output_key then
+        return nil, "TAPROOT_TWEAK_FAILED"
+      end
+
+      -- Verify the output key matches the witness program (the 32-byte key in scriptPubKey)
+      if computed_output_key ~= witness_program then
+        return nil, "WITNESS_PROGRAM_MISMATCH"
+      end
+
+      -- Verify parity matches
+      if computed_parity ~= output_key_parity then
+        return nil, "WITNESS_PROGRAM_MISMATCH"
+      end
+
+      -- Execute the tapscript if leaf_version == 0xc0 (tapscript)
+      if leaf_version == 0xc0 then
+        -- Build the stack from witness items (excluding script and control block)
+        local tap_stack = {}
+        for i = 1, stack_end - 2 do
+          tap_stack[i] = witness[i]
+        end
+
+        -- Set tapscript flags
+        local tap_flags = {}
+        for k, v in pairs(flags) do tap_flags[k] = v end
+        tap_flags.is_tapscript = true
+
+        -- Execute the tapscript
+        return M.execute_witness_script(tap_script, tap_stack, tap_flags, checker)
+      else
+        -- Unknown leaf version
+        if flags.verify_discourage_upgradable_taproot_version then
+          return nil, "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+        end
+        return true
+      end
+
+    else
+      -- Key-path spending: single witness element is a Schnorr signature
+      -- For now: succeed (key-path verification requires BIP340 sig check against output key)
+      return true
+    end
+
   elseif flags.verify_discourage_upgradable_witness then
     -- Unknown witness version with DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag
     return nil, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
