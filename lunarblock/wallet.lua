@@ -1747,4 +1747,308 @@ function M.exists(filepath)
   return false
 end
 
+--------------------------------------------------------------------------------
+-- Wallet Manager (Multi-Wallet Support)
+--------------------------------------------------------------------------------
+
+local WalletManager = {}
+WalletManager.__index = WalletManager
+
+--- Create a new wallet manager.
+-- @param datadir string: Base data directory
+-- @param network table: Network configuration
+-- @param storage table: Storage backend (optional)
+-- @return WalletManager: New wallet manager instance
+function M.new_manager(datadir, network, storage)
+  local self = setmetatable({}, WalletManager)
+  self.datadir = datadir
+  self.wallets_dir = datadir .. "/wallets"
+  self.network = network or consensus.networks.mainnet
+  self.storage = storage
+  self.wallets = {}       -- name -> wallet instance
+  self.wallet_locks = {}  -- name -> file descriptor (for locking)
+  self.default_wallet = nil  -- default wallet name
+  return self
+end
+
+--- Ensure wallets directory exists.
+-- @return boolean: true on success
+function WalletManager:ensure_wallets_dir()
+  -- Try to create directory
+  local ok = os.execute("mkdir -p '" .. self.wallets_dir .. "'")
+  return ok == true or ok == 0
+end
+
+--- Get wallet directory path for a wallet name.
+-- @param name string: Wallet name
+-- @return string: Path to wallet directory
+function WalletManager:get_wallet_dir(name)
+  if name == "" then
+    -- Default wallet is in root data directory (backward compatible)
+    return self.datadir
+  end
+  return self.wallets_dir .. "/" .. name
+end
+
+--- Get wallet file path for a wallet name.
+-- @param name string: Wallet name
+-- @return string: Path to wallet.json file
+function WalletManager:get_wallet_path(name)
+  return self:get_wallet_dir(name) .. "/wallet.json"
+end
+
+--- Check if a wallet is loaded.
+-- @param name string: Wallet name
+-- @return boolean: true if wallet is loaded
+function WalletManager:is_loaded(name)
+  return self.wallets[name] ~= nil
+end
+
+--- Get list of loaded wallet names.
+-- @return table: Array of wallet names
+function WalletManager:list_wallets()
+  local names = {}
+  for name, _ in pairs(self.wallets) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  return names
+end
+
+--- Get a loaded wallet by name.
+-- @param name string: Wallet name (empty string for default)
+-- @return Wallet|nil: Wallet instance, or nil if not loaded
+function WalletManager:get_wallet(name)
+  return self.wallets[name]
+end
+
+--- Get default wallet (first loaded or named "").
+-- @return Wallet|nil: Default wallet, or nil if no wallets loaded
+function WalletManager:get_default_wallet()
+  if self.default_wallet and self.wallets[self.default_wallet] then
+    return self.wallets[self.default_wallet], self.default_wallet
+  end
+  -- Fallback: empty string wallet or first loaded
+  if self.wallets[""] then
+    return self.wallets[""], ""
+  end
+  -- Return first loaded wallet
+  for name, wallet in pairs(self.wallets) do
+    return wallet, name
+  end
+  return nil, nil
+end
+
+--- Try to acquire a file lock for a wallet.
+-- @param name string: Wallet name
+-- @return boolean: true if lock acquired
+-- @return string|nil: Error message if failed
+function WalletManager:acquire_lock(name)
+  local wallet_dir = self:get_wallet_dir(name)
+  local lock_path = wallet_dir .. "/.lock"
+
+  -- Create lock file if it doesn't exist
+  local fd = ffi.C.open(lock_path, bit.bor(O_RDWR, O_CREAT), 0x180)  -- 0600
+  if fd < 0 then
+    return false, "Cannot open lock file: " .. lock_path
+  end
+
+  -- Try to get exclusive lock (non-blocking)
+  if not lock_file(fd) then
+    ffi.C.close(fd)
+    return false, "Wallet is locked by another process"
+  end
+
+  self.wallet_locks[name] = fd
+  return true
+end
+
+--- Release file lock for a wallet.
+-- @param name string: Wallet name
+function WalletManager:release_lock(name)
+  local fd = self.wallet_locks[name]
+  if fd then
+    unlock_file(fd)
+    ffi.C.close(fd)
+    self.wallet_locks[name] = nil
+  end
+end
+
+--- Create a new wallet.
+-- @param name string: Wallet name
+-- @param options table: Options {disable_private_keys, blank, passphrase, descriptors}
+-- @return Wallet|nil: New wallet, or nil on error
+-- @return string|nil: Error message
+function WalletManager:create_wallet(name, options)
+  options = options or {}
+
+  -- Validate name
+  if name:find("[/\\:*?\"<>|]") then
+    return nil, "Invalid wallet name: contains illegal characters"
+  end
+
+  -- Check if already loaded
+  if self.wallets[name] then
+    return nil, "Wallet \"" .. name .. "\" is already loaded"
+  end
+
+  -- Check if wallet already exists
+  local wallet_path = self:get_wallet_path(name)
+  if M.exists(wallet_path) then
+    return nil, "Wallet \"" .. name .. "\" already exists"
+  end
+
+  -- Ensure wallets directory exists
+  if name ~= "" then
+    self:ensure_wallets_dir()
+    local wallet_dir = self:get_wallet_dir(name)
+    os.execute("mkdir -p '" .. wallet_dir .. "'")
+  end
+
+  -- Acquire lock
+  local lock_ok, lock_err = self:acquire_lock(name)
+  if not lock_ok then
+    return nil, lock_err
+  end
+
+  -- Create wallet
+  local wallet
+  if options.blank or options.disable_private_keys then
+    -- Create blank wallet (no keys)
+    wallet = M.new(self.network, self.storage)
+    wallet.is_locked = not options.disable_private_keys
+  else
+    -- Create with new seed
+    wallet = M.create(self.network, self.storage, options.passphrase)
+  end
+
+  -- Save wallet
+  local save_ok, save_err = wallet:save(wallet_path)
+  if not save_ok then
+    self:release_lock(name)
+    return nil, save_err
+  end
+
+  -- Add to loaded wallets
+  self.wallets[name] = wallet
+
+  -- Set as default if first wallet
+  if self.default_wallet == nil then
+    self.default_wallet = name
+  end
+
+  return wallet
+end
+
+--- Load an existing wallet.
+-- @param name string: Wallet name (or path for backward compat)
+-- @param passphrase string: Passphrase for encrypted wallets (optional)
+-- @return Wallet|nil: Loaded wallet, or nil on error
+-- @return string|nil: Error message
+function WalletManager:load_wallet(name, passphrase)
+  -- Check if already loaded
+  if self.wallets[name] then
+    return nil, "Wallet \"" .. name .. "\" is already loaded"
+  end
+
+  -- Check if wallet exists
+  local wallet_path = self:get_wallet_path(name)
+  if not M.exists(wallet_path) then
+    return nil, "Wallet file not found: " .. wallet_path
+  end
+
+  -- Acquire lock
+  local lock_ok, lock_err = self:acquire_lock(name)
+  if not lock_ok then
+    return nil, lock_err
+  end
+
+  -- Load wallet
+  local wallet, load_err = M.load(wallet_path, self.network, self.storage, passphrase)
+  if not wallet then
+    self:release_lock(name)
+    return nil, load_err
+  end
+
+  -- Add to loaded wallets
+  self.wallets[name] = wallet
+
+  -- Set as default if first wallet
+  if self.default_wallet == nil then
+    self.default_wallet = name
+  end
+
+  return wallet
+end
+
+--- Unload a wallet.
+-- @param name string: Wallet name
+-- @return boolean: true on success
+-- @return string|nil: Error message
+function WalletManager:unload_wallet(name)
+  local wallet = self.wallets[name]
+  if not wallet then
+    return false, "Wallet \"" .. name .. "\" is not loaded"
+  end
+
+  -- Save wallet before unloading
+  local wallet_path = self:get_wallet_path(name)
+  local save_ok, save_err = wallet:save(wallet_path)
+  if not save_ok then
+    return false, "Failed to save wallet: " .. (save_err or "unknown error")
+  end
+
+  -- Remove from loaded wallets
+  self.wallets[name] = nil
+
+  -- Release lock
+  self:release_lock(name)
+
+  -- Update default wallet if needed
+  if self.default_wallet == name then
+    self.default_wallet = nil
+    -- Set new default to first available
+    for new_name, _ in pairs(self.wallets) do
+      self.default_wallet = new_name
+      break
+    end
+  end
+
+  return true
+end
+
+--- List wallets in wallet directory (loaded and unloaded).
+-- @return table: Array of {name=string, loaded=boolean}
+function WalletManager:list_wallet_dir()
+  local wallets = {}
+
+  -- Check for default wallet in data dir
+  if M.exists(self.datadir .. "/wallet.json") then
+    wallets[#wallets + 1] = {
+      name = "",
+      loaded = self.wallets[""] ~= nil,
+    }
+  end
+
+  -- Scan wallets directory
+  local handle = io.popen("ls -1 '" .. self.wallets_dir .. "' 2>/dev/null")
+  if handle then
+    for dir in handle:lines() do
+      local wallet_path = self.wallets_dir .. "/" .. dir .. "/wallet.json"
+      if M.exists(wallet_path) then
+        wallets[#wallets + 1] = {
+          name = dir,
+          loaded = self.wallets[dir] ~= nil,
+        }
+      end
+    end
+    handle:close()
+  end
+
+  return wallets
+end
+
+-- Export WalletManager class
+M.WalletManager = WalletManager
+
 return M

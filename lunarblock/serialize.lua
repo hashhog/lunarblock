@@ -354,6 +354,17 @@ function M.serialize_block(blk)
   return w.result()
 end
 
+-- Serialize a block without witness data (for stripped size calculation)
+function M.serialize_block_without_witness(blk)
+  local w = M.buffer_writer()
+  w.write_bytes(M.serialize_block_header(blk.header))
+  w.write_varint(#blk.transactions)
+  for _, tx in ipairs(blk.transactions) do
+    w.write_bytes(M.serialize_transaction(tx, false))  -- false = no witness
+  end
+  return w.result()
+end
+
 -- Deserialize a full block
 function M.deserialize_block(reader)
   local types = require("lunarblock.types")

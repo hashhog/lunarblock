@@ -2,7 +2,127 @@ local types = require("lunarblock.types")
 local serialize = require("lunarblock.serialize")
 local validation = require("lunarblock.validation")
 local consensus = require("lunarblock.consensus")
+local script_mod = require("lunarblock.script")
 local M = {}
+
+-- Cluster mempool: union-find for tracking transaction clusters
+local uf_parent = {}
+local uf_rank = {}
+
+local function uf_find(x)
+  while uf_parent[x] ~= x do
+    uf_parent[x] = uf_parent[uf_parent[x]]
+    x = uf_parent[x]
+  end
+  return x
+end
+
+local function uf_union(a, b)
+  a, b = uf_find(a), uf_find(b)
+  if a == b then return end
+  if (uf_rank[a] or 0) < (uf_rank[b] or 0) then a, b = b, a end
+  uf_parent[b] = a
+  if (uf_rank[a] or 0) == (uf_rank[b] or 0) then uf_rank[a] = (uf_rank[a] or 0) + 1 end
+end
+
+local MAX_CLUSTER_SIZE = 101
+
+local function get_cluster_size(root)
+  local count = 0
+  for txid, _ in pairs(uf_parent) do
+    if uf_find(txid) == root then count = count + 1 end
+  end
+  return count
+end
+
+local function get_cluster_txids(root)
+  local txids = {}
+  for txid, _ in pairs(uf_parent) do
+    if uf_find(txid) == root then txids[#txids + 1] = txid end
+  end
+  return txids
+end
+
+local function linearize_cluster(txids, entries)
+  -- Greedy chunk algorithm: repeatedly extract highest-feerate prefix
+  local remaining = {}
+  for _, txid in ipairs(txids) do remaining[txid] = true end
+  local result = {}
+  while next(remaining) do
+    local best_txid, best_rate = nil, -1
+    for txid in pairs(remaining) do
+      local e = entries[txid]
+      if e then
+        local rate = (e.fee or 0) / math.max(e.size or 1, 1)
+        if rate > best_rate then best_rate = rate; best_txid = txid end
+      end
+    end
+    if not best_txid then break end
+    result[#result + 1] = best_txid
+    remaining[best_txid] = nil
+  end
+  return result
+end
+
+local function interpolate_fee(diagram, size)
+  for i = 2, #diagram do
+    if diagram[i].size >= size then
+      local prev = diagram[i-1]
+      local curr = diagram[i]
+      local frac = (size - prev.size) / math.max(curr.size - prev.size, 1)
+      return prev.fee + frac * (curr.fee - prev.fee)
+    end
+  end
+  return diagram[#diagram] and diagram[#diagram].fee or 0
+end
+
+local function build_feerate_diagram(linearization, entries)
+  local diagram = {{size = 0, fee = 0}}
+  local cum_size, cum_fee = 0, 0
+  for _, txid in ipairs(linearization) do
+    local e = entries[txid]
+    if e then
+      cum_size = cum_size + (e.size or 0)
+      cum_fee = cum_fee + (e.fee or 0)
+      diagram[#diagram + 1] = {size = cum_size, fee = cum_fee}
+    end
+  end
+  return diagram
+end
+
+local function compare_diagrams(old_diag, new_diag)
+  -- Returns true if new is strictly better (fee >= at every size, > at least once)
+  local dominated = true
+  local strictly_better = false
+  local oi, ni = 1, 1
+  while oi <= #old_diag or ni <= #new_diag do
+    local os_val = old_diag[oi] and old_diag[oi].size or math.huge
+    local ns = new_diag[ni] and new_diag[ni].size or math.huge
+    local check_size = math.min(os_val, ns)
+    if check_size == math.huge then break end
+    -- Interpolate fees at check_size for both diagrams
+    local old_fee = interpolate_fee(old_diag, check_size)
+    local new_fee = interpolate_fee(new_diag, check_size)
+    if new_fee < old_fee then dominated = false; break end
+    if new_fee > old_fee then strictly_better = true end
+    if os_val <= ns then oi = oi + 1 end
+    if ns <= os_val then ni = ni + 1 end
+  end
+  return dominated and strictly_better
+end
+
+-- Export cluster mempool utilities for external use
+M.uf_parent = uf_parent
+M.uf_rank = uf_rank
+M.uf_find = uf_find
+M.uf_union = uf_union
+M.MAX_CLUSTER_SIZE = MAX_CLUSTER_SIZE
+M.get_cluster_size = get_cluster_size
+M.get_cluster_txids = get_cluster_txids
+M.linearize_cluster = linearize_cluster
+M.build_feerate_diagram = build_feerate_diagram
+M.compare_diagrams = compare_diagrams
+M.interpolate_fee = interpolate_fee
 
 --------------------------------------------------------------------------------
 -- Mempool Policy Constants
@@ -27,6 +147,9 @@ M.MAX_PACKAGE_COUNT = 25                 -- Max transactions in a package
 M.MAX_PACKAGE_WEIGHT = 404000            -- Max total weight (101KB vsize)
 M.MAX_PACKAGE_VSIZE = 101000             -- Max total vsize (weight / 4)
 
+-- Pay-to-Anchor (P2A) Constants
+M.ANCHOR_AMOUNT = 0                      -- P2A outputs must have zero value
+
 --------------------------------------------------------------------------------
 -- BIP125 RBF Signaling
 --------------------------------------------------------------------------------
@@ -42,6 +165,51 @@ function M.signals_rbf(tx)
     end
   end
   return false
+end
+
+--------------------------------------------------------------------------------
+-- Pay-to-Anchor (P2A) Policy
+--------------------------------------------------------------------------------
+
+--- Check if an output is a Pay-to-Anchor (P2A) output.
+-- P2A outputs are anyone-can-spend outputs designed for anchor outputs in
+-- Lightning commitment transactions. They allow CPFP fee bumping.
+-- @param output txout: The transaction output to check
+-- @return boolean: True if this is a P2A output
+function M.is_anchor_output(output)
+  return script_mod.is_pay_to_anchor(output.script_pubkey)
+end
+
+--- Check if a P2A (anchor) output has valid amount (must be 0).
+-- Per policy, anchor outputs must have exactly 0 value to be relayed.
+-- This prevents dust accumulation while allowing CPFP.
+-- @param output txout: The transaction output to check
+-- @return boolean: True if the anchor output has valid (zero) value
+function M.is_valid_anchor_amount(output)
+  return output.value == M.ANCHOR_AMOUNT
+end
+
+--- Check if a transaction's outputs comply with P2A policy.
+-- All P2A outputs in a transaction must have zero value.
+-- @param tx transaction: The transaction to check
+-- @return boolean, string: True if valid, or false and error message
+function M.check_anchor_outputs(tx)
+  for i, out in ipairs(tx.outputs) do
+    if M.is_anchor_output(out) then
+      if not M.is_valid_anchor_amount(out) then
+        return false, string.format("anchor output %d must have value 0, got %d", i, out.value)
+      end
+    end
+  end
+  return true
+end
+
+--- Check if a scriptPubKey is exempt from dust threshold.
+-- P2A outputs are exempt from dust because they must be 0 value.
+-- @param script_pubkey string: The scriptPubKey to check
+-- @return boolean: True if exempt from dust threshold
+function M.is_dust_exempt(script_pubkey)
+  return script_mod.is_pay_to_anchor(script_pubkey)
 end
 
 --------------------------------------------------------------------------------
@@ -115,6 +283,10 @@ function M.new(chain_state, config)
   self.outpoint_to_tx = {}    -- outpoint_key -> txid_hex (tracks which tx spends each output)
   self.total_size = 0          -- Current memory usage estimate
   self.tx_count = 0
+  -- Optional notification callbacks (for ZMQ, etc.)
+  self.callbacks = {
+    on_tx_removed = nil,  -- function(txid, reason)
+  }
   return self
 end
 
@@ -202,7 +374,13 @@ function Mempool:accept_transaction(tx, allow_rbf)
     return false, "missing inputs"
   end
 
-  -- 4. Calculate fee
+  -- 4. Check P2A (anchor) output policy
+  local anchor_ok, anchor_err = M.check_anchor_outputs(tx)
+  if not anchor_ok then
+    return false, anchor_err
+  end
+
+  -- 5. Calculate fee
   local output_total = 0
   for _, out in ipairs(tx.outputs) do
     output_total = output_total + out.value
@@ -212,7 +390,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
     return false, "outputs exceed inputs"
   end
 
-  -- 5. Check fee rate
+  -- 6. Check fee rate
   local weight = validation.get_tx_weight(tx)
   local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
   local fee_rate_per_kb = fee * 1000 / vsize
@@ -221,7 +399,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
       fee_rate_per_kb, self.min_relay_fee)
   end
 
-  -- 6. Handle RBF conflicts (BIP125)
+  -- 7. Handle RBF conflicts (BIP125)
   local all_conflicts = {}  -- All txs to be evicted (conflicts + descendants)
   if next(conflicts) then
     -- BIP125 Rule #1: All conflicting transactions must be replaceable
@@ -306,7 +484,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
     end
   end
 
-  -- 7. Compute ancestors (with proper deduplication) and check limits
+  -- 8. Compute ancestors (with proper deduplication) and check limits
   -- Build the full set of unique in-mempool ancestors
   local ancestors = {}  -- txid_hex -> true (set of all ancestors)
   local direct_parents = {}  -- txid_hex -> entry (direct parents only)
@@ -345,7 +523,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
     return false, "ancestor size too large: " .. ancestor_size
   end
 
-  -- 7b. Check descendant limits for ALL ancestors
+  -- 8b. Check descendant limits for ALL ancestors
   -- Adding this transaction would add 1 to descendant_count and vsize to descendant_size
   -- for every ancestor (including direct parents)
   for anc_hex in pairs(ancestors) do
@@ -362,7 +540,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
     end
   end
 
-  -- 8. Add to mempool
+  -- 9. Add to mempool
   local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time())
   entry.ancestor_count = ancestor_count - 1  -- exclude self
   entry.ancestor_size = ancestor_size - vsize  -- exclude self
@@ -393,6 +571,19 @@ function Mempool:accept_transaction(tx, allow_rbf)
       anc_entry.descendant_size = anc_entry.descendant_size + vsize
       anc_entry.descendant_fees = anc_entry.descendant_fees + fee
     end
+  end
+
+  -- Cluster mempool: register in union-find and merge with parent clusters
+  uf_parent[txid_hex] = txid_hex
+  uf_rank[txid_hex] = 0
+  for parent_hex in pairs(direct_parents) do
+    uf_union(txid_hex, parent_hex)
+  end
+  -- Check cluster size limit
+  if get_cluster_size(uf_find(txid_hex)) > MAX_CLUSTER_SIZE then
+    -- Undo: remove the entry we just added
+    self:remove_transaction(txid_hex, "cluster-limit")
+    return false, "cluster size exceeds limit of " .. MAX_CLUSTER_SIZE
   end
 
   -- 9. Evict low-fee transactions if mempool exceeds max size
@@ -443,6 +634,16 @@ function Mempool:remove_transaction(txid_hex, reason)
   self.total_size = self.total_size - entry.size
   self.tx_count = self.tx_count - 1
   self.entries[txid_hex] = nil
+
+  -- Cluster mempool: remove from union-find
+  uf_parent[txid_hex] = nil
+  uf_rank[txid_hex] = nil
+
+  -- Invoke callback if registered (for ZMQ notifications, etc.)
+  -- Note: txid_hex is the hex string; callers needing bytes should convert
+  if self.callbacks.on_tx_removed then
+    self.callbacks.on_tx_removed(txid_hex, reason)
+  end
 end
 
 --------------------------------------------------------------------------------

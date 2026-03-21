@@ -28,6 +28,16 @@ local function parse_args(argv)
     jitprofile = false,
     jitverbose = false,
     prune = 0,  -- 0=disabled, 1=manual only, >=550=target MB
+    rest = false,  -- Enable REST API
+    restport = nil,  -- REST server port (default: 8080)
+    -- ZMQ notification endpoints
+    zmqpubhashblock = nil,
+    zmqpubhashtx = nil,
+    zmqpubrawblock = nil,
+    zmqpubrawtx = nil,
+    zmqpubsequence = nil,
+    zmqpubhwm = 1000,  -- ZMQ high water mark
+    nov2transport = false,  -- Disable BIP324 v2 transport
   }
 
   local i = 1
@@ -57,6 +67,15 @@ local function parse_args(argv)
       print("      --jitprofile        Enable JIT profiling output")
       print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --prune N           Prune mode: 0=disabled, 1=manual, >=550=target MB")
+      print("      --rest              Enable REST API (no auth, read-only)")
+      print("      --restport PORT     REST server port (default: 8080)")
+      print("      --zmqpubhashblock ENDPOINT  Publish hashblock notifications")
+      print("      --zmqpubhashtx ENDPOINT     Publish hashtx notifications")
+      print("      --zmqpubrawblock ENDPOINT   Publish rawblock notifications")
+      print("      --zmqpubrawtx ENDPOINT      Publish rawtx notifications")
+      print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
+      print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
+      print("      --nov2transport             Disable BIP324 v2 encrypted transport")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -107,6 +126,8 @@ local function parse_args(argv)
       args.jitprofile = true
     elseif arg == "--jitverbose" then
       args.jitverbose = true
+    elseif arg == "--nov2transport" then
+      args.nov2transport = true
     elseif arg == "--prune" then
       i = i + 1
       local prune_val = tonumber(argv[i])
@@ -123,6 +144,29 @@ local function parse_args(argv)
         os.exit(1)
       end
       args.prune = prune_val
+    elseif arg == "--rest" then
+      args.rest = true
+    elseif arg == "--restport" then
+      i = i + 1
+      args.restport = tonumber(argv[i])
+    elseif arg == "--zmqpubhashblock" then
+      i = i + 1
+      args.zmqpubhashblock = argv[i]
+    elseif arg == "--zmqpubhashtx" then
+      i = i + 1
+      args.zmqpubhashtx = argv[i]
+    elseif arg == "--zmqpubrawblock" then
+      i = i + 1
+      args.zmqpubrawblock = argv[i]
+    elseif arg == "--zmqpubrawtx" then
+      i = i + 1
+      args.zmqpubrawtx = argv[i]
+    elseif arg == "--zmqpubsequence" then
+      i = i + 1
+      args.zmqpubsequence = argv[i]
+    elseif arg == "--zmqpubhwm" then
+      i = i + 1
+      args.zmqpubhwm = tonumber(argv[i])
     else
       io.stderr:write("Unknown option: " .. arg .. "\n")
       os.exit(1)
@@ -147,8 +191,6 @@ M.parse_args = parse_args
 
 local function main()
   local socket = require("socket")
-  local lfs = require("lfs")
-
   local args = parse_args(arg)
 
   -- Override network from flags
@@ -187,8 +229,8 @@ local function main()
   if args.network ~= "mainnet" then
     datadir = datadir .. "/" .. args.network
   end
-  lfs.mkdir(args.datadir)
-  lfs.mkdir(datadir)
+  os.execute("mkdir -p " .. args.datadir)
+  os.execute("mkdir -p " .. datadir)
 
   print("LunarBlock v" .. VERSION .. " starting...")
   print("Network: " .. args.network)
@@ -230,11 +272,59 @@ local function main()
     header_chain.header_tip_hash and types.hash256_hex(header_chain.header_tip_hash) or "none"
   ))
 
+  -- Initialize block downloader for IBD
+  local block_downloader = sync_mod.new_block_downloader(header_chain, db, network)
+  -- Start downloading from after the current chain tip
+  block_downloader.next_connect_height = chain_state.tip_height + 1
+  block_downloader.next_download_height = chain_state.tip_height + 1
+  -- Wire up block connection callback to update UTXO chain state
+  block_downloader.connect_callback = function(block, height, block_hash)
+    local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, true)
+    if not ok then
+      print(string.format("Failed to connect block %d: %s", height, tostring(err)))
+    end
+  end
+
   -- Initialize mempool
   local mempool = mempool_mod.new(chain_state, {
     max_mempool_size = 300 * 1024 * 1024,
     min_relay_fee = 1000,
   })
+
+  -- Initialize ZMQ notifications (if any endpoints configured)
+  local zmq_notifier = nil
+  if args.zmqpubhashblock or args.zmqpubhashtx or args.zmqpubrawblock or
+     args.zmqpubrawtx or args.zmqpubsequence then
+    local zmq_mod = require("lunarblock.zmq")
+    if zmq_mod.is_available() then
+      zmq_notifier = zmq_mod.new_notification_manager({
+        zmqpubhashblock = args.zmqpubhashblock,
+        zmqpubhashtx = args.zmqpubhashtx,
+        zmqpubrawblock = args.zmqpubrawblock,
+        zmqpubrawtx = args.zmqpubrawtx,
+        zmqpubsequence = args.zmqpubsequence,
+        zmqpubhwm = args.zmqpubhwm,
+      })
+      if zmq_notifier.enabled then
+        print("ZMQ notifications enabled")
+        -- Wire up chain state callbacks for block notifications
+        chain_state.callbacks.on_block_connected = function(block_hash, block)
+          local block_data = serialize.serialize_block(block)
+          zmq_notifier:on_block_connected(block_hash.bytes, block_data)
+        end
+        chain_state.callbacks.on_block_disconnected = function(block_hash)
+          zmq_notifier:on_block_disconnected(block_hash.bytes)
+        end
+        -- Wire up mempool callback for tx removal notifications
+        mempool.callbacks.on_tx_removed = function(txid_hex, _reason)
+          local txid_bytes = types.hash256_from_hex(txid_hex)
+          zmq_notifier:on_tx_removed(txid_bytes.bytes)
+        end
+      end
+    else
+      print("Warning: ZMQ notifications requested but libzmq not available")
+    end
+  end
 
   -- Initialize fee estimator
   local fee_estimator = fee_mod.new(144)
@@ -243,6 +333,7 @@ local function main()
   local peer_manager = peerman_mod.new(network, db, {
     maxpeers = args.maxpeers,
     max_outbound = 8,
+    nov2transport = args.nov2transport,
   })
   peer_manager.our_height = header_chain.header_tip_height
 
@@ -256,12 +347,17 @@ local function main()
       print(string.format("Accepted %d headers, tip now at height %d",
         accepted, header_chain.header_tip_height))
       peer_manager.our_height = header_chain.header_tip_height
+      chain_state.header_tip_height = header_chain.header_tip_height
     end
   end)
 
-  peer_manager:register_handler("block", function(_peer, _payload)
-    -- Handle during IBD (block downloader) or normal operation
-    -- Block handling is done via the block downloader for IBD
+  peer_manager:register_handler("block", function(peer, payload)
+    if not block_downloader.ibd_complete then
+      local ok, err = block_downloader:handle_block(peer, payload)
+      if not ok then
+        print(string.format("Block download error: %s", tostring(err)))
+      end
+    end
   end)
 
   peer_manager:register_handler("inv", function(peer, payload)
@@ -303,6 +399,10 @@ local function main()
         if entry then
           fee_estimator:track_tx(txid_hex, entry.fee_rate, chain_state.tip_height)
         end
+        -- ZMQ notification for new transaction
+        if zmq_notifier then
+          zmq_notifier:on_tx_added(txid.bytes, payload)
+        end
       else
         -- Log rejection if verbose
         local _ = reason
@@ -330,22 +430,34 @@ local function main()
   -- Peer established callback: start sync
   peer_manager.callbacks.on_peer_established = function(peer)
     print(string.format("Peer established: %s:%d %s (height=%d)",
-      peer.ip, peer.port, peer.user_agent, peer.start_height))
+      peer.ip, peer.port, peer.user_agent or "unknown", peer.start_height))
     if not header_chain.syncing and peer.start_height > header_chain.header_tip_height then
       header_chain:start_sync(peer)
     end
   end
 
-  -- Initialize wallet
+  -- Initialize wallet manager (multi-wallet support)
+  local wallet_manager = wallet_mod.new_manager(datadir, network, db)
+  wallet_manager:ensure_wallets_dir()
+
+  -- Load or create default wallet (backward compatible)
   local wallet = nil
-  local wallet_path = datadir .. "/wallet.json"
+  local default_wallet_path = datadir .. "/wallet.json"
   if not args.nowalletcreate then
-    wallet = wallet_mod.load(wallet_path, network, db)
+    -- Try to load existing default wallet
+    if wallet_mod.exists(default_wallet_path) then
+      wallet = wallet_manager:load_wallet("")
+      if wallet then
+        print("Loaded default wallet")
+      end
+    end
+    -- Create new wallet if none exists
     if not wallet then
       print("Creating new wallet...")
-      wallet = wallet_mod.create(network, db)
-      wallet:save(wallet_path)
-      print("Wallet created. First address: " .. wallet.addresses[1])
+      wallet = wallet_manager:create_wallet("", {})
+      if wallet then
+        print("Wallet created. First address: " .. (wallet.addresses[1] or "none"))
+      end
     end
   end
 
@@ -361,10 +473,28 @@ local function main()
     storage = db,
     network = network,
     fee_estimator = fee_estimator,
-    wallet = wallet,
+    wallet = wallet,  -- Legacy single wallet (backward compat)
+    wallet_manager = wallet_manager,  -- Multi-wallet manager
+    datadir = datadir,
     mining = mining_mod,
   })
   rpc_server:start()
+
+  -- Initialize REST server (if enabled)
+  local rest_server = nil
+  if args.rest then
+    local rest_mod = require("lunarblock.rest")
+    local rest_port = args.restport or 8080
+    rest_server = rest_mod.new({
+      host = "127.0.0.1",
+      rest_port = rest_port,
+      chain_state = chain_state,
+      mempool = mempool,
+      storage = db,
+      network = network,
+    })
+    rest_server:start()
+  end
 
   -- Connect to specific peer if requested
   if args.connect then
@@ -377,6 +507,9 @@ local function main()
   peer_manager:start_listener("0.0.0.0", args.port)
   print(string.format("P2P listening on port %d", args.port))
   print(string.format("RPC listening on port %d", args.rpcport))
+  if rest_server then
+    print(string.format("REST listening on port %d", args.restport or 8080))
+  end
 
   -- Signal handling (graceful shutdown)
   local running = true
@@ -388,8 +521,21 @@ local function main()
     -- Process P2P
     peer_manager:tick()
 
+    -- Schedule block downloads during IBD
+    if not block_downloader.ibd_complete and header_chain.header_tip_height > chain_state.tip_height then
+      local peers = peer_manager:get_established_peers()
+      if #peers > 0 then
+        block_downloader:schedule_downloads(peers)
+      end
+    end
+
     -- Process RPC
     rpc_server:tick()
+
+    -- Process REST
+    if rest_server then
+      rest_server:tick()
+    end
 
     -- Periodic status update
     local now = socket.gettime()
@@ -430,6 +576,7 @@ local function main()
 
   peer_manager:stop()
   rpc_server:stop()
+  if rest_server then rest_server:stop() end
   if wallet then wallet:save(wallet_path) end
   db.close()
   print("LunarBlock stopped.")
@@ -467,6 +614,14 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --jitprofile        Enable JIT profiling output")
       print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --prune N           Prune mode: 0=disabled, 1=manual, >=550=target MB")
+      print("      --rest              Enable REST API (no auth, read-only)")
+      print("      --restport PORT     REST server port (default: 8080)")
+      print("      --zmqpubhashblock ENDPOINT  Publish hashblock notifications")
+      print("      --zmqpubhashtx ENDPOINT     Publish hashtx notifications")
+      print("      --zmqpubrawblock ENDPOINT   Publish rawblock notifications")
+      print("      --zmqpubrawtx ENDPOINT      Publish rawtx notifications")
+      print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
+      print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)

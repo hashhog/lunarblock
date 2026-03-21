@@ -528,6 +528,10 @@ end
 
 --- Verify ECDSA signature with lax DER parsing (pre-BIP66 compatibility).
 -- Uses lax DER parsing that accepts OpenSSL-compatible non-strict DER.
+-- Always uses our lax parser because secp256k1_ecdsa_signature_parse_der
+-- may return success for certain non-standard DER signatures (e.g., R with
+-- high bit set but no leading 0x00 padding) while silently zeroing values,
+-- causing verification to fail even though the signature is mathematically valid.
 -- @param pubkey_bytes string: public key bytes
 -- @param sig_der string: DER-encoded signature (potentially non-strict)
 -- @param msg_hash32 string: 32-byte message hash
@@ -540,21 +544,17 @@ function M.ecdsa_verify_lax(pubkey_bytes, sig_der, msg_hash32)
     return false, "invalid public key"
   end
 
-  -- Try strict DER first (most signatures are valid strict DER)
-  local sig = ffi.new("secp256k1_ecdsa_signature")
-  local ok = libsecp256k1.secp256k1_ecdsa_signature_parse_der(
-    secp_ctx, sig, sig_der, #sig_der
-  )
-
-  if ok ~= 1 then
-    -- Strict DER failed - try lax DER parsing
-    sig = lax_der_parse(sig_der)
-    if not sig then
-      return false, "invalid DER signature"
-    end
+  -- Always use the lax DER parser. We cannot try secp256k1_ecdsa_signature_parse_der
+  -- first because it may return success but silently zero out R/S values for
+  -- signatures with non-standard DER encoding (e.g., negative integers without
+  -- proper 0x00 padding), causing verification to fail incorrectly.
+  local sig = lax_der_parse(sig_der)
+  if not sig then
+    return false, "invalid DER signature"
   end
 
   -- Normalize S to low-S form before verification
+  -- (required by secp256k1_ecdsa_verify which only accepts low-S)
   libsecp256k1.secp256k1_ecdsa_signature_normalize(secp_ctx, sig, sig)
 
   local result = libsecp256k1.secp256k1_ecdsa_verify(secp_ctx, sig, msg_hash32, pubkey)
@@ -1027,12 +1027,17 @@ end
 --------------------------------------------------------------------------------
 
 --- Compute a BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
+-- @param tag string: The tag string (e.g., "TapLeaf", "TapBranch", "TapTweak")
+-- @param msg string: The message to hash
+-- @return string: 32-byte hash
 function M.tagged_hash(tag, msg)
   local tag_hash = M.sha256(tag)
   return M.sha256(tag_hash .. tag_hash .. msg)
 end
 
 --- Encode a length as Bitcoin compact size (varint).
+-- @param n number: The length value to encode
+-- @return string: The compact size encoding
 function M.compact_size(n)
   if n < 0xFD then
     return string.char(n)
@@ -1052,26 +1057,35 @@ function M.compact_size(n)
 end
 
 --- Tweak an x-only public key with a 32-byte tweak using secp256k1.
+-- Computes the x-only coordinate of: point(internal_key) + point(tweak * G)
+-- @param xonly_pubkey32 string: 32-byte x-only internal public key
+-- @param tweak32 string: 32-byte tweak scalar
+-- @return string|nil: 32-byte x-only tweaked public key, or nil on error
+-- @return number|nil: parity of the tweaked key (0 or 1)
 function M.tweak_pubkey(xonly_pubkey32, tweak32)
   assert(#xonly_pubkey32 == 32, "x-only pubkey must be 32 bytes")
   assert(#tweak32 == 32, "tweak must be 32 bytes")
 
+  -- Parse the x-only pubkey
   local internal_xonly = ffi.new("secp256k1_xonly_pubkey")
   if libsecp256k1.secp256k1_xonly_pubkey_parse(secp_ctx, internal_xonly, xonly_pubkey32) ~= 1 then
     return nil, nil
   end
 
+  -- Tweak-add to get a full pubkey
   local output_pubkey = ffi.new("secp256k1_pubkey")
   if libsecp256k1.secp256k1_xonly_pubkey_tweak_add(secp_ctx, output_pubkey, internal_xonly, tweak32) ~= 1 then
     return nil, nil
   end
 
+  -- Convert the full pubkey back to x-only
   local result_xonly = ffi.new("secp256k1_xonly_pubkey")
   local parity = ffi.new("int[1]")
   if libsecp256k1.secp256k1_xonly_pubkey_from_pubkey(secp_ctx, result_xonly, parity, output_pubkey) ~= 1 then
     return nil, nil
   end
 
+  -- Serialize the x-only pubkey
   local output32 = ffi.new("unsigned char[32]")
   if libsecp256k1.secp256k1_xonly_pubkey_serialize(secp_ctx, output32, result_xonly) ~= 1 then
     return nil, nil

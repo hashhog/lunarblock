@@ -559,6 +559,15 @@ function M.V2Transport(magic_bytes, initiator)
         self.send_state = M.SendState.AWAITING_KEY
         -- Continue processing
       elseif self.recv_state == M.RecvState.KEY then
+        -- For initiator: check for v1 fallback before waiting for full 64 bytes
+        if self.initiator and #self.recv_buffer >= 16 and looks_like_v1(self.recv_buffer:sub(1, 16)) then
+          self.recv_state = M.RecvState.V1
+          self.send_state = M.SendState.V1
+          self.v1_detected = true
+          self.v1_prefix = self.recv_buffer:sub(1, 16)
+          self.recv_buffer = self.recv_buffer:sub(17)
+          return true
+        end
         -- Need 64 bytes for peer's ElligatorSwift key
         if #self.recv_buffer < M.ELLSWIFT_SIZE then
           return true

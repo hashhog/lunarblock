@@ -1459,4 +1459,108 @@ function M.deserialize_pckginfo1(data)
   }
 end
 
+--------------------------------------------------------------------------------
+-- BIP330 Erlay Messages
+--------------------------------------------------------------------------------
+
+--- Serialize a sendtxrcncl message.
+-- Sent during handshake to negotiate Erlay transaction reconciliation.
+-- @param version number: Erlay version (currently 1)
+-- @param salt number: 64-bit reconciliation salt
+-- @return string: serialized sendtxrcncl payload
+function M.serialize_sendtxrcncl(version, salt)
+  local w = serialize.buffer_writer()
+  w.write_u32le(version)
+  w.write_u64le(salt)
+  return w.result()
+end
+
+--- Deserialize a sendtxrcncl message.
+-- @param data string: sendtxrcncl payload
+-- @return table: {version, salt}
+function M.deserialize_sendtxrcncl(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    version = r.read_u32le(),
+    salt = r.read_u64le(),
+  }
+end
+
+--- Serialize a reqrecon message (request reconciliation).
+-- @param set_size number: size of our reconciliation set for this peer
+-- @param q number: difference coefficient (scaled by 2^16)
+-- @return string: serialized reqrecon payload
+function M.serialize_reqrecon(set_size, q)
+  local w = serialize.buffer_writer()
+  w.write_varint(set_size)
+  w.write_u16le(math.floor(q * 65536))  -- Q scaled to uint16
+  return w.result()
+end
+
+--- Deserialize a reqrecon message.
+-- @param data string: reqrecon payload
+-- @return table: {set_size, q}
+function M.deserialize_reqrecon(data)
+  local r = serialize.buffer_reader(data)
+  return {
+    set_size = r.read_varint(),
+    q = r.read_u16le() / 65536,
+  }
+end
+
+--- Serialize a sketch message.
+-- @param sketch_bytes string: serialized minisketch
+-- @return string: serialized sketch payload
+function M.serialize_sketch(sketch_bytes)
+  local w = serialize.buffer_writer()
+  w.write_varint(#sketch_bytes)
+  w.write_bytes(sketch_bytes)
+  return w.result()
+end
+
+--- Deserialize a sketch message.
+-- @param data string: sketch payload
+-- @return string: sketch bytes
+function M.deserialize_sketch(data)
+  local r = serialize.buffer_reader(data)
+  local len = r.read_varint()
+  return r.read_bytes(len)
+end
+
+--- Serialize a reconcildiff message.
+-- Sent after reconciliation to request missing transactions.
+-- @param success boolean: whether reconciliation succeeded
+-- @param want_txids table: list of short txids we want (only if success=true)
+-- @return string: serialized reconcildiff payload
+function M.serialize_reconcildiff(success, want_txids)
+  local w = serialize.buffer_writer()
+  w.write_u8(success and 1 or 0)
+  if success then
+    w.write_varint(#want_txids)
+    for _, short_id in ipairs(want_txids) do
+      w.write_u32le(short_id)
+    end
+  end
+  return w.result()
+end
+
+--- Deserialize a reconcildiff message.
+-- @param data string: reconcildiff payload
+-- @return table: {success, want_txids}
+function M.deserialize_reconcildiff(data)
+  local r = serialize.buffer_reader(data)
+  local success = r.read_u8() == 1
+  local want_txids = {}
+  if success then
+    local count = r.read_varint()
+    for i = 1, count do
+      want_txids[i] = r.read_u32le()
+    end
+  end
+  return {
+    success = success,
+    want_txids = want_txids,
+  }
+end
+
 return M
