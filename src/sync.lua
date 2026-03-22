@@ -445,11 +445,14 @@ end
 --- Initialize the header chain from storage or genesis.
 function HeaderChain:init()
   -- Check if we have a stored header tip (separate from chain tip!)
+  io.stdout:write("  Checking header tip...\n"); io.stdout:flush()
   local tip_hash, tip_height = self:get_header_tip()
   if tip_hash then
+    io.stdout:write(string.format("  Header tip: height=%d\n", tip_height)); io.stdout:flush()
     -- Load the header chain from storage
     self:load_from_storage(tip_hash, tip_height)
   else
+    io.stdout:write("  No header tip found, starting from genesis\n"); io.stdout:flush()
     -- Start from genesis
     self:add_genesis()
   end
@@ -483,9 +486,12 @@ end
 -- @param tip_hash hash256: known tip hash
 -- @param tip_height number: known tip height
 function HeaderChain:load_from_storage(tip_hash, tip_height)
-  -- Walk backwards from tip to genesis loading headers
+  -- Walk backwards from tip to genesis loading headers (without work yet)
+  io.stdout:write(string.format("  Loading %d headers from storage...\n", tip_height + 1))
+  io.stdout:flush()
   local current_hash = tip_hash
   local current_height = tip_height
+  local loaded = 0
 
   while current_height >= 0 do
     local header = self.storage.get_header(current_hash)
@@ -497,9 +503,15 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
     self.headers[hash_hex] = {
       header = header,
       height = current_height,
-      total_work = self:calculate_total_work_from_storage(current_height),
+      total_work = 0,  -- placeholder, filled in forward pass below
     }
     self.height_to_hash[current_height] = hash_hex
+    loaded = loaded + 1
+
+    if loaded % 10000 == 0 then
+      io.stdout:write(string.format("  Loaded %d/%d headers...\n", loaded, tip_height + 1))
+      io.stdout:flush()
+    end
 
     if current_height == 0 then
       break
@@ -507,6 +519,22 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
 
     current_hash = header.prev_hash
     current_height = current_height - 1
+  end
+
+  io.stdout:write(string.format("  Loaded %d headers, computing work...\n", loaded))
+  io.stdout:flush()
+
+  -- Forward pass: compute total_work incrementally from genesis to tip
+  local cumulative_work = 0
+  for h = 0, tip_height do
+    local hash_hex = self.height_to_hash[h]
+    if hash_hex then
+      local entry = self.headers[hash_hex]
+      if entry and entry.header then
+        cumulative_work = cumulative_work + self:work_for_bits(entry.header.bits)
+        entry.total_work = cumulative_work
+      end
+    end
   end
 
   self.header_tip_hash = tip_hash
