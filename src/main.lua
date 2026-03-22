@@ -260,16 +260,21 @@ local function main()
   end
 
   -- Initialize database
-  print("Opening database...")
+  io.stdout:write("Opening database...\n"); io.stdout:flush()
   local db = storage_mod.open(datadir .. "/chainstate", args.dbcache)
+  io.stdout:write("Database opened.\n"); io.stdout:flush()
 
   -- Initialize chain state
+  io.stdout:write("Initializing chain state...\n"); io.stdout:flush()
   local chain_state = utxo_mod.new_chain_state(db, network)
   chain_state:init()
+  io.stdout:write(string.format("Chain state initialized: height=%d\n", chain_state.tip_height or -1)); io.stdout:flush()
 
   -- Initialize header chain
+  io.stdout:write("Initializing header chain...\n"); io.stdout:flush()
   local header_chain = sync_mod.new_header_chain(network, db)
   header_chain:init()
+  io.stdout:write("Header chain initialized.\n"); io.stdout:flush()
   print(string.format("Chain tip: height=%d hash=%s",
     header_chain.header_tip_height,
     header_chain.header_tip_hash and types.hash256_hex(header_chain.header_tip_hash) or "none"
