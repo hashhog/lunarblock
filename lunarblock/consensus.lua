@@ -797,8 +797,8 @@ M.networks.testnet4 = {
   -- Minimum chain work (testnet4)
   min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
 
-  -- Assumevalid (none for testnet4 yet, it's new)
-  assumevalid = nil,
+  -- Assumevalid — block 123613
+  assumevalid = "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
 
   -- BIP9 versionbits parameters (all forks already active at height 1)
   versionbits_period = 2016,
