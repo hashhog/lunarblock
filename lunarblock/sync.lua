@@ -1217,8 +1217,8 @@ function M.new_block_downloader(header_chain, storage, network)
   self.pending_blocks = {}          -- hash_hex -> {block, height, hash}
   self.inflight = {}                -- hash_hex -> {peer, request_time, timeout}
   self.peer_inflight = {}           -- peer -> count of in-flight requests
-  self.base_stall_timeout = 5       -- Base timeout before considering stalled (adaptive)
-  self.max_stall_timeout = 64       -- Maximum stall timeout
+  self.base_stall_timeout = 30      -- Base timeout before considering stalled (seconds)
+  self.max_stall_timeout = 120      -- Maximum stall timeout
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
   self.utxo_flush_interval = 2000   -- Flush UTXO set every N blocks
@@ -1241,6 +1241,7 @@ function BlockDownloader:schedule_downloads(peers)
   local now = socket.gettime()
 
   -- Check for stalled requests and handle adaptive timeout
+  local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
     if now - info.request_time > info.timeout then
       -- Stalled request - remove from inflight and peer tracking
@@ -1251,9 +1252,14 @@ function BlockDownloader:schedule_downloads(peers)
           self.peer_inflight[info.peer] = nil
         end
       end
-      -- Double the timeout for next request of this block (adaptive stalling)
-      -- The block will be re-requested on next schedule cycle
+      had_stalls = true
     end
+  end
+  -- Reset download cursor so stalled blocks get re-requested.
+  -- next_download_height may have advanced past stalled blocks,
+  -- leaving a gap between the connected tip and the download window.
+  if had_stalls then
+    self.next_download_height = self.next_connect_height
   end
 
   -- Calculate how many more blocks we can request
