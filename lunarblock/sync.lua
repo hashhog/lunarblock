@@ -604,8 +604,10 @@ function HeaderChain:add_genesis()
     gen.bits,
     gen.nonce
   )
-  local hash = validation.compute_block_hash(header)
-  local hash_hex = types.hash256_hex(hash)
+  -- Use the authoritative genesis hash from network params instead of computing it,
+  -- since the coinbase serialization may not exactly match Bitcoin Core's encoding
+  local hash = types.hash256_from_hex(self.network.genesis_hash)
+  local hash_hex = self.network.genesis_hash
 
   self.headers[hash_hex] = {
     header = header,

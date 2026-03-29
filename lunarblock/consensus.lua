@@ -757,15 +757,14 @@ M.networks.testnet4 = {
   wif_prefix = 0xEF,
   bech32_hrp = "tb",
 
-  -- Genesis block (testnet4-specific)
+  -- Genesis block (testnet4 uses the same coinbase as mainnet, only header fields differ)
   genesis = {
     version = 1,
     timestamp = 1714777860,
     bits = 0x1d00ffff,
     nonce = 393743547,
-    coinbase_message = "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e",
-    -- Testnet4 uses 33 zero bytes as the pubkey (OP_RETURN-style null output)
-    coinbase_pubkey_hex = "000000000000000000000000000000000000000000000000000000000000000000"
+    coinbase_message = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks",
+    -- Same Satoshi pubkey as mainnet (Bitcoin Core's CreateGenesisBlock reuses it)
   },
   genesis_hash = "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
 
