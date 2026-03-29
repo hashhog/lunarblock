@@ -254,13 +254,13 @@ function M.build_http_response(status, body, content_type)
   -- 204 No Content should not have a body or Content-Length
   if status == 204 then
     return string.format(
-      "HTTP/1.1 %d %s\r\nConnection: keep-alive\r\n\r\n",
+      "HTTP/1.1 %d %s\r\nConnection: close\r\n\r\n",
       status, status_text[status]
     )
   end
 
   local response = string.format(
-    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s",
+    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
     status, status_text[status] or "Unknown", content_type, #body, body
   )
   return response
@@ -2952,25 +2952,25 @@ function RPCServer:tick()
   if not client then return end
 
   client:settimeout(5)
-  -- Read the full HTTP request
-  local data = ""
+  -- Read HTTP headers line-by-line, then read the exact body size.
+  -- Using receive(8192) blocks until 8192 bytes arrive or the timeout
+  -- fires — by then the client has already timed out and closed the
+  -- connection, so the response never reaches it.
+  local headers_raw = ""
+  local content_length = 0
   while true do
-    local chunk, err, partial = client:receive(8192)
-    chunk = chunk or partial
-    if chunk then data = data .. chunk end
-    if err == "closed" or err == "timeout" then break end
-    -- Check if we have the full request
-    local header_end = data:find("\r\n\r\n")
-    if header_end then
-      local content_length = data:match("[Cc]ontent%-[Ll]ength:%s*(%d+)")
-      if content_length then
-        content_length = tonumber(content_length)
-        if #data >= header_end + 3 + content_length then break end
-      else
-        break
-      end
-    end
+    local line, err = client:receive("*l")
+    if not line then break end
+    if line == "" then break end  -- blank line = end of headers
+    headers_raw = headers_raw .. line .. "\r\n"
+    local cl = line:match("^[Cc]ontent%-[Ll]ength:%s*(%d+)")
+    if cl then content_length = tonumber(cl) end
   end
+  local body = ""
+  if content_length > 0 then
+    body = client:receive(content_length) or ""
+  end
+  local data = headers_raw .. "\r\n" .. body
 
   if #data == 0 then
     client:close()
