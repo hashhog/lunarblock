@@ -529,6 +529,30 @@ function Peer:handle_version(payload)
     self:send_message("sendtxrcncl", p2p.serialize_sendtxrcncl(erlay.VERSION, self.erlay_salt))
   end
 
+  -- Inbound peers must send their own version message back (both sides send
+  -- version in the Bitcoin protocol).  Outbound peers already sent version via
+  -- start_handshake(), so only do this for inbound connections.
+  if self.inbound and self.state == M.STATE.CONNECTED then
+    self.nonce = math.random(1, 2^52)
+    local ver_payload = p2p.serialize_version({
+      version = p2p.PROTOCOL_VERSION,
+      services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS),
+      timestamp = os.time(),
+      recv_services = ver.services,
+      recv_ip = self.ip,
+      recv_port = self.port,
+      from_services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS),
+      from_ip = "0.0.0.0",
+      from_port = 0,
+      nonce = self.nonce,
+      user_agent = "/LunarBlock:0.1.0/",
+      start_height = self.our_height,
+      relay = true,
+    })
+    self:send_message("version", ver_payload)
+    self.state = M.STATE.VERSION_SENT
+  end
+
   -- Send verack
   self:send_message("verack", "")
   if self.state == M.STATE.VERSION_SENT then
