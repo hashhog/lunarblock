@@ -290,6 +290,14 @@ local function main()
     local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, true)
     if not ok then
       print(string.format("Failed to connect block %d: %s", height, tostring(err)))
+      return
+    end
+    -- Broadcast inv to peers for newly connected blocks (skip during IBD)
+    if block_downloader.ibd_complete then
+      local inv_payload = p2p.serialize_inv({
+        {type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash}
+      })
+      peer_manager:broadcast("inv", inv_payload)
     end
   end
 
@@ -423,6 +431,7 @@ local function main()
 
   peer_manager:register_handler("getdata", function(peer, payload)
     local items = p2p.deserialize_inv(payload)
+    local not_found = {}
     for _, item in ipairs(items) do
       if item.type == p2p.INV_TYPE.MSG_WITNESS_TX or item.type == p2p.INV_TYPE.MSG_TX then
         local txid_hex = types.hash256_hex(item.hash)
@@ -430,8 +439,21 @@ local function main()
         if entry then
           local data = serialize.serialize_transaction(entry.tx, true)
           peer:send_message("tx", data)
+        else
+          not_found[#not_found + 1] = item
+        end
+      elseif item.type == p2p.INV_TYPE.MSG_BLOCK or item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
+        local blk = db.get_block(item.hash)
+        if blk then
+          local data = serialize.serialize_block(blk)
+          peer:send_message("block", data)
+        else
+          not_found[#not_found + 1] = item
         end
       end
+    end
+    if #not_found > 0 then
+      peer:send_message("notfound", p2p.serialize_notfound(not_found))
     end
   end)
 
