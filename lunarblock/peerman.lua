@@ -1292,6 +1292,7 @@ function PeerManager:accept_inbound()
   local client, err = self.listen_socket:accept()
   if not client then
     -- No connection waiting (timeout or error)
+    -- No connection waiting (timeout or error)
     local _ = err
     return
   end
@@ -1310,7 +1311,6 @@ function PeerManager:accept_inbound()
     client:close()
     return
   end
-
   local inbound_v2 = not self.config.nov2transport
   local p = peer_mod.new(ip, port, self.network, self.our_height, inbound_v2)
   p.socket = client
@@ -1325,7 +1325,6 @@ function PeerManager:accept_inbound()
   local key = ip .. ":" .. port
   self.peers[key] = p
   self.peer_list[#self.peer_list + 1] = p
-
   if self.callbacks.on_peer_connected then
     self.callbacks.on_peer_connected(p)
   end
