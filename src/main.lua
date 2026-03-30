@@ -350,6 +350,7 @@ local function main()
     maxpeers = args.maxpeers,
     max_outbound = 8,
     nov2transport = args.nov2transport,
+    data_dir = datadir,
   })
   peer_manager.our_height = header_chain.header_tip_height
 
