@@ -534,8 +534,12 @@ local function main()
   end
 
   -- Start P2P listener
-  peer_manager:start_listener("0.0.0.0", args.port)
-  print(string.format("P2P listening on port %d", args.port))
+  local listen_ok, listen_err = peer_manager:start_listener("0.0.0.0", args.port)
+  if listen_ok then
+    print(string.format("P2P listening on port %d", args.port))
+  else
+    print(string.format("WARNING: P2P listener failed on port %d: %s", args.port, tostring(listen_err)))
+  end
   print(string.format("RPC listening on port %d", args.rpcport))
   if rest_server then
     print(string.format("REST listening on port %d", args.restport or 8080))
