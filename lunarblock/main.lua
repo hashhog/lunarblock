@@ -588,8 +588,6 @@ local function main()
       last_status = now
     end
 
-    -- Short sleep to avoid busy-waiting
-    socket.sleep(0.05)
   end
 
   -- Cleanup
