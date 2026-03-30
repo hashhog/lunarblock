@@ -537,8 +537,11 @@ local function main()
       end
     end
 
-    -- Process RPC
-    rpc_server:tick()
+    -- Process RPC (pcall to prevent tick errors from crashing the server socket)
+    local rpc_ok, rpc_err = pcall(function() rpc_server:tick() end)
+    if not rpc_ok then
+      print(string.format("RPC tick error: %s", tostring(rpc_err)))
+    end
 
     -- Process REST
     if rest_server then
