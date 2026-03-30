@@ -2,6 +2,9 @@
 -- LunarBlock - Bitcoin full node in Lua
 -- CLI & Application Entry Point
 
+io.stdout:setvbuf("line")
+io.stderr:setvbuf("line")
+
 local VERSION = "0.1.0"
 
 --------------------------------------------------------------------------------
@@ -257,16 +260,21 @@ local function main()
   end
 
   -- Initialize database
-  print("Opening database...")
+  io.stdout:write("Opening database...\n"); io.stdout:flush()
   local db = storage_mod.open(datadir .. "/chainstate", args.dbcache)
+  io.stdout:write("Database opened.\n"); io.stdout:flush()
 
   -- Initialize chain state
+  io.stdout:write("Initializing chain state...\n"); io.stdout:flush()
   local chain_state = utxo_mod.new_chain_state(db, network)
   chain_state:init()
+  io.stdout:write(string.format("Chain state initialized: height=%d\n", chain_state.tip_height or -1)); io.stdout:flush()
 
   -- Initialize header chain
+  io.stdout:write("Initializing header chain...\n"); io.stdout:flush()
   local header_chain = sync_mod.new_header_chain(network, db)
   header_chain:init()
+  io.stdout:write("Header chain initialized.\n"); io.stdout:flush()
   print(string.format("Chain tip: height=%d hash=%s",
     header_chain.header_tip_height,
     header_chain.header_tip_hash and types.hash256_hex(header_chain.header_tip_hash) or "none"
@@ -282,6 +290,14 @@ local function main()
     local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, true)
     if not ok then
       print(string.format("Failed to connect block %d: %s", height, tostring(err)))
+      return
+    end
+    -- Broadcast inv to peers for newly connected blocks (skip during IBD)
+    if block_downloader.ibd_complete then
+      local inv_payload = p2p.serialize_inv({
+        {type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash}
+      })
+      peer_manager:broadcast("inv", inv_payload)
     end
   end
 
@@ -415,6 +431,7 @@ local function main()
 
   peer_manager:register_handler("getdata", function(peer, payload)
     local items = p2p.deserialize_inv(payload)
+    local not_found = {}
     for _, item in ipairs(items) do
       if item.type == p2p.INV_TYPE.MSG_WITNESS_TX or item.type == p2p.INV_TYPE.MSG_TX then
         local txid_hex = types.hash256_hex(item.hash)
@@ -422,14 +439,21 @@ local function main()
         if entry then
           local data = serialize.serialize_transaction(entry.tx, true)
           peer:send_message("tx", data)
+        else
+          not_found[#not_found + 1] = item
         end
       elseif item.type == p2p.INV_TYPE.MSG_BLOCK or item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
-        local block = db.get_block(item.hash)
-        if block then
-          local data = serialize.serialize_block(block)
+        local blk = db.get_block(item.hash)
+        if blk then
+          local data = serialize.serialize_block(blk)
           peer:send_message("block", data)
+        else
+          not_found[#not_found + 1] = item
         end
       end
+    end
+    if #not_found > 0 then
+      peer:send_message("notfound", p2p.serialize_notfound(not_found))
     end
   end)
 
@@ -510,8 +534,12 @@ local function main()
   end
 
   -- Start P2P listener
-  peer_manager:start_listener("0.0.0.0", args.port)
-  print(string.format("P2P listening on port %d", args.port))
+  local listen_ok, listen_err = peer_manager:start_listener("0.0.0.0", args.port)
+  if listen_ok then
+    print(string.format("P2P listening on port %d", args.port))
+  else
+    print(string.format("WARNING: P2P listener failed on port %d: %s", args.port, tostring(listen_err)))
+  end
   print(string.format("RPC listening on port %d", args.rpcport))
   if rest_server then
     print(string.format("REST listening on port %d", args.restport or 8080))
@@ -535,8 +563,11 @@ local function main()
       end
     end
 
-    -- Process RPC
-    rpc_server:tick()
+    -- Process RPC (pcall to prevent tick errors from crashing the server socket)
+    local rpc_ok, rpc_err = pcall(function() rpc_server:tick() end)
+    if not rpc_ok then
+      print(string.format("RPC tick error: %s", tostring(rpc_err)))
+    end
 
     -- Process REST
     if rest_server then
