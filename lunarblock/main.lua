@@ -423,6 +423,12 @@ local function main()
           local data = serialize.serialize_transaction(entry.tx, true)
           peer:send_message("tx", data)
         end
+      elseif item.type == p2p.INV_TYPE.MSG_BLOCK or item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
+        local block = db.get_block(item.hash)
+        if block then
+          local data = serialize.serialize_block(block)
+          peer:send_message("block", data)
+        end
       end
     end
   end)
