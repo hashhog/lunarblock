@@ -1453,6 +1453,14 @@ function RPCServer:register_methods()
       end
 
       block_hashes[#block_hashes + 1] = types.hash256_hex(block_hash)
+
+      -- Broadcast inv to peers so they learn about the new block
+      if rpc.peer_manager then
+        local inv_payload = p2p.serialize_inv({
+          {type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash}
+        })
+        rpc.peer_manager:broadcast("inv", inv_payload)
+      end
     end
 
     return block_hashes
