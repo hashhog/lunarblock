@@ -504,8 +504,18 @@ function RPCServer:handle_single_request(request)
   local params = request.params or {}
   local id = request.id
 
-  -- Check if this is a notification (no id field at all)
-  local is_notification = (id == nil)
+  -- JSON-RPC 2.0 defines a notification as a request without an "id" field.
+  -- JSON-RPC 1.0 (used by bitcoin-cli) does not have notifications — a
+  -- missing "id" should default to null so the server always sends a
+  -- response.  Bitcoin Core always responds regardless of "id" presence.
+  local is_notification = false
+  if id == nil then
+    if request.jsonrpc == "2.0" then
+      is_notification = true
+    else
+      id = cjson.null
+    end
+  end
 
   local handler = self.methods[method]
   if not handler then

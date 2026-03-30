@@ -506,7 +506,7 @@ local function main()
     fee_estimator = fee_estimator,
     wallet = wallet,  -- Legacy single wallet (backward compat)
     wallet_manager = wallet_manager,  -- Multi-wallet manager
-    datadir = datadir,
+    datadir = args.datadir,
     mining = mining_mod,
   })
   rpc_server:start()
