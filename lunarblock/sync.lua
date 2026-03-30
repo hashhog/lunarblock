@@ -445,11 +445,14 @@ end
 --- Initialize the header chain from storage or genesis.
 function HeaderChain:init()
   -- Check if we have a stored header tip (separate from chain tip!)
+  io.stdout:write("  Checking header tip...\n"); io.stdout:flush()
   local tip_hash, tip_height = self:get_header_tip()
   if tip_hash then
+    io.stdout:write(string.format("  Header tip: height=%d\n", tip_height)); io.stdout:flush()
     -- Load the header chain from storage
     self:load_from_storage(tip_hash, tip_height)
   else
+    io.stdout:write("  No header tip found, starting from genesis\n"); io.stdout:flush()
     -- Start from genesis
     self:add_genesis()
   end
@@ -521,7 +524,7 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
   io.stdout:write(string.format("  Loaded %d headers, computing work...\n", loaded))
   io.stdout:flush()
 
-  -- Forward pass: compute total_work incrementally O(N) instead of O(N^2)
+  -- Forward pass: compute total_work incrementally from genesis to tip
   local cumulative_work = 0
   for h = 0, tip_height do
     local hash_hex = self.height_to_hash[h]
@@ -576,7 +579,14 @@ function HeaderChain:add_genesis()
   local msg = gen.coinbase_message
   -- scriptSig: PUSH4(486604799_le) PUSH1(0x04) PUSH_N(message)
   -- 486604799 = 0x1d00ffff, always hardcoded in Bitcoin Core's CreateGenesisBlock
-  local script_sig = "\x04\xff\xff\x00\x1d\x01\x04" .. string.char(#msg) .. msg
+  -- For messages > 75 bytes, use OP_PUSHDATA1 (0x4c) + length byte
+  local msg_push
+  if #msg > 75 then
+    msg_push = "\x4c" .. string.char(#msg) .. msg  -- OP_PUSHDATA1
+  else
+    msg_push = string.char(#msg) .. msg
+  end
+  local script_sig = "\x04\xff\xff\x00\x1d\x01\x04" .. msg_push
   local coinbase_input = types.txin(
     types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
     script_sig, 0xFFFFFFFF
@@ -604,10 +614,8 @@ function HeaderChain:add_genesis()
     gen.bits,
     gen.nonce
   )
-  -- Use the authoritative genesis hash from network params instead of computing it,
-  -- since the coinbase serialization may not exactly match Bitcoin Core's encoding
-  local hash = types.hash256_from_hex(self.network.genesis_hash)
-  local hash_hex = self.network.genesis_hash
+  local hash = validation.compute_block_hash(header)
+  local hash_hex = types.hash256_hex(hash)
 
   self.headers[hash_hex] = {
     header = header,
@@ -1217,8 +1225,8 @@ function M.new_block_downloader(header_chain, storage, network)
   self.pending_blocks = {}          -- hash_hex -> {block, height, hash}
   self.inflight = {}                -- hash_hex -> {peer, request_time, timeout}
   self.peer_inflight = {}           -- peer -> count of in-flight requests
-  self.base_stall_timeout = 30      -- Base timeout before considering stalled (seconds)
-  self.max_stall_timeout = 120      -- Maximum stall timeout
+  self.base_stall_timeout = 5       -- Base timeout before considering stalled (adaptive)
+  self.max_stall_timeout = 64       -- Maximum stall timeout
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
   self.utxo_flush_interval = 2000   -- Flush UTXO set every N blocks
@@ -1241,7 +1249,6 @@ function BlockDownloader:schedule_downloads(peers)
   local now = socket.gettime()
 
   -- Check for stalled requests and handle adaptive timeout
-  local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
     if now - info.request_time > info.timeout then
       -- Stalled request - remove from inflight and peer tracking
@@ -1252,14 +1259,9 @@ function BlockDownloader:schedule_downloads(peers)
           self.peer_inflight[info.peer] = nil
         end
       end
-      had_stalls = true
+      -- Double the timeout for next request of this block (adaptive stalling)
+      -- The block will be re-requested on next schedule cycle
     end
-  end
-  -- Reset download cursor so stalled blocks get re-requested.
-  -- next_download_height may have advanced past stalled blocks,
-  -- leaving a gap between the connected tip and the download window.
-  if had_stalls then
-    self.next_download_height = self.next_connect_height
   end
 
   -- Calculate how many more blocks we can request

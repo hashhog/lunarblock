@@ -254,13 +254,13 @@ function M.build_http_response(status, body, content_type)
   -- 204 No Content should not have a body or Content-Length
   if status == 204 then
     return string.format(
-      "HTTP/1.1 %d %s\r\nConnection: close\r\n\r\n",
+      "HTTP/1.1 %d %s\r\nConnection: keep-alive\r\n\r\n",
       status, status_text[status]
     )
   end
 
   local response = string.format(
-    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s",
     status, status_text[status] or "Unknown", content_type, #body, body
   )
   return response
@@ -1360,67 +1360,6 @@ function RPCServer:register_methods()
     return 0
   end
 
-  self.methods["addnode"] = function(rpc, params)
-    local node_addr = params[1]
-    local command = params[2]
-    if type(node_addr) ~= "string" or #node_addr == 0 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Node address required"})
-    end
-    if type(command) ~= "string" then
-      error({code = M.ERROR.INVALID_PARAMS, message = 'Command required ("add", "remove", or "onetry")'})
-    end
-    command = command:lower()
-    if command ~= "add" and command ~= "remove" and command ~= "onetry" then
-      error({code = M.ERROR.INVALID_PARAMS, message = 'Command must be "add", "remove", or "onetry"'})
-    end
-    if not rpc.peer_manager then
-      error({code = M.ERROR.MISC_ERROR, message = "Peer manager not available"})
-    end
-    -- Parse host:port
-    local host, port_str = node_addr:match("^%[?([^%]]+)%]?:(%d+)$")
-    if not host then
-      host = node_addr
-      port_str = nil
-    end
-    local port = tonumber(port_str) or (rpc.peer_manager.network and rpc.peer_manager.network.port) or 8333
-    if command == "onetry" or command == "add" then
-      local ok, err = rpc.peer_manager:connect_peer(host, port, true)
-      if not ok and command == "add" then
-        error({code = M.ERROR.MISC_ERROR, message = "Failed to connect: " .. tostring(err)})
-      end
-    elseif command == "remove" then
-      local key = host .. ":" .. port
-      local peer = rpc.peer_manager.peers[key]
-      if peer then
-        rpc.peer_manager:disconnect_peer(peer, "removed via addnode RPC")
-      end
-    end
-    return nil  -- Bitcoin Core returns null on success
-  end
-
-  self.methods["disconnectnode"] = function(rpc, params)
-    local address = params[1]
-    if type(address) ~= "string" or #address == 0 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Node address required"})
-    end
-    if not rpc.peer_manager then
-      error({code = M.ERROR.MISC_ERROR, message = "Peer manager not available"})
-    end
-    local host, port_str = address:match("^%[?([^%]]+)%]?:(%d+)$")
-    if not host then
-      host = address
-      port_str = nil
-    end
-    local port = tonumber(port_str) or (rpc.peer_manager.network and rpc.peer_manager.network.port) or 8333
-    local key = host .. ":" .. port
-    local peer = rpc.peer_manager.peers[key]
-    if not peer then
-      error({code = M.ERROR.MISC_ERROR, message = "Node not found: " .. address})
-    end
-    rpc.peer_manager:disconnect_peer(peer, "disconnected via RPC")
-    return nil
-  end
-
   -- Fee estimation
   self.methods["estimatesmartfee"] = function(rpc, params)
     local conf_target = params[1] or 6
@@ -1515,10 +1454,10 @@ function RPCServer:register_methods()
 
       block_hashes[#block_hashes + 1] = types.hash256_hex(block_hash)
 
-      -- Announce new block to all connected peers
+      -- Broadcast inv to peers so they learn about the new block
       if rpc.peer_manager then
         local inv_payload = p2p.serialize_inv({
-          { type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash },
+          {type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash}
         })
         rpc.peer_manager:broadcast("inv", inv_payload)
       end
@@ -3021,25 +2960,25 @@ function RPCServer:tick()
   if not client then return end
 
   client:settimeout(5)
-  -- Read HTTP headers line-by-line, then read the exact body size.
-  -- Using receive(8192) blocks until 8192 bytes arrive or the timeout
-  -- fires — by then the client has already timed out and closed the
-  -- connection, so the response never reaches it.
-  local headers_raw = ""
-  local content_length = 0
+  -- Read the full HTTP request
+  local data = ""
   while true do
-    local line, err = client:receive("*l")
-    if not line then break end
-    if line == "" then break end  -- blank line = end of headers
-    headers_raw = headers_raw .. line .. "\r\n"
-    local cl = line:match("^[Cc]ontent%-[Ll]ength:%s*(%d+)")
-    if cl then content_length = tonumber(cl) end
+    local chunk, err, partial = client:receive(8192)
+    chunk = chunk or partial
+    if chunk then data = data .. chunk end
+    if err == "closed" or err == "timeout" then break end
+    -- Check if we have the full request
+    local header_end = data:find("\r\n\r\n")
+    if header_end then
+      local content_length = data:match("[Cc]ontent%-[Ll]ength:%s*(%d+)")
+      if content_length then
+        content_length = tonumber(content_length)
+        if #data >= header_end + 3 + content_length then break end
+      else
+        break
+      end
+    end
   end
-  local body = ""
-  if content_length > 0 then
-    body = client:receive(content_length) or ""
-  end
-  local data = headers_raw .. "\r\n" .. body
 
   if #data == 0 then
     client:close()

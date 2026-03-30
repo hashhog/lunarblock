@@ -1266,23 +1266,22 @@ end
 -- @return boolean: true on success
 -- @return string: error message on failure
 function PeerManager:start_listener(bind_ip, port)
-  self.listen_socket = socket.tcp()
-  -- reuseaddr is best-effort; some luasocket builds don't support it
-  -- on unbound sockets
-  self.listen_socket:setoption("reuseaddr", true)
   local listen_port = port or (self.network and self.network.port) or 8333
-  ok, err = self.listen_socket:bind(bind_ip or "0.0.0.0", listen_port)
+  -- Use tcp() + bind() + listen() manually, skipping setoption
+  -- which fails on some luasocket builds.
+  local sock = socket.tcp()
+  if not sock then return false, "failed to create socket" end
+  local ok, err = sock:bind(bind_ip or "0.0.0.0", listen_port)
   if not ok then
-    self.listen_socket:close()
-    self.listen_socket = nil
+    sock:close()
     return false, err
   end
-  ok, err = self.listen_socket:listen(32)
+  ok, err = sock:listen(32)
   if not ok then
-    self.listen_socket:close()
-    self.listen_socket = nil
+    sock:close()
     return false, err
   end
+  self.listen_socket = sock
   self.listen_socket:settimeout(0)
   return true
 end
