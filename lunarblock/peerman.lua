@@ -1005,6 +1005,7 @@ function PeerManager:maintain_connections()
     if not p.inbound then outbound = outbound + 1 end
   end
 
+
   -- First, try to connect to any remaining anchor peers (eclipse mitigation)
   if self._anchors and #self._anchors > 0 then
     while #self._anchors > 0 and outbound < self.max_outbound do
