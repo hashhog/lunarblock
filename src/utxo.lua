@@ -660,6 +660,11 @@ function CoinView:flush(reallocate)
   if reallocate then
     self.cache = {}
     self.cached_memory_usage = 0
+    -- Force immediate GC to release the old table.  Without this,
+    -- LuaJIT holds both the old (huge) and new (empty) tables in
+    -- memory until the next GC cycle, causing unbounded RSS growth.
+    collectgarbage("collect")
+    collectgarbage("collect")  -- Second pass for weak refs
   else
     -- Evict clean entries when cache exceeds the limit.
     -- LuaJIT doesn't shrink hash tables on deletion, so we rebuild
