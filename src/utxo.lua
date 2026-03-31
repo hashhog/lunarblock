@@ -339,15 +339,17 @@ local FLAG_FRESH = 0x02  -- Parent cache does not have this entry
 local CoinView = {}
 CoinView.__index = CoinView
 
--- Default cache size: 256MB
-local DEFAULT_CACHE_SIZE_MB = 256
+-- Default cache size: 64MB — kept small because LuaJIT's actual
+-- per-entry memory is ~10KB (vs 2KB estimate) and the GC doesn't
+-- release pages back to the OS efficiently.
+local DEFAULT_CACHE_SIZE_MB = 64
 local BYTES_PER_MB = 1024 * 1024
 
 -- Estimated memory per cache entry (for memory tracking).
--- LuaJIT hash table entries use much more memory than the raw data
--- due to table node overhead, GC metadata, and string interning.
--- Empirical measurement: ~2KB per entry on testnet4 IBD.
-local BASE_ENTRY_OVERHEAD = 1800
+-- LuaJIT hash table entries use ~8-10KB actual RSS per entry due to
+-- table node overhead, GC metadata, string interning, and allocator
+-- fragmentation.  We use 8KB to trigger eviction early enough.
+local BASE_ENTRY_OVERHEAD = 7800
 local SCRIPT_OVERHEAD = 200
 
 --- Estimate memory usage of a single cache entry.
