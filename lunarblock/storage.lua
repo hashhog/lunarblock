@@ -206,7 +206,7 @@ end
 
 -- Open a RocksDB database
 function M.open(path, cache_size_mb)
-  cache_size_mb = cache_size_mb or 450
+  cache_size_mb = cache_size_mb or 64
   local errptr = ffi.new("char*[1]")
 
   -- Create main options
@@ -214,8 +214,8 @@ function M.open(path, cache_size_mb)
   librocksdb.rocksdb_options_set_create_if_missing(options, 1)
   librocksdb.rocksdb_options_set_create_missing_column_families(options, 1)
   librocksdb.rocksdb_options_set_max_open_files(options, 1000)
-  librocksdb.rocksdb_options_set_write_buffer_size(options, 64 * 1024 * 1024)  -- 64MB
-  librocksdb.rocksdb_options_set_max_write_buffer_number(options, 3)
+  librocksdb.rocksdb_options_set_write_buffer_size(options, 16 * 1024 * 1024)  -- 16MB
+  librocksdb.rocksdb_options_set_max_write_buffer_number(options, 2)
   librocksdb.rocksdb_options_set_compression(options, 0)  -- No compression
 
   -- Create LRU block cache
