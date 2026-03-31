@@ -557,6 +557,7 @@ local function main()
     peer_manager:tick()
 
     -- Schedule block downloads during IBD
+    -- Schedule block downloads during IBD
     if not block_downloader.ibd_complete and header_chain.header_tip_height > chain_state.tip_height then
       local peers = peer_manager:get_established_peers()
       if #peers > 0 then

@@ -1290,6 +1290,15 @@ function BlockDownloader:schedule_downloads(peers)
   local height = self.next_download_height
   local tip = self.header_chain.header_tip_height
 
+  if not self._sched_debug then
+    self._sched_debug = true
+    print(string.format("schedule_downloads: height=%d tip=%d available=%d peers=%d",
+      height, tip, available, #available_peers))
+    -- Check if height_to_hash has entries
+    local sample = self.header_chain.height_to_hash[height]
+    print(string.format("  height_to_hash[%d] = %s", height, tostring(sample)))
+  end
+
   while height <= tip and available > 0 do
     local hash_hex = self.header_chain.height_to_hash[height]
     if not hash_hex then break end
