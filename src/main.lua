@@ -354,6 +354,18 @@ local function main()
   })
   peer_manager.our_height = header_chain.header_tip_height
 
+  -- Clear any stale bans from previous sessions (genesis hash was wrong,
+  -- causing all peers to be banned — now fixed).
+  peer_manager.banned = {}
+
+  -- Bootstrap: connect to local Bitcoin Core directly
+  local bootstrap_ok, bootstrap_err = peer_manager:connect_peer("127.0.0.1", 48332, true)
+  if bootstrap_ok then
+    print("Bootstrap: connected to Bitcoin Core at 127.0.0.1:48332")
+  else
+    print("Bootstrap: failed to connect to Bitcoin Core: " .. tostring(bootstrap_err))
+  end
+
   -- Register P2P message handlers
   peer_manager:register_handler("headers", function(peer, payload)
     local accepted, err = header_chain:handle_headers(peer, payload)
