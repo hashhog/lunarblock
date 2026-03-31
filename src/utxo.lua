@@ -339,18 +339,16 @@ local FLAG_FRESH = 0x02  -- Parent cache does not have this entry
 local CoinView = {}
 CoinView.__index = CoinView
 
--- Default cache size: 450MB
-local DEFAULT_CACHE_SIZE_MB = 450
+-- Default cache size: 256MB
+local DEFAULT_CACHE_SIZE_MB = 256
 local BYTES_PER_MB = 1024 * 1024
 
--- Estimated memory per cache entry (for memory tracking)
--- Key: 36 bytes (outpoint)
--- Value overhead: 8 (value) + 4 (height) + 1 (coinbase) + 1 (flags) + ~8 (table overhead)
--- Script: variable, average ~34 bytes
--- Lua table/GC overhead: ~40 bytes
--- Total estimate: ~130 bytes per entry
-local BASE_ENTRY_OVERHEAD = 96
-local SCRIPT_OVERHEAD = 34
+-- Estimated memory per cache entry (for memory tracking).
+-- LuaJIT hash table entries use much more memory than the raw data
+-- due to table node overhead, GC metadata, and string interning.
+-- Empirical measurement: ~2KB per entry on testnet4 IBD.
+local BASE_ENTRY_OVERHEAD = 1800
+local SCRIPT_OVERHEAD = 200
 
 --- Estimate memory usage of a single cache entry.
 -- @param entry table: UTXO entry with script_pubkey
@@ -657,6 +655,26 @@ function CoinView:flush(reallocate)
   if reallocate then
     self.cache = {}
     self.cached_memory_usage = 0
+  else
+    -- Evict clean entries when cache exceeds the limit.
+    -- LuaJIT doesn't shrink hash tables on deletion, so we rebuild
+    -- the table with only the entries we want to keep.  This forces
+    -- a fresh allocation and lets the old table be GC'd.
+    if self.cached_memory_usage > self.max_cache_bytes then
+      local new_cache = {}
+      local new_usage = 0
+      local target = self.max_cache_bytes / 4
+      for key, entry in pairs(self.cache) do
+        if is_dirty(entry) or (new_usage < target and not entry.spent) then
+          new_cache[key] = entry
+          new_usage = new_usage + estimate_entry_memory(entry)
+        end
+      end
+      self.cache = new_cache
+      self.cached_memory_usage = new_usage
+      -- Force GC to reclaim the old table
+      collectgarbage("collect")
+    end
   end
 end
 
