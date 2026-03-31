@@ -339,10 +339,11 @@ local FLAG_FRESH = 0x02  -- Parent cache does not have this entry
 local CoinView = {}
 CoinView.__index = CoinView
 
--- Default cache size: 64MB — kept small because LuaJIT's actual
--- per-entry memory is ~10KB (vs 2KB estimate) and the GC doesn't
--- release pages back to the OS efficiently.
-local DEFAULT_CACHE_SIZE_MB = 64
+-- Default cache size: 8MB — very small to force frequent eviction.
+-- LuaJIT's actual per-entry memory is ~10KB and the GC doesn't
+-- release pages efficiently. A small cache + frequent table rebuilds
+-- keeps RSS bounded at the cost of more RocksDB reads.
+local DEFAULT_CACHE_SIZE_MB = 8
 local BYTES_PER_MB = 1024 * 1024
 
 -- Estimated memory per cache entry (for memory tracking).
@@ -476,7 +477,9 @@ function CoinView:get(txid, vout)
   entry = self:_fetch_from_disk(key)
   if not entry then return nil end
 
-  -- Cache the entry (not dirty, not fresh since it came from disk)
+  -- Cache the entry for intra-block lookups.
+  -- The cache is cleared completely after each block flush to prevent
+  -- LuaJIT hash table memory from growing unboundedly.
   local mem_usage = estimate_entry_memory(entry)
   self.cache[key] = entry
   self.cached_memory_usage = self.cached_memory_usage + mem_usage
@@ -1348,8 +1351,10 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     self.storage.put_undo(block_hash, undo_data)
   end
 
-  -- Flush UTXO changes to database
-  self.coin_view:flush()
+  -- Flush UTXO changes to database and CLEAR the cache entirely.
+  -- LuaJIT's hash tables don't release memory on deletion, so we use
+  -- reallocate=true to drop the table completely after each block.
+  self.coin_view:flush(true)
 
   -- Update chain tip
   self.tip_hash = block_hash
@@ -1424,8 +1429,10 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
     end
   end
 
-  -- Flush UTXO changes to database
-  self.coin_view:flush()
+  -- Flush UTXO changes to database and CLEAR the cache entirely.
+  -- LuaJIT's hash tables don't release memory on deletion, so we use
+  -- reallocate=true to drop the table completely after each block.
+  self.coin_view:flush(true)
 
   -- Remove undo data for this block
   if undo_data_raw then
