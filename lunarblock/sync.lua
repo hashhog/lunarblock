@@ -1218,14 +1218,14 @@ function M.new_block_downloader(header_chain, storage, network)
   self.header_chain = header_chain
   self.storage = storage
   self.network = network
-  self.download_window = 1024       -- Max blocks in-flight total
+  self.download_window = 64         -- Max blocks in-flight total
   self.blocks_per_peer = 16         -- Max blocks requested per peer at once
   self.next_download_height = 0     -- Next block height to request
   self.next_connect_height = 0      -- Next block height to connect to chain
   self.pending_blocks = {}          -- hash_hex -> {block, height, hash}
   self.inflight = {}                -- hash_hex -> {peer, request_time, timeout}
   self.peer_inflight = {}           -- peer -> count of in-flight requests
-  self.base_stall_timeout = 5       -- Base timeout before considering stalled (adaptive)
+  self.base_stall_timeout = 30      -- Base timeout before considering stalled (adaptive)
   self.max_stall_timeout = 64       -- Maximum stall timeout
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
@@ -1249,19 +1249,25 @@ function BlockDownloader:schedule_downloads(peers)
   local now = socket.gettime()
 
   -- Check for stalled requests and handle adaptive timeout
+  local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
     if now - info.request_time > info.timeout then
       -- Stalled request - remove from inflight and peer tracking
       self.inflight[hash_hex] = nil
+      had_stalls = true
       if self.peer_inflight[info.peer] then
         self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
         if self.peer_inflight[info.peer] <= 0 then
           self.peer_inflight[info.peer] = nil
         end
       end
-      -- Double the timeout for next request of this block (adaptive stalling)
-      -- The block will be re-requested on next schedule cycle
     end
+  end
+  -- After clearing stalls, rewind download cursor so timed-out blocks
+  -- are re-requested.  Without this, next_download_height stays past
+  -- the stalled blocks and they're never retried.
+  if had_stalls then
+    self.next_download_height = self.next_connect_height
   end
 
   -- Calculate how many more blocks we can request
@@ -1404,9 +1410,19 @@ end
 -- @return boolean, string|nil: success flag, error message
 function BlockDownloader:connect_pending_blocks()
   -- Connect blocks in height order starting from next_connect_height
+  local connected = 0
   while true do
     local hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
-    if not hash_hex then break end
+    if not hash_hex then
+      if not self._connect_debug then
+        self._connect_debug = true
+        local pending_count = 0
+        for _ in pairs(self.pending_blocks) do pending_count = pending_count + 1 end
+        print(string.format("CONNECT: no hash at h=%d pending=%d",
+          self.next_connect_height, pending_count))
+      end
+      break
+    end
 
     local pending = self.pending_blocks[hash_hex]
     if not pending then break end
@@ -1419,8 +1435,10 @@ function BlockDownloader:connect_pending_blocks()
     if not ok then
       -- Invalid block, remove from pending and report error
       self.pending_blocks[hash_hex] = nil
+      print(string.format("CONNECT FAIL h=%d: %s", self.next_connect_height, tostring(err)))
       return false, err
     end
+    connected = connected + 1
 
     -- Store the block
     self.storage.put_block(pending.hash, pending.block)
