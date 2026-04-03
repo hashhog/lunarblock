@@ -301,11 +301,28 @@ function M.get_next_work_required(height, timestamp, network, get_ancestor)
 
   -- For BIP94 (testnet4): use the first block's bits for the calculation
   -- This preserves real difficulty even when min-diff blocks are present
+  local result
   if network.enforce_bip94 then
-    return M.calculate_next_target(prev.header.bits, actual_timespan, first.header.bits)
+    result = M.calculate_next_target(prev.header.bits, actual_timespan, first.header.bits)
   else
-    return M.calculate_next_target(prev.header.bits, actual_timespan, nil)
+    result = M.calculate_next_target(prev.header.bits, actual_timespan, nil)
   end
+
+  -- Clamp to pow_limit: target must not exceed the minimum difficulty.
+  -- Bitcoin Core: if (bnNew > bnPowLimit) bnNew = bnPowLimit;
+  -- Compare as big-endian byte strings (lexicographic = numeric for same-length)
+  local new_target = M.bits_to_target(result)
+  local pow_limit = M.bits_to_target(network.pow_limit_bits)
+  for i = 1, 32 do
+    local a = new_target:byte(i) or 0
+    local b = pow_limit:byte(i) or 0
+    if a > b then
+      return network.pow_limit_bits
+    elseif a < b then
+      break
+    end
+  end
+  return result
 end
 
 --------------------------------------------------------------------------------
@@ -765,7 +782,6 @@ M.networks.testnet4 = {
     bits = 0x1d00ffff,
     nonce = 393743547,
     coinbase_message = "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e",
-    -- Testnet4 uses a null compressed pubkey (33 zero bytes), NOT Satoshi's key.
     coinbase_pubkey_hex = "000000000000000000000000000000000000000000000000000000000000000000",
   },
   genesis_hash = "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
