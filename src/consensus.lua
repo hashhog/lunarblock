@@ -301,11 +301,28 @@ function M.get_next_work_required(height, timestamp, network, get_ancestor)
 
   -- For BIP94 (testnet4): use the first block's bits for the calculation
   -- This preserves real difficulty even when min-diff blocks are present
+  local result
   if network.enforce_bip94 then
-    return M.calculate_next_target(prev.header.bits, actual_timespan, first.header.bits)
+    result = M.calculate_next_target(prev.header.bits, actual_timespan, first.header.bits)
   else
-    return M.calculate_next_target(prev.header.bits, actual_timespan, nil)
+    result = M.calculate_next_target(prev.header.bits, actual_timespan, nil)
   end
+
+  -- Clamp to pow_limit: target must not exceed the minimum difficulty.
+  -- Bitcoin Core: if (bnNew > bnPowLimit) bnNew = bnPowLimit;
+  -- Compare as big-endian byte strings (lexicographic = numeric for same-length)
+  local new_target = M.bits_to_target(result)
+  local pow_limit = M.bits_to_target(network.pow_limit_bits)
+  for i = 1, 32 do
+    local a = new_target:byte(i) or 0
+    local b = pow_limit:byte(i) or 0
+    if a > b then
+      return network.pow_limit_bits
+    elseif a < b then
+      break
+    end
+  end
+  return result
 end
 
 --------------------------------------------------------------------------------
