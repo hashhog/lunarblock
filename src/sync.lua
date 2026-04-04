@@ -1299,7 +1299,9 @@ function BlockDownloader:schedule_downloads(peers)
     print(string.format("  height_to_hash[%d] = %s", height, tostring(sample)))
   end
 
-  while height <= tip and available > 0 do
+  -- Don't download too far ahead of connection cursor
+  local max_ahead = self.next_connect_height + 512
+  while height <= tip and height <= max_ahead and available > 0 do
     local hash_hex = self.header_chain.height_to_hash[height]
     if not hash_hex then break end
 
@@ -1393,6 +1395,15 @@ function BlockDownloader:handle_block(peer, block_data)
     return true
   end
 
+  -- Bound the pending buffer to prevent OOM. At ~500KB per mainnet block,
+  -- 256 blocks ≈ 128MB. Drop blocks if buffer is full — they'll be
+  -- re-downloaded when the connection cursor catches up.
+  local pending_count = 0
+  for _ in pairs(self.pending_blocks) do pending_count = pending_count + 1 end
+  if pending_count >= 256 then
+    return true  -- Buffer full, drop this block
+  end
+
   -- Store in pending
   self.pending_blocks[hash_hex] = {
     block = block,
@@ -1447,6 +1458,11 @@ function BlockDownloader:connect_pending_blocks()
     if self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval then
       self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
       self.last_flush_height = self.next_connect_height
+    end
+
+    -- Periodic GC to prevent LuaJIT table bloat
+    if self.next_connect_height % 100 == 0 then
+      collectgarbage("collect")
     end
 
     -- Log progress periodically
