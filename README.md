@@ -36,6 +36,7 @@ exactly that. It uses FFI bindings for performance-critical crypto operations.
 - [x] BIP152 compact block relay (SipHash-2-4, short txids, high-bandwidth mode)
 - [x] BIP155 addrv2 messages (TorV3, I2P, CJDNS address support)
 - [x] Output descriptors (BIP380-386 parsing, checksum validation, address derivation)
+- [x] Mainnet sync (fully synced to chain tip at block 943,574)
 
 ## Quick start
 
