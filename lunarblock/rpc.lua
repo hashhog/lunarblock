@@ -254,13 +254,13 @@ function M.build_http_response(status, body, content_type)
   -- 204 No Content should not have a body or Content-Length
   if status == 204 then
     return string.format(
-      "HTTP/1.1 %d %s\r\nConnection: close\r\n\r\n",
+      "HTTP/1.1 %d %s\r\nConnection: keep-alive\r\n\r\n",
       status, status_text[status]
     )
   end
 
   local response = string.format(
-    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s",
     status, status_text[status] or "Unknown", content_type, #body, body
   )
   return response
@@ -270,68 +270,15 @@ end
 -- HTTP Basic Authentication
 --------------------------------------------------------------------------------
 
-function M.check_auth(headers, username, password, cookie_password)
+function M.check_auth(headers, username, password)
   local auth = headers["authorization"]
   if not auth then return false end
   local scheme, creds = auth:match("^(%w+)%s+(.+)")
   if scheme ~= "Basic" then return false end
   -- Decode base64
   local decoded = M.base64_decode(creds)
-  -- Accept cookie credential when cookie auth is configured
-  if cookie_password and cookie_password ~= "" then
-    if decoded == "__cookie__:" .. cookie_password then
-      return true
-    end
-  end
   local expected = username .. ":" .. password
   return decoded == expected
-end
-
---- Generate a random cookie for RPC authentication.
--- Reads 32 bytes from /dev/urandom, hex-encodes them, and writes
--- "__cookie__:<hex>" to {datadir}/.cookie.
--- @param datadir string: node data directory
--- @return string|nil: the hex cookie on success, or nil + error
-function M.generate_cookie(datadir)
-  local hex_chars = "0123456789abcdef"
-  local hex = {}
-  -- Prefer /dev/urandom for cryptographic randomness
-  local urandom = io.open("/dev/urandom", "rb")
-  if urandom then
-    local bytes = urandom:read(32)
-    urandom:close()
-    if bytes and #bytes == 32 then
-      for i = 1, #bytes do
-        local b = bytes:byte(i)
-        hex[#hex + 1] = hex_chars:sub(bit.rshift(b, 4) + 1, bit.rshift(b, 4) + 1)
-        hex[#hex + 1] = hex_chars:sub(bit.band(b, 0x0f) + 1, bit.band(b, 0x0f) + 1)
-      end
-    end
-  end
-  -- Fallback: use math.random (less secure but always available)
-  if #hex < 64 then
-    math.randomseed(os.time() * 1000 + (os.clock() * 1e9) % 1000)
-    hex = {}
-    for _ = 1, 64 do
-      local idx = math.random(0, 15)
-      hex[#hex + 1] = hex_chars:sub(idx + 1, idx + 1)
-    end
-  end
-  local cookie_hex = table.concat(hex)
-  local cookie_path = datadir .. "/.cookie"
-  local f, err = io.open(cookie_path, "w")
-  if not f then
-    return nil, "Cannot write cookie file " .. cookie_path .. ": " .. tostring(err)
-  end
-  f:write("__cookie__:" .. cookie_hex)
-  f:close()
-  return cookie_hex
-end
-
---- Delete the cookie file on shutdown.
--- @param datadir string: node data directory
-function M.delete_cookie(datadir)
-  os.remove(datadir .. "/.cookie")
 end
 
 --------------------------------------------------------------------------------
@@ -428,7 +375,6 @@ function M.new(config)
   self.username = config.rpcuser or "lunarblock"
   self.password = config.rpcpassword or ""
   self.server_socket = nil
-  self.clients = {}         -- active in-progress client connections: {socket, buf}
   self.methods = {}        -- method_name -> handler function
   self.chain_state = config.chain_state
   self.mempool = config.mempool
@@ -442,16 +388,6 @@ function M.new(config)
   self.mining = config.mining
   self.running = false
   self.request_wallet = nil  -- Current request's wallet context
-  -- Cookie authentication: always generate a fresh cookie on startup
-  self.cookie_password = nil
-  if config.datadir then
-    local cookie, err = M.generate_cookie(config.datadir)
-    if cookie then
-      self.cookie_password = cookie
-    else
-      print("WARNING: RPC cookie generation failed: " .. tostring(err))
-    end
-  end
   -- Register built-in methods
   self:register_methods()
   return self
@@ -504,18 +440,8 @@ function RPCServer:handle_single_request(request)
   local params = request.params or {}
   local id = request.id
 
-  -- JSON-RPC 2.0 defines a notification as a request without an "id" field.
-  -- JSON-RPC 1.0 (used by bitcoin-cli) does not have notifications — a
-  -- missing "id" should default to null so the server always sends a
-  -- response.  Bitcoin Core always responds regardless of "id" presence.
-  local is_notification = false
-  if id == nil then
-    if request.jsonrpc == "2.0" then
-      is_notification = true
-    else
-      id = cjson.null
-    end
-  end
+  -- Check if this is a notification (no id field at all)
+  local is_notification = (id == nil)
 
   local handler = self.methods[method]
   if not handler then
@@ -2858,9 +2784,41 @@ function RPCServer:register_methods()
       return "invalid"
     end
 
+    -- Compute block hash
+    local block_hash = validation.compute_block_hash(block.header)
+
+    -- Check if this block is already known (duplicate detection)
+    if rpc.chain_state and rpc.chain_state.tip_height then
+      -- If we already have a header for this hash in storage, it's a duplicate
+      if rpc.storage then
+        local existing_header = rpc.storage.get_header(block_hash)
+        if existing_header then
+          return "duplicate"
+        end
+      end
+
+      -- Check if block's prev_hash connects to our current tip
+      local prev_hash = block.header.prev_hash
+      local tip_hash = rpc.chain_state.tip_hash
+      if prev_hash ~= tip_hash then
+        -- Not extending our best chain; could be orphan or stale
+        return "prev-blk-not-found"
+      end
+    end
+
+    -- Determine height: tip + 1 since we verified prev_hash == tip_hash above
+    local new_height = (rpc.chain_state and rpc.chain_state.tip_height or 0) + 1
+
+    -- Store the block so it is available for later retrieval
+    if rpc.storage then
+      rpc.storage.put_block(block_hash, block)
+      rpc.storage.put_header(block_hash, block.header)
+      rpc.storage.put_height_index(new_height, block_hash)
+    end
+
     -- If chain_state has a connect_block method, use it
     if rpc.chain_state and rpc.chain_state.connect_block then
-      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block)
+      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true)
       if not ok_conn then
         return tostring(conn_err)
       end
@@ -3026,9 +2984,39 @@ function RPCServer:start()
   print("RPC server listening on " .. self.host .. ":" .. self.port)
 end
 
---- Dispatch a fully-buffered HTTP request and send the response.
--- Called once `data` contains the complete HTTP request.
-function RPCServer:_dispatch(client, data)
+function RPCServer:tick()
+  if not self.running then return end
+
+  -- Accept a new connection
+  local client = self.server_socket:accept()
+  if not client then return end
+
+  client:settimeout(5)
+  -- Read the full HTTP request
+  local data = ""
+  while true do
+    local chunk, err, partial = client:receive(8192)
+    chunk = chunk or partial
+    if chunk then data = data .. chunk end
+    if err == "closed" or err == "timeout" then break end
+    -- Check if we have the full request
+    local header_end = data:find("\r\n\r\n")
+    if header_end then
+      local content_length = data:match("[Cc]ontent%-[Ll]ength:%s*(%d+)")
+      if content_length then
+        content_length = tonumber(content_length)
+        if #data >= header_end + 3 + content_length then break end
+      else
+        break
+      end
+    end
+  end
+
+  if #data == 0 then
+    client:close()
+    return
+  end
+
   local method, path, headers, body = M.parse_http_request(data)
   if not method then
     client:send(M.build_http_response(400, '{"error":"Bad request"}'))
@@ -3036,9 +3024,8 @@ function RPCServer:_dispatch(client, data)
     return
   end
 
-  -- Check authentication: require either password or cookie to be set
-  local auth_required = (self.password ~= "") or (self.cookie_password ~= nil)
-  if auth_required and not M.check_auth(headers, self.username, self.password, self.cookie_password) then
+  -- Check authentication
+  if self.password ~= "" and not M.check_auth(headers, self.username, self.password) then
     client:send(M.build_http_response(401, '{"error":"Unauthorized"}'))
     client:close()
     return
@@ -3072,109 +3059,15 @@ function RPCServer:_dispatch(client, data)
 
   -- Clear request context
   self.request_wallet = nil
+
   client:close()
-end
-
---- Check whether `data` contains a complete HTTP request.
-local function http_request_complete(data)
-  local header_end = data:find("\r\n\r\n")
-  if not header_end then return false end
-  local content_length = data:match("[Cc]ontent%-[Ll]ength:%s*(%d+)")
-  if content_length then
-    return #data >= header_end + 3 + tonumber(content_length)
-  end
-  return true
-end
-
-function RPCServer:tick()
-  if not self.running then return end
-
-  -- Build the list of sockets we want to poll:
-  -- index 1 is always the server (accept) socket; the rest are active clients.
-  local read_set = { self.server_socket }
-  for i = 1, #self.clients do
-    read_set[#read_set + 1] = self.clients[i].sock
-  end
-
-  -- Use socket.select with a 50 ms timeout so the main loop keeps moving.
-  local readable, _, sel_err = socket.select(read_set, nil, 0.05)
-  if sel_err and sel_err ~= "timeout" then return end
-  if not readable then return end
-
-  -- Build a fast lookup: socket -> index in self.clients (offset by 1 because
-  -- index 1 of read_set is the server socket).
-  local sock_to_idx = {}
-  for i, entry in ipairs(self.clients) do
-    sock_to_idx[entry.sock] = i
-  end
-
-  local new_clients = {}   -- clients to remove (indices)
-
-  for _, sock in ipairs(readable) do
-    if sock == self.server_socket then
-      -- Accept a new connection (non-blocking; already set to 0.1s timeout).
-      local new_sock = self.server_socket:accept()
-      if new_sock then
-        new_sock:settimeout(0)   -- fully non-blocking from here on
-        self.clients[#self.clients + 1] = { sock = new_sock, buf = "" }
-      end
-    else
-      -- Read available data from an existing client connection.
-      local idx = sock_to_idx[sock]
-      if idx then
-        local entry = self.clients[idx]
-        local chunk, err, partial = sock:receive(8192)
-        local received = chunk or partial or ""
-        entry.buf = entry.buf .. received
-
-        local done = false
-        if err == "closed" then
-          -- Connection closed by peer; try to dispatch whatever we have.
-          if #entry.buf > 0 and http_request_complete(entry.buf) then
-            self:_dispatch(sock, entry.buf)
-          else
-            sock:close()
-          end
-          done = true
-        elseif http_request_complete(entry.buf) then
-          self:_dispatch(sock, entry.buf)
-          done = true
-        end
-        -- If err == "timeout" (EAGAIN on non-blocking) just wait for next tick.
-
-        if done then
-          new_clients[idx] = true
-        end
-      end
-    end
-  end
-
-  -- Remove completed/closed client entries (iterate backwards to preserve indices).
-  if next(new_clients) then
-    local remaining = {}
-    for i, entry in ipairs(self.clients) do
-      if not new_clients[i] then
-        remaining[#remaining + 1] = entry
-      end
-    end
-    self.clients = remaining
-  end
 end
 
 function RPCServer:stop()
   self.running = false
-  -- Close any in-progress client connections
-  for _, entry in ipairs(self.clients) do
-    pcall(function() entry.sock:close() end)
-  end
-  self.clients = {}
   if self.server_socket then
     self.server_socket:close()
     self.server_socket = nil
-  end
-  -- Remove the cookie file so stale credentials can't be reused
-  if self.datadir and self.cookie_password then
-    M.delete_cookie(self.datadir)
   end
 end
 

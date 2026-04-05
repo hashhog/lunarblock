@@ -41,6 +41,7 @@ local function parse_args(argv)
     zmqpubsequence = nil,
     zmqpubhwm = 1000,  -- ZMQ high water mark
     nov2transport = false,  -- Disable BIP324 v2 transport
+    import_blocks = nil,   -- Path to framed block file for import (or "-" for stdin)
   }
 
   local i = 1
@@ -79,6 +80,7 @@ local function parse_args(argv)
       print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
+      print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -131,6 +133,9 @@ local function parse_args(argv)
       args.jitverbose = true
     elseif arg == "--nov2transport" then
       args.nov2transport = true
+    elseif arg == "--import-blocks" then
+      i = i + 1
+      args.import_blocks = argv[i]
     elseif arg == "--prune" then
       i = i + 1
       local prune_val = tonumber(argv[i])
@@ -181,6 +186,172 @@ local function parse_args(argv)
 end
 
 --------------------------------------------------------------------------------
+-- Block Import Mode
+--------------------------------------------------------------------------------
+
+local function run_import_blocks(args)
+  local ffi = require("ffi")
+  local consensus_mod = require("lunarblock.consensus")
+  local storage_mod = require("lunarblock.storage")
+  local utxo_mod = require("lunarblock.utxo")
+  local validation = require("lunarblock.validation")
+  local serialize = require("lunarblock.serialize")
+  local types = require("lunarblock.types")
+
+  -- Get network configuration
+  local network = consensus_mod.networks[args.network]
+  if not network then
+    io.stderr:write("Unknown network: " .. args.network .. "\n")
+    os.exit(1)
+  end
+
+  -- Create data directory
+  local datadir = args.datadir
+  if args.network ~= "mainnet" then
+    datadir = datadir .. "/" .. args.network
+  end
+  os.execute("mkdir -p " .. datadir)
+
+  print(string.format("import-blocks: network=%s datadir=%s source=%s",
+    args.network, datadir, args.import_blocks))
+
+  -- Initialize database
+  local db = storage_mod.open(datadir .. "/chainstate", args.dbcache)
+
+  -- Initialize chain state
+  local chain_state = utxo_mod.new_chain_state(db, network)
+  chain_state:init()
+  local tip_height = chain_state.tip_height or 0
+  print(string.format("Chain tip at height %d, starting import", tip_height))
+
+  -- Open input file
+  local input
+  if args.import_blocks == "-" then
+    input = io.stdin
+  else
+    local err
+    input, err = io.open(args.import_blocks, "rb")
+    if not input then
+      io.stderr:write("Cannot open file: " .. tostring(err) .. "\n")
+      os.exit(1)
+    end
+  end
+
+  -- Use C fread for efficient binary I/O via FFI
+  pcall(ffi.cdef, [[
+    typedef struct { void *_opaque; } FILE;
+    size_t fread(void *ptr, size_t size, size_t count, FILE *stream);
+    FILE *fdopen(int fd, const char *mode);
+    int fileno(FILE *stream);
+    int fclose(FILE *stream);
+    FILE *fopen(const char *path, const char *mode);
+  ]])
+
+  local c_file
+  if args.import_blocks == "-" then
+    -- Use stdin file descriptor
+    c_file = ffi.C.fdopen(0, "rb")
+  else
+    c_file = ffi.C.fopen(args.import_blocks, "rb")
+  end
+  if c_file == nil then
+    io.stderr:write("Cannot open file via FFI\n")
+    os.exit(1)
+  end
+
+  local frame_buf = ffi.new("uint8_t[8]")
+  local imported = 0
+  local skipped = 0
+  local start_time = os.clock()
+  local last_log_time = start_time
+  local last_log_count = 0
+
+  while true do
+    -- Read frame header: [4 bytes height LE] [4 bytes size LE]
+    local n = ffi.C.fread(frame_buf, 1, 8, c_file)
+    if n == 0 then break end
+    if n ~= 8 then
+      io.stderr:write(string.format("Incomplete frame header: got %d bytes\n", tonumber(n)))
+      break
+    end
+
+    local frame_height = frame_buf[0] + frame_buf[1] * 256 +
+                         frame_buf[2] * 65536 + frame_buf[3] * 16777216
+    local frame_size = frame_buf[4] + frame_buf[5] * 256 +
+                       frame_buf[6] * 65536 + frame_buf[7] * 16777216
+
+    if frame_size == 0 or frame_size > 4 * 1024 * 1024 then
+      io.stderr:write(string.format("Invalid frame size %d at height %d\n", frame_size, frame_height))
+      break
+    end
+
+    -- Read block data
+    local block_buf = ffi.new("uint8_t[?]", frame_size)
+    n = ffi.C.fread(block_buf, 1, frame_size, c_file)
+    if tonumber(n) ~= frame_size then
+      io.stderr:write(string.format("Incomplete block data at height %d: got %d of %d\n",
+        frame_height, tonumber(n), frame_size))
+      break
+    end
+
+    -- Skip blocks we already have
+    if frame_height <= tip_height then
+      skipped = skipped + 1
+    else
+      -- Convert to Lua string for deserialization
+      local block_data = ffi.string(block_buf, frame_size)
+
+      -- Deserialize the block
+      local ok, block = pcall(serialize.deserialize_block, block_data)
+      if not ok then
+        io.stderr:write(string.format("Error deserializing block at height %d: %s\n",
+          frame_height, tostring(block)))
+        os.exit(1)
+      end
+
+      -- Compute block hash
+      local block_hash = validation.compute_block_hash(block.header)
+
+      -- Connect the block to chain state (skip script validation for speed during import)
+      local skip_scripts = true
+      local connect_ok, connect_err = chain_state:connect_block(
+        block, frame_height, block_hash, nil, nil, skip_scripts)
+      if not connect_ok then
+        io.stderr:write(string.format("Error connecting block at height %d: %s\n",
+          frame_height, tostring(connect_err)))
+        os.exit(1)
+      end
+
+      imported = imported + 1
+
+      -- Log progress periodically
+      local now = os.clock()
+      if now - last_log_time >= 10 or imported % 10000 == 0 then
+        local elapsed = now - start_time
+        local rate = (imported - last_log_count) / math.max(now - last_log_time, 0.001)
+        print(string.format("import-blocks: height=%d imported=%d skipped=%d rate=%.1f blk/s",
+          frame_height, imported, skipped, rate))
+        last_log_time = now
+        last_log_count = imported
+      end
+    end
+  end
+
+  -- Cleanup
+  if args.import_blocks ~= "-" then
+    ffi.C.fclose(c_file)
+  end
+
+  -- Close database (flushes on close)
+  db.close()
+
+  local elapsed = os.clock() - start_time
+  local rate = imported / math.max(elapsed, 0.001)
+  print(string.format("import-blocks complete: imported=%d skipped=%d elapsed=%.1fs rate=%.1f blk/s",
+    imported, skipped, elapsed, rate))
+end
+
+--------------------------------------------------------------------------------
 -- Module exports for testing
 --------------------------------------------------------------------------------
 
@@ -199,6 +370,12 @@ local function main()
   -- Override network from flags
   if args.testnet then args.network = "testnet" end
   if args.regtest then args.network = "regtest" end
+
+  -- Check for import-blocks mode
+  if args.import_blocks then
+    run_import_blocks(args)
+    return
+  end
 
   -- Load modules
   local consensus_mod = require("lunarblock.consensus")
@@ -289,8 +466,11 @@ local function main()
   block_downloader.connect_callback = function(block, height, block_hash)
     local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, true)
     if not ok then
-      print(string.format("Failed to connect block %d: %s", height, tostring(err)))
-      return
+      -- Raise an error so pcall in connect_pending_blocks catches it.
+      -- Returning nil without error would cause connect_pending_blocks to
+      -- believe the connection succeeded, storing the block and advancing
+      -- the height while the UTXO state was never updated.
+      error(string.format("Failed to connect block %d: %s", height, tostring(err)))
     end
     -- Broadcast inv to peers for newly connected blocks (skip during IBD)
     if block_downloader.ibd_complete then
@@ -386,6 +566,20 @@ local function main()
     local ok, err = block_downloader:handle_block(peer, payload)
     if not ok then
       print(string.format("Block download error: %s", tostring(err)))
+    end
+  end)
+
+  peer_manager:register_handler("notfound", function(peer, payload)
+    -- Handle notfound responses: remove blocks from inflight so they can
+    -- be re-requested from different peers. Without this handler, the
+    -- inflight entry lingers until timeout, delaying stall recovery.
+    local items = p2p.deserialize_inv(payload)
+    for _, item in ipairs(items) do
+      if item.type == p2p.INV_TYPE.MSG_BLOCK or
+         item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
+        local hash_hex = types.hash256_hex(item.hash)
+        block_downloader:handle_notfound(hash_hex, peer)
+      end
     end
   end)
 
@@ -593,12 +787,15 @@ local function main()
     local now = socket.gettime()
     if now - last_status > 60 then
       local peers = peer_manager:get_established_peers()
-      print(string.format("[%s] Height: %d | Peers: %d | Mempool: %d txs (%d bytes)",
+      print(string.format("[%s] Height: %d | Headers: %d | Peers: %d | Mempool: %d txs (%d bytes) | Pending: %d | Inflight: %d",
         os.date("%Y-%m-%d %H:%M:%S"),
+        chain_state.tip_height or 0,
         header_chain.header_tip_height,
         #peers,
         mempool.tx_count,
-        mempool.total_size
+        mempool.total_size,
+        block_downloader:get_pending_count(),
+        block_downloader:get_inflight_count()
       ))
       last_status = now
     end
@@ -674,6 +871,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --zmqpubrawtx ENDPOINT      Publish rawtx notifications")
       print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
+      print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
