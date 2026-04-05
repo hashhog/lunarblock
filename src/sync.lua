@@ -1225,12 +1225,15 @@ function M.new_block_downloader(header_chain, storage, network)
   self.pending_blocks = {}          -- hash_hex -> {block, height, hash}
   self.inflight = {}                -- hash_hex -> {peer, request_time, timeout}
   self.peer_inflight = {}           -- peer -> count of in-flight requests
-  self.base_stall_timeout = 5       -- Base timeout before considering stalled (adaptive)
-  self.max_stall_timeout = 64       -- Maximum stall timeout
+  self.base_stall_timeout = 20      -- Base timeout before considering stalled (adaptive)
+  self.max_stall_timeout = 120      -- Maximum stall timeout
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
   self.utxo_flush_interval = 2000   -- Flush UTXO set every N blocks
   self.last_flush_height = 0
+  self.peer_round_robin = 1         -- Persistent round-robin index across schedule_downloads calls
+  self.last_connect_advance = 0     -- Timestamp when next_connect_height last advanced
+  self.connect_stall_timeout = 90   -- Seconds without connection progress before forced reset
   return self
 end
 
@@ -1249,6 +1252,7 @@ function BlockDownloader:schedule_downloads(peers)
   local now = socket.gettime()
 
   -- Check for stalled requests and handle adaptive timeout
+  local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
     if now - info.request_time > info.timeout then
       -- Stalled request - remove from inflight and peer tracking
@@ -1259,8 +1263,7 @@ function BlockDownloader:schedule_downloads(peers)
           self.peer_inflight[info.peer] = nil
         end
       end
-      -- Double the timeout for next request of this block (adaptive stalling)
-      -- The block will be re-requested on next schedule cycle
+      had_stalls = true
     end
   end
 
@@ -1270,11 +1273,67 @@ function BlockDownloader:schedule_downloads(peers)
   local available = self.download_window - inflight_count
   if available <= 0 then return end
 
-  -- Filter peers with available slots
+  -- Reset download cursor when there are gaps between the connection cursor
+  -- and the download cursor but nothing is in-flight. This ensures blocks
+  -- that were never received (peer disconnected, pruned node, etc.) get
+  -- re-requested from different peers.
+  if had_stalls or (inflight_count == 0 and self.next_download_height > self.next_connect_height) then
+    self.next_download_height = self.next_connect_height
+  end
+
+  -- Detect persistent connection stall: if next_connect_height hasn't advanced
+  -- for connect_stall_timeout seconds despite blocks being downloaded, force
+  -- a full reset. This handles the case where the block at next_connect_height
+  -- was received but evicted from pending, timed out without had_stalls, or
+  -- otherwise lost without any stall being detected.
+  if self.next_download_height > self.next_connect_height then
+    if self.last_connect_advance == 0 then
+      self.last_connect_advance = now
+    end
+    if now - self.last_connect_advance > self.connect_stall_timeout then
+      -- Force reset: clear ALL inflight (they're for blocks we can't use)
+      -- and reset download cursor to re-request from next_connect_height
+      local cleared = 0
+      for hash_hex, info in pairs(self.inflight) do
+        if self.peer_inflight[info.peer] then
+          self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+          if self.peer_inflight[info.peer] <= 0 then
+            self.peer_inflight[info.peer] = nil
+          end
+        end
+        self.inflight[hash_hex] = nil
+        cleared = cleared + 1
+      end
+      -- Also clear pending blocks that are FAR ahead of connection cursor
+      -- to make room for blocks near the cursor
+      local evicted = 0
+      for k, p in pairs(self.pending_blocks) do
+        if p.height > self.next_connect_height + 64 then
+          self.pending_blocks[k] = nil
+          evicted = evicted + 1
+        end
+      end
+      self.next_download_height = self.next_connect_height
+      self.last_connect_advance = now
+      print(string.format(
+        "STALL RECOVERY: connection stuck at %d for >%ds, reset cursor (cleared %d inflight, evicted %d pending)",
+        self.next_connect_height, self.connect_stall_timeout, cleared, evicted))
+      -- Recalculate inflight count after clearing
+      inflight_count = 0
+      for _ in pairs(self.inflight) do inflight_count = inflight_count + 1 end
+      available = self.download_window - inflight_count
+    end
+  else
+    self.last_connect_advance = now
+  end
+
+  -- Filter peers with available slots AND that can actually serve blocks
+  -- (peers advertising height=0 or very low height cannot serve IBD blocks)
+  local min_useful_height = self.next_connect_height
   local available_peers = {}
   for _, p in ipairs(peers) do
     local peer_count = self.peer_inflight[p] or 0
-    if peer_count < self.blocks_per_peer then
+    if peer_count < self.blocks_per_peer and (p.start_height or 0) >= min_useful_height then
       available_peers[#available_peers + 1] = p
     end
   end
@@ -1286,33 +1345,51 @@ function BlockDownloader:schedule_downloads(peers)
     peer_requests[p] = {}
   end
 
-  local peer_idx = 1
+  -- Use persistent round-robin index to avoid always assigning the first
+  -- block to the same peer after stall-induced cursor resets.
+  local peer_idx = self.peer_round_robin
   local height = self.next_download_height
   local tip = self.header_chain.header_tip_height
 
-  if not self._sched_debug then
-    self._sched_debug = true
-    print(string.format("schedule_downloads: height=%d tip=%d available=%d peers=%d",
-      height, tip, available, #available_peers))
-    -- Check if height_to_hash has entries
-    local sample = self.header_chain.height_to_hash[height]
-    print(string.format("  height_to_hash[%d] = %s", height, tostring(sample)))
+  -- Log scheduling state periodically (once per minute) to aid debugging stalls
+  local _sched_now = now
+  if not self._last_sched_log or _sched_now - self._last_sched_log > 60 then
+    self._last_sched_log = _sched_now
+    print(string.format("schedule_downloads: next_dl=%d next_conn=%d tip=%d available=%d peers=%d had_stalls=%s",
+      self.next_download_height, self.next_connect_height, tip, available, #available_peers,
+      tostring(had_stalls)))
   end
 
   -- Don't download too far ahead of connection cursor
-  local max_ahead = self.next_connect_height + 512
+  local max_ahead = self.next_connect_height + self.download_window
   while height <= tip and height <= max_ahead and available > 0 do
     local hash_hex = self.header_chain.height_to_hash[height]
     if not hash_hex then break end
 
     -- Skip if already downloaded or in-flight
     if not self.pending_blocks[hash_hex] and not self.inflight[hash_hex] then
-      -- Check if block already in storage
+      -- Check if block already in storage. For blocks near the connection
+      -- cursor, skip the storage check — connect_pending_blocks will load
+      -- them from storage if needed. Only skip downloads for blocks well
+      -- ahead of the connection cursor (which are truly already connected).
       local entry = self.header_chain.headers[hash_hex]
       if entry then
         local block_hash = validation.compute_block_hash(entry.header)
-        local existing = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes)
-        if not existing then
+        local need_download = true
+
+        -- Only check storage for blocks ahead of next_connect_height.
+        -- Blocks AT or NEAR next_connect_height might be in storage but
+        -- not yet connected (stored before callback succeeded). Those are
+        -- handled by connect_pending_blocks' storage fallback, so we skip
+        -- downloading them to avoid wasting bandwidth.
+        if height > self.next_connect_height then
+          local existing = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes)
+          if existing then
+            need_download = false
+          end
+        end
+
+        if need_download then
           -- Find a peer with available slots (round-robin)
           local attempts = 0
           while attempts < #available_peers do
@@ -1344,6 +1421,7 @@ function BlockDownloader:schedule_downloads(peers)
   end
 
   self.next_download_height = height
+  self.peer_round_robin = peer_idx  -- Persist round-robin index
 
   -- Send batched getdata requests
   for p, items in pairs(peer_requests) do
@@ -1358,6 +1436,28 @@ end
 --------------------------------------------------------------------------------
 -- Block Receipt Handling
 --------------------------------------------------------------------------------
+
+--- Handle a notfound response for a block hash.
+-- Removes the block from inflight so it can be re-requested from a different peer.
+-- @param hash_hex string: hex hash of the block not found
+-- @param peer table: peer that sent the notfound
+function BlockDownloader:handle_notfound(hash_hex, peer)
+  local info = self.inflight[hash_hex]
+  if info then
+    self.inflight[hash_hex] = nil
+    if self.peer_inflight[info.peer] then
+      self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+      if self.peer_inflight[info.peer] <= 0 then
+        self.peer_inflight[info.peer] = nil
+      end
+    end
+    -- Reset download cursor to re-request this block from another peer
+    local entry = self.header_chain.headers[hash_hex]
+    if entry and entry.height <= self.next_download_height then
+      self.next_download_height = entry.height
+    end
+  end
+end
 
 --- Handle a received block from a peer.
 -- @param peer table: peer that sent the block
@@ -1396,12 +1496,24 @@ function BlockDownloader:handle_block(peer, block_data)
   end
 
   -- Bound the pending buffer to prevent OOM. At ~500KB per mainnet block,
-  -- 256 blocks ≈ 128MB. Drop blocks if buffer is full — they'll be
-  -- re-downloaded when the connection cursor catches up.
+  -- 512 blocks ≈ 256MB. If buffer is full, evict the highest-height block
+  -- to make room (preferring to keep blocks near the connection cursor).
   local pending_count = 0
   for _ in pairs(self.pending_blocks) do pending_count = pending_count + 1 end
-  if pending_count >= 256 then
-    return true  -- Buffer full, drop this block
+  if pending_count >= 512 then
+    -- Evict the block furthest from the connection cursor
+    local max_height_hex, max_height = nil, -1
+    for k, p in pairs(self.pending_blocks) do
+      if p.height > max_height then
+        max_height = p.height
+        max_height_hex = k
+      end
+    end
+    if max_height_hex and entry.height < max_height then
+      self.pending_blocks[max_height_hex] = nil
+    else
+      return true  -- This block is even further ahead, drop it
+    end
   end
 
   -- Store in pending
@@ -1426,10 +1538,61 @@ function BlockDownloader:connect_pending_blocks()
   -- Connect blocks in height order starting from next_connect_height
   while true do
     local hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
-    if not hash_hex then break end
+    if not hash_hex then
+      -- Debug: missing header at this height
+      local socket = require("socket")
+      local now = socket.gettime()
+      if not self._last_missing_log or now - self._last_missing_log > 60 then
+        self._last_missing_log = now
+        print(string.format("connect_pending_blocks: no header for height %d (header_tip=%d)",
+          self.next_connect_height, self.header_chain.header_tip_height))
+      end
+      break
+    end
 
     local pending = self.pending_blocks[hash_hex]
-    if not pending then break end
+
+    -- If the block is not in pending_blocks, check storage. This handles
+    -- the case where a block was stored (put_block) in a previous attempt
+    -- but the UTXO connection failed or the process was restarted before
+    -- next_connect_height was advanced. Without this fallback, the
+    -- scheduler sees the block in storage and never re-downloads it,
+    -- while connect_pending_blocks cannot find it in pending — deadlock.
+    if not pending then
+      local entry = self.header_chain.headers[hash_hex]
+      if entry then
+        local block_hash = validation.compute_block_hash(entry.header)
+        local block_data = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes)
+        if block_data then
+          local deser_ok, block = pcall(serialize.deserialize_block, block_data)
+          if deser_ok and block then
+            pending = {
+              block = block,
+              height = entry.height,
+              hash = block_hash,
+            }
+            print(string.format("Recovered block %d from storage (was stored but not connected)",
+              entry.height))
+          else
+            print(string.format("Warning: corrupted block %d in storage, will re-download: %s",
+              entry.height, tostring(block)))
+          end
+        end
+      end
+    end
+
+    if not pending then
+      -- Debug: log why connection stalled (but only once per minute to avoid spam)
+      local socket = require("socket")
+      local now = socket.gettime()
+      if not self._last_stall_log or now - self._last_stall_log > 60 then
+        self._last_stall_log = now
+        local in_pending = self.pending_blocks[hash_hex] and "yes" or "no"
+        print(string.format("connect_pending_blocks: stalled at height %d, hash_hex=%s, in_pending=%s, in_storage=checked",
+          self.next_connect_height, hash_hex and hash_hex:sub(1,16) or "NIL", in_pending))
+      end
+      break
+    end
 
     -- Validate the full block
     local ok, err = pcall(function()
@@ -1437,22 +1600,43 @@ function BlockDownloader:connect_pending_blocks()
     end)
 
     if not ok then
-      -- Invalid block, remove from pending and report error
+      -- Invalid block, remove from pending and skip this height.
+      -- Incrementing next_connect_height prevents permanent stall on a
+      -- block that repeatedly fails context-free validation.
       self.pending_blocks[hash_hex] = nil
-      return false, err
+      print(string.format("Skipping invalid block at height %d: %s",
+        self.next_connect_height, tostring(err)))
+      self.next_connect_height = self.next_connect_height + 1
+      -- Continue loop to try next height rather than returning immediately
+      goto continue_loop
     end
 
-    -- Store the block
+    -- Notify callback (for UTXO updates, etc.) BEFORE storing the block.
+    -- This ensures that if the callback fails, the block is NOT in storage
+    -- and the scheduler will re-download it on the next attempt.
+    if self.connect_callback then
+      local cb_ok, cb_err = pcall(self.connect_callback, pending.block, pending.height, pending.hash)
+      if not cb_ok then
+        -- Callback failed (e.g., UTXO validation error). Remove from pending
+        -- but do NOT advance height — the block may need to be retried after
+        -- fixing state. Do NOT store to disk so the scheduler re-downloads it.
+        self.pending_blocks[hash_hex] = nil
+        print(string.format("Block %d connect callback failed: %s",
+          self.next_connect_height, tostring(cb_err)))
+        return false, cb_err
+      end
+    end
+
+    -- Store the block AFTER successful connection (callback passed)
     self.storage.put_block(pending.hash, pending.block)
     self.storage.set_chain_tip(pending.hash, pending.height, false)
 
-    -- Notify callback (for UTXO updates, etc.)
-    if self.connect_callback then
-      self.connect_callback(pending.block, pending.height, pending.hash)
-    end
-
     self.pending_blocks[hash_hex] = nil
     self.next_connect_height = self.next_connect_height + 1
+
+    -- Reset stall timer on successful connection
+    local _sock = require("socket")
+    self.last_connect_advance = _sock.gettime()
 
     -- Flush UTXO set periodically during IBD
     if self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval then
@@ -1460,9 +1644,9 @@ function BlockDownloader:connect_pending_blocks()
       self.last_flush_height = self.next_connect_height
     end
 
-    -- Periodic GC to prevent LuaJIT table bloat
-    if self.next_connect_height % 100 == 0 then
-      collectgarbage("collect")
+    -- Periodic incremental GC to prevent LuaJIT table bloat
+    if self.next_connect_height % 1000 == 0 then
+      collectgarbage("step", 100)
     end
 
     -- Log progress periodically
@@ -1472,6 +1656,8 @@ function BlockDownloader:connect_pending_blocks()
         self.next_connect_height, self.header_chain.header_tip_height, progress))
       io.flush()
     end
+
+    ::continue_loop::
   end
 
   -- Check if IBD is complete

@@ -681,8 +681,8 @@ M.networks.mainnet = {
   min_chain_work = "000000000000000000000000000000000000000088430067bc7f9c1f8cc40b55",
 
   -- Assumevalid block hash (skip script validation for ancestors)
-  -- This is periodically updated; value from Bitcoin Core v27
-  assumevalid = "000000000000000000026811d149d4d261995ec5be500220c903a3b4c7c1a11f",
+  -- Height 938343, from Bitcoin Core v28
+  assumevalid = "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
 
   -- BIP9 versionbits parameters
   versionbits_period = 2016,
