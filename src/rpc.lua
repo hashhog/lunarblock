@@ -2784,9 +2784,41 @@ function RPCServer:register_methods()
       return "invalid"
     end
 
+    -- Compute block hash
+    local block_hash = validation.compute_block_hash(block.header)
+
+    -- Check if this block is already known (duplicate detection)
+    if rpc.chain_state and rpc.chain_state.tip_height then
+      -- If we already have a header for this hash in storage, it's a duplicate
+      if rpc.storage then
+        local existing_header = rpc.storage.get_header(block_hash)
+        if existing_header then
+          return "duplicate"
+        end
+      end
+
+      -- Check if block's prev_hash connects to our current tip
+      local prev_hash = block.header.prev_hash
+      local tip_hash = rpc.chain_state.tip_hash
+      if prev_hash ~= tip_hash then
+        -- Not extending our best chain; could be orphan or stale
+        return "prev-blk-not-found"
+      end
+    end
+
+    -- Determine height: tip + 1 since we verified prev_hash == tip_hash above
+    local new_height = (rpc.chain_state and rpc.chain_state.tip_height or 0) + 1
+
+    -- Store the block so it is available for later retrieval
+    if rpc.storage then
+      rpc.storage.put_block(block_hash, block)
+      rpc.storage.put_header(block_hash, block.header)
+      rpc.storage.put_height_index(new_height, block_hash)
+    end
+
     -- If chain_state has a connect_block method, use it
     if rpc.chain_state and rpc.chain_state.connect_block then
-      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block)
+      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true)
       if not ok_conn then
         return tostring(conn_err)
       end

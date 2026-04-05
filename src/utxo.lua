@@ -6,7 +6,7 @@ local validation = require("lunarblock.validation")
 local script = require("lunarblock.script")
 local storage_mod = require("lunarblock.storage")
 local perf = require("lunarblock.perf")
-local sig_cache = require("sig_cache")
+local sig_cache = require("lunarblock.sig_cache")
 local bit = require("bit")
 local M = {}
 
@@ -339,11 +339,10 @@ local FLAG_FRESH = 0x02  -- Parent cache does not have this entry
 local CoinView = {}
 CoinView.__index = CoinView
 
--- Default cache size: 8MB — very small to force frequent eviction.
--- LuaJIT's actual per-entry memory is ~10KB and the GC doesn't
--- release pages efficiently. A small cache + frequent table rebuilds
--- keeps RSS bounded at the cost of more RocksDB reads.
-local DEFAULT_CACHE_SIZE_MB = 8
+-- Default cache size: 450MB — matches Bitcoin Core's default dbcache.
+-- A larger cache reduces RocksDB reads and avoids frequent table rebuilds
+-- that trigger expensive full GC cycles on large heaps.
+local DEFAULT_CACHE_SIZE_MB = 450
 local BYTES_PER_MB = 1024 * 1024
 
 -- Estimated memory per cache entry (for memory tracking).
@@ -615,8 +614,11 @@ end
 --- Flush dirty entries to disk.
 -- Writes modified entries and deletes spent entries.
 -- @param reallocate boolean: if true, clear cache after flush (default: false)
-function CoinView:flush(reallocate)
-  if self.dirty_count == 0 then return end
+-- @param extra_batch_fn function|nil: optional callback(batch) to add extra
+--        operations to the same atomic write batch (e.g. chain tip update)
+-- @param sync boolean|nil: if true, force sync write (default: false)
+function CoinView:flush(reallocate, extra_batch_fn, sync)
+  if self.dirty_count == 0 and not extra_batch_fn then return end
 
   local batch = self.storage.batch()
   local writes = 0
@@ -643,8 +645,13 @@ function CoinView:flush(reallocate)
     end
   end
 
+  -- Allow caller to add extra operations (e.g. chain tip) to the same batch
+  if extra_batch_fn then
+    extra_batch_fn(batch)
+  end
+
   -- Execute batch
-  batch.write(false)
+  batch.write(sync or false)
   batch.destroy()
 
   -- Update stats
@@ -660,11 +667,9 @@ function CoinView:flush(reallocate)
   if reallocate then
     self.cache = {}
     self.cached_memory_usage = 0
-    -- Force immediate GC to release the old table.  Without this,
-    -- LuaJIT holds both the old (huge) and new (empty) tables in
-    -- memory until the next GC cycle, causing unbounded RSS growth.
-    collectgarbage("collect")
-    collectgarbage("collect")  -- Second pass for weak refs
+    -- Incremental GC step to nudge collection without traversing the
+    -- entire heap (full collect on a multi-GB heap causes GC thrashing).
+    collectgarbage("step", 100)
   else
     -- Evict clean entries when cache exceeds the limit.
     -- LuaJIT doesn't shrink hash tables on deletion, so we rebuild
@@ -682,8 +687,8 @@ function CoinView:flush(reallocate)
       end
       self.cache = new_cache
       self.cached_memory_usage = new_usage
-      -- Force GC to reclaim the old table
-      collectgarbage("collect")
+      -- Incremental GC step to nudge collection of the old table
+      collectgarbage("step", 100)
     end
   end
 end
@@ -1356,15 +1361,22 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     self.storage.put_undo(block_hash, undo_data)
   end
 
-  -- Flush UTXO changes to database and CLEAR the cache entirely.
-  -- LuaJIT's hash tables don't release memory on deletion, so we use
-  -- reallocate=true to drop the table completely after each block.
-  self.coin_view:flush(true)
+  -- Flush dirty UTXO entries and update chain tip in the SAME atomic batch.
+  -- This prevents the chain tip from advancing ahead of the UTXO set if the
+  -- process crashes between the two writes.
+  local tip_hash_capture = block_hash
+  local tip_height_capture = height
+  local storage_ref = self.storage
+  self.coin_view:flush(false, function(batch)
+    local w = serialize.buffer_writer()
+    w.write_hash256(tip_hash_capture)
+    w.write_u32le(tip_height_capture)
+    batch.put(storage_mod.CF.META, "chain_tip", w.result())
+  end, true)
 
-  -- Update chain tip
+  -- Update in-memory tip (only after the atomic write succeeds)
   self.tip_hash = block_hash
   self.tip_height = height
-  self.storage.set_chain_tip(block_hash, height, true)
 
   -- Invoke callback if registered (for ZMQ notifications, etc.)
   if self.callbacks.on_block_connected then
@@ -1434,21 +1446,29 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
     end
   end
 
-  -- Flush UTXO changes to database and CLEAR the cache entirely.
-  -- LuaJIT's hash tables don't release memory on deletion, so we use
-  -- reallocate=true to drop the table completely after each block.
-  self.coin_view:flush(true)
+  -- Flush dirty UTXO entries and update chain tip atomically.
+  local new_tip_height = height - 1
+  local new_tip_hash = prev_hash
+  local had_undo = undo_data_raw ~= nil
+  local disconnect_hash = block_hash
+  self.coin_view:flush(false, function(batch)
+    -- Remove undo data for this block
+    if had_undo then
+      batch.delete(storage_mod.CF.UNDO, disconnect_hash.bytes)
+    end
+    -- Update chain tip to the previous block
+    if new_tip_hash then
+      local w = serialize.buffer_writer()
+      w.write_hash256(new_tip_hash)
+      w.write_u32le(new_tip_height)
+      batch.put(storage_mod.CF.META, "chain_tip", w.result())
+    end
+  end, true)
 
-  -- Remove undo data for this block
-  if undo_data_raw then
-    self.storage.delete_undo(block_hash)
-  end
-
-  -- Update chain tip to the previous block
-  self.tip_height = height - 1
-  if prev_hash then
-    self.tip_hash = prev_hash
-    self.storage.set_chain_tip(prev_hash, height - 1, true)
+  -- Update in-memory tip
+  self.tip_height = new_tip_height
+  if new_tip_hash then
+    self.tip_hash = new_tip_hash
   end
 
   -- Invoke callback if registered (for ZMQ notifications, etc.)

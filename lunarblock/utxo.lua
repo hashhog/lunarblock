@@ -339,18 +339,18 @@ local FLAG_FRESH = 0x02  -- Parent cache does not have this entry
 local CoinView = {}
 CoinView.__index = CoinView
 
--- Default cache size: 450MB
+-- Default cache size: 450MB — matches Bitcoin Core's default dbcache.
+-- A larger cache reduces RocksDB reads and avoids frequent table rebuilds
+-- that trigger expensive full GC cycles on large heaps.
 local DEFAULT_CACHE_SIZE_MB = 450
 local BYTES_PER_MB = 1024 * 1024
 
--- Estimated memory per cache entry (for memory tracking)
--- Key: 36 bytes (outpoint)
--- Value overhead: 8 (value) + 4 (height) + 1 (coinbase) + 1 (flags) + ~8 (table overhead)
--- Script: variable, average ~34 bytes
--- Lua table/GC overhead: ~40 bytes
--- Total estimate: ~130 bytes per entry
-local BASE_ENTRY_OVERHEAD = 96
-local SCRIPT_OVERHEAD = 34
+-- Estimated memory per cache entry (for memory tracking).
+-- LuaJIT hash table entries use ~8-10KB actual RSS per entry due to
+-- table node overhead, GC metadata, string interning, and allocator
+-- fragmentation.  We use 8KB to trigger eviction early enough.
+local BASE_ENTRY_OVERHEAD = 7800
+local SCRIPT_OVERHEAD = 200
 
 --- Estimate memory usage of a single cache entry.
 -- @param entry table: UTXO entry with script_pubkey
@@ -476,7 +476,9 @@ function CoinView:get(txid, vout)
   entry = self:_fetch_from_disk(key)
   if not entry then return nil end
 
-  -- Cache the entry (not dirty, not fresh since it came from disk)
+  -- Cache the entry for intra-block lookups.
+  -- The cache is cleared completely after each block flush to prevent
+  -- LuaJIT hash table memory from growing unboundedly.
   local mem_usage = estimate_entry_memory(entry)
   self.cache[key] = entry
   self.cached_memory_usage = self.cached_memory_usage + mem_usage
@@ -612,8 +614,11 @@ end
 --- Flush dirty entries to disk.
 -- Writes modified entries and deletes spent entries.
 -- @param reallocate boolean: if true, clear cache after flush (default: false)
-function CoinView:flush(reallocate)
-  if self.dirty_count == 0 then return end
+-- @param extra_batch_fn function|nil: optional callback(batch) to add extra
+--        operations to the same atomic write batch (e.g. chain tip update)
+-- @param sync boolean|nil: if true, force sync write (default: false)
+function CoinView:flush(reallocate, extra_batch_fn, sync)
+  if self.dirty_count == 0 and not extra_batch_fn then return end
 
   local batch = self.storage.batch()
   local writes = 0
@@ -640,8 +645,13 @@ function CoinView:flush(reallocate)
     end
   end
 
+  -- Allow caller to add extra operations (e.g. chain tip) to the same batch
+  if extra_batch_fn then
+    extra_batch_fn(batch)
+  end
+
   -- Execute batch
-  batch.write(false)
+  batch.write(sync or false)
   batch.destroy()
 
   -- Update stats
@@ -657,6 +667,29 @@ function CoinView:flush(reallocate)
   if reallocate then
     self.cache = {}
     self.cached_memory_usage = 0
+    -- Incremental GC step to nudge collection without traversing the
+    -- entire heap (full collect on a multi-GB heap causes GC thrashing).
+    collectgarbage("step", 100)
+  else
+    -- Evict clean entries when cache exceeds the limit.
+    -- LuaJIT doesn't shrink hash tables on deletion, so we rebuild
+    -- the table with only the entries we want to keep.  This forces
+    -- a fresh allocation and lets the old table be GC'd.
+    if self.cached_memory_usage > self.max_cache_bytes then
+      local new_cache = {}
+      local new_usage = 0
+      local target = self.max_cache_bytes / 4
+      for key, entry in pairs(self.cache) do
+        if is_dirty(entry) or (new_usage < target and not entry.spent) then
+          new_cache[key] = entry
+          new_usage = new_usage + estimate_entry_memory(entry)
+        end
+      end
+      self.cache = new_cache
+      self.cached_memory_usage = new_usage
+      -- Incremental GC step to nudge collection of the old table
+      collectgarbage("step", 100)
+    end
   end
 end
 
@@ -1328,13 +1361,22 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     self.storage.put_undo(block_hash, undo_data)
   end
 
-  -- Flush UTXO changes to database
-  self.coin_view:flush()
+  -- Flush dirty UTXO entries and update chain tip in the SAME atomic batch.
+  -- This prevents the chain tip from advancing ahead of the UTXO set if the
+  -- process crashes between the two writes.
+  local tip_hash_capture = block_hash
+  local tip_height_capture = height
+  local storage_ref = self.storage
+  self.coin_view:flush(false, function(batch)
+    local w = serialize.buffer_writer()
+    w.write_hash256(tip_hash_capture)
+    w.write_u32le(tip_height_capture)
+    batch.put(storage_mod.CF.META, "chain_tip", w.result())
+  end, true)
 
-  -- Update chain tip
+  -- Update in-memory tip (only after the atomic write succeeds)
   self.tip_hash = block_hash
   self.tip_height = height
-  self.storage.set_chain_tip(block_hash, height, true)
 
   -- Invoke callback if registered (for ZMQ notifications, etc.)
   if self.callbacks.on_block_connected then
@@ -1404,19 +1446,29 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
     end
   end
 
-  -- Flush UTXO changes to database
-  self.coin_view:flush()
+  -- Flush dirty UTXO entries and update chain tip atomically.
+  local new_tip_height = height - 1
+  local new_tip_hash = prev_hash
+  local had_undo = undo_data_raw ~= nil
+  local disconnect_hash = block_hash
+  self.coin_view:flush(false, function(batch)
+    -- Remove undo data for this block
+    if had_undo then
+      batch.delete(storage_mod.CF.UNDO, disconnect_hash.bytes)
+    end
+    -- Update chain tip to the previous block
+    if new_tip_hash then
+      local w = serialize.buffer_writer()
+      w.write_hash256(new_tip_hash)
+      w.write_u32le(new_tip_height)
+      batch.put(storage_mod.CF.META, "chain_tip", w.result())
+    end
+  end, true)
 
-  -- Remove undo data for this block
-  if undo_data_raw then
-    self.storage.delete_undo(block_hash)
-  end
-
-  -- Update chain tip to the previous block
-  self.tip_height = height - 1
-  if prev_hash then
-    self.tip_hash = prev_hash
-    self.storage.set_chain_tip(prev_hash, height - 1, true)
+  -- Update in-memory tip
+  self.tip_height = new_tip_height
+  if new_tip_hash then
+    self.tip_hash = new_tip_hash
   end
 
   -- Invoke callback if registered (for ZMQ notifications, etc.)
