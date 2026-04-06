@@ -1020,7 +1020,7 @@ function PeerManager:maintain_connections()
 
   -- Determine connection target (allow one extra if tip is stale)
   local target = self.max_outbound
-  if self._try_new_outbound_peer then
+  if self._try_new_outbound_peer and target > 0 then
     target = target + 1  -- Allow one extra outbound when searching for better chain
   end
 
