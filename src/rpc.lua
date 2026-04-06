@@ -386,6 +386,7 @@ function M.new(config)
   self.wallet_manager = config.wallet_manager  -- Multi-wallet manager
   self.datadir = config.datadir
   self.mining = config.mining
+  self.block_downloader = config.block_downloader
   self.running = false
   self.request_wallet = nil  -- Current request's wallet context
   -- Register built-in methods
@@ -2787,21 +2788,25 @@ function RPCServer:register_methods()
     -- Compute block hash
     local block_hash = validation.compute_block_hash(block.header)
 
-    -- Check if this block is already known (duplicate detection)
+    -- Check if this block extends our current tip
     if rpc.chain_state and rpc.chain_state.tip_height then
-      -- If we already have a header for this hash in storage, it's a duplicate
-      if rpc.storage then
-        local existing_header = rpc.storage.get_header(block_hash)
-        if existing_header then
-          return "duplicate"
-        end
-      end
-
-      -- Check if block's prev_hash connects to our current tip
       local prev_hash = block.header.prev_hash
       local tip_hash = rpc.chain_state.tip_hash
-      if prev_hash ~= tip_hash then
-        -- Not extending our best chain; could be orphan or stale
+
+      if not types.hash256_eq(prev_hash, tip_hash) then
+        -- Block does not extend our tip. Check if it's a duplicate (already
+        -- connected) by seeing if our chain already includes this hash.
+        -- NOTE: We cannot use storage.get_header() for duplicate detection
+        -- because headers are stored during header-first sync long before
+        -- block bodies are downloaded and connected. Instead, check if the
+        -- block data (not just header) exists in storage, which is only
+        -- written after successful connection.
+        if rpc.storage then
+          local existing_block = rpc.storage.get(rpc.storage.CF.BLOCKS, block_hash.bytes)
+          if existing_block then
+            return "duplicate"
+          end
+        end
         return "prev-blk-not-found"
       end
     end
@@ -2824,6 +2829,27 @@ function RPCServer:register_methods()
       end
       if not conn_err then
         return "invalid"
+      end
+    end
+
+    -- Sync block_downloader so P2P sync doesn't try to re-connect this block
+    if rpc.block_downloader and rpc.block_downloader.next_connect_height then
+      if new_height >= rpc.block_downloader.next_connect_height then
+        rpc.block_downloader.next_connect_height = new_height + 1
+        rpc.block_downloader.next_download_height = new_height + 1
+        -- Clear any pending/inflight for the block we just connected
+        local connected_hex = types.hash256_hex(block_hash)
+        rpc.block_downloader.pending_blocks[connected_hex] = nil
+        if rpc.block_downloader.inflight[connected_hex] then
+          local inf = rpc.block_downloader.inflight[connected_hex]
+          if rpc.block_downloader.peer_inflight[inf.peer] then
+            rpc.block_downloader.peer_inflight[inf.peer] = rpc.block_downloader.peer_inflight[inf.peer] - 1
+            if rpc.block_downloader.peer_inflight[inf.peer] <= 0 then
+              rpc.block_downloader.peer_inflight[inf.peer] = nil
+            end
+          end
+          rpc.block_downloader.inflight[connected_hex] = nil
+        end
       end
     end
 
