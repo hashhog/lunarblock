@@ -191,12 +191,16 @@ function M.check_transaction(tx)
   assert(#tx_data >= consensus.MIN_TX_SIZE,
          "transaction size " .. #tx_data .. " below minimum " .. consensus.MIN_TX_SIZE)
 
-  -- Check for duplicate inputs
+  -- Check for duplicate inputs (avoid buffer_writer allocation per input)
   local seen_outpoints = {}
   for _, inp in ipairs(tx.inputs) do
-    local w = serialize.buffer_writer()
-    w.write_u32le(inp.prev_out.index)
-    local key = inp.prev_out.hash.bytes .. w.result()
+    local idx = inp.prev_out.index
+    local key = inp.prev_out.hash.bytes .. string.char(
+      bit.band(idx, 0xFF),
+      bit.band(bit.rshift(idx, 8), 0xFF),
+      bit.band(bit.rshift(idx, 16), 0xFF),
+      bit.band(bit.rshift(idx, 24), 0xFF)
+    )
     if seen_outpoints[key] then
       error("duplicate input")
     end
@@ -1110,27 +1114,24 @@ function M.check_block(block, network, height)
   -- Must have at least one transaction
   assert(#block.transactions > 0, "block has no transactions")
 
-  -- First transaction must be coinbase
-  local _, is_coinbase = M.check_transaction(block.transactions[1])
-  assert(is_coinbase, "first transaction is not coinbase")
-
-  -- Rest must not be coinbase
-  for i = 2, #block.transactions do
-    local _, is_cb = M.check_transaction(block.transactions[i])
-    assert(not is_cb, "transaction " .. i .. " is coinbase")
-  end
-
-  -- Compute total block weight
+  -- Single-pass: check transactions, compute weight, and count sigops together
+  -- to avoid redundant iterations and serializations.
   local total_weight = 0
-  for _, tx in ipairs(block.transactions) do
-    total_weight = total_weight + M.get_tx_weight(tx)
-  end
-  assert(total_weight <= consensus.MAX_BLOCK_WEIGHT,
-         "block weight " .. total_weight .. " exceeds maximum " .. consensus.MAX_BLOCK_WEIGHT)
-
-  -- Count legacy sigops (scriptSig + scriptPubKey, non-accurate counting)
   local total_sigops = 0
-  for _, tx in ipairs(block.transactions) do
+  for i, tx in ipairs(block.transactions) do
+    local _, is_cb = M.check_transaction(tx)
+    if i == 1 then
+      assert(is_cb, "first transaction is not coinbase")
+    else
+      assert(not is_cb, "transaction " .. i .. " is coinbase")
+    end
+
+    -- Weight: base_size * 3 + total_size (inlined get_tx_weight to reuse serialization)
+    local base_data = serialize.serialize_transaction(tx, false)
+    local total_data = serialize.serialize_transaction(tx, true)
+    total_weight = total_weight + #base_data * 3 + #total_data
+
+    -- Legacy sigops
     for _, inp in ipairs(tx.inputs) do
       total_sigops = total_sigops + M.count_script_sigops(inp.script_sig, false)
     end
@@ -1138,6 +1139,8 @@ function M.check_block(block, network, height)
       total_sigops = total_sigops + M.count_script_sigops(out.script_pubkey, false)
     end
   end
+  assert(total_weight <= consensus.MAX_BLOCK_WEIGHT,
+         "block weight " .. total_weight .. " exceeds maximum " .. consensus.MAX_BLOCK_WEIGHT)
   assert(total_sigops * consensus.WITNESS_SCALE_FACTOR <= consensus.MAX_BLOCK_SIGOPS_COST,
          "sigops cost " .. (total_sigops * consensus.WITNESS_SCALE_FACTOR) ..
          " exceeds maximum " .. consensus.MAX_BLOCK_SIGOPS_COST)
