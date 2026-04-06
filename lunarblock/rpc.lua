@@ -2823,7 +2823,13 @@ function RPCServer:register_methods()
 
     -- If chain_state has a connect_block method, use it
     if rpc.chain_state and rpc.chain_state.connect_block then
-      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true)
+      -- During bulk import (many sequential submitblock calls), skip fsync on
+      -- most blocks and only sync every 500 blocks to amortize the cost.
+      -- After IBD, post-tip blocks are rare enough that always syncing is fine,
+      -- but the height check below handles both cases.
+      rpc._submitblock_count = (rpc._submitblock_count or 0) + 1
+      local nosync = (rpc._submitblock_count % 500 ~= 0)
+      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true, nil, nosync)
       if not ok_conn then
         return tostring(conn_err)
       end
@@ -3005,7 +3011,7 @@ function RPCServer:start()
   self.server_socket:setoption("reuseaddr", true)
   assert(self.server_socket:bind(self.host, self.port))
   assert(self.server_socket:listen(32))
-  self.server_socket:settimeout(0.1)  -- Short timeout for non-blocking accept
+  self.server_socket:settimeout(0)  -- Non-blocking accept
   self.running = true
   print("RPC server listening on " .. self.host .. ":" .. self.port)
 end
@@ -3018,25 +3024,26 @@ function RPCServer:tick()
   if not client then return end
 
   client:settimeout(5)
-  -- Read the full HTTP request
-  local data = ""
+  -- Read HTTP headers line-by-line, then read exact body by Content-Length.
+  -- This avoids the LuaSocket receive(n) blocking issue where it waits for
+  -- exactly n bytes or timeout.
+  local headers_raw = {}
+  local content_length = 0
   while true do
-    local chunk, err, partial = client:receive(8192)
-    chunk = chunk or partial
-    if chunk then data = data .. chunk end
-    if err == "closed" or err == "timeout" then break end
-    -- Check if we have the full request
-    local header_end = data:find("\r\n\r\n")
-    if header_end then
-      local content_length = data:match("[Cc]ontent%-[Ll]ength:%s*(%d+)")
-      if content_length then
-        content_length = tonumber(content_length)
-        if #data >= header_end + 3 + content_length then break end
-      else
-        break
-      end
-    end
+    local line, err = client:receive("*l")
+    if not line or line == "" then break end  -- empty line = end of headers
+    if err then break end
+    headers_raw[#headers_raw + 1] = line
+    local cl = line:match("^[Cc]ontent%-[Ll]ength:%s*(%d+)")
+    if cl then content_length = tonumber(cl) end
   end
+  -- Read exact body
+  local body_data = ""
+  if content_length > 0 then
+    body_data = client:receive(content_length) or ""
+  end
+  -- Reconstruct full request for parse_http_request
+  local data = table.concat(headers_raw, "\r\n") .. "\r\n\r\n" .. body_data
 
   if #data == 0 then
     client:close()

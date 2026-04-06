@@ -291,11 +291,14 @@ end
 --------------------------------------------------------------------------------
 
 -- Generate a 36-byte key for database lookups (32-byte txid + 4-byte vout index)
+-- Hot path: avoid buffer_writer overhead by constructing the key directly.
 function M.outpoint_key(txid_hash256, vout_index)
-  local w = serialize.buffer_writer()
-  w.write_hash256(txid_hash256)
-  w.write_u32le(vout_index)
-  return w.result()  -- 36 bytes
+  return txid_hash256.bytes .. string.char(
+    bit.band(vout_index, 0xFF),
+    bit.band(bit.rshift(vout_index, 8), 0xFF),
+    bit.band(bit.rshift(vout_index, 16), 0xFF),
+    bit.band(bit.rshift(vout_index, 24), 0xFF)
+  )
 end
 
 --------------------------------------------------------------------------------
@@ -1001,8 +1004,9 @@ end
 -- @param get_block_mtp Function to get MTP for a given height (for BIP68)
 -- @param skip_script_validation If true, skip script verification (assumevalid optimization)
 -- @param use_parallel If true, attempt parallel signature verification (default: auto)
+-- @param nosync If true, skip fsync on flush (caller is responsible for periodic sync)
 -- @return true on success, nil and error message on failure
-function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel)
+function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel, nosync)
   -- Build undo data as we go - one TxUndo per non-coinbase transaction
   local block_undo = M.block_undo({})
   local total_fees = 0
@@ -1364,15 +1368,18 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- Flush dirty UTXO entries and update chain tip in the SAME atomic batch.
   -- This prevents the chain tip from advancing ahead of the UTXO set if the
   -- process crashes between the two writes.
+  -- When nosync is true, skip the expensive fsync — the caller (e.g. the IBD
+  -- loop) is responsible for issuing a periodic sync flush to bound data loss.
   local tip_hash_capture = block_hash
   local tip_height_capture = height
   local storage_ref = self.storage
+  local do_sync = not nosync
   self.coin_view:flush(false, function(batch)
     local w = serialize.buffer_writer()
     w.write_hash256(tip_hash_capture)
     w.write_u32le(tip_height_capture)
     batch.put(storage_mod.CF.META, "chain_tip", w.result())
-  end, true)
+  end, do_sync)
 
   -- Update in-memory tip (only after the atomic write succeeds)
   self.tip_hash = block_hash

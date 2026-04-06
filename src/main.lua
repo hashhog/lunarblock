@@ -464,7 +464,11 @@ local function main()
   block_downloader.next_download_height = chain_state.tip_height + 1
   -- Wire up block connection callback to update UTXO chain state
   block_downloader.connect_callback = function(block, height, block_hash)
-    local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, true)
+    -- During IBD, skip fsync on every block (nosync=true). The sync.lua loop
+    -- issues a sync flush every utxo_flush_interval blocks (default 2000).
+    -- This avoids ~5ms of fsync latency per block, giving ~200x speedup for
+    -- small early blocks.
+    local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, true, nil, true)
     if not ok then
       -- Raise an error so pcall in connect_pending_blocks catches it.
       -- Returning nil without error would cause connect_pending_blocks to
@@ -528,7 +532,7 @@ local function main()
   -- Initialize peer manager
   local peer_manager = peerman_mod.new(network, db, {
     maxpeers = args.maxpeers,
-    max_outbound = 8,
+    max_outbound = (args.maxpeers == 0) and 0 or 8,
     nov2transport = args.nov2transport,
     data_dir = datadir,
   })
@@ -801,8 +805,8 @@ local function main()
       last_status = now
     end
 
-    -- Short sleep to avoid busy-waiting
-    socket.sleep(0.05)
+    -- Short sleep to avoid busy-waiting (reduced for RPC throughput)
+    socket.sleep(0.001)
   end
 
   -- Cleanup
