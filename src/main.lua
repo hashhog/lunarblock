@@ -714,6 +714,7 @@ local function main()
     wallet_manager = wallet_manager,  -- Multi-wallet manager
     datadir = args.datadir,
     mining = mining_mod,
+    block_downloader = block_downloader,
   })
   rpc_server:start()
 
