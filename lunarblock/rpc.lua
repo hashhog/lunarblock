@@ -11,6 +11,7 @@ local p2p = require("lunarblock.p2p")
 local script_mod = require("lunarblock.script")
 local address_mod = require("lunarblock.address")
 local bit = require("bit")
+local storage_mod = require("lunarblock.storage")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -1441,14 +1442,25 @@ function RPCServer:register_methods()
         error({code = M.ERROR.MISC_ERROR, message = "Failed to mine block (nonce exhausted)"})
       end
 
-      -- Store the block
-      rpc.storage.put_block(block_hash, block)
-      rpc.storage.put_header(block_hash, block.header)
+      -- Store block/header/height_index atomically with UTXO flush
       local new_height = rpc.chain_state.tip_height + 1
-      rpc.storage.put_height_index(new_height, block_hash)
+      local block_data = serialize.serialize_block(block)
+      local header_data = serialize.serialize_block_header(block.header)
+      local height_key = string.char(
+        math.floor(new_height / 16777216) % 256,
+        math.floor(new_height / 65536) % 256,
+        math.floor(new_height / 256) % 256,
+        new_height % 256
+      )
+      local hash_bytes = block_hash.bytes
+      local store_batch_fn = function(batch)
+        batch.put(storage_mod.CF.BLOCKS, hash_bytes, block_data)
+        batch.put(storage_mod.CF.HEADERS, hash_bytes, header_data)
+        batch.put(storage_mod.CF.HEIGHT_INDEX, height_key, hash_bytes)
+      end
 
       -- Connect the block to chain state (skip full script validation for self-mined blocks)
-      local ok, err = rpc.chain_state:connect_block(block, new_height, block_hash, nil, nil, true)
+      local ok, err = rpc.chain_state:connect_block(block, new_height, block_hash, nil, nil, true, nil, false, store_batch_fn)
       if not ok then
         error({code = M.ERROR.VERIFY_ERROR, message = "Failed to connect block: " .. tostring(err)})
       end
@@ -2814,14 +2826,11 @@ function RPCServer:register_methods()
     -- Determine height: tip + 1 since we verified prev_hash == tip_hash above
     local new_height = (rpc.chain_state and rpc.chain_state.tip_height or 0) + 1
 
-    -- Store the block so it is available for later retrieval
-    if rpc.storage then
-      rpc.storage.put_block(block_hash, block)
-      rpc.storage.put_header(block_hash, block.header)
-      rpc.storage.put_height_index(new_height, block_hash)
-    end
-
-    -- If chain_state has a connect_block method, use it
+    -- If chain_state has a connect_block method, use it.
+    -- Block/header/height_index storage writes are included in the same atomic
+    -- WriteBatch as the UTXO flush and chain tip update via caller_batch_fn.
+    -- This prevents a crash from leaving the height index pointing to a block
+    -- whose UTXOs haven't been applied.
     if rpc.chain_state and rpc.chain_state.connect_block then
       -- During bulk import (many sequential submitblock calls), skip fsync on
       -- most blocks and only sync every 500 blocks to amortize the cost.
@@ -2829,13 +2838,41 @@ function RPCServer:register_methods()
       -- but the height check below handles both cases.
       rpc._submitblock_count = (rpc._submitblock_count or 0) + 1
       local nosync = (rpc._submitblock_count % 500 ~= 0)
-      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true, nil, nosync)
+
+      -- Pre-serialize block data for the batch function closure
+      local block_data = serialize.serialize_block(block)
+      local header_data = serialize.serialize_block_header(block.header)
+      local height_key = string.char(
+        math.floor(new_height / 16777216) % 256,
+        math.floor(new_height / 65536) % 256,
+        math.floor(new_height / 256) % 256,
+        new_height % 256
+      )
+      local hash_bytes = block_hash.bytes
+      local storage_ref = rpc.storage
+
+      -- Batch function: write block, header, and height index atomically
+      local store_batch_fn
+      if storage_ref then
+        store_batch_fn = function(batch)
+          batch.put(storage_mod.CF.BLOCKS, hash_bytes, block_data)
+          batch.put(storage_mod.CF.HEADERS, hash_bytes, header_data)
+          batch.put(storage_mod.CF.HEIGHT_INDEX, height_key, hash_bytes)
+        end
+      end
+
+      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true, nil, nosync, store_batch_fn)
       if not ok_conn then
         return tostring(conn_err)
       end
       if not conn_err then
         return "invalid"
       end
+    elseif rpc.storage then
+      -- No chain_state — just store block data (fallback, shouldn't happen in practice)
+      rpc.storage.put_block(block_hash, block)
+      rpc.storage.put_header(block_hash, block.header)
+      rpc.storage.put_height_index(new_height, block_hash)
     end
 
     -- Sync block_downloader so P2P sync doesn't try to re-connect this block

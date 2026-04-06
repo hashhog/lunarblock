@@ -1005,8 +1005,10 @@ end
 -- @param skip_script_validation If true, skip script verification (assumevalid optimization)
 -- @param use_parallel If true, attempt parallel signature verification (default: auto)
 -- @param nosync If true, skip fsync on flush (caller is responsible for periodic sync)
+-- @param caller_batch_fn function|nil: optional callback(batch) to add extra operations
+--        (e.g. block/header/height_index storage) to the same atomic write batch
 -- @return true on success, nil and error message on failure
-function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel, nosync)
+function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel, nosync, caller_batch_fn)
   -- Build undo data as we go - one TxUndo per non-coinbase transaction
   local block_undo = M.block_undo({})
   local total_fees = 0
@@ -1379,6 +1381,11 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     w.write_hash256(tip_hash_capture)
     w.write_u32le(tip_height_capture)
     batch.put(storage_mod.CF.META, "chain_tip", w.result())
+    -- Include caller's extra operations (e.g. block/header/height_index from
+    -- submitblock) in the same atomic write batch.
+    if caller_batch_fn then
+      caller_batch_fn(batch)
+    end
   end, do_sync)
 
   -- Update in-memory tip (only after the atomic write succeeds)
