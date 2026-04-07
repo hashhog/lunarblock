@@ -343,13 +343,13 @@ function M.deserialize_transaction(reader)
   return tx
 end
 
--- Serialize a full block
+-- Serialize a full block (uses cached tx data from check_block if available)
 function M.serialize_block(blk)
   local w = M.buffer_writer()
   w.write_bytes(M.serialize_block_header(blk.header))
   w.write_varint(#blk.transactions)
   for _, tx in ipairs(blk.transactions) do
-    w.write_bytes(M.serialize_transaction(tx, true))
+    w.write_bytes(tx._cached_witness_data or M.serialize_transaction(tx, true))
   end
   return w.result()
 end
@@ -360,7 +360,7 @@ function M.serialize_block_without_witness(blk)
   w.write_bytes(M.serialize_block_header(blk.header))
   w.write_varint(#blk.transactions)
   for _, tx in ipairs(blk.transactions) do
-    w.write_bytes(M.serialize_transaction(tx, false))  -- false = no witness
+    w.write_bytes(tx._cached_base_data or M.serialize_transaction(tx, false))  -- false = no witness
   end
   return w.result()
 end
