@@ -186,8 +186,8 @@ function M.check_transaction(tx)
   assert(#tx.inputs > 0, "transaction has no inputs")
   assert(#tx.outputs > 0, "transaction has no outputs")
 
-  -- Check serialized size
-  local tx_data = serialize.serialize_transaction(tx, false)
+  -- Check serialized size (use cached data if available from check_block)
+  local tx_data = tx._cached_base_data or serialize.serialize_transaction(tx, false)
   assert(#tx_data >= consensus.MIN_TX_SIZE,
          "transaction size " .. #tx_data .. " below minimum " .. consensus.MIN_TX_SIZE)
 
@@ -248,20 +248,28 @@ end
 --------------------------------------------------------------------------------
 
 --- Compute txid (double-SHA256 of non-witness serialization).
+-- Uses cached serialization if available (set by check_block).
 -- @param tx transaction: The transaction
 -- @return hash256: The txid
 function M.compute_txid(tx)
-  local data = serialize.serialize_transaction(tx, false)
-  return crypto.hash256_type(data)
+  if tx._cached_txid then return tx._cached_txid end
+  local data = tx._cached_base_data or serialize.serialize_transaction(tx, false)
+  local txid = crypto.hash256_type(data)
+  tx._cached_txid = txid
+  return txid
 end
 
 --- Compute wtxid (double-SHA256 of witness serialization).
 -- For non-segwit transactions, wtxid == txid.
+-- Uses cached serialization if available (set by check_block).
 -- @param tx transaction: The transaction
 -- @return hash256: The wtxid
 function M.compute_wtxid(tx)
-  local data = serialize.serialize_transaction(tx, true)
-  return crypto.hash256_type(data)
+  if tx._cached_wtxid then return tx._cached_wtxid end
+  local data = tx._cached_witness_data or serialize.serialize_transaction(tx, true)
+  local wtxid = crypto.hash256_type(data)
+  tx._cached_wtxid = wtxid
+  return wtxid
 end
 
 --------------------------------------------------------------------------------
@@ -1114,11 +1122,25 @@ function M.check_block(block, network, height)
   -- Must have at least one transaction
   assert(#block.transactions > 0, "block has no transactions")
 
-  -- Single-pass: check transactions, compute weight, and count sigops together
-  -- to avoid redundant iterations and serializations.
+  -- Single-pass: check transactions, compute weight, count sigops, and cache
+  -- serialized data on each tx to eliminate redundant serializations in
+  -- check_merkle_root, check_witness_commitment, and connect_block.
   local total_weight = 0
   local total_sigops = 0
   for i, tx in ipairs(block.transactions) do
+    -- Serialize once and cache on the tx object BEFORE check_transaction
+    -- so it can reuse the cached base_data for the MIN_TX_SIZE check.
+    -- This also eliminates redundant serializations in check_merkle_root,
+    -- check_witness_commitment, and connect_block.
+    local base_data = serialize.serialize_transaction(tx, false)
+    local total_data = serialize.serialize_transaction(tx, true)
+    tx._cached_base_data = base_data
+    tx._cached_witness_data = total_data
+
+    -- Pre-compute and cache txid/wtxid from the serialized data
+    tx._cached_txid = crypto.hash256_type(base_data)
+    tx._cached_wtxid = crypto.hash256_type(total_data)
+
     local _, is_cb = M.check_transaction(tx)
     if i == 1 then
       assert(is_cb, "first transaction is not coinbase")
@@ -1126,9 +1148,7 @@ function M.check_block(block, network, height)
       assert(not is_cb, "transaction " .. i .. " is coinbase")
     end
 
-    -- Weight: base_size * 3 + total_size (inlined get_tx_weight to reuse serialization)
-    local base_data = serialize.serialize_transaction(tx, false)
-    local total_data = serialize.serialize_transaction(tx, true)
+    -- Weight: base_size * 3 + total_size
     total_weight = total_weight + #base_data * 3 + #total_data
 
     -- Legacy sigops
