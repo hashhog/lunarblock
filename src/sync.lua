@@ -1631,6 +1631,14 @@ function BlockDownloader:connect_pending_blocks()
     self.storage.put_block(pending.hash, pending.block)
     self.storage.set_chain_tip(pending.hash, pending.height, false)
 
+    -- Clear cached serialization data to free memory
+    for _, tx in ipairs(pending.block.transactions) do
+      tx._cached_base_data = nil
+      tx._cached_witness_data = nil
+      tx._cached_txid = nil
+      tx._cached_wtxid = nil
+    end
+
     self.pending_blocks[hash_hex] = nil
     self.next_connect_height = self.next_connect_height + 1
 

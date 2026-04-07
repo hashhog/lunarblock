@@ -2782,14 +2782,17 @@ function RPCServer:register_methods()
       error({code = M.ERROR.INVALID_PARAMS, message = "Block hex data required"})
     end
 
+    local t_start = os.clock()
     local raw = M.hex_decode(hexdata)
     local ok_deser, block = pcall(serialize.deserialize_block, raw)
     if not ok_deser or not block then
       error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block decode failed"})
     end
+    local t_deser = os.clock()
 
     -- Basic validation
     local ok_val, val_err = pcall(validation.check_block, block)
+    local t_validate = os.clock()
     if not ok_val then
       return tostring(val_err)
     end
@@ -2839,8 +2842,8 @@ function RPCServer:register_methods()
       rpc._submitblock_count = (rpc._submitblock_count or 0) + 1
       local nosync = (rpc._submitblock_count % 500 ~= 0)
 
-      -- Pre-serialize block data for the batch function closure
-      local block_data = serialize.serialize_block(block)
+      -- Use the original raw bytes instead of re-serializing the block
+      local block_data = raw
       local header_data = serialize.serialize_block_header(block.header)
       local height_key = string.char(
         math.floor(new_height / 16777216) % 256,
@@ -2862,11 +2865,28 @@ function RPCServer:register_methods()
       end
 
       local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true, nil, nosync, store_batch_fn)
+      local t_connect = os.clock()
       if not ok_conn then
         return tostring(conn_err)
       end
       if not conn_err then
         return "invalid"
+      end
+
+      -- Periodic timing log
+      if new_height % 100 == 0 then
+        io.stderr:write(string.format(
+          "Block %d: deser=%.3f val=%.3f connect=%.3f total=%.3f txs=%d\n",
+          new_height, t_deser - t_start, t_validate - t_deser,
+          t_connect - t_validate, t_connect - t_start, #block.transactions))
+      end
+
+      -- Clear cached serialization data to free memory
+      for _, tx in ipairs(block.transactions) do
+        tx._cached_base_data = nil
+        tx._cached_witness_data = nil
+        tx._cached_txid = nil
+        tx._cached_wtxid = nil
       end
     elseif rpc.storage then
       -- No chain_state — just store block data (fallback, shouldn't happen in practice)
