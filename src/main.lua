@@ -42,6 +42,7 @@ local function parse_args(argv)
     zmqpubhwm = 1000,  -- ZMQ high water mark
     nov2transport = false,  -- Disable BIP324 v2 transport
     import_blocks = nil,   -- Path to framed block file for import (or "-" for stdin)
+    import_utxo = nil,     -- Path to HDOG UTXO snapshot file for AssumeUTXO import
   }
 
   local i = 1
@@ -81,6 +82,7 @@ local function parse_args(argv)
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
+      print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -136,6 +138,9 @@ local function parse_args(argv)
     elseif arg == "--import-blocks" then
       i = i + 1
       args.import_blocks = argv[i]
+    elseif arg == "--import-utxo" then
+      i = i + 1
+      args.import_utxo = argv[i]
     elseif arg == "--prune" then
       i = i + 1
       local prune_val = tonumber(argv[i])
@@ -352,6 +357,66 @@ local function run_import_blocks(args)
 end
 
 --------------------------------------------------------------------------------
+-- UTXO Snapshot Import Mode (AssumeUTXO)
+--------------------------------------------------------------------------------
+
+local function run_import_utxo(args)
+  local ffi = require("ffi")
+
+  -- Determine data directory
+  local datadir = args.datadir
+  if args.network ~= "mainnet" then
+    datadir = datadir .. "/" .. args.network
+  end
+  os.execute("mkdir -p " .. datadir)
+
+  local db_path = datadir .. "/chainstate"
+  os.execute("mkdir -p " .. db_path)
+
+  print(string.format("import-utxo: network=%s datadir=%s source=%s",
+    args.network, datadir, args.import_utxo))
+
+  -- Load the C helper via FFI
+  ffi.cdef[[
+    typedef struct {
+      int success;
+      char error_msg[256];
+      uint64_t utxo_count;
+      uint32_t block_height;
+      uint8_t block_hash[32];
+      double elapsed_seconds;
+    } hdog_import_result_t;
+
+    hdog_import_result_t hdog_import(
+      const char *hdog_path,
+      const char *db_path,
+      int cache_mb
+    );
+  ]]
+
+  local lib = ffi.load("hdog_import")
+
+  -- Run the import
+  local result = lib.hdog_import(args.import_utxo, db_path, args.dbcache)
+
+  if result.success == 0 then
+    io.stderr:write("import-utxo FAILED: " .. ffi.string(result.error_msg) .. "\n")
+    os.exit(1)
+  end
+
+  -- Display the block hash in hex (big-endian display format)
+  local hash_hex = {}
+  for i = 31, 0, -1 do
+    hash_hex[#hash_hex + 1] = string.format("%02x", result.block_hash[i])
+  end
+  print(string.format("import-utxo complete: height=%d utxos=%s block=%s elapsed=%.1fs",
+    result.block_height,
+    tostring(tonumber(result.utxo_count)),
+    table.concat(hash_hex),
+    result.elapsed_seconds))
+end
+
+--------------------------------------------------------------------------------
 -- Module exports for testing
 --------------------------------------------------------------------------------
 
@@ -370,6 +435,12 @@ local function main()
   -- Override network from flags
   if args.testnet then args.network = "testnet" end
   if args.regtest then args.network = "regtest" end
+
+  -- Check for import-utxo mode
+  if args.import_utxo then
+    run_import_utxo(args)
+    return
+  end
 
   -- Check for import-blocks mode
   if args.import_blocks then
@@ -877,6 +948,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
+      print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
