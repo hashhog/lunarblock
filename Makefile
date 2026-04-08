@@ -1,7 +1,7 @@
 # lunarblock Makefile
 # Build, test, and lint targets for the Bitcoin full node
 
-.PHONY: test lint check run help
+.PHONY: test lint check run help build
 
 # Default target
 help:
@@ -13,6 +13,11 @@ help:
 	@echo "  check  - Run both lint and test"
 	@echo "  run    - Run the node (requires dependencies)"
 	@echo "  help   - Show this help message"
+
+# Build C helpers (FFI shared libraries)
+build:
+	@mkdir -p lib
+	gcc -O2 -shared -fPIC -o lib/libhdog_import.so csrc/hdog_import.c -lrocksdb
 
 # Run tests with busted using LuaJIT
 test:
