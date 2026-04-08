@@ -177,20 +177,37 @@ end
 -- Hex Encoding/Decoding
 --------------------------------------------------------------------------------
 
+-- Fast hex encode using pre-built lookup table
+local _hex_chars = {}
+for i = 0, 255 do _hex_chars[i] = string.format("%02x", i) end
+
 function M.hex_encode(data)
   local hex = {}
   for i = 1, #data do
-    hex[i] = string.format("%02x", data:byte(i))
+    hex[i] = _hex_chars[data:byte(i)]
   end
   return table.concat(hex)
 end
 
+-- Fast hex decode using FFI: single allocation instead of per-byte strings
+local ffi = require("ffi")
+local _hex_lut = ffi.new("uint8_t[256]")
+for i = 0, 255 do _hex_lut[i] = 255 end
+for i = 0, 9 do _hex_lut[string.byte("0") + i] = i end
+for i = 0, 5 do _hex_lut[string.byte("a") + i] = 10 + i end
+for i = 0, 5 do _hex_lut[string.byte("A") + i] = 10 + i end
+
 function M.hex_decode(hex)
-  local bytes = {}
-  for i = 1, #hex, 2 do
-    bytes[#bytes + 1] = string.char(tonumber(hex:sub(i, i + 1), 16))
+  local len = #hex
+  if len == 0 then return "" end
+  local out_len = math.floor(len / 2)
+  local buf = ffi.new("uint8_t[?]", out_len)
+  for i = 0, out_len - 1 do
+    local hi = _hex_lut[hex:byte(i * 2 + 1)]
+    local lo = _hex_lut[hex:byte(i * 2 + 2)]
+    buf[i] = hi * 16 + lo
   end
-  return table.concat(bytes)
+  return ffi.string(buf, out_len)
 end
 
 --------------------------------------------------------------------------------
@@ -2923,6 +2940,30 @@ function RPCServer:register_methods()
 
     return cjson.null  -- success
   end
+
+  --- submitblocks: Submit multiple blocks in one RPC call for faster IBD.
+  -- @param params array of hex-encoded blocks
+  -- @return array of results (null = success, string = error)
+  self.methods["submitblocks"] = function(rpc, params)
+    local blocks_hex = params[1]
+    if type(blocks_hex) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Array of block hex data required"})
+    end
+    local results = {}
+    local submitblock_fn = rpc.methods["submitblock"]
+    for i, hex in ipairs(blocks_hex) do
+      local ok, result = pcall(submitblock_fn, rpc, {hex})
+      if ok then
+        results[i] = result
+      else
+        results[i] = tostring(result)
+      end
+    end
+    return results
+  end
+
+  -- Alias for compatibility with feed-sequential.py
+  self.methods["submitblockbatch"] = self.methods["submitblocks"]
 
   --- getmininginfo: Return mining-related information.
   self.methods["getmininginfo"] = function(rpc, _params)

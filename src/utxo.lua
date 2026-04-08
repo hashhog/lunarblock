@@ -1,3 +1,4 @@
+local ffi = require("ffi")
 local types = require("lunarblock.types")
 local serialize = require("lunarblock.serialize")
 local crypto = require("lunarblock.crypto")
@@ -8,7 +9,70 @@ local storage_mod = require("lunarblock.storage")
 local perf = require("lunarblock.perf")
 local sig_cache = require("lunarblock.sig_cache")
 local bit = require("bit")
+local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 local M = {}
+
+--------------------------------------------------------------------------------
+-- Fast UTXO Serialization (FFI-based, avoids buffer_writer/reader overhead)
+--------------------------------------------------------------------------------
+
+-- Pre-allocated buffer for UTXO serialization (max: 8 + 5 + 10000 + 4 + 1)
+local _utxo_buf = ffi.new("uint8_t[?]", 16384)
+
+-- Write a 64-bit signed LE value into buf at offset, return new offset
+local function _write_i64le(buf, off, val)
+  local lo, hi
+  if val < 0 then
+    lo = val % 4294967296
+    hi = math.floor(val / 4294967296)
+    if lo < 0 then lo = lo + 4294967296; hi = hi - 1 end
+    if hi < 0 then hi = hi + 4294967296 end
+  else
+    lo = val % 4294967296
+    hi = math.floor(val / 4294967296)
+  end
+  buf[off]   = band(lo, 0xFF)
+  buf[off+1] = band(rshift(lo, 8), 0xFF)
+  buf[off+2] = band(rshift(lo, 16), 0xFF)
+  buf[off+3] = band(rshift(lo, 24), 0xFF)
+  buf[off+4] = band(hi, 0xFF)
+  buf[off+5] = band(rshift(hi, 8), 0xFF)
+  buf[off+6] = band(rshift(hi, 16), 0xFF)
+  buf[off+7] = band(rshift(hi, 24), 0xFF)
+  return off + 8
+end
+
+-- Write a varint into buf at offset, return new offset
+local function _write_varint(buf, off, val)
+  if val < 0xFD then
+    buf[off] = val
+    return off + 1
+  elseif val <= 0xFFFF then
+    buf[off] = 0xFD
+    buf[off+1] = band(val, 0xFF)
+    buf[off+2] = band(rshift(val, 8), 0xFF)
+    return off + 3
+  elseif val <= 0xFFFFFFFF then
+    buf[off] = 0xFE
+    buf[off+1] = band(val, 0xFF)
+    buf[off+2] = band(rshift(val, 8), 0xFF)
+    buf[off+3] = band(rshift(val, 16), 0xFF)
+    buf[off+4] = band(rshift(val, 24), 0xFF)
+    return off + 5
+  end
+  -- 8-byte varint (unlikely for script lengths)
+  buf[off] = 0xFF
+  return _write_i64le(buf, off + 1, val)
+end
+
+-- Write a uint32 LE into buf at offset, return new offset
+local function _write_u32le(buf, off, val)
+  buf[off]   = band(val, 0xFF)
+  buf[off+1] = band(rshift(val, 8), 0xFF)
+  buf[off+2] = band(rshift(val, 16), 0xFF)
+  buf[off+3] = band(rshift(val, 24), 0xFF)
+  return off + 4
+end
 
 --------------------------------------------------------------------------------
 -- UTXO Entry
@@ -30,22 +94,70 @@ end
 --------------------------------------------------------------------------------
 
 function M.serialize_utxo_entry(entry)
-  local w = serialize.buffer_writer()
-  w.write_i64le(entry.value)
-  w.write_varstr(entry.script_pubkey)
-  w.write_u32le(entry.height)
-  w.write_u8(entry.is_coinbase and 1 or 0)
-  return w.result()
+  local buf = _utxo_buf
+  local off = _write_i64le(buf, 0, entry.value)
+  local sp = entry.script_pubkey
+  local sp_len = #sp
+  off = _write_varint(buf, off, sp_len)
+  ffi.copy(buf + off, sp, sp_len)
+  off = off + sp_len
+  off = _write_u32le(buf, off, entry.height)
+  buf[off] = entry.is_coinbase and 1 or 0
+  off = off + 1
+  return ffi.string(buf, off)
 end
 
 function M.deserialize_utxo_entry(data)
-  local r = serialize.buffer_reader(data)
-  return M.utxo_entry(
-    r.read_i64le(),
-    r.read_varstr(),
-    r.read_u32le(),
-    r.read_u8() == 1
-  )
+  -- Fast inline deserialization avoiding buffer_reader closure overhead
+  local pos = 1
+  -- read i64le (value)
+  local b1, b2, b3, b4, b5, b6, b7, b8 = data:byte(pos, pos + 7)
+  local lo = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+  local hi = b5 + b6 * 256 + b7 * 65536 + b8 * 16777216
+  local value
+  if hi >= 2147483648 then
+    local comp_lo = 4294967295 - lo
+    local comp_hi = 4294967295 - hi
+    value = -(comp_lo + comp_hi * 4294967296 + 1)
+  else
+    value = lo + hi * 4294967296
+  end
+  pos = pos + 8
+
+  -- read varint (script length)
+  local first = data:byte(pos)
+  pos = pos + 1
+  local script_len
+  if first < 0xFD then
+    script_len = first
+  elseif first == 0xFD then
+    local sb1, sb2 = data:byte(pos, pos + 1)
+    script_len = sb1 + sb2 * 256
+    pos = pos + 2
+  elseif first == 0xFE then
+    local sb1, sb2, sb3, sb4 = data:byte(pos, pos + 3)
+    script_len = sb1 + sb2 * 256 + sb3 * 65536 + sb4 * 16777216
+    pos = pos + 4
+  else
+    -- 8-byte varint (extremely unlikely)
+    local r = serialize.buffer_reader(data:sub(pos))
+    script_len = r.read_u64le()
+    pos = pos + 8
+  end
+
+  -- read script bytes
+  local script_pubkey = data:sub(pos, pos + script_len - 1)
+  pos = pos + script_len
+
+  -- read u32le (height)
+  b1, b2, b3, b4 = data:byte(pos, pos + 3)
+  local height = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+  pos = pos + 4
+
+  -- read u8 (is_coinbase)
+  local is_coinbase = data:byte(pos) == 1
+
+  return M.utxo_entry(value, script_pubkey, height, is_coinbase)
 end
 
 --------------------------------------------------------------------------------
@@ -290,15 +402,20 @@ end
 -- Outpoint Key
 --------------------------------------------------------------------------------
 
+-- Pre-allocated 36-byte FFI buffer for outpoint key construction.
+-- Using ffi.copy + ffi.string avoids the two Lua string allocations
+-- (txid.bytes .. string.char(...)) that the old code produced per call.
+local _outpoint_buf = ffi.new("uint8_t[36]")
+
 -- Generate a 36-byte key for database lookups (32-byte txid + 4-byte vout index)
--- Hot path: avoid buffer_writer overhead by constructing the key directly.
+-- Hot path: uses FFI buffer to avoid intermediate string allocations.
 function M.outpoint_key(txid_hash256, vout_index)
-  return txid_hash256.bytes .. string.char(
-    bit.band(vout_index, 0xFF),
-    bit.band(bit.rshift(vout_index, 8), 0xFF),
-    bit.band(bit.rshift(vout_index, 16), 0xFF),
-    bit.band(bit.rshift(vout_index, 24), 0xFF)
-  )
+  ffi.copy(_outpoint_buf, txid_hash256.bytes, 32)
+  _outpoint_buf[32] = band(vout_index, 0xFF)
+  _outpoint_buf[33] = band(rshift(vout_index, 8), 0xFF)
+  _outpoint_buf[34] = band(rshift(vout_index, 16), 0xFF)
+  _outpoint_buf[35] = band(rshift(vout_index, 24), 0xFF)
+  return ffi.string(_outpoint_buf, 36)
 end
 
 --------------------------------------------------------------------------------
@@ -392,6 +509,9 @@ function M.new_coin_view(storage, opts)
 
   -- Track memory usage
   self.cached_memory_usage = 0
+
+  -- Persistent write batch: reused across flushes to avoid create/destroy overhead
+  self._persistent_batch = storage.batch()
 
   -- Statistics
   self.stats = {
@@ -623,7 +743,9 @@ end
 function CoinView:flush(reallocate, extra_batch_fn, sync)
   if self.dirty_count == 0 and not extra_batch_fn then return end
 
-  local batch = self.storage.batch()
+  -- Reuse persistent batch to avoid create/destroy overhead per flush
+  local batch = self._persistent_batch
+  batch.clear()
   local writes = 0
   local deletes = 0
 
@@ -655,7 +777,6 @@ function CoinView:flush(reallocate, extra_batch_fn, sync)
 
   -- Execute batch
   batch.write(sync or false)
-  batch.destroy()
 
   -- Update stats
   self.stats.disk_writes = self.stats.disk_writes + writes
@@ -1064,14 +1185,17 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
         utxo_cache[inp_idx] = utxo
       end
 
+      -- Build a reverse map from input object identity to index for O(1) lookup.
+      -- Avoids O(n) linear scan in get_prev_output / get_utxo_height callbacks.
+      local inp_to_idx = {}
+      for idx, input in ipairs(tx.inputs) do
+        inp_to_idx[input] = idx
+      end
+
       -- Calculate sigop cost for this transaction
       local function get_prev_output(inp)
-        for idx, input in ipairs(tx.inputs) do
-          if input == inp then
-            return utxo_cache[idx]
-          end
-        end
-        return nil
+        local idx = inp_to_idx[inp]
+        return idx and utxo_cache[idx] or nil
       end
       local tx_sigop_cost = validation.get_transaction_sigop_cost(tx, get_prev_output, sigop_flags)
       total_sigop_cost = total_sigop_cost + tx_sigop_cost
@@ -1081,12 +1205,8 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       if enforce_bip68 and tx.version >= 2 and prev_block_mtp and get_block_mtp then
         -- Helper to get UTXO height for each input
         local function get_utxo_height(inp)
-          for idx, input in ipairs(tx.inputs) do
-            if input == inp then
-              return utxo_cache[idx].height
-            end
-          end
-          return nil
+          local idx = inp_to_idx[inp]
+          return idx and utxo_cache[idx].height or nil
         end
 
         -- Calculate and check sequence locks
@@ -1374,13 +1494,17 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- loop) is responsible for issuing a periodic sync flush to bound data loss.
   local tip_hash_capture = block_hash
   local tip_height_capture = height
-  local storage_ref = self.storage
   local do_sync = not nosync
+  -- Serialize chain tip using FFI buffer instead of buffer_writer
+  local tip_buf = ffi.new("uint8_t[36]")
+  ffi.copy(tip_buf, tip_hash_capture.bytes, 32)
+  tip_buf[32] = band(tip_height_capture, 0xFF)
+  tip_buf[33] = band(rshift(tip_height_capture, 8), 0xFF)
+  tip_buf[34] = band(rshift(tip_height_capture, 16), 0xFF)
+  tip_buf[35] = band(rshift(tip_height_capture, 24), 0xFF)
+  local tip_data = ffi.string(tip_buf, 36)
   self.coin_view:flush(false, function(batch)
-    local w = serialize.buffer_writer()
-    w.write_hash256(tip_hash_capture)
-    w.write_u32le(tip_height_capture)
-    batch.put(storage_mod.CF.META, "chain_tip", w.result())
+    batch.put(storage_mod.CF.META, "chain_tip", tip_data)
     -- Include caller's extra operations (e.g. block/header/height_index from
     -- submitblock) in the same atomic write batch.
     if caller_batch_fn then
