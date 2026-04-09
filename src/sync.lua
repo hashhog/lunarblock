@@ -1255,6 +1255,10 @@ function BlockDownloader:schedule_downloads(peers)
   local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
     if now - info.request_time > info.timeout then
+      -- Score misbehavior for stalling block downloads (+50)
+      if info.peer and info.peer.misbehaving then
+        info.peer:misbehaving(50, "block download stalling")
+      end
       -- Stalled request - remove from inflight and peer tracking
       self.inflight[hash_hex] = nil
       if self.peer_inflight[info.peer] then
