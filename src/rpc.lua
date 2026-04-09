@@ -1011,6 +1011,9 @@ function RPCServer:register_methods()
       maxmempool = info.maxmempool,
       mempoolminfee = mempool_min_fee / 100000000,  -- Convert sat/kvB to BTC/kvB
       minrelaytxfee = min_relay_fee / 100000000,  -- Convert sat/kvB to BTC/kvB
+      incrementalrelayfee = 0.00001,
+      unbroadcastcount = 0,
+      fullrbf = true,
     }
   end
 
@@ -1028,18 +1031,31 @@ function RPCServer:register_methods()
     for _, txid_hex in ipairs(rpc.mempool:get_raw_mempool()) do
       local entry = rpc.mempool:get_entry(txid_hex)
       if entry then
+        local fee_btc = entry.fee / consensus.COIN
         result[txid_hex] = {
           vsize = entry.vsize,
           weight = entry.weight,
-          fee = entry.fee / consensus.COIN,
+          fee = fee_btc,
+          modifiedfee = fee_btc,
           time = entry.time,
           height = entry.height,
-          descendantcount = entry.descendant_count,
-          descendantsize = entry.descendant_size,
-          descendantfees = entry.descendant_fees,
-          ancestorcount = entry.ancestor_count,
-          ancestorsize = entry.ancestor_size,
-          ancestorfees = entry.ancestor_fees,
+          descendantcount = entry.descendant_count or 1,
+          descendantsize = entry.descendant_size or entry.vsize,
+          descendantfees = entry.descendant_fees or entry.fee,
+          ancestorcount = entry.ancestor_count or 1,
+          ancestorsize = entry.ancestor_size or entry.vsize,
+          ancestorfees = entry.ancestor_fees or entry.fee,
+          wtxid = entry.wtxid or txid_hex,
+          fees = {
+            base = fee_btc,
+            modified = fee_btc,
+            ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
+            descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
+          },
+          depends = entry.depends or {},
+          spentby = entry.spent_by or {},
+          ["bip125-replaceable"] = true,
+          unbroadcast = false,
         }
       end
     end
@@ -1338,34 +1354,75 @@ function RPCServer:register_methods()
   -- Network methods
   self.methods["getnetworkinfo"] = function(rpc, _params)
     local connections = 0
+    local connections_in = 0
+    local connections_out = 0
     if rpc.peer_manager then
       connections = #rpc.peer_manager.peer_list
+      for _, p in ipairs(rpc.peer_manager.peer_list) do
+        if p.inbound then
+          connections_in = connections_in + 1
+        else
+          connections_out = connections_out + 1
+        end
+      end
     end
     return {
-      version = 10000,
+      version = 250000,
       subversion = "/LunarBlock:0.1.0/",
       protocolversion = p2p.PROTOCOL_VERSION,
+      localservices = "0000000000000009",
+      localservicesnames = {"NETWORK", "WITNESS"},
+      localrelay = true,
+      timeoffset = 0,
+      networkactive = true,
       connections = connections,
-      networks = {{name = "ipv4", reachable = true}},
+      connections_in = connections_in,
+      connections_out = connections_out,
+      networks = {
+        {name = "ipv4", limited = false, reachable = true, proxy = "", proxy_randomize_credentials = false},
+        {name = "ipv6", limited = false, reachable = true, proxy = "", proxy_randomize_credentials = false},
+      },
       relayfee = 0.00001,
+      incrementalfee = 0.00001,
       localaddresses = {},
+      warnings = "",
     }
   end
 
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
     if rpc.peer_manager then
-      for _, p in ipairs(rpc.peer_manager.peer_list) do
+      for i, p in ipairs(rpc.peer_manager.peer_list) do
+        local svc = p.services or 0
+        local svc_names = {}
+        if bit.band(svc, 1) ~= 0 then svc_names[#svc_names + 1] = "NETWORK" end
+        if bit.band(svc, 8) ~= 0 then svc_names[#svc_names + 1] = "WITNESS" end
+        if bit.band(svc, 1024) ~= 0 then svc_names[#svc_names + 1] = "NETWORK_LIMITED" end
+        local is_inbound = p.inbound or false
         peers[#peers + 1] = {
+          id = i - 1,
           addr = p.ip .. ":" .. p.port,
-          services = string.format("%016x", p.services or 0),
+          network = "ipv4",
+          services = string.format("%016x", svc),
+          servicesnames = svc_names,
+          relaytxes = true,
           lastsend = math.floor(p.last_send or 0),
           lastrecv = math.floor(p.last_recv or 0),
-          subver = p.user_agent or "",
-          inbound = p.inbound or false,
-          startingheight = p.start_height or 0,
+          bytessent = p.bytes_sent or 0,
+          bytesrecv = p.bytes_recv or 0,
+          conntime = math.floor(p.conn_time or os.time()),
+          timeoffset = 0,
           pingtime = (p.latency_ms or 0) / 1000,
-          banscore = p.ban_score or 0,
+          version = p.version or 0,
+          subver = p.user_agent or "",
+          inbound = is_inbound,
+          bip152_hb_to = false,
+          bip152_hb_from = false,
+          startingheight = p.start_height or 0,
+          synced_headers = -1,
+          synced_blocks = -1,
+          inflight = {},
+          connection_type = is_inbound and "inbound" or "outbound-full-relay",
         }
       end
     end
@@ -1382,14 +1439,20 @@ function RPCServer:register_methods()
   -- Fee estimation
   self.methods["estimatesmartfee"] = function(rpc, params)
     local conf_target = params[1] or 6
+    if type(conf_target) ~= "number" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "conf_target must be numeric"})
+    end
+    conf_target = math.max(1, math.min(1008, math.floor(conf_target)))
     if rpc.fee_estimator then
       local fee_rate, actual_target = rpc.fee_estimator:estimate_smart_fee(conf_target)
-      return {
-        feerate = fee_rate / 100000,  -- Convert sat/vB to BTC/kB
-        blocks = actual_target,
-      }
+      if fee_rate and fee_rate > 0 then
+        return {
+          feerate = fee_rate / 100000,  -- Convert sat/vB to BTC/kvB
+          blocks = actual_target or conf_target,
+        }
+      end
     end
-    return {feerate = 0.00001, blocks = conf_target}
+    return {errors = {"Insufficient data or no feerate found"}, blocks = conf_target}
   end
 
   -- Mining
