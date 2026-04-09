@@ -1,0 +1,48 @@
+# LunarBlock - Bitcoin Full Node (Lua/LuaJIT)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: mainnet, testnet, regtest
+network = "mainnet"
+
+[storage]
+# Data directory
+datadir = "~/.lunarblock"
+# Database cache size in MB
+dbcache = 450
+
+[rpc]
+# RPC server port
+rpcport = 8332
+# RPC authentication
+rpcuser = "lunarblock"
+rpcpassword = ""
+# Enable REST API (no auth, read-only)
+rest = false
+# REST server port
+restport = 8080
+
+[p2p]
+# P2P listen port
+port = 8333
+# Maximum peer connections
+maxpeers = 125
+# Connect to specific peer
+# connect = "host:port"
+# Disable BIP324 v2 encrypted transport
+nov2transport = false
+
+[mempool]
+# (Uses Bitcoin Core defaults internally)
+# Prune mode: 0 = disabled, 1 = manual only, >= 550 = target MB
+prune = 0
+
+[logging]
+# Print log to console
+printtoconsole = false
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332

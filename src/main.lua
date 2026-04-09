@@ -944,6 +944,25 @@ local function main()
     rest_server:start()
   end
 
+  -- Initialize Prometheus metrics server
+  local metrics_port = 9332  -- TODO: make configurable via --metricsport
+  local metrics_socket = nil
+  if metrics_port > 0 then
+    local socket = require("socket")
+    metrics_socket = socket.tcp()
+    metrics_socket:setoption("reuseaddr", true)
+    local ok, err = metrics_socket:bind("0.0.0.0", metrics_port)
+    if ok then
+      metrics_socket:listen(16)
+      metrics_socket:settimeout(0)
+      print(string.format("Prometheus metrics server on port %d", metrics_port))
+    else
+      print(string.format("WARNING: Metrics server failed on port %d: %s", metrics_port, tostring(err)))
+      metrics_socket:close()
+      metrics_socket = nil
+    end
+  end
+
   -- Connect to specific peer if requested
   if args.connect then
     local ip, port_str = args.connect:match("^([^:]+):?(%d*)$")
@@ -992,6 +1011,41 @@ local function main()
     -- Process REST
     if rest_server then
       rest_server:tick()
+    end
+
+    -- Process Prometheus metrics requests
+    if metrics_socket then
+      local client = metrics_socket:accept()
+      if client then
+        client:settimeout(2)
+        -- Read and discard HTTP request
+        repeat
+          local line = client:receive("*l")
+        until not line or line == ""
+        -- Build metrics response
+        local height = chain_state.tip_height or 0
+        local peers = #(peer_manager:get_established_peers())
+        local mp_count = mempool and mempool.tx_count or 0
+        local body = string.format(
+          "# HELP bitcoin_blocks_total Current block height\n" ..
+          "# TYPE bitcoin_blocks_total gauge\n" ..
+          "bitcoin_blocks_total %d\n" ..
+          "# HELP bitcoin_peers_connected Number of connected peers\n" ..
+          "# TYPE bitcoin_peers_connected gauge\n" ..
+          "bitcoin_peers_connected %d\n" ..
+          "# HELP bitcoin_mempool_size Mempool transaction count\n" ..
+          "# TYPE bitcoin_mempool_size gauge\n" ..
+          "bitcoin_mempool_size %d\n",
+          height, peers, mp_count)
+        local resp = string.format(
+          "HTTP/1.1 200 OK\r\n" ..
+          "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" ..
+          "Content-Length: %d\r\n" ..
+          "Connection: close\r\n\r\n%s",
+          #body, body)
+        client:send(resp)
+        client:close()
+      end
     end
 
     -- Periodic status update
