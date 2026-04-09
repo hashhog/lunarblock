@@ -711,6 +711,117 @@ local function main()
     end
   end)
 
+  -- BIP 152: Compact block message handlers
+  local compact_block = require("lunarblock.compact_block")
+
+  peer_manager:register_handler("cmpctblock", function(peer, payload)
+    local ok, err = pcall(function()
+      local cmpctblock = p2p.deserialize_cmpctblock(payload)
+      local header_bytes = serialize.serialize_block_header(cmpctblock.header)
+      local block_hash = types.hash256(header_bytes)
+      print(string.format("Received compact block from %s:%d (short_ids=%d, prefilled=%d)",
+        peer.ip, peer.port, #cmpctblock.short_ids, #cmpctblock.prefilled_txns))
+
+      -- Create a partial block and try to reconstruct
+      local partial = compact_block.new_partial_block()
+      local init_err = partial:init(cmpctblock, mempool)
+      if init_err then
+        print("compact block init error: " .. init_err)
+        -- Fall back to requesting full block
+        return
+      end
+
+      if partial:is_complete() then
+        -- All transactions available (all prefilled or from mempool)
+        local blk, recon_err = partial:reconstruct()
+        if blk then
+          print("Compact block fully reconstructed")
+          -- Serialize and pass through normal block handling
+          local blk_data = serialize.serialize_block(blk)
+          block_downloader:handle_block(peer, blk_data)
+        else
+          print("Compact block reconstruction failed: " .. (recon_err or "unknown"))
+        end
+      else
+        -- Request missing transactions via getblocktxn
+        local missing = partial:get_missing_indices()
+        print(string.format("Compact block missing %d txns, sending getblocktxn", #missing))
+        local req_payload = p2p.serialize_getblocktxn(block_hash, missing)
+        peer:send_message("getblocktxn", req_payload)
+        -- Store partial block for later completion
+        peer.pending_compact = peer.pending_compact or {}
+        peer.pending_compact[types.hash256_hex(block_hash)] = partial
+      end
+    end)
+    if not ok then
+      print("Error processing compact block: " .. tostring(err))
+    end
+  end)
+
+  peer_manager:register_handler("blocktxn", function(peer, payload)
+    local ok, err = pcall(function()
+      local blocktxn = p2p.deserialize_blocktxn(payload)
+      local hash_hex = types.hash256_hex(blocktxn.block_hash)
+      print(string.format("Received blocktxn from %s:%d (%d txns)",
+        peer.ip, peer.port, #blocktxn.transactions))
+
+      -- Look up pending compact block
+      if not peer.pending_compact or not peer.pending_compact[hash_hex] then
+        print("Unexpected blocktxn (no pending compact block)")
+        return
+      end
+
+      local partial = peer.pending_compact[hash_hex]
+      local fill_err = partial:fill_from_blocktxn(blocktxn.transactions)
+      if fill_err then
+        print("blocktxn fill error: " .. fill_err)
+        peer.pending_compact[hash_hex] = nil
+        return
+      end
+
+      local blk, recon_err = partial:reconstruct()
+      peer.pending_compact[hash_hex] = nil
+      if blk then
+        print("Compact block reconstructed from blocktxn")
+          local blk_data = serialize.serialize_block(blk)
+          block_downloader:handle_block(peer, blk_data)
+      else
+        print("Compact block reconstruction failed: " .. (recon_err or "unknown"))
+      end
+    end)
+    if not ok then
+      print("Error processing blocktxn: " .. tostring(err))
+    end
+  end)
+
+  peer_manager:register_handler("getblocktxn", function(peer, payload)
+    local ok, err = pcall(function()
+      local req = p2p.deserialize_getblocktxn(payload)
+      print(string.format("Received getblocktxn from %s:%d (%d indexes)",
+        peer.ip, peer.port, #req.indexes))
+
+      -- Look up the full block
+      local blk = db.get_block(req.block_hash)
+      if blk then
+        -- Respond with the requested transactions
+        local transactions = {}
+        for _, index in ipairs(req.indexes) do
+          local tx = blk.transactions[index + 1]  -- Convert to 1-based
+          if tx then
+            transactions[#transactions + 1] = tx
+          end
+        end
+        local resp_payload = p2p.serialize_blocktxn(req.block_hash, transactions)
+        peer:send_message("blocktxn", resp_payload)
+      else
+        print("getblocktxn: block not found")
+      end
+    end)
+    if not ok then
+      print("Error processing getblocktxn: " .. tostring(err))
+    end
+  end)
+
   peer_manager:register_handler("getdata", function(peer, payload)
     local items = p2p.deserialize_inv(payload)
     local not_found = {}
