@@ -1,0 +1,14 @@
+services:
+  lunarblock:
+    build: .
+    container_name: lunarblock
+    restart: unless-stopped
+    ports:
+      - "48351:48351"
+      - "48341:48341"
+    volumes:
+      - lunarblock-data:/data
+    command: ["--datadir=/data", "--network=mainnet"]
+
+volumes:
+  lunarblock-data:
