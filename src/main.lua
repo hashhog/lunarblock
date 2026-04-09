@@ -599,6 +599,30 @@ local function main()
 
   -- Initialize fee estimator
   local fee_estimator = fee_mod.new(144)
+  local fee_est_path = datadir .. "/fee_estimates.dat"
+  if fee_estimator:load(fee_est_path) then
+    print("Loaded fee estimation data from " .. fee_est_path)
+  end
+
+  -- Wire fee estimator into block-connected callback.
+  -- Wrap any existing callback (e.g. ZMQ) so both fire.
+  local prev_on_block_connected = chain_state.callbacks.on_block_connected
+  chain_state.callbacks.on_block_connected = function(block_hash, block)
+    -- Feed the fee estimator: record confirmations for tracked txs
+    local height = chain_state.tip_height
+    if block and block.transactions then
+      for _, tx in ipairs(block.transactions) do
+        local txid = validation.compute_txid(tx)
+        local txid_hex = types.hash256_hex(txid)
+        fee_estimator:tx_confirmed(txid_hex, height)
+      end
+    end
+    fee_estimator:on_block(height)
+    -- Call previous callback (ZMQ, etc.)
+    if prev_on_block_connected then
+      prev_on_block_connected(block_hash, block)
+    end
+  end
 
   -- Initialize peer manager
   local peer_manager = peerman_mod.new(network, db, {
@@ -1014,6 +1038,13 @@ local function main()
   rpc_server:stop()
   if rest_server then rest_server:stop() end
   if wallet then wallet:save(wallet_path) end
+  -- Persist fee estimation data
+  local save_ok, save_err = fee_estimator:save(fee_est_path)
+  if save_ok then
+    print("Saved fee estimation data to " .. fee_est_path)
+  else
+    print("Warning: failed to save fee estimates: " .. tostring(save_err))
+  end
   db.close()
   print("LunarBlock stopped.")
 end
