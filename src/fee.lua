@@ -181,4 +181,69 @@ function FeeEstimator:estimate_smart_fee(target)
   return 1, self.max_target
 end
 
+--- Save estimator state to a file
+-- @param path string: file path to save to
+function FeeEstimator:save(path)
+  local cjson = require("cjson")
+  -- Build serializable state
+  local state = {
+    version = 1,
+    best_height = self.best_height,
+    max_target = self.max_target,
+    decay = self.decay,
+    confirmed = {},
+  }
+  for t = 1, self.max_target do
+    state.confirmed[t] = {}
+    for b = 1, M.BUCKET_COUNT do
+      state.confirmed[t][b] = {
+        count = self.confirmed[t][b].count,
+        total = self.confirmed[t][b].total,
+      }
+    end
+  end
+  -- Write atomically via temp file + rename
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "w")
+  if not f then return false, "cannot open " .. tmp end
+  f:write(cjson.encode(state))
+  f:close()
+  os.rename(tmp, path)
+  return true
+end
+
+--- Load estimator state from a file
+-- @param path string: file path to load from
+-- @return boolean: true if loaded successfully
+function FeeEstimator:load(path)
+  local cjson = require("cjson")
+  local f = io.open(path, "r")
+  if not f then return false end
+  local data = f:read("*a")
+  f:close()
+  local ok, state = pcall(cjson.decode, data)
+  if not ok or type(state) ~= "table" then return false end
+  if state.version ~= 1 then return false end
+
+  self.best_height = state.best_height or 0
+
+  -- Restore bucket data
+  if state.confirmed then
+    local max_t = math.min(#state.confirmed, self.max_target)
+    for t = 1, max_t do
+      if state.confirmed[t] then
+        local max_b = math.min(#state.confirmed[t], M.BUCKET_COUNT)
+        for b = 1, max_b do
+          local d = state.confirmed[t][b]
+          if d then
+            self.confirmed[t][b].count = d.count or 0
+            self.confirmed[t][b].total = d.total or 0
+          end
+        end
+      end
+    end
+  end
+  return true
+end
+
 return M
