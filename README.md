@@ -2,107 +2,122 @@
 
 A Bitcoin full node implementation in Lua, targeting LuaJIT 2.1.
 
-## What is it?
+## Quick Start
 
-Maybe you've wondered what it takes to validate a Bitcoin transaction from scratch.
-lunarblock is a from-scratch Bitcoin full node written in Lua (LuaJIT) that does
-exactly that. It uses FFI bindings for performance-critical crypto operations.
-
-## Current status
-
-- [x] Bitcoin primitive types (hash256, hash160, outpoint, txin, txout, transaction, block)
-- [x] Binary serialization (buffer reader/writer, varint, block/tx serialization)
-- [x] Cryptographic operations (SHA256, RIPEMD160, secp256k1, Schnorr)
-- [x] Address encoding (Base58Check, Bech32/Bech32m for P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-- [x] Script interpreter (stack-based VM, all standard opcodes, P2SH, BIP146 NULLFAIL)
-- [x] Consensus parameters (block rewards, difficulty, network configs, BIP9 versionbits)
-- [x] Block storage (RocksDB with column families, batch writes, iterators)
-- [x] Block & transaction validation (txid/wtxid, sigops, sighash, PoW, merkle root, BIP68)
-- [x] P2P message serialization (version, verack, ping, inv, headers, block, tx, addr)
-- [x] P2P networking (peer connections, version/verack handshake, ping/pong)
-- [x] Peer manager (connection pooling, DNS discovery, ban management, event loop)
-- [x] Eclipse attack mitigations (new/tried bucketed addrman, anchor connections, outbound diversity)
-- [x] Header synchronization (headers-first IBD, PoW validation, difficulty adjustment)
-- [x] Block download & IBD (parallel downloads, per-peer limits, adaptive stalling)
-- [x] UTXO set & chain state (CoinView cache with dirty/fresh flags, flush strategy, connect/disconnect blocks)
-- [x] Mempool (tx acceptance, fee validation, RBF, ancestor/descendant limits)
-- [x] Fee estimation (bucketed tracking, decay weighting, confirmation targets)
-- [x] Block template & mining (BIP22 getblocktemplate, coinbase creation, CPU miner)
-- [x] RPC server (JSON-RPC 1.0/2.0 over HTTP, Bitcoin Core-compatible methods)
-- [x] HD Wallet (BIP32/BIP44/BIP84, key derivation, tx signing, WIF import/export)
-- [x] CLI & main event loop (ties all modules together, 20Hz tick rate)
-- [x] Testing & verification (busted framework, luacheck, Bitcoin Core test vectors)
-- [x] Performance optimization (buffer pools, LRU cache, JIT profiling, FFI best practices)
-- [x] BIP152 compact block relay (SipHash-2-4, short txids, high-bandwidth mode)
-- [x] BIP155 addrv2 messages (TorV3, I2P, CJDNS address support)
-- [x] Output descriptors (BIP380-386 parsing, checksum validation, address derivation)
-- [x] Mainnet sync (fully synced to chain tip at block 943,574)
-
-## Quick start
+### Docker
 
 ```bash
-# Run the node (requires luasocket, rocksdb, openssl)
-LD_LIBRARY_PATH=./lib luajit src/main.lua
+docker build -t lunarblock .
+docker run -v lunarblock-data:/data -p 48351:48351 -p 48341:48341 lunarblock
+```
 
-# Show help
-luajit src/main.lua --help
+### From Source
 
-# Run with regtest (for local testing)
+```bash
+# Requires: luajit, luasocket, lua-cjson, libsecp256k1, openssl, rocksdb
+LD_LIBRARY_PATH=./lib luajit src/main.lua --help
+LD_LIBRARY_PATH=./lib luajit src/main.lua --network mainnet
 LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
-
-# Enable JIT profiling (outputs to data dir)
-LD_LIBRARY_PATH=./lib luajit src/main.lua --jitprofile --jitverbose
-
-# Using make
-make run-regtest
 ```
 
-## Project structure
+## Features
 
-```
-src/
-  main.lua       - CLI entry point and event loop
-  types.lua      - Bitcoin primitive types (hash256, transactions, blocks)
-  serialize.lua  - Binary serialization/deserialization
-  crypto.lua     - Hash functions and secp256k1 bindings (OpenSSL + libsecp256k1)
-  address.lua    - Address encoding (Base58Check, Bech32/Bech32m, output descriptors)
-  script.lua     - Bitcoin Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, BIP146)
-  consensus.lua  - Consensus parameters, difficulty, BIP9 versionbits, network configs
-  storage.lua    - RocksDB storage layer (blocks, headers, UTXO, chain state)
-  validation.lua - Block & transaction validation (PoW, merkle root, sighash, BIP68)
-  p2p.lua        - P2P protocol message serialization
-  peer.lua       - TCP peer connection management and handshake
-  peerman.lua    - Peer manager with connection pooling, discovery, bans, eclipse mitigations
-  sync.lua       - Header/block sync (headers-first IBD, block downloader)
-  utxo.lua       - UTXO set, CoinView cache with flush strategy, chain state manager
-  perf.lua       - Performance utilities (buffer pool, LRU cache, fast serialize)
-  mempool.lua    - Transaction memory pool (RBF, CPFP, fee policies)
-  fee.lua        - Fee rate estimation (bucketed tracking, smart fee targets)
-  mining.lua     - Block template construction and mining (BIP22, coinbase)
-  rpc.lua        - JSON-RPC server (HTTP Basic auth, Bitcoin Core methods)
-  wallet.lua     - HD wallet (BIP32/44/84, address generation, tx signing)
-  compact_block.lua - BIP152 compact block relay (short IDs, block reconstruction)
-spec/
-  helpers.lua    - FFI test helpers, mock objects, Bitcoin test vectors
-  *_spec.lua     - Test files (busted framework)
-lib/
-  libsecp256k1   - ECDSA/Schnorr library
-```
+- Full block and transaction validation (SegWit, Taproot, BIP68 sequence locks, sigop counting, PoW, merkle root)
+- Script interpreter (stack-based VM, all standard opcodes, P2PKH, P2SH, P2WPKH, P2WSH, P2TR, BIP146 NULLFAIL)
+- Header-first sync with PoW validation and difficulty adjustment
+- Parallel block download with per-peer limits and adaptive stalling
+- UTXO set with CoinView cache (dirty/fresh flags, flush strategy, connect/disconnect blocks)
+- Mempool (tx acceptance, fee validation, RBF, CPFP, ancestor/descendant limits)
+- BIP-152 compact block relay (SipHash-2-4, short txids, high-bandwidth mode)
+- BIP-155 ADDRv2 (TorV3, I2P, CJDNS address support)
+- BIP-324 v2 encrypted transport (can be disabled with `--nov2transport`)
+- BIP-9 versionbits soft fork tracking
+- Eclipse attack mitigations (bucketed addrman, anchor connections, outbound diversity)
+- Peer misbehavior scoring and ban management
+- Output descriptors (BIP380-386 parsing, checksum validation, address derivation)
+- HD wallet (BIP-32/44/84, key derivation, tx signing, WIF import/export)
+- Multi-wallet support (createwallet, loadwallet, unloadwallet, listwallets)
+- Wallet encryption (AES-256-CBC with passphrase, walletpassphrase/walletlock)
+- PSBT (createpsbt, decodepsbt, walletprocesspsbt)
+- Fee estimation (bucketed tracking, decay weighting, confirmation targets)
+- Block template construction (BIP22 getblocktemplate, coinbase creation, CPU miner)
+- REST API (read-only, enabled with `--rest`)
+- ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics)
+- Block pruning (0=disabled, 1=manual, >=550=target MB)
+- Chain management (invalidateblock, reconsiderblock RPCs)
+- Flat file block storage (Bitcoin Core compatible format)
+- JIT profiling support (`--jitprofile`, `--jitverbose`)
+- FFI bindings for performance-critical crypto (libsecp256k1, OpenSSL)
 
-## Running tests
+## Configuration
 
-```bash
-# Requires: luajit, busted, luasocket, rocksdb, openssl
-make test
+### CLI Flags
 
-# Or run individual test files
-make test-crypto
-make test-handshake
-make test-header-sync
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--datadir DIR` | `~/.lunarblock` | Data directory |
+| `--network NET` | `mainnet` | Network: mainnet, testnet, regtest |
+| `--rpcport PORT` | per-network | RPC server port |
+| `--rpcuser USER` | `lunarblock` | RPC username |
+| `--rpcpassword PW` | empty | RPC password |
+| `--port PORT` | per-network | P2P listen port |
+| `--maxpeers N` | `125` | Maximum peer connections |
+| `--dbcache MB` | `450` | Database cache size in MB |
+| `--connect IP:PORT` | none | Connect to specific peer |
+| `--testnet` | off | Use testnet |
+| `--regtest` | off | Use regtest |
+| `--printtoconsole` | off | Print log to console |
+| `--nowalletcreate` | off | Do not create wallet on first run |
+| `--reindex` | off | Rebuild UTXO set from blocks |
+| `--daemon` | off | Run as daemon |
+| `--prune N` | `0` | Prune mode: 0=disabled, 1=manual, >=550=target MB |
+| `--rest` | off | Enable REST API (no auth, read-only) |
+| `--restport PORT` | `8080` | REST server port |
+| `--zmqpubhashblock EP` | none | ZMQ endpoint for hashblock notifications |
+| `--zmqpubhashtx EP` | none | ZMQ endpoint for hashtx notifications |
+| `--zmqpubrawblock EP` | none | ZMQ endpoint for rawblock notifications |
+| `--zmqpubrawtx EP` | none | ZMQ endpoint for rawtx notifications |
+| `--zmqpubsequence EP` | none | ZMQ endpoint for sequence notifications |
+| `--zmqpubhwm N` | `1000` | ZMQ high water mark |
+| `--nov2transport` | off | Disable BIP-324 v2 encrypted transport |
+| `--jitprofile` | off | Enable JIT profiling output |
+| `--jitverbose` | off | Enable verbose JIT compilation logging |
+| `--import-blocks FILE` | none | Import blocks from framed file (`-` for stdin) |
+| `--import-utxo FILE` | none | Import UTXO snapshot from HDOG file |
 
-# Run linter
-make lint
+## RPC API
 
-# Run both lint and tests
-make check
-```
+Bitcoin Core-compatible JSON-RPC 1.0/2.0 over HTTP with Basic auth.
+
+| Category | Methods |
+|----------|---------|
+| Blockchain | `getblockchaininfo`, `getblock`, `getblockhash`, `getblockheader`, `getblockcount`, `getbestblockhash`, `getchaintips`, `getdifficulty` |
+| Transactions | `getrawtransaction`, `sendrawtransaction`, `decoderawtransaction` |
+| Mempool | `getmempoolinfo`, `getrawmempool` |
+| Mining | `getblocktemplate`, `submitblock`, `submitblocks`, `getmininginfo`, `generatetoaddress` |
+| Network | `getnetworkinfo`, `getpeerinfo`, `getconnectioncount` |
+| Wallet | `createwallet`, `loadwallet`, `unloadwallet`, `listwallets`, `listwalletdir`, `getwalletinfo`, `getnewaddress`, `getbalance`, `getbalances`, `listunspent`, `sendtoaddress`, `listtransactions`, `dumpprivkey` |
+| Wallet Security | `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange` |
+| Descriptors | `getdescriptorinfo`, `deriveaddresses` |
+| PSBT | `createpsbt`, `decodepsbt`, `walletprocesspsbt` |
+| Util | `validateaddress`, `estimatesmartfee`, `getinfo` |
+| Chain Mgmt | `invalidateblock`, `reconsiderblock` |
+| Control | `stop` |
+
+## Monitoring
+
+No built-in Prometheus exporter. Monitor via RPC calls to `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, and `getnetworkinfo`. JIT profiling output is available with `--jitprofile` for performance analysis.
+
+## Architecture
+
+lunarblock is built on LuaJIT 2.1, leveraging its trace-based JIT compiler to achieve near-native speeds for the hot validation loops. The FFI (Foreign Function Interface) provides zero-overhead bindings to libsecp256k1 for ECDSA/Schnorr signature verification and OpenSSL for SHA256/RIPEMD160 hashing, avoiding the Lua/C boundary overhead that standard `lua_CFunction` bindings would introduce. Buffer pools and LRU caches reduce GC pressure during block processing.
+
+The node runs on a single-threaded event loop with a 20Hz tick rate, processing P2P messages, mempool transactions, and RPC requests in each cycle. The peer manager handles connection pooling, DNS seed discovery, and eclipse attack mitigations through bucketed address management with netgroup diversity enforcement. Block download uses a parallel sliding window with per-peer limits and adaptive stall detection.
+
+The storage layer uses RocksDB via FFI bindings with column families to separate block headers, block data, UTXO set, and chain state metadata. The CoinView cache maintains dirty/fresh flags matching Bitcoin Core's design, flushing to disk periodically during IBD and on shutdown. Flat file block storage follows the Bitcoin Core blk*.dat format for cross-implementation compatibility.
+
+The wallet supports BIP-32/44/84 hierarchical deterministic key derivation with WIF import/export capability. Multi-wallet support allows creating, loading, and unloading named wallets at runtime. Wallet encryption uses AES-256-CBC with passphrase-based key derivation, and PSBT support enables multi-party signing workflows through createpsbt, decodepsbt, and walletprocesspsbt RPCs.
+
+## License
+
+MIT
