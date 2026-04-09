@@ -572,7 +572,7 @@ function Peer:handle_verack()
     -- Send post-handshake messages
     self:send_message("sendheaders", "")
     self:send_message("sendcmpct", p2p.serialize_sendcmpct(false, 2))
-    self:send_message("feefilter", p2p.serialize_feefilter(1000)) -- 1 sat/vB minimum
+    self:send_message("feefilter", p2p.serialize_feefilter(100000)) -- 100 sat/vB = 100000 sat/kvB
   end
 end
 

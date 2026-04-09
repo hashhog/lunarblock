@@ -305,6 +305,19 @@ function M.new(network, storage, config)
   -- Load and connect to anchor peers
   self:_load_anchors()
 
+  -- Register addr/addrv2/getaddr handlers for address relay (BIP155)
+  self:register_handler("addr", function(peer, payload)
+    self:handle_addr(peer, payload)
+    self:_relay_addr_to_random_peers(peer)
+  end)
+  self:register_handler("addrv2", function(peer, payload)
+    self:handle_addrv2(peer, payload)
+    self:_relay_addr_to_random_peers(peer)
+  end)
+  self:register_handler("getaddr", function(peer, _payload)
+    self:_respond_getaddr(peer)
+  end)
+
   return self
 end
 
@@ -1447,6 +1460,63 @@ function PeerManager:register_handler(command, handler)
   -- Also register on existing peers
   for _, p in ipairs(self.peer_list) do
     p:on(command, handler)
+  end
+end
+
+--- Relay addresses to up to 2 random connected peers (not back to source).
+-- Implements Bitcoin Core's RelayAddress behavior.
+-- @param source Peer: the peer that sent us the addresses
+function PeerManager:_relay_addr_to_random_peers(source)
+  local candidates = {}
+  for _, p in ipairs(self.peer_list) do
+    if p ~= source and p.state == "connected" then
+      candidates[#candidates + 1] = p
+    end
+  end
+  if #candidates == 0 then return end
+
+  -- Shuffle
+  for i = #candidates, 2, -1 do
+    local j = math.random(1, i)
+    candidates[i], candidates[j] = candidates[j], candidates[i]
+  end
+
+  -- Pick up to 2 and send some addresses
+  local n = math.min(2, #candidates)
+  -- Collect up to 10 addresses to relay
+  local addr_list = {}
+  local count = 0
+  for _, info in pairs(self.known_addresses) do
+    if count >= 10 then break end
+    if info.ip then
+      addr_list[#addr_list + 1] = info
+      count = count + 1
+    end
+  end
+  if count == 0 then return end
+
+  for i = 1, n do
+    local target = candidates[i]
+    local payload, cmd = self:serialize_addr_for_peer(target, addr_list)
+    target:send_message(cmd, payload)
+  end
+end
+
+--- Respond to a getaddr message by sending up to 1000 known addresses.
+-- @param peer Peer: peer that requested addresses
+function PeerManager:_respond_getaddr(peer)
+  local addr_list = {}
+  local count = 0
+  for _, info in pairs(self.known_addresses) do
+    if count >= 1000 then break end
+    if info.ip then
+      addr_list[#addr_list + 1] = info
+      count = count + 1
+    end
+  end
+  if count > 0 then
+    local payload, cmd = self:serialize_addr_for_peer(peer, addr_list)
+    peer:send_message(cmd, payload)
   end
 end
 
