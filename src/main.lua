@@ -72,6 +72,7 @@ local function parse_args(argv)
       print("      --jitprofile        Enable JIT profiling output")
       print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --prune N           Prune mode: 0=disabled, 1=manual, >=550=target MB")
+      print("      --metricsport PORT  Prometheus metrics port (default: 9332, 0 = disabled)")
       print("      --rest              Enable REST API (no auth, read-only)")
       print("      --restport PORT     REST server port (default: 8080)")
       print("      --zmqpubhashblock ENDPOINT  Publish hashblock notifications")
@@ -157,6 +158,9 @@ local function parse_args(argv)
         os.exit(1)
       end
       args.prune = prune_val
+    elseif arg == "--metricsport" then
+      i = i + 1
+      args.metricsport = tonumber(argv[i])
     elseif arg == "--rest" then
       args.rest = true
     elseif arg == "--restport" then
@@ -945,7 +949,7 @@ local function main()
   end
 
   -- Initialize Prometheus metrics server
-  local metrics_port = 9332  -- TODO: make configurable via --metricsport
+  local metrics_port = args.metricsport or 9332
   local metrics_socket = nil
   if metrics_port > 0 then
     local socket = require("socket")
@@ -1135,6 +1139,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --jitprofile        Enable JIT profiling output")
       print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --prune N           Prune mode: 0=disabled, 1=manual, >=550=target MB")
+      print("      --metricsport PORT  Prometheus metrics port (default: 9332, 0 = disabled)")
       print("      --rest              Enable REST API (no auth, read-only)")
       print("      --restport PORT     REST server port (default: 8080)")
       print("      --zmqpubhashblock ENDPOINT  Publish hashblock notifications")
