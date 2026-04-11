@@ -2388,4 +2388,125 @@ describe("rpc", function()
     end)
   end)
 
+  describe("getdeploymentinfo", function()
+    it("returns non-empty deployments on regtest with segwit and taproot", function()
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 150,
+          tip_hash = types.hash256(string.rep("\xab", 32)),
+        },
+        network = consensus.networks.regtest,
+      })
+
+      local request = '{"method":"getdeploymentinfo","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.equal(cjson.null, decoded.error)
+      local deps = decoded.result.deployments
+      assert.is_table(deps)
+
+      -- Must have segwit
+      assert.is_table(deps.segwit)
+      assert.equal("buried", deps.segwit.type)
+      assert.is_boolean(deps.segwit.active)
+      assert.is_number(deps.segwit.height)
+      assert.is_number(deps.segwit.min_activation_height)
+
+      -- Must have taproot
+      assert.is_table(deps.taproot)
+      assert.equal("buried", deps.taproot.type)
+      assert.is_boolean(deps.taproot.active)
+
+      -- On regtest height 0, both should be active at tip_height 150
+      assert.is_true(deps.segwit.active)
+      assert.is_true(deps.taproot.active)
+    end)
+
+    it("returns inactive deployments when tip is below activation height", function()
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 100,
+          tip_hash = types.hash256(string.rep("\xcd", 32)),
+        },
+        network = consensus.networks.mainnet,
+      })
+
+      local request = '{"method":"getdeploymentinfo","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.equal(cjson.null, decoded.error)
+      local deps = decoded.result.deployments
+
+      -- segwit activates at height 481824 on mainnet; tip is 100
+      assert.is_table(deps.segwit)
+      assert.is_false(deps.segwit.active)
+
+      -- taproot activates at height 709632 on mainnet; tip is 100
+      assert.is_table(deps.taproot)
+      assert.is_false(deps.taproot.active)
+    end)
+
+    it("returns active deployments when tip is at or above activation height", function()
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 750000,
+          tip_hash = types.hash256(string.rep("\xef", 32)),
+        },
+        network = consensus.networks.mainnet,
+      })
+
+      local request = '{"method":"getdeploymentinfo","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.equal(cjson.null, decoded.error)
+      local deps = decoded.result.deployments
+
+      -- Both segwit (481824) and taproot (709632) should be active at 750000
+      assert.is_true(deps.segwit.active)
+      assert.is_true(deps.taproot.active)
+
+      -- bip34, bip65, bip66, csv all active well below 750000
+      assert.is_true(deps.bip34.active)
+      assert.is_true(deps.bip65.active)
+      assert.is_true(deps.bip66.active)
+      assert.is_true(deps.csv.active)
+    end)
+
+    it("returns hash and height in result", function()
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 42,
+          tip_hash = types.hash256(string.rep("\x11", 32)),
+        },
+        network = consensus.networks.regtest,
+      })
+
+      local request = '{"method":"getdeploymentinfo","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.equal(cjson.null, decoded.error)
+      assert.is_number(decoded.result.height)
+      assert.equal(42, decoded.result.height)
+      assert.is_string(decoded.result.hash)
+      assert.equal(64, #decoded.result.hash)
+    end)
+
+    it("errors on invalid blockhash param", function()
+      local server = rpc.new({
+        chain_state = {tip_height = 10},
+        network = consensus.networks.regtest,
+      })
+
+      local request = '{"method":"getdeploymentinfo","params":["notahash"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_not_nil(decoded.error)
+    end)
+  end)
+
 end)
