@@ -1264,9 +1264,19 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             verify_witness_pubkeytype = height >= self.network.segwit_height,
           }
 
-          local checker = validation.make_sig_checker(
-            tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags
-          )
+          -- Select checker: collecting (deferred ECDSA) when parallel mode
+          -- is active, or immediate when serial.  Taproot (Schnorr) is always
+          -- verified immediately — only ECDSA is deferred to the batch pass.
+          local checker
+          if use_parallel_verify then
+            checker = validation.make_collecting_sig_checker(
+              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs
+            )
+          else
+            checker = validation.make_sig_checker(
+              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags
+            )
+          end
 
           -- Determine which scripts to run based on output type
           local script_type = script.classify_script(utxo.script_pubkey)
@@ -1286,9 +1296,16 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               for k, v in pairs(flags) do segwit_flags[k] = v end
               segwit_flags.is_segwit = true
               segwit_flags.is_witness_v0 = true  -- Enable WITNESS_PUBKEYTYPE check
-              local segwit_checker = validation.make_sig_checker(
-                tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
-              )
+              local segwit_checker
+              if use_parallel_verify then
+                segwit_checker = validation.make_collecting_sig_checker(
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs
+                )
+              else
+                segwit_checker = validation.make_sig_checker(
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
+                )
+              end
               -- BIP141: Use execute_witness_script which enforces cleanstack
               local ok, err = script.execute_witness_script(synthetic_script, stack, segwit_flags, segwit_checker)
               assert(ok, err or "P2WPKH script verification failed")
@@ -1307,9 +1324,16 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               segwit_flags.is_segwit = true
               segwit_flags.is_witness_v0 = true  -- Enable WITNESS_PUBKEYTYPE check
               segwit_flags.witness_script = witness_script
-              local segwit_checker = validation.make_sig_checker(
-                tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
-              )
+              local segwit_checker
+              if use_parallel_verify then
+                segwit_checker = validation.make_collecting_sig_checker(
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs
+                )
+              else
+                segwit_checker = validation.make_sig_checker(
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
+                )
+              end
               -- BIP141: Use execute_witness_script which enforces cleanstack
               local ok, err = script.execute_witness_script(witness_script, stack, segwit_flags, segwit_checker)
               assert(ok, err or "P2WSH script verification failed")

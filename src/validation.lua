@@ -1568,4 +1568,127 @@ function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, a
   return checker
 end
 
+--------------------------------------------------------------------------------
+-- Deferred-Collect Sig Checker (for parallel batch ECDSA)
+--------------------------------------------------------------------------------
+
+--- Create a "collecting" sig checker that defers ECDSA verification.
+-- During script execution, instead of immediately verifying each ECDSA
+-- signature, this checker records {pubkey, sig_der, sighash} into a
+-- caller-supplied collector table.  After all inputs have been processed,
+-- the caller batch-verifies via verify_signatures_parallel().
+--
+-- Script opcode logic (OP_CHECKMULTISIG counting, push-only checks, etc.)
+-- still runs inside the script engine; only the final crypto step is deferred.
+--
+-- NOTE: For Schnorr / Taproot signatures (Schnorr is always immediate since
+-- schnorr_verify is in the C extension and typically fast enough) we still
+-- verify immediately.  Only ECDSA (the bottleneck for pre-taproot blocks) is
+-- deferred.
+--
+-- @param tx transaction: The transaction being verified
+-- @param input_index number: 0-based input index
+-- @param prev_output_value number: Satoshi value of the prev output
+-- @param prev_script_pubkey string: scriptPubKey of the prev output
+-- @param flags table: Script verification flags
+-- @param collector table: Array to append {pubkey, sig_der, sighash} to
+-- @return table: Checker compatible with make_sig_checker interface
+function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector)
+  flags = flags or {}
+  local checker = {}
+
+  local is_segwit = flags.is_segwit or false
+  local wpkh_program = nil
+  local wsh_script = nil
+
+  function checker.set_segwit(segwit, p2wpkh_program, p2wsh_witness_script)
+    is_segwit = segwit
+    wpkh_program = p2wpkh_program
+    wsh_script = p2wsh_witness_script
+  end
+
+  function checker.get_witness()
+    local inp = tx.inputs[input_index + 1]
+    if inp and inp.witness then
+      return inp.witness
+    end
+    return {}
+  end
+
+  --- Deferred ECDSA check: compute sighash immediately (must happen in script
+  -- execution order) but push (pubkey, sig_der, sighash) to collector instead
+  -- of calling ecdsa_verify.  Returns true (optimistic) so script execution
+  -- can continue; the batch verify pass at the end will catch any failures.
+  function checker.check_sig(sig, pubkey)
+    if #sig == 0 then
+      return false
+    end
+
+    local hash_type = sig:byte(#sig)
+    local sig_der = sig:sub(1, -2)
+
+    -- Determine script code (same logic as make_sig_checker)
+    local script_code
+    if is_segwit then
+      if wpkh_program then
+        script_code = script.make_p2pkh_script(wpkh_program)
+      elseif wsh_script then
+        script_code = wsh_script
+      else
+        local script_type, hash = script.classify_script(prev_script_pubkey)
+        if script_type == "p2wpkh" then
+          script_code = script.make_p2pkh_script(hash)
+        else
+          script_code = flags.witness_script or prev_script_pubkey
+        end
+      end
+    else
+      script_code = flags.script_code or prev_script_pubkey
+    end
+
+    -- Compute sighash now (order-dependent — must run here in script execution)
+    local sighash
+    if is_segwit then
+      sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
+    else
+      sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig)
+    end
+
+    -- Push to collector for deferred parallel ECDSA verification
+    collector[#collector + 1] = { pubkey = pubkey, sig_der = sig_der, sighash = sighash }
+
+    -- Return true optimistically; batch verify will catch failures
+    return true
+  end
+
+  function checker.check_locktime(script_locktime)
+    if tx.inputs[input_index + 1].sequence == 0xFFFFFFFF then
+      return false
+    end
+    local threshold = consensus.LOCKTIME_THRESHOLD
+    local tx_locktime = tx.locktime
+    if (script_locktime < threshold) ~= (tx_locktime < threshold) then
+      return false
+    end
+    return script_locktime <= tx_locktime
+  end
+
+  function checker.check_sequence(script_sequence)
+    if not consensus.sequence_locks_active(script_sequence) then
+      return true
+    end
+    local inp = tx.inputs[input_index + 1]
+    if tx.version < 2 then return false end
+    if not consensus.sequence_locks_active(inp.sequence) then return false end
+    local script_is_time = consensus.sequence_lock_is_time_based(script_sequence)
+    local input_is_time = consensus.sequence_lock_is_time_based(inp.sequence)
+    if script_is_time ~= input_is_time then return false end
+    local script_value = consensus.sequence_lock_value(script_sequence)
+    local input_value = consensus.sequence_lock_value(inp.sequence)
+    return script_value <= input_value
+  end
+
+  return checker
+end
+
 return M
