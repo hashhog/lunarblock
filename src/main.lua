@@ -537,13 +537,31 @@ local function main()
   -- Start downloading from after the current chain tip
   block_downloader.next_connect_height = chain_state.tip_height + 1
   block_downloader.next_download_height = chain_state.tip_height + 1
+  -- Build assumevalid callbacks once; they close over header_chain which is
+  -- updated in-place as new headers arrive, so the lookup is always current.
+  local av_in_index, av_is_ancestor, av_on_best_chain =
+    consensus_mod.make_assumevalid_callbacks(network, header_chain)
+
   -- Wire up block connection callback to update UTXO chain state
   block_downloader.connect_callback = function(block, height, block_hash)
     -- During IBD, skip fsync on every block (nosync=true). The sync.lua loop
     -- issues a sync flush every utxo_flush_interval blocks (default 2000).
     -- This avoids ~5ms of fsync latency per block, giving ~200x speedup for
     -- small early blocks.
-    local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, true, nil, true)
+
+    -- Compute skip_scripts via the real ancestor-check semantic (Bitcoin Core
+    -- v28.0 ConnectBlock logic).  Regtest has assumevalid=nil so skip_scripts
+    -- will always be false there, preserving full script verification.
+    local block_hash_hex = types.hash256_hex(block_hash)
+    local best_header_work = header_chain:get_chain_work()
+    local best_header_height = header_chain.header_tip_height or 0
+    local skip_scripts = consensus_mod.should_skip_script_validation(
+      network, height, block_hash_hex,
+      av_in_index, av_is_ancestor, av_on_best_chain,
+      best_header_work, best_header_height
+    )
+
+    local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, skip_scripts, nil, true)
     if not ok then
       -- Raise an error so pcall in connect_pending_blocks catches it.
       -- Returning nil without error would cause connect_pending_blocks to
@@ -929,6 +947,12 @@ local function main()
     datadir = args.datadir,
     mining = mining_mod,
     block_downloader = block_downloader,
+    -- Pass header_chain so submitblock can compute assumevalid skip decision
+    header_chain = header_chain,
+    -- Pre-built assumevalid callbacks (same closures as used by connect_callback)
+    av_in_index = av_in_index,
+    av_is_ancestor = av_is_ancestor,
+    av_on_best_chain = av_on_best_chain,
   })
   rpc_server:start()
 
