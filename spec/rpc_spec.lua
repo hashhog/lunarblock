@@ -2509,4 +2509,90 @@ describe("rpc", function()
     end)
   end)
 
+  -- L2-SOFTFORKS-BRIDGE: assert that getblockchaininfo.softforks and
+  -- getdeploymentinfo.deployments are consistent for every shared deployment
+  -- name.  Both RPCs now project from build_deployment_state(), the single
+  -- source of truth introduced by this commit.  Test runs on regtest with an
+  -- ephemeral chain state (no disk I/O) at two heights to cover the
+  -- active/inactive boundary.
+  describe("softforks / deployments consistency (L2-SOFTFORKS-BRIDGE)", function()
+    local function assert_rpc_consistency(tip_height, network, label)
+      local server = rpc.new({
+        chain_state = {
+          tip_height = tip_height,
+          tip_hash   = types.hash256(string.rep("\xaa", 32)),
+        },
+        network = network,
+      })
+
+      local gbc_body = server:handle_request(
+        '{"method":"getblockchaininfo","params":[],"id":1}')
+      local gdi_body = server:handle_request(
+        '{"method":"getdeploymentinfo","params":[],"id":1}')
+      local gbc_resp = cjson.decode(gbc_body)
+      local gdi_resp = cjson.decode(gdi_body)
+
+      assert.equal(cjson.null, gbc_resp.error,
+        label .. ": getblockchaininfo returned error")
+      assert.equal(cjson.null, gdi_resp.error,
+        label .. ": getdeploymentinfo returned error")
+
+      local softforks  = gbc_resp.result.softforks
+      local deployments = gdi_resp.result.deployments
+
+      assert.is_table(softforks,   label .. ": softforks must be a table")
+      assert.is_table(deployments, label .. ": deployments must be a table")
+
+      -- Every key present in softforks must appear in deployments with
+      -- identical type, active, and height values.
+      for name, sf in pairs(softforks) do
+        local dep = deployments[name]
+        assert.is_table(dep,
+          label .. ": deployment '" .. name .. "' missing from getdeploymentinfo")
+        assert.equal(sf.type, dep.type,
+          label .. ": " .. name .. ".type mismatch")
+        assert.equal(sf.active, dep.active,
+          label .. ": " .. name .. ".active mismatch")
+        assert.equal(sf.height, dep.height,
+          label .. ": " .. name .. ".height mismatch")
+      end
+
+      -- Every key in deployments (excluding testdummy, which is absent from
+      -- the getblockchaininfo softforks projection) must appear in softforks.
+      for name, dep in pairs(deployments) do
+        if name ~= "testdummy" then
+          local sf = softforks[name]
+          assert.is_table(sf,
+            label .. ": softfork '" .. name .. "' missing from getblockchaininfo")
+          assert.equal(dep.type, sf.type,
+            label .. ": " .. name .. ".type mismatch (reverse)")
+          assert.equal(dep.active, sf.active,
+            label .. ": " .. name .. ".active mismatch (reverse)")
+          assert.equal(dep.height, sf.height,
+            label .. ": " .. name .. ".height mismatch (reverse)")
+        end
+      end
+    end
+
+    it("regtest tip=0: all deployments agree (all active)", function()
+      assert_rpc_consistency(0, consensus.networks.regtest,
+        "regtest tip=0")
+    end)
+
+    it("regtest tip=500: all deployments agree (all active above height 0)", function()
+      assert_rpc_consistency(500, consensus.networks.regtest,
+        "regtest tip=500")
+    end)
+
+    it("mainnet tip=100: all deployments agree (segwit/taproot inactive)", function()
+      assert_rpc_consistency(100, consensus.networks.mainnet,
+        "mainnet tip=100")
+    end)
+
+    it("mainnet tip=750000: all deployments agree (all active)", function()
+      assert_rpc_consistency(750000, consensus.networks.mainnet,
+        "mainnet tip=750000")
+    end)
+  end)
+
 end)
