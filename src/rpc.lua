@@ -578,6 +578,68 @@ function RPCServer:handle_request(request_body)
 end
 
 --------------------------------------------------------------------------------
+-- Shared softfork/deployment helper
+--------------------------------------------------------------------------------
+
+-- build_deployment_state: single source of truth for buried-softfork state.
+-- Returns a table keyed by deployment name, each value being:
+--   { type, active, height, min_activation_height }
+-- Both getblockchaininfo (via .softforks) and getdeploymentinfo (via
+-- .deployments) project from this table; neither reads from a stale cache or
+-- a hard-coded activation table of its own.
+--
+-- @param tip_height  number  current chain tip height (or target block height)
+-- @param net         table   network params (rpc.network)
+-- @return table
+local function build_deployment_state(tip_height, net)
+  local function buried_entry(activation_height)
+    local h = activation_height or 0
+    return {
+      type                = "buried",
+      active              = tip_height >= h,
+      height              = h,
+      min_activation_height = h,
+    }
+  end
+
+  local deployments = {}
+
+  if net.bip34_height then
+    deployments.bip34 = buried_entry(net.bip34_height)
+  end
+  if net.bip65_height then
+    deployments.bip65 = buried_entry(net.bip65_height)
+  end
+  if net.bip66_height then
+    deployments.bip66 = buried_entry(net.bip66_height)
+  end
+  if net.csv_height then
+    deployments.csv = buried_entry(net.csv_height)
+  end
+  if net.segwit_height then
+    deployments.segwit = buried_entry(net.segwit_height)
+  end
+  if net.taproot_height then
+    deployments.taproot = buried_entry(net.taproot_height)
+  end
+
+  -- testdummy: not tracked independently; always buried-active.
+  -- On regtest all softforks activate at height 0; on mainnet/testnet this
+  -- deployment was only ever a test vehicle and is always active.
+  deployments.testdummy = {
+    type                = "buried",
+    active              = true,
+    height              = 0,
+    min_activation_height = 0,
+  }
+
+  return deployments
+end
+
+-- Expose for testing
+M.build_deployment_state = build_deployment_state
+
+--------------------------------------------------------------------------------
 -- RPC Method Registration
 --------------------------------------------------------------------------------
 
@@ -636,26 +698,10 @@ function RPCServer:register_methods()
       chainwork = string.rep("0", 64)  -- Default to zeros if not tracked
     end
 
-    -- Build softforks table
-    local softforks = {}
-    if rpc.network.bip34_height then
-      softforks.bip34 = {type = "buried", active = tip_height >= rpc.network.bip34_height, height = rpc.network.bip34_height}
-    end
-    if rpc.network.bip66_height then
-      softforks.bip66 = {type = "buried", active = tip_height >= rpc.network.bip66_height, height = rpc.network.bip66_height}
-    end
-    if rpc.network.bip65_height then
-      softforks.bip65 = {type = "buried", active = tip_height >= rpc.network.bip65_height, height = rpc.network.bip65_height}
-    end
-    if rpc.network.csv_height then
-      softforks.csv = {type = "buried", active = tip_height >= rpc.network.csv_height, height = rpc.network.csv_height}
-    end
-    if rpc.network.segwit_height then
-      softforks.segwit = {type = "buried", active = tip_height >= rpc.network.segwit_height, height = rpc.network.segwit_height}
-    end
-    if rpc.network.taproot_height then
-      softforks.taproot = {type = "buried", active = tip_height >= rpc.network.taproot_height, height = rpc.network.taproot_height}
-    end
+    -- Build softforks table via the shared deployment helper so that
+    -- getblockchaininfo.softforks and getdeploymentinfo.deployments always
+    -- read from the same source of truth.
+    local softforks = build_deployment_state(tip_height, rpc.network)
 
     return {
       chain = rpc.network.name,
@@ -3221,54 +3267,9 @@ function RPCServer:register_methods()
       end
     end
 
-    local net = rpc.network
-
-    -- Helper: build a buried deployment entry.
-    -- activation_height is the height at which the rule is enforced.
-    -- Bitcoin Core semantics: active = (tip_height + 1) > activation_height,
-    -- i.e. active once the *next* block will be at or above activation height.
-    -- We simplify to: active when tip_height >= activation_height (standard
-    -- buried-deployment check used across the fleet).
-    local function buried_entry(activation_height)
-      local h = activation_height or 0
-      return {
-        type   = "buried",
-        active = target_height >= h,
-        height = h,
-        min_activation_height = h,
-      }
-    end
-
-    local deployments = {}
-
-    if net.bip34_height then
-      deployments.bip34 = buried_entry(net.bip34_height)
-    end
-    if net.bip65_height then
-      deployments.bip65 = buried_entry(net.bip65_height)
-    end
-    if net.bip66_height then
-      deployments.bip66 = buried_entry(net.bip66_height)
-    end
-    if net.csv_height then
-      deployments.csv = buried_entry(net.csv_height)
-    end
-    if net.segwit_height then
-      deployments.segwit = buried_entry(net.segwit_height)
-    end
-    if net.taproot_height then
-      deployments.taproot = buried_entry(net.taproot_height)
-    end
-    -- testdummy: lunarblock does not track this deployment independently;
-    -- report it as buried-active (matches regtest behaviour where all
-    -- softforks activate at height 0).  On mainnet/testnet it is always
-    -- active (it was only ever a test vehicle and is not deployed).
-    deployments.testdummy = {
-      type   = "buried",
-      active = true,
-      height = 0,
-      min_activation_height = 0,
-    }
+    -- Use the shared deployment helper so this RPC reads from the same
+    -- source of truth as getblockchaininfo.softforks.
+    local deployments = build_deployment_state(target_height, rpc.network)
 
     return {
       hash        = target_hash_hex,
