@@ -1123,41 +1123,126 @@ end
 --------------------------------------------------------------------------------
 
 --- Check if script validation should be skipped for a block.
--- This implements the assumevalid optimization: skip script verification
--- for blocks that are ancestors of the assumevalid block.
--- @param network table: network configuration
--- @param block_height number: height of block being validated
--- @param block_hash_hex string: hash of block being validated
+-- Implements the Bitcoin Core v28.0 assumevalid ancestor-check semantic.
+-- Script verification is skipped if and only if ALL six conditions hold:
+--   1. assumed_valid hash is configured (non-nil, non-empty).
+--   2. The assumed-valid block is present in the local header index
+--      (is_av_in_index returns true).
+--   3. The block being connected is an ancestor of the assumed-valid block
+--      on the active header chain (is_ancestor_of_assumevalid returns true).
+--   4. The block is also an ancestor of the best known header
+--      (is_on_best_header_chain returns true).
+--   5. The best-known-header chainwork >= minimumChainWork.
+--   6. The best-known-header is at least TWO_WEEKS_BLOCKS above the block
+--      being connected (prevents a manufactured shallow header chain from
+--      unlocking the skip path).
+--
+-- Reference: Bitcoin Core src/validation.cpp ConnectBlock, lines 2345-2383.
+--
+-- @param network table: network configuration (must have .assumevalid, .min_chain_work)
+-- @param block_height number: height of block being connected
+-- @param block_hash_hex string: hex hash of block being connected
+-- @param is_av_in_index function: fn() -> boolean — true if assumevalid hash is in header index
 -- @param is_ancestor_of_assumevalid function: fn(height, hash_hex) -> boolean
--- @param best_header_work string: 32-byte work of best header
--- @param best_header_height number: height of best header
+--   Returns true iff the block at `height` with `hash_hex` is on the ancestor
+--   path to the assumevalid block (i.e., the canonical chain's block at that
+--   height IS this block, and the assumevalid block is at or above this height).
+-- @param is_on_best_header_chain function: fn(height, hash_hex) -> boolean
+--   Returns true iff the block at `height` with `hash_hex` is on the best header chain.
+-- @param best_header_work string: 32-byte big-endian cumulative work of best header
+-- @param best_header_height number: height of best known header
 -- @return boolean: true if script validation should be skipped
-function M.should_skip_script_validation(network, block_height, block_hash_hex, is_ancestor_of_assumevalid, best_header_work, best_header_height)
+function M.should_skip_script_validation(network, block_height, block_hash_hex,
+    is_av_in_index, is_ancestor_of_assumevalid, is_on_best_header_chain,
+    best_header_work, best_header_height)
+  -- Condition 1: assumevalid must be configured
   local assumevalid = network.assumevalid
   if not assumevalid or assumevalid == "" then
-    return false  -- No assumevalid configured, always verify
+    return false, "assumevalid not configured"
   end
 
-  -- Check if best header has minimum chain work
+  -- Condition 2: the assumed-valid block must be in our header index
+  if not is_av_in_index() then
+    return false, "assumevalid hash not in header index"
+  end
+
+  -- Condition 3: block must be an ancestor of the assumed-valid block
+  if not is_ancestor_of_assumevalid(block_height, block_hash_hex) then
+    return false, "block not in assumevalid chain"
+  end
+
+  -- Condition 4: block must be an ancestor of the best known header
+  if not is_on_best_header_chain(block_height, block_hash_hex) then
+    return false, "block not in best header chain"
+  end
+
+  -- Condition 5: best header must have minimum chain work
   local min_work = M.work_from_hex(network.min_chain_work or string.rep("00", 64))
   if M.work_compare(best_header_work, min_work) < 0 then
-    return false  -- Not enough work, verify everything
+    return false, "best header chainwork below minimumchainwork"
   end
 
-  -- Check if block is an ancestor of the assumevalid block
-  if not is_ancestor_of_assumevalid(block_height, block_hash_hex) then
-    return false  -- Block not in assumevalid chain, verify it
-  end
-
-  -- Additional safety check: block should not be too recent
-  -- Bitcoin Core uses a 2-week equivalent time check, but we simplify to height check
-  -- Skip script validation only for blocks well below the tip
+  -- Condition 6: best header must be at least ~2 weeks of blocks past this block
+  -- Bitcoin Core uses GetBlockProofEquivalentTime for a precise 2-week equivalent-work
+  -- check; we conservatively approximate as TWO_WEEKS_BLOCKS block-height gap.
   local TWO_WEEKS_BLOCKS = 2016  -- ~2 weeks at 10 min/block
   if best_header_height - block_height < TWO_WEEKS_BLOCKS then
-    return false  -- Block too recent, verify it
+    return false, "block too recent relative to best header"
   end
 
-  return true  -- Safe to skip script validation
+  return true  -- All conditions met — safe to skip script validation
+end
+
+--- Build the is_av_in_index, is_ancestor_of_assumevalid, and is_on_best_header_chain
+-- callbacks needed by should_skip_script_validation, from a HeaderChain object.
+--
+-- The HeaderChain must expose:
+--   .height_to_hash[height] -> hash_hex  (canonical chain hash at each height)
+--   .headers[hash_hex] -> {height=N, ...}  (header index)
+--   .header_tip_height -> number
+--
+-- @param network table: network configuration (must have .assumevalid)
+-- @param header_chain table: HeaderChain object from sync.lua
+-- @return is_av_in_index fn, is_ancestor fn, is_on_best_header_chain fn
+function M.make_assumevalid_callbacks(network, header_chain)
+  local av_hash = network.assumevalid  -- hex string or nil
+
+  -- Condition 2 callback: is assumevalid hash in our header index?
+  local function is_av_in_index()
+    if not av_hash then return false end
+    return header_chain.headers[av_hash] ~= nil
+  end
+
+  -- Find the height of the assumevalid block once (lazily cached).
+  local av_height_cache = nil
+  local function get_av_height()
+    if av_height_cache then return av_height_cache end
+    if not av_hash then return nil end
+    local entry = header_chain.headers[av_hash]
+    if entry then
+      av_height_cache = entry.height
+    end
+    return av_height_cache
+  end
+
+  -- Condition 3 callback: is this block an ancestor of the assumevalid block?
+  -- A block at `height` is an ancestor of assumevalid iff:
+  --   a) height <= assumevalid_height
+  --   b) the canonical chain's block at `height` IS this block
+  --      (i.e. height_to_hash[height] == block_hash_hex)
+  local function is_ancestor_of_assumevalid(height, hash_hex)
+    local av_height = get_av_height()
+    if not av_height then return false end
+    if height > av_height then return false end
+    return header_chain.height_to_hash[height] == hash_hex
+  end
+
+  -- Condition 4 callback: is this block on the best known header chain?
+  local function is_on_best_header_chain(height, hash_hex)
+    return header_chain.height_to_hash[height] == hash_hex
+  end
+
+  return is_av_in_index, is_ancestor_of_assumevalid, is_on_best_header_chain
 end
 
 --------------------------------------------------------------------------------

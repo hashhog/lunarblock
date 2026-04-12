@@ -405,6 +405,11 @@ function M.new(config)
   self.datadir = config.datadir
   self.mining = config.mining
   self.block_downloader = config.block_downloader
+  -- Assumevalid ancestor-check callbacks (from consensus.make_assumevalid_callbacks)
+  self.header_chain = config.header_chain
+  self.av_in_index = config.av_in_index
+  self.av_is_ancestor = config.av_is_ancestor
+  self.av_on_best_chain = config.av_on_best_chain
   self.running = false
   self.request_wallet = nil  -- Current request's wallet context
   -- Register built-in methods
@@ -1585,8 +1590,22 @@ function RPCServer:register_methods()
         batch.put(storage_mod.CF.HEIGHT_INDEX, height_key, hash_bytes)
       end
 
-      -- Connect the block to chain state (skip full script validation for self-mined blocks)
-      local ok, err = rpc.chain_state:connect_block(block, new_height, block_hash, nil, nil, true, nil, false, store_batch_fn)
+      -- Connect the block to chain state.
+      -- Self-mined blocks are always at the chain tip (well above any assumevalid height),
+      -- so skip_scripts will be false in practice.  Still use the proper check for
+      -- correctness in case assumevalid is unset or the height happens to fall below it.
+      local gen_skip_scripts = false
+      if rpc.av_in_index and rpc.av_is_ancestor and rpc.av_on_best_chain and rpc.header_chain then
+        local gen_hash_hex = types.hash256_hex(block_hash)
+        local gen_bh_work = rpc.header_chain:get_chain_work()
+        local gen_bh_height = rpc.header_chain.header_tip_height or 0
+        gen_skip_scripts = consensus.should_skip_script_validation(
+          rpc.network, new_height, gen_hash_hex,
+          rpc.av_in_index, rpc.av_is_ancestor, rpc.av_on_best_chain,
+          gen_bh_work, gen_bh_height
+        )
+      end
+      local ok, err = rpc.chain_state:connect_block(block, new_height, block_hash, nil, nil, gen_skip_scripts, nil, false, store_batch_fn)
       if not ok then
         error({code = M.ERROR.VERIFY_ERROR, message = "Failed to connect block: " .. tostring(err)})
       end
@@ -2990,7 +3009,21 @@ function RPCServer:register_methods()
         end
       end
 
-      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, true, nil, nosync, store_batch_fn)
+      -- Compute skip_scripts via the real assumevalid ancestor-check semantic.
+      -- Falls back to false (always verify) if header_chain callbacks are unavailable.
+      local skip_scripts = false
+      if rpc.av_in_index and rpc.av_is_ancestor and rpc.av_on_best_chain and rpc.header_chain then
+        local block_hash_hex = types.hash256_hex(block_hash)
+        local best_header_work = rpc.header_chain:get_chain_work()
+        local best_header_height = rpc.header_chain.header_tip_height or 0
+        skip_scripts = consensus.should_skip_script_validation(
+          rpc.network, new_height, block_hash_hex,
+          rpc.av_in_index, rpc.av_is_ancestor, rpc.av_on_best_chain,
+          best_header_work, best_header_height
+        )
+      end
+
+      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, skip_scripts, nil, nosync, store_batch_fn)
       local t_connect = os.clock()
       if not ok_conn then
         return tostring(conn_err)

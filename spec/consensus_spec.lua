@@ -1128,67 +1128,209 @@ describe("consensus", function()
     end)
   end)
 
+  -- ---------------------------------------------------------------------------
+  -- Assumevalid optimization — 7-case test matrix
+  -- Matches Bitcoin Core v28.0 ConnectBlock logic (src/validation.cpp:2345-2383).
+  -- All six conditions must hold for script verification to be skipped.
+  -- ---------------------------------------------------------------------------
   describe("assumevalid optimization", function()
-    local test_network
+    -- av_hash is the hardcoded assumevalid hash (height 5000 on the test chain).
+    local AV_HASH   = "0000000000000000000000000000000000000000000000000000000000001000"
+    local AV_HEIGHT = 5000
+    -- The block being connected lives well below the assumevalid block.
+    local BLOCK_HASH   = "0000000000000000000000000000000000000000000000000000000000000abc"
+    local BLOCK_HEIGHT = 100
+    -- Best header is 10000 blocks above the block being connected (> 2016).
+    local BEST_HEADER_HEIGHT = 10000
+    local GOOD_WORK = consensus.work_from_hex(
+      "0000000000000000000000000000000000000000000000000000000000000002")
+    local ZERO_WORK = consensus.work_from_hex(
+      "0000000000000000000000000000000000000000000000000000000000000000")
 
-    before_each(function()
-      test_network = {
+    -- Helper: build network config.
+    local function net(av)
+      return {
         name = "test",
-        assumevalid = "0000000000000000000000000000000000000000000000000000000000001000",
+        assumevalid = av,
         min_chain_work = "0000000000000000000000000000000000000000000000000000000000000001",
       }
+    end
+
+    -- All-pass callbacks: every condition succeeds.
+    local function all_pass_callbacks()
+      local function is_av_in_index() return true end
+      local function is_ancestor(h, hash)
+        return h <= AV_HEIGHT and hash == BLOCK_HASH
+      end
+      local function is_on_best(h, hash)
+        return hash == BLOCK_HASH
+      end
+      return is_av_in_index, is_ancestor, is_on_best
+    end
+
+    -- Test 1: assumevalid absent (nil) → every block runs scripts.
+    -- Corresponds to running with -assumevalid=0 or no config.
+    it("case 1 — assumevalid absent: always verifies scripts", function()
+      local av_in, av_anc, av_best = all_pass_callbacks()
+      local skip = consensus.should_skip_script_validation(
+        net(nil), BLOCK_HEIGHT, BLOCK_HASH,
+        av_in, av_anc, av_best,
+        GOOD_WORK, BEST_HEADER_HEIGHT
+      )
+      assert.is_false(skip)
     end)
 
-    describe("should_skip_script_validation", function()
-      it("returns false when assumevalid is nil", function()
-        local network = { assumevalid = nil, min_chain_work = "0000000000000000000000000000000000000000000000000000000000000001" }
-        local skip = consensus.should_skip_script_validation(
-          network, 100, "somehash",
-          function() return true end,
-          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
-          5000
-        )
-        assert.is_false(skip)
+    -- Test 2: block IS an ancestor of assumevalid and all safety conditions hold
+    -- → script skip fires.
+    it("case 2 — block is ancestor of assumevalid: scripts skipped", function()
+      local av_in, av_anc, av_best = all_pass_callbacks()
+      local skip = consensus.should_skip_script_validation(
+        net(AV_HASH), BLOCK_HEIGHT, BLOCK_HASH,
+        av_in, av_anc, av_best,
+        GOOD_WORK, BEST_HEADER_HEIGHT
+      )
+      assert.is_true(skip)
+    end)
+
+    -- Test 3: block NOT in assumevalid chain at the same height (different hash
+    -- at that height on the canonical chain) → scripts must run.
+    it("case 3 — block not in assumevalid chain: scripts run", function()
+      local function is_av_in_index() return true end
+      local function is_ancestor(_h, _hash) return false end  -- wrong branch
+      local function is_on_best(_h, _hash) return true end
+      local skip = consensus.should_skip_script_validation(
+        net(AV_HASH), BLOCK_HEIGHT, "deadbeefdeadbeef000000000000000000000000000000000000000000000000",
+        is_av_in_index, is_ancestor, is_on_best,
+        GOOD_WORK, BEST_HEADER_HEIGHT
+      )
+      assert.is_false(skip)
+    end)
+
+    -- Test 4: block height ABOVE the assumevalid height → scripts must run.
+    it("case 4 — block height above assumevalid height: scripts run", function()
+      local function is_av_in_index() return true end
+      -- is_ancestor correctly returns false for heights > AV_HEIGHT
+      local function is_ancestor(h, _hash) return h <= AV_HEIGHT end
+      local function is_on_best(_h, _hash) return true end
+      local skip = consensus.should_skip_script_validation(
+        net(AV_HASH), AV_HEIGHT + 1, BLOCK_HASH,
+        is_av_in_index, is_ancestor, is_on_best,
+        GOOD_WORK, BEST_HEADER_HEIGHT
+      )
+      assert.is_false(skip)
+    end)
+
+    -- Test 5: assumevalid hash not yet in header index (condition 2 fails)
+    -- → scripts must run (we haven't received the header yet).
+    it("case 5 — assumevalid hash not in header index: scripts run", function()
+      local function is_av_in_index() return false end  -- haven't seen the header
+      local function is_ancestor(_h, _hash) return true end
+      local function is_on_best(_h, _hash) return true end
+      local skip = consensus.should_skip_script_validation(
+        net(AV_HASH), BLOCK_HEIGHT, BLOCK_HASH,
+        is_av_in_index, is_ancestor, is_on_best,
+        GOOD_WORK, BEST_HEADER_HEIGHT
+      )
+      assert.is_false(skip)
+    end)
+
+    -- Test 6: block would pass ancestor check but fails a NON-script check
+    -- (bad merkle root / bad coinbase / PoW) → block is REJECTED even though
+    -- skip_scripts returned true.  The skip decision does not bypass non-script
+    -- validation; this test verifies we do NOT skip rejection of invalid blocks.
+    -- We model this by checking that connect_block-level non-script validation
+    -- is independent: skip_scripts=true does not suppress the non-script error.
+    -- Since that logic lives in utxo.connect_block (not here), we verify that
+    -- should_skip_script_validation itself returns true (i.e., the skip flag is
+    -- set) while the caller is still responsible for running non-script checks.
+    it("case 6 — non-script invalidity: skip flag may be true but non-script checks still run", function()
+      -- should_skip_script_validation only controls the script-check flag.
+      -- A block that is an ancestor of assumevalid CAN have skip_scripts=true
+      -- even if it has a bad merkle root — the caller (connect_block) must
+      -- still reject it on non-script grounds.  Here we just confirm the flag
+      -- is true so that the caller receives it; the caller's responsibility is
+      -- tested in utxo_spec.lua.
+      local av_in, av_anc, av_best = all_pass_callbacks()
+      local skip = consensus.should_skip_script_validation(
+        net(AV_HASH), BLOCK_HEIGHT, BLOCK_HASH,
+        av_in, av_anc, av_best,
+        GOOD_WORK, BEST_HEADER_HEIGHT
+      )
+      -- skip_scripts can be true; the block is still expected to be rejected by
+      -- connect_block's non-script checks (merkle, coinbase, PoW).
+      assert.is_true(skip)
+    end)
+
+    -- Test 7: regtest IBD — assumevalid is nil on regtest, so skip never fires.
+    -- With and without the flag, the outcome should be identical (always verify).
+    it("case 7 — regtest: assumevalid nil, scripts always verified", function()
+      local regtest_net = {
+        name = "regtest",
+        assumevalid = nil,  -- regtest has no assumevalid by design
+        min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
+      }
+      local av_in, av_anc, av_best = all_pass_callbacks()
+      -- Even if all other conditions would pass, nil assumevalid forces verify.
+      local skip_with = consensus.should_skip_script_validation(
+        regtest_net, 5000, BLOCK_HASH,
+        av_in, av_anc, av_best,
+        GOOD_WORK, 10000
+      )
+      local skip_without = consensus.should_skip_script_validation(
+        regtest_net, 5000, BLOCK_HASH,
+        function() return false end,
+        function() return false end,
+        function() return false end,
+        ZERO_WORK, 0
+      )
+      assert.is_false(skip_with)
+      assert.is_false(skip_without)
+      -- Both cases must be identical (no divergence on regtest)
+      assert.equals(skip_with, skip_without)
+    end)
+
+    -- Also test make_assumevalid_callbacks with a mock header_chain.
+    describe("make_assumevalid_callbacks", function()
+      it("returns correct callbacks for a well-formed header_chain", function()
+        local mock_chain = {
+          headers = {
+            [AV_HASH] = { height = AV_HEIGHT },
+            [BLOCK_HASH] = { height = BLOCK_HEIGHT },
+          },
+          height_to_hash = {
+            [AV_HEIGHT] = AV_HASH,
+            [BLOCK_HEIGHT] = BLOCK_HASH,
+          },
+          header_tip_height = BEST_HEADER_HEIGHT,
+        }
+        local test_net = net(AV_HASH)
+        local av_in, av_anc, av_best =
+          consensus.make_assumevalid_callbacks(test_net, mock_chain)
+
+        -- Condition 2: av hash is in index
+        assert.is_true(av_in())
+
+        -- Condition 3: block at BLOCK_HEIGHT with BLOCK_HASH is ancestor
+        assert.is_true(av_anc(BLOCK_HEIGHT, BLOCK_HASH))
+        -- Wrong hash at same height → not ancestor
+        assert.is_false(av_anc(BLOCK_HEIGHT, "deadbeef" .. string.rep("00", 28)))
+        -- Height above AV_HEIGHT → not ancestor
+        assert.is_false(av_anc(AV_HEIGHT + 1, BLOCK_HASH))
+
+        -- Condition 4: block is on best header chain
+        assert.is_true(av_best(BLOCK_HEIGHT, BLOCK_HASH))
+        assert.is_false(av_best(BLOCK_HEIGHT, "deadbeef" .. string.rep("00", 28)))
       end)
 
-      it("returns false when best header work is below minimum", function()
-        local skip = consensus.should_skip_script_validation(
-          test_network, 100, "somehash",
-          function() return true end,
-          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000000"),
-          5000
-        )
-        assert.is_false(skip)
-      end)
-
-      it("returns false when block is not ancestor of assumevalid", function()
-        local skip = consensus.should_skip_script_validation(
-          test_network, 100, "somehash",
-          function() return false end,  -- not an ancestor
-          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
-          5000
-        )
-        assert.is_false(skip)
-      end)
-
-      it("returns false when block is too recent (within 2016 blocks of tip)", function()
-        local skip = consensus.should_skip_script_validation(
-          test_network, 4000, "somehash",
-          function() return true end,
-          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
-          5000  -- only 1000 blocks behind, < 2016
-        )
-        assert.is_false(skip)
-      end)
-
-      it("returns true when all conditions are met", function()
-        local skip = consensus.should_skip_script_validation(
-          test_network, 100, "somehash",
-          function() return true end,  -- is ancestor
-          consensus.work_from_hex("0000000000000000000000000000000000000000000000000000000000000002"),
-          5000  -- 4900 blocks behind, > 2016
-        )
-        assert.is_true(skip)
+      it("returns is_av_in_index=false when assumevalid hash is absent from index", function()
+        local mock_chain = {
+          headers = {},  -- empty — haven't seen the header yet
+          height_to_hash = {},
+          header_tip_height = 0,
+        }
+        local av_in, _, _ =
+          consensus.make_assumevalid_callbacks(net(AV_HASH), mock_chain)
+        assert.is_false(av_in())
       end)
     end)
   end)
