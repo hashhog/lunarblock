@@ -454,8 +454,13 @@ M.SendState = {
 -- @return table: transport object
 function M.V2Transport(magic_bytes, initiator)
   -- Generate ephemeral key pair
+  -- BIP324: pass 32 bytes of aux randomness to ellswift_create (matches Bitcoin
+  -- Core's m_key.EllSwiftCreate(ent32); see bitcoin-core/src/bip324.cpp:28).
+  -- Without auxrnd32, libsecp256k1 derives a deterministic encoding that Core
+  -- peers silently reject — see wave4-2026-04-14/LUNARBLOCK-BLOCK-SYNC-STALL-DIAG.md.
   local privkey = crypto.random_bytes(32)
-  local our_ellswift = crypto.ellswift_create(privkey)
+  local auxrnd32 = crypto.random_bytes(32)
+  local our_ellswift = crypto.ellswift_create(privkey, auxrnd32)
   if not our_ellswift then
     error("failed to create ElligatorSwift key")
   end
