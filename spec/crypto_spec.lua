@@ -332,6 +332,23 @@ describe("crypto", function()
 
       assert.equals(bin_to_hex(crypto.sha256("test")), bin_to_hex(result))
     end)
+
+    it("rejects double final() instead of double-freeing EVP_MD_CTX", function()
+      local hasher = crypto.sha256_init()
+      hasher.update("x")
+      hasher.final()
+      local ok, err = pcall(function() hasher.final() end)
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find("final%(%) called after final%(%)"))
+    end)
+
+    it("rejects update() after final()", function()
+      local hasher = crypto.sha256_init()
+      hasher.final()
+      local ok, err = pcall(function() hasher.update("x") end)
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find("update%(%) called after final%(%)"))
+    end)
   end)
 
   describe("hmac_sha256", function()
