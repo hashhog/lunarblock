@@ -152,14 +152,17 @@ function M.sha256_init()
   local hasher = {}
 
   function hasher.update(data)
+    assert(ctx ~= nil, "sha256 hasher: update() called after final()")
     libcrypto.EVP_DigestUpdate(ctx, data, #data)
   end
 
   function hasher.final()
+    assert(ctx ~= nil, "sha256 hasher: final() called after final()")
     local md = ffi.new("unsigned char[32]")
     local md_len = ffi.new("unsigned int[1]")
     libcrypto.EVP_DigestFinal_ex(ctx, md, md_len)
     libcrypto.EVP_MD_CTX_free(ctx)
+    ctx = nil
     return ffi.string(md, 32)
   end
 
