@@ -325,6 +325,14 @@ end
 --- Disconnect from the peer.
 -- @param reason string: reason for disconnection (optional, for logging)
 function Peer:disconnect(reason)
+  -- [wave7 instrumentation] surface silent v2 handshake disconnects
+  if self.state ~= M.STATE.DISCONNECTED then
+    io.stderr:write(string.format(
+      "[%s] V2DIAG peer=%s:%s state=%s v2=%s reason=%s\n",
+      os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(self.ip), tostring(self.port),
+      tostring(self.state), tostring(self.use_v2), tostring(reason or "?")))
+    io.stderr:flush()
+  end
   if self.socket then
     self.socket:close()
     self.socket = nil

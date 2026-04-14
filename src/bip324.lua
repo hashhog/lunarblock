@@ -98,6 +98,14 @@ end
 
 --- Create a forward-secure ChaCha20 cipher for length encryption.
 -- Rekeys every REKEY_INTERVAL packets.
+-- Per BIP324, this is a *continuous* stream cipher: within one rekey period
+-- the keystream bytes produced across successive crypt() calls are contiguous
+-- blocks of a single ChaCha20 stream with nonce=(0, rekey_counter), NOT a
+-- fresh stream-per-packet. See bitcoin-core/src/crypto/chacha20.cpp
+-- (FSChaCha20::Crypt) and BIP324 Python reference FSChaCha20. Previously we
+-- derived a fresh stream per packet keyed by (packet_counter, rekey_counter),
+-- which decrypts packet 0 correctly but corrupts packet 1 onward — Core peers
+-- close the connection after our first post-handshake message is sent.
 -- @param key string: 32-byte key
 -- @param rekey_interval number: packets between rekeys
 -- @return table: cipher object
@@ -107,17 +115,12 @@ local function FSChaCha20(key, rekey_interval)
     rekey_interval = rekey_interval,
     packet_counter = 0,
     rekey_counter = ffi.new("uint64_t", 0),
+    keystream = "",  -- pre-generated keystream for the current rekey period
   }
 
-  -- Build nonce from counters (12 bytes: 4-byte packet counter + 8-byte rekey counter)
-  local function make_nonce()
+  -- Build rekey-period nonce (12 bytes: 4-byte zero + 8-byte LE rekey counter)
+  local function period_nonce()
     local nonce = ffi.new("unsigned char[12]")
-    -- Little-endian packet counter (4 bytes)
-    nonce[0] = bit.band(self.packet_counter, 0xFF)
-    nonce[1] = bit.band(bit.rshift(self.packet_counter, 8), 0xFF)
-    nonce[2] = bit.band(bit.rshift(self.packet_counter, 16), 0xFF)
-    nonce[3] = bit.band(bit.rshift(self.packet_counter, 24), 0xFF)
-    -- Little-endian rekey counter (8 bytes)
     local rc = self.rekey_counter
     for i = 0, 7 do
       nonce[4 + i] = tonumber(bit.band(bit.rshift(rc, i * 8), 0xFF))
@@ -125,29 +128,37 @@ local function FSChaCha20(key, rekey_interval)
     return ffi.string(nonce, 12)
   end
 
-  -- Rekey using keystream
-  local function rekey()
-    -- Generate keystream with nonce = {0xFFFFFFFF, rekey_counter}
-    local rekey_nonce = ffi.new("unsigned char[12]")
-    rekey_nonce[0], rekey_nonce[1], rekey_nonce[2], rekey_nonce[3] = 0xFF, 0xFF, 0xFF, 0xFF
-    local rc = self.rekey_counter
-    for i = 0, 7 do
-      rekey_nonce[4 + i] = tonumber(bit.band(bit.rshift(rc, i * 8), 0xFF))
-    end
-    -- Get 32 bytes of keystream for new key
-    local zeros = string.rep("\0", 32)
-    self.key = crypto.chacha20_crypt(self.key, ffi.string(rekey_nonce, 12), zeros)
-    self.packet_counter = 0
-    self.rekey_counter = self.rekey_counter + ffi.new("uint64_t", 1)
+  -- Generate the full keystream for this rekey period up front:
+  -- REKEY_INTERVAL * LENGTH_LEN bytes for packet length crypts, then 32 bytes
+  -- of keystream that becomes the next-period key. One chacha20_crypt call
+  -- produces the contiguous stream that matches Core's block-counter-driven
+  -- incremental keystream.
+  local function refill_keystream()
+    local zeros = string.rep("\0", self.rekey_interval * M.LENGTH_LEN + 32)
+    self.keystream = crypto.chacha20_crypt(self.key, period_nonce(), zeros)
   end
+
+  refill_keystream()
 
   -- Encrypt/decrypt (same operation for stream cipher)
   function self:crypt(data)
-    local nonce = make_nonce()
-    local result = crypto.chacha20_crypt(self.key, nonce, data)
+    local n = #data
+    local off = self.packet_counter * M.LENGTH_LEN
+    local ks = self.keystream:sub(off + 1, off + n)
+    local out = ffi.new("unsigned char[?]", n)
+    for i = 0, n - 1 do
+      out[i] = bit.bxor(data:byte(i + 1), ks:byte(i + 1))
+    end
+    local result = ffi.string(out, n)
     self.packet_counter = self.packet_counter + 1
     if self.packet_counter == self.rekey_interval then
-      rekey()
+      -- New key = last 32 bytes of current period's keystream (continuation
+      -- of the same stream, as Core does via m_chacha20.Keystream(new_key)).
+      self.key = self.keystream:sub(self.rekey_interval * M.LENGTH_LEN + 1,
+                                    self.rekey_interval * M.LENGTH_LEN + 32)
+      self.packet_counter = 0
+      self.rekey_counter = self.rekey_counter + ffi.new("uint64_t", 1)
+      refill_keystream()
     end
     return result
   end
@@ -583,8 +594,17 @@ function M.V2Transport(magic_bytes, initiator)
         -- Initialize cipher with peer's key
         local ok, err = self.cipher:initialize(their_ellswift, self.initiator, self.magic_bytes)
         if not ok then
+          io.stderr:write(string.format("[%s] V2DIAG bip324 cipher_init_failed err=%s their_ells8=%s\n",
+            os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(err or "?"),
+            (their_ellswift:sub(1,8):gsub(".", function(c) return string.format("%02x", c:byte()) end))))
+          io.stderr:flush()
           return false, "cipher initialization failed: " .. (err or "unknown")
         end
+        io.stderr:write(string.format("[%s] V2DIAG bip324 KEY->GARB_GARBTERM init=%s their_ells8=%s recv_term8=%s\n",
+          os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(self.initiator),
+          (their_ellswift:sub(1,8):gsub(".", function(c) return string.format("%02x", c:byte()) end)),
+          (self.cipher.recv_garbage_terminator:sub(1,8):gsub(".", function(c) return string.format("%02x", c:byte()) end))))
+        io.stderr:flush()
 
         -- Transition to garbage phase
         self.recv_state = M.RecvState.GARB_GARBTERM
@@ -613,8 +633,14 @@ function M.V2Transport(magic_bytes, initiator)
           self.recv_aad = self.recv_buffer:sub(1, found_at)
           self.recv_buffer = self.recv_buffer:sub(found_at + M.GARBAGE_TERMINATOR_LEN + 1)
           self.recv_state = M.RecvState.VERSION
+          io.stderr:write(string.format("[%s] V2DIAG bip324 GARB_GARBTERM->VERSION garb_len=%d\n",
+            os.date("!%Y-%m-%dT%H:%M:%SZ"), found_at))
+          io.stderr:flush()
           -- Continue processing
         elseif #self.recv_buffer > max_search then
+          io.stderr:write(string.format("[%s] V2DIAG bip324 garbage_term_not_found buflen=%d max=%d\n",
+            os.date("!%Y-%m-%dT%H:%M:%SZ"), #self.recv_buffer, max_search))
+          io.stderr:flush()
           return false, "garbage terminator not found"
         else
           return true
@@ -641,6 +667,10 @@ function M.V2Transport(magic_bytes, initiator)
         local enc_payload = self.recv_buffer:sub(M.LENGTH_LEN + 1, packet_size)
         local contents, ignore, err = self.cipher:decrypt(enc_payload, self.recv_aad)
         if not contents then
+          io.stderr:write(string.format("[%s] V2DIAG bip324 decrypt_failed state=%s plen=%d aad_len=%d err=%s\n",
+            os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(self.recv_state), self.recv_len,
+            #self.recv_aad, tostring(err or "?")))
+          io.stderr:flush()
           return false, "decryption failed: " .. (err or "unknown")
         end
 
