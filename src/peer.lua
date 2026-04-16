@@ -235,7 +235,10 @@ function Peer:connect(timeout)
   else
     -- Direct connection
     self.socket = socket.tcp()
-    self.socket:settimeout(timeout or 5)
+    -- Use 0.5s timeout for connect (was 5s) to limit event-loop blocking when
+    -- peers are unreachable. Combined with 1-attempt-per-tick in maintain_connections,
+    -- RPC latency is bounded at ~500ms per reconnect event (W21 starvation fix).
+    self.socket:settimeout(timeout or 0.5)
     ok, err = self.socket:connect(self.ip, self.port)
     if not ok then
       self:disconnect("connect failed: " .. (err or "unknown"))

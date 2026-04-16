@@ -3333,7 +3333,7 @@ function RPCServer:tick()
   local client = self.server_socket:accept()
   if not client then return end
 
-  client:settimeout(5)
+  client:settimeout(1)  -- 1s max per read (was 5s) to limit event-loop blocking
   -- Read HTTP headers line-by-line, then read exact body by Content-Length.
   -- This avoids the LuaSocket receive(n) blocking issue where it waits for
   -- exactly n bytes or timeout.
