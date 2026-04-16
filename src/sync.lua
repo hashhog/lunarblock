@@ -1234,6 +1234,7 @@ function M.new_block_downloader(header_chain, storage, network)
   self.peer_round_robin = 1         -- Persistent round-robin index across schedule_downloads calls
   self.last_connect_advance = 0     -- Timestamp when next_connect_height last advanced
   self.connect_stall_timeout = 90   -- Seconds without connection progress before forced reset
+  self.max_blocks_per_connect = 8   -- Max blocks to connect per call (prevents RPC starvation)
   return self
 end
 
@@ -1255,10 +1256,14 @@ function BlockDownloader:schedule_downloads(peers)
   local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
     if now - info.request_time > info.timeout then
-      -- Score misbehavior for stalling block downloads (+50)
-      if info.peer and info.peer.misbehaving then
-        info.peer:misbehaving(50, "block download stalling")
-      end
+      -- Do NOT score misbehavior for stalling block downloads during IBD.
+      -- Old blocks may legitimately be slow to serve (peer rate-limits, pruned
+      -- nodes, network congestion). Scoring +N per stalled entry caused mass
+      -- peer disconnection storms: a peer with 10+ stalled inflight entries
+      -- would hit the 100-threshold in a single schedule_downloads pass,
+      -- causing all peers to disconnect simultaneously and stalling IBD for
+      -- minutes (W21 RPC starvation fix). Instead, just re-request from
+      -- other peers by leaving had_stalls=true (cursor reset below).
       -- Stalled request - remove from inflight and peer tracking
       self.inflight[hash_hex] = nil
       if self.peer_inflight[info.peer] then
@@ -1537,10 +1542,18 @@ end
 
 --- Connect pending blocks in height order.
 -- Processes blocks sequentially starting from next_connect_height.
+-- Limits blocks per call to self.max_blocks_per_connect so the outer main
+-- loop can service RPC requests between batches (prevents event-loop starvation).
 -- @return boolean, string|nil: success flag, error message
 function BlockDownloader:connect_pending_blocks()
   -- Connect blocks in height order starting from next_connect_height
+  local blocks_this_call = 0
   while true do
+    -- Yield back to event loop after max_blocks_per_connect blocks to allow
+    -- RPC and P2P I/O to be serviced (W21 cooperative-loop starvation fix).
+    if blocks_this_call >= self.max_blocks_per_connect then
+      break
+    end
     local hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
     if not hash_hex then
       -- Debug: missing header at this height
@@ -1645,6 +1658,7 @@ function BlockDownloader:connect_pending_blocks()
 
     self.pending_blocks[hash_hex] = nil
     self.next_connect_height = self.next_connect_height + 1
+    blocks_this_call = blocks_this_call + 1
 
     -- Reset stall timer on successful connection
     local _sock = require("socket")
