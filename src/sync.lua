@@ -1505,11 +1505,16 @@ function BlockDownloader:handle_block(peer, block_data)
   end
 
   -- Bound the pending buffer to prevent OOM. At ~500KB per mainnet block,
-  -- 512 blocks ≈ 256MB. If buffer is full, evict the highest-height block
-  -- to make room (preferring to keep blocks near the connection cursor).
+  -- 1024 blocks ≈ 512MB. The cap MUST match download_window — otherwise
+  -- prefetched blocks at the far end of the window get evicted back to the
+  -- network, and when next_connect_height advances near them, they must be
+  -- re-requested (adding ~1-3 min per-block latency at the cursor).
+  -- Observed in Wave 32: pending=512 with window=1024 caused per-block
+  -- stalls every ~1 min, throttling IBD to ~1,500 blk/hr.
+  local pending_cap = self.download_window  -- match download_window (1024)
   local pending_count = 0
   for _ in pairs(self.pending_blocks) do pending_count = pending_count + 1 end
-  if pending_count >= 512 then
+  if pending_count >= pending_cap then
     -- Evict the block furthest from the connection cursor
     local max_height_hex, max_height = nil, -1
     for k, p in pairs(self.pending_blocks) do
