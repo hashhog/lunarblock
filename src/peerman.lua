@@ -15,7 +15,7 @@ M.MISBEHAVIOR = {
   INVALID_TRANSACTION = 10,    -- Minor violation: tx fails validation
   UNSOLICITED_DATA = 5,        -- Sent data we didn't request
   HEADERS_DONT_CONNECT = 20,   -- Headers that don't connect to our chain
-  BLOCK_DOWNLOAD_STALL = 50,   -- Stalling block download
+  BLOCK_DOWNLOAD_STALL = 10,   -- Stalling block download (was 50; 50 caused mass-disconnect storms during IBD)
   TOO_MANY_MESSAGES = 50,      -- DoS protection: message flood
   BAN_THRESHOLD = 100,         -- Score at which peer is banned
   DEFAULT_BAN_DURATION = 86400, -- 24 hours in seconds
@@ -1039,8 +1039,12 @@ function PeerManager:maintain_connections()
     target = target + 1  -- Allow one extra outbound when searching for better chain
   end
 
-  -- Connect to more peers if below target
-  while outbound < target do
+  -- Connect to more peers if below target.
+  -- Limit to 1 connect attempt per tick so blocking TCP connects (even at 2s
+  -- timeout) don't stall the event loop for many seconds on a reconnect storm
+  -- (W21 cooperative-loop starvation fix).
+  local attempts_this_tick = 0
+  while outbound < target and attempts_this_tick < 1 do
     local candidate = self:select_peer_to_connect()
     if not candidate then
       -- No candidates; try DNS discovery
@@ -1049,6 +1053,7 @@ function PeerManager:maintain_connections()
       if not candidate then break end
     end
     local ok = self:connect_peer(candidate.ip, candidate.port)
+    attempts_this_tick = attempts_this_tick + 1
     if ok then outbound = outbound + 1 end
   end
 end
