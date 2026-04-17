@@ -135,4 +135,44 @@ describe("BIP324 FSChaCha20 length cipher (continuous stream)", function()
       assert.equals(payload, got)
     end
   end)
+
+  it("FSChaCha20Poly1305 rekey at packet 224 produces matching new keys (W56)", function()
+    -- W56 regression: the rekey step of FSChaCha20Poly1305 previously used
+    -- bare ChaCha20 block 0 as the new key, but BIP324 / Core /
+    -- bip324_cipher.py derive the new key from the AEAD keystream (block 1,
+    -- since block 0 is used for the Poly1305 one-time key). After packet 224
+    -- our key diverged from the peer's and every subsequent decrypt failed
+    -- authentication. This test exchanges REKEY_INTERVAL+10 = 234 packets
+    -- in BOTH directions to force exactly one rekey on each cipher and
+    -- confirm continued success past the boundary.
+    local magic = "\xf9\xbe\xb4\xd9"
+    local initiator = bip324.V2Transport(magic, true)
+    local responder = bip324.V2Transport(magic, false)
+    local function must(ok, err) assert.is_true(ok, tostring(err)); return ok end
+    local init_hs = initiator:get_handshake_bytes()
+    local resp_hs = responder:get_handshake_bytes()
+    must(responder:recv_bytes(init_hs))
+    must(initiator:recv_bytes(resp_hs))
+    must(responder:recv_bytes(initiator:make_version_packet()))
+    must(initiator:recv_bytes(responder:make_version_packet()))
+
+    for i = 1, 234 do
+      local payload = string.rep(string.char((i * 13) % 256), (i % 17) + 1)
+      local enc = initiator:encrypt_message("inv", payload)
+      local ok, err = responder:recv_bytes(enc)
+      assert.is_true(ok, "i->r packet " .. i .. " decrypt failed: " .. tostring(err))
+      assert.is_true(responder:message_ready(), "no message ready i->r #" .. i)
+      local cmd, got = responder:get_message()
+      assert.equals("inv", cmd)
+      assert.equals(payload, got)
+
+      local enc2 = responder:encrypt_message("pong", payload)
+      ok, err = initiator:recv_bytes(enc2)
+      assert.is_true(ok, "r->i packet " .. i .. " decrypt failed: " .. tostring(err))
+      assert.is_true(initiator:message_ready(), "no message ready r->i #" .. i)
+      cmd, got = initiator:get_message()
+      assert.equals("pong", cmd)
+      assert.equals(payload, got)
+    end
+  end)
 end)
