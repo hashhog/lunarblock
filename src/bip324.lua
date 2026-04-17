@@ -665,11 +665,32 @@ function M.V2Transport(magic_bytes, initiator)
 
         -- Decrypt packet
         local enc_payload = self.recv_buffer:sub(M.LENGTH_LEN + 1, packet_size)
+        -- W54: capture cipher state BEFORE decrypt so a failed auth lets us
+        -- compare our nonce vs what the peer used. recv_p_cipher.packet_counter
+        -- is the counter that was used for this specific decrypt attempt (the
+        -- counter is incremented inside :decrypt() AFTER the call).
+        local _pre_p = self.cipher.recv_p_cipher
+        local _pre_l = self.cipher.recv_l_cipher
+        local _p_ctr = _pre_p and _pre_p.packet_counter or -1
+        local _p_rc  = _pre_p and tonumber(_pre_p.rekey_counter) or -1
+        local _l_ctr = _pre_l and _pre_l.packet_counter or -1
         local contents, ignore, err = self.cipher:decrypt(enc_payload, self.recv_aad)
         if not contents then
-          io.stderr:write(string.format("[%s] V2DIAG bip324 decrypt_failed state=%s plen=%d aad_len=%d err=%s\n",
+          local function hex8(s)
+            if not s or #s == 0 then return "" end
+            local n = math.min(8, #s)
+            local out = ""
+            for i = 1, n do out = out .. string.format("%02x", s:byte(i)) end
+            return out
+          end
+          io.stderr:write(string.format(
+            "[%s] V2DIAG bip324 decrypt_failed state=%s plen=%d aad_len=%d "
+              .. "p_ctr=%d p_rc=%d l_ctr=%d ct8=%s tag8=%s err=%s\n",
             os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(self.recv_state), self.recv_len,
-            #self.recv_aad, tostring(err or "?")))
+            #self.recv_aad, _p_ctr, _p_rc, _l_ctr,
+            hex8(enc_payload),
+            hex8(enc_payload:sub(#enc_payload - 7)),
+            tostring(err or "?")))
           io.stderr:flush()
           return false, "decryption failed: " .. (err or "unknown")
         end
@@ -680,10 +701,22 @@ function M.V2Transport(magic_bytes, initiator)
 
         if ignore then
           -- Decoy packet, ignore and continue
+          -- W54: log decoy decrypts so the failure-before-first-real-APP
+          -- hypothesis can be tested. If we see "decoy_in state=VERSION"
+          -- followed by APP decrypt_failed, the bug is downstream of decoy.
+          io.stderr:write(string.format(
+            "[%s] V2DIAG bip324 decoy_decrypt state=%s plen=%d aad_len=%d\n",
+            os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(self.recv_state),
+            self.recv_len, 0))  -- aad already cleared above
+          io.stderr:flush()
         else
           if self.recv_state == M.RecvState.VERSION then
             -- Version packet received, transition to APP
             -- (contents are currently ignored per BIP324)
+            io.stderr:write(string.format(
+              "[%s] V2DIAG bip324 VERSION->APP contents_len=%d\n",
+              os.date("!%Y-%m-%dT%H:%M:%SZ"), #contents))
+            io.stderr:flush()
             self.recv_state = M.RecvState.APP
           else
             -- Application packet, make available
