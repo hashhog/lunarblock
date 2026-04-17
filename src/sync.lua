@@ -1354,6 +1354,55 @@ function BlockDownloader:schedule_downloads(peers)
     peer_requests[p] = {}
   end
 
+  -- W46 FORCE RE-REQUEST: if the connector is stuck at next_connect_height
+  -- because the block was never received (header in memory, nothing in pending
+  -- or storage), issue a fresh getdata for it BEFORE the normal cursor-based
+  -- loop. Without this, next_download_height has already moved past so the
+  -- normal loop never touches this height, and the three fallback paths
+  -- (STALL RECOVERY, had_stalls reset, invalid-block skip) do not fire
+  -- because no inflight exists to time out. Rate-limited to once every 30s
+  -- per stuck hash so we don't spam peers.
+  if self.next_connect_height < self.next_download_height then
+    local stuck_hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
+    if stuck_hash_hex
+      and not self.inflight[stuck_hash_hex]
+      and not self.pending_blocks[stuck_hash_hex] then
+      self._force_rerequest_last = self._force_rerequest_last or {}
+      local last = self._force_rerequest_last[stuck_hash_hex] or 0
+      if now - last >= 30 then
+        local entry = self.header_chain.headers[stuck_hash_hex]
+        if entry then
+          local picked = nil
+          for _, p in ipairs(available_peers) do
+            local pc = self.peer_inflight[p] or 0
+            if pc < self.blocks_per_peer then
+              picked = p
+              break
+            end
+          end
+          if picked then
+            self._force_rerequest_last[stuck_hash_hex] = now
+            local stuck_block_hash = validation.compute_block_hash(entry.header)
+            peer_requests[picked][#peer_requests[picked] + 1] = {
+              type = p2p.INV_TYPE.MSG_WITNESS_BLOCK,
+              hash = stuck_block_hash,
+            }
+            self.inflight[stuck_hash_hex] = {
+              peer = picked,
+              request_time = now,
+              timeout = self.base_stall_timeout,
+            }
+            available = available - 1
+            print(string.format(
+              "FORCE-REREQUEST (W46): height=%d hash=%s peer=%s",
+              self.next_connect_height, stuck_hash_hex,
+              tostring(picked.address or picked.ip or "?")))
+          end
+        end
+      end
+    end
+  end
+
   -- Use persistent round-robin index to avoid always assigning the first
   -- block to the same peer after stall-induced cursor resets.
   local peer_idx = self.peer_round_robin
@@ -1610,8 +1659,20 @@ function BlockDownloader:connect_pending_blocks()
       if not self._last_stall_log or now - self._last_stall_log > 60 then
         self._last_stall_log = now
         local in_pending = self.pending_blocks[hash_hex] and "yes" or "no"
-        print(string.format("connect_pending_blocks: stalled at height %d, hash_hex=%s, in_pending=%s, in_storage=checked",
-          self.next_connect_height, hash_hex and hash_hex:sub(1,16) or "NIL", in_pending))
+        -- W46: print full hash (not sub(1,16)) and probe whether the in-memory
+        -- headers map has an entry for hash_hex. This distinguishes two failure
+        -- modes: header_in_mem=false means height_to_hash / headers consistency
+        -- gap; header_in_mem=true means the block was never downloaded/stored.
+        local header_in_mem = self.header_chain.headers[hash_hex] ~= nil
+        local block_in_storage = "unknown"
+        if header_in_mem then
+          local entry = self.header_chain.headers[hash_hex]
+          local block_hash = validation.compute_block_hash(entry.header)
+          block_in_storage = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes) and "yes" or "no"
+        end
+        print(string.format("connect_pending_blocks: stalled at height %d, hash_hex=%s, in_pending=%s, header_in_mem=%s, block_in_storage=%s",
+          self.next_connect_height, hash_hex or "NIL", in_pending,
+          tostring(header_in_mem), block_in_storage))
       end
       break
     end
