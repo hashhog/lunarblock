@@ -854,8 +854,17 @@ function M.chacha20_crypt(key, nonce, data)
   local ctx = libcrypto.EVP_CIPHER_CTX_new()
   assert(ctx ~= nil, "Failed to create EVP_CIPHER_CTX")
 
-  -- Initialize ChaCha20 cipher
-  if libcrypto.EVP_EncryptInit_ex(ctx, libcrypto.EVP_chacha20(), nil, key, nonce) ~= 1 then
+  -- OpenSSL's EVP_chacha20 takes a 16-byte IV (4-byte LE block counter ||
+  -- 12-byte RFC 8439 nonce), NOT a bare 12-byte nonce. Passing only 12 bytes
+  -- reads 4 bytes of undefined memory past the string — worked by luck for
+  -- all-zero nonces (heap was zeroed) but produced garbage keystream for any
+  -- non-zero nonce. Core's FSChaCha20 rekey uses nonce=(0, rekey_counter)
+  -- which is non-zero from rc=1 onward; that divergence made every
+  -- post-rekey length decrypt produce a wrong length, which then misaligned
+  -- the packet boundary and caused AEAD auth to fail on the payload.
+  -- (W56 follow-up — W57.) The 4-byte block counter prefix starts at 0.
+  local iv16 = "\0\0\0\0" .. nonce
+  if libcrypto.EVP_EncryptInit_ex(ctx, libcrypto.EVP_chacha20(), nil, key, iv16) ~= 1 then
     libcrypto.EVP_CIPHER_CTX_free(ctx)
     error("EVP_EncryptInit_ex failed")
   end
