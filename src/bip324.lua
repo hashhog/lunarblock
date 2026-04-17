@@ -199,18 +199,28 @@ local function FSChaCha20Poly1305(key, rekey_interval)
     return ffi.string(nonce, 12)
   end
 
-  -- Rekey using keystream
+  -- Rekey using the AEAD keystream.
+  -- Per BIP324, the new key is derived from 32 bytes of ChaCha20 keystream
+  -- under nonce=(0xFFFFFFFF, rekey_counter) starting at BLOCK 1 (block 0 is
+  -- reserved for the Poly1305 one-time key). Core does this via
+  -- AEADChaCha20Poly1305::Keystream (Seek(nonce, 1); Keystream(...)), and the
+  -- Python reference does it via `aead_chacha20_poly1305_encrypt(key, nonce,
+  -- b"", b"\x00"*32)[:32]` — the AEAD encrypt naturally skips block 0.
+  -- Bug fixed in W56: the previous implementation called bare ChaCha20 and
+  -- took block 0 output as the new key, so after packet_counter reached
+  -- rekey_interval (224) our key diverged from the peer's and every
+  -- subsequent AEAD decrypt failed with authentication failed. This showed
+  -- up in the V2DIAG logs as p_rc=1 p_ctr=0 on every block-sized APP packet.
   local function rekey()
-    -- Generate keystream with nonce = {0xFFFFFFFF, rekey_counter}
     local rekey_nonce = ffi.new("unsigned char[12]")
     rekey_nonce[0], rekey_nonce[1], rekey_nonce[2], rekey_nonce[3] = 0xFF, 0xFF, 0xFF, 0xFF
     local rc = self.rekey_counter
     for i = 0, 7 do
       rekey_nonce[4 + i] = tonumber(bit.band(bit.rshift(rc, i * 8), 0xFF))
     end
-    -- Get 32 bytes of keystream for new key
-    local zeros = string.rep("\0", 32)
-    self.key = crypto.chacha20_crypt(self.key, ffi.string(rekey_nonce, 12), zeros)
+    local rekey_blob = crypto.chacha20poly1305_encrypt(
+      self.key, ffi.string(rekey_nonce, 12), string.rep("\0", 32), "")
+    self.key = rekey_blob:sub(1, 32)
     self.packet_counter = 0
     self.rekey_counter = self.rekey_counter + ffi.new("uint64_t", 1)
   end
