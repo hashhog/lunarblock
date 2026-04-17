@@ -1450,6 +1450,7 @@ function BlockDownloader:schedule_downloads(peers)
         if need_download then
           -- Find a peer with available slots (round-robin)
           local attempts = 0
+          local scheduled = false
           while attempts < #available_peers do
             local p = available_peers[((peer_idx - 1) % #available_peers) + 1]
             local peer_count = self.peer_inflight[p] or 0
@@ -1467,10 +1468,21 @@ function BlockDownloader:schedule_downloads(peers)
               }
               available = available - 1
               peer_idx = peer_idx + 1
+              scheduled = true
               break
             end
             peer_idx = peer_idx + 1
             attempts = attempts + 1
+          end
+          -- W47: if every peer is saturated at blocks_per_peer, do NOT
+          -- advance `height`. Breaking keeps next_download_height parked
+          -- so this height is retried next schedule_downloads call.
+          -- Without this break, the outer loop skipped the height (never
+          -- enqueued, never inflight, never pending) and relied on W46's
+          -- force-rerequest to recover it one-at-a-time at the connect
+          -- cursor — which capped IBD at ~800 blocks/hr.
+          if not scheduled then
+            break
           end
         end
       end
