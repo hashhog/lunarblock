@@ -967,6 +967,96 @@ function RPCServer:register_methods()
     return types.hash256_hex(types.hash256_zero())
   end
 
+  -- W70: canonical sync-state RPC. See spec/getsyncstate.md in the
+  -- hashhog meta-repo for the full field-by-field contract.
+  self.methods["getsyncstate"] = function(rpc, _params)
+    local tip_height = 0
+    local tip_hash = types.hash256_zero()
+    if rpc.chain_state then
+      tip_height = rpc.chain_state.tip_height or 0
+      tip_hash = rpc.chain_state.tip_hash or tip_hash
+    end
+
+    local best_header_height = tip_height
+    local best_header_hash = tip_hash
+    if rpc.header_chain then
+      if rpc.header_chain.header_tip_height and rpc.header_chain.header_tip_height >= 0 then
+        best_header_height = rpc.header_chain.header_tip_height
+      end
+      if rpc.header_chain.header_tip_hash then
+        best_header_hash = rpc.header_chain.header_tip_hash
+      end
+    end
+
+    -- IBD: tip is >24h behind wall clock by the header timestamp of
+    -- the current best block, or we have no tip at all. Matches the
+    -- logic already in getblockchaininfo.
+    local ibd = true
+    if rpc.storage and rpc.chain_state and rpc.chain_state.tip_hash then
+      local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
+      if header then
+        local age = os.time() - header.timestamp
+        ibd = age > 24 * 60 * 60
+      end
+    end
+
+    local num_peers = 0
+    if rpc.peer_manager then
+      num_peers = #rpc.peer_manager.peer_list
+    end
+
+    -- verification_progress: tip / best_header_height, clamped to [0, 1].
+    local verification_progress = cjson.null
+    if best_header_height > 0 then
+      local vp = tip_height / best_header_height
+      if vp > 1.0 then vp = 1.0 end
+      if vp < 0.0 then vp = 0.0 end
+      verification_progress = vp
+    end
+
+    local blocks_in_flight = cjson.null
+    local blocks_pending_connect = cjson.null
+    if rpc.block_downloader then
+      if rpc.block_downloader.get_inflight_count then
+        blocks_in_flight = rpc.block_downloader:get_inflight_count()
+      end
+      if rpc.block_downloader.get_pending_count then
+        blocks_pending_connect = rpc.block_downloader:get_pending_count()
+      end
+    end
+
+    -- Chain label in Bitcoin Core's canonical shape.
+    local chain_label = cjson.null
+    if rpc.network and rpc.network.name then
+      local name = rpc.network.name
+      if name == "mainnet" then
+        chain_label = "main"
+      elseif name == "testnet" or name == "testnet3" then
+        chain_label = "test"
+      else
+        -- testnet4, signet, regtest are identical in both conventions.
+        chain_label = name
+      end
+    end
+
+    return {
+      tip_height = tip_height,
+      tip_hash = types.hash256_hex(tip_hash),
+      best_header_height = best_header_height,
+      best_header_hash = types.hash256_hex(best_header_hash),
+      initial_block_download = ibd,
+      num_peers = num_peers,
+      verification_progress = verification_progress,
+      blocks_in_flight = blocks_in_flight,
+      blocks_pending_connect = blocks_pending_connect,
+      -- Lunarblock does not currently track the wall-clock time of the
+      -- last tip advance; morning reviewers add if needed.
+      last_block_received_time = cjson.null,
+      chain = chain_label,
+      protocol_version = p2p.PROTOCOL_VERSION,
+    }
+  end
+
   -- Block invalidation methods
   self.methods["invalidateblock"] = function(rpc, params)
     local blockhash = params[1]
