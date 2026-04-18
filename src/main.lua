@@ -977,8 +977,10 @@ local function main()
   local metrics_socket = nil
   if metrics_port > 0 then
     local socket = require("socket")
-    metrics_socket = socket.tcp()
-    metrics_socket:setoption("reuseaddr", true)
+    -- tcp4() not tcp(): see rpc.lua / rest.lua — reuseaddr otherwise
+    -- silently fails on LuaSocket 3.0 and bind races TIME_WAIT on relaunch.
+    metrics_socket = socket.tcp4()
+    assert(metrics_socket:setoption("reuseaddr", true))
     local ok, err = metrics_socket:bind("0.0.0.0", metrics_port)
     if ok then
       metrics_socket:listen(16)
