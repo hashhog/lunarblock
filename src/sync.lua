@@ -1225,7 +1225,14 @@ function M.new_block_downloader(header_chain, storage, network)
   self.pending_blocks = {}          -- hash_hex -> {block, height, hash}
   self.inflight = {}                -- hash_hex -> {peer, request_time, timeout}
   self.peer_inflight = {}           -- peer -> count of in-flight requests
-  self.base_stall_timeout = 20      -- Base timeout before considering stalled (adaptive)
+  -- Base timeout before considering stalled. W65 raised 20 -> 60: a 20 s
+  -- timeout is too aggressive for 1 MB+ old-era blocks when the pure-Lua
+  -- deserialize on the main thread takes several seconds per block under
+  -- concurrent multi-peer ingestion. Observed at height 565,083 on
+  -- 2026-04-18: 30+ peers issued getdata, block in transit timed out at
+  -- 20 s before finishing reassembly, re-requested, timed out again — for
+  -- 5.75 h. 60 s matches Bitcoin Core's block-download timeout floor.
+  self.base_stall_timeout = 60
   self.max_stall_timeout = 120      -- Maximum stall timeout
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
@@ -1291,49 +1298,57 @@ function BlockDownloader:schedule_downloads(peers)
   end
 
   -- Detect persistent connection stall: if next_connect_height hasn't advanced
-  -- for connect_stall_timeout seconds despite blocks being downloaded, force
-  -- a full reset. This handles the case where the block at next_connect_height
-  -- was received but evicted from pending, timed out without had_stalls, or
-  -- otherwise lost without any stall being detected.
-  if self.next_download_height > self.next_connect_height then
-    if self.last_connect_advance == 0 then
-      self.last_connect_advance = now
-    end
-    if now - self.last_connect_advance > self.connect_stall_timeout then
-      -- Force reset: clear ALL inflight (they're for blocks we can't use)
-      -- and reset download cursor to re-request from next_connect_height
-      local cleared = 0
-      for hash_hex, info in pairs(self.inflight) do
-        if self.peer_inflight[info.peer] then
-          self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
-          if self.peer_inflight[info.peer] <= 0 then
-            self.peer_inflight[info.peer] = nil
-          end
-        end
-        self.inflight[hash_hex] = nil
-        cleared = cleared + 1
-      end
-      -- Also clear pending blocks that are FAR ahead of connection cursor
-      -- to make room for blocks near the cursor
-      local evicted = 0
-      for k, p in pairs(self.pending_blocks) do
-        if p.height > self.next_connect_height + 64 then
-          self.pending_blocks[k] = nil
-          evicted = evicted + 1
-        end
-      end
-      self.next_download_height = self.next_connect_height
-      self.last_connect_advance = now
-      print(string.format(
-        "STALL RECOVERY: connection stuck at %d for >%ds, reset cursor (cleared %d inflight, evicted %d pending)",
-        self.next_connect_height, self.connect_stall_timeout, cleared, evicted))
-      -- Recalculate inflight count after clearing
-      inflight_count = 0
-      for _ in pairs(self.inflight) do inflight_count = inflight_count + 1 end
-      available = self.download_window - inflight_count
-    end
-  else
+  -- for connect_stall_timeout seconds, force a full reset. This is the
+  -- last-resort safety net for wedges where the block at next_connect_height
+  -- is being requested-and-timed-out repeatedly without ever reaching
+  -- handle_block (peer black-hole, pending-eviction, CPU-starved event loop).
+  --
+  -- W65 FIX: The timer is driven by actual next_connect_height advance,
+  -- stamped in connect_pending_blocks (success path + invalid-skip path).
+  -- Previously the else-branch here re-armed the timer whenever
+  -- next_download_height <= next_connect_height, which the had_stalls
+  -- reset above forces true every 5-10 s under stall pressure. Result:
+  -- the 90 s recovery timer was dead code under exactly the conditions
+  -- it was meant to catch. Observed at mainnet height 565,083 on
+  -- 2026-04-18: node stuck 5.75 h, recovery never fired once.
+  if self.last_connect_advance == 0 then
     self.last_connect_advance = now
+  end
+  if now - self.last_connect_advance > self.connect_stall_timeout then
+    -- Force reset: clear ALL inflight (they're for blocks we can't use)
+    -- and reset download cursor to re-request from next_connect_height
+    local cleared = 0
+    for hash_hex, info in pairs(self.inflight) do
+      if self.peer_inflight[info.peer] then
+        self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+        if self.peer_inflight[info.peer] <= 0 then
+          self.peer_inflight[info.peer] = nil
+        end
+      end
+      self.inflight[hash_hex] = nil
+      cleared = cleared + 1
+    end
+    -- Also clear pending blocks that are FAR ahead of connection cursor
+    -- to make room for blocks near the cursor
+    local evicted = 0
+    for k, p in pairs(self.pending_blocks) do
+      if p.height > self.next_connect_height + 64 then
+        self.pending_blocks[k] = nil
+        evicted = evicted + 1
+      end
+    end
+    self.next_download_height = self.next_connect_height
+    -- Give peers time to respond to fresh getdatas before re-firing. The
+    -- timer will be cleared naturally when connect_pending_blocks advances
+    -- next_connect_height, which is the true signal of progress.
+    self.last_connect_advance = now
+    print(string.format(
+      "STALL RECOVERY: connection stuck at %d for >%ds, reset cursor (cleared %d inflight, evicted %d pending)",
+      self.next_connect_height, self.connect_stall_timeout, cleared, evicted))
+    -- Recalculate inflight count after clearing
+    inflight_count = 0
+    for _ in pairs(self.inflight) do inflight_count = inflight_count + 1 end
+    available = self.download_window - inflight_count
   end
 
   -- Filter peers with available slots AND that can actually serve blocks
@@ -1702,6 +1717,9 @@ function BlockDownloader:connect_pending_blocks()
       print(string.format("Skipping invalid block at height %d: %s",
         self.next_connect_height, tostring(err)))
       self.next_connect_height = self.next_connect_height + 1
+      -- Reset stall-recovery timer: skipping is still cursor advance.
+      local _sock = require("socket")
+      self.last_connect_advance = _sock.gettime()
       -- Continue loop to try next height rather than returning immediately
       goto continue_loop
     end
