@@ -1068,8 +1068,11 @@ end
 --------------------------------------------------------------------------------
 
 function RESTServer:start()
-  self.server_socket = socket.tcp()
-  self.server_socket:setoption("reuseaddr", true)
+  -- tcp4() not tcp(): setoption("reuseaddr", true) silently fails on a
+  -- generic master socket under LuaSocket 3.0, which lets bind() race the
+  -- OS TIME_WAIT window on a stop/relaunch. Same fix as rpc.lua / peerman.lua.
+  self.server_socket = socket.tcp4()
+  assert(self.server_socket:setoption("reuseaddr", true))
   assert(self.server_socket:bind(self.host, self.port))
   assert(self.server_socket:listen(32))
   self.server_socket:settimeout(0.1)
