@@ -253,7 +253,7 @@ function Peer:connect(timeout)
 
   -- Initialize v2 transport if enabled
   if self.use_v2 then
-    self.v2_transport = bip324.V2Transport(self.network.magic_bytes, true)
+    self.v2_transport = bip324.V2Transport(self.network.magic_bytes, true, self.ip, self.port)
   end
 
   return true
