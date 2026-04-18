@@ -278,6 +278,67 @@ describe("rpc", function()
     end)
   end)
 
+  -- W70: getsyncstate RPC. Spec: hashhog meta-repo spec/getsyncstate.md.
+  describe("getsyncstate", function()
+    it("returns all six MUST fields populated and well-typed", function()
+      local server = rpc.new({
+        chain_state = {tip_height = 123456, tip_hash = types.hash256_zero()},
+        network = consensus.networks.mainnet,
+      })
+
+      local request = '{"method":"getsyncstate","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      local r = decoded.result
+
+      assert.is_number(r.tip_height)
+      assert.equal(123456, r.tip_height)
+      assert.is_string(r.tip_hash)
+      assert.equal(64, #r.tip_hash)
+      assert.is_number(r.best_header_height)
+      assert.is_string(r.best_header_hash)
+      assert.equal(64, #r.best_header_hash)
+      assert.is_boolean(r.initial_block_download)
+      assert.is_number(r.num_peers)
+    end)
+
+    it("emits all SHOULD fields as keys (null allowed)", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local request = '{"method":"getsyncstate","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      local r = decoded.result
+
+      -- Keys must exist even when the node can't produce them. This is
+      -- how consumers distinguish "not implemented" from "missing key
+      -- means an older node".
+      local should_keys = {
+        "verification_progress", "blocks_in_flight", "blocks_pending_connect",
+        "last_block_received_time", "chain", "protocol_version",
+      }
+      for _, k in ipairs(should_keys) do
+        -- Either the value is non-null, or the JSON encoded it as null
+        -- (cjson.null which decodes back to cjson.null sentinel).
+        local has_key = (r[k] ~= nil) or (rawget(r, k) ~= nil)
+        assert.truthy(has_key, "missing SHOULD key: " .. k)
+      end
+
+      -- Protocol version is a constant; always produced.
+      assert.equal(70016, r.protocol_version)
+      -- Mainnet label translates to Core's "main".
+      assert.equal("main", r.chain)
+    end)
+
+    it("reports IBD=true when no storage is wired (empty chain)", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local request = '{"method":"getsyncstate","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_true(decoded.result.initial_block_download)
+    end)
+  end)
+
   describe("getrawmempool", function()
     it("returns list of txids when no mempool", function()
       local server = rpc.new({network = consensus.networks.mainnet})
