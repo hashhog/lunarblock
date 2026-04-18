@@ -3317,8 +3317,12 @@ end
 --------------------------------------------------------------------------------
 
 function RPCServer:start()
-  self.server_socket = socket.tcp()
-  self.server_socket:setoption("reuseaddr", true)
+  -- Use tcp4() (not tcp()) so setoption("reuseaddr", true) actually succeeds
+  -- on LuaSocket 3.0 — on this build setsockopt fails on a generic master
+  -- socket returned by tcp(), leaving bind() to fail with "address already
+  -- in use" during the TIME_WAIT window after a clean SIGTERM restart.
+  self.server_socket = socket.tcp4()
+  assert(self.server_socket:setoption("reuseaddr", true))
   assert(self.server_socket:bind(self.host, self.port))
   assert(self.server_socket:listen(32))
   self.server_socket:settimeout(0)  -- Non-blocking accept
