@@ -968,6 +968,126 @@ describe("sync", function()
         -- Note: It will be re-requested in the same call
         assert.equals(0, downloader.peer_inflight[peer] or 0)
       end)
+
+      it("STALL RECOVERY fires after connect_stall_timeout (W65)", function()
+        -- W65 regression test: the 90 s last-resort stall recovery MUST
+        -- fire when next_connect_height stays stuck, regardless of whether
+        -- the download cursor has been snapped back by had_stalls.
+        -- Previously the else-branch that reset last_connect_advance every
+        -- cycle where next_download_height <= next_connect_height made
+        -- this timer dead code under stall pressure, and lunarblock
+        -- mainnet wedged for 5.75 h at height 565,083 on 2026-04-18.
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp + 600
+        local header = create_valid_header(parent_hash, timestamp)
+        assert.is_true(find_valid_nonce(header))
+        chain:accept_header(header)
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 1
+        downloader.next_download_height = 1
+        downloader.connect_stall_timeout = 90
+
+        local peer = create_mock_peer(1)
+        peer.address = "1.2.3.4:8333"
+
+        -- Arm the stall-recovery timer far in the past (we have been
+        -- wedged for >90 s). Simulate the "pressure" state: an inflight
+        -- request that has already timed out (had_stalls will be true on
+        -- the next schedule_downloads pass, which snaps the download
+        -- cursor back to the connect cursor).
+        local socket = require("socket")
+        local now = socket.gettime()
+        downloader.last_connect_advance = now - 200
+        local hash_hex = chain.height_to_hash[1]
+        downloader.inflight[hash_hex] = {
+          peer = peer,
+          request_time = now - 100,
+          timeout = 1,
+        }
+        downloader.peer_inflight[peer] = 1
+
+        -- Also pre-stage some "far ahead" pending_blocks to verify the
+        -- recovery path evicts them correctly.
+        for fake_height = 200, 210 do
+          downloader.pending_blocks["fake_" .. fake_height] = {
+            block = {}, height = fake_height, hash = "fake_" .. fake_height,
+          }
+        end
+
+        downloader:schedule_downloads({peer})
+
+        -- Recovery cleared inflight and re-armed the timer close to now.
+        local inflight_after = 0
+        for _ in pairs(downloader.inflight) do
+          inflight_after = inflight_after + 1
+        end
+        -- May have re-issued a request inside the same schedule pass, so
+        -- allow up to 1 inflight; the key invariant is that the old
+        -- timed-out entry is cleared.
+        assert.is_true(inflight_after <= 1, "expected inflight <= 1, got " .. inflight_after)
+
+        -- Far-ahead pendings should be evicted.
+        local far_ahead_remaining = 0
+        for _, p in pairs(downloader.pending_blocks) do
+          if p.height > downloader.next_connect_height + 64 then
+            far_ahead_remaining = far_ahead_remaining + 1
+          end
+        end
+        assert.equals(0, far_ahead_remaining)
+
+        -- Timer re-armed to now (not still in the distant past).
+        assert.is_true(
+          (now - downloader.last_connect_advance) < 5,
+          "expected last_connect_advance reset near now"
+        )
+      end)
+
+      it("STALL RECOVERY NOT re-armed by cursor-equality under had_stalls (W65)", function()
+        -- The core of the W65 bug: the had_stalls reset snaps
+        -- next_download_height == next_connect_height. The pre-W65 code
+        -- then hit the else-branch and reset last_connect_advance = now
+        -- every pass, preventing the 90 s timer from ever elapsing. This
+        -- test locks the fix in place: under the exact same conditions
+        -- (expired inflight forcing had_stalls=true, cursors equal after
+        -- snap-back), last_connect_advance must NOT be silently reset.
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp + 600
+        local header = create_valid_header(parent_hash, timestamp)
+        assert.is_true(find_valid_nonce(header))
+        chain:accept_header(header)
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 1
+        downloader.next_download_height = 1
+        downloader.connect_stall_timeout = 90
+        -- Set timer to 50 s in the past — short of the 90 s threshold,
+        -- so recovery should NOT fire, but it also must NOT be reset.
+        local socket = require("socket")
+        local now = socket.gettime()
+        local timer_before = now - 50
+        downloader.last_connect_advance = timer_before
+
+        local peer = create_mock_peer(1)
+        peer.address = "1.2.3.4:8333"
+        local hash_hex = chain.height_to_hash[1]
+        downloader.inflight[hash_hex] = {
+          peer = peer,
+          request_time = now - 100,
+          timeout = 1,  -- already timed out -> had_stalls=true next pass
+        }
+        downloader.peer_inflight[peer] = 1
+
+        downloader:schedule_downloads({peer})
+
+        -- Timer must still reflect the 50-s-ago value (within a small
+        -- tolerance for clock drift during the call). If the buggy
+        -- else-branch ran, it would have been reset to now.
+        assert.is_true(
+          downloader.last_connect_advance < now - 40,
+          "last_connect_advance was silently reset by cursor-equality"
+        )
+      end)
     end)
 
     describe("IBD completion", function()
