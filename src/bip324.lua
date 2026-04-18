@@ -473,7 +473,7 @@ M.SendState = {
 -- @param magic_bytes string: 4-byte network magic
 -- @param initiator boolean: true if we initiated the connection
 -- @return table: transport object
-function M.V2Transport(magic_bytes, initiator)
+function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
   -- Generate ephemeral key pair
   -- BIP324: pass 32 bytes of aux randomness to ellswift_create (matches Bitcoin
   -- Core's m_key.EllSwiftCreate(ent32); see bitcoin-core/src/bip324.cpp:28).
@@ -510,6 +510,10 @@ function M.V2Transport(magic_bytes, initiator)
     -- For v1 detection
     v1_detected = false,
     v1_prefix = "",       -- First 16 bytes received (for v1 detection)
+
+    -- W60: peer label for diagnostic logging (decrypt_failed lines)
+    peer_label = string.format("%s:%s",
+      tostring(peer_ip or "?"), tostring(peer_port or "?")),
   }
 
   --- Get our ElligatorSwift public key for sending during handshake.
@@ -694,9 +698,10 @@ function M.V2Transport(magic_bytes, initiator)
             return out
           end
           io.stderr:write(string.format(
-            "[%s] V2DIAG bip324 decrypt_failed state=%s plen=%d aad_len=%d "
+            "[%s] V2DIAG bip324 decrypt_failed peer=%s state=%s plen=%d aad_len=%d "
               .. "p_ctr=%d p_rc=%d l_ctr=%d ct8=%s tag8=%s err=%s\n",
-            os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(self.recv_state), self.recv_len,
+            os.date("!%Y-%m-%dT%H:%M:%SZ"), self.peer_label,
+            tostring(self.recv_state), self.recv_len,
             #self.recv_aad, _p_ctr, _p_rc, _l_ctr,
             hex8(enc_payload),
             hex8(enc_payload:sub(#enc_payload - 7)),
