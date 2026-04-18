@@ -21,6 +21,14 @@ M.HEADER_LEN = 1               -- Encrypted header size
 M.TAG_LEN = 16                 -- Poly1305 tag size
 M.EXPANSION = M.LENGTH_LEN + M.HEADER_LEN + M.TAG_LEN  -- Total overhead (20 bytes)
 
+-- W67c: payload cap matching Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH
+-- (net.h). BIP324 length is 24-bit (up to ~16 MiB) but the p2p protocol
+-- never carries more than 4_000_000 bytes in a single payload. A peer
+-- sending a larger decoded length is either buggy or malicious; accepting
+-- it would let them force us to buffer up to ~16 MiB before validation
+-- (DoS / memory pressure, especially during IBD).
+M.MAX_PAYLOAD_LEN = 4000000
+
 -- Header flags
 M.IGNORE_BIT = 0x80            -- Decoy packet flag
 
@@ -669,6 +677,18 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
         if self.recv_len == 0 then
           local enc_len = self.recv_buffer:sub(1, M.LENGTH_LEN)
           self.recv_len = self.cipher:decrypt_length(enc_len)
+          -- W67c: reject oversize frames before we allocate/buffer them.
+          -- Matches Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH. A corrupt
+          -- or malicious length-cipher state can produce up to ~16 MiB
+          -- otherwise.
+          if self.recv_len > M.MAX_PAYLOAD_LEN then
+            io.stderr:write(string.format(
+              "[%s] V2DIAG bip324 oversize_frame peer=%s state=%s recv_len=%d max=%d\n",
+              os.date("!%Y-%m-%dT%H:%M:%SZ"), self.peer_label,
+              tostring(self.recv_state), self.recv_len, M.MAX_PAYLOAD_LEN))
+            io.stderr:flush()
+            return false, "oversize v2 frame: " .. tostring(self.recv_len)
+          end
         end
 
         -- Check if we have the full packet
