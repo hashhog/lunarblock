@@ -1287,11 +1287,18 @@ end
 -- @return string: error message on failure
 function PeerManager:start_listener(bind_ip, port)
   local listen_port = port or (self.network and self.network.port) or 8333
-  -- Use tcp() + bind() + listen() manually, skipping setoption
-  -- which fails on some luasocket builds.
-  local sock = socket.tcp()
+  -- Use tcp4() so setoption("reuseaddr", true) actually succeeds on this
+  -- LuaSocket 3.0 build (setsockopt fails on the generic tcp() master socket).
+  -- Without SO_REUSEADDR, bind() fails with "address already in use" during
+  -- the TIME_WAIT window after a clean SIGTERM relaunch.
+  local sock = socket.tcp4()
   if not sock then return false, "failed to create socket" end
-  local ok, err = sock:bind(bind_ip or "0.0.0.0", listen_port)
+  local ok, err = sock:setoption("reuseaddr", true)
+  if not ok then
+    sock:close()
+    return false, err
+  end
+  ok, err = sock:bind(bind_ip or "0.0.0.0", listen_port)
   if not ok then
     sock:close()
     return false, err
