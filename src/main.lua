@@ -1092,6 +1092,51 @@ local function main()
         block_downloader:get_pending_count(),
         block_downloader:get_inflight_count()
       ))
+
+      -- [DIAG] Wedge-diagnostic line: captures state that the existing
+      -- status line omits but that matters when the node wedges
+      -- (state R, RPC unresponsive, RSS growing). Written so future
+      -- post-mortems have data on whether the wedge is GC-stall,
+      -- heap-blowup, cursor-skip, or peer-starvation.
+      --
+      --   gc_kb            : Lua heap via collectgarbage("count") — a
+      --                      jump here correlates with a GC pause; a
+      --                      steady climb means a leak.
+      --   rss_kb           : process RSS from /proc/self/status — if
+      --                      gc_kb stays flat but rss_kb grows, the
+      --                      allocation is FFI or native (not Lua heap).
+      --   dl_conn_gap      : next_download_height - next_connect_height
+      --                      — shows whether the scheduler is running
+      --                      ahead of the connector (normal) or stuck
+      --                      at the cursor (wedge).
+      --   since_connect_s  : seconds since next_connect_height last
+      --                      advanced — the 90 s STALL RECOVERY timer
+      --                      source-of-truth. If this grows past 90
+      --                      without a STALL RECOVERY line, recovery
+      --                      is broken.
+      local gc_kb = collectgarbage("count")
+      local rss_kb = 0
+      local f = io.open("/proc/self/status", "r")
+      if f then
+        for line in f:lines() do
+          local m = line:match("^VmRSS:%s*(%d+)")
+          if m then rss_kb = tonumber(m); break end
+        end
+        f:close()
+      end
+      local dl_conn_gap = (block_downloader.next_download_height or 0)
+        - (block_downloader.next_connect_height or 0)
+      local since_connect_s = 0
+      if block_downloader.last_connect_advance and block_downloader.last_connect_advance > 0 then
+        since_connect_s = now - block_downloader.last_connect_advance
+      end
+      print(string.format(
+        "[DIAG] gc_kb=%d rss_kb=%d dl_conn_gap=%d since_connect_s=%.0f peers=%d pending=%d inflight=%d",
+        math.floor(gc_kb), rss_kb, dl_conn_gap, since_connect_s,
+        #peers,
+        block_downloader:get_pending_count(),
+        block_downloader:get_inflight_count()))
+
       last_status = now
     end
 
