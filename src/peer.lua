@@ -139,6 +139,9 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config)
   self.our_height = our_height or 0
   self.last_send = 0
   self.last_recv = 0
+  self.bytes_sent = 0
+  self.bytes_recv = 0
+  self.conn_time = 0           -- Set on CONNECT, used by getpeerinfo.conntime
   self.last_ping_time = 0
   self.last_pong_time = 0
   self.ping_nonce = 0
@@ -249,6 +252,7 @@ function Peer:connect(timeout)
 
   self.state = M.STATE.CONNECTED
   self.last_recv = socket.gettime()
+  self.conn_time = socket.gettime()
   self.handshake_start_time = socket.gettime()  -- Start handshake timer
 
   -- Initialize v2 transport if enabled
@@ -272,6 +276,7 @@ function Peer:start_v2_handshake()
   end
   self.state = M.STATE.V2_KEY_SENT
   self.last_send = socket.gettime()
+  self.bytes_sent = self.bytes_sent + #handshake_bytes
   return true
 end
 
@@ -311,6 +316,7 @@ function Peer:process_v2_handshake()
     end
     self.state = M.STATE.V2_READY
     self.last_send = socket.gettime()
+    self.bytes_sent = self.bytes_sent + #version_bytes
     self.v2_handshake_done = true
     self.session_id = self.v2_transport:get_session_id()
   end
@@ -389,6 +395,7 @@ function Peer:send_message(command, payload)
     return false
   end
   self.last_send = socket.gettime()
+  self.bytes_sent = self.bytes_sent + #msg
   return true
 end
 
@@ -412,6 +419,7 @@ function Peer:recv_messages()
   if data and #data > 0 then
     self.recv_buffer = self.recv_buffer .. data
     self.last_recv = socket.gettime()
+    self.bytes_recv = self.bytes_recv + #data
   elseif err == "closed" then
     self:disconnect("connection closed by peer")
     return messages
@@ -640,6 +648,7 @@ function Peer:process_messages()
     if data and #data > 0 then
       self.recv_buffer = self.recv_buffer .. data
       self.last_recv = socket.gettime()
+      self.bytes_recv = self.bytes_recv + #data
     elseif err == "closed" then
       self:disconnect("connection closed by peer")
       return {}
