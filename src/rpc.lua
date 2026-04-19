@@ -1552,7 +1552,9 @@ function RPCServer:register_methods()
           bytessent = p.bytes_sent or 0,
           bytesrecv = p.bytes_recv or 0,
           conntime = math.floor(p.conn_time or 0),
-          timeoffset = 0,
+          timeoffset = (p.version_info and p.version_recv_time and p.version_recv_time > 0)
+            and (p.version_info.timestamp - math.floor(p.version_recv_time))
+            or 0,
           pingtime = (p.latency_ms or 0) / 1000,
           version = (p.version_info and p.version_info.version) or 0,
           subver = p.user_agent or "",

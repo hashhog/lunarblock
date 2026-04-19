@@ -142,6 +142,8 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config)
   self.bytes_sent = 0
   self.bytes_recv = 0
   self.conn_time = 0           -- Set on CONNECT, used by getpeerinfo.conntime
+  self.version_recv_time = 0   -- Local time when peer's VERSION was processed
+                               -- (getpeerinfo.timeoffset = peer_ts - this)
   self.last_ping_time = 0
   self.last_pong_time = 0
   self.ping_nonce = 0
@@ -528,6 +530,7 @@ function Peer:handle_version(payload)
   -- Deserialize version message
   local ver = p2p.deserialize_version(payload)
   self.version_info = ver
+  self.version_recv_time = socket.gettime()
   self.services = ver.services
   self.start_height = ver.start_height
   self.user_agent = ver.user_agent
