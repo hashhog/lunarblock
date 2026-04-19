@@ -4,6 +4,7 @@ local p2p = require("lunarblock.p2p")
 local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
 local crypto = require("lunarblock.crypto")
+local perf = require("lunarblock.perf")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -1242,6 +1243,13 @@ function M.new_block_downloader(header_chain, storage, network)
   self.last_connect_advance = 0     -- Timestamp when next_connect_height last advanced
   self.connect_stall_timeout = 90   -- Seconds without connection progress before forced reset
   self.max_blocks_per_connect = 8   -- Max blocks to connect per call (prevents RPC starvation)
+  -- W72 instrumentation: per-window deserialize/hash stats. Replaced with
+  -- a fresh table after each [W72-DESER] log line so averages are
+  -- rolling-window not lifetime.  Removed when the Tier-3 FFI deserialize
+  -- path lands.
+  self.deser_win = { n = 0, t = 0, h_t = 0, b = 0, txs = 0, d_max = 0, h_max = 0 }
+  self.deser_lifetime = 0
+  self.deser_log_every = 500
   return self
 end
 
@@ -1554,10 +1562,40 @@ end
 -- @param block_data string: raw block message payload
 -- @return boolean, string|nil: success flag, error message
 function BlockDownloader:handle_block(peer, block_data)
-  -- Deserialize the block
+  -- Deserialize the block + compute the block hash.  Timed for W72: the
+  -- working hypothesis is that pure-Lua deserialize dominates the IBD
+  -- per-block budget on 1 MB+ blocks; the sync-constructor comment on
+  -- base_stall_timeout explicitly blames "pure-Lua deserialize on the
+  -- main thread takes several seconds per block".  Before we spend days
+  -- on an FFI replacement we want the actual ms-per-block number.
+  local t0 = perf.now()
   local block = serialize.deserialize_block(block_data)
+  local t1 = perf.now()
   local hash = validation.compute_block_hash(block.header)
+  local t2 = perf.now()
   local hash_hex = types.hash256_hex(hash)
+
+  local w = self.deser_win
+  local d = t1 - t0
+  local h = t2 - t1
+  w.n = w.n + 1
+  w.t = w.t + d
+  w.h_t = w.h_t + h
+  w.b = w.b + #block_data
+  w.txs = w.txs + #block.transactions
+  if d > w.d_max then w.d_max = d end
+  if h > w.h_max then w.h_max = h end
+  self.deser_lifetime = self.deser_lifetime + 1
+  if w.n >= self.deser_log_every then
+    local mb_s = (w.b / 1048576) / math.max(w.t, 1e-9)
+    print(string.format(
+      "[W72-DESER] window=%d total=%d deser_avg=%.2fms hash_avg=%.2fms bytes_avg=%.0f txs_avg=%.0f d_max=%.1fms h_max=%.1fms throughput=%.1f MB/s",
+      w.n, self.deser_lifetime,
+      (w.t / w.n) * 1000, (w.h_t / w.n) * 1000,
+      w.b / w.n, w.txs / w.n,
+      w.d_max * 1000, w.h_max * 1000, mb_s))
+    self.deser_win = { n = 0, t = 0, h_t = 0, b = 0, txs = 0, d_max = 0, h_max = 0 }
+  end
 
   -- Update adaptive timeout on success (decay toward base)
   local info = self.inflight[hash_hex]
