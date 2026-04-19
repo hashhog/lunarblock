@@ -962,6 +962,16 @@ function M.new_chain_state(storage, network)
     on_block_connected = nil,     -- function(block_hash, block_data)
     on_block_disconnected = nil,  -- function(block_hash)
   }
+  -- W77-CB: rolling-window sub-phase breakdown of connect_block.  W75-CONN
+  -- in sync.lua measures the callback as a black box (cb_avg ≈ 700–850ms
+  -- during IBD, dominating the ~900ms/block budget).  This inner window
+  -- breaks that time into tx_loop / parallel_verify / undo_write /
+  -- utxo_flush / callback so we can identify which phase is actually slow.
+  self.cb_log_every = 500
+  self.cb_lifetime = 0
+  self.cb_win = { n = 0, tx_loop_t = 0, parallel_t = 0, undo_t = 0,
+                  flush_t = 0, cb_t = 0, total_t = 0,
+                  tx_max = 0, flush_max = 0, total_max = 0 }
   return self
 end
 
@@ -1130,6 +1140,8 @@ end
 --        (e.g. block/header/height_index storage) to the same atomic write batch
 -- @return true on success, nil and error message on failure
 function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel, nosync, caller_batch_fn)
+  local _cb_t0 = perf.now()
+
   -- Build undo data as we go - one TxUndo per non-coinbase transaction
   local block_undo = M.block_undo({})
   local total_fees = 0
@@ -1484,11 +1496,14 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     end
   end
 
+  local _cb_t_tx = perf.now()
+
   -- If we collected signatures for parallel verification, verify them now
   if parallel_sigs and #parallel_sigs > 0 then
     local ok, err = validation.verify_signatures_parallel(parallel_sigs)
     assert(ok, "Parallel signature verification failed: " .. (err or "unknown error"))
   end
+  local _cb_t_parallel = perf.now()
 
   -- Check total sigop cost does not exceed limit
   assert(total_sigop_cost <= consensus.MAX_BLOCK_SIGOPS_COST,
@@ -1510,6 +1525,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     local undo_data = M.serialize_block_undo(block_undo)
     self.storage.put_undo(block_hash, undo_data)
   end
+  local _cb_t_undo = perf.now()
 
   -- Flush dirty UTXO entries and update chain tip in the SAME atomic batch.
   -- This prevents the chain tip from advancing ahead of the UTXO set if the
@@ -1535,6 +1551,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       caller_batch_fn(batch)
     end
   end, do_sync)
+  local _cb_t_flush = perf.now()
 
   -- Update in-memory tip (only after the atomic write succeeds)
   self.tip_hash = block_hash
@@ -1543,6 +1560,41 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- Invoke callback if registered (for ZMQ notifications, etc.)
   if self.callbacks.on_block_connected then
     self.callbacks.on_block_connected(block_hash, block)
+  end
+  local _cb_t_cb = perf.now()
+
+  -- W77-CB: accumulate sub-phase timings and emit every cb_log_every blocks.
+  do
+    local w = self.cb_win
+    local tx    = _cb_t_tx - _cb_t0
+    local par   = _cb_t_parallel - _cb_t_tx
+    local undo  = _cb_t_undo - _cb_t_parallel
+    local flush = _cb_t_flush - _cb_t_undo
+    local cb    = _cb_t_cb - _cb_t_flush
+    local total = _cb_t_cb - _cb_t0
+    w.n         = w.n + 1
+    w.tx_loop_t = w.tx_loop_t + tx
+    w.parallel_t = w.parallel_t + par
+    w.undo_t    = w.undo_t + undo
+    w.flush_t   = w.flush_t + flush
+    w.cb_t      = w.cb_t + cb
+    w.total_t   = w.total_t + total
+    if tx    > w.tx_max    then w.tx_max    = tx end
+    if flush > w.flush_max then w.flush_max = flush end
+    if total > w.total_max then w.total_max = total end
+    self.cb_lifetime = self.cb_lifetime + 1
+    if w.n >= self.cb_log_every then
+      print(string.format(
+        "[W77-CB] window=%d total=%d tx_avg=%.1fms par_avg=%.1fms undo_avg=%.1fms flush_avg=%.1fms cb_avg=%.1fms total_avg=%.1fms tx_max=%.0fms flush_max=%.0fms total_max=%.0fms",
+        w.n, self.cb_lifetime,
+        (w.tx_loop_t / w.n) * 1000, (w.parallel_t / w.n) * 1000,
+        (w.undo_t    / w.n) * 1000, (w.flush_t    / w.n) * 1000,
+        (w.cb_t      / w.n) * 1000, (w.total_t    / w.n) * 1000,
+        w.tx_max * 1000, w.flush_max * 1000, w.total_max * 1000))
+      self.cb_win = { n = 0, tx_loop_t = 0, parallel_t = 0, undo_t = 0,
+                      flush_t = 0, cb_t = 0, total_t = 0,
+                      tx_max = 0, flush_max = 0, total_max = 0 }
+    end
   end
 
   return true, total_fees
