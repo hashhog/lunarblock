@@ -1250,6 +1250,18 @@ function M.new_block_downloader(header_chain, storage, network)
   self.deser_win = { n = 0, t = 0, h_t = 0, b = 0, txs = 0, d_max = 0, h_max = 0 }
   self.deser_lifetime = 0
   self.deser_log_every = 500
+  -- W75 instrumentation: per-window connect_pending_blocks phase timings.
+  -- The W72 deser-only probe proved deserialize is ~84 ms/block on the
+  -- overnight-run-2 mainnet sync — but overall cadence is ~900 ms/block
+  -- (≈4000 blk/hr).  The remaining ~800 ms/block lives in check_block →
+  -- connect_callback (UTXO apply) → put_block → set_chain_tip → flush.
+  -- This window attributes it per-phase so a future Tier-3 optimisation
+  -- targets the right hot spot instead of guessing.
+  self.conn_win = { n = 0, validate_t = 0, cb_t = 0, put_t = 0, tip_t = 0,
+                    flush_t = 0, total_t = 0,
+                    v_max = 0, cb_max = 0, p_max = 0, total_max = 0 }
+  self.conn_lifetime = 0
+  self.conn_log_every = 500
   return self
 end
 
@@ -1762,9 +1774,11 @@ function BlockDownloader:connect_pending_blocks()
     end
 
     -- Validate the full block
+    local _cp0 = perf.now()
     local ok, err = pcall(function()
       validation.check_block(pending.block, self.network, pending.height)
     end)
+    local _cp1 = perf.now()
 
     if not ok then
       -- Invalid block, remove from pending and skip this height.
@@ -1796,10 +1810,13 @@ function BlockDownloader:connect_pending_blocks()
         return false, cb_err
       end
     end
+    local _cp2 = perf.now()
 
     -- Store the block AFTER successful connection (callback passed)
     self.storage.put_block(pending.hash, pending.block)
+    local _cp3 = perf.now()
     self.storage.set_chain_tip(pending.hash, pending.height, false)
+    local _cp4 = perf.now()
 
     -- Clear cached serialization data to free memory
     for _, tx in ipairs(pending.block.transactions) do
@@ -1818,9 +1835,49 @@ function BlockDownloader:connect_pending_blocks()
     self.last_connect_advance = _sock.gettime()
 
     -- Flush UTXO set periodically during IBD
+    local _flush_t = 0
     if self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval then
+      local _fp0 = perf.now()
       self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
+      _flush_t = perf.now() - _fp0
       self.last_flush_height = self.next_connect_height
+    end
+
+    -- W75 instrumentation: accumulate per-phase timings for this block into
+    -- the rolling window and emit a summary every conn_log_every blocks.
+    -- Only success-path blocks count — invalid-skip and callback-failure
+    -- paths exit above without reaching here.
+    do
+      local cw = self.conn_win
+      local _vt = _cp1 - _cp0   -- validate
+      local _ct = _cp2 - _cp1   -- connect_callback (UTXO apply)
+      local _pt = _cp3 - _cp2   -- storage.put_block
+      local _tt = _cp4 - _cp3   -- storage.set_chain_tip (async)
+      local _total = _vt + _ct + _pt + _tt + _flush_t
+      cw.n = cw.n + 1
+      cw.validate_t = cw.validate_t + _vt
+      cw.cb_t = cw.cb_t + _ct
+      cw.put_t = cw.put_t + _pt
+      cw.tip_t = cw.tip_t + _tt
+      cw.flush_t = cw.flush_t + _flush_t
+      cw.total_t = cw.total_t + _total
+      if _vt > cw.v_max then cw.v_max = _vt end
+      if _ct > cw.cb_max then cw.cb_max = _ct end
+      if _pt > cw.p_max then cw.p_max = _pt end
+      if _total > cw.total_max then cw.total_max = _total end
+      self.conn_lifetime = self.conn_lifetime + 1
+      if cw.n >= self.conn_log_every then
+        print(string.format(
+          "[W75-CONN] window=%d total=%d validate_avg=%.1fms cb_avg=%.1fms put_avg=%.1fms tip_avg=%.1fms flush_avg=%.1fms total_avg=%.1fms v_max=%.0fms cb_max=%.0fms p_max=%.0fms t_max=%.0fms",
+          cw.n, self.conn_lifetime,
+          (cw.validate_t / cw.n) * 1000, (cw.cb_t / cw.n) * 1000,
+          (cw.put_t / cw.n) * 1000, (cw.tip_t / cw.n) * 1000,
+          (cw.flush_t / cw.n) * 1000, (cw.total_t / cw.n) * 1000,
+          cw.v_max * 1000, cw.cb_max * 1000, cw.p_max * 1000, cw.total_max * 1000))
+        self.conn_win = { n = 0, validate_t = 0, cb_t = 0, put_t = 0, tip_t = 0,
+                          flush_t = 0, total_t = 0,
+                          v_max = 0, cb_max = 0, p_max = 0, total_max = 0 }
+      end
     end
 
     -- Periodic incremental GC to prevent LuaJIT table bloat
