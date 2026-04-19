@@ -210,6 +210,155 @@ function M.buffer_reader(data)
   return reader
 end
 
+-- W72: FFI-backed buffer_reader.  Public API is byte-identical to
+-- buffer_reader above — it can be substituted at any call site.  The
+-- implementation differs in two ways the JIT cares about:
+--   * Multi-byte integer reads use bit.bor + lshift over a cdata
+--     uint8_t* instead of string.byte + Lua arithmetic.
+--   * read_bytes uses ffi.string(ptr+pos, n) which LuaJIT emits as a
+--     single fast-path GCstr alloc + memcpy, vs. data:sub(a,b) which
+--     always allocates a Lua string.
+-- We keep `data` rooted in the returned reader table via _data so that
+-- the cast pointer stays valid for the reader's lifetime.  The cast
+-- itself does NOT pin the string.
+--
+-- Correctness is verified by tests/test_ffi_reader.lua against a corpus
+-- of mainnet blocks pulled from another fleet node.
+local _ffi_reader_ok, ffi = pcall(require, "ffi")
+local _bit_ok, bit = pcall(require, "bit")
+if _ffi_reader_ok and _bit_ok then
+  local band, bor, lshift = bit.band, bit.bor, bit.lshift
+
+  function M.buffer_reader_ffi(data)
+    local len = #data
+    local ptr = ffi.cast("const uint8_t*", data)
+    local pos = 0  -- 0-based internally; public position() returns 1-based
+    local reader = {}
+    -- Anchor: ffi.cast on a Lua string returns a pointer into its
+    -- internal buffer without pinning it.  Holding data here keeps
+    -- the buffer alive for as long as the caller holds the reader.
+    reader._data = data
+
+    function reader.read_u8()
+      if pos >= len then error("read_u8: unexpected end of data") end
+      local v = ptr[pos]
+      pos = pos + 1
+      return v
+    end
+
+    function reader.read_u16le()
+      if pos + 2 > len then error("read_u16le: unexpected end of data") end
+      local v = bor(ptr[pos], lshift(ptr[pos + 1], 8))
+      pos = pos + 2
+      return v
+    end
+
+    function reader.read_u16be()
+      if pos + 2 > len then error("read_u16be: unexpected end of data") end
+      local v = bor(lshift(ptr[pos], 8), ptr[pos + 1])
+      pos = pos + 2
+      return v
+    end
+
+    function reader.read_u32le()
+      if pos + 4 > len then error("read_u32le: unexpected end of data") end
+      local v = bor(ptr[pos],
+                    lshift(ptr[pos + 1], 8),
+                    lshift(ptr[pos + 2], 16),
+                    lshift(ptr[pos + 3], 24))
+      pos = pos + 4
+      -- bit.bor returns signed int32; normalize to unsigned.
+      if v < 0 then v = v + 4294967296 end
+      return v
+    end
+
+    function reader.read_i32le()
+      if pos + 4 > len then error("read_i32le: unexpected end of data") end
+      -- Keep the signed int32 result from bit ops as-is.
+      local v = bor(ptr[pos],
+                    lshift(ptr[pos + 1], 8),
+                    lshift(ptr[pos + 2], 16),
+                    lshift(ptr[pos + 3], 24))
+      pos = pos + 4
+      return v
+    end
+
+    function reader.read_u64le()
+      local low = reader.read_u32le()
+      local high = reader.read_u32le()
+      return low + high * 4294967296
+    end
+
+    function reader.read_i64le()
+      local low = reader.read_u32le()
+      local high = reader.read_u32le()
+      if high >= 2147483648 then
+        local comp_low = 4294967295 - low
+        local comp_high = 4294967295 - high
+        return -(comp_low + comp_high * 4294967296 + 1)
+      else
+        return low + high * 4294967296
+      end
+    end
+
+    function reader.read_varint()
+      local first = reader.read_u8()
+      if first < 0xFD then
+        return first
+      elseif first == 0xFD then
+        return reader.read_u16le()
+      elseif first == 0xFE then
+        return reader.read_u32le()
+      else
+        return reader.read_u64le()
+      end
+    end
+
+    function reader.read_bytes(n)
+      if pos + n > len then
+        error("read_bytes: unexpected end of data at pos " .. (pos + 1) .. " need " .. n)
+      end
+      local result = ffi.string(ptr + pos, n)
+      pos = pos + n
+      return result
+    end
+
+    function reader.read_varstr()
+      local n = reader.read_varint()
+      return reader.read_bytes(n)
+    end
+
+    function reader.read_hash256()
+      local types = require("lunarblock.types")
+      return types.hash256(reader.read_bytes(32))
+    end
+
+    function reader.position()
+      return pos + 1  -- public API is 1-based to match buffer_reader
+    end
+
+    function reader.remaining()
+      return len - pos
+    end
+
+    function reader.is_eof()
+      return pos >= len
+    end
+
+    return reader
+  end
+
+  -- Convenience: deserialize_block using the FFI reader.  Identical
+  -- output to deserialize_block; differs only in the reader factory.
+  function M.deserialize_block_ffi(data)
+    if type(data) ~= "string" then
+      error("deserialize_block_ffi: expected string, got " .. type(data))
+    end
+    local r = M.buffer_reader_ffi(data)
+    return M.deserialize_block(r)
+  end
+end
+
 -- Serialize a block header to 80 bytes
 function M.serialize_block_header(header)
   local w = M.buffer_writer()
