@@ -1581,7 +1581,21 @@ function BlockDownloader:handle_block(peer, block_data)
   -- main thread takes several seconds per block".  Before we spend days
   -- on an FFI replacement we want the actual ms-per-block number.
   local t0 = perf.now()
-  local block = serialize.deserialize_block(block_data)
+  -- Pure-Lua deserialize_block raises on malformed wire data via the
+  -- error()/assert() calls in serialize.lua. Without pcall here, the
+  -- throw propagates through main.lua:687 → peer.lua:745 (neither
+  -- wraps the handler) and kills the peer's message-processing loop.
+  -- Result: a malformed block payload silently drops the peer AND
+  -- the inflight entry never clears at line 1622, so the cursor
+  -- wedges until STALL RECOVERY fires 90s later. Observed on mainnet
+  -- 2026-04-19 at heights 647,650-647,740 as the `in_pending=no,
+  -- block_in_storage=no` pattern in connect_pending_blocks stall log.
+  local ok_d, block = pcall(serialize.deserialize_block, block_data)
+  if not ok_d then
+    print(string.format("[BLOCK-DROP] DESER_FAIL peer=%s bytes=%d err=%s",
+      tostring(peer and peer.addr), #block_data, tostring(block)))
+    return false, "deserialize failed"
+  end
   local t1 = perf.now()
   local hash = validation.compute_block_hash(block.header)
   local t2 = perf.now()
@@ -1646,6 +1660,8 @@ function BlockDownloader:handle_block(peer, block_data)
   -- wedging IBD permanently. Observed on mainnet at height 576466
   -- on 2026-04-18 (2h+ wedge, Pending=1024 pinned, 421 re-requests).
   if entry.height < self.next_connect_height then
+    print(string.format("[BLOCK-DROP] LATE_ARRIVAL height=%d next_connect=%d hash=%s",
+      entry.height, self.next_connect_height, hash_hex:sub(1, 16)))
     return true
   end
 
@@ -1671,6 +1687,8 @@ function BlockDownloader:handle_block(peer, block_data)
     if max_height_hex and entry.height < max_height then
       self.pending_blocks[max_height_hex] = nil
     else
+      print(string.format("[BLOCK-DROP] BUFFER_FULL pending=%d cap=%d height=%d max_in_buf=%d hash=%s",
+        pending_count, pending_cap, entry.height, max_height, hash_hex:sub(1, 16)))
       return true  -- This block is even further ahead, drop it
     end
   end
