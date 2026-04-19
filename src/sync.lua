@@ -1335,40 +1335,46 @@ function BlockDownloader:schedule_downloads(peers)
     self.last_connect_advance = now
   end
   if now - self.last_connect_advance > self.connect_stall_timeout then
-    -- Force reset: clear ALL inflight (they're for blocks we can't use)
-    -- and reset download cursor to re-request from next_connect_height
+    -- Surgical recovery: clear ONLY the inflight entry for the block that's
+    -- actually blocking progress at next_connect_height. Leaving other
+    -- peers' inflight alone prevents the LATE_ARRIVAL burst seen under the
+    -- old nuclear-clear: ~990 healthy inflight blocks would arrive shortly
+    -- after the reset but be rejected by handle_block's W71 guard, wasting
+    -- the peers' bandwidth and forcing a re-download of the whole window.
+    -- The W46 FORCE RE-REQUEST path below handles the actual re-request for
+    -- the stuck hash on every scheduler pass.
     local cleared = 0
-    for hash_hex, info in pairs(self.inflight) do
-      if self.peer_inflight[info.peer] then
-        self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
-        if self.peer_inflight[info.peer] <= 0 then
-          self.peer_inflight[info.peer] = nil
+    local stuck_hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
+    if stuck_hash_hex then
+      local info = self.inflight[stuck_hash_hex]
+      if info then
+        if self.peer_inflight[info.peer] then
+          self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+          if self.peer_inflight[info.peer] <= 0 then
+            self.peer_inflight[info.peer] = nil
+          end
         end
+        self.inflight[stuck_hash_hex] = nil
+        cleared = 1
       end
-      self.inflight[hash_hex] = nil
-      cleared = cleared + 1
     end
-    -- Clear pending blocks that are unusable by the cursor:
-    --  - Far ahead (> next_connect_height + 64): makes room near cursor.
-    --  - Behind (< next_connect_height): W71 zombie sweep. Defence in depth
-    --    against the late-arrival wedge; the primary guard is in
-    --    handle_block but any future code path that re-seeds below the
-    --    cursor would otherwise refill the zombie pile.
+    -- W71 zombie sweep: drop pending entries behind the cursor. Defence in
+    -- depth against future code paths that re-seed below the cursor; the
+    -- primary guard is in handle_block. Do NOT evict far-ahead pending —
+    -- those blocks will connect naturally once the cursor catches up.
     local evicted = 0
     for k, p in pairs(self.pending_blocks) do
-      if p.height > self.next_connect_height + 64
-        or p.height < self.next_connect_height then
+      if p.height < self.next_connect_height then
         self.pending_blocks[k] = nil
         evicted = evicted + 1
       end
     end
-    self.next_download_height = self.next_connect_height
-    -- Give peers time to respond to fresh getdatas before re-firing. The
-    -- timer will be cleared naturally when connect_pending_blocks advances
-    -- next_connect_height, which is the true signal of progress.
+    -- Reset the timer so we don't re-enter every scheduler tick; the real
+    -- signal of recovery is connect_pending_blocks advancing
+    -- next_connect_height, which stamps last_connect_advance afresh.
     self.last_connect_advance = now
     print(string.format(
-      "STALL RECOVERY: connection stuck at %d for >%ds, reset cursor (cleared %d inflight, evicted %d pending)",
+      "STALL RECOVERY: connection stuck at %d for >%ds, cleared %d stuck inflight, evicted %d zombie pending",
       self.next_connect_height, self.connect_stall_timeout, cleared, evicted))
     -- Recalculate inflight count after clearing
     inflight_count = 0
