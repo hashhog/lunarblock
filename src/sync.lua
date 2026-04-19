@@ -1328,11 +1328,16 @@ function BlockDownloader:schedule_downloads(peers)
       self.inflight[hash_hex] = nil
       cleared = cleared + 1
     end
-    -- Also clear pending blocks that are FAR ahead of connection cursor
-    -- to make room for blocks near the cursor
+    -- Clear pending blocks that are unusable by the cursor:
+    --  - Far ahead (> next_connect_height + 64): makes room near cursor.
+    --  - Behind (< next_connect_height): W71 zombie sweep. Defence in depth
+    --    against the late-arrival wedge; the primary guard is in
+    --    handle_block but any future code path that re-seeds below the
+    --    cursor would otherwise refill the zombie pile.
     local evicted = 0
     for k, p in pairs(self.pending_blocks) do
-      if p.height > self.next_connect_height + 64 then
+      if p.height > self.next_connect_height + 64
+        or p.height < self.next_connect_height then
         self.pending_blocks[k] = nil
         evicted = evicted + 1
       end
@@ -1577,6 +1582,20 @@ function BlockDownloader:handle_block(peer, block_data)
   local entry = self.header_chain.headers[hash_hex]
   if not entry then
     -- Unknown block, ignore
+    return true
+  end
+
+  -- W71: drop late-arrivals for already-connected heights. Without this,
+  -- duplicate responses (e.g. peers replying to a getdata after W65
+  -- STALL RECOVERY already cleared the inflight entry) accumulate in
+  -- pending_blocks as zombies. Over long stall/rerequest cycles they
+  -- fill the 1024-slot buffer; once max_height across pending falls
+  -- below next_connect_height, the eviction check
+  --   `entry.height < max_height`
+  -- rejects every new-cursor block instead of evicting a zombie,
+  -- wedging IBD permanently. Observed on mainnet at height 576466
+  -- on 2026-04-18 (2h+ wedge, Pending=1024 pinned, 421 re-requests).
+  if entry.height < self.next_connect_height then
     return true
   end
 
