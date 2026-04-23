@@ -1605,7 +1605,7 @@ function RPCServer:register_methods()
     local use_v2_override = nil
     if is_localhost then use_v2_override = false end
     if command == "onetry" or command == "add" then
-      local ok, err = rpc.peer_manager:connect_peer(ip, port, true, use_v2_override)
+      local ok, err = rpc.peer_manager:connect_peer(ip, port, true, use_v2_override, true)
       if not ok then
         error({code = M.ERROR.MISC_ERROR, message = "failed to connect: " .. tostring(err)})
       end
