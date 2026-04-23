@@ -864,9 +864,10 @@ end
 -- @param ip string: peer IP address
 -- @param port number: peer port
 -- @param skip_diversity boolean: skip outbound diversity check (for anchors)
+-- @param use_v2_override boolean|nil: force v1 (false) or v2 (true); nil = config default
 -- @return boolean: true on success
 -- @return string: error message on failure
-function PeerManager:connect_peer(ip, port, skip_diversity)
+function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override)
   local key = ip .. ":" .. port
   if self.peers[key] then return false, "already connected" end
   if self.banned[ip] and self.banned[ip] > os.time() then
@@ -890,8 +891,15 @@ function PeerManager:connect_peer(ip, port, skip_diversity)
     return false, "same /16 subnet as existing peer"
   end
 
-  -- Create peer with proxy configuration
-  local use_v2 = not self.config.nov2transport
+  -- Create peer with proxy configuration.  `use_v2_override` lets the addnode
+  -- RPC force v1 for localhost mesh peers (rustoshi et al. don't negotiate
+  -- BIP324 v2 cleanly — fleet is trusted so v1 is fine).
+  local use_v2
+  if use_v2_override ~= nil then
+    use_v2 = use_v2_override
+  else
+    use_v2 = not self.config.nov2transport
+  end
   local p = peer_mod.new(ip, port, self.network, self.our_height, use_v2, self.proxy_config)
   -- Register all our message handlers
   for cmd, handler in pairs(self.message_handlers) do
