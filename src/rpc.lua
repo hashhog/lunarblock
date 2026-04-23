@@ -1579,6 +1579,49 @@ function RPCServer:register_methods()
     return 0
   end
 
+  -- Manual peer control — minimal Bitcoin Core `addnode` parity.  Supports
+  -- "onetry" and "add" (both initiate an outbound connection) and "remove"
+  -- (disconnect + forget).  Used by the hashhog localhost IBD mesh (see
+  -- memory/project_local_peer_ibd_setup.md).  Localhost targets default to
+  -- BIP324 v1 because rustoshi / haskoin / hotbuns don't all speak v2.
+  self.methods["addnode"] = function(rpc, params)
+    local node = params and params[1]
+    local command = params and params[2]
+    if type(node) ~= "string" or type(command) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "addnode requires <node> <command>"})
+    end
+    if not rpc.peer_manager then
+      error({code = M.ERROR.MISC_ERROR, message = "peer manager not available"})
+    end
+    local ip, port_str = node:match("^([^:]+):?(%d*)$")
+    if not ip or ip == "" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "invalid node address: " .. node})
+    end
+    local port = tonumber(port_str)
+    if not port or port == 0 then
+      port = rpc.peer_manager.network and rpc.peer_manager.network.port or 8333
+    end
+    local is_localhost = (ip == "127.0.0.1" or ip == "::1" or ip == "localhost")
+    local use_v2_override = nil
+    if is_localhost then use_v2_override = false end
+    if command == "onetry" or command == "add" then
+      local ok, err = rpc.peer_manager:connect_peer(ip, port, true, use_v2_override)
+      if not ok then
+        error({code = M.ERROR.MISC_ERROR, message = "failed to connect: " .. tostring(err)})
+      end
+      return nil
+    elseif command == "remove" then
+      local key = ip .. ":" .. port
+      local p = rpc.peer_manager.peers and rpc.peer_manager.peers[key]
+      if p then
+        rpc.peer_manager:disconnect_peer(p, "removed by addnode RPC")
+      end
+      return nil
+    else
+      error({code = M.ERROR.INVALID_PARAMS, message = "invalid addnode command: " .. command})
+    end
+  end
+
   -- Fee estimation
   self.methods["estimatesmartfee"] = function(rpc, params)
     local conf_target = params[1] or 6
