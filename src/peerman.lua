@@ -865,9 +865,10 @@ end
 -- @param port number: peer port
 -- @param skip_diversity boolean: skip outbound diversity check (for anchors)
 -- @param use_v2_override boolean|nil: force v1 (false) or v2 (true); nil = config default
+-- @param is_manual boolean|nil: if true, mark peer as protected from eviction
 -- @return boolean: true on success
 -- @return string: error message on failure
-function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override)
+function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override, is_manual)
   local key = ip .. ":" .. port
   if self.peers[key] then return false, "already connected" end
   if self.banned[ip] and self.banned[ip] > os.time() then
@@ -925,6 +926,16 @@ function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override)
 
   -- Initialize chain sync state for stale tip detection
   self:_init_peer_chain_sync(p)
+
+  -- Mark addnode peers as protected so consider_eviction /
+  -- evict_extra_outbound_peers don't disconnect them when the localhost
+  -- mesh is in use (memory/project_local_peer_ibd_setup.md).
+  if is_manual then
+    local key = ip .. ":" .. port
+    if self._peer_chain_sync[key] then
+      self._peer_chain_sync[key].protect = true
+    end
+  end
 
   p:start_handshake()
 
