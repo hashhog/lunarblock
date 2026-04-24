@@ -265,6 +265,13 @@ function M.new(network, storage, config)
   self.known_addresses = {}    -- ip:port -> {ip, port, services, timestamp, attempts, last_try}
   self.banned = {}             -- ip -> ban_until_timestamp
   self.our_nonces = {}         -- set of nonces we've used (detect self-connect)
+  -- Manual peers (addnode <ip> add).  Keyed by "ip:port" with
+  -- {ip, port, use_v2_override, last_try, attempts}.  Distinct from
+  -- known_addresses because we want a much shorter reconnect interval
+  -- (MANUAL_RECONNECT_INTERVAL) when at-tip peers evict our IBD-state
+  -- connection, and because `addnode onetry` must NOT persist.
+  self.manual_peers = {}
+  self.manual_reconnect_interval = 30  -- seconds; matches clearbit
   self.our_height = 0
   self.listen_socket = nil
   self.message_handlers = {}   -- command -> handler(peer, payload)
@@ -1384,6 +1391,38 @@ end
 --- Process one tick of the event loop.
 -- Accepts inbound connections, processes messages, checks timeouts,
 -- maintains outbound connections, and processes transaction trickling.
+--- Reconnect dropped manual peers (addnode <ip> add).
+-- When a remote at-tip peer evicts our IBD-state connection ("behind our
+-- tip"), the mesh would permanently lose it without this.  Matches Bitcoin
+-- Core ThreadOpenConnections periodic manual-peer reconnect.  onetry peers
+-- are NOT in manual_peers, so they stay one-shot.
+function PeerManager:_reconnect_manual_peers()
+  local now = os.time()
+  for key, entry in pairs(self.manual_peers) do
+    -- Already connected?  Nothing to do.
+    if not self.peers[key] then
+      -- Throttle: don't re-attempt faster than manual_reconnect_interval.
+      if not entry.last_try or (now - entry.last_try) >= self.manual_reconnect_interval then
+        entry.last_try = now
+        entry.attempts = (entry.attempts or 0) + 1
+        local ok, _err = self:connect_peer(
+          entry.ip, entry.port, true, entry.use_v2_override, true
+        )
+        if ok then
+          entry.success_count = (entry.success_count or 0) + 1
+          print(string.format(
+            "[MANUAL-RECONNECT] reconnected %s (attempt %d, total reconnects %d)",
+            key, entry.attempts, entry.success_count
+          ))
+        end
+        -- Failures are expected (remote may still be evicting us); the
+        -- next tick + throttle window will retry.  Don't log to avoid
+        -- log spam during sustained eviction.
+      end
+    end
+  end
+end
+
 function PeerManager:tick()
   -- Accept inbound connections
   self:accept_inbound()
@@ -1422,6 +1461,11 @@ function PeerManager:tick()
 
   -- Maintain outbound connections
   self:maintain_connections()
+
+  -- Reconnect dropped manual peers last, AFTER stale-tip eviction has
+  -- had its chance.  Running every tick is cheap — the per-entry
+  -- throttle (manual_reconnect_interval) gates actual connect attempts.
+  self:_reconnect_manual_peers()
 end
 
 --- Run the main event loop.
