@@ -1604,14 +1604,36 @@ function RPCServer:register_methods()
     local is_localhost = (ip == "127.0.0.1" or ip == "::1" or ip == "localhost")
     local use_v2_override = nil
     if is_localhost then use_v2_override = false end
-    if command == "onetry" or command == "add" then
+    local key = ip .. ":" .. port
+    if command == "add" then
+      -- Persist: register in manual_peers so the tick-level
+      -- _reconnect_manual_peers() keeps reconnecting after remote-side
+      -- eviction.  Failure here is non-fatal — the reconnect loop will
+      -- pick it up on the next tick.
+      rpc.peer_manager.manual_peers[key] = {
+        ip = ip,
+        port = port,
+        use_v2_override = use_v2_override,
+        last_try = 0,
+        attempts = 0,
+        success_count = 0,
+      }
+      local ok, err = rpc.peer_manager:connect_peer(ip, port, true, use_v2_override, true)
+      if not ok then
+        -- Don't erase from manual_peers — reconnect loop owns the retry.
+        -- Surface the first-attempt failure via RPC error for visibility.
+        error({code = M.ERROR.MISC_ERROR, message = "initial connect failed (will retry): " .. tostring(err)})
+      end
+      return nil
+    elseif command == "onetry" then
+      -- One-shot: do NOT persist in manual_peers.
       local ok, err = rpc.peer_manager:connect_peer(ip, port, true, use_v2_override, true)
       if not ok then
         error({code = M.ERROR.MISC_ERROR, message = "failed to connect: " .. tostring(err)})
       end
       return nil
     elseif command == "remove" then
-      local key = ip .. ":" .. port
+      rpc.peer_manager.manual_peers[key] = nil
       local p = rpc.peer_manager.peers and rpc.peer_manager.peers[key]
       if p then
         rpc.peer_manager:disconnect_peer(p, "removed by addnode RPC")
@@ -1774,6 +1796,19 @@ function RPCServer:register_methods()
   self.methods["stop"] = function(_rpc, _params)
     -- Signal shutdown
     return "LunarBlock stopping..."
+  end
+
+  self.methods["jitprofileflush"] = function(_rpc, _params)
+    -- Flush LuaJIT profile by stopping the profiler. Caller should pass a
+    -- file path to restart capture into; otherwise capture stops permanently.
+    -- main.lua's cleanup path is unreachable (no SIGTERM handler), so this
+    -- is the only way to get the profile data on disk.
+    local ok, jit_p = pcall(require, "jit.p")
+    if not ok then
+      return { error = "jit.p not available" }
+    end
+    jit_p.stop()
+    return { flushed = true }
   end
 
   self.methods["help"] = function(rpc, params)
