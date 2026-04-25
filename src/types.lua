@@ -8,10 +8,17 @@ ffi.cdef[[
 ]]
 
 -- Hash256: 32-byte hash used for txid, block hash, merkle nodes
--- Store internally as a 32-byte Lua string (binary, little-endian as on wire)
+-- Store internally as a 32-byte Lua string (binary, little-endian as on wire).
+--
+-- The wrapper is a single-field table; the prior `_type = "hash256"` field
+-- was set on every allocation but never read (grep confirmed no dispatch on
+-- _type for hash256 anywhere). Dropping it ~halves the allocation cost on
+-- the hottest GC path — the 2026-04-23 LuaJIT profile recorded 18% of GC
+-- time in this constructor and another 24% in serialize.read_hash256
+-- (which calls this).
 function M.hash256(bytes)
   assert(#bytes == 32, "hash256 requires exactly 32 bytes")
-  return { _type = "hash256", bytes = bytes }
+  return { bytes = bytes }
 end
 
 -- Reverse a hash for display (Bitcoin displays hashes in big-endian)
@@ -42,10 +49,11 @@ function M.hash256_eq(a, b)
   return a.bytes == b.bytes
 end
 
--- Hash160: 20-byte hash used for addresses (RIPEMD160(SHA256(x)))
+-- Hash160: 20-byte hash used for addresses (RIPEMD160(SHA256(x))).
+-- See hash256 above for why _type was dropped.
 function M.hash160(bytes)
   assert(#bytes == 20, "hash160 requires exactly 20 bytes")
-  return { _type = "hash160", bytes = bytes }
+  return { bytes = bytes }
 end
 
 -- OutPoint: reference to a specific output of a previous transaction
