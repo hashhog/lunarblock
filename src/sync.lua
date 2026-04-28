@@ -1237,8 +1237,22 @@ function M.new_block_downloader(header_chain, storage, network)
   self.max_stall_timeout = 120      -- Maximum stall timeout
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
-  self.utxo_flush_interval = 2000   -- Flush UTXO set every N blocks
+  -- IBD durability: how often to fsync the chainstate to disk. The
+  -- per-block flush goes to RocksDB with sync=false (memtable + WAL
+  -- in OS page cache); at this cadence we issue a sync write so the
+  -- WAL up to that point is fsync'd. Bounds data loss on a hard
+  -- crash (EMFILE / OOM / power loss) to at most utxo_flush_interval
+  -- blocks of work.
+  --
+  -- Was 2000 before 2026-04-28; lowered to 200 after the
+  -- h=938,344 wedge (project_lunarblock_wedge_2026_04_28). 200 blocks
+  -- is ~30s at typical IBD rate; we additionally force a sync if more
+  -- than utxo_flush_max_seconds wall-clock have elapsed since the
+  -- last sync, so a slow IBD stretch can't extend the loss window.
+  self.utxo_flush_interval = 200
+  self.utxo_flush_max_seconds = 60
   self.last_flush_height = 0
+  self.last_flush_time = 0
   self.peer_round_robin = 1         -- Persistent round-robin index across schedule_downloads calls
   self.last_connect_advance = 0     -- Timestamp when next_connect_height last advanced
   self.connect_stall_timeout = 90   -- Seconds without connection progress before forced reset
@@ -1858,13 +1872,30 @@ function BlockDownloader:connect_pending_blocks()
     local _sock = require("socket")
     self.last_connect_advance = _sock.gettime()
 
-    -- Flush UTXO set periodically during IBD
+    -- Flush UTXO set periodically during IBD. The sync=true write of
+    -- chain_tip fsyncs the WAL up to that point, durably persisting
+    -- ALL prior writes (the per-block atomic batch from connect_block,
+    -- which ran with sync=false). Two trigger conditions:
+    --   1. utxo_flush_interval blocks since last sync (bounds loss-by-block)
+    --   2. utxo_flush_max_seconds wall-clock since last sync (bounds
+    --      loss-by-time, in case IBD is slow due to disk pressure /
+    --      compaction lag, which is exactly the regime where a crash
+    --      becomes more likely).
     local _flush_t = 0
-    if self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval then
-      local _fp0 = perf.now()
-      self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
-      _flush_t = perf.now() - _fp0
-      self.last_flush_height = self.next_connect_height
+    do
+      local _now = require("socket").gettime()
+      if self.last_flush_time == 0 then
+        self.last_flush_time = _now
+      end
+      local block_trigger = self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval
+      local time_trigger = _now - self.last_flush_time >= self.utxo_flush_max_seconds
+      if block_trigger or time_trigger then
+        local _fp0 = perf.now()
+        self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
+        _flush_t = perf.now() - _fp0
+        self.last_flush_height = self.next_connect_height
+        self.last_flush_time = _now
+      end
     end
 
     -- W75 instrumentation: accumulate per-phase timings for this block into
