@@ -1063,6 +1063,141 @@ function ChainState:connect_genesis()
   self.storage.set_chain_tip(block_hash, 0, true)
 end
 
+--- Reindex the chainstate from on-disk blocks. Used to recover from a
+-- corrupt UTXO set (e.g., the post-EMFILE wedge documented in
+-- project_lunarblock_wedge_2026_04_28).
+--
+-- Walks CF.UTXO and CF.UNDO and deletes everything, then iterates the
+-- height-index from height 1 to header_tip_height, re-executing
+-- connect_block on each block in order. The genesis block's UTXO set
+-- is reseeded by re-applying the genesis coinbase outputs (same shape
+-- as connect_genesis but without put_block, since genesis is already
+-- in storage).
+--
+-- Script validation is skipped during reindex (the blocks were
+-- validated when they were first downloaded and the chain tip the
+-- header chain knows about is what we trust).
+--
+-- @param header_tip_height number: the height to replay up to (usually
+--        the current header_chain.header_tip_height — the highest
+--        block whose body lives in CF.BLOCKS).
+-- @param progress_fn function|nil: optional callback (height, total)
+--        invoked every 1000 blocks for progress logging.
+function ChainState:reindex_chainstate(header_tip_height, progress_fn)
+  local _t0 = perf.now()
+
+  -- 1. Wipe CF.UTXO and CF.UNDO. We do this in 64k-key batches so a
+  --    multi-million-row UTXO set doesn't become one giant write batch.
+  local function wipe_cf(cf, label)
+    local iter = self.storage.iterator(cf)
+    iter.seek_to_first()
+    local batch = self.storage.batch()
+    local count = 0
+    local total = 0
+    while iter.valid() do
+      batch.delete(cf, iter.key())
+      count = count + 1
+      total = total + 1
+      if count >= 65536 then
+        batch.write(false)
+        batch.clear()
+        count = 0
+        if progress_fn then
+          progress_fn(string.format("reindex: wiped %s %d keys", label, total), nil)
+        end
+      end
+      iter.next()
+    end
+    if count > 0 then
+      batch.write(false)
+    end
+    batch.destroy()
+    iter.destroy()
+    -- Final sync to make sure the wipe is durable.
+    self.storage.set_chain_tip(types.hash256_zero(), 0, true)
+    return total
+  end
+
+  local utxos_wiped = wipe_cf(storage_mod.CF.UTXO, "CF.UTXO")
+  local undos_wiped = wipe_cf(storage_mod.CF.UNDO, "CF.UNDO")
+  if progress_fn then
+    progress_fn(string.format("reindex: wiped %d utxos, %d undos", utxos_wiped, undos_wiped), nil)
+  end
+
+  -- 2. Reset in-memory chainstate.
+  self.coin_view:clear_cache()
+  self.tip_hash = nil
+  self.tip_height = -1
+
+  -- 3. Reseed genesis. We can't call connect_genesis (it puts the
+  --    block to storage; genesis is already there). Instead, replay
+  --    the genesis coinbase output add and set chain_tip = 0.
+  local gen_hash = self.storage.get_hash_by_height(0)
+  if not gen_hash then
+    return nil, "reindex: genesis block missing from height index"
+  end
+  local gen_block = self.storage.get_block(gen_hash)
+  if not gen_block then
+    return nil, "reindex: genesis block body missing from CF.BLOCKS"
+  end
+  local gen_coinbase = gen_block.transactions[1]
+  local gen_txid = validation.compute_txid(gen_coinbase)
+  for vout_idx, out in ipairs(gen_coinbase.outputs) do
+    if #out.script_pubkey == 0 or out.script_pubkey:byte(1) ~= 0x6a then
+      self.coin_view:add(gen_txid, vout_idx - 1, M.utxo_entry(
+        out.value, out.script_pubkey, 0, true
+      ))
+    end
+  end
+  self.coin_view:flush(false, function(batch)
+    local w = serialize.buffer_writer()
+    w.write_hash256(gen_hash)
+    w.write_u32le(0)
+    batch.put(storage_mod.CF.META, "chain_tip", w.result())
+  end, true)
+  self.tip_hash = gen_hash
+  self.tip_height = 0
+
+  -- 4. Replay blocks 1 → header_tip_height.
+  local _last_progress_t = perf.now()
+  for height = 1, header_tip_height do
+    local block_hash = self.storage.get_hash_by_height(height)
+    if not block_hash then
+      return nil, string.format("reindex: missing height index for h=%d (header_tip=%d)",
+        height, header_tip_height)
+    end
+    local block = self.storage.get_block(block_hash)
+    if not block then
+      return nil, string.format("reindex: missing block body for h=%d hash=%s",
+        height, types.hash256_hex(block_hash))
+    end
+    -- Skip script validation during reindex: blocks were validated when
+    -- they were first downloaded. Use nosync=true (the periodic sync at
+    -- every 200 blocks in the IBD loop is mirrored by the explicit
+    -- sync flush below every 5000 blocks).
+    local ok, err = self:connect_block(
+      block, height, block_hash, nil, nil, true, nil, true, nil)
+    if not ok then
+      return nil, string.format("reindex: connect_block failed at h=%d: %s",
+        height, tostring(err))
+    end
+    if height % 5000 == 0 then
+      -- Force fsync to bound recovery cost if reindex is interrupted.
+      self.coin_view:flush(false, nil, true)
+    end
+    if progress_fn and (height % 1000 == 0 or perf.now() - _last_progress_t > 5) then
+      progress_fn(nil, height)
+      _last_progress_t = perf.now()
+    end
+  end
+
+  -- 5. Final sync.
+  self.coin_view:flush(false, nil, true)
+  local _t1 = perf.now()
+  return true, string.format("reindex complete: %d blocks in %.1fs",
+    header_tip_height, _t1 - _t0)
+end
+
 --- Load invalid blocks set from persistent storage.
 function ChainState:load_invalid_blocks()
   local data = self.storage.get(storage_mod.CF.META, "invalid_blocks")
