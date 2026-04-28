@@ -3413,11 +3413,16 @@ function RPCServer:register_methods()
 
   -- getdeploymentinfo: returns deployment state for each known softfork.
   -- All deployments in lunarblock are buried (enforced from genesis or a fixed
-  -- activation height). A BIP9 state machine is not yet implemented; the
-  -- roadmap issue is tracked as lunarblock#TODO-bip9-state-machine.
-  -- For each deployment this returns at minimum:
-  --   type, active, height, min_activation_height
-  -- (no bip9.status / bip9.since because there is no versionbits cache)
+  -- activation height). A reference BIP9 state machine exists in
+  -- src/consensus.lua (versionbits_condition / get_deployment_state /
+  -- get_deployment_state_for_block), exhaustively unit-tested in
+  -- spec/consensus_spec.lua, but it is INTENTIONALLY NOT on the consensus
+  -- path — see the long comment block at the top of the BIP9 section in
+  -- consensus.lua. There is no versionbits cache, so this RPC returns only
+  -- the buried fields (type, active, height, min_activation_height) without
+  -- a bip9.status / bip9.since sub-object. Wiring the state machine into the
+  -- response would require a versionbits cache and is the natural followup
+  -- if/when a future deployment ships unburied.
   self.methods["getdeploymentinfo"] = function(rpc, params)
     -- Resolve the target block
     local target_height

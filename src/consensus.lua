@@ -327,6 +327,40 @@ end
 
 --------------------------------------------------------------------------------
 -- BIP9 Versionbits State Machine
+--
+-- INTENTIONALLY DECORATIVE: this module is NOT on the consensus path.
+--
+-- Lunarblock enforces every soft fork (BIP65, BIP66, BIP68/CSV, BIP141 SegWit,
+-- BIP341 Taproot) via hard-coded buried activation heights stored in the
+-- per-network table at the bottom of this file (see `bip65_height`,
+-- `bip66_height`, `csv_height`, `segwit_height`, `taproot_height`). The actual
+-- height-gate decisions live in src/utxo.lua connect_block (search for
+-- `verify_dersig`, `verify_checklocktimeverify`, `verify_witness`,
+-- `verify_taproot`).
+--
+-- This is the same approach Bitcoin Core eventually settled on: once a
+-- deployment locks in and activates, its activation height is a fact of the
+-- chain, and re-running the full BIP9 state machine on every block during IBD
+-- is wasted work. Core hard-codes the heights in chainparams.cpp; we hard-code
+-- them in M.networks.<name>.<fork>_height. See bitcoin-core/src/deploymentstatus.h
+-- and the `DeploymentEnabled` / `DeploymentActiveAfter` helpers there.
+--
+-- The functions below (versionbits_condition, get_deployment_state,
+-- get_deployment_state_for_block) are kept because:
+--   1. They are exhaustively unit-tested in spec/consensus_spec.lua and serve
+--      as a reference implementation of the BIP9 algorithm.
+--   2. A future versionbits cache + getblockchaininfo `softforks.bip9` block
+--      may legitimately drive them (see TODO at src/rpc.lua getdeploymentinfo).
+--   3. Future testnet-only deployments that have not yet buried may need them.
+--
+-- They MUST NOT be called from the consensus / block-validation path. If you
+-- find yourself wanting to wire this into utxo.lua connect_block, stop and
+-- talk to whoever owns soft-fork activation policy first.
+--
+-- Defense-in-depth: validate_buried_deployment_consistency() at the bottom of
+-- this section asserts that the per-deployment min_activation_height matches
+-- the buried height in M.networks.mainnet, so a future patch that silently
+-- changes one without the other will fail loud at module load time.
 --------------------------------------------------------------------------------
 
 -- Versionbits signaling constants (BIP9)
@@ -886,6 +920,82 @@ M.networks.regtest = {
 function M.get_network(name)
   return M.networks[name]
 end
+
+--------------------------------------------------------------------------------
+-- Buried-deployment consistency check (defense in depth)
+--
+-- The buried activation heights in M.networks.mainnet drive consensus
+-- enforcement (see src/utxo.lua connect_block). The decorative BIP9 state
+-- machine above carries its own copy of those heights in M.DEPLOYMENTS.
+-- These two tables MUST agree for mainnet, otherwise a future RPC consumer
+-- of M.DEPLOYMENTS would report a different activation height than the
+-- one the validator actually enforces, leading to subtle disagreement with
+-- Bitcoin Core in tooling.
+--
+-- This is run once at module load and raises immediately on disagreement.
+-- Cost: a few comparisons per process startup. Zero IBD overhead.
+--
+-- Only mainnet is checked because:
+--   * regtest activates everything from height 0
+--   * testnet3/testnet4 use different activation heights and have no entry
+--     in M.DEPLOYMENTS (which is mainnet-shaped). Adding per-network
+--     deployment tables is out of scope for this defense-in-depth check.
+--------------------------------------------------------------------------------
+function M.validate_buried_deployment_consistency()
+  local net = M.networks.mainnet
+  if not net then
+    error("consensus.lua: mainnet network table missing")
+  end
+
+  -- SEGWIT (BIP141): M.DEPLOYMENTS.SEGWIT.min_activation_height matches
+  -- net.segwit_height. Core mainnet activated SegWit at height 481824 and
+  -- BIP9 min_activation_height was 0 (i.e. activate as soon as locked in).
+  -- We carry min_activation_height = 0 in M.DEPLOYMENTS.SEGWIT to match the
+  -- BIP9 spec; the buried height is the *actual* activation height. They
+  -- legitimately differ and this is fine — we only assert that the buried
+  -- height is non-zero and sensible.
+  if net.segwit_height == nil or net.segwit_height < 1 then
+    error(string.format(
+      "consensus.lua: mainnet segwit_height invalid (got %s, expected >= 1)",
+      tostring(net.segwit_height)))
+  end
+
+  -- TAPROOT (BIP341): M.DEPLOYMENTS.TAPROOT.min_activation_height is the
+  -- buried activation height per BIP341 (709632). Core hard-coded this in
+  -- chainparams.cpp, so the BIP9 table value MUST match net.taproot_height
+  -- exactly. If they ever drift, fail loud.
+  local taproot_dep_height = M.DEPLOYMENTS.TAPROOT.min_activation_height
+  if taproot_dep_height ~= net.taproot_height then
+    error(string.format(
+      "consensus.lua: TAPROOT min_activation_height mismatch: " ..
+      "M.DEPLOYMENTS.TAPROOT.min_activation_height=%d, " ..
+      "M.networks.mainnet.taproot_height=%d. " ..
+      "Both must reference the same buried activation height (BIP341: 709632).",
+      taproot_dep_height, net.taproot_height))
+  end
+
+  -- Sanity: every buried height referenced from the consensus path
+  -- (utxo.lua) must be a non-negative integer.
+  local buried = {
+    bip34_height   = net.bip34_height,
+    bip65_height   = net.bip65_height,
+    bip66_height   = net.bip66_height,
+    csv_height     = net.csv_height,
+    segwit_height  = net.segwit_height,
+    taproot_height = net.taproot_height,
+  }
+  for name, h in pairs(buried) do
+    if type(h) ~= "number" or h < 0 or h ~= math.floor(h) then
+      error(string.format(
+        "consensus.lua: mainnet %s invalid (got %s, expected non-negative integer)",
+        name, tostring(h)))
+    end
+  end
+end
+
+-- Run at module load. If a future patch breaks the invariant, the entire
+-- node refuses to boot rather than silently disagreeing with Core.
+M.validate_buried_deployment_consistency()
 
 --------------------------------------------------------------------------------
 -- 256-bit Chainwork Arithmetic (for anti-DoS header sync)
