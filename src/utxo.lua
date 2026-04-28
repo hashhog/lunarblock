@@ -1274,7 +1274,22 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             verify_nulldummy = height >= self.network.segwit_height,
             verify_nullfail = height >= self.network.segwit_height,
             verify_witness_pubkeytype = height >= self.network.segwit_height,
+            verify_taproot = height >= self.network.taproot_height,
           }
+
+          -- Build prev_outputs once per tx for Taproot key-path checker.
+          -- (utxo_cache is built in the first pass above; lazy because
+          -- only Taproot key-path actually needs it.)
+          local tx_prev_outputs = nil
+          local function get_tx_prev_outputs()
+            if tx_prev_outputs then return tx_prev_outputs end
+            tx_prev_outputs = {}
+            for pi = 1, #tx.inputs do
+              local pu = utxo_cache[pi]
+              tx_prev_outputs[pi] = { value = pu.value, script_pubkey = pu.script_pubkey }
+            end
+            return tx_prev_outputs
+          end
 
           -- Select checker: collecting (deferred ECDSA) when parallel mode
           -- is active, or immediate when serial.  Taproot (Schnorr) is always
@@ -1282,11 +1297,13 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           local checker
           if use_parallel_verify then
             checker = validation.make_collecting_sig_checker(
-              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs
+              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs,
+              get_tx_prev_outputs()
             )
           else
             checker = validation.make_sig_checker(
-              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags
+              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags,
+              get_tx_prev_outputs()
             )
           end
 

@@ -843,45 +843,27 @@ end
 -- BIP341 Taproot Signature Hash
 --------------------------------------------------------------------------------
 
---- Compute taproot sighash (BIP341).
--- @param tx transaction: The transaction being verified
--- @param input_index number: 0-based index of the input being signed
--- @param hash_type number: Sighash type (0x00 = SIGHASH_DEFAULT, or standard types)
--- @param prev_outputs table: Array of {value=number, script_pubkey=string} for ALL inputs
--- @param ext_flag number: Extension flag (0 for key-path, 1 for script-path)
--- @param annex string|nil: Annex data (if present)
--- @param tapleaf_hash string|nil: 32-byte leaf hash (for script-path spending)
--- @param codesep_pos number|nil: Code separator position (default 0xFFFFFFFF)
--- @return string: 32-byte sighash
-function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
-                                   ext_flag, annex, tapleaf_hash, codesep_pos)
+--- Compute the BIP-341 sigmsg buffer (the bytes fed into TapSighash tagged
+-- hash). Exposed so the bip341-vector-runner shim can validate the
+-- pre-image against Bitcoin Core's BIP-341 wallet vectors before checking
+-- the final hash.
+function M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
+                                  ext_flag, annex, tapleaf_hash, codesep_pos)
   ext_flag = ext_flag or 0
   codesep_pos = codesep_pos or 0xFFFFFFFF
 
-  -- Determine effective sighash type
   local ht = hash_type
-  if ht == 0x00 then
-    ht = 0x01  -- SIGHASH_DEFAULT acts as SIGHASH_ALL
-  end
+  if ht == 0x00 then ht = 0x01 end
   local output_type = bit.band(ht, 0x03)
   local anyone_can_pay = bit.band(ht, 0x80) ~= 0
 
-  -- Build the epoch + sighash preimage using tagged hash
   local w = serialize.buffer_writer()
-
-  -- Epoch byte (0x00)
-  w.write_u8(0x00)
-
-  -- Hash type
+  w.write_u8(0x00)  -- epoch
   w.write_u8(hash_type)
-
-  -- Transaction data
   w.write_i32le(tx.version)
   w.write_u32le(tx.locktime)
 
-  -- If NOT ANYONECANPAY, commit to all inputs
   if not anyone_can_pay then
-    -- sha_prevouts: SHA256 of all outpoints
     local pw = serialize.buffer_writer()
     for _, inp in ipairs(tx.inputs) do
       pw.write_hash256(inp.prev_out.hash)
@@ -889,21 +871,18 @@ function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
     end
     w.write_bytes(crypto.sha256(pw.result()))
 
-    -- sha_amounts: SHA256 of all prev output amounts
     local aw = serialize.buffer_writer()
     for _, po in ipairs(prev_outputs) do
       aw.write_i64le(po.value)
     end
     w.write_bytes(crypto.sha256(aw.result()))
 
-    -- sha_scriptpubkeys: SHA256 of all prev output scriptPubKeys (with compact size prefix)
     local sw = serialize.buffer_writer()
     for _, po in ipairs(prev_outputs) do
       sw.write_varstr(po.script_pubkey)
     end
     w.write_bytes(crypto.sha256(sw.result()))
 
-    -- sha_sequences: SHA256 of all input sequences
     local qw = serialize.buffer_writer()
     for _, inp in ipairs(tx.inputs) do
       qw.write_u32le(inp.sequence)
@@ -911,9 +890,7 @@ function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
     w.write_bytes(crypto.sha256(qw.result()))
   end
 
-  -- If SIGHASH_ALL (output_type == 1 or 0), commit to all outputs
   if output_type ~= 0x02 and output_type ~= 0x03 then
-    -- sha_outputs: SHA256 of all outputs
     local ow = serialize.buffer_writer()
     for _, out in ipairs(tx.outputs) do
       ow.write_i64le(out.value)
@@ -922,36 +899,26 @@ function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
     w.write_bytes(crypto.sha256(ow.result()))
   end
 
-  -- Spend type: (ext_flag * 2) + annex_present
   local annex_present = annex and 1 or 0
   w.write_u8(ext_flag * 2 + annex_present)
 
-  -- Input-specific data
   if anyone_can_pay then
-    -- This input's outpoint
     local inp = tx.inputs[input_index + 1]
     w.write_hash256(inp.prev_out.hash)
     w.write_u32le(inp.prev_out.index)
-
-    -- This input's prev output
     local po = prev_outputs[input_index + 1]
     w.write_i64le(po.value)
     w.write_varstr(po.script_pubkey)
-
-    -- This input's sequence
     w.write_u32le(inp.sequence)
   else
-    -- Just the input index
     w.write_u32le(input_index)
   end
 
-  -- Annex hash (if present)
   if annex then
     local ah = crypto.sha256(crypto.compact_size(#annex) .. annex)
     w.write_bytes(ah)
   end
 
-  -- Output-specific data for SIGHASH_SINGLE
   if output_type == 0x03 then
     if input_index < #tx.outputs then
       local ow = serialize.buffer_writer()
@@ -964,15 +931,31 @@ function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
     end
   end
 
-  -- Script-path extensions (ext_flag == 1)
   if ext_flag == 1 then
     assert(tapleaf_hash, "tapleaf_hash required for script-path sighash")
     w.write_bytes(tapleaf_hash)
-    w.write_u8(0x00)  -- key_version
+    w.write_u8(0x00)
     w.write_u32le(codesep_pos)
   end
 
-  return crypto.tagged_hash("TapSighash", w.result())
+  return w.result()
+end
+
+--- Compute taproot sighash (BIP341).
+-- @param tx transaction: The transaction being verified
+-- @param input_index number: 0-based index of the input being signed
+-- @param hash_type number: Sighash type (0x00 = SIGHASH_DEFAULT, or standard types)
+-- @param prev_outputs table: Array of {value=number, script_pubkey=string} for ALL inputs
+-- @param ext_flag number: Extension flag (0 for key-path, 1 for script-path)
+-- @param annex string|nil: Annex data (if present)
+-- @param tapleaf_hash string|nil: 32-byte leaf hash (for script-path spending)
+-- @param codesep_pos number|nil: Code separator position (default 0xFFFFFFFF)
+-- @return string: 32-byte sighash
+function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
+                                   ext_flag, annex, tapleaf_hash, codesep_pos)
+  local msg = M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
+                                       ext_flag, annex, tapleaf_hash, codesep_pos)
+  return crypto.tagged_hash("TapSighash", msg)
 end
 
 --------------------------------------------------------------------------------
@@ -1332,7 +1315,7 @@ end
 -- @param prev_script_pubkey string: ScriptPubKey of the previous output
 -- @param flags table: Script verification flags
 -- @return table: Checker with check_sig, check_locktime, check_sequence methods
-function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags)
+function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, prev_outputs)
   flags = flags or {}
   local checker = {}
 
@@ -1417,6 +1400,32 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     else
       return crypto.ecdsa_verify_lax(pubkey, sig_der, sighash)
     end
+  end
+
+  --- BIP-341 Taproot key-path Schnorr verify.
+  -- Returns true iff `sig` is a valid BIP-340 Schnorr signature by
+  -- `witness_program` (the 32-byte x-only output key) over the BIP-341
+  -- key-path (ext_flag=0) sighash of this transaction.
+  -- @param witness_program string: 32-byte x-only output key
+  -- @param sig string: 64- or 65-byte Schnorr signature (65 = sig||hash_type)
+  -- @param annex string|nil: BIP-341 annex including the 0x50 prefix
+  -- @return boolean: true if signature verifies, false otherwise
+  function checker.check_schnorr_keypath(witness_program, sig, annex)
+    if not prev_outputs then return false end
+    if #sig ~= 64 and #sig ~= 65 then return false end
+
+    local hash_type = 0x00
+    local sig_bytes = sig
+    if #sig == 65 then
+      hash_type = string.byte(sig, 65)
+      sig_bytes = string.sub(sig, 1, 64)
+      -- BIP-341: explicit SIGHASH_DEFAULT byte is invalid in 65-byte form
+      if hash_type == 0x00 then return false end
+    end
+
+    local sighash = M.signature_hash_taproot(
+      tx, input_index, hash_type, prev_outputs, 0, annex)
+    return crypto.schnorr_verify(witness_program, sig_bytes, sighash)
   end
 
   --- Check locktime (BIP65 CLTV).
@@ -1593,7 +1602,7 @@ end
 -- @param flags table: Script verification flags
 -- @param collector table: Array to append {pubkey, sig_der, sighash} to
 -- @return table: Checker compatible with make_sig_checker interface
-function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector)
+function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector, prev_outputs)
   flags = flags or {}
   local checker = {}
 
@@ -1659,6 +1668,26 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
 
     -- Return true optimistically; batch verify will catch failures
     return true
+  end
+
+  --- BIP-341 Taproot key-path Schnorr verify (immediate; not batched).
+  -- Same semantics as make_sig_checker.check_schnorr_keypath. Schnorr
+  -- verification is not deferred to the batch pass — only ECDSA is.
+  function checker.check_schnorr_keypath(witness_program, sig, annex)
+    if not prev_outputs then return false end
+    if #sig ~= 64 and #sig ~= 65 then return false end
+
+    local hash_type = 0x00
+    local sig_bytes = sig
+    if #sig == 65 then
+      hash_type = string.byte(sig, 65)
+      sig_bytes = string.sub(sig, 1, 64)
+      if hash_type == 0x00 then return false end
+    end
+
+    local sighash = M.signature_hash_taproot(
+      tx, input_index, hash_type, prev_outputs, 0, annex)
+    return crypto.schnorr_verify(witness_program, sig_bytes, sighash)
   end
 
   function checker.check_locktime(script_locktime)
