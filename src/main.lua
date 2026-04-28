@@ -27,6 +27,7 @@ local function parse_args(argv)
     printtoconsole = false,
     nowalletcreate = false,
     reindex = false,
+    reindex_chainstate = false,
     daemon = false,
     jitprofile = false,
     jitverbose = false,
@@ -68,6 +69,7 @@ local function parse_args(argv)
       print("      --printtoconsole    Print log to console")
       print("      --nowalletcreate    Do not create wallet on first run")
       print("      --reindex           Rebuild UTXO set from blocks")
+      print("      --reindex-chainstate Rebuild chainstate (UTXO set) from on-disk blocks")
       print("      --daemon            Run as daemon")
       print("      --jitprofile        Enable JIT profiling output")
       print("      --jitverbose        Enable verbose JIT compilation logging")
@@ -128,6 +130,8 @@ local function parse_args(argv)
       args.nowalletcreate = true
     elseif arg == "--reindex" then
       args.reindex = true
+    elseif arg == "--reindex-chainstate" then
+      args.reindex_chainstate = true
     elseif arg == "--daemon" then
       args.daemon = true
     elseif arg == "--jitprofile" then
@@ -531,6 +535,40 @@ local function main()
     header_chain.header_tip_height,
     header_chain.header_tip_hash and types.hash256_hex(header_chain.header_tip_hash) or "none"
   ))
+
+  -- --reindex-chainstate: wipe CF.UTXO + CF.UNDO and replay every
+  -- block-body in CF.BLOCKS via connect_block. Recovers from the
+  -- chainstate-corruption wedge documented in
+  -- project_lunarblock_wedge_2026_04_28.
+  if args.reindex_chainstate then
+    local reindex_target = header_chain.header_tip_height
+    if not reindex_target or reindex_target < 1 then
+      io.stderr:write("--reindex-chainstate: no header tip to replay against — abort\n")
+      os.exit(1)
+    end
+    io.stdout:write(string.format(
+      "[reindex-chainstate] starting: target_height=%d (header tip)\n",
+      reindex_target))
+    io.stdout:flush()
+    local progress_fn = function(msg, height)
+      if msg then
+        io.stdout:write(string.format("[reindex-chainstate] %s\n", msg))
+      else
+        io.stdout:write(string.format("[reindex-chainstate] replayed %d / %d (%.1f%%)\n",
+          height, reindex_target, 100 * height / reindex_target))
+      end
+      io.stdout:flush()
+    end
+    local ok, msg = chain_state:reindex_chainstate(reindex_target, progress_fn)
+    if not ok then
+      io.stderr:write(string.format("[reindex-chainstate] FAILED: %s\n", tostring(msg)))
+      os.exit(1)
+    end
+    io.stdout:write(string.format("[reindex-chainstate] %s\n", tostring(msg)))
+    io.stdout:write(string.format("[reindex-chainstate] resuming normal startup at h=%d\n",
+      chain_state.tip_height))
+    io.stdout:flush()
+  end
 
   -- Initialize block downloader for IBD
   local block_downloader = sync_mod.new_block_downloader(header_chain, db, network)
@@ -1206,6 +1244,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --printtoconsole    Print log to console")
       print("      --nowalletcreate    Do not create wallet on first run")
       print("      --reindex           Rebuild UTXO set from blocks")
+      print("      --reindex-chainstate Rebuild chainstate (UTXO set) from on-disk blocks")
       print("      --daemon            Run as daemon")
       print("      --jitprofile        Enable JIT profiling output")
       print("      --jitverbose        Enable verbose JIT compilation logging")
