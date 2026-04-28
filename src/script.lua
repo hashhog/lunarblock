@@ -1560,7 +1560,26 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
       end
 
     else
-      -- Key-path spending
+      -- BIP-341 key-path spend: witness must be a single Schnorr signature.
+      -- (Annex, if present, was already detected and stack_end decremented.)
+      if stack_end ~= 1 then
+        return nil, "TAPROOT_INVALID_KEYPATH_WITNESS"
+      end
+      local sig = witness[1]
+      local annex = nil
+      if #witness >= 2 and #witness[#witness] > 0
+         and witness[#witness]:byte(1) == 0x50 then
+        annex = witness[#witness]
+      end
+      if not (checker and checker.check_schnorr_keypath) then
+        -- Fail-closed: previously this returned true, silently accepting
+        -- any witness. If the checker can't verify Schnorr, we can't
+        -- claim the signature is valid.
+        return nil, "TAPROOT_KEYPATH_NO_CHECKER"
+      end
+      if not checker.check_schnorr_keypath(witness_program, sig, annex) then
+        return nil, "TAPROOT_KEYPATH_VERIFY_FAILED"
+      end
       return true
     end
 
