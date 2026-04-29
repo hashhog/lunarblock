@@ -42,6 +42,7 @@ local function parse_args(argv)
     zmqpubsequence = nil,
     zmqpubhwm = 1000,  -- ZMQ high water mark
     nov2transport = false,  -- Disable BIP324 v2 transport
+    peerbloomfilters = true, -- BIP-35 / NODE_BLOOM: advertise + service mempool
     import_blocks = nil,   -- Path to framed block file for import (or "-" for stdin)
     import_utxo = nil,     -- Path to HDOG UTXO snapshot file for AssumeUTXO import
   }
@@ -84,6 +85,7 @@ local function parse_args(argv)
       print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
+      print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 1)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
       print("      --version           Print version and exit")
@@ -140,6 +142,10 @@ local function parse_args(argv)
       args.jitverbose = true
     elseif arg == "--nov2transport" then
       args.nov2transport = true
+    elseif arg == "--peerbloomfilters" then
+      i = i + 1
+      local v = argv[i]
+      args.peerbloomfilters = (v == "1" or v == "true" or v == "yes" or v == "on")
     elseif arg == "--import-blocks" then
       i = i + 1
       args.import_blocks = argv[i]
@@ -689,6 +695,7 @@ local function main()
     maxpeers = args.maxpeers,
     max_outbound = (args.maxpeers == 0) and 0 or 8,
     nov2transport = args.nov2transport,
+    peerbloomfilters = args.peerbloomfilters,
     data_dir = datadir,
   })
   peer_manager.our_height = header_chain.header_tip_height
@@ -793,6 +800,50 @@ local function main()
     if not ok then
       peer_manager:add_ban_score(peer, 10, tostring(err))
     end
+  end)
+
+  -- BIP 35: respond to "mempool" by sending inv of every txid in our mempool.
+  -- Reference: bitcoin-core/src/net_processing.cpp ProcessMessage MEMPOOL handler
+  -- (the "Only process received mempool messages if we advertise NODE_BLOOM"
+  -- block).  We mirror that exactly: gate on the per-peer our_services flag,
+  -- disconnect the peer if they ask without us advertising NODE_BLOOM (Core's
+  -- "fDisconnect = true; return;" path), then enqueue all mempool entries via
+  -- the existing trickle queue so the actual sends are spread across ticks
+  -- and never block the single-threaded event loop on a giant walk.
+  local bit = require("bit")
+  peer_manager:register_handler("mempool", function(peer, _payload)
+    -- Gate: did *we* advertise NODE_BLOOM to this peer? (Core's m_our_services
+    -- check.)  Without it, Core treats the request as misbehavior and drops
+    -- the peer.  We follow the same policy.
+    local advertised_bloom = bit.band(peer.our_services or 0,
+                                      p2p.SERVICES.NODE_BLOOM) ~= 0
+    if not advertised_bloom then
+      peer:disconnect("mempool request with bloom filters disabled")
+      return
+    end
+
+    -- Walk the mempool once and queue every entry onto this peer's trickle
+    -- queue.  _process_trickle() drains MAX_INV_PER_MSG entries per tick, so
+    -- even a 30k-tx mempool fans out across the next few ticks without
+    -- starving the event loop.
+    local trickle_state = peer_manager._peer_trickle and
+                          peer_manager._peer_trickle[peer.ip .. ":" .. peer.port]
+    if not trickle_state then
+      -- Peer not yet established or already torn down — nothing to do.
+      return
+    end
+    local use_wtxid = peer.wtxid_relay
+    for _, entry in pairs(mempool.entries) do
+      local hash = use_wtxid and entry.wtxid or entry.txid
+      trickle_state.inv_queue[#trickle_state.inv_queue + 1] = {
+        hash = hash,
+        is_wtxid = use_wtxid,
+      }
+    end
+    -- Force the next trickle send to fire on the next tick rather than
+    -- waiting up to OUTBOUND_INTERVAL/INBOUND_INTERVAL seconds — BIP-35
+    -- semantics expect a prompt response.
+    trickle_state.next_send_time = 0
   end)
 
   -- BIP 152: Compact block message handlers

@@ -122,8 +122,9 @@ Peer.__index = Peer
 -- @param our_height number: our current blockchain height (optional)
 -- @param use_v2 boolean: use BIP324 v2 encrypted transport (optional, default true)
 -- @param proxy_config table: proxy configuration (optional)
+-- @param peerbloomfilters boolean: advertise NODE_BLOOM (BIP-35) (optional, default true)
 -- @return Peer: new peer object
-function M.new(ip, port, network, our_height, use_v2, proxy_config)
+function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfilters)
   local self = setmetatable({}, Peer)
   self.ip = ip
   self.port = port or (network and network.port) or 8333
@@ -166,6 +167,18 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config)
   self.handshake_start_time = 0   -- When connection started (for timeout)
   self.wtxid_relay = false        -- BIP 339: peer wants wtxid for tx relay
   self.send_addrv2 = false        -- BIP 155: peer supports addrv2
+  -- Services we advertised to this peer in our `version` message. Set in
+  -- start_handshake() (outbound) and handle_version() (inbound). Used to gate
+  -- BIP-35 mempool requests: Core only accepts mempool from peers when *we*
+  -- advertised NODE_BLOOM (net_processing.cpp ProcessMessage MEMPOOL handler).
+  self.our_services = 0
+  -- BIP-35 / NODE_BLOOM advertisement gate. Default true (matches Core's
+  -- -peerbloomfilters=1 default). Operators can disable via main.lua CLI.
+  if peerbloomfilters == nil then
+    self.peerbloomfilters = true
+  else
+    self.peerbloomfilters = peerbloomfilters and true or false
+  end
 
   -- Erlay (BIP330)
   self.erlay_enabled = false      -- True if Erlay was negotiated
@@ -586,15 +599,19 @@ function Peer:start_handshake()
 
   -- Generate random nonce for this connection
   self.nonce = math.random(1, 2^52)
+  -- Compute and remember the services we advertise (NODE_NETWORK|NODE_WITNESS,
+  -- plus NODE_BLOOM when --peerbloomfilters is enabled — see BIP-35 / Core
+  -- net_processing.cpp MEMPOOL handler).
+  self.our_services = p2p.our_services(self.peerbloomfilters)
   -- Send version message
   local payload = p2p.serialize_version({
     version = p2p.PROTOCOL_VERSION,
-    services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS),
+    services = self.our_services,
     timestamp = os.time(),
     recv_services = 0,
     recv_ip = self.ip,
     recv_port = self.port,
-    from_services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS),
+    from_services = self.our_services,
     from_ip = "0.0.0.0",
     from_port = 0,
     nonce = self.nonce,
@@ -642,14 +659,17 @@ function Peer:handle_version(payload)
   -- start_handshake(), so only do this for inbound connections.
   if self.inbound and self.state == M.STATE.CONNECTED then
     self.nonce = math.random(1, 2^52)
+    -- Track the services we advertise so the BIP-35 mempool handler can gate
+    -- on whether we promised NODE_BLOOM to this specific peer.
+    self.our_services = p2p.our_services(self.peerbloomfilters)
     local ver_payload = p2p.serialize_version({
       version = p2p.PROTOCOL_VERSION,
-      services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS),
+      services = self.our_services,
       timestamp = os.time(),
       recv_services = ver.services,
       recv_ip = self.ip,
       recv_port = self.port,
-      from_services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS),
+      from_services = self.our_services,
       from_ip = "0.0.0.0",
       from_port = 0,
       nonce = self.nonce,
