@@ -122,7 +122,7 @@ Peer.__index = Peer
 -- @param our_height number: our current blockchain height (optional)
 -- @param use_v2 boolean: use BIP324 v2 encrypted transport (optional, default true)
 -- @param proxy_config table: proxy configuration (optional)
--- @param peerbloomfilters boolean: advertise NODE_BLOOM (BIP-35) (optional, default true)
+-- @param peerbloomfilters boolean: advertise NODE_BLOOM (BIP-35) (optional, default false — matches Core)
 -- @return Peer: new peer object
 function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfilters)
   local self = setmetatable({}, Peer)
@@ -172,10 +172,11 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
   -- BIP-35 mempool requests: Core only accepts mempool from peers when *we*
   -- advertised NODE_BLOOM (net_processing.cpp ProcessMessage MEMPOOL handler).
   self.our_services = 0
-  -- BIP-35 / NODE_BLOOM advertisement gate. Default true (matches Core's
-  -- -peerbloomfilters=1 default). Operators can disable via main.lua CLI.
+  -- BIP-35 / NODE_BLOOM advertisement gate. Default false (matches Core's
+  -- DEFAULT_PEERBLOOMFILTERS=false in net_processing.h). Operators can
+  -- enable via main.lua CLI (--peerbloomfilters 1).
   if peerbloomfilters == nil then
-    self.peerbloomfilters = true
+    self.peerbloomfilters = false
   else
     self.peerbloomfilters = peerbloomfilters and true or false
   end
