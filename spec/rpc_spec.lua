@@ -507,6 +507,80 @@ describe("rpc", function()
     end)
   end)
 
+  describe("addnode", function()
+    -- Mock peer_manager that records every connect_peer call so we can
+    -- assert what use_v2_override the addnode RPC passed down.  No real
+    -- socket / peer state is created.
+    local function make_recording_peer_manager()
+      local pm = {
+        manual_peers = {},
+        peers = {},
+        network = {port = 8333},
+        connect_calls = {},
+        disconnect_calls = {},
+      }
+      pm.connect_peer = function(self, ip, port, skip_diversity, use_v2_override, is_manual)
+        self.connect_calls[#self.connect_calls + 1] = {
+          ip = ip,
+          port = port,
+          skip_diversity = skip_diversity,
+          use_v2_override = use_v2_override,
+          is_manual = is_manual,
+        }
+        return true
+      end
+      pm.disconnect_peer = function(self, p, reason)
+        self.disconnect_calls[#self.disconnect_calls + 1] = {peer = p, reason = reason}
+      end
+      return pm
+    end
+
+    it("does NOT force v1 for localhost onetry (defers to peerman default)", function()
+      local pm = make_recording_peer_manager()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+
+      local request = '{"method":"addnode","params":["127.0.0.1:51001","onetry"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.equal(cjson.null, decoded.error)
+      assert.equal(1, #pm.connect_calls)
+      assert.equal("127.0.0.1", pm.connect_calls[1].ip)
+      assert.equal(51001, pm.connect_calls[1].port)
+      -- Critical: no per-target v2 override; connect_peer falls through
+      -- to its config.nov2transport default (v2 by default).
+      assert.is_nil(pm.connect_calls[1].use_v2_override)
+    end)
+
+    it("does NOT force v1 for remote IP either (regression check)", function()
+      local pm = make_recording_peer_manager()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+
+      local request = '{"method":"addnode","params":["198.51.100.7:8333","onetry"],"id":1}'
+      server:handle_request(request)
+
+      assert.equal(1, #pm.connect_calls)
+      assert.is_nil(pm.connect_calls[1].use_v2_override)
+    end)
+
+    it("persists localhost peer in manual_peers without v2 override on add", function()
+      local pm = make_recording_peer_manager()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+
+      local request = '{"method":"addnode","params":["127.0.0.1:51003","add"],"id":1}'
+      server:handle_request(request)
+
+      local key = "127.0.0.1:51003"
+      local entry = pm.manual_peers[key]
+      assert.is_table(entry)
+      assert.equal("127.0.0.1", entry.ip)
+      assert.equal(51003, entry.port)
+      -- Reconnect loop reads this field — it must be nil so the loop
+      -- inherits the config default rather than pinning v1 forever.
+      assert.is_nil(entry.use_v2_override)
+    end)
+  end)
+
   describe("RPC error codes", function()
     it("defines standard JSON-RPC error codes", function()
       assert.equal(-32700, rpc.ERROR.PARSE_ERROR)

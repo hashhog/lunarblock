@@ -1582,8 +1582,15 @@ function RPCServer:register_methods()
   -- Manual peer control — minimal Bitcoin Core `addnode` parity.  Supports
   -- "onetry" and "add" (both initiate an outbound connection) and "remove"
   -- (disconnect + forget).  Used by the hashhog localhost IBD mesh (see
-  -- memory/project_local_peer_ibd_setup.md).  Localhost targets default to
-  -- BIP324 v1 because rustoshi / haskoin / hotbuns don't all speak v2.
+  -- memory/project_local_peer_ibd_setup.md).
+  --
+  -- BIP324 v2 negotiation: addnode follows the same path as automatic
+  -- outbound peers — `connect_peer` defaults to v2 unless the node was
+  -- launched with `--nov2transport`, identical to the inbound responder
+  -- path in `accept_inbound`.  The previous always-on localhost v1 force
+  -- was a debugging artifact from when not every fleet sibling spoke v2;
+  -- operators who still want it can pass `--nov2transport` (global) and
+  -- rustoshi/haskoin/hotbuns inbounds will negotiate v1 the same way.
   self.methods["addnode"] = function(rpc, params)
     local node = params and params[1]
     local command = params and params[2]
@@ -1601,9 +1608,10 @@ function RPCServer:register_methods()
     if not port or port == 0 then
       port = rpc.peer_manager.network and rpc.peer_manager.network.port or 8333
     end
-    local is_localhost = (ip == "127.0.0.1" or ip == "::1" or ip == "localhost")
+    -- Defer to connect_peer's default (config.nov2transport).  No
+    -- per-target override — keeps the negotiation path identical for
+    -- localhost and remote targets, matching the inbound side.
     local use_v2_override = nil
-    if is_localhost then use_v2_override = false end
     local key = ip .. ":" .. port
     if command == "add" then
       -- Persist: register in manual_peers so the tick-level
