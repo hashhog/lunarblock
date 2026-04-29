@@ -33,6 +33,32 @@ M.MAX_PAYLOAD_LEN = 4000000
 M.IGNORE_BIT = 0x80            -- Decoy packet flag
 
 --------------------------------------------------------------------------------
+-- V1 / V2 prefix classification
+--------------------------------------------------------------------------------
+
+-- Length of the prefix needed to disambiguate v1 from v2 on the wire.
+-- 16 bytes covers the v1 message-header magic (4 B) + command (12 B); the
+-- v2 ElligatorSwift pubkey is 64 random bytes whose first 16 collide with
+-- the v1 "<magic>version\0\0\0\0\0" prefix only with probability ~2^-96.
+M.V1_PREFIX_LEN = 16
+
+--- Return true iff the first 16 bytes of a freshly-accepted TCP stream
+--- look like the v1 wire prefix (network magic + "version\0\0\0\0\0").
+--- Mirrors V2Transport's internal classifier so peer.lua can peek-and-
+--- classify before deciding whether to send v2 ellswift bytes (we MUST
+--- avoid sending v2 garbage to a v1-only peer; the 64 bytes will be
+--- mis-parsed as a v1 header and the peer will ban us).
+-- @param data string: first 16 (or more) bytes received from peer
+-- @return boolean: true if this looks like v1
+function M.looks_like_v1(data)
+  if not data or #data < 16 then return false end
+  -- Bytes 5-16 must match the v1 command field "version\0\0\0\0\0".
+  -- We do not check magic explicitly — the chance of a random ellswift
+  -- pubkey collision with these 12 specific bytes is ~2^-96.
+  return data:sub(5, 16) == "version\0\0\0\0\0"
+end
+
+--------------------------------------------------------------------------------
 -- Short Message Type IDs (BIP324)
 --------------------------------------------------------------------------------
 
@@ -559,16 +585,10 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
     return self.cipher.session_id
   end
 
-  --- Check if the first 16 bytes look like a v1 message.
-  -- V1 prefix: magic (4 bytes) + "version" + null padding
-  -- @param data string: first 16 bytes received
-  -- @return boolean: true if this looks like v1
-  local function looks_like_v1(data)
-    if #data < 16 then return false end
-    -- Check if bytes 5-16 match "version\0\0\0\0\0"
-    local expected_cmd = "version\0\0\0\0\0"
-    return data:sub(5, 16) == expected_cmd
-  end
+  -- Local alias to the module-level v1 classifier.  Hoisted to module level
+  -- so peer.lua can reuse the exact same heuristic when peeking inbound
+  -- bytes (see M.looks_like_v1).
+  local looks_like_v1 = M.looks_like_v1
 
   --- Process received bytes.
   -- @param data string: received bytes
