@@ -909,7 +909,8 @@ function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override, is_
   else
     use_v2 = not self.config.nov2transport
   end
-  local p = peer_mod.new(ip, port, self.network, self.our_height, use_v2, self.proxy_config)
+  local p = peer_mod.new(ip, port, self.network, self.our_height, use_v2, self.proxy_config,
+                         self.config.peerbloomfilters)
   -- Register all our message handlers
   for cmd, handler in pairs(self.message_handlers) do
     p:on(cmd, handler)
@@ -1366,7 +1367,8 @@ function PeerManager:accept_inbound()
   end
 
   local inbound_v2 = not self.config.nov2transport
-  local p = peer_mod.new(ip, port, self.network, self.our_height, inbound_v2)
+  local p = peer_mod.new(ip, port, self.network, self.our_height, inbound_v2, nil,
+                         self.config.peerbloomfilters)
   p.socket = client
   p.state = peer_mod.STATE.CONNECTED
   p.inbound = true

@@ -833,4 +833,147 @@ describe("peer", function()
       assert.is_nil(peer_module.PRE_HANDSHAKE_ALLOWED.block)
     end)
   end)
+
+  describe("BIP-35 NODE_BLOOM advertisement and mempool dispatch", function()
+    local bit = require("bit")
+    local bip324 = require("lunarblock.bip324")
+
+    local mock_socket = function()
+      return setmetatable({sent = {}, closed = false}, {
+        __index = function(t, key)
+          if key == "receive" then
+            return function() return nil, "timeout", "" end
+          end
+          if key == "send" then
+            return function(_, data) t.sent[#t.sent + 1] = data; return #data end
+          end
+          if key == "close" then
+            return function(_) t.closed = true end
+          end
+        end
+      })
+    end
+
+    it("p2p.our_services advertises NODE_NETWORK|NODE_WITNESS|NODE_BLOOM by default", function()
+      local s = p2p.our_services(true)
+      assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_NETWORK) ~= 0)
+      assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_WITNESS) ~= 0)
+      assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_BLOOM) ~= 0)
+      -- 0x0d = 1 | 4 | 8
+      assert.equal(0x0d, s)
+    end)
+
+    it("p2p.our_services drops NODE_BLOOM when peerbloomfilters=false", function()
+      local s = p2p.our_services(false)
+      assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_NETWORK) ~= 0)
+      assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_WITNESS) ~= 0)
+      assert.equal(0, bit.band(s, p2p.SERVICES.NODE_BLOOM))
+      -- 0x09 = 1 | 8
+      assert.equal(0x09, s)
+    end)
+
+    it("Peer.new defaults peerbloomfilters to true", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      assert.is_true(p.peerbloomfilters)
+    end)
+
+    it("Peer.new accepts peerbloomfilters=false", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet, 0, false, nil, false)
+      assert.is_false(p.peerbloomfilters)
+    end)
+
+    it("start_handshake stores our_services with NODE_BLOOM when enabled", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.peerbloomfilters = true
+      -- Sock-only mock so send_message can call :send and capture bytes
+      local sent = {}
+      p.socket = setmetatable({}, {
+        __index = function(_, key)
+          if key == "send" then
+            return function(_, data) sent[#sent + 1] = data; return #data end
+          end
+          if key == "receive" then
+            return function() return nil, "timeout", "" end
+          end
+        end
+      })
+      p.state = peer_module.STATE.CONNECTED
+      p:start_handshake()
+      assert.is_truthy(bit.band(p.our_services, p2p.SERVICES.NODE_BLOOM) ~= 0)
+      assert.equal(0x0d, p.our_services)
+    end)
+
+    it("start_handshake omits NODE_BLOOM when peerbloomfilters=false", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet, 0, false, nil, false)
+      p.socket = setmetatable({}, {
+        __index = function(_, key)
+          if key == "send" then return function(_, data) return #data end end
+          if key == "receive" then return function() return nil, "timeout", "" end end
+        end
+      })
+      p.state = peer_module.STATE.CONNECTED
+      p:start_handshake()
+      assert.equal(0, bit.band(p.our_services, p2p.SERVICES.NODE_BLOOM))
+      assert.equal(0x09, p.our_services)
+    end)
+
+    it("BIP-324 v2 maps mempool to short ID 15 in both directions", function()
+      assert.equal(15, bip324.MESSAGE_MAP["mempool"])
+      assert.equal("mempool", bip324.MESSAGE_IDS[15])
+      -- encode/decode round-trip via short ID
+      local encoded = bip324.encode_message("mempool", "")
+      assert.equal(string.char(15), encoded)
+      local cmd, payload = bip324.decode_message(encoded)
+      assert.equal("mempool", cmd)
+      assert.equal("", payload)
+    end)
+
+    it("dispatches mempool to a registered handler after handshake (v1 path)", function()
+      local p = peer_module.new("127.0.0.1", 8333, mainnet)
+      p.state = peer_module.STATE.ESTABLISHED
+      p.handshake_complete = true
+      p.version_received = true
+      p.our_services = p2p.our_services(true)
+
+      local got = {peer_seen = nil, payload_seen = nil}
+      p:on("mempool", function(peer, payload)
+        got.peer_seen = peer
+        got.payload_seen = payload
+      end)
+
+      local msg = p2p.make_message(mainnet.magic_bytes, "mempool", "")
+      p.recv_buffer = msg
+      p.socket = mock_socket()
+
+      p:process_messages()
+      assert.equal(p, got.peer_seen)
+      assert.equal("", got.payload_seen)
+    end)
+
+    it("a mempool handler can disconnect when our_services lacks NODE_BLOOM", function()
+      -- Mirrors the gating logic registered in main.lua so we can verify the
+      -- gate works without spinning up the whole node.
+      local p = peer_module.new("127.0.0.1", 8333, mainnet, 0, false, nil, false)
+      local sock = mock_socket()
+      p.state = peer_module.STATE.ESTABLISHED
+      p.handshake_complete = true
+      p.version_received = true
+      p.our_services = p2p.our_services(false)  -- no NODE_BLOOM
+      p.socket = sock
+
+      p:on("mempool", function(peer, _payload)
+        local has_bloom = bit.band(peer.our_services or 0, p2p.SERVICES.NODE_BLOOM) ~= 0
+        if not has_bloom then
+          peer:disconnect("mempool request with bloom filters disabled")
+        end
+      end)
+
+      local msg = p2p.make_message(mainnet.magic_bytes, "mempool", "")
+      p.recv_buffer = msg
+      p:process_messages()
+      assert.equal(peer_module.STATE.DISCONNECTED, p.state)
+      assert.equal("mempool request with bloom filters disabled", p.disconnect_reason)
+      assert.is_true(sock.closed)
+    end)
+  end)
 end)
