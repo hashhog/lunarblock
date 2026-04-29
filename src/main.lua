@@ -42,7 +42,7 @@ local function parse_args(argv)
     zmqpubsequence = nil,
     zmqpubhwm = 1000,  -- ZMQ high water mark
     nov2transport = false,  -- Disable BIP324 v2 transport
-    peerbloomfilters = true, -- BIP-35 / NODE_BLOOM: advertise + service mempool
+    peerbloomfilters = false, -- BIP-35 / NODE_BLOOM: matches Core DEFAULT_PEERBLOOMFILTERS=false (net_processing.h)
     import_blocks = nil,   -- Path to framed block file for import (or "-" for stdin)
     import_utxo = nil,     -- Path to HDOG UTXO snapshot file for AssumeUTXO import
   }
@@ -85,7 +85,7 @@ local function parse_args(argv)
       print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
-      print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 1)")
+      print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
       print("      --version           Print version and exit")
