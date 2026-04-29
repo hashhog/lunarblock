@@ -872,9 +872,9 @@ describe("peer", function()
       assert.equal(0x09, s)
     end)
 
-    it("Peer.new defaults peerbloomfilters to true", function()
+    it("Peer.new defaults peerbloomfilters to false (matches Core DEFAULT_PEERBLOOMFILTERS)", function()
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
-      assert.is_true(p.peerbloomfilters)
+      assert.is_false(p.peerbloomfilters)
     end)
 
     it("Peer.new accepts peerbloomfilters=false", function()
