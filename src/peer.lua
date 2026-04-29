@@ -181,6 +181,10 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config)
   self.v2_transport = nil         -- V2Transport object (created on connect)
   self.v2_active = false          -- True when v2 encryption is active
   self.v2_handshake_done = false  -- True after v2 crypto handshake complete
+  self.v2_handshake_started = false -- Inbound: peeked + classified prefix.
+                                    -- One-shot guard so drive_inbound_v2_handshake
+                                    -- doesn't re-peek after we've sent our pubkey
+                                    -- or fallen back to v1.
   self.session_id = nil           -- BIP324 session ID (32 bytes)
 
   -- Proxy configuration
@@ -331,6 +335,88 @@ function Peer:process_v2_handshake()
   end
 
   return false  -- Need more data
+end
+
+--- Drive the BIP-324 v2 handshake from the responder (inbound) side.
+-- Called from process_messages when the peer is inbound, in state
+-- CONNECTED, with a v2_transport already constructed (responder mode)
+-- but not yet started.  The first 16 bytes from the wire are used to
+-- distinguish v1 from v2:
+--   * v1 prefix (network magic + "version\0\0\0\0\0"): tear down
+--     v2_transport, leave the bytes in recv_buffer, and let
+--     process_messages fall through to the v1 path.
+--   * otherwise: send our 64-byte ellswift pubkey + garbage and
+--     transition to STATE.V2_KEY_SENT so subsequent ticks drive the
+--     existing v2 state machine (process_v2_handshake) to completion.
+-- Critically, we do NOT send any v2 bytes until we've classified —
+-- a v1 peer would interpret the 64 random bytes as a v1 message
+-- header, almost certainly disconnect, and may add us to its banlist.
+-- Reference: clearbit/src/peer.zig:899-930 (peek-then-construct).
+-- @return boolean: true if classification advanced (always non-fatal here)
+function Peer:drive_inbound_v2_handshake()
+  if not self.v2_transport then return false end
+  if not self.inbound then return false end
+  if self.v2_handshake_started then return false end
+
+  -- Read whatever the kernel has buffered (non-blocking).
+  local data, err, partial = self.socket:receive(65536)
+  data = data or partial
+  if data and #data > 0 then
+    self.recv_buffer = self.recv_buffer .. data
+    self.last_recv = socket.gettime()
+    self.bytes_recv = self.bytes_recv + #data
+  elseif err == "closed" then
+    self:disconnect("connection closed by peer")
+    return false
+  end
+
+  -- Need at least V1_PREFIX_LEN bytes to classify.
+  if #self.recv_buffer < bip324.V1_PREFIX_LEN then
+    return false  -- wait for more data on a future tick
+  end
+
+  -- Peek (do not consume) the first 16 bytes to classify.
+  local prefix = self.recv_buffer:sub(1, bip324.V1_PREFIX_LEN)
+  if bip324.looks_like_v1(prefix) then
+    -- Peer is v1-only.  Tear down v2 and let the v1 path in
+    -- recv_messages() consume the bytes still in recv_buffer.
+    io.stderr:write(string.format(
+      "[%s] V2DIAG inbound peer=%s:%s classified=v1 (no v2 bytes sent)\n",
+      os.date("!%Y-%m-%dT%H:%M:%SZ"),
+      tostring(self.ip), tostring(self.port)))
+    io.stderr:flush()
+    self.use_v2 = false
+    self.v2_transport = nil
+    self.v2_handshake_started = true   -- one-shot: don't re-classify
+    -- recv_buffer keeps the v1 prefix; v1 message parser will pick it up.
+    return true
+  end
+
+  -- Looks like a v2 ellswift pubkey.  Send our pubkey+garbage now and
+  -- transition to V2_KEY_SENT so process_messages routes future ticks
+  -- through the existing v2 driver (which calls process_v2_handshake).
+  local handshake_bytes = self.v2_transport:get_handshake_bytes()
+  if not handshake_bytes or #handshake_bytes == 0 then
+    -- Shouldn't happen on a fresh responder-mode V2Transport (send_state
+    -- is MAYBE_V1, get_handshake_bytes returns key+garbage).  Defensive.
+    self:disconnect("v2 inbound: empty handshake bytes")
+    return false
+  end
+  local sent, send_err = self.socket:send(handshake_bytes)
+  if not sent then
+    self:disconnect("v2 inbound handshake send failed: " .. (send_err or "unknown"))
+    return false
+  end
+  self.last_send = socket.gettime()
+  self.bytes_sent = self.bytes_sent + #handshake_bytes
+  self.v2_handshake_started = true
+  self.state = M.STATE.V2_KEY_SENT
+  io.stderr:write(string.format(
+    "[%s] V2DIAG inbound peer=%s:%s classified=v2 sent_pubkey+garbage=%dB\n",
+    os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    tostring(self.ip), tostring(self.port), #handshake_bytes))
+  io.stderr:flush()
+  return true
 end
 
 --- Disconnect from the peer.
@@ -641,6 +727,23 @@ end
 -- Enforces pre-handshake filtering per Bitcoin Core net_processing.cpp.
 -- @return table: list of processed messages
 function Peer:process_messages()
+  -- Inbound v2 peek-and-classify: an inbound peer accepted with v2 enabled
+  -- starts in STATE.CONNECTED with a responder-mode v2_transport but has
+  -- NOT yet sent any bytes on the wire.  drive_inbound_v2_handshake reads
+  -- up to 16 bytes, decides v1 vs v2, and either tears down v2_transport
+  -- (v1 fallback, recv_buffer left intact for the v1 parser) or sends our
+  -- ellswift pubkey + garbage and transitions to STATE.V2_KEY_SENT (which
+  -- the block below then drives).  This must run BEFORE the v2-state
+  -- branch so a freshly-accepted inbound peer enters the cipher handshake.
+  if self.state == M.STATE.CONNECTED and self.inbound
+     and self.use_v2 and self.v2_transport
+     and not self.v2_active and not self.v2_handshake_started then
+    self:drive_inbound_v2_handshake()
+    if self.state == M.STATE.DISCONNECTED then return {} end
+    -- If we sent our key, fall through to V2_KEY_SENT processing this tick;
+    -- otherwise (v1 fallback OR still waiting for 16 B) continue below.
+  end
+
   -- Handle v2 handshake states
   if self.state == M.STATE.V2_KEY_SENT or
      self.state == M.STATE.V2_KEY_RECV or
@@ -663,8 +766,16 @@ function Peer:process_messages()
       return {}  -- Disconnected
     end
     if complete then
-      -- Handshake complete (v2 or v1 fallback), now start version handshake
-      self:start_handshake()
+      -- Handshake complete (v2 or v1 fallback).  For OUTBOUND peers we
+      -- now drive the application version handshake (we initiate version).
+      -- For INBOUND peers we wait for the peer to send version first;
+      -- handle_version() will reply with our version + verack per the
+      -- existing inbound version handler (line ~557).  Calling
+      -- start_handshake() on an inbound peer would send version
+      -- prematurely and break the responder ordering.
+      if not self.inbound then
+        self:start_handshake()
+      end
     end
     return {}  -- No application messages yet
   end

@@ -3,6 +3,7 @@ local peer_mod = require("lunarblock.peer")
 local p2p = require("lunarblock.p2p")
 local crypto = require("lunarblock.crypto")
 local proxy_mod = require("lunarblock.proxy")
+local bip324 = require("lunarblock.bip324")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -1369,7 +1370,26 @@ function PeerManager:accept_inbound()
   p.socket = client
   p.state = peer_mod.STATE.CONNECTED
   p.inbound = true
+  -- conn_time / handshake_start_time are normally set by Peer:connect (the
+  -- outbound TCP connect path); inbound peers bypass that, so initialize
+  -- them here to keep the handshake-timeout watchdog (peer.lua check_timeouts)
+  -- correct and getpeerinfo.conntime sane.
+  p.conn_time = socket.gettime()
+  p.last_recv = socket.gettime()
+  p.handshake_start_time = socket.gettime()
   client:settimeout(0)
+
+  -- BIP-324 v2 inbound: build a responder-mode V2Transport now so the
+  -- transport state machine has its keypair/garbage prepared.  The actual
+  -- decision to *send* our 64-byte ellswift pubkey is deferred to
+  -- Peer:drive_inbound_v2_handshake() which first peeks 16 bytes to
+  -- distinguish v1 from v2 (sending v2 garbage on a v1-only peer would
+  -- corrupt the v1 framing on the remote and get us banned).  See
+  -- W82-style inbound v2 plumbing in clearbit/peer.zig:899-930.
+  if inbound_v2 then
+    p.v2_transport = bip324.V2Transport(
+      self.network.magic_bytes, false, ip, port)
+  end
 
   for cmd, handler in pairs(self.message_handlers) do
     p:on(cmd, handler)
