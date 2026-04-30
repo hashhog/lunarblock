@@ -1969,4 +1969,71 @@ describe("mempool", function()
     end)
   end)
 
+  describe("MAX_STANDARD_TX_WEIGHT (relay policy)", function()
+    -- Bitcoin Core: policy/policy.h:38 — MAX_STANDARD_TX_WEIGHT = 400_000.
+    -- Tx weight greater than this is non-standard.  Block consensus permits
+    -- up to MAX_BLOCK_WEIGHT (4_000_000); the cap below is policy only.
+    it("exposes MAX_STANDARD_TX_WEIGHT = 400_000", function()
+      assert.equal(400000, mempool.MAX_STANDARD_TX_WEIGHT)
+    end)
+
+    it("rejects a transaction that exceeds MAX_STANDARD_TX_WEIGHT", function()
+      local prev_txid = types.hash256(string.rep("\x42", 32))
+      local prev_txid_hex = types.hash256_hex(prev_txid)
+      local chain_state = make_mock_chain_state()
+      add_utxo(chain_state, prev_txid_hex, 0, 100000)
+      local mp = mempool.new(chain_state)
+
+      -- Build an oversized tx by stuffing scriptSig with junk.  Each
+      -- scriptSig byte counts as 4 weight (non-witness).  ~110 KB of
+      -- scriptSig blows past the 400_000 weight cap on its own.
+      local tx = make_tx(1, {}, {}, 0)
+      tx.inputs[1] = types.txin(types.outpoint(prev_txid, 0),
+        string.rep("\x00", 110000), 0xFFFFFFFE)
+      tx.outputs[1] = make_output(90000)
+
+      assert.is_true(validation.get_tx_weight(tx) > mempool.MAX_STANDARD_TX_WEIGHT)
+
+      local ok, err = mp:accept_transaction(tx)
+      assert.is_false(ok)
+      assert.truthy(err:match("^tx%-size:"))
+    end)
+
+    it("accepts a transaction at the MAX_STANDARD_TX_WEIGHT threshold", function()
+      -- A small, normal tx is well under 400k weight; sanity-check that
+      -- the policy cap does not block normal traffic.
+      local prev_txid = types.hash256(string.rep("\x43", 32))
+      local prev_txid_hex = types.hash256_hex(prev_txid)
+      local chain_state = make_mock_chain_state()
+      add_utxo(chain_state, prev_txid_hex, 0, 100000)
+      local mp = mempool.new(chain_state)
+
+      local tx = make_tx(1, {}, {}, 0)
+      tx.inputs[1] = make_input(prev_txid, 0)
+      tx.outputs[1] = make_output(90000)
+
+      assert.is_true(validation.get_tx_weight(tx) <= mempool.MAX_STANDARD_TX_WEIGHT)
+
+      local ok = mp:accept_transaction(tx)
+      assert.is_true(ok)
+    end)
+
+    it("accept_package rejects an oversized tx in a package", function()
+      local prev_txid = types.hash256(string.rep("\x44", 32))
+      local prev_txid_hex = types.hash256_hex(prev_txid)
+      local chain_state = make_mock_chain_state()
+      add_utxo(chain_state, prev_txid_hex, 0, 100000)
+      local mp = mempool.new(chain_state)
+
+      local tx = make_tx(1, {}, {}, 0)
+      tx.inputs[1] = types.txin(types.outpoint(prev_txid, 0),
+        string.rep("\x00", 110000), 0xFFFFFFFE)
+      tx.outputs[1] = make_output(90000)
+
+      local ok, err = mp:accept_package({ tx })
+      assert.is_false(ok)
+      assert.truthy(err:match("^tx%-size:"))
+    end)
+  end)
+
 end)
