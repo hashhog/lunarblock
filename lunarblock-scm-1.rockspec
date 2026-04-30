@@ -42,6 +42,7 @@ build = {
     ["lunarblock.fee"] = "src/fee.lua",
     ["lunarblock.perf"] = "src/perf.lua",
     ["lunarblock.prune"] = "src/prune.lua",
+    ["lunarblock.ops"] = "src/ops.lua",
     ["lunarblock.sha256_accel"] = {
       sources = {"csrc/sha256_accel.c"},
       libraries = {"crypto"},
