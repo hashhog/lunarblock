@@ -1257,6 +1257,50 @@ function RPCServer:register_methods()
     return result
   end
 
+  -- Bitcoin Core-compatible mempool.dat dump/load.
+  -- See bitcoin-core/src/node/mempool_persist.cpp for the on-disk format.
+  -- The file lives at <datadir>/mempool.dat by convention; an explicit
+  -- absolute path may be passed as params[1].
+  self.methods["dumpmempool"] = function(rpc, params)
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+    if not rpc.datadir then
+      error({code = M.ERROR.MISC_ERROR, message = "Datadir not configured"})
+    end
+    local mempool_persist_mod = require("lunarblock.mempool_persist")
+    local path = (params and params[1]) or (rpc.datadir .. "/mempool.dat")
+    local ok, count_or_err = mempool_persist_mod.dump(rpc.mempool, path)
+    if not ok then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Could not dump mempool: " .. tostring(count_or_err)})
+    end
+    return { filename = path, count = count_or_err }
+  end
+
+  self.methods["loadmempool"] = function(rpc, params)
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+    if not rpc.datadir then
+      error({code = M.ERROR.MISC_ERROR, message = "Datadir not configured"})
+    end
+    local mempool_persist_mod = require("lunarblock.mempool_persist")
+    local path = (params and params[1]) or (rpc.datadir .. "/mempool.dat")
+    local ok, stats = mempool_persist_mod.load(rpc.mempool, path)
+    if not ok then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Could not load mempool: " .. tostring(stats)})
+    end
+    return {
+      filename = path,
+      accepted = stats.count or 0,
+      failed = stats.failed or 0,
+      expired = stats.expired or 0,
+      already_there = stats.already_there or 0,
+    }
+  end
+
   -- Transaction methods
   self.methods["sendrawtransaction"] = function(rpc, params)
     local hex = params[1]
