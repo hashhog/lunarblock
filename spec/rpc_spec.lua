@@ -2981,4 +2981,349 @@ describe("rpc", function()
     end)
   end)
 
+  -----------------------------------------------------------------------------
+  -- BIP-137 "Bitcoin Signed Message" sign/verify
+  -- Bitcoin Core ref: src/common/signmessage.cpp + src/rpc/signmessage.cpp
+  -----------------------------------------------------------------------------
+  describe("signmessage / verifymessage (BIP-137)", function()
+    local crypto = require("lunarblock.crypto")
+    local addr_mod = require("lunarblock.address")
+
+    local function make_keypair()
+      local privkey = string.rep("\x07", 32)
+      local pubkey = assert(crypto.pubkey_from_privkey(privkey, true))
+      local address = addr_mod.pubkey_to_p2pkh(pubkey, "mainnet")
+      return privkey, pubkey, address
+    end
+
+    it("signmessagewithprivkey + verifymessage roundtrip", function()
+      local privkey, _, address = make_keypair()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(cjson.encode({
+        method = "signmessagewithprivkey",
+        params = {rpc.hex_encode(privkey), "hashhog"},
+        id = 1,
+      }))
+      local sign_resp = cjson.decode(body)
+      assert.equal(cjson.null, sign_resp.error)
+      assert.is_string(sign_resp.result)
+
+      local body2 = server:handle_request(cjson.encode({
+        method = "verifymessage",
+        params = {address, sign_resp.result, "hashhog"},
+        id = 2,
+      }))
+      local verify_resp = cjson.decode(body2)
+      assert.equal(cjson.null, verify_resp.error)
+      assert.is_true(verify_resp.result)
+    end)
+
+    it("verifymessage returns false for tampered message", function()
+      local privkey, _, address = make_keypair()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local sign_body = server:handle_request(cjson.encode({
+        method = "signmessagewithprivkey",
+        params = {rpc.hex_encode(privkey), "hashhog"},
+        id = 1,
+      }))
+      local sig_resp = cjson.decode(sign_body)
+      local body = server:handle_request(cjson.encode({
+        method = "verifymessage",
+        params = {address, sig_resp.result, "tampered"},
+        id = 2,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_false(resp.result)
+    end)
+
+    it("verifymessage rejects non-P2PKH address", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      -- bc1q... segwit address (P2WPKH); valid encoding, wrong type for BIP-137
+      local body = server:handle_request(cjson.encode({
+        method = "verifymessage",
+        params = {"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                  "msg"},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.TYPE_ERROR, resp.error.code)
+    end)
+
+    it("verifymessage rejects malformed base64 signature", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(cjson.encode({
+        method = "verifymessage",
+        params = {"1FvyAqqELFiQyaEWdhFbWF8MZapKPZS8J7", "tooshort", "msg"},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.TYPE_ERROR, resp.error.code)
+    end)
+
+    it("signmessage by address returns WALLET_ERROR (no keystore wired)", function()
+      local _, _, address = make_keypair()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(cjson.encode({
+        method = "signmessage",
+        params = {address, "msg"},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.WALLET_ERROR, resp.error.code)
+    end)
+
+    it("signmessage falls through to privkey form when first arg is hex privkey", function()
+      local privkey, _, address = make_keypair()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local sign_body = server:handle_request(cjson.encode({
+        method = "signmessage",
+        params = {rpc.hex_encode(privkey), "fallthrough"},
+        id = 1,
+      }))
+      local sig_resp = cjson.decode(sign_body)
+      assert.equal(cjson.null, sig_resp.error)
+      local verify_body = server:handle_request(cjson.encode({
+        method = "verifymessage",
+        params = {address, sig_resp.result, "fallthrough"},
+        id = 2,
+      }))
+      local verify = cjson.decode(verify_body)
+      assert.is_true(verify.result)
+    end)
+  end)
+
+  -----------------------------------------------------------------------------
+  -- estimaterawfee
+  -- Bitcoin Core ref: src/rpc/fees.cpp::estimaterawfee
+  -----------------------------------------------------------------------------
+  describe("estimaterawfee", function()
+    it("returns short/medium/long horizon entries with errors when no estimator", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(
+        '{"method":"estimaterawfee","params":[6],"id":1}')
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_table(resp.result.short)
+      assert.is_table(resp.result.medium)
+      assert.is_table(resp.result.long)
+      -- Each horizon must have an errors field when fee_estimator is missing.
+      assert.is_table(resp.result.short.errors)
+    end)
+
+    it("rejects non-numeric conf_target", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(
+        '{"method":"estimaterawfee","params":["six"],"id":1}')
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+    end)
+
+    it("clamps conf_target to [1, 1008]", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      -- 99999 -> clamped to 1008; should still return a valid result.
+      local body = server:handle_request(
+        '{"method":"estimaterawfee","params":[99999],"id":1}')
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_table(resp.result.short)
+    end)
+  end)
+
+  -----------------------------------------------------------------------------
+  -- savemempool (alias for dumpmempool, returns only filename)
+  -----------------------------------------------------------------------------
+  describe("savemempool", function()
+    local mempool = require("lunarblock.mempool")
+
+    local function tmpdir()
+      local dir = os.tmpname() .. "_lb_savemempool"
+      os.execute("mkdir -p " .. dir)
+      return dir
+    end
+
+    local function build_mempool_with_one_tx()
+      local prev_txid = types.hash256(string.rep("\xab", 32))
+      local prev_hex = types.hash256_hex(prev_txid)
+      local mock_coin_view = {
+        utxos = {
+          [prev_hex .. ":0"] = {
+            value = 100000,
+            script_pubkey = string.rep("\x00", 25),
+            height = 500000,
+            is_coinbase = false,
+          },
+        },
+        get = function(self, txid, vout)
+          return self.utxos[types.hash256_hex(txid) .. ":" .. vout]
+        end,
+      }
+      local chain_state = { coin_view = mock_coin_view, tip_height = 700000 }
+      local mp = mempool.new(chain_state)
+      local tx = types.transaction(1,
+        { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFE) },
+        { types.txout(90000, string.rep("\x00", 25)) },
+        0)
+      assert(mp:accept_transaction(tx))
+      return mp
+    end
+
+    it("writes mempool.dat and returns the filename", function()
+      local mp = build_mempool_with_one_tx()
+      local dir = tmpdir()
+      finally(function() os.execute("rm -rf " .. dir) end)
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        mempool = mp,
+        datadir = dir,
+      })
+      local body = server:handle_request(
+        '{"method":"savemempool","params":[],"id":1}')
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(dir .. "/mempool.dat", resp.result.filename)
+      local f = io.open(dir .. "/mempool.dat", "rb")
+      assert.is_not_nil(f)
+      f:close()
+    end)
+
+    it("errors when mempool is not configured", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(
+        '{"method":"savemempool","params":[],"id":1}')
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+  end)
+
+  -----------------------------------------------------------------------------
+  -- getmempoolentry / getmempoolancestors / getmempooldescendants
+  -----------------------------------------------------------------------------
+  describe("getmempoolentry / getmempoolancestors / getmempooldescendants", function()
+    local mempool = require("lunarblock.mempool")
+    local validation = require("lunarblock.validation")
+
+    local function build_chain_with_two_tx()
+      -- Set up a UTXO and accept tx1 spending it; then accept tx2 spending tx1.
+      -- That creates an in-mempool ancestor/descendant edge tx1 <- tx2.
+      local prev_txid = types.hash256(string.rep("\xcd", 32))
+      local prev_hex = types.hash256_hex(prev_txid)
+      local script_pk = string.rep("\x00", 25)
+      local mock_coin_view = {
+        utxos = {
+          [prev_hex .. ":0"] = {
+            value = 100000,
+            script_pubkey = script_pk,
+            height = 500000,
+            is_coinbase = false,
+          },
+        },
+        get = function(self, txid, vout)
+          return self.utxos[types.hash256_hex(txid) .. ":" .. vout]
+        end,
+      }
+      local chain_state = { coin_view = mock_coin_view, tip_height = 700000 }
+      local mp = mempool.new(chain_state)
+
+      local tx1 = types.transaction(1,
+        { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFE) },
+        { types.txout(80000, script_pk) },
+        0)
+      assert(mp:accept_transaction(tx1))
+      local tx1_id = validation.compute_txid(tx1)
+      local tx1_hex = types.hash256_hex(tx1_id)
+
+      local tx2 = types.transaction(1,
+        { types.txin(types.outpoint(tx1_id, 0), "", 0xFFFFFFFE) },
+        { types.txout(60000, script_pk) },
+        0)
+      assert(mp:accept_transaction(tx2))
+      local tx2_hex = types.hash256_hex(validation.compute_txid(tx2))
+
+      return mp, tx1_hex, tx2_hex
+    end
+
+    it("getmempoolentry returns the entry for an in-mempool tx", function()
+      local mp, tx1_hex, _ = build_chain_with_two_tx()
+      local server = rpc.new({network = consensus.networks.mainnet, mempool = mp})
+      local body = server:handle_request(cjson.encode({
+        method = "getmempoolentry", params = {tx1_hex}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_number(resp.result.vsize)
+      assert.is_number(resp.result.weight)
+      assert.is_number(resp.result.fee)
+    end)
+
+    it("getmempoolentry rejects unknown txid", function()
+      local mp = build_chain_with_two_tx()
+      local server = rpc.new({network = consensus.networks.mainnet, mempool = mp})
+      local body = server:handle_request(cjson.encode({
+        method = "getmempoolentry", params = {string.rep("0", 64)}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+
+    it("getmempoolancestors returns parent txid (non-verbose)", function()
+      local mp, tx1_hex, tx2_hex = build_chain_with_two_tx()
+      local server = rpc.new({network = consensus.networks.mainnet, mempool = mp})
+      local body = server:handle_request(cjson.encode({
+        method = "getmempoolancestors", params = {tx2_hex}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      local found = false
+      for _, hex in ipairs(resp.result) do
+        if hex == tx1_hex then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("getmempoolancestors verbose returns map with full entry", function()
+      local mp, tx1_hex, tx2_hex = build_chain_with_two_tx()
+      local server = rpc.new({network = consensus.networks.mainnet, mempool = mp})
+      local body = server:handle_request(cjson.encode({
+        method = "getmempoolancestors", params = {tx2_hex, true}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_table(resp.result[tx1_hex])
+      assert.is_number(resp.result[tx1_hex].vsize)
+    end)
+
+    it("getmempooldescendants returns child txid (non-verbose)", function()
+      local mp, tx1_hex, tx2_hex = build_chain_with_two_tx()
+      local server = rpc.new({network = consensus.networks.mainnet, mempool = mp})
+      local body = server:handle_request(cjson.encode({
+        method = "getmempooldescendants", params = {tx1_hex}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      local found = false
+      for _, hex in ipairs(resp.result) do
+        if hex == tx2_hex then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("getmempooldescendants verbose returns map with full entry", function()
+      local mp, tx1_hex, tx2_hex = build_chain_with_two_tx()
+      local server = rpc.new({network = consensus.networks.mainnet, mempool = mp})
+      local body = server:handle_request(cjson.encode({
+        method = "getmempooldescendants", params = {tx1_hex, true}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_table(resp.result[tx2_hex])
+      assert.is_number(resp.result[tx2_hex].vsize)
+    end)
+  end)
+
 end)
