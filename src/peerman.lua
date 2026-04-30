@@ -263,6 +263,13 @@ function M.new(network, storage, config)
   self.data_dir = config.data_dir or "."
   self.peers = {}              -- ip:port -> Peer object
   self.peer_list = {}          -- ordered list for iteration
+  -- Cumulative byte counters for getnettotals.  Bitcoin Core mirrors this
+  -- with CConnman::nTotalBytesRecv / nTotalBytesSent (src/net.cpp); the key
+  -- semantic is "do NOT reset when a peer disconnects".  We accumulate the
+  -- final per-peer counters into this struct in disconnect_peer/stop, and
+  -- the rpc.getnettotals handler returns globals + currently-connected
+  -- per-peer counters.
+  self.totals = { bytes_recv = 0, bytes_sent = 0 }
   self.known_addresses = {}    -- ip:port -> {ip, port, services, timestamp, attempts, last_try}
   self.banned = {}             -- ip -> ban_until_timestamp
   self.our_nonces = {}         -- set of nonces we've used (detect self-connect)
@@ -970,6 +977,12 @@ function PeerManager:disconnect_peer(p, reason)
   if not p.inbound then
     self:_remove_outbound_group(p.ip)
   end
+
+  -- Accumulate the peer's final byte counters into the cumulative globals
+  -- BEFORE we tear it down (otherwise getnettotals would lose those bytes
+  -- the moment the peer disconnects -- Core's CConnman keeps them).
+  self.totals.bytes_recv = self.totals.bytes_recv + (p.bytes_recv or 0)
+  self.totals.bytes_sent = self.totals.bytes_sent + (p.bytes_sent or 0)
 
   p:disconnect(reason)
   self.peers[key] = nil
@@ -2077,6 +2090,10 @@ function PeerManager:stop()
   self:_save_anchors()
 
   for _, p in ipairs(self.peer_list) do
+    -- Roll the per-peer counters into the cumulative totals before tear-down
+    -- (matches CConnman::Stop semantics).
+    self.totals.bytes_recv = self.totals.bytes_recv + (p.bytes_recv or 0)
+    self.totals.bytes_sent = self.totals.bytes_sent + (p.bytes_sent or 0)
     p:disconnect("shutdown")
   end
   self.peer_list = {}

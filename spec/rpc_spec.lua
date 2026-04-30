@@ -3516,6 +3516,65 @@ describe("rpc", function()
       assert.equal(0, resp.result.totalbytesrecv)
       assert.equal(0, resp.result.totalbytessent)
     end)
+
+    -- Round-trip: connected-peer counters + post-disconnect global counters.
+    -- Bitcoin Core's CConnman::GetTotalBytesRecv/Sent persists across peer
+    -- teardown; we mirror that via PeerManager.totals (accumulated in
+    -- disconnect_peer/stop).
+    it("getnettotals persists totals across disconnects (Core CConnman parity)", function()
+      local pm = fake_peer_manager()
+      pm.totals = { bytes_recv = 0, bytes_sent = 0 }
+      -- Override disconnect_peer to behave like PeerManager:disconnect_peer:
+      -- accumulate bytes into globals before tear-down.
+      function pm:disconnect_peer(p, _reason)
+        self.totals.bytes_recv = self.totals.bytes_recv + (p.bytes_recv or 0)
+        self.totals.bytes_sent = self.totals.bytes_sent + (p.bytes_sent or 0)
+        local key = p.ip .. ":" .. p.port
+        self.peers[key] = nil
+        for i, q in ipairs(self.peer_list) do
+          if q == p then table.remove(self.peer_list, i); break end
+        end
+        p.disconnected = true
+      end
+      local a = fake_peer("10.0.0.1", 8333, 1000, 2000)
+      local b = fake_peer("10.0.0.2", 8333, 500, 1500)
+      pm.peers["10.0.0.1:8333"] = a
+      pm.peers["10.0.0.2:8333"] = b
+      pm.peer_list[1] = a
+      pm.peer_list[2] = b
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+
+      -- Step 1: both peers connected -> globals=0, current sums = recv 1500/sent 3500.
+      local body1 = server:handle_request('{"method":"getnettotals","params":[],"id":1}')
+      local r1 = cjson.decode(body1)
+      assert.equal(1500, r1.result.totalbytesrecv)
+      assert.equal(3500, r1.result.totalbytessent)
+
+      -- Step 2: disconnect 'a'.  Its bytes (1000/2000) move from current
+      -- per-peer counters into globals; total reported value is unchanged.
+      pm:disconnect_peer(a, "test")
+      local body2 = server:handle_request('{"method":"getnettotals","params":[],"id":1}')
+      local r2 = cjson.decode(body2)
+      assert.equal(1500, r2.result.totalbytesrecv)
+      assert.equal(3500, r2.result.totalbytessent)
+
+      -- Step 3: 'b' transmits more bytes after 'a' is gone.  Globals are
+      -- unchanged (1000/2000); current sums = b's new counters.
+      b.bytes_recv = 800
+      b.bytes_sent = 2200
+      local body3 = server:handle_request('{"method":"getnettotals","params":[],"id":1}')
+      local r3 = cjson.decode(body3)
+      assert.equal(1000 + 800, r3.result.totalbytesrecv)
+      assert.equal(2000 + 2200, r3.result.totalbytessent)
+
+      -- Step 4: disconnect 'b'.  Both peers gone, but globals retain the
+      -- cumulative byte counts (Core CConnman semantics).
+      pm:disconnect_peer(b, "test")
+      local body4 = server:handle_request('{"method":"getnettotals","params":[],"id":1}')
+      local r4 = cjson.decode(body4)
+      assert.equal(1800, r4.result.totalbytesrecv)
+      assert.equal(4200, r4.result.totalbytessent)
+    end)
   end)
 
   -----------------------------------------------------------------------------
@@ -3621,6 +3680,85 @@ describe("rpc", function()
       local resp = cjson.decode(body)
       assert.is_truthy(resp.error and resp.error ~= cjson.null)
       assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+    end)
+
+    -- BlockUndo-driven fee aggregates.  Bitcoin Core ref:
+    -- src/rpc/blockchain.cpp::getblockstats loop_inputs path -> reads
+    -- vtxundo[i-1].vprevout for each non-coinbase tx and computes
+    -- fee = sum(prevout.nValue) - sum(tx.vout.nValue).
+    it("computes fee/feerate aggregates from BlockUndo", function()
+      local utxo_mod = require("lunarblock.utxo")
+      local block = build_block_with_two_tx()
+      local block_hash = crypto.hash256_type(serialize.serialize_block_header(block.header))
+
+      -- Construct a fake BlockUndo for the single non-coinbase tx in the
+      -- block (vtxundo[1] -> tx[2]).  The non-coinbase tx pays out
+      -- 4_000_000_000 sat over one output and consumes one prev-output
+      -- valued at 4_000_010_000 -> fee = 10_000 sat.
+      local block_undo = utxo_mod.block_undo({
+        utxo_mod.tx_undo({
+          utxo_mod.utxo_entry(4000010000, string.rep("\x00", 25), 50, false),
+        })
+      })
+      local undo_data = utxo_mod.serialize_block_undo(block_undo)
+
+      local fake_storage = {
+        get_block = function(_h) return block end,
+        get_header = function(_h) return nil end,
+        get_undo = function(_h) return undo_data end,
+      }
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        storage = fake_storage,
+        chain_state = { tip_height = 100, tip_hash = block_hash },
+      })
+      local body = server:handle_request(cjson.encode({
+        method = "getblockstats",
+        params = {types.hash256_hex(block_hash)},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(10000, resp.result.totalfee)
+      assert.equal(10000, resp.result.maxfee)
+      assert.equal(10000, resp.result.minfee)
+      assert.equal(10000, resp.result.medianfee)
+      assert.equal(10000, resp.result.avgfee)
+      -- feerate = (10000 * 4) / weight; with one non-coinbase tx all
+      -- percentile slots collapse to that single feerate.
+      assert.is_table(resp.result.feerate_percentiles)
+      assert.equal(5, #resp.result.feerate_percentiles)
+      for _, p in ipairs(resp.result.feerate_percentiles) do
+        assert.equal(resp.result.maxfeerate, p)
+      end
+      assert.is_true(resp.result.maxfeerate > 0)
+      assert.equal(resp.result.maxfeerate, resp.result.minfeerate)
+    end)
+
+    it("falls back to zero fee stats when BlockUndo is unavailable", function()
+      local block = build_block_with_two_tx()
+      local block_hash = crypto.hash256_type(serialize.serialize_block_header(block.header))
+      local fake_storage = {
+        get_block = function() return block end,
+        get_header = function() return nil end,
+        -- get_undo returns nil -> no undo data.
+        get_undo = function() return nil end,
+      }
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        storage = fake_storage,
+        chain_state = { tip_height = 100, tip_hash = block_hash },
+      })
+      local body = server:handle_request(cjson.encode({
+        method = "getblockstats",
+        params = {types.hash256_hex(block_hash)},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(0, resp.result.totalfee)
+      assert.equal(0, resp.result.maxfee)
+      assert.equal(0, resp.result.medianfee)
     end)
   end)
 
@@ -3736,6 +3874,94 @@ describe("rpc", function()
       }))
       local resp = cjson.decode(body)
       assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+
+    -- Coinbase fee collection (regtest).  Bitcoin Core ref:
+    -- src/rpc/mining.cpp::generateblock builds a block with use_mempool=false
+    -- (subsidy-only coinbase) and inserts caller-provided txs verbatim; we
+    -- intentionally diverge: the lunarblock generateblock RPC adds the sum
+    -- of caller-provided tx fees to the coinbase output value so test
+    -- frameworks can mine fee-paying blocks deterministically.
+    it("collects caller tx fees into the coinbase output (subsidy + fees)", function()
+      local mining = require("lunarblock.mining")
+      local mempool = require("lunarblock.mempool")
+      local serialize = require("lunarblock.serialize")
+
+      -- Build a chain_state with one funding UTXO of 1 BTC at vout 0,
+      -- height=0 prev, regtest difficulty, plus a stub storage.
+      local prev_txid = types.hash256(string.rep("\xfa", 32))
+      local prev_hex = types.hash256_hex(prev_txid)
+      local script_pk = string.rep("\x00", 25)
+      local utxos = {
+        [prev_hex .. ":0"] = {
+          value = 100000000,        -- 1 BTC
+          script_pubkey = script_pk,
+          height = 0,
+          is_coinbase = false,
+        },
+      }
+      local mock_coin_view = {
+        get = function(_, txid, vout)
+          return utxos[types.hash256_hex(txid) .. ":" .. vout]
+        end,
+      }
+      local mock_storage = {
+        get_header = function(_h)
+          return { bits = 0x207fffff, prev_hash = nil, timestamp = 1700000000 }
+        end,
+      }
+      local chain_state = {
+        coin_view = mock_coin_view,
+        tip_height = 0,
+        tip_hash = types.hash256_zero(),
+        mtp = 1700000000,
+        storage = mock_storage,
+      }
+      local mp = mempool.new(chain_state)
+      local server = rpc.new({
+        network = consensus.networks.regtest,
+        chain_state = chain_state,
+        mempool = mp,
+        mining = mining,
+      })
+
+      -- Caller-supplied tx: spends the 1 BTC funding UTXO, leaves 12_345 sat
+      -- as fee.  When generateblock processes this raw tx, the rpc handler
+      -- resolves the prev-out via coin_view and credits 12_345 sat to the
+      -- coinbase value alongside the regtest subsidy (50 BTC = 5_000_000_000).
+      local fee = 12345
+      local tx = types.transaction(1,
+        { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFE) },
+        { types.txout(100000000 - fee, script_pk) },
+        0)
+      local hex = rpc.hex_encode(serialize.serialize_transaction(tx, true))
+
+      local body = server:handle_request(cjson.encode({
+        method = "generateblock",
+        -- bech32 p2wpkh(regtest, 20 zero bytes) for the regtest payout.
+        params = {"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202", {hex}, false},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_string(resp.result.hash)
+      assert.is_string(resp.result.hex)
+
+      -- Decode the returned block and verify the coinbase value.
+      local block_bytes = rpc.hex_decode(resp.result.hex)
+      local block = serialize.deserialize_block(block_bytes)
+      assert.equal(2, #block.transactions)
+      local subsidy = consensus.get_block_subsidy(1)  -- height=tip+1
+      local coinbase = block.transactions[1]
+      -- Coinbase has [0] = payout output; if segwit-active, [1] = OP_RETURN
+      -- witness commitment with value=0.  Sum of values must be subsidy+fee.
+      local cb_total = 0
+      for _, out in ipairs(coinbase.outputs) do
+        cb_total = cb_total + out.value
+      end
+      assert.equal(subsidy + fee, cb_total)
+      -- The first output (the payout) must carry the subsidy + fees value.
+      assert.equal(subsidy + fee, coinbase.outputs[1].value)
     end)
   end)
 
