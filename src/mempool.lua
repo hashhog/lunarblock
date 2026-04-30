@@ -137,6 +137,12 @@ M.MAX_ANCESTOR_SIZE = 101000      -- Max total vsize of ancestor chain
 M.MAX_DESCENDANT_SIZE = 101000    -- Max total vsize of descendant chain
 M.REPLACEMENT_MIN_FEE_BUMP = 1000 -- Minimum fee increase for RBF (sat/KB)
 
+-- IsStandardTx weight cap (Bitcoin Core policy/policy.h:38).
+-- Transactions whose weight exceeds this are non-standard and must not
+-- be relayed.  Block consensus still allows them (MAX_BLOCK_WEIGHT =
+-- 4_000_000), but a node treats them as non-standard at relay time.
+M.MAX_STANDARD_TX_WEIGHT = 400000
+
 -- BIP125 RBF Constants
 M.MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD  -- Sequence number signaling RBF
 M.MAX_REPLACEMENT_CANDIDATES = 100       -- Max transactions that can be evicted by RBF
@@ -318,6 +324,16 @@ function Mempool:accept_transaction(tx, allow_rbf)
   end
   if is_coinbase then
     return false, "coinbase transactions not accepted"
+  end
+
+  -- 2b. IsStandardTx weight cap (relay policy, not consensus).
+  -- Bitcoin Core: policy/policy.cpp:111-115 — txs with weight greater
+  -- than MAX_STANDARD_TX_WEIGHT (400_000) are rejected at relay with
+  -- reason "tx-size".  Consensus still allows up to MAX_BLOCK_WEIGHT.
+  local tx_weight_check = validation.get_tx_weight(tx)
+  if tx_weight_check > M.MAX_STANDARD_TX_WEIGHT then
+    return false, string.format("tx-size: weight %d exceeds %d",
+      tx_weight_check, M.MAX_STANDARD_TX_WEIGHT)
   end
 
   -- 3. Check all inputs exist (in UTXO set or mempool)
@@ -1055,6 +1071,13 @@ function Mempool:accept_package(txns)
     end
     if is_coinbase then
       return false, "coinbase transactions not accepted"
+    end
+    -- IsStandardTx weight cap applies to each tx individually within a
+    -- package (Bitcoin Core: policy/policy.cpp:111-115).
+    local tx_weight_pkg = validation.get_tx_weight(tx)
+    if tx_weight_pkg > M.MAX_STANDARD_TX_WEIGHT then
+      return false, string.format("tx-size: weight %d exceeds %d at index %d",
+        tx_weight_pkg, M.MAX_STANDARD_TX_WEIGHT, i)
     end
   end
 
