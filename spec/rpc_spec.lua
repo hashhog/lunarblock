@@ -251,6 +251,73 @@ describe("rpc", function()
 
       assert.equal("testnet", decoded.result.chain)
     end)
+
+    it("pruned=false and no pruneheight when pruner disabled", function()
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 700000,
+          tip_hash = types.hash256(string.rep("\xab", 32)),
+        },
+        network = consensus.networks.mainnet,
+        -- no pruner -> pruning disabled (matches default behavior)
+      })
+
+      local request = '{"method":"getblockchaininfo","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_false(decoded.result.pruned)
+      assert.is_nil(decoded.result.pruneheight)
+      assert.is_nil(decoded.result.automatic_pruning)
+    end)
+
+    it("pruned=true with pruneheight + automatic_pruning when prune mode on", function()
+      local prune_mod = require("lunarblock.prune")
+      local pruner = prune_mod.new({ target_mb = 550 })
+      pruner.prune_height = 1234  -- pretend we've already pruned up to 1234
+
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 700000,
+          tip_hash = types.hash256(string.rep("\xab", 32)),
+        },
+        network = consensus.networks.mainnet,
+        pruner = pruner,
+      })
+
+      local request = '{"method":"getblockchaininfo","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_true(decoded.result.pruned)
+      -- Bitcoin Core: pruneheight = first UNPRUNED block (prune_height + 1)
+      assert.equal(1235, decoded.result.pruneheight)
+      assert.is_true(decoded.result.automatic_pruning)
+      assert.equal(550 * 1024 * 1024, decoded.result.prune_target_size)
+    end)
+
+    it("manual-only prune sets automatic_pruning=false", function()
+      local prune_mod = require("lunarblock.prune")
+      local pruner = prune_mod.new({ target_mb = 1 })  -- manual-only
+
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 700000,
+          tip_hash = types.hash256(string.rep("\xab", 32)),
+        },
+        network = consensus.networks.mainnet,
+        pruner = pruner,
+      })
+
+      local request = '{"method":"getblockchaininfo","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_true(decoded.result.pruned)
+      assert.is_false(decoded.result.automatic_pruning)
+      -- manual-only mode does not expose prune_target_size (matches Core)
+      assert.is_nil(decoded.result.prune_target_size)
+    end)
   end)
 
   describe("getblockcount", function()
@@ -2014,6 +2081,85 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.equal(1, decoded.result.nTx)
+    end)
+
+    -- Pruned-block error path. Mirrors Bitcoin Core's
+    -- rpc/blockchain.cpp:677 ("Block not available (pruned data)" with
+    -- code RPC_MISC_ERROR = -1).
+    it("returns RPC_MISC_ERROR with pruned message for pruned heights", function()
+      local prune_mod = require("lunarblock.prune")
+      local pruner = prune_mod.new({ target_mb = 550 })
+      pruner.prune_height = 100  -- pretend heights 1..100 are pruned
+
+      local block = make_test_block()
+      local block_hash = types.hash256(string.rep("\xcd", 32))
+      local block_hash_hex = types.hash256_hex(block_hash)
+      -- Construct an iterator that returns this hash at height 50
+      -- (which is below prune_height=100, so the block is pruned).
+      local pruned_height = 50
+      local function make_height_iter()
+        local emitted = false
+        return {
+          seek_to_first = function() emitted = false end,
+          valid = function() return not emitted end,
+          next = function() emitted = true end,
+          key = function()
+            return string.char(0, 0, 0, pruned_height)
+          end,
+          value = function()
+            return block_hash.bytes
+          end,
+          destroy = function() end,
+        }
+      end
+
+      local mock_storage = {
+        -- Body returns nil (pruned).
+        get_block = function() return nil end,
+        -- Header still around (not pruned).
+        get_header = function(hash)
+          if hash.bytes == block_hash.bytes then return block.header end
+          return nil
+        end,
+        iterator = function(_cf) return make_height_iter() end,
+      }
+
+      local server = rpc.new({
+        storage = mock_storage,
+        network = consensus.networks.mainnet,
+        pruner = pruner,
+      })
+
+      local request = '{"method":"getblock","params":["' .. block_hash_hex .. '", 0],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_not_nil(decoded.error)
+      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
+      assert.matches("pruned", decoded.error.message)
+    end)
+
+    it("falls back to 'Block not found' when pruner not enabled", function()
+      local block_hash_hex = string.rep("ab", 32)
+      local mock_storage = {
+        get_block = function() return nil end,
+        get_header = function() return nil end,
+        iterator = function() return nil end,
+      }
+
+      local server = rpc.new({
+        storage = mock_storage,
+        network = consensus.networks.mainnet,
+        -- no pruner
+      })
+
+      local request = '{"method":"getblock","params":["' .. block_hash_hex .. '", 0],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_not_nil(decoded.error)
+      assert.equal(rpc.ERROR.INVALID_ADDRESS, decoded.error.code)
+      assert.matches("not found", decoded.error.message)
     end)
   end)
 

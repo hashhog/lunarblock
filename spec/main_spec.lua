@@ -114,6 +114,77 @@ describe("main module", function()
       assert.is_true(args.daemon)
     end)
 
+    -- --prune validation. parse_args calls os.exit on invalid input,
+    -- so we monkey-patch os.exit to surface the error as a Lua error
+    -- instead of killing the busted runner. parse_args writes to
+    -- io.stderr before exiting; that's just diagnostic noise during
+    -- the negative tests so we leave it (io.stderr is a userdata
+    -- handle and can't easily be shadowed without breaking other
+    -- tests).
+    describe("--prune", function()
+      local original_exit
+
+      before_each(function()
+        original_exit = os.exit
+        os.exit = function(code)
+          error("OS_EXIT_" .. tostring(code), 0)
+        end
+      end)
+
+      after_each(function()
+        os.exit = original_exit
+      end)
+
+      it("defaults to 0 when not provided", function()
+        local args = main.parse_args({})
+        assert.equal(0, args.prune)
+      end)
+
+      it("accepts --prune=0 (disabled)", function()
+        local args = main.parse_args({"--prune", "0"})
+        assert.equal(0, args.prune)
+      end)
+
+      it("accepts --prune=1 (manual-only)", function()
+        local args = main.parse_args({"--prune", "1"})
+        assert.equal(1, args.prune)
+      end)
+
+      it("accepts --prune=550 (minimum auto target)", function()
+        local args = main.parse_args({"--prune", "550"})
+        assert.equal(550, args.prune)
+      end)
+
+      it("accepts --prune=10000 (large target)", function()
+        local args = main.parse_args({"--prune", "10000"})
+        assert.equal(10000, args.prune)
+      end)
+
+      it("rejects --prune=549 (below minimum auto target)", function()
+        local ok, err = pcall(main.parse_args, {"--prune", "549"})
+        assert.is_false(ok)
+        assert.matches("OS_EXIT_1", err)
+      end)
+
+      it("rejects --prune=2 (between manual and auto)", function()
+        local ok, err = pcall(main.parse_args, {"--prune", "2"})
+        assert.is_false(ok)
+        assert.matches("OS_EXIT_1", err)
+      end)
+
+      it("rejects --prune=-5 (negative)", function()
+        local ok, err = pcall(main.parse_args, {"--prune", "-5"})
+        assert.is_false(ok)
+        assert.matches("OS_EXIT_1", err)
+      end)
+
+      it("rejects --prune=foo (non-numeric)", function()
+        local ok, err = pcall(main.parse_args, {"--prune", "foo"})
+        assert.is_false(ok)
+        assert.matches("OS_EXIT_1", err)
+      end)
+    end)
+
     it("handles multiple options", function()
       local args = main.parse_args({
         "--testnet",
@@ -160,6 +231,7 @@ describe("main module", function()
         "lunarblock.mining",
         "lunarblock.rpc",
         "lunarblock.wallet",
+        "lunarblock.prune",
       }
 
       for _, mod_name in ipairs(modules) do

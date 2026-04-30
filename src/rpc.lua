@@ -410,6 +410,10 @@ function M.new(config)
   self.av_in_index = config.av_in_index
   self.av_is_ancestor = config.av_is_ancestor
   self.av_on_best_chain = config.av_on_best_chain
+  -- Pruner (lunarblock.prune) — when enabled, gates block-body lookups
+  -- and exposes pruneheight / automatic_pruning in getblockchaininfo.
+  -- nil/disabled is the historical default.
+  self.pruner = config.pruner
   self.running = false
   self.request_wallet = nil  -- Current request's wallet context
   -- Register built-in methods
@@ -708,7 +712,14 @@ function RPCServer:register_methods()
     -- read from the same source of truth.
     local softforks = build_deployment_state(tip_height, rpc.network)
 
-    return {
+    -- Pruning fields. We mirror Bitcoin Core's getblockchaininfo output
+    -- shape (rpc/blockchain.cpp:1447-1456): `pruned` is always present;
+    -- `pruneheight` and `automatic_pruning` are only added when prune
+    -- mode is on. `pruneheight` is the first UNPRUNED block (Bitcoin
+    -- Core: prune_height ? value+1 : 0).
+    local pruner = rpc.pruner
+    local is_pruned = pruner and pruner.enabled or false
+    local result = {
       chain = rpc.network.name,
       blocks = tip_height,
       headers = header_height,
@@ -718,9 +729,19 @@ function RPCServer:register_methods()
       verificationprogress = verification_progress,
       initialblockdownload = initial_block_download,
       chainwork = chainwork,
-      pruned = false,
+      pruned = is_pruned,
       softforks = softforks,
     }
+    if is_pruned then
+      result.pruneheight = pruner.prune_height > 0
+        and (pruner.prune_height + 1) or 0
+      result.automatic_pruning = pruner.automatic and true or false
+      if pruner.automatic then
+        -- Bytes, matching Bitcoin Core's `prune_target_size`
+        result.prune_target_size = pruner.target_mb * 1024 * 1024
+      end
+    end
+    return result
   end
 
   self.methods["getblockhash"] = function(rpc, params)
@@ -768,6 +789,39 @@ function RPCServer:register_methods()
     local hash = types.hash256_from_hex(blockhash)
     local block = rpc.storage.get_block(hash)
     if not block then
+      -- Check whether this is a known-but-pruned block. We never delete
+      -- CF.HEADERS, so the header is still around even after the body
+      -- is pruned. If header exists AND its height has been pruned,
+      -- mirror Bitcoin Core's RPC_MISC_ERROR + "Block not available
+      -- (pruned data)" string (rpc/blockchain.cpp:677).
+      if rpc.pruner and rpc.pruner.enabled then
+        local header = rpc.storage.get_header(hash)
+        if header then
+          -- Reverse-lookup height for this hash via the height index.
+          -- This is O(prune_height) worst case but only runs on the
+          -- error path; fast path (block present) never reaches here.
+          local found_height = nil
+          local iter = rpc.storage.iterator("height")
+          if iter then
+            iter.seek_to_first()
+            while iter.valid() do
+              local v = iter.value()
+              if v and #v == 32 and v == hash.bytes then
+                local k = iter.key()
+                found_height = k:byte(1) * 16777216 + k:byte(2) * 65536
+                  + k:byte(3) * 256 + k:byte(4)
+                break
+              end
+              iter.next()
+            end
+            iter.destroy()
+          end
+          if found_height and rpc.pruner:is_pruned(found_height) then
+            error({code = M.ERROR.MISC_ERROR,
+                   message = "Block not available (pruned data)"})
+          end
+        end
+      end
       error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
     end
 
