@@ -11,8 +11,8 @@ local VERSION = "0.1.0"
 -- Minimal argument parser (no external dependency)
 --------------------------------------------------------------------------------
 
-local function parse_args(argv)
-  local args = {
+local function default_args()
+  return {
     datadir = os.getenv("HOME") .. "/.lunarblock",
     network = "mainnet",
     rpcport = nil,  -- will default from network config
@@ -45,7 +45,19 @@ local function parse_args(argv)
     peerbloomfilters = false, -- BIP-35 / NODE_BLOOM: matches Core DEFAULT_PEERBLOOMFILTERS=false (net_processing.h)
     import_blocks = nil,   -- Path to framed block file for import (or "-" for stdin)
     import_utxo = nil,     -- Path to HDOG UTXO snapshot file for AssumeUTXO import
+    -- Operational-parity flags (mirrors Bitcoin Core init.cpp + util/system.cpp)
+    pid = nil,             -- Path to PID file (default: <datadir>/lunarblock.pid)
+    debug = nil,           -- Comma-separated debug categories (e.g. "net,mempool")
+    log = nil,             -- Path to log file (default: <datadir>/debug.log)
+    conf = nil,            -- Path to bitcoin.conf-style config file
+    ready_fd = nil,        -- File descriptor for ready-signal (systemd-style)
   }
+end
+
+local function parse_args(argv)
+  -- Snapshot defaults so conf-file merge can detect "still at default" cleanly.
+  local args = default_args()
+  local defaults = default_args()
 
   local i = 1
   while i <= #argv do
@@ -88,6 +100,11 @@ local function parse_args(argv)
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
+      print("      --pid PATH                  Path to PID file (default: <datadir>/lunarblock.pid)")
+      print("      --debug CATS                Enable debug categories (comma-separated; e.g. net,mempool,1=all)")
+      print("      --log PATH                  Path to log file (default: <datadir>/debug.log)")
+      print("      --conf PATH                 Path to bitcoin.conf-style config file")
+      print("      --ready-fd N                Write READY token to this FD when listeners are up")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -194,11 +211,48 @@ local function parse_args(argv)
     elseif arg == "--zmqpubhwm" then
       i = i + 1
       args.zmqpubhwm = tonumber(argv[i])
+    elseif arg == "--pid" or arg:match("^%-%-pid=") then
+      -- Accept both "--pid PATH" and "--pid=PATH" (Bitcoin Core both forms).
+      local v = arg:match("^%-%-pid=(.*)$")
+      if v then args.pid = v else i = i + 1; args.pid = argv[i] end
+    elseif arg == "--debug" or arg:match("^%-%-debug=") then
+      local v = arg:match("^%-%-debug=(.*)$")
+      if v then args.debug = v else i = i + 1; args.debug = argv[i] end
+    elseif arg == "--log" or arg:match("^%-%-log=") then
+      local v = arg:match("^%-%-log=(.*)$")
+      if v then args.log = v else i = i + 1; args.log = argv[i] end
+    elseif arg == "--conf" or arg:match("^%-%-conf=") then
+      local v = arg:match("^%-%-conf=(.*)$")
+      if v then args.conf = v else i = i + 1; args.conf = argv[i] end
+    elseif arg == "--ready-fd" or arg:match("^%-%-ready%-fd=") then
+      local v = arg:match("^%-%-ready%-fd=(.*)$")
+      if v then args.ready_fd = tonumber(v) else i = i + 1; args.ready_fd = tonumber(argv[i]) end
     else
       io.stderr:write("Unknown option: " .. arg .. "\n")
       os.exit(1)
     end
     i = i + 1
+  end
+
+  -- Conf-file merge.  CLI flags win; conf-file fills in remaining defaults.
+  -- The network used for [section] gating is whichever the CLI selected
+  -- (testnet/regtest flags applied below) — but since those flags also
+  -- override `network` directly, we approximate by computing the effective
+  -- network here.
+  if args.conf then
+    local effective_network = args.network
+    if args.testnet then effective_network = "testnet" end
+    if args.regtest then effective_network = "regtest" end
+    local ok_ops, ops = pcall(require, "lunarblock.ops")
+    if ok_ops then
+      local conf, err = ops.parse_conf_file(args.conf, effective_network)
+      if not conf then
+        io.stderr:write(string.format(
+          "Failed to read --conf=%s: %s\n", args.conf, tostring(err)))
+        os.exit(1)
+      end
+      ops.apply_conf_to_args(args, defaults, conf)
+    end
   end
 
   return args
@@ -503,6 +557,71 @@ local function main()
   print("Network: " .. args.network)
   print("Data directory: " .. datadir)
 
+  -- Operational helpers: daemon, PID file, logger, signals, ready-fd.
+  -- Must run before storage open() because daemonize() closes inherited
+  -- FDs (Bitcoin Core init.cpp does the same: AppInitMain calls
+  -- DaemonizeIfRequested *before* OpenDataDirectory).
+  local ops = require("lunarblock.ops")
+
+  -- Default log path lives in datadir.  --log may override.
+  local log_path = args.log or (datadir .. "/debug.log")
+  -- Default PID path lives in datadir.  --pid may override.
+  local pid_path = args.pid or (datadir .. "/lunarblock.pid")
+
+  -- --daemon: detach via double-fork.  Stdout/stderr get redirected to the
+  -- log file inside the grandchild — anything we print BEFORE this call goes
+  -- to the controlling terminal.  We DO NOT daemonize during import-blocks
+  -- or import-utxo (those modes already returned early).
+  if args.daemon then
+    print("Daemonizing...")
+    local ok, err = ops.daemonize({ log_path = log_path })
+    if not ok then
+      io.stderr:write("daemonize failed: " .. tostring(err) .. "\n")
+      os.exit(1)
+    end
+    -- We're now in the grandchild.  io.stdout/io.stderr point at log_path
+    -- (or /dev/null if no log was configured) via dup2.  Reset line-buffer
+    -- mode that we set at the top of the file.
+    io.stdout:setvbuf("line")
+    io.stderr:setvbuf("line")
+  end
+
+  -- PID file: write our PID for ops scripts (start/stop_mainnet.sh).
+  -- Bitcoin Core writes this in init.cpp after fork() but before main loop.
+  local pid_ok, pid_err = ops.write_pid_file(pid_path)
+  if not pid_ok then
+    io.stderr:write(string.format("Warning: failed to write PID file %s: %s\n",
+      pid_path, tostring(pid_err)))
+  else
+    print("PID file: " .. pid_path)
+  end
+
+  -- Build logger.  --debug=<cat>[,<cat>] gates per-category emission.
+  local debug_cats = ops.parse_debug_cats(args.debug)
+  local logger = ops.new_logger({
+    log_file = (args.printtoconsole and not args.daemon) and nil or log_path,
+    debug_cats = debug_cats,
+    printtoconsole = args.printtoconsole,
+  })
+  local logger_ok, logger_err = logger:open()
+  if not logger_ok then
+    io.stderr:write(string.format(
+      "Warning: failed to open log file %s: %s\n", log_path, tostring(logger_err)))
+  end
+  -- Stash on package.loaded so other modules can access it without an arg
+  -- threading change.  (Most lunarblock modules use io.stdout directly today;
+  -- migrating them to the category logger is a separate cleanup.)
+  package.loaded["lunarblock.logger"] = logger
+  if args.debug then
+    print("Debug categories: " .. args.debug)
+  end
+
+  -- SIGHUP → reopen log file (logrotate).
+  -- SIGTERM/SIGINT → graceful shutdown via the `running` flag below.
+  -- Signal handlers run in async context; the main loop polls them.
+  -- The actual `running` flag is created down at line ~1207 ("local running")
+  -- — we install handlers there so the closure can mutate it.
+
   -- Enable JIT profiling if requested
   if args.jitprofile then
     local ok, jit_p = pcall(require, "jit.p")
@@ -543,6 +662,25 @@ local function main()
     header_chain.header_tip_height,
     header_chain.header_tip_hash and types.hash256_hex(header_chain.header_tip_hash) or "none"
   ))
+
+  -- --reindex (full): Bitcoin Core re-reads every blk*.dat file from disk
+  -- and rebuilds BOTH the block index AND the chainstate (init.cpp
+  -- LoadBlocksFromDisk → ActivateBestChain).  In lunarblock today, the
+  -- block-body store is a RocksDB CF (CF.BLOCKS), keyed by block hash, that
+  -- IS the block index — there's no separate "block.idx" to rebuild.  So
+  -- --reindex effectively reduces to --reindex-chainstate (replay every
+  -- block-body via connect_block).  The remaining gap is a *block-body*
+  -- re-import from an external source (e.g. -loadblock=bootstrap.dat),
+  -- which is a separate feature and is left as a TODO below.
+  --
+  -- TODO(ops): full --reindex including block-body re-import from external
+  -- bootstrap.dat is not yet implemented.  Today --reindex == --reindex-
+  -- chainstate.  When the import-blocks framing pipeline is wired into
+  -- startup, this is where it would chain off args.reindex.
+  if args.reindex and not args.reindex_chainstate then
+    print("[reindex] no separate block-body store to rebuild; running --reindex-chainstate")
+    args.reindex_chainstate = true
+  end
 
   -- --reindex-chainstate: wipe CF.UTXO + CF.UNDO and replay every
   -- block-body in CF.BLOCKS via connect_block. Recovers from the
@@ -1150,13 +1288,46 @@ local function main()
     print(string.format("REST listening on port %d", args.restport or 8080))
   end
 
-  -- Signal handling (graceful shutdown)
+  -- Ready signal: notify supervisor that listeners are up.
+  -- Bitcoin Core uses sd_notify(READY=1); we use a simple write to a
+  -- pre-opened FD so any process supervisor (s6, runit, shell) can wait on it.
+  if args.ready_fd then
+    if ops.signal_ready(args.ready_fd) then
+      print(string.format("Ready signal sent on FD %d", args.ready_fd))
+    else
+      io.stderr:write(string.format(
+        "Warning: failed to write READY to FD %d\n", args.ready_fd))
+    end
+  end
+
+  -- Signal handling (graceful shutdown + log rotation).
+  -- SIGTERM/SIGINT → flip running=false; main loop exits, cleanup runs.
+  -- SIGHUP        → reopen log file (logrotate compatibility).
   local running = true
+  ops.set_signal_handler(ops.SIGTERM, function()
+    print("[signal] SIGTERM received, shutting down")
+    running = false
+  end)
+  ops.set_signal_handler(ops.SIGINT, function()
+    print("[signal] SIGINT received, shutting down")
+    running = false
+  end)
+  ops.set_signal_handler(ops.SIGHUP, function()
+    print("[signal] SIGHUP received, reopening log file")
+    local rok, rerr = logger:reopen()
+    if not rok then
+      io.stderr:write("log reopen failed: " .. tostring(rerr) .. "\n")
+    end
+  end)
 
   -- Main event loop
   print("Entering main loop...")
   local last_status = 0
   while running do
+    -- Drain any pending POSIX signals (SIGTERM/SIGINT/SIGHUP).
+    -- Cheap: just int compares when no signal is pending.
+    ops.poll_signals()
+
     -- Process P2P
     peer_manager:tick()
 
@@ -1321,6 +1492,10 @@ local function main()
     print("Warning: failed to dump mempool: " .. tostring(dump_count_or_err))
   end
   db.close()
+  -- Remove PID file (Bitcoin Core init.cpp does this in the Shutdown path).
+  ops.remove_pid_file(pid_path)
+  -- Close logger so the file gets fsynced before exit.
+  logger:close()
   print("LunarBlock stopped.")
 end
 
@@ -1368,6 +1543,11 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
+      print("      --pid PATH                  Path to PID file (default: <datadir>/lunarblock.pid)")
+      print("      --debug CATS                Enable debug categories (comma-separated; e.g. net,mempool,1=all)")
+      print("      --log PATH                  Path to log file (default: <datadir>/debug.log)")
+      print("      --conf PATH                 Path to bitcoin.conf-style config file")
+      print("      --ready-fd N                Write READY token to this FD when listeners are up")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
