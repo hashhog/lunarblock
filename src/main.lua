@@ -473,6 +473,7 @@ local function main()
   local fee_mod = require("lunarblock.fee")
   local wallet_mod = require("lunarblock.wallet")
   local mining_mod = require("lunarblock.mining")
+  local prune_mod = require("lunarblock.prune")
   local validation = require("lunarblock.validation")
   local p2p = require("lunarblock.p2p")
   local types = require("lunarblock.types")
@@ -576,6 +577,22 @@ local function main()
     io.stdout:flush()
   end
 
+  -- Initialize block pruner.  args.prune is the user-supplied --prune
+  -- value: 0=disabled (default), 1=manual-only, >=550=automatic with
+  -- target MB.  When disabled, pruner.maybe_prune is a no-op so the
+  -- IBD path remains identical to the un-pruned default.
+  local pruner = prune_mod.new({
+    target_mb = args.prune or 0,
+    storage = db,
+  })
+  if pruner.enabled then
+    print(string.format(
+      "Pruning enabled: mode=%s target=%d MB (keep newest %d blocks)",
+      pruner.automatic and "automatic" or "manual",
+      pruner.target_mb,
+      pruner.automatic and pruner:target_blocks_to_keep() or -1))
+  end
+
   -- Initialize block downloader for IBD
   local block_downloader = sync_mod.new_block_downloader(header_chain, db, network)
   -- Start downloading from after the current chain tip
@@ -612,6 +629,14 @@ local function main()
       -- believe the connection succeeded, storing the block and advancing
       -- the height while the UTXO state was never updated.
       error(string.format("Failed to connect block %d: %s", height, tostring(err)))
+    end
+    -- Run the prune sweep AFTER the block is connected. maybe_prune is
+    -- self-throttled (PRUNE_INTERVAL_BLOCKS) and capped per-call
+    -- (MAX_DELETES_PER_SWEEP), so calling it on every connected block
+    -- adds at most a hash-table check on the fast path. When --prune=0
+    -- this is a single early-return.
+    if pruner.enabled then
+      pruner:maybe_prune(height)
     end
     -- Broadcast inv to peers for newly connected blocks (skip during IBD)
     if block_downloader.ibd_complete then
@@ -1042,6 +1067,9 @@ local function main()
     av_in_index = av_in_index,
     av_is_ancestor = av_is_ancestor,
     av_on_best_chain = av_on_best_chain,
+    -- Pruner: enables `pruned`, `pruneheight`, `automatic_pruning` in
+    -- getblockchaininfo and gates getblock with the right error code.
+    pruner = pruner,
   })
   rpc_server:start()
 
