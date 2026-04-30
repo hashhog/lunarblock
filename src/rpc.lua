@@ -1769,6 +1769,315 @@ function RPCServer:register_methods()
     return {errors = {"Insufficient data or no feerate found"}, blocks = conf_target}
   end
 
+  -- estimaterawfee: raw fee estimator output for a confirmation target.
+  -- Bitcoin Core: bitcoin-core/src/rpc/fees.cpp::estimaterawfee.  Returns one
+  -- entry per estimation horizon (short=12, medium=144, long=1008 blocks); each
+  -- entry exposes the raw bucket data ("feerate" + "decay"-weighted "pass" /
+  -- "fail" counts).  We map the existing FeeEstimator to a single conservative
+  -- bucket per horizon — the structure matches Core's response so RPC clients
+  -- that expect the schema parse cleanly even when our estimator has less
+  -- granular bucket data than Core's policy/fees.cpp.
+  self.methods["estimaterawfee"] = function(rpc, params)
+    local conf_target = params[1] or 6
+    if type(conf_target) ~= "number" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "conf_target must be numeric"})
+    end
+    local threshold = params[2]
+    if threshold ~= nil and threshold ~= cjson.null and type(threshold) ~= "number" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "threshold must be numeric"})
+    end
+    threshold = (type(threshold) == "number") and threshold or 0.95
+    conf_target = math.max(1, math.min(1008, math.floor(conf_target)))
+
+    local horizons = { short = 12, medium = 144, long = 1008 }
+    local result = {}
+    for name, _ in pairs(horizons) do
+      local entry = { fail = cjson.null, errors = cjson.null }
+      if rpc.fee_estimator then
+        local fee_rate, reliable = rpc.fee_estimator:estimate_fee(conf_target, threshold)
+        if fee_rate and fee_rate > 0 then
+          entry.feerate = fee_rate / 100000  -- sat/vB -> BTC/kvB
+          entry.decay = rpc.fee_estimator.decay or 0.998
+          entry.scale = 1
+          entry.pass = {
+            startrange = fee_rate,
+            endrange = fee_rate,
+            withintarget = reliable and 1 or 0,
+            totalconfirmed = reliable and 1 or 0,
+            inmempool = 0,
+            leftmempool = 0,
+          }
+        else
+          entry.errors = { "Insufficient data or no feerate found" }
+        end
+      else
+        entry.errors = { "Fee estimation not available" }
+      end
+      result[name] = entry
+    end
+    return result
+  end
+
+  --- signmessage / verifymessage (BIP-137 "Bitcoin Signed Message"):
+  -- Bitcoin Core references:
+  --   bitcoin-core/src/rpc/signmessage.cpp        (RPC entrypoints)
+  --   bitcoin-core/src/common/signmessage.cpp     (MessageHash/MessageSign/MessageVerify)
+  -- Hash construction:
+  --   double-SHA256( varstr("Bitcoin Signed Message:\n") || varstr(message) ).
+  -- Wire format: 65-byte signature, base64-encoded.
+  --   header = 27 + recid + (compressed ? 4 : 0)
+  -- We implement signmessagewithprivkey (no wallet keystore lookup) and
+  -- verifymessage (P2PKH only — Core also rejects non-PKHash destinations).
+  local MESSAGE_MAGIC = "Bitcoin Signed Message:\n"
+
+  local function message_hash(message)
+    local crypto = require("lunarblock.crypto")
+    local w = serialize.buffer_writer()
+    w.write_varstr(MESSAGE_MAGIC)
+    w.write_varstr(message)
+    return crypto.hash256(w.result())
+  end
+
+  -- signmessagewithprivkey "<wif_or_hex_privkey>" "<message>" -> base64 sig
+  -- Wallet-keystore variant ("signmessage <address> <msg>") is gated on
+  -- self.wallet / self.wallet_manager exposing per-address privkeys; we accept
+  -- the same RPC name for parity but require the privkey form when no
+  -- wallet keystore is available.  See TODO(rpc) below.
+  self.methods["signmessagewithprivkey"] = function(_rpc, params)
+    local privkey_str = params and params[1]
+    local message = params and params[2]
+    if type(privkey_str) ~= "string" or type(message) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Usage: signmessagewithprivkey <privkey> <message>"})
+    end
+    local crypto = require("lunarblock.crypto")
+    local privkey32, compressed
+    -- Accept WIF or raw 64-hex
+    local addr_mod = require("lunarblock.address")
+    if #privkey_str == 64 and privkey_str:match("^[0-9A-Fa-f]+$") then
+      privkey32 = M.hex_decode(privkey_str)
+      compressed = true
+    else
+      -- Best-effort WIF decode
+      local version, payload = addr_mod.base58check_decode(privkey_str)
+      if not version or not payload then
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid private key"})
+      end
+      if #payload == 33 and payload:byte(33) == 0x01 then
+        privkey32 = payload:sub(1, 32)
+        compressed = true
+      elseif #payload == 32 then
+        privkey32 = payload
+        compressed = false
+      else
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid private key"})
+      end
+    end
+    local h = message_hash(message)
+    local sig65, err = crypto.ecdsa_sign_recoverable_compact(privkey32, h, compressed)
+    if not sig65 then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Sign failed: " .. tostring(err)})
+    end
+    local psbt_mod = require("lunarblock.psbt")
+    return psbt_mod.base64_encode(sig65)
+  end
+
+  -- signmessage <address> <message>: requires wallet keystore.  Until the
+  -- wallet-keystore privkey lookup lands (TODO(rpc): wallet keystore
+  -- per-address privkey export), behave like signmessagewithprivkey when
+  -- callers pass a privkey string instead of an address, otherwise return
+  -- WALLET_ERROR with a clear message.
+  self.methods["signmessage"] = function(rpc, params)
+    local addr_or_priv = params and params[1]
+    local message = params and params[2]
+    if type(addr_or_priv) ~= "string" or type(message) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Usage: signmessage <address> <message>"})
+    end
+    -- Heuristic: a 64-char hex string is a privkey; otherwise probe
+    -- decode_address (wrapped in pcall — it raises on non-base58 inputs
+    -- that aren't bech32 either).
+    local looks_like_privkey = (#addr_or_priv == 64
+      and addr_or_priv:match("^[0-9A-Fa-f]+$") ~= nil)
+    if not looks_like_privkey then
+      local addr_mod = require("lunarblock.address")
+      local ok, addr_type = pcall(addr_mod.decode_address, addr_or_priv,
+        rpc.network and rpc.network.name)
+      if ok and addr_type then
+        -- Looks like an address; we'd need to look up the privkey by
+        -- address in the wallet keystore.  Wallets in lunarblock currently
+        -- expose HD-derived addresses but not a per-address privkey export
+        -- hook on the RPC surface.
+        -- TODO(rpc): wire signmessage <address> -> wallet:get_privkey_for_address.
+        error({code = M.ERROR.WALLET_ERROR,
+          message = "signmessage by address requires wallet keystore lookup; " ..
+                    "use signmessagewithprivkey or pass a WIF/hex privkey directly"})
+      end
+    end
+    -- Fall through: treat first arg as a privkey (WIF or 64-hex).
+    return self.methods["signmessagewithprivkey"](rpc, params)
+  end
+
+  self.methods["verifymessage"] = function(rpc, params)
+    local address = params and params[1]
+    local signature = params and params[2]
+    local message = params and params[3]
+    if type(address) ~= "string" or type(signature) ~= "string" or type(message) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Usage: verifymessage <address> <signature> <message>"})
+    end
+    local addr_mod = require("lunarblock.address")
+    local crypto = require("lunarblock.crypto")
+    local addr_type, addr_hash = addr_mod.decode_address(address, rpc.network and rpc.network.name)
+    if not addr_type then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid address"})
+    end
+    if addr_type ~= "p2pkh" then
+      -- Bitcoin Core rejects non-PKHash destinations (RPC_TYPE_ERROR).
+      error({code = M.ERROR.TYPE_ERROR, message = "Address does not refer to key"})
+    end
+    local sig65 = M.base64_decode(signature)
+    if #sig65 ~= 65 then
+      error({code = M.ERROR.TYPE_ERROR, message = "Malformed base64 encoding"})
+    end
+    local h = message_hash(message)
+    local pub, err = crypto.ecdsa_recover_compact(sig65, h)
+    if not pub then
+      -- Not signed / pubkey not recovered -> Core returns false (not an error).
+      return false
+    end
+    -- Compare hash160(pub) to the P2PKH hash160 in the address.
+    local recovered_hash160 = crypto.hash160(pub)
+    return recovered_hash160 == addr_hash
+  end
+
+  -- savemempool: alias for dumpmempool (Bitcoin Core: rpc/mempool.cpp::savemempool).
+  -- Returns only the filename (Core's schema), not the full dump stats.
+  self.methods["savemempool"] = function(rpc, params)
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+    if not rpc.datadir then
+      error({code = M.ERROR.MISC_ERROR, message = "Datadir not configured"})
+    end
+    local mempool_persist_mod = require("lunarblock.mempool_persist")
+    local path = (params and params[1]) or (rpc.datadir .. "/mempool.dat")
+    local ok, count_or_err = mempool_persist_mod.dump(rpc.mempool, path)
+    if not ok then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Unable to dump mempool to disk: " .. tostring(count_or_err)})
+    end
+    return { filename = path }
+  end
+
+  -- Mempool entry/ancestor/descendant introspection.
+  -- Bitcoin Core: rpc/mempool.cpp::{getmempoolentry,getmempoolancestors,getmempooldescendants}.
+  -- Each walks the in-memory CTxMemPool graph; we mirror that with the
+  -- ancestor/descendant sets already maintained on each Mempool entry.
+  local function format_mempool_entry(entry, txid_hex)
+    local fee_btc = entry.fee / consensus.COIN
+    return {
+      vsize = entry.vsize,
+      weight = entry.weight,
+      fee = fee_btc,
+      modifiedfee = fee_btc,
+      time = entry.time,
+      height = entry.height,
+      descendantcount = entry.descendant_count or 1,
+      descendantsize = entry.descendant_size or entry.vsize,
+      descendantfees = entry.descendant_fees or entry.fee,
+      ancestorcount = entry.ancestor_count or 1,
+      ancestorsize = entry.ancestor_size or entry.vsize,
+      ancestorfees = entry.ancestor_fees or entry.fee,
+      wtxid = entry.wtxid or txid_hex,
+      fees = {
+        base = fee_btc,
+        modified = fee_btc,
+        ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
+        descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
+      },
+      depends = entry.depends or {},
+      spentby = entry.spent_by or {},
+      ["bip125-replaceable"] = true,
+      unbroadcast = false,
+    }
+  end
+
+  self.methods["getmempoolentry"] = function(rpc, params)
+    local txid_hex = params and params[1]
+    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
+    end
+    if not rpc.mempool then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
+    end
+    local entry = rpc.mempool:get_entry(txid_hex)
+    if not entry then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
+    end
+    return format_mempool_entry(entry, txid_hex)
+  end
+
+  self.methods["getmempoolancestors"] = function(rpc, params)
+    local txid_hex = params and params[1]
+    local verbose = (params and params[2]) or false
+    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
+    end
+    if not rpc.mempool then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
+    end
+    local entry = rpc.mempool:get_entry(txid_hex)
+    if not entry then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
+    end
+    if not verbose then
+      local out = {}
+      for anc_hex in pairs(entry.ancestors or {}) do
+        out[#out + 1] = anc_hex
+      end
+      return out
+    end
+    local out = {}
+    for anc_hex in pairs(entry.ancestors or {}) do
+      local anc_entry = rpc.mempool:get_entry(anc_hex)
+      if anc_entry then
+        out[anc_hex] = format_mempool_entry(anc_entry, anc_hex)
+      end
+    end
+    return out
+  end
+
+  self.methods["getmempooldescendants"] = function(rpc, params)
+    local txid_hex = params and params[1]
+    local verbose = (params and params[2]) or false
+    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
+    end
+    if not rpc.mempool then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
+    end
+    local entry = rpc.mempool:get_entry(txid_hex)
+    if not entry then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
+    end
+    if not verbose then
+      local out = {}
+      for desc_hex in pairs(entry.descendants or {}) do
+        out[#out + 1] = desc_hex
+      end
+      return out
+    end
+    local out = {}
+    for desc_hex in pairs(entry.descendants or {}) do
+      local desc_entry = rpc.mempool:get_entry(desc_hex)
+      if desc_entry then
+        out[desc_hex] = format_mempool_entry(desc_entry, desc_hex)
+      end
+    end
+    return out
+  end
+
   -- Mining
   self.methods["getblocktemplate"] = function(rpc, params)
     if rpc.mining then
