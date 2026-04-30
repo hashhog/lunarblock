@@ -2215,17 +2215,27 @@ function RPCServer:register_methods()
   end
 
   -- getnettotals: cumulative bytes-in / bytes-out.  Bitcoin Core:
-  -- src/rpc/net.cpp::getnettotals.  We sum per-peer counters since we do
-  -- not maintain a global CConnman::nTotalBytesRecv / nTotalBytesSent.
-  -- TODO(rpc): wire global totals into PeerManager once a unified counter
-  -- exists; this loop misses bytes from already-disconnected peers.
+  -- src/rpc/net.cpp::getnettotals -> CConnman::GetTotalBytesRecv /
+  -- GetTotalBytesSent (src/net.cpp).  Core keeps a single pair of monotonic
+  -- counters that DON'T reset when a peer disconnects.
+  --
+  -- Implementation: PeerManager.totals = {bytes_recv, bytes_sent} are the
+  -- cumulative globals; disconnect_peer / stop accumulate the final
+  -- per-peer counters into them.  At RPC time we add the still-connected
+  -- peers' counters on top so the number is up-to-the-second.
   self.methods["getnettotals"] = function(rpc, _params)
     local total_recv = 0
     local total_sent = 0
-    if rpc.peer_manager and rpc.peer_manager.peer_list then
-      for _, p in ipairs(rpc.peer_manager.peer_list) do
-        total_recv = total_recv + (p.bytes_recv or 0)
-        total_sent = total_sent + (p.bytes_sent or 0)
+    if rpc.peer_manager then
+      if rpc.peer_manager.totals then
+        total_recv = total_recv + (rpc.peer_manager.totals.bytes_recv or 0)
+        total_sent = total_sent + (rpc.peer_manager.totals.bytes_sent or 0)
+      end
+      if rpc.peer_manager.peer_list then
+        for _, p in ipairs(rpc.peer_manager.peer_list) do
+          total_recv = total_recv + (p.bytes_recv or 0)
+          total_sent = total_sent + (p.bytes_sent or 0)
+        end
       end
     end
     return {
@@ -2301,6 +2311,21 @@ function RPCServer:register_methods()
       return requested == nil or requested[name]
     end
 
+    -- Try to load and decode BlockUndo so we can populate fee/feerate stats.
+    -- BlockUndo entries are aligned with non-coinbase txs: vtxundo[1] -> tx[2].
+    -- See bitcoin-core/src/rpc/blockchain.cpp::getblockstats (loop_inputs path).
+    local block_undo = nil
+    if rpc.storage.get_undo then
+      local undo_raw = rpc.storage.get_undo(block_hash)
+      if undo_raw then
+        local utxo_mod = require("lunarblock.utxo")
+        local ok, decoded = pcall(utxo_mod.deserialize_block_undo, undo_raw)
+        if ok and decoded and type(decoded) == "table" and decoded.tx_undo then
+          block_undo = decoded
+        end
+      end
+    end
+
     local txs = block.transactions
     local total_size = 0
     local total_weight = 0
@@ -2311,6 +2336,12 @@ function RPCServer:register_methods()
     local swtxs, swtotal_size, swtotal_weight = 0, 0, 0
     local maxtxsize, mintxsize = 0, math.huge
     local utxos_count = 0
+    -- Fee/feerate accumulators (only populated when block_undo is present).
+    local fee_array = {}
+    local feerate_array = {}      -- {{feerate_satvb, weight}, ...}
+    local total_fee = 0
+    local maxfee, minfee = 0, math.huge
+    local maxfeerate, minfeerate = 0, math.huge
     -- Coinbase index: tx[1].
     for i, tx in ipairs(txs) do
       local tx_size = #serialize.serialize_transaction(tx, true)
@@ -2330,14 +2361,43 @@ function RPCServer:register_methods()
       end
       if i > 1 then
         inputs = inputs + #tx.inputs
+        local tx_total_out = 0
         for _, out in ipairs(tx.outputs) do
           total_out = total_out + out.value
+          tx_total_out = tx_total_out + out.value
         end
         total_size = total_size + tx_size
         total_weight = total_weight + tx_weight
         txsize_array[#txsize_array + 1] = tx_size
         if tx_size > maxtxsize then maxtxsize = tx_size end
         if tx_size < mintxsize then mintxsize = tx_size end
+
+        -- Per-tx fee via BlockUndo (matches Core's loop_inputs path).
+        if block_undo then
+          local txu = block_undo.tx_undo[i - 1]
+          if txu and txu.prev_outputs then
+            local tx_total_in = 0
+            for _, prev in ipairs(txu.prev_outputs) do
+              tx_total_in = tx_total_in + (prev.value or 0)
+            end
+            local txfee = tx_total_in - tx_total_out
+            -- Negative fees are nonsensical (would mean undo lookup mismatch);
+            -- clamp to 0 so we don't poison aggregates.
+            if txfee < 0 then txfee = 0 end
+            fee_array[#fee_array + 1] = txfee
+            total_fee = total_fee + txfee
+            if txfee > maxfee then maxfee = txfee end
+            if txfee < minfee then minfee = txfee end
+            -- Feerate in sat/vbyte = (txfee * 4) / weight.
+            local feerate = 0
+            if tx_weight > 0 then
+              feerate = math.floor((txfee * consensus.WITNESS_SCALE_FACTOR) / tx_weight)
+            end
+            feerate_array[#feerate_array + 1] = {feerate, tx_weight}
+            if feerate > maxfeerate then maxfeerate = feerate end
+            if feerate < minfeerate then minfeerate = feerate end
+          end
+        end
       end
       -- utxo_increase counts spendable outputs created (cheap heuristic;
       -- Core also subtracts unspendable scripts -- TODO(rpc) when we
@@ -2345,6 +2405,49 @@ function RPCServer:register_methods()
       utxos_count = utxos_count + #tx.outputs
     end
     if mintxsize == math.huge then mintxsize = 0 end
+    if minfee == math.huge then minfee = 0 end
+    if minfeerate == math.huge then minfeerate = 0 end
+
+    -- Bitcoin Core's CalculateTruncatedMedian: sort, average two middle
+    -- elements when even-sized, else pick the middle.
+    local function truncated_median(arr)
+      if #arr == 0 then return 0 end
+      table.sort(arr)
+      if #arr % 2 == 0 then
+        return math.floor((arr[#arr / 2] + arr[#arr / 2 + 1]) / 2)
+      end
+      return arr[math.ceil(#arr / 2)]
+    end
+
+    -- Bitcoin Core's CalculatePercentilesByWeight: sort by feerate, then walk
+    -- the cumulative-weight axis emitting percentiles at 10/25/50/75/90.
+    local function feerate_percentiles_calc()
+      local result = {0, 0, 0, 0, 0}
+      if #feerate_array == 0 or total_weight == 0 then return result end
+      table.sort(feerate_array, function(a, b) return a[1] < b[1] end)
+      local thresholds = {
+        total_weight / 10.0,
+        total_weight / 4.0,
+        total_weight / 2.0,
+        (total_weight * 3.0) / 4.0,
+        (total_weight * 9.0) / 10.0,
+      }
+      local next_idx = 1
+      local cumulative = 0
+      for _, e in ipairs(feerate_array) do
+        cumulative = cumulative + e[2]
+        while next_idx <= 5 and cumulative >= thresholds[next_idx] do
+          result[next_idx] = e[1]
+          next_idx = next_idx + 1
+        end
+      end
+      -- Fill remaining with the largest feerate (matches Core).
+      local last = feerate_array[#feerate_array][1]
+      for i = next_idx, 5 do
+        result[i] = last
+      end
+      return result
+    end
 
     if not height and rpc.storage.iterator then
       -- Reverse-lookup height; relatively cheap given height index is small.
@@ -2403,12 +2506,22 @@ function RPCServer:register_methods()
         table.sort(timestamps)
         return timestamps[math.ceil(#timestamps / 2)]
       end)(),
-      -- TODO(rpc): fee/feerate stats require BlockUndo to fetch input
-      -- prevouts.  Wire when storage.get_undo is exposed cleanly.
-      avgfee = 0, avgfeerate = 0, totalfee = 0,
-      maxfee = 0, maxfeerate = 0, medianfee = 0,
-      minfee = 0, minfeerate = 0,
-      feerate_percentiles = {0, 0, 0, 0, 0},
+      -- Fee/feerate stats: zero if BlockUndo wasn't available, otherwise
+      -- computed from per-tx prev-output values via BlockUndo (matches
+      -- bitcoin-core/src/rpc/blockchain.cpp::getblockstats loop_inputs).
+      avgfee = (block_undo and #txs > 1) and math.floor(total_fee / (#txs - 1)) or 0,
+      avgfeerate = (block_undo and total_weight > 0)
+        and math.floor((total_fee * consensus.WITNESS_SCALE_FACTOR) / total_weight) or 0,
+      totalfee = block_undo and total_fee or 0,
+      maxfee = block_undo and maxfee or 0,
+      maxfeerate = block_undo and maxfeerate or 0,
+      medianfee = block_undo and truncated_median(fee_array) or 0,
+      minfee = block_undo and minfee or 0,
+      minfeerate = block_undo and minfeerate or 0,
+      feerate_percentiles = block_undo and feerate_percentiles_calc() or {0, 0, 0, 0, 0},
+      -- _actual variants subtract unspendable script outputs; we don't yet
+      -- expose script_mod.is_unspendable, so they trail utxo_increase /
+      -- utxo_size_inc until that helper lands.
       utxo_increase_actual = 0, utxo_size_inc_actual = 0,
     }
 
@@ -2495,8 +2608,12 @@ function RPCServer:register_methods()
   -- generateblock <output> <transactions> [<submit>] -- regtest only.
   -- Bitcoin Core: src/rpc/mining.cpp::generateblock.  Mines a block
   -- containing the listed transactions (or txids referencing already-in
-  -- mempool transactions) directed at the given output address.  Test fees
-  -- are NOT collected (subsidy-only coinbase).
+  -- mempool transactions) directed at the given output address.  We collect
+  -- fees from the caller-provided txs into the coinbase output value
+  -- (coinbase value = subsidy + sum(fees)).  For mempool-resident txs we
+  -- read the precomputed `entry.fee`; for raw-hex txs we resolve each input
+  -- via chain_state.coin_view (and fall back to mempool entries created
+  -- earlier in the same call, allowing in-block tx chains).
   self.methods["generateblock"] = function(rpc, params)
     if not rpc.mining then
       error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
@@ -2539,8 +2656,12 @@ function RPCServer:register_methods()
     end
 
     -- Resolve each entry: a 64-char hex txid references an in-mempool tx,
-    -- everything else is treated as raw tx hex.
+    -- everything else is treated as raw tx hex.  Track per-entry fee where
+    -- known (mempool entries) so we can collect fees into the coinbase.
     local provided_txs = {}
+    local known_fee = {}     -- per-index fee in satoshis (mempool path only)
+    local intra_block = {}   -- txid_hex -> {vout_idx -> {value, script}}
+                             -- so a later raw tx can spend an earlier one
     for i, item in ipairs(tx_list) do
       if type(item) ~= "string" then
         error({code = M.ERROR.INVALID_PARAMS,
@@ -2557,6 +2678,7 @@ function RPCServer:register_methods()
             message = "transactions[" .. i .. "] references unknown txid"})
         end
         provided_txs[#provided_txs + 1] = entry.tx
+        known_fee[#provided_txs] = entry.fee or 0
       else
         local ok, tx = pcall(serialize.deserialize_transaction, M.hex_decode(item))
         if not ok then
@@ -2567,24 +2689,102 @@ function RPCServer:register_methods()
       end
     end
 
-    -- Build a normal block template via the mempool, then replace the
-    -- non-coinbase tx list with the user's txs (preserves coinbase weight
-    -- accounting).  Test fees are not collected -- coinbase value stays at
-    -- the subsidy alone (matches Core's generateblock).
-    -- TODO(rpc): coinbase-fee handling.  Core's generateblock leaves fees
-    -- uncollected; we mirror that.  When a real test framework asks us to
-    -- mine "with fees", switch to mining.create_block_template + adjust
-    -- coinbase output value to equal subsidy + sum(fees).
+    -- Compute total fees over the provided txs so we can pay them out via
+    -- the coinbase (Core ref: src/rpc/mining.cpp::generateblock builds the
+    -- block via createNewBlock with use_mempool=false, which leaves the
+    -- coinbase at subsidy; we deliberately diverge to support fee
+    -- collection for test frameworks that mine fee-paying txs).
+    local total_fees = 0
+    for i, tx in ipairs(provided_txs) do
+      if known_fee[i] then
+        total_fees = total_fees + known_fee[i]
+      else
+        -- Resolve each input via chain_state.coin_view, falling back to
+        -- the mempool (for parents already accepted) and to intra-block
+        -- siblings (for tx-chains in the caller's list).
+        local tx_in_value = 0
+        local resolved_all = true
+        for _, inp in ipairs(tx.inputs) do
+          local prev_hex = types.hash256_hex(inp.prev_out.hash)
+          local val
+          -- 1) chain UTXO set
+          if rpc.chain_state and rpc.chain_state.coin_view
+              and rpc.chain_state.coin_view.get then
+            local entry = rpc.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+            if entry then val = entry.value end
+          end
+          -- 2) intra-block sibling tx
+          if not val and intra_block[prev_hex] then
+            local sibling = intra_block[prev_hex][inp.prev_out.index]
+            if sibling then val = sibling.value end
+          end
+          -- 3) mempool entry (parent tx in same call series, where caller
+          --    passed the parent as a mempool txid)
+          if not val and rpc.mempool then
+            local mp_entry = rpc.mempool:get_entry(prev_hex)
+            if mp_entry and mp_entry.tx and mp_entry.tx.outputs[inp.prev_out.index + 1] then
+              val = mp_entry.tx.outputs[inp.prev_out.index + 1].value
+            end
+          end
+          if not val then
+            resolved_all = false
+            break
+          end
+          tx_in_value = tx_in_value + val
+        end
+        if resolved_all then
+          local tx_out_value = 0
+          for _, out in ipairs(tx.outputs) do
+            tx_out_value = tx_out_value + out.value
+          end
+          local fee = tx_in_value - tx_out_value
+          if fee > 0 then total_fees = total_fees + fee end
+        end
+      end
+      -- Index this tx's outputs so a later sibling can resolve them.
+      local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+      intra_block[txid_hex] = {}
+      for vout_idx, out in ipairs(tx.outputs) do
+        intra_block[txid_hex][vout_idx - 1] = {value = out.value, script = out.script_pubkey}
+      end
+    end
+
+    -- Build a normal block template via the mempool (gives us a coinbase at
+    -- subsidy, segwit witness-commitment scaffolding, and the next-bits
+    -- target), then replace the non-coinbase tx list with the caller's txs
+    -- and rebuild the coinbase to reflect subsidy + total_fees.
     local _template, block = rpc.mining.create_block_template(
       rpc.mempool, rpc.chain_state, rpc.network, payout_script
     )
 
-    -- Replace mempool-selected txs with caller-supplied txs (keep coinbase).
-    local coinbase = block.transactions[1]
-    block.transactions = { coinbase }
+    local height = rpc.chain_state.tip_height + 1
+    local subsidy = consensus.get_block_subsidy(height)
+
+    -- Replace mempool-selected txs with caller-supplied txs.
+    block.transactions = {}
     for _, tx in ipairs(provided_txs) do
       block.transactions[#block.transactions + 1] = tx
     end
+
+    -- Rebuild the coinbase: same height/extra/payout scaffolding as the
+    -- template's coinbase, but value = subsidy + total_fees, and witness
+    -- commitment recomputed over the new (caller-supplied) tx list.
+    local witness_commitment = nil
+    if height >= rpc.network.segwit_height then
+      local crypto_mod = require("lunarblock.crypto")
+      local wtx_hashes = {types.hash256_zero()}  -- coinbase wtxid placeholder
+      for _, tx in ipairs(provided_txs) do
+        wtx_hashes[#wtx_hashes + 1] = validation.compute_wtxid(tx)
+      end
+      local witness_root = crypto_mod.compute_merkle_root(wtx_hashes)
+      local witness_nonce = string.rep("\0", 32)
+      witness_commitment = crypto_mod.hash256(witness_root.bytes .. witness_nonce)
+    end
+    local coinbase = rpc.mining.create_coinbase_tx(
+      height, subsidy + total_fees, "/LunarBlock/", witness_commitment, payout_script
+    )
+    table.insert(block.transactions, 1, coinbase)
+
     -- Recompute the merkle root over the new tx set.
     local tx_hashes = {}
     for i, tx in ipairs(block.transactions) do
