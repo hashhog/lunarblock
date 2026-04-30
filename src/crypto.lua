@@ -397,6 +397,40 @@ ffi.cdef[[
     secp256k1_ellswift_xdh_hash_function hashfp,
     void *data
   );
+
+  /* Recoverable ECDSA (libsecp256k1 recovery module).
+   * Used by BIP-137 / "Bitcoin Signed Message" verifymessage / signmessage. */
+  typedef struct { unsigned char data[65]; } secp256k1_ecdsa_recoverable_signature;
+
+  int secp256k1_ecdsa_recoverable_signature_parse_compact(
+    const secp256k1_context* ctx,
+    secp256k1_ecdsa_recoverable_signature* sig,
+    const unsigned char* input64,
+    int recid
+  );
+
+  int secp256k1_ecdsa_recoverable_signature_serialize_compact(
+    const secp256k1_context* ctx,
+    unsigned char* output64,
+    int* recid,
+    const secp256k1_ecdsa_recoverable_signature* sig
+  );
+
+  int secp256k1_ecdsa_recover(
+    const secp256k1_context* ctx,
+    secp256k1_pubkey* pubkey,
+    const secp256k1_ecdsa_recoverable_signature* sig,
+    const unsigned char* msghash32
+  );
+
+  int secp256k1_ecdsa_sign_recoverable(
+    const secp256k1_context* ctx,
+    secp256k1_ecdsa_recoverable_signature* sig,
+    const unsigned char* msghash32,
+    const unsigned char* seckey,
+    void* noncefp,
+    const void* ndata
+  );
 ]]
 
 local libsecp256k1 = ffi.load("secp256k1")
@@ -594,6 +628,71 @@ function M.ecdsa_sign(privkey32, msg_hash32)
   libsecp256k1.secp256k1_ecdsa_signature_serialize_der(
     secp_ctx, output, outputlen, sig
   )
+  return ffi.string(output, outputlen[0])
+end
+
+-- Sign a 32-byte message hash with a 32-byte private key, returning a 65-byte
+-- recoverable signature in Bitcoin Core's "compact" format:
+--   header (1 byte: 27 + recid + (compressed ? 4 : 0)) || R (32 bytes) || S (32 bytes)
+-- The header encoding matches `CKey::SignCompact` in bitcoin-core/src/key.cpp.
+-- @param privkey32 string: 32-byte private key
+-- @param msg_hash32 string: 32-byte message hash
+-- @param compressed boolean: whether the corresponding pubkey is compressed
+-- @return string|nil: 65-byte compact recoverable signature, nil + err on failure
+function M.ecdsa_sign_recoverable_compact(privkey32, msg_hash32, compressed)
+  if compressed == nil then compressed = true end
+  assert(#privkey32 == 32, "privkey must be 32 bytes")
+  assert(#msg_hash32 == 32, "msg_hash must be 32 bytes")
+  local sig = ffi.new("secp256k1_ecdsa_recoverable_signature")
+  if libsecp256k1.secp256k1_ecdsa_sign_recoverable(
+    secp_ctx, sig, msg_hash32, privkey32, nil, nil
+  ) ~= 1 then
+    return nil, "signing failed"
+  end
+  local output64 = ffi.new("unsigned char[64]")
+  local recid = ffi.new("int[1]")
+  if libsecp256k1.secp256k1_ecdsa_recoverable_signature_serialize_compact(
+    secp_ctx, output64, recid, sig
+  ) ~= 1 then
+    return nil, "serialize_compact failed"
+  end
+  local header = 27 + recid[0] + (compressed and 4 or 0)
+  return string.char(header) .. ffi.string(output64, 64)
+end
+
+-- Recover the compressed public key from a 65-byte compact recoverable
+-- signature (header || R || S) and a 32-byte message hash.
+-- Mirrors `CPubKey::RecoverCompact` from bitcoin-core/src/pubkey.cpp.
+-- @param sig65 string: 65-byte signature (header byte + 64 bytes RS)
+-- @param msg_hash32 string: 32-byte message hash
+-- @return string|nil: 33-byte (compressed) or 65-byte (uncompressed) pubkey
+function M.ecdsa_recover_compact(sig65, msg_hash32)
+  if #sig65 ~= 65 then return nil, "signature must be 65 bytes" end
+  if #msg_hash32 ~= 32 then return nil, "msg_hash must be 32 bytes" end
+  local header = sig65:byte(1)
+  if header < 27 or header > 34 then
+    return nil, "invalid signature header byte"
+  end
+  local compressed = header >= 31
+  local recid = (header - 27) % 4
+  local rs = sig65:sub(2, 65)
+  local rec_sig = ffi.new("secp256k1_ecdsa_recoverable_signature")
+  if libsecp256k1.secp256k1_ecdsa_recoverable_signature_parse_compact(
+    secp_ctx, rec_sig, rs, recid
+  ) ~= 1 then
+    return nil, "parse_compact failed"
+  end
+  local pubkey = ffi.new("secp256k1_pubkey")
+  if libsecp256k1.secp256k1_ecdsa_recover(
+    secp_ctx, pubkey, rec_sig, msg_hash32
+  ) ~= 1 then
+    return nil, "recovery failed"
+  end
+  local flags = compressed and 0x0102 or 0x0002
+  local outlen = compressed and 33 or 65
+  local output = ffi.new("unsigned char[?]", outlen)
+  local outputlen = ffi.new("size_t[1]", outlen)
+  libsecp256k1.secp256k1_ec_pubkey_serialize(secp_ctx, output, outputlen, pubkey, flags)
   return ffi.string(output, outputlen[0])
 end
 
