@@ -2876,4 +2876,109 @@ describe("rpc", function()
     end)
   end)
 
+  -- -------------------------------------------------------------------
+  -- Bitcoin Core-compatible mempool.dat dump/load.
+  -- These tests exercise only the RPC surface; the on-disk format is
+  -- covered byte-by-byte in spec/mempool_persist_spec.lua.
+  -- -------------------------------------------------------------------
+  describe("dumpmempool / loadmempool", function()
+    local mempool = require("lunarblock.mempool")
+    local serialize = require("lunarblock.serialize")
+
+    local function tmpdir()
+      local dir = os.tmpname() .. "_lb_rpc_persist"
+      os.execute("mkdir -p " .. dir)
+      return dir
+    end
+
+    local function build_mempool_with_one_tx()
+      local prev_txid = types.hash256(string.rep("\xab", 32))
+      local prev_hex = types.hash256_hex(prev_txid)
+      local mock_coin_view = {
+        utxos = {
+          [prev_hex .. ":0"] = {
+            value = 100000,
+            script_pubkey = string.rep("\x00", 25),
+            height = 500000,
+            is_coinbase = false,
+          },
+        },
+        get = function(self, txid, vout)
+          return self.utxos[types.hash256_hex(txid) .. ":" .. vout]
+        end,
+      }
+      local chain_state = {
+        coin_view = mock_coin_view,
+        tip_height = 700000,
+      }
+      local mp = mempool.new(chain_state)
+      local tx = types.transaction(1,
+        { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFE) },
+        { types.txout(90000, string.rep("\x00", 25)) },
+        0)
+      assert(mp:accept_transaction(tx))
+      return mp, chain_state, tx
+    end
+
+    it("dumpmempool writes to <datadir>/mempool.dat by default", function()
+      local mp = build_mempool_with_one_tx()
+      local dir = tmpdir()
+      finally(function() os.execute("rm -rf " .. dir) end)
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        mempool = mp,
+        datadir = dir,
+      })
+      local request = '{"method":"dumpmempool","params":[],"id":1}'
+      local body = server:handle_request(request)
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(dir .. "/mempool.dat", resp.result.filename)
+      assert.equal(1, resp.result.count)
+
+      local f = io.open(dir .. "/mempool.dat", "rb")
+      assert.is_not_nil(f)
+      f:close()
+    end)
+
+    it("loadmempool reads back what dumpmempool wrote", function()
+      local mp, chain_state = build_mempool_with_one_tx()
+      local dir = tmpdir()
+      finally(function() os.execute("rm -rf " .. dir) end)
+
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        mempool = mp,
+        datadir = dir,
+      })
+      local _ = server:handle_request(
+        '{"method":"dumpmempool","params":[],"id":1}')
+
+      -- Fresh mempool sharing the same UTXO chain_state.
+      local fresh = mempool.new(chain_state)
+      local server2 = rpc.new({
+        network = consensus.networks.mainnet,
+        mempool = fresh,
+        datadir = dir,
+      })
+      local body2 = server2:handle_request(
+        '{"method":"loadmempool","params":[],"id":2}')
+      local resp = cjson.decode(body2)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(1, resp.result.accepted)
+      assert.equal(0, resp.result.failed)
+      assert.equal(1, fresh.tx_count)
+    end)
+
+    it("dumpmempool errors when no mempool is configured", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(
+        '{"method":"dumpmempool","params":[],"id":1}')
+      local resp = cjson.decode(body)
+      -- The RPC must NOT silently succeed; either a JSON-RPC error or
+      -- a non-null `error` field.
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+  end)
+
 end)

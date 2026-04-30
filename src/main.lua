@@ -469,6 +469,7 @@ local function main()
   local peerman_mod = require("lunarblock.peerman")
   local rpc_mod = require("lunarblock.rpc")
   local mempool_mod = require("lunarblock.mempool")
+  local mempool_persist_mod = require("lunarblock.mempool_persist")
   local utxo_mod = require("lunarblock.utxo")
   local fee_mod = require("lunarblock.fee")
   local wallet_mod = require("lunarblock.wallet")
@@ -652,6 +653,26 @@ local function main()
     max_mempool_size = 300 * 1024 * 1024,
     min_relay_fee = 1000,
   })
+
+  -- Bitcoin Core-compatible mempool.dat (kernel/mempool_persist.cpp).
+  -- Load any prior dump now; persistence on shutdown is wired into the
+  -- main-loop cleanup section below.
+  local mempool_dat_path = datadir .. "/mempool.dat"
+  do
+    local f = io.open(mempool_dat_path, "rb")
+    if f then
+      f:close()
+      local ok, stats_or_err = mempool_persist_mod.load(mempool, mempool_dat_path)
+      if ok then
+        print(string.format(
+          "Loaded mempool.dat: %d accepted, %d failed, %d expired, %d already there",
+          stats_or_err.count or 0, stats_or_err.failed or 0,
+          stats_or_err.expired or 0, stats_or_err.already_there or 0))
+      else
+        print("Warning: failed to load mempool.dat: " .. tostring(stats_or_err))
+      end
+    end
+  end
 
   -- Initialize ZMQ notifications (if any endpoints configured)
   local zmq_notifier = nil
@@ -1290,6 +1311,14 @@ local function main()
     print("Saved fee estimation data to " .. fee_est_path)
   else
     print("Warning: failed to save fee estimates: " .. tostring(save_err))
+  end
+  -- Persist mempool to mempool.dat (Bitcoin Core compatible).
+  local dump_ok, dump_count_or_err = mempool_persist_mod.dump(mempool, mempool_dat_path)
+  if dump_ok then
+    print(string.format("Dumped %d mempool transactions to %s",
+      dump_count_or_err or 0, mempool_dat_path))
+  else
+    print("Warning: failed to dump mempool: " .. tostring(dump_count_or_err))
   end
   db.close()
   print("LunarBlock stopped.")
