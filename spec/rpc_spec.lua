@@ -3326,4 +3326,417 @@ describe("rpc", function()
     end)
   end)
 
+  -----------------------------------------------------------------------------
+  -- gettxout
+  -- Bitcoin Core ref: src/rpc/blockchain.cpp::gettxout
+  -----------------------------------------------------------------------------
+  describe("gettxout", function()
+    local function make_chain_with_utxo()
+      local txid = types.hash256(string.rep("\xee", 32))
+      local txid_hex = types.hash256_hex(txid)
+      local script_pk = "\x76\xa9\x14" .. string.rep("\x11", 20) .. "\x88\xac"  -- OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+      local utxos = {
+        [txid_hex .. ":0"] = {
+          value = 5000000000,
+          script_pubkey = script_pk,
+          height = 200,
+          is_coinbase = true,
+        },
+      }
+      local mock_coin_view = {
+        get = function(_, _txid, vout)
+          return utxos[types.hash256_hex(_txid) .. ":" .. vout]
+        end,
+      }
+      local chain_state = {
+        coin_view = mock_coin_view,
+        tip_height = 250,
+        tip_hash = types.hash256(string.rep("\x99", 32)),
+      }
+      return chain_state, txid, txid_hex, utxos
+    end
+
+    it("returns null when UTXO is missing", function()
+      local chain_state = make_chain_with_utxo()
+      local server = rpc.new({network = consensus.networks.mainnet, chain_state = chain_state})
+      local body = server:handle_request(cjson.encode({
+        method = "gettxout",
+        params = {string.rep("00", 32), 0},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(cjson.null, resp.result)
+    end)
+
+    it("returns confirmed UTXO with confirmations and value in BTC", function()
+      local chain_state, _, txid_hex = make_chain_with_utxo()
+      local server = rpc.new({network = consensus.networks.mainnet, chain_state = chain_state})
+      local body = server:handle_request(cjson.encode({
+        method = "gettxout",
+        params = {txid_hex, 0},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_table(resp.result)
+      assert.equal(50, resp.result.value)              -- 50 BTC
+      assert.equal(250 - 200 + 1, resp.result.confirmations)
+      assert.is_true(resp.result.coinbase)
+      assert.equal(types.hash256_hex(chain_state.tip_hash), resp.result.bestblock)
+      assert.is_table(resp.result.scriptPubKey)
+    end)
+
+    it("rejects invalid txid length", function()
+      local chain_state = make_chain_with_utxo()
+      local server = rpc.new({network = consensus.networks.mainnet, chain_state = chain_state})
+      local body = server:handle_request(
+        '{"method":"gettxout","params":["abc",0],"id":1}')
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+    end)
+
+    it("rejects negative vout", function()
+      local _, _, txid_hex = make_chain_with_utxo()
+      local server = rpc.new({network = consensus.networks.mainnet,
+        chain_state = make_chain_with_utxo()})
+      local body = server:handle_request(cjson.encode({
+        method = "gettxout", params = {txid_hex, -1}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+    end)
+  end)
+
+  -----------------------------------------------------------------------------
+  -- disconnectnode + getnettotals (peer manager surface)
+  -----------------------------------------------------------------------------
+  describe("disconnectnode + getnettotals", function()
+    local function fake_peer(ip, port, recv, sent)
+      local p = {
+        ip = ip, port = port,
+        bytes_recv = recv or 0, bytes_sent = sent or 0,
+        disconnected = false,
+      }
+      function p:disconnect(_) self.disconnected = true end
+      return p
+    end
+
+    local function fake_peer_manager()
+      local pm = { peers = {}, peer_list = {}, manual_peers = {} }
+      function pm:disconnect_peer(p, _reason)
+        local key = p.ip .. ":" .. p.port
+        self.peers[key] = nil
+        for i, q in ipairs(self.peer_list) do
+          if q == p then table.remove(self.peer_list, i); break end
+        end
+        p.disconnected = true
+      end
+      return pm
+    end
+
+    it("disconnectnode by address removes the peer", function()
+      local pm = fake_peer_manager()
+      local p = fake_peer("127.0.0.1", 18444)
+      pm.peers["127.0.0.1:18444"] = p
+      pm.peer_list[#pm.peer_list + 1] = p
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local body = server:handle_request(cjson.encode({
+        method = "disconnectnode",
+        params = {"127.0.0.1:18444"},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(cjson.null, resp.result)
+      assert.is_true(p.disconnected)
+      assert.is_nil(pm.peers["127.0.0.1:18444"])
+    end)
+
+    it("disconnectnode by nodeid (id is index in peer_list)", function()
+      local pm = fake_peer_manager()
+      local a = fake_peer("10.0.0.1", 8333)
+      local b = fake_peer("10.0.0.2", 8333)
+      pm.peers["10.0.0.1:8333"] = a
+      pm.peers["10.0.0.2:8333"] = b
+      pm.peer_list[1] = a
+      pm.peer_list[2] = b
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      -- Disconnect peer-id 1 (= b).
+      local body = server:handle_request(cjson.encode({
+        method = "disconnectnode", params = {"", 1}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_true(b.disconnected)
+      assert.is_false(a.disconnected)
+    end)
+
+    it("disconnectnode rejects when neither address nor nodeid given", function()
+      local pm = fake_peer_manager()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local body = server:handle_request(
+        '{"method":"disconnectnode","params":[],"id":1}')
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+    end)
+
+    it("disconnectnode errors on unknown peer", function()
+      local pm = fake_peer_manager()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local body = server:handle_request(cjson.encode({
+        method = "disconnectnode", params = {"127.0.0.1:9999"}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+
+    it("getnettotals sums per-peer counters", function()
+      local pm = fake_peer_manager()
+      pm.peer_list[1] = fake_peer("10.0.0.1", 8333, 100, 200)
+      pm.peer_list[2] = fake_peer("10.0.0.2", 8333, 50, 75)
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local body = server:handle_request('{"method":"getnettotals","params":[],"id":1}')
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(150, resp.result.totalbytesrecv)
+      assert.equal(275, resp.result.totalbytessent)
+      assert.is_number(resp.result.timemillis)
+      assert.is_table(resp.result.uploadtarget)
+    end)
+
+    it("getnettotals returns zeros when peer manager is absent", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request('{"method":"getnettotals","params":[],"id":1}')
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(0, resp.result.totalbytesrecv)
+      assert.equal(0, resp.result.totalbytessent)
+    end)
+  end)
+
+  -----------------------------------------------------------------------------
+  -- getblockstats
+  -- Bitcoin Core ref: src/rpc/blockchain.cpp::getblockstats
+  -----------------------------------------------------------------------------
+  describe("getblockstats", function()
+    local serialize = require("lunarblock.serialize")
+    local crypto = require("lunarblock.crypto")
+
+    local function build_block_with_two_tx()
+      -- Block header: version=1, prev=0, merkle=zero (we don't validate),
+      -- timestamp=1700000000, bits=0x207fffff, nonce=0.
+      local prev_hash = types.hash256_zero()
+      local merkle = types.hash256_zero()
+      local header = types.block_header(1, prev_hash, merkle, 1700000000, 0x207fffff, 0)
+
+      -- Coinbase tx
+      local cb = types.transaction(1,
+        { types.txin(types.outpoint(types.hash256_zero(), 0xFFFFFFFF), "\x01\x00", 0xFFFFFFFF) },
+        { types.txout(5000000000, string.rep("\x00", 25)) },
+        0)
+
+      -- Non-coinbase tx with one output
+      local tx = types.transaction(1,
+        { types.txin(types.outpoint(types.hash256(string.rep("\xaa", 32)), 0), "", 0xFFFFFFFE) },
+        { types.txout(4000000000, string.rep("\x00", 25)) },
+        0)
+
+      local block = types.block(header, { cb, tx })
+      return block
+    end
+
+    it("returns aggregate stats by block hash", function()
+      local block = build_block_with_two_tx()
+      local block_hash = crypto.hash256_type(serialize.serialize_block_header(block.header))
+      local fake_storage = {
+        get_block = function(_h)
+          return block
+        end,
+        get_header = function(_h) return nil end,
+      }
+      -- chain_state is required for height-confirmation accounting; we
+      -- don't need a real coin_view.
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        storage = fake_storage,
+        chain_state = { tip_height = 100, tip_hash = block_hash },
+      })
+      local body = server:handle_request(cjson.encode({
+        method = "getblockstats",
+        params = {types.hash256_hex(block_hash)},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.is_table(resp.result)
+      assert.equal(2, resp.result.txs)
+      assert.equal(1, resp.result.ins)   -- coinbase excluded
+      assert.equal(2, resp.result.outs)
+      assert.equal(4000000000, resp.result.total_out)
+      assert.is_number(resp.result.total_size)
+      assert.is_number(resp.result.total_weight)
+      assert.is_number(resp.result.mediantxsize)
+      assert.equal(types.hash256_hex(block_hash), resp.result.blockhash)
+    end)
+
+    it("filters stats by requested keys", function()
+      local block = build_block_with_two_tx()
+      local block_hash = crypto.hash256_type(serialize.serialize_block_header(block.header))
+      local fake_storage = {
+        get_block = function() return block end,
+        get_header = function() return nil end,
+      }
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        storage = fake_storage,
+        chain_state = { tip_height = 100, tip_hash = block_hash },
+      })
+      local body = server:handle_request(cjson.encode({
+        method = "getblockstats",
+        params = {types.hash256_hex(block_hash), {"txs", "outs"}},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal(2, resp.result.txs)
+      assert.equal(2, resp.result.outs)
+      -- Filtered fields should not appear (or be nil — cjson encodes them as
+      -- absent keys in the table)
+      assert.is_nil(resp.result.total_size)
+      assert.is_nil(resp.result.ins)
+    end)
+
+    it("rejects missing hash_or_height", function()
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        storage = { get_block = function() return nil end },
+        chain_state = { tip_height = 0 },
+      })
+      local body = server:handle_request(
+        '{"method":"getblockstats","params":[],"id":1}')
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+    end)
+  end)
+
+  -----------------------------------------------------------------------------
+  -- submitpackage (regtest-style, no network broadcast in test)
+  -- Bitcoin Core ref: src/rpc/mempool.cpp::submitpackage
+  -----------------------------------------------------------------------------
+  describe("submitpackage", function()
+    local mempool = require("lunarblock.mempool")
+    local serialize = require("lunarblock.serialize")
+    local validation = require("lunarblock.validation")
+
+    local function build_chain_state()
+      local prev_txid = types.hash256(string.rep("\xfa", 32))
+      local prev_hex = types.hash256_hex(prev_txid)
+      local script_pk = string.rep("\x00", 25)
+      local utxos = {
+        [prev_hex .. ":0"] = {
+          value = 100000000,
+          script_pubkey = script_pk,
+          height = 100,
+          is_coinbase = false,
+        },
+      }
+      local mock_coin_view = {
+        get = function(_, txid, vout)
+          return utxos[types.hash256_hex(txid) .. ":" .. vout]
+        end,
+      }
+      return {
+        coin_view = mock_coin_view,
+        tip_height = 200,
+      }, prev_txid, script_pk
+    end
+
+    it("accepts a single-tx package and returns a tx-results map", function()
+      local chain_state, prev_txid, script_pk = build_chain_state()
+      local mp = mempool.new(chain_state)
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        chain_state = chain_state,
+        mempool = mp,
+      })
+      local tx = types.transaction(1,
+        { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFE) },
+        { types.txout(99000000, script_pk) },
+        0)
+      local hex = rpc.hex_encode(serialize.serialize_transaction(tx, true))
+      local body = server:handle_request(cjson.encode({
+        method = "submitpackage",
+        params = {{hex}},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.equal(cjson.null, resp.error)
+      assert.equal("success", resp.result.package_msg)
+      local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
+      assert.is_table(resp.result["tx-results"][wtxid_hex])
+    end)
+
+    it("rejects malformed package input", function()
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        mempool = mempool.new({coin_view = {get = function() return nil end}, tip_height = 0}),
+      })
+      local body = server:handle_request(
+        '{"method":"submitpackage","params":[[]],"id":1}')
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+  end)
+
+  -----------------------------------------------------------------------------
+  -- generateblock (regtest only)
+  -- Bitcoin Core ref: src/rpc/mining.cpp::generateblock
+  -----------------------------------------------------------------------------
+  describe("generateblock", function()
+    it("rejects on non-regtest network", function()
+      local server = rpc.new({
+        network = consensus.networks.mainnet,
+        mining = {},
+      })
+      local body = server:handle_request(cjson.encode({
+        method = "generateblock",
+        params = {"1FvyAqqELFiQyaEWdhFbWF8MZapKPZS8J7", {}},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.MISC_ERROR, resp.error.code)
+    end)
+
+    it("rejects when mining module is absent", function()
+      local server = rpc.new({network = consensus.networks.regtest})
+      local body = server:handle_request(cjson.encode({
+        method = "generateblock",
+        params = {"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", {}},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+
+    it("rejects invalid output address on regtest", function()
+      local server = rpc.new({
+        network = consensus.networks.regtest,
+        mining = {},
+      })
+      local body = server:handle_request(cjson.encode({
+        method = "generateblock",
+        params = {"!notanaddress!", {}},
+        id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    end)
+  end)
+
 end)
