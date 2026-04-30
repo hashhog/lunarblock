@@ -114,6 +114,99 @@ describe("main module", function()
       assert.is_true(args.daemon)
     end)
 
+    -- Operational-parity flags (W-ops): --pid, --debug, --log, --conf, --ready-fd.
+    -- All three accept both "--flag VALUE" and "--flag=VALUE" form to match
+    -- Bitcoin Core's bitcoind CLI.
+    it("parses --pid PATH (separate)", function()
+      local args = main.parse_args({"--pid", "/var/run/lb.pid"})
+      assert.equal("/var/run/lb.pid", args.pid)
+    end)
+
+    it("parses --pid=PATH (joined)", function()
+      local args = main.parse_args({"--pid=/var/run/lb.pid"})
+      assert.equal("/var/run/lb.pid", args.pid)
+    end)
+
+    it("parses --debug=net,mempool", function()
+      local args = main.parse_args({"--debug=net,mempool"})
+      assert.equal("net,mempool", args.debug)
+    end)
+
+    it("parses --debug net (separate)", function()
+      local args = main.parse_args({"--debug", "net"})
+      assert.equal("net", args.debug)
+    end)
+
+    it("parses --log=PATH", function()
+      local args = main.parse_args({"--log=/tmp/lb.log"})
+      assert.equal("/tmp/lb.log", args.log)
+    end)
+
+    it("parses --conf=PATH (uses tmp file so merge succeeds)", function()
+      -- parse_args reads the conf file at the end of parsing — if the file
+      -- doesn't exist, parse_args calls os.exit(1), which would kill the
+      -- test runner.  So we materialize a real tmp file just to verify the
+      -- arg field gets populated.
+      local tmp = os.tmpname()
+      local f = assert(io.open(tmp, "w")); f:write("# empty\n"); f:close()
+      local args = main.parse_args({"--conf=" .. tmp})
+      assert.equal(tmp, args.conf)
+      os.remove(tmp)
+    end)
+
+    it("parses --ready-fd=3", function()
+      local args = main.parse_args({"--ready-fd=3"})
+      assert.equal(3, args.ready_fd)
+    end)
+
+    it("parses --ready-fd 3 (separate)", function()
+      local args = main.parse_args({"--ready-fd", "3"})
+      assert.equal(3, args.ready_fd)
+    end)
+
+    it("defaults all ops flags to nil", function()
+      local args = main.parse_args({})
+      assert.is_nil(args.pid)
+      assert.is_nil(args.debug)
+      assert.is_nil(args.log)
+      assert.is_nil(args.conf)
+      assert.is_nil(args.ready_fd)
+    end)
+
+    -- Conf-file integration: when --conf=PATH is given, settings from the
+    -- file fill in still-default args.  CLI flags take precedence.
+    describe("--conf integration", function()
+      local tmp_path
+
+      before_each(function()
+        tmp_path = os.tmpname()
+      end)
+
+      after_each(function()
+        os.remove(tmp_path)
+      end)
+
+      local function write_conf(content)
+        local f = assert(io.open(tmp_path, "w"))
+        f:write(content)
+        f:close()
+      end
+
+      it("fills in defaults from conf file", function()
+        write_conf("maxpeers=42\nrpcuser=alice\n")
+        local args = main.parse_args({"--conf=" .. tmp_path})
+        assert.equal(42, args.maxpeers)
+        assert.equal("alice", args.rpcuser)
+      end)
+
+      it("CLI flags override conf-file values", function()
+        write_conf("maxpeers=42\n")
+        local args = main.parse_args({"--maxpeers", "9", "--conf=" .. tmp_path})
+        -- CLI 9 wins over conf 42.
+        assert.equal(9, args.maxpeers)
+      end)
+    end)
+
     -- --prune validation. parse_args calls os.exit on invalid input,
     -- so we monkey-patch os.exit to surface the error as a Lua error
     -- instead of killing the busted runner. parse_args writes to

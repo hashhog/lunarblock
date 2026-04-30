@@ -4737,6 +4737,23 @@ function RPCServer:tick()
     end
   end
 
+  -- /health: GET endpoint for process supervisors.  No auth required so
+  -- supervisors don't need RPC creds.  Returns 200 with a small JSON body
+  -- whenever the RPC server's tick is running — supervisors can use this
+  -- as a "the daemon is responsive" probe.  We deliberately do NOT report
+  -- IBD-completion status here; this is a *liveness* check, not readiness.
+  -- Reference: bitcoin-core does not ship /health; this is a lunarblock
+  -- ergonomic addition for supervised deployments.
+  if method == "GET" and path == "/health" then
+    local height = (self.chain_state and self.chain_state.tip_height) or -1
+    local body = string.format(
+      '{"status":"ok","height":%d,"version":"lunarblock"}\n', height)
+    client:send(M.build_http_response(200, body, "application/json"))
+    self.request_wallet = nil
+    client:close()
+    return
+  end
+
   -- Handle JSON-RPC
   if method == "POST" then
     local response_body, status_override = self:handle_request(body, wallet_name)
