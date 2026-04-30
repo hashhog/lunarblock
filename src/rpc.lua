@@ -2078,6 +2078,558 @@ function RPCServer:register_methods()
     return out
   end
 
+  -- gettxout: return UTXO info if unspent at the chain tip.
+  -- Bitcoin Core: src/rpc/blockchain.cpp::gettxout.
+  -- Reads through chain_state.coin_view (which transparently consults the
+  -- in-memory cache then the RocksDB UTXO column family).  The
+  -- include_mempool branch matches Core's CCoinsViewMemPool wrapper:
+  -- a tx in mempool that spends the outpoint hides it; a tx in mempool that
+  -- creates the outpoint exposes it (with confirmations=0).
+  self.methods["gettxout"] = function(rpc, params)
+    local txid_hex = params and params[1]
+    local n = params and params[2]
+    local include_mempool = true
+    if params and params[3] ~= nil and params[3] ~= cjson.null then
+      include_mempool = params[3] and true or false
+    end
+    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
+    end
+    if type(n) ~= "number" or n < 0 or n ~= math.floor(n) then
+      error({code = M.ERROR.INVALID_PARAMS, message = "vout must be a non-negative integer"})
+    end
+    if not rpc.chain_state or not rpc.chain_state.coin_view then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+
+    local txid = types.hash256_from_hex(txid_hex)
+
+    -- Check if mempool spends this outpoint (hides confirmed UTXO).
+    if include_mempool and rpc.mempool then
+      local mempool_mod = require("lunarblock.mempool")
+      local op_key = mempool_mod.outpoint_key(txid, n)
+      local spender = rpc.mempool.outpoint_to_tx and rpc.mempool.outpoint_to_tx[op_key]
+      if spender then
+        return cjson.null
+      end
+    end
+
+    local entry = rpc.chain_state.coin_view:get(txid, n)
+    local utxo_height = entry and entry.height
+    local is_coinbase = entry and entry.is_coinbase or false
+
+    -- If not in confirmed UTXO and mempool inclusion is on, see if a
+    -- mempool tx creates this output (height=0/MEMPOOL_HEIGHT semantics).
+    if not entry and include_mempool and rpc.mempool then
+      local mp_entry = rpc.mempool:get_entry(txid_hex)
+      if mp_entry and mp_entry.tx and mp_entry.tx.outputs[n + 1] then
+        local out = mp_entry.tx.outputs[n + 1]
+        entry = {
+          value = out.value,
+          script_pubkey = out.script_pubkey,
+          height = nil,
+          is_coinbase = false,
+        }
+        is_coinbase = false
+        utxo_height = nil  -- signals mempool height -> confirmations=0
+      end
+    end
+
+    if not entry then
+      return cjson.null
+    end
+
+    local tip_height = rpc.chain_state.tip_height or 0
+    local tip_hash_hex
+    if rpc.chain_state.tip_hash then
+      tip_hash_hex = types.hash256_hex(rpc.chain_state.tip_hash)
+    else
+      tip_hash_hex = string.rep("0", 64)
+    end
+    local confirmations
+    if utxo_height then
+      confirmations = math.max(0, tip_height - utxo_height + 1)
+    else
+      confirmations = 0
+    end
+
+    return {
+      bestblock = tip_hash_hex,
+      confirmations = confirmations,
+      value = entry.value / consensus.COIN,
+      scriptPubKey = M.decode_script_pubkey(entry.script_pubkey, rpc.network),
+      coinbase = is_coinbase,
+    }
+  end
+
+  -- disconnectnode: address (ip:port) OR nodeid.  Bitcoin Core:
+  -- src/rpc/net.cpp::disconnectnode.  Returns null on success; raises
+  -- CLIENT_NODE_NOT_CONNECTED-style error if no such peer.
+  self.methods["disconnectnode"] = function(rpc, params)
+    if not rpc.peer_manager then
+      error({code = M.ERROR.MISC_ERROR, message = "peer manager not available"})
+    end
+    local address = params and params[1]
+    local nodeid = params and params[2]
+    if (address == nil or address == cjson.null or address == "") and
+       (nodeid == nil or nodeid == cjson.null) then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Either 'address' or 'nodeid' must be provided"})
+    end
+    if address ~= nil and address ~= cjson.null and address ~= "" and
+       nodeid ~= nil and nodeid ~= cjson.null then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Only one of 'address' or 'nodeid' must be provided"})
+    end
+
+    local target_peer = nil
+    if type(address) == "string" and #address > 0 then
+      target_peer = rpc.peer_manager.peers and rpc.peer_manager.peers[address]
+      if not target_peer then
+        -- Linear search: peers may be keyed by canonical "ip:port" but caller
+        -- could pass "ip" without port; match either.
+        for _, p in ipairs(rpc.peer_manager.peer_list or {}) do
+          if (p.ip .. ":" .. p.port) == address or p.ip == address then
+            target_peer = p
+            break
+          end
+        end
+      end
+    elseif type(nodeid) == "number" then
+      -- nodeid is the 0-based index into peer_list (matches getpeerinfo "id").
+      local pl = rpc.peer_manager.peer_list or {}
+      target_peer = pl[nodeid + 1]
+    end
+
+    if not target_peer then
+      error({code = -29 --[[ CLIENT_NODE_NOT_CONNECTED ]],
+        message = "Node not found in connected nodes"})
+    end
+    rpc.peer_manager:disconnect_peer(target_peer, "disconnectnode RPC")
+    -- Also unlink from manual_peers so the reconnect loop does not undo us.
+    if rpc.peer_manager.manual_peers then
+      local key = target_peer.ip .. ":" .. target_peer.port
+      rpc.peer_manager.manual_peers[key] = nil
+    end
+    return cjson.null
+  end
+
+  -- getnettotals: cumulative bytes-in / bytes-out.  Bitcoin Core:
+  -- src/rpc/net.cpp::getnettotals.  We sum per-peer counters since we do
+  -- not maintain a global CConnman::nTotalBytesRecv / nTotalBytesSent.
+  -- TODO(rpc): wire global totals into PeerManager once a unified counter
+  -- exists; this loop misses bytes from already-disconnected peers.
+  self.methods["getnettotals"] = function(rpc, _params)
+    local total_recv = 0
+    local total_sent = 0
+    if rpc.peer_manager and rpc.peer_manager.peer_list then
+      for _, p in ipairs(rpc.peer_manager.peer_list) do
+        total_recv = total_recv + (p.bytes_recv or 0)
+        total_sent = total_sent + (p.bytes_sent or 0)
+      end
+    end
+    return {
+      totalbytesrecv = total_recv,
+      totalbytessent = total_sent,
+      timemillis = math.floor(socket.gettime() * 1000),
+      uploadtarget = {
+        timeframe = 86400,
+        target = 0,
+        target_reached = false,
+        serve_historical_blocks = true,
+        bytes_left_in_cycle = 0,
+        time_left_in_cycle = 0,
+      },
+    }
+  end
+
+  -- getblockstats: per-block statistics.  Bitcoin Core:
+  -- src/rpc/blockchain.cpp::getblockstats.  Selectable stat keys via
+  -- params[2]; default is everything we can compute without the block-undo
+  -- (which would give us per-input prevout values for fees / feerates).
+  --
+  -- Limits:
+  --   * Stats that need fees or input prevout values (avgfee, totalfee,
+  --     avgfeerate, min/maxfee, min/maxfeerate, medianfee,
+  --     feerate_percentiles, utxo_increase_actual, utxo_size_inc_actual)
+  --     require the block-undo data; we expose them when storage.get_undo
+  --     returns data, otherwise mark as `nil` (Core sets them to 0 for the
+  --     genesis block — matching that convention only when undo is missing).
+  self.methods["getblockstats"] = function(rpc, params)
+    if not rpc.storage or not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+    local hash_or_height = params and params[1]
+    if hash_or_height == nil or hash_or_height == cjson.null then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "hash_or_height is required"})
+    end
+
+    local block_hash, height
+    if type(hash_or_height) == "number" then
+      height = math.floor(hash_or_height)
+      if rpc.storage.get_hash_by_height then
+        block_hash = rpc.storage.get_hash_by_height(height)
+      end
+      if not block_hash then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = "Block not found at height " .. height})
+      end
+    elseif type(hash_or_height) == "string" then
+      if #hash_or_height ~= 64 then
+        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+      end
+      block_hash = types.hash256_from_hex(hash_or_height)
+    else
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "hash_or_height must be a hash string or numeric height"})
+    end
+
+    local block = rpc.storage.get_block(block_hash)
+    if not block then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+    end
+
+    local requested = nil
+    if params and params[2] and params[2] ~= cjson.null then
+      requested = {}
+      for _, name in ipairs(params[2]) do
+        requested[name] = true
+      end
+    end
+    local function want(name)
+      return requested == nil or requested[name]
+    end
+
+    local txs = block.transactions
+    local total_size = 0
+    local total_weight = 0
+    local total_out = 0  -- excludes coinbase output total
+    local outputs = 0
+    local inputs = 0
+    local txsize_array = {}
+    local swtxs, swtotal_size, swtotal_weight = 0, 0, 0
+    local maxtxsize, mintxsize = 0, math.huge
+    local utxos_count = 0
+    -- Coinbase index: tx[1].
+    for i, tx in ipairs(txs) do
+      local tx_size = #serialize.serialize_transaction(tx, true)
+      local tx_weight = validation.get_tx_weight(tx)
+      outputs = outputs + #tx.outputs
+      -- Segwit detection: any tx with at least one non-empty witness vector.
+      local has_witness = false
+      for _, inp in ipairs(tx.inputs) do
+        if inp.witness and #inp.witness > 0 then
+          has_witness = true; break
+        end
+      end
+      if has_witness then
+        swtxs = swtxs + 1
+        swtotal_size = swtotal_size + tx_size
+        swtotal_weight = swtotal_weight + tx_weight
+      end
+      if i > 1 then
+        inputs = inputs + #tx.inputs
+        for _, out in ipairs(tx.outputs) do
+          total_out = total_out + out.value
+        end
+        total_size = total_size + tx_size
+        total_weight = total_weight + tx_weight
+        txsize_array[#txsize_array + 1] = tx_size
+        if tx_size > maxtxsize then maxtxsize = tx_size end
+        if tx_size < mintxsize then mintxsize = tx_size end
+      end
+      -- utxo_increase counts spendable outputs created (cheap heuristic;
+      -- Core also subtracts unspendable scripts -- TODO(rpc) when we
+      -- expose script_mod.is_unspendable).
+      utxos_count = utxos_count + #tx.outputs
+    end
+    if mintxsize == math.huge then mintxsize = 0 end
+
+    if not height and rpc.storage.iterator then
+      -- Reverse-lookup height; relatively cheap given height index is small.
+      local iter = rpc.storage.iterator("height")
+      if iter then
+        iter.seek_to_first()
+        while iter.valid() do
+          local k = iter.key()
+          local v = iter.value()
+          if v and #v == 32 and v == block_hash.bytes then
+            height = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
+            break
+          end
+          iter.next()
+        end
+        iter.destroy()
+      end
+    end
+
+    local result = {
+      blockhash = types.hash256_hex(block_hash),
+      time = block.header and block.header.timestamp or 0,
+      height = height,
+      ins = inputs,
+      outs = outputs,
+      txs = #txs,
+      total_size = total_size,
+      total_weight = total_weight,
+      total_out = total_out,
+      swtotal_size = swtotal_size,
+      swtotal_weight = swtotal_weight,
+      swtxs = swtxs,
+      mintxsize = mintxsize,
+      maxtxsize = maxtxsize,
+      avgtxsize = (#txs > 1) and math.floor(total_size / (#txs - 1)) or 0,
+      mediantxsize = (function()
+        if #txsize_array == 0 then return 0 end
+        table.sort(txsize_array)
+        return txsize_array[math.ceil(#txsize_array / 2)]
+      end)(),
+      utxo_increase = utxos_count - inputs,
+      utxo_size_inc = 0,  -- TODO(rpc): wire PER_UTXO_OVERHEAD-based size delta
+      subsidy = consensus.get_block_subsidy and height
+        and consensus.get_block_subsidy(height) or 0,
+      mediantime = (function()
+        if not rpc.storage.get_header or not block.header then return 0 end
+        local timestamps = {}
+        local cur = block.header.prev_hash
+        for _ = 1, 11 do
+          local h = cur and rpc.storage.get_header(cur)
+          if not h then break end
+          timestamps[#timestamps + 1] = h.timestamp
+          cur = h.prev_hash
+        end
+        if #timestamps == 0 then return block.header.timestamp end
+        table.sort(timestamps)
+        return timestamps[math.ceil(#timestamps / 2)]
+      end)(),
+      -- TODO(rpc): fee/feerate stats require BlockUndo to fetch input
+      -- prevouts.  Wire when storage.get_undo is exposed cleanly.
+      avgfee = 0, avgfeerate = 0, totalfee = 0,
+      maxfee = 0, maxfeerate = 0, medianfee = 0,
+      minfee = 0, minfeerate = 0,
+      feerate_percentiles = {0, 0, 0, 0, 0},
+      utxo_increase_actual = 0, utxo_size_inc_actual = 0,
+    }
+
+    -- Filter by requested stats
+    if requested then
+      local filtered = {}
+      for k, _ in pairs(requested) do
+        filtered[k] = result[k]
+      end
+      return filtered
+    end
+    return result
+  end
+
+  -- submitpackage: pipe to mempool:accept_package, then re-emit results in
+  -- Core's schema.  Bitcoin Core: src/rpc/mempool.cpp::submitpackage.
+  -- Wallet-side propagation (broadcasting an inv per tx) is handled the
+  -- same way sendrawtransaction does it.
+  self.methods["submitpackage"] = function(rpc, params)
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+    local pkg = params and params[1]
+    if type(pkg) ~= "table" or pkg[1] == nil then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "package must be a non-empty array of raw tx hex strings"})
+    end
+    local txs = {}
+    for i, hex in ipairs(pkg) do
+      if type(hex) ~= "string" then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = "package[" .. i .. "] is not a hex string"})
+      end
+      local ok, tx = pcall(serialize.deserialize_transaction, M.hex_decode(hex))
+      if not ok then
+        error({code = M.ERROR.DESERIALIZATION_ERROR,
+          message = "package[" .. i .. "] failed to deserialize: " .. tostring(tx)})
+      end
+      txs[i] = tx
+    end
+    local accept_ok, err_or_results = rpc.mempool:accept_package(txs)
+    local tx_results = {}
+    -- accept_package returns (true, {...}) on success or (false, err_msg).
+    if accept_ok then
+      for _, tx in ipairs(txs) do
+        local txid = validation.compute_txid(tx)
+        local wtxid = validation.compute_wtxid(tx)
+        local txid_hex = types.hash256_hex(txid)
+        local wtxid_hex = types.hash256_hex(wtxid)
+        local entry = rpc.mempool:get_entry(txid_hex)
+        local fee_btc = entry and (entry.fee / consensus.COIN) or 0
+        local vsize = entry and entry.vsize or 0
+        tx_results[wtxid_hex] = {
+          txid = txid_hex,
+          vsize = vsize,
+          fees = {
+            base = fee_btc,
+          },
+        }
+      end
+      -- Broadcast via inv (matches sendrawtransaction).
+      if rpc.peer_manager then
+        local invs = {}
+        for _, tx in ipairs(txs) do
+          local txid = validation.compute_txid(tx)
+          invs[#invs + 1] = {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
+        end
+        local inv_payload = p2p.serialize_inv(invs)
+        rpc.peer_manager:broadcast("inv", inv_payload)
+      end
+      return {
+        package_msg = "success",
+        ["tx-results"] = tx_results,
+        ["replaced-transactions"] = {},
+      }
+    end
+    return {
+      package_msg = tostring(err_or_results),
+      ["tx-results"] = tx_results,
+      ["replaced-transactions"] = {},
+    }
+  end
+
+  -- generateblock <output> <transactions> [<submit>] -- regtest only.
+  -- Bitcoin Core: src/rpc/mining.cpp::generateblock.  Mines a block
+  -- containing the listed transactions (or txids referencing already-in
+  -- mempool transactions) directed at the given output address.  Test fees
+  -- are NOT collected (subsidy-only coinbase).
+  self.methods["generateblock"] = function(rpc, params)
+    if not rpc.mining then
+      error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
+    end
+    if not rpc.network or rpc.network.name ~= "regtest" then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "generateblock is only available on regtest"})
+    end
+    local output = params and params[1]
+    local tx_list = params and params[2]
+    local submit = true
+    if params and params[3] ~= nil and params[3] ~= cjson.null then
+      submit = params[3] and true or false
+    end
+    if type(output) ~= "string" or #output == 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "output address is required"})
+    end
+    if type(tx_list) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "transactions must be an array"})
+    end
+
+    -- Decode payout address -> script_pubkey
+    local addr_type, addr_data = address_mod.decode_address(output, rpc.network.name)
+    if not addr_type then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid output address"})
+    end
+    local payout_script
+    if addr_type == "p2pkh" then
+      payout_script = script_mod.make_p2pkh_script(addr_data)
+    elseif addr_type == "p2sh" then
+      payout_script = script_mod.make_p2sh_script(addr_data)
+    elseif addr_type == "p2wpkh" then
+      payout_script = script_mod.make_p2wpkh_script(addr_data)
+    elseif addr_type == "p2wsh" then
+      payout_script = script_mod.make_p2wsh_script(addr_data)
+    elseif addr_type == "p2tr" then
+      payout_script = script_mod.make_p2tr_script(addr_data)
+    else
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Unsupported address type"})
+    end
+
+    -- Resolve each entry: a 64-char hex txid references an in-mempool tx,
+    -- everything else is treated as raw tx hex.
+    local provided_txs = {}
+    for i, item in ipairs(tx_list) do
+      if type(item) ~= "string" then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = "transactions[" .. i .. "] is not a hex string"})
+      end
+      if #item == 64 and item:match("^[0-9A-Fa-f]+$") then
+        if not rpc.mempool then
+          error({code = M.ERROR.MISC_ERROR,
+            message = "Mempool not available; cannot resolve mempool txid"})
+        end
+        local entry = rpc.mempool:get_entry(item:lower())
+        if not entry then
+          error({code = M.ERROR.INVALID_ADDRESS,
+            message = "transactions[" .. i .. "] references unknown txid"})
+        end
+        provided_txs[#provided_txs + 1] = entry.tx
+      else
+        local ok, tx = pcall(serialize.deserialize_transaction, M.hex_decode(item))
+        if not ok then
+          error({code = M.ERROR.DESERIALIZATION_ERROR,
+            message = "transactions[" .. i .. "] failed to deserialize"})
+        end
+        provided_txs[#provided_txs + 1] = tx
+      end
+    end
+
+    -- Build a normal block template via the mempool, then replace the
+    -- non-coinbase tx list with the user's txs (preserves coinbase weight
+    -- accounting).  Test fees are not collected -- coinbase value stays at
+    -- the subsidy alone (matches Core's generateblock).
+    -- TODO(rpc): coinbase-fee handling.  Core's generateblock leaves fees
+    -- uncollected; we mirror that.  When a real test framework asks us to
+    -- mine "with fees", switch to mining.create_block_template + adjust
+    -- coinbase output value to equal subsidy + sum(fees).
+    local _template, block = rpc.mining.create_block_template(
+      rpc.mempool, rpc.chain_state, rpc.network, payout_script
+    )
+
+    -- Replace mempool-selected txs with caller-supplied txs (keep coinbase).
+    local coinbase = block.transactions[1]
+    block.transactions = { coinbase }
+    for _, tx in ipairs(provided_txs) do
+      block.transactions[#block.transactions + 1] = tx
+    end
+    -- Recompute the merkle root over the new tx set.
+    local tx_hashes = {}
+    for i, tx in ipairs(block.transactions) do
+      tx_hashes[i] = validation.compute_txid(tx)
+    end
+    block.header.merkle_root = require("lunarblock.crypto").compute_merkle_root(tx_hashes)
+
+    local found, block_hash = rpc.mining.mine_block(block)
+    if not found then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Failed to mine block (nonce exhausted)"})
+    end
+
+    if submit then
+      local new_height = rpc.chain_state.tip_height + 1
+      local block_data = serialize.serialize_block(block)
+      local header_data = serialize.serialize_block_header(block.header)
+      local height_key = string.char(
+        math.floor(new_height / 16777216) % 256,
+        math.floor(new_height / 65536) % 256,
+        math.floor(new_height / 256) % 256,
+        new_height % 256
+      )
+      local hash_bytes = block_hash.bytes
+      local store_batch_fn = function(batch)
+        batch.put(storage_mod.CF.BLOCKS, hash_bytes, block_data)
+        batch.put(storage_mod.CF.HEADERS, hash_bytes, header_data)
+        batch.put(storage_mod.CF.HEIGHT_INDEX, height_key, hash_bytes)
+      end
+      local ok, err = rpc.chain_state:connect_block(
+        block, new_height, block_hash, nil, nil, false, nil, false, store_batch_fn
+      )
+      if not ok then
+        error({code = M.ERROR.VERIFY_ERROR,
+          message = "Failed to connect block: " .. tostring(err)})
+      end
+    end
+
+    local result = { hash = types.hash256_hex(block_hash) }
+    if not submit then
+      result.hex = M.hex_encode(serialize.serialize_block(block))
+    end
+    return result
+  end
+
   -- Mining
   self.methods["getblocktemplate"] = function(rpc, params)
     if rpc.mining then
