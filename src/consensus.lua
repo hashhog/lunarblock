@@ -724,13 +724,30 @@ M.networks.mainnet = {
 
   -- AssumeUTXO snapshots: validated UTXO set hashes at specific heights
   -- Format: {height = {hash_serialized = "...", m_chain_tx_count = N, blockhash = "..."}}
-  -- Hash is SHA256 of serialized UTXO set in canonical order
-  -- Reference: Bitcoin Core chainparams.cpp
+  -- hash_serialized is Bitcoin Core's "muhash"-style serialized UTXO set
+  -- hash, displayed in the same big-endian hex format used by uint256.ToString().
+  -- Source of truth: bitcoin-core/src/kernel/chainparams.cpp m_assumeutxo_data
+  -- (sha256 verified against bitcoin-core release manifests).
   assumeutxo = {
     [840000] = {
-      hash_serialized = "51c8d11d7f6a24c8c8f44e4e8b4c3c3b2a1a0f0e0d0c0b0a09080706050403020100",
-      m_chain_tx_count = 990228937,
+      hash_serialized = "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
+      m_chain_tx_count = 991032194,
       blockhash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+    },
+    [880000] = {
+      hash_serialized = "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
+      m_chain_tx_count = 1145604538,
+      blockhash = "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"
+    },
+    [910000] = {
+      hash_serialized = "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+      m_chain_tx_count = 1226586151,
+      blockhash = "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"
+    },
+    [935000] = {
+      hash_serialized = "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
+      m_chain_tx_count = 1305397408,
+      blockhash = "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
     }
   }
 }
