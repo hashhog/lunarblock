@@ -4745,9 +4745,38 @@ function RPCServer:register_methods()
     local au_data, au_height = consensus.assumeutxo_for_blockhash(
       rpc.network, base_hash_hex)
     if not au_data then
+      -- Core-strict whitelist (bitcoin-core/src/validation.cpp:5775-5780):
+      -- after looking up the snapshot's base block in the header index to
+      -- recover its height, refuse the load if AssumeutxoForHeight(height)
+      -- returns nullopt.  Emit Core's exact error string so cross-impl
+      -- consensus-diff probes can match on it byte-for-byte.
+      --
+      -- We don't carry a hash->height index, so derive the height from
+      -- whatever local source we can: the network's genesis hash short-
+      -- circuits to 0; otherwise fall back to the height-index by
+      -- scanning around the chain tip; otherwise report it as unknown.
+      local base_height
+      if base_hash_hex == rpc.network.genesis_hash then
+        base_height = 0
+      elseif rpc.storage and rpc.storage.get_hash_by_height
+          and rpc.chain_state and rpc.chain_state.tip_height then
+        for h = 0, rpc.chain_state.tip_height do
+          local hh = rpc.storage.get_hash_by_height(h)
+          if hh and types.hash256_hex(hh) == base_hash_hex then
+            base_height = h
+            break
+          end
+        end
+      end
+      local height_str
+      if base_height ~= nil then
+        height_str = tostring(base_height)
+      else
+        height_str = "?"
+      end
       error({code = M.ERROR.MISC_ERROR,
-        message = "snapshot base block " .. base_hash_hex
-          .. " is not a known assumeutxo height for this network"})
+        message = "Assumeutxo height in snapshot metadata not recognized ("
+          .. height_str .. ") - refusing to load snapshot"})
     end
 
     local ok, lerr = rpc.chain_state:load_snapshot(path)
