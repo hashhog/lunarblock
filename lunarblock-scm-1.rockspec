@@ -39,6 +39,7 @@ build = {
     ["lunarblock.rpc"] = "src/rpc.lua",
     ["lunarblock.wallet"] = "src/wallet.lua",
     ["lunarblock.utxo"] = "src/utxo.lua",
+    ["lunarblock.muhash"] = "src/muhash.lua",
     ["lunarblock.fee"] = "src/fee.lua",
     ["lunarblock.perf"] = "src/perf.lua",
     ["lunarblock.prune"] = "src/prune.lua",
