@@ -533,6 +533,161 @@ describe("Core-format UTXO snapshot", function()
     end)
   end)
 
+  describe("loadtxoutset strict gate uses HASH_SERIALIZED (SHA256d)",
+           function()
+    -- bitcoin-core/src/validation.cpp:5904-5915 calls
+    --   ComputeUTXOStats(CoinStatsHashType::HASH_SERIALIZED, ...)
+    -- and bytewise-compares maybe_stats->hashSerialized against
+    -- au_data.hash_serialized.  Per kernel/coinstats.cpp:161-163,
+    -- HASH_SERIALIZED is a HashWriter, whose GetHash() returns SHA256d
+    -- (hash.h:115-119).  MuHash3072 is a separate hash type
+    -- (CoinStatsHashType::MUHASH) used only by gettxoutsetinfo.
+    --
+    -- This test pins compute_utxo_hash to the SHA256d-of-streamed-TxOutSer
+    -- contract by computing the hash twice and comparing against an
+    -- independently-streamed reference (no muhash module touched).
+    local crypto = require("lunarblock.crypto")
+    local script_mod = require("lunarblock.script")
+
+    local tmp_path
+    local db
+
+    setup(function()
+      tmp_path = "/tmp/lunarblock_strictgate_" .. os.time()
+        .. "_" .. math.random(1000000)
+    end)
+
+    after_each(function()
+      if db then db.close(); db = nil end
+    end)
+
+    it("compute_utxo_hash returns SHA256d of canonical TxOutSer stream",
+       function()
+      db = storage_mod.open(tmp_path .. "_a_" .. math.random(1000000))
+      local cs = utxo.new_chain_state(db, consensus.networks.regtest)
+      cs:init()
+
+      -- Three UTXOs across two txids, with one txid containing a
+      -- multi-byte vout (256) so the test catches regressions if the
+      -- iterator order is ever assumed to be byte-LE rather than
+      -- numeric-uint32 ascending (Core uses std::map<uint32_t, Coin>).
+      local txid_a = types.hash256(string.rep("\x10", 32))
+      local txid_b = types.hash256(string.rep("\x20", 32))
+      local fixtures = {
+        { txid = txid_a, vout = 1,
+          entry = utxo.utxo_entry(50, script_mod.make_p2pkh_script(
+            string.rep("\x33", 20)), 11, true) },
+        { txid = txid_a, vout = 256,
+          entry = utxo.utxo_entry(99, script_mod.make_p2pkh_script(
+            string.rep("\x44", 20)), 12, false) },
+        { txid = txid_b, vout = 0,
+          entry = utxo.utxo_entry(7, script_mod.make_p2pkh_script(
+            string.rep("\x55", 20)), 13, false) },
+      }
+      for _, f in ipairs(fixtures) do
+        cs.coin_view:add(f.txid, f.vout, f.entry)
+      end
+      cs.coin_view:flush()
+
+      -- Independent reference: build the canonical TxOutSer stream by
+      -- hand in (txid lex-asc, vout uint32-asc) order, single-pass
+      -- streaming SHA256, then SHA256-once-more for SHA256d. This is
+      -- byte-equivalent to Core's HashWriter::GetHash().
+      local ref = crypto.sha256_init()
+      -- txid_a runs first (\x10... < \x20...), with vouts 1, 256.
+      ref.update(utxo.serialize_txoutser(
+        utxo.outpoint_key(txid_a, 1), fixtures[1].entry))
+      ref.update(utxo.serialize_txoutser(
+        utxo.outpoint_key(txid_a, 256), fixtures[2].entry))
+      -- Then txid_b with vout 0.
+      ref.update(utxo.serialize_txoutser(
+        utxo.outpoint_key(txid_b, 0), fixtures[3].entry))
+      local expected = crypto.sha256(ref.final())
+
+      local got, count = cs:compute_utxo_hash()
+      assert.equal(32, #got)
+      -- Count includes regtest genesis coinbase added by cs:init() plus
+      -- our 3 fixtures. We don't pin the exact count here — the byte
+      -- equality is the load-bearing assertion. To keep the SHA256d
+      -- reference pure, recompute fresh on a chainstate with no genesis.
+      assert.is_true(count >= 3)
+
+      -- Run on a clean chainstate without init() so the genesis coinbase
+      -- doesn't perturb the streamed bytes.
+      local db2 = storage_mod.open(tmp_path .. "_b_"
+        .. math.random(1000000))
+      local cs2 = utxo.new_chain_state(db2, consensus.networks.regtest)
+      -- Skip init(); just install the fixtures.
+      for _, f in ipairs(fixtures) do
+        cs2.coin_view:add(f.txid, f.vout, f.entry)
+      end
+      cs2.coin_view:flush()
+      local clean_hash, clean_count = cs2:compute_utxo_hash()
+      db2.close()
+
+      assert.equal(3, clean_count)
+      assert.equal(expected, clean_hash,
+        "compute_utxo_hash must equal SHA256d of canonical TxOutSer stream")
+    end)
+
+    it("does NOT equal compute_muhash for the same UTXO set", function()
+      -- MuHash3072 and HASH_SERIALIZED are different functions; the
+      -- 25bdd7d regression silently swapped one for the other in the
+      -- strict gate. Pin that they produce different bytes so any future
+      -- swap is caught by the test suite.
+      db = storage_mod.open(tmp_path .. "_c_" .. math.random(1000000))
+      local cs = utxo.new_chain_state(db, consensus.networks.regtest)
+      cs:init()
+
+      local txid = types.hash256(string.rep("\x77", 32))
+      cs.coin_view:add(txid, 0, utxo.utxo_entry(
+        21000000, script_mod.make_p2pkh_script(string.rep("\x88", 20)),
+        100, true))
+      cs.coin_view:flush()
+
+      local sha_d = cs:compute_utxo_hash()
+      local muhash = cs:compute_muhash()
+      assert.equal(32, #sha_d)
+      assert.equal(32, #muhash)
+      assert.are_not.equal(sha_d, muhash,
+        "HASH_SERIALIZED and MuHash3072 are distinct hash functions")
+    end)
+
+    it("load_snapshot rejects mismatched HASH_SERIALIZED expected_hash",
+       function()
+      -- Round-trip a snapshot, then attempt to load it with a wrong
+      -- expected_hash; the strict-gate check must trigger and the error
+      -- message must mention HASH_SERIALIZED, not muhash.
+      local snapshot_file = tmp_path .. "_snap.dat"
+
+      db = storage_mod.open(tmp_path .. "_d_" .. math.random(1000000))
+      local cs = utxo.new_chain_state(db, consensus.networks.regtest)
+      cs:init()
+      cs.coin_view:add(types.hash256(string.rep("\xab", 32)), 0,
+        utxo.utxo_entry(42, script_mod.make_p2pkh_script(
+          string.rep("\xcd", 20)), 7, false))
+      cs.coin_view:flush()
+      cs.tip_hash = types.hash256(string.rep("\xee", 32))
+      cs.tip_height = 1
+      local _, derr = cs:dump_snapshot(snapshot_file)
+      assert.is_nil(derr)
+
+      local db2 = storage_mod.open(tmp_path .. "_e_"
+        .. math.random(1000000))
+      local cs2 = utxo.new_chain_state(db2, consensus.networks.regtest)
+      cs2:init()
+      local wrong_hash = string.rep("\x00", 32)
+      local ok, err = cs2:load_snapshot(snapshot_file, wrong_hash)
+      db2.close()
+      os.remove(snapshot_file)
+
+      assert.is_false(ok)
+      assert.is_not_nil(err)
+      assert.matches("hash_serialized", err,
+        "strict-gate error must reference HASH_SERIALIZED")
+    end)
+  end)
+
   -- Suppress unused warnings
   local _ = unhex
   local _2 = validation

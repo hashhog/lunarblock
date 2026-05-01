@@ -724,8 +724,12 @@ M.networks.mainnet = {
 
   -- AssumeUTXO snapshots: validated UTXO set hashes at specific heights
   -- Format: {height = {hash_serialized = "...", m_chain_tx_count = N, blockhash = "..."}}
-  -- hash_serialized is Bitcoin Core's "muhash"-style serialized UTXO set
-  -- hash, displayed in the same big-endian hex format used by uint256.ToString().
+  -- hash_serialized is Bitcoin Core's CoinStatsHashType::HASH_SERIALIZED
+  -- value: SHA256d (via HashWriter, see kernel/coinstats.cpp:161-163,
+  -- 182-184) over canonical-order TxOutSer bytes for the entire UTXO set.
+  -- Displayed in the same big-endian hex format used by uint256.ToString().
+  -- This is what compute_utxo_hash() returns — NOT MuHash3072 (that is
+  -- gettxoutsetinfo hash_type=muhash and lives on compute_muhash).
   -- Source of truth: bitcoin-core/src/kernel/chainparams.cpp m_assumeutxo_data
   -- (sha256 verified against bitcoin-core release manifests).
   assumeutxo = {
