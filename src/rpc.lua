@@ -4655,8 +4655,20 @@ function RPCServer:register_methods()
 
   -- dumptxoutset: write the serialized UTXO set to a file in Bitcoin Core
   -- wire format.  Mirrors bitcoin-core/src/rpc/blockchain.cpp dumptxoutset.
-  -- params[1] = path (string).  Returns {coins_written, base_hash,
-  -- base_height, path, txoutset_hash, nchaintx}.
+  -- Positional params:
+  --   [1] path (string, required)
+  --   [2] type ("latest" | "rollback" | "")
+  --   [3] options ({rollback = <height|hash>}) -- optional
+  -- Modes:
+  --   "latest" (or unset, default): dump the current tip's UTXO set
+  --     unchanged.  Backwards-compatible with the previous lunarblock RPC.
+  --   "rollback" without an explicit height: roll back to the highest
+  --     network.assumeutxo entry that is <= current tip, dump there,
+  --     then re-apply the disconnected blocks.
+  --   options.rollback = <int> | <hex hash>: roll back to the requested
+  --     height (or to the block whose hash matches), dump, re-apply.
+  -- Returns {coins_written, base_hash, base_height, path, txoutset_hash,
+  -- nchaintx}.
   self.methods["dumptxoutset"] = function(rpc, params)
     if not rpc.chain_state then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
@@ -4666,6 +4678,17 @@ function RPCServer:register_methods()
       error({code = M.ERROR.INVALID_PARAMS,
         message = "dumptxoutset requires a path string"})
     end
+    local snapshot_type = params and params[2] or ""
+    if type(snapshot_type) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "dumptxoutset type must be a string"})
+    end
+    local options = (params and params[3]) or nil
+    if options ~= nil and type(options) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "dumptxoutset options must be an object"})
+    end
+
     -- Refuse to clobber an existing file (matches Core dumptxoutset).
     local probe = io.open(path, "rb")
     if probe then
@@ -4674,14 +4697,127 @@ function RPCServer:register_methods()
         message = "path already exists: " .. path})
     end
 
+    -- Resolve the rollback target.  target_height = nil means "no
+    -- rollback, dump current tip" (the historical lunarblock behavior).
+    local current_tip_height = rpc.chain_state.tip_height
+    local target_height = nil
+
+    local function resolve_height_or_hash(spec)
+      if type(spec) == "number" then
+        if spec ~= math.floor(spec) or spec < 0 then
+          error({code = M.ERROR.INVALID_PARAMS,
+            message = "rollback height must be a non-negative integer"})
+        end
+        return spec
+      end
+      if type(spec) == "string" then
+        -- Try integer first (Core accepts both forms in -named usage).
+        local as_num = tonumber(spec)
+        if as_num and as_num == math.floor(as_num) and #spec ~= 64 then
+          return math.floor(as_num)
+        end
+        -- Else treat as a 64-char hex blockhash.
+        if #spec ~= 64 or spec:match("[^0-9a-fA-F]") then
+          error({code = M.ERROR.INVALID_PARAMS,
+            message = "rollback hash must be 64 hex chars"})
+        end
+        if not (rpc.storage and rpc.storage.get_hash_by_height) then
+          error({code = M.ERROR.MISC_ERROR,
+            message = "rollback by hash requires a height index"})
+        end
+        local target_lower = spec:lower()
+        for h = 0, current_tip_height or 0 do
+          local hh = rpc.storage.get_hash_by_height(h)
+          if hh and types.hash256_hex(hh):lower() == target_lower then
+            return h
+          end
+        end
+        error({code = M.ERROR.MISC_ERROR,
+          message = "rollback target hash not found in active chain"})
+      end
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "rollback target must be number or hex string"})
+    end
+
+    if options and options.rollback ~= nil then
+      if snapshot_type ~= "" and snapshot_type ~= "rollback" then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = "Invalid snapshot type \"" .. snapshot_type
+            .. "\" specified with rollback option"})
+      end
+      target_height = resolve_height_or_hash(options.rollback)
+    elseif snapshot_type == "rollback" then
+      -- Pick highest assumeutxo height <= current tip.
+      local heights = consensus.get_assumeutxo_heights(rpc.network)
+      if not heights or #heights == 0 then
+        error({code = M.ERROR.MISC_ERROR,
+          message = "No assumeutxo snapshots configured for "
+            .. rpc.network.name})
+      end
+      local picked
+      for _, h in ipairs(heights) do
+        if (current_tip_height or 0) >= h then
+          if not picked or h > picked then picked = h end
+        end
+      end
+      if not picked then
+        error({code = M.ERROR.MISC_ERROR,
+          message = "Current tip is below all configured assumeutxo "
+            .. "snapshot heights"})
+      end
+      target_height = picked
+    elseif snapshot_type == "" or snapshot_type == "latest" then
+      target_height = nil  -- dump current tip
+    else
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Invalid snapshot type \"" .. snapshot_type
+          .. "\" specified. Please specify \"rollback\" or \"latest\""})
+    end
+
+    if target_height ~= nil and target_height > (current_tip_height or 0) then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Rollback target above current tip"})
+    end
+
     local utxo_mod = require("lunarblock.utxo")
-    local _ = utxo_mod  -- chain_state.dump_snapshot dispatches via :method
+    local _ = utxo_mod  -- chain_state methods dispatch via :method
+
+    -- Stage 1: roll back if requested.
+    local disconnected = nil
+    if target_height ~= nil and target_height < (current_tip_height or 0) then
+      local list, rerr = rpc.chain_state:rollback_chain_to(target_height)
+      if not list then
+        error({code = M.ERROR.MISC_ERROR,
+          message = "Could not roll back to requested height: "
+            .. tostring(rerr)})
+      end
+      disconnected = list
+    end
+
+    -- Stage 2: dump.  If the dump fails we still try to re-apply the
+    -- disconnected blocks so the node is left at the original tip.
     local tmppath = path .. ".incomplete"
     local result, err = rpc.chain_state:dump_snapshot(tmppath)
+
+    -- Stage 3: re-apply if we rolled back.  This must run regardless of
+    -- whether the dump succeeded, otherwise a failed dump would leave
+    -- the node stuck at the rollback height.
+    if disconnected and #disconnected > 0 then
+      local rok, rerr = rpc.chain_state:reapply_disconnected(disconnected)
+      if not rok then
+        os.remove(tmppath)
+        error({code = M.ERROR.MISC_ERROR,
+          message = "rollback dump succeeded but re-applying blocks "
+            .. "failed: " .. tostring(rerr)
+            .. " (chain may need reindex)"})
+      end
+    end
+
     if not result then
       os.remove(tmppath)
       error({code = M.ERROR.MISC_ERROR, message = err or "dump failed"})
     end
+
     local rok, rerr = os.rename(tmppath, path)
     if not rok then
       os.remove(tmppath)
