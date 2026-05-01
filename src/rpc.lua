@@ -4652,6 +4652,123 @@ function RPCServer:register_methods()
       deployments = deployments,
     }
   end
+
+  -- dumptxoutset: write the serialized UTXO set to a file in Bitcoin Core
+  -- wire format.  Mirrors bitcoin-core/src/rpc/blockchain.cpp dumptxoutset.
+  -- params[1] = path (string).  Returns {coins_written, base_hash,
+  -- base_height, path, txoutset_hash, nchaintx}.
+  self.methods["dumptxoutset"] = function(rpc, params)
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+    local path = params and params[1]
+    if type(path) ~= "string" or path == "" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "dumptxoutset requires a path string"})
+    end
+    -- Refuse to clobber an existing file (matches Core dumptxoutset).
+    local probe = io.open(path, "rb")
+    if probe then
+      probe:close()
+      error({code = M.ERROR.MISC_ERROR,
+        message = "path already exists: " .. path})
+    end
+
+    local utxo_mod = require("lunarblock.utxo")
+    local _ = utxo_mod  -- chain_state.dump_snapshot dispatches via :method
+    local tmppath = path .. ".incomplete"
+    local result, err = rpc.chain_state:dump_snapshot(tmppath)
+    if not result then
+      os.remove(tmppath)
+      error({code = M.ERROR.MISC_ERROR, message = err or "dump failed"})
+    end
+    local rok, rerr = os.rename(tmppath, path)
+    if not rok then
+      os.remove(tmppath)
+      error({code = M.ERROR.MISC_ERROR,
+        message = "rename failed: " .. tostring(rerr)})
+    end
+
+    local base_hash_hex = types.hash256_hex(result.base_blockhash)
+    local hash_hex = ""
+    for i = 1, 32 do
+      hash_hex = hash_hex .. string.format("%02x", result.hash:byte(i))
+    end
+    return {
+      coins_written = result.coins_count,
+      base_hash     = base_hash_hex,
+      base_height   = result.base_height,
+      path          = path,
+      txoutset_hash = hash_hex,
+      nchaintx      = result.coins_count,  -- caller can read m_chain_tx_count from chainparams
+    }
+  end
+
+  -- loadtxoutset: load a serialized UTXO snapshot file (Bitcoin Core wire
+  -- format) into the chainstate.  Mirrors loadtxoutset in
+  -- bitcoin-core/src/rpc/blockchain.cpp.  params[1] = path.
+  -- Validates against chainparams.assumeutxo before accepting.
+  self.methods["loadtxoutset"] = function(rpc, params)
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+    local path = params and params[1]
+    if type(path) ~= "string" or path == "" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "loadtxoutset requires a path string"})
+    end
+
+    -- Peek at metadata to learn the base blockhash, then look up the
+    -- assumeutxo entry for that hash.  Reject the load if the chainparams
+    -- table does not list this base block (matches Core's safeguard).
+    local utxo_mod = require("lunarblock.utxo")
+    local f, ferr = io.open(path, "rb")
+    if not f then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "failed to open snapshot: " .. tostring(ferr)})
+    end
+    local hdr = f:read(51)
+    f:close()
+    if not hdr or #hdr < 51 then
+      error({code = M.ERROR.DESERIALIZATION_ERROR,
+        message = "snapshot header truncated"})
+    end
+    local meta, merr = utxo_mod.deserialize_snapshot_metadata(hdr)
+    if not meta then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = merr})
+    end
+    if meta.network_magic ~= rpc.network.magic_bytes then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "snapshot is for a different network"})
+    end
+    local base_hash_hex = types.hash256_hex(meta.base_blockhash)
+    local au_data, au_height = consensus.assumeutxo_for_blockhash(
+      rpc.network, base_hash_hex)
+    if not au_data then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "snapshot base block " .. base_hash_hex
+          .. " is not a known assumeutxo height for this network"})
+    end
+
+    local ok, lerr = rpc.chain_state:load_snapshot(path)
+    if not ok then
+      error({code = M.ERROR.MISC_ERROR,
+        message = lerr or "load failed"})
+    end
+
+    -- Update the in-memory tip height to match the snapshot base.
+    rpc.chain_state.tip_height = au_height
+    if rpc.storage and rpc.storage.set_chain_tip then
+      rpc.storage.set_chain_tip(rpc.chain_state.tip_hash, au_height, true)
+    end
+
+    return {
+      coins_loaded     = meta.coins_count,
+      tip_hash         = base_hash_hex,
+      base_height      = au_height,
+      path             = path,
+    }
+  end
 end
 
 --------------------------------------------------------------------------------
