@@ -83,7 +83,7 @@ LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
 | `--jitprofile` | off | Enable JIT profiling output |
 | `--jitverbose` | off | Enable verbose JIT compilation logging |
 | `--import-blocks FILE` | none | Import blocks from framed file (`-` for stdin) |
-| `--import-utxo FILE` | none | Import UTXO snapshot from HDOG file |
+| `--import-utxo FILE` | none | Import UTXO snapshot from Core `dumptxoutset` file |
 
 ## RPC API
 
