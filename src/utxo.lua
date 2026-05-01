@@ -2340,6 +2340,71 @@ function ChainState:compute_utxo_hash()
   return hasher.final(), count
 end
 
+--- Serialize one (outpoint, coin) tuple in Bitcoin Core's TxOutSer format
+-- (bitcoin-core/src/kernel/coinstats.cpp:46).  This is the per-element
+-- payload that ApplyCoinHash feeds into MuHash3072::Insert.
+--
+-- Layout (all little-endian):
+--   txid    : 32 bytes (raw, on-disk byte order)
+--   vout    : uint32 LE (4 bytes)
+--   code    : uint32 LE = (nHeight << 1) | fCoinBase   (4 bytes)
+--   value   : int64 LE  (8 bytes)
+--   scriptPubKey : CompactSize len || raw bytes
+--
+-- The on-disk UTXO key already encodes (txid || vout LE), so we hand that
+-- back unchanged for the first 36 bytes.
+local function _serialize_txoutser(key, entry)
+  -- key is exactly 36 bytes: 32 raw txid + 4 vout LE.
+  assert(#key == 36, "txoutser: expected 36-byte UTXO key")
+
+  local code = entry.height * 2 + (entry.is_coinbase and 1 or 0)
+  local w = serialize.buffer_writer()
+  w.write_bytes(key)
+  w.write_u32le(code)
+  w.write_i64le(entry.value)
+  w.write_varint(#entry.script_pubkey)
+  w.write_bytes(entry.script_pubkey)
+  return w.result()
+end
+M.serialize_txoutser = _serialize_txoutser
+
+--- Compute the MuHash3072 set hash of the current UTXO set, byte-compatible
+-- with Bitcoin Core's CoinStatsHashType::MUHASH (kernel/coinstats.cpp).
+--
+-- This is what AssumeUTXO snapshot validation commits to:
+-- chainparams.cpp's m_assumeutxo_data.hash_serialized is exactly the value
+-- this function returns, displayed as a uint256 (i.e. reversed bytes).
+--
+-- Order-independent (MuHash is a homomorphic set hash), but for sanity we
+-- still iterate in canonical RocksDB key order.
+--
+-- @return string: 32 raw bytes (SHA256 of the canonical 384-byte Num3072
+--                 packing, in the natural little-endian byte order).
+-- @return number: number of UTXOs hashed.
+function ChainState:compute_muhash()
+  -- Flush any pending changes to ensure we're reading from disk.
+  self.coin_view:flush()
+
+  local muhash_mod = require("lunarblock.muhash")
+  local mh = muhash_mod.new()
+
+  local count = 0
+  local iter = self.storage.iterator(storage_mod.CF.UTXO)
+  iter.seek_to_first()
+
+  while iter.valid() do
+    local key = iter.key()
+    local data = iter.value()
+    local entry = M.deserialize_utxo_entry(data)
+    mh:insert(_serialize_txoutser(key, entry))
+    count = count + 1
+    iter.next()
+  end
+  iter.destroy()
+
+  return mh:finalize(), count
+end
+
 --- Dump the UTXO set to a snapshot file in Bitcoin Core wire format.
 -- Mirrors WriteUTXOSnapshot in bitcoin-core/src/rpc/blockchain.cpp.
 -- Outer body loop is grouped by txid using CompactSize counts; inner
@@ -2626,9 +2691,20 @@ function ChainState:load_snapshot(file_path, expected_hash)
   self.coin_view:flush()
 
   if expected_hash then
-    local computed_hash, _ = self:compute_utxo_hash()
+    -- bitcoin-core/src/validation.cpp:5912-5914 compares
+    -- maybe_stats->hashSerialized (CoinStatsHashType::MUHASH) against
+    -- au_data.hash_serialized.  Use MuHash here for strict parity with
+    -- assumeutxo commitments; the legacy SHA256 streaming path is kept
+    -- on compute_utxo_hash for callers that need it.
+    --
+    -- Convention: expected_hash is 32 raw bytes in the natural
+    -- (little-endian) MuHash3072::Finalize() output order, matching what
+    -- compute_muhash returns. Callers passing a hex string from
+    -- consensus.assumeutxo.hash_serialized must reverse the bytes first
+    -- (uint256.ToString is big-endian display).
+    local computed_hash, _ = self:compute_muhash()
     if computed_hash ~= expected_hash then
-      return false, "snapshot hash mismatch"
+      return false, "snapshot hash mismatch (muhash)"
     end
   end
 
