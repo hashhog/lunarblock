@@ -373,6 +373,131 @@ describe("Core-format UTXO snapshot", function()
     end)
   end)
 
+  describe("Core-strict genesis-coinbase exclusion (dump_snapshot)", function()
+    -- Bitcoin Core never inserts the genesis block's coinbase into the
+    -- UTXO set (validation.cpp:2337-2343 ConnectBlock fast-path), so its
+    -- dumptxoutset on a fresh chainstate emits coins_count=0 and a 51-byte
+    -- file (just the metadata header).  lunarblock's connect_genesis()
+    -- inserts the coinbase for "consistency"; dump_snapshot must filter
+    -- it out so the wire format stays byte-identical to Core.
+    local tmp_path
+    local snapshot_file
+    local db
+
+    setup(function()
+      tmp_path = "/tmp/lunarblock_genesis_excl_" .. os.time()
+      snapshot_file = tmp_path .. ".dat"
+    end)
+
+    after_each(function()
+      if db then db.close(); db = nil end
+      os.remove(snapshot_file)
+    end)
+
+    it("produces a 51-byte snapshot with coins_count=0 on fresh regtest",
+       function()
+      db = storage_mod.open(tmp_path .. "_a_" .. math.random(1000000))
+      local cs = utxo.new_chain_state(db, consensus.networks.regtest)
+      cs:init()  -- adds genesis coinbase to the in-memory UTXO set
+
+      local result, err = cs:dump_snapshot(snapshot_file)
+      assert.is_nil(err)
+      assert.is_not_nil(result)
+      assert.equal(0, result.coins_count,
+        "dump_snapshot must exclude the genesis coinbase")
+
+      local f = io.open(snapshot_file, "rb")
+      local raw = f:read("*a")
+      f:close()
+      assert.equal(51, #raw,
+        "fresh regtest snapshot must be exactly 51 bytes (metadata only)")
+
+      -- Sanity: parsed metadata reports zero coins.
+      local meta, merr = utxo.deserialize_snapshot_metadata(raw)
+      assert.is_nil(merr)
+      assert.equal(0, meta.coins_count)
+    end)
+
+    it("produces a 51-byte snapshot with coins_count=0 on fresh mainnet",
+       function()
+      db = storage_mod.open(tmp_path .. "_b_" .. math.random(1000000))
+      local cs = utxo.new_chain_state(db, consensus.networks.mainnet)
+      cs:init()
+
+      local result, err = cs:dump_snapshot(snapshot_file)
+      assert.is_nil(err)
+      assert.equal(0, result.coins_count)
+
+      local f = io.open(snapshot_file, "rb")
+      local raw = f:read("*a")
+      f:close()
+      assert.equal(51, #raw)
+    end)
+  end)
+
+  describe("Core-strict assumeutxo whitelist (loadtxoutset RPC)", function()
+    -- bitcoin-core/src/validation.cpp:5775-5780: after recovering the
+    -- snapshot's base block height from the header index, the chainparams
+    -- whitelist is consulted by HEIGHT.  If the height is not present,
+    -- Core refuses with the exact string "Assumeutxo height in snapshot
+    -- metadata not recognized (<H>) - refusing to load snapshot".
+    local rpc_mod = require("lunarblock.rpc")
+    local cjson = require("cjson")
+
+    local tmp_path
+    local snapshot_file
+    local db
+
+    setup(function()
+      tmp_path = "/tmp/lunarblock_whitelist_" .. os.time()
+      snapshot_file = tmp_path .. ".dat"
+    end)
+
+    after_each(function()
+      if db then db.close(); db = nil end
+      os.remove(snapshot_file)
+    end)
+
+    it("rejects a regtest-genesis snapshot with Core's exact error message",
+       function()
+      -- Build a fresh regtest chainstate and dump it.  base_blockhash
+      -- will be the regtest genesis hash and base_height = 0.  Regtest
+      -- has no assumeutxo entries, so the whitelist lookup must fail
+      -- and Core's exact error string must surface back through the
+      -- JSON-RPC envelope.
+      db = storage_mod.open(tmp_path .. "_c_" .. math.random(1000000))
+      local cs = utxo.new_chain_state(db, consensus.networks.regtest)
+      cs:init()
+
+      local _, derr = cs:dump_snapshot(snapshot_file)
+      assert.is_nil(derr)
+
+      local server = rpc_mod.new({
+        chain_state = cs,
+        storage = db,
+        network = consensus.networks.regtest,
+      })
+
+      local request = cjson.encode({
+        jsonrpc = "1.0",
+        method  = "loadtxoutset",
+        params  = { snapshot_file },
+        id      = 1,
+      })
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+
+      assert.is_not_nil(decoded.error,
+        "loadtxoutset must error on a non-whitelisted base height")
+      assert.equal(rpc_mod.ERROR.MISC_ERROR, decoded.error.code)
+      -- Substring match against Core's exact error template.
+      assert.matches(
+        "Assumeutxo height in snapshot metadata not recognized %(0%)"
+        .. " %- refusing to load snapshot",
+        decoded.error.message)
+    end)
+  end)
+
   describe("chainparams.assumeutxo", function()
     it("contains all 4 mainnet snapshots from Bitcoin Core", function()
       local heights = consensus.get_assumeutxo_heights(
