@@ -2362,6 +2362,31 @@ function ChainState:dump_snapshot(file_path)
   -- naturally lex-sorted by txid then vout.  We still group in memory
   -- because lunarblock historically returns the per-txid bucket in one
   -- go to the writer.  TODO: stream this for >tens-of-millions UTXOs.
+  --
+  -- Genesis-coinbase exclusion: Bitcoin Core never adds the genesis
+  -- block's coinbase output to the UTXO set
+  -- (bitcoin-core/src/validation.cpp:2337-2343 short-circuits on the
+  -- genesis hash and skips ConnectBlock for its transactions).
+  -- lunarblock's connect_genesis() inserts it for "consistency", which
+  -- diverged the dump's coins_count by 1 vs Core.  Compute the genesis
+  -- coinbase txid here and skip exactly that entry so the wire format
+  -- (51-byte metadata, coins_count=0 on a fresh chain) is byte-identical
+  -- to Core's regtest dump.
+  local genesis_coinbase_txid_bytes = nil
+  do
+    local ok, gen_block_hash = pcall(self.storage.get_hash_by_height, 0)
+    if ok and gen_block_hash then
+      local gok, gen_block = pcall(self.storage.get_block, gen_block_hash)
+      if gok and gen_block and gen_block.transactions
+          and gen_block.transactions[1] then
+        local gtxid = validation.compute_txid(gen_block.transactions[1])
+        if gtxid and gtxid.bytes then
+          genesis_coinbase_txid_bytes = gtxid.bytes
+        end
+      end
+    end
+  end
+
   local utxos_by_txid = {}
   local total_count = 0
 
@@ -2378,11 +2403,15 @@ function ChainState:dump_snapshot(file_path)
 
     local entry = M.deserialize_utxo_entry(data)
 
-    if not utxos_by_txid[txid_bytes] then
-      utxos_by_txid[txid_bytes] = {}
+    -- Skip the genesis coinbase, byte-matching Core which never
+    -- inserts it (validation.cpp ConnectBlock fast-path).
+    if txid_bytes ~= genesis_coinbase_txid_bytes then
+      if not utxos_by_txid[txid_bytes] then
+        utxos_by_txid[txid_bytes] = {}
+      end
+      utxos_by_txid[txid_bytes][vout] = entry
+      total_count = total_count + 1
     end
-    utxos_by_txid[txid_bytes][vout] = entry
-    total_count = total_count + 1
 
     iter.next()
   end
