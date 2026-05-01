@@ -44,7 +44,7 @@ local function default_args()
     nov2transport = false,  -- Disable BIP324 v2 transport
     peerbloomfilters = false, -- BIP-35 / NODE_BLOOM: matches Core DEFAULT_PEERBLOOMFILTERS=false (net_processing.h)
     import_blocks = nil,   -- Path to framed block file for import (or "-" for stdin)
-    import_utxo = nil,     -- Path to HDOG UTXO snapshot file for AssumeUTXO import
+    import_utxo = nil,     -- Path to Core-format UTXO snapshot file for AssumeUTXO import
     -- Operational-parity flags (mirrors Bitcoin Core init.cpp + util/system.cpp)
     pid = nil,             -- Path to PID file (default: <datadir>/lunarblock.pid)
     debug = nil,           -- Comma-separated debug categories (e.g. "net,mempool")
@@ -99,7 +99,7 @@ local function parse_args(argv)
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
-      print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
+      print("      --import-utxo FILE          Import UTXO snapshot from Core dumptxoutset file (AssumeUTXO)")
       print("      --pid PATH                  Path to PID file (default: <datadir>/lunarblock.pid)")
       print("      --debug CATS                Enable debug categories (comma-separated; e.g. net,mempool,1=all)")
       print("      --log PATH                  Path to log file (default: <datadir>/debug.log)")
@@ -426,10 +426,17 @@ end
 
 --------------------------------------------------------------------------------
 -- UTXO Snapshot Import Mode (AssumeUTXO)
+--
+-- Replaces the legacy HDOG-FFI fast path with a pure-Lua loader that
+-- accepts Bitcoin Core's dumptxoutset wire format.  See utxo.lua
+-- ChainState:load_snapshot for the parser.
 --------------------------------------------------------------------------------
 
 local function run_import_utxo(args)
-  local ffi = require("ffi")
+  local consensus_mod = require("lunarblock.consensus")
+  local storage_mod = require("lunarblock.storage")
+  local utxo_mod = require("lunarblock.utxo")
+  local types = require("lunarblock.types")
 
   -- Determine data directory
   local datadir = args.datadir
@@ -438,50 +445,52 @@ local function run_import_utxo(args)
   end
   os.execute("mkdir -p " .. datadir)
 
-  local db_path = datadir .. "/chainstate"
-  os.execute("mkdir -p " .. db_path)
-
   print(string.format("import-utxo: network=%s datadir=%s source=%s",
     args.network, datadir, args.import_utxo))
 
-  -- Load the C helper via FFI
-  ffi.cdef[[
-    typedef struct {
-      int success;
-      char error_msg[256];
-      uint64_t utxo_count;
-      uint32_t block_height;
-      uint8_t block_hash[32];
-      double elapsed_seconds;
-    } hdog_import_result_t;
-
-    hdog_import_result_t hdog_import(
-      const char *hdog_path,
-      const char *db_path,
-      int cache_mb
-    );
-  ]]
-
-  local lib = ffi.load("hdog_import")
-
-  -- Run the import
-  local result = lib.hdog_import(args.import_utxo, db_path, args.dbcache)
-
-  if result.success == 0 then
-    io.stderr:write("import-utxo FAILED: " .. ffi.string(result.error_msg) .. "\n")
+  local network = consensus_mod.networks[args.network]
+  if not network then
+    io.stderr:write("import-utxo FAILED: unknown network " .. tostring(args.network) .. "\n")
     os.exit(1)
   end
 
-  -- Display the block hash in hex (big-endian display format)
-  local hash_hex = {}
-  for i = 31, 0, -1 do
-    hash_hex[#hash_hex + 1] = string.format("%02x", result.block_hash[i])
+  local db = storage_mod.open(datadir)
+  local cs = utxo_mod.new_chain_state(db, network)
+  cs:init()
+
+  local t0 = os.time()
+  local ok, err = cs:load_snapshot(args.import_utxo)
+  local elapsed = os.time() - t0
+
+  if not ok then
+    db.close()
+    io.stderr:write("import-utxo FAILED: " .. tostring(err) .. "\n")
+    os.exit(1)
   end
-  print(string.format("import-utxo complete: height=%d utxos=%s block=%s elapsed=%.1fs",
-    result.block_height,
-    tostring(tonumber(result.utxo_count)),
-    table.concat(hash_hex),
-    result.elapsed_seconds))
+
+  -- Resolve assumeutxo height for the loaded base block.
+  local tip_hex = types.hash256_hex(cs.tip_hash)
+  local au_data, au_height = consensus_mod.assumeutxo_for_blockhash(network, tip_hex)
+  if au_height then
+    cs.tip_height = au_height
+    db.set_chain_tip(cs.tip_hash, au_height, true)
+    if au_data and au_data.hash_serialized then
+      print("import-utxo: blockhash matches assumeutxo height " .. au_height)
+    end
+  end
+
+  -- Compute and display the resulting set hash.
+  local set_hash, count = cs:compute_utxo_hash()
+  local set_hash_hex = ""
+  for i = 1, 32 do
+    set_hash_hex = set_hash_hex .. string.format("%02x", set_hash:byte(i))
+  end
+
+  db.close()
+
+  print(string.format(
+    "import-utxo complete: utxos=%d block=%s set_hash=%s elapsed=%ds",
+    count, tip_hex, set_hash_hex, elapsed))
 end
 
 --------------------------------------------------------------------------------
@@ -1542,7 +1551,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
-      print("      --import-utxo FILE          Import UTXO snapshot from HDOG file (AssumeUTXO)")
+      print("      --import-utxo FILE          Import UTXO snapshot from Core dumptxoutset file (AssumeUTXO)")
       print("      --pid PATH                  Path to PID file (default: <datadir>/lunarblock.pid)")
       print("      --debug CATS                Enable debug categories (comma-separated; e.g. net,mempool,1=all)")
       print("      --log PATH                  Path to log file (default: <datadir>/debug.log)")

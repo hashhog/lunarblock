@@ -15,9 +15,12 @@ help:
 	@echo "  help   - Show this help message"
 
 # Build C helpers (FFI shared libraries)
+# Note: HDOG-format snapshot importer (csrc/hdog_import.c) was retired in
+# favor of a pure-Lua Core-format loader; see src/utxo.lua load_snapshot
+# and src/main.lua run_import_utxo.
 build:
 	@mkdir -p lib
-	gcc -O2 -shared -fPIC -o lib/libhdog_import.so csrc/hdog_import.c -lrocksdb
+	@echo "(no FFI helpers to build)"
 
 # Run tests with busted using LuaJIT
 test:

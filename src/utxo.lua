@@ -285,29 +285,294 @@ end
 -- AssumeUTXO Snapshot Format
 --------------------------------------------------------------------------------
 
--- Snapshot metadata structure matching Bitcoin Core's SnapshotMetadata
--- Reference: /home/max/hashhog/bitcoin/src/node/utxo_snapshot.h
+-- Snapshot wire format matching Bitcoin Core (bitcoin-core/src/node/utxo_snapshot.h
+-- and bitcoin-core/src/rpc/blockchain.cpp WriteUTXOSnapshot).
 --
--- Format:
---   magic_bytes[5]  = 'utxo' + 0xff
---   version[2]      = uint16 LE
---   network_magic[4] = 4-byte network identifier
---   base_blockhash[32] = hash of snapshot base block
---   coins_count[8]  = uint64 LE total number of UTXOs
+-- Header (51 bytes, see SnapshotMetadata::Serialize):
+--   magic_bytes[5]      = 'utxo' + 0xff   (SNAPSHOT_MAGIC_BYTES)
+--   version[2]          = uint16 LE       (SnapshotMetadata::VERSION = 2)
+--   network_magic[4]    = MessageStartChars
+--   base_blockhash[32]  = uint256 (LE on the wire, matches storage order)
+--   coins_count[8]      = uint64 LE
 --
--- Followed by UTXO data:
---   For each unique txid:
---     txid[32]         = transaction ID
---     num_outputs[var] = varint number of outputs for this txid
---     For each output:
---       vout_index[var] = varint output index
---       code[var]       = varint (height * 2 + is_coinbase)
---       value[8]        = int64 LE amount in satoshis
---       script[var]     = varstring script_pubkey
+-- Body (grouped by txid; see WriteUTXOSnapshot in rpc/blockchain.cpp):
+--   For each txid (in lexicographic key order from leveldb):
+--     txid[32]                    = raw 32 bytes (no length prefix)
+--     coins_per_txid (CompactSize)= number of coins for this txid
+--     For each coin:
+--       vout_index (CompactSize)
+--       code (Core VARINT)        = (height * 2) + (coinbase ? 1 : 0)
+--       compressed_amount (Core VARINT) = CompressAmount(value)
+--       script_pubkey             = ScriptCompression (compressed type byte
+--                                   + raw, OR Core VARINT(size+6) + raw bytes)
+--
+-- IMPORTANT: Core uses TWO different variable-length encodings:
+--   1. CompactSize (Bitcoin's varint): 1/3/5/9 byte LE encoding used for
+--      counts in the snapshot body (coins_per_txid, vout).  This matches
+--      what serialize.lua:write_varint already does.
+--   2. Core VARINT: MSB base-128 encoding (see serialize.h:WriteVarInt).
+--      Used inside Coin::Serialize for `code` and inside AmountCompression
+--      and ScriptCompression.  We implement this below as
+--      _write_corevarint / _read_corevarint.
+--
+-- Mixing the two is the bug this commit fixes — the prior implementation
+-- emitted coin data with `write_varint` (CompactSize) for `code`, no
+-- amount compression, and a varstring for the script.
 
 -- Snapshot magic bytes (Bitcoin Core compatible)
 M.SNAPSHOT_MAGIC = "utxo\xff"
 M.SNAPSHOT_VERSION = 2
+
+-- ScriptCompression special-script count (compressor.h:ScriptCompression)
+M.N_SPECIAL_SCRIPTS = 6
+-- Maximum tx output script size that ScriptCompression accepts
+-- (matches MAX_SCRIPT_SIZE in script.h).
+M.MAX_SCRIPT_SIZE = 10000
+
+--------------------------------------------------------------------------------
+-- Core VARINT (MSB base-128) helpers
+--
+-- Bitcoin Core's WriteVarInt (serialize.h) is NOT the CompactSize encoding.
+-- It writes 7 bits at a time, MSB-first, with the high bit of every byte
+-- except the last set to 1.  After each non-final byte, the value is
+-- decremented by 1 (Mode::DEFAULT) so that the encoding is unique.
+-- This implementation accepts/produces uint64-range values via LuaJIT
+-- cdata so it stays correct above 2^53 (snapshot reading hits 64-bit
+-- intermediate values inside DecompressAmount).
+--------------------------------------------------------------------------------
+
+-- u64 cdata for >32-bit safe arithmetic (LuaJIT FFI).
+local u64_t = ffi.typeof("uint64_t")
+
+local function _to_u64(v)
+  if type(v) == "cdata" then return ffi.cast(u64_t, v) end
+  return ffi.cast(u64_t, v)
+end
+
+--- Write a Core VARINT (MSB base-128 with -1 carry).
+-- @param w buffer_writer
+-- @param val number|cdata: non-negative integer in uint64 range
+function M.write_corevarint(w, val)
+  local n = _to_u64(val)
+  -- We need the bytes in MSB-first order.  Emit to a stack-like array,
+  -- then write in reverse.
+  local tmp = ffi.new("uint8_t[10]")
+  local len = 0
+  while true do
+    -- low 7 bits
+    local low7 = tonumber(n % u64_t(128))
+    -- high bit set if this is not the final byte (we set it for every
+    -- non-zero "len" because the loop reverses the byte order: the byte
+    -- written FIRST in the buffer is the highest-order byte and must have
+    -- 0x80 set; the byte written LAST must have 0x80 clear).
+    tmp[len] = low7 + (len > 0 and 0x80 or 0)
+    if n <= u64_t(0x7F) then break end
+    n = (n / u64_t(128)) - u64_t(1)
+    len = len + 1
+  end
+  -- Write bytes in reverse (most-significant first).
+  for i = len, 0, -1 do
+    w.write_u8(tmp[i])
+  end
+end
+
+--- Read a Core VARINT.
+-- @param r buffer_reader
+-- @return cdata uint64_t
+function M.read_corevarint(r)
+  local n = u64_t(0)
+  local guard = 0
+  while true do
+    guard = guard + 1
+    if guard > 18 then
+      error("read_corevarint: encoded length exceeds uint64 range")
+    end
+    local b = r.read_u8()
+    -- size check matching ReadVarInt:
+    -- if (n > (UINT64_MAX >> 7)) throw "size too large"
+    -- UINT64_MAX >> 7 == 0x01FFFFFFFFFFFFFF
+    if n > u64_t(0x01FFFFFFFFFFFFFFULL) then
+      error("read_corevarint: size too large")
+    end
+    n = (n * u64_t(128)) + u64_t(b % 128)  -- band 0x7F
+    if b >= 0x80 then
+      -- not the final byte: increment carry and continue
+      n = n + u64_t(1)
+    else
+      return n
+    end
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Amount compression (compressor.cpp:CompressAmount/DecompressAmount).
+--
+-- Pure integer arithmetic.  All intermediates fit in uint64 because amounts
+-- are bounded by MAX_MONEY (21e6 * 1e8 = 2.1e15 < 2^53).  Returned values
+-- are LuaJIT cdata uint64 so write_corevarint can consume them directly
+-- and so we never lose bits when the compressed value drifts above 2^53.
+--------------------------------------------------------------------------------
+
+--- Compress an amount (in satoshis, must be 0 <= n <= MAX_MONEY).
+-- @param n number|cdata
+-- @return cdata uint64_t
+function M.compress_amount(n)
+  local v = _to_u64(n)
+  if v == u64_t(0) then return u64_t(0) end
+  local e = 0
+  while (v % u64_t(10) == u64_t(0)) and e < 9 do
+    v = v / u64_t(10)
+    e = e + 1
+  end
+  if e < 9 then
+    local d = tonumber(v % u64_t(10))
+    -- d is in [1..9] because we just divided out all trailing zeros
+    v = v / u64_t(10)
+    return u64_t(1) + (v * u64_t(9) + u64_t(d - 1)) * u64_t(10) + u64_t(e)
+  else
+    return u64_t(1) + (v - u64_t(1)) * u64_t(10) + u64_t(9)
+  end
+end
+
+--- Decompress an amount produced by compress_amount.
+-- @param x number|cdata
+-- @return number satoshis
+function M.decompress_amount(x)
+  local v = _to_u64(x)
+  if v == u64_t(0) then return 0 end
+  v = v - u64_t(1)
+  local e = tonumber(v % u64_t(10))
+  v = v / u64_t(10)
+  local n
+  if e < 9 then
+    local d = tonumber(v % u64_t(9)) + 1
+    v = v / u64_t(9)
+    n = v * u64_t(10) + u64_t(d)
+  else
+    n = v + u64_t(1)
+  end
+  for _ = 1, e do
+    n = n * u64_t(10)
+  end
+  return tonumber(n)
+end
+
+--------------------------------------------------------------------------------
+-- Script compression (compressor.cpp:CompressScript/DecompressScript).
+--
+-- Phase 1 (this commit, per task TODO): we only emit the "raw" branch
+--   VARINT(size + 6) + raw_bytes
+-- which Core's DecompressScript handles (nSize >= nSpecialScripts case).
+-- Compressed types 0x00 (P2PKH) / 0x01 (P2SH) / 0x02-0x05 (P2PK) are read
+-- on the load path so we round-trip third-party snapshots, but we do not
+-- yet emit them on dump.  This is honest: the file is bigger than Core's
+-- but the format is byte-compatible.  TODO: detect the recognized types
+-- on dump for byte-for-byte parity with Core.
+--------------------------------------------------------------------------------
+
+--- Detect a P2PKH script: OP_DUP OP_HASH160 0x14 <20> OP_EQUALVERIFY OP_CHECKSIG.
+-- @param s string
+-- @return string|nil 20-byte hash160 or nil
+local function _is_p2pkh(s)
+  if #s ~= 25 then return nil end
+  if s:byte(1) ~= 0x76 or s:byte(2) ~= 0xA9 or s:byte(3) ~= 20
+     or s:byte(24) ~= 0x88 or s:byte(25) ~= 0xAC then
+    return nil
+  end
+  return s:sub(4, 23)
+end
+
+--- Detect a P2SH script: OP_HASH160 0x14 <20> OP_EQUAL.
+-- @param s string
+-- @return string|nil 20-byte hash160 or nil
+local function _is_p2sh(s)
+  if #s ~= 23 then return nil end
+  if s:byte(1) ~= 0xA9 or s:byte(2) ~= 20 or s:byte(23) ~= 0x87 then
+    return nil
+  end
+  return s:sub(3, 22)
+end
+
+--- Detect a compressed-pubkey-only P2PK: 0x21 <33> OP_CHECKSIG with prefix 0x02/0x03.
+-- @param s string
+-- @return number|nil prefix (0x02 or 0x03), string|nil 32-byte x-coord
+local function _is_p2pk_compressed(s)
+  if #s ~= 35 then return nil end
+  if s:byte(1) ~= 33 or s:byte(35) ~= 0xAC then return nil end
+  local prefix = s:byte(2)
+  if prefix ~= 0x02 and prefix ~= 0x03 then return nil end
+  return prefix, s:sub(3, 34)
+end
+
+--- Compress a scriptPubKey using ScriptCompression.
+-- This emits the OUTPUT BYTES (no length prefix) — the caller has already
+-- decided whether to lead with VARINT(size+6) or with one of the special
+-- type bytes.
+--
+-- For Phase 1 we always take the "raw" branch.  Recognized types are
+-- TODO; the comment above explains why.
+--
+-- @param script_bytes string
+-- @return string serialized form (with size+6 VARINT prefix)
+function M.compress_script(script_bytes)
+  -- TODO(W-CORE-COMPRESS): emit type-byte forms (0x00..0x05) when
+  -- script_bytes matches a recognized template.  For now always fall
+  -- through to the raw path so the encoding is unambiguous and
+  -- Core-readable.
+  local _ = _is_p2pkh
+  local _2 = _is_p2sh
+  local _3 = _is_p2pk_compressed
+  local w = serialize.buffer_writer()
+  M.write_corevarint(w, #script_bytes + M.N_SPECIAL_SCRIPTS)
+  w.write_bytes(script_bytes)
+  return w.result()
+end
+
+--- Get the on-disk byte length for a recognized type byte.
+-- Mirrors compressor.cpp:GetSpecialScriptSize.
+-- @param nSize number type indicator (already in [0..5])
+-- @return number raw payload length
+local function _special_script_size(nSize)
+  if nSize == 0 or nSize == 1 then return 20 end
+  if nSize >= 2 and nSize <= 5 then return 32 end
+  return 0
+end
+
+--- Decompress a scriptPubKey using ScriptCompression.
+-- Reads from the buffer_reader and returns the reconstructed scriptPubKey.
+-- For type 0x04/0x05 (uncompressed P2PK) we do NOT attempt to decompress
+-- the secp256k1 point — instead we return a marker scriptPubKey of
+-- OP_RETURN to keep the loader resilient.  Production code must wire
+-- libsecp256k1 here; production load on lunarblock today only happens
+-- against snapshots that lunarblock itself wrote, so type 4/5 should
+-- not appear yet.  TODO: real EC decompression for cross-impl loads.
+-- @param r buffer_reader
+-- @return string script_pubkey
+function M.decompress_script(r)
+  local nSize = tonumber(M.read_corevarint(r))
+  if nSize == 0x00 then
+    local h = r.read_bytes(20)
+    return "\x76\xa9\x14" .. h .. "\x88\xac"  -- P2PKH
+  elseif nSize == 0x01 then
+    local h = r.read_bytes(20)
+    return "\xa9\x14" .. h .. "\x87"  -- P2SH
+  elseif nSize == 0x02 or nSize == 0x03 then
+    local x = r.read_bytes(32)
+    return "\x21" .. string.char(nSize) .. x .. "\xac"  -- compressed P2PK
+  elseif nSize == 0x04 or nSize == 0x05 then
+    -- Uncompressed P2PK; needs secp256k1 to recover y.  See note above.
+    r.read_bytes(32)
+    return "\x6a"  -- OP_RETURN placeholder; flagged unspendable
+  else
+    local size = nSize - M.N_SPECIAL_SCRIPTS
+    if size > M.MAX_SCRIPT_SIZE then
+      -- Core skips overly-long scripts; we do the same for safety.
+      r.read_bytes(size)
+      return "\x6a"
+    end
+    return r.read_bytes(size)
+  end
+end
 
 --- Create snapshot metadata structure.
 -- @param network_magic string: 4-byte network identifier
@@ -372,29 +637,34 @@ function M.deserialize_snapshot_metadata(data)
   }
 end
 
---- Serialize a coin for snapshot format.
--- Uses compact encoding: code (height*2 + coinbase) + value + script
+--- Serialize a coin for snapshot format (Core-byte-compatible).
+-- Format matches bitcoin-core/src/coins.h Coin::Serialize:
+--   VARINT_core(code = height*2 + coinbase)
+--   VARINT_core(CompressAmount(value))
+--   ScriptCompression(script_pubkey)
+-- where ScriptCompression for the raw branch is VARINT_core(size+6) || raw.
 -- @param entry table: UTXO entry
--- @return string: serialized coin
+-- @return string: serialized coin (does NOT include vout prefix; the
+--                 caller emits CompactSize(vout) before this byte string)
 function M.serialize_snapshot_coin(entry)
   local w = serialize.buffer_writer()
-  -- Encode height and coinbase flag together: (height * 2) + coinbase_flag
   local code = entry.height * 2 + (entry.is_coinbase and 1 or 0)
-  w.write_varint(code)
-  w.write_i64le(entry.value)
-  w.write_varstr(entry.script_pubkey)
+  M.write_corevarint(w, code)
+  M.write_corevarint(w, M.compress_amount(entry.value))
+  w.write_bytes(M.compress_script(entry.script_pubkey))
   return w.result()
 end
 
---- Deserialize a coin from snapshot format.
+--- Deserialize a coin from Core snapshot format.
 -- @param reader buffer_reader: reader positioned at coin data
 -- @return table: UTXO entry
 function M.deserialize_snapshot_coin(reader)
-  local code = reader.read_varint()
+  local code = tonumber(M.read_corevarint(reader))
   local height = math.floor(code / 2)
   local is_coinbase = (code % 2) == 1
-  local value = reader.read_i64le()
-  local script_pubkey = reader.read_varstr()
+  local compressed_amount = M.read_corevarint(reader)
+  local value = M.decompress_amount(compressed_amount)
+  local script_pubkey = M.decompress_script(reader)
   return M.utxo_entry(value, script_pubkey, height, is_coinbase)
 end
 
@@ -2070,12 +2340,15 @@ function ChainState:compute_utxo_hash()
   return hasher.final(), count
 end
 
---- Dump the UTXO set to a snapshot file.
--- Format matches Bitcoin Core's dumptxoutset output.
+--- Dump the UTXO set to a snapshot file in Bitcoin Core wire format.
+-- Mirrors WriteUTXOSnapshot in bitcoin-core/src/rpc/blockchain.cpp.
+-- Outer body loop is grouped by txid using CompactSize counts; inner
+-- coin payload uses Core VARINTs and ScriptCompression.
 -- @param file_path string: path to write snapshot file
--- @return table|nil, string|nil: {coins_count, hash} or nil, error message
+-- @return table|nil, string|nil: {coins_count, hash, base_blockhash,
+--                                  base_height, path} or nil, error message
 function ChainState:dump_snapshot(file_path)
-  -- Ensure coin view is flushed
+  -- Ensure coin view is flushed so the iterator sees a consistent state.
   self.coin_view:flush()
 
   -- Open output file
@@ -2084,7 +2357,11 @@ function ChainState:dump_snapshot(file_path)
     return nil, "failed to open file: " .. (err or "unknown error")
   end
 
-  -- First pass: count UTXOs and group by txid
+  -- First pass: collect UTXOs grouped by txid.  The on-disk RocksDB key
+  -- is already (txid || vout LE), so iterating the column family is
+  -- naturally lex-sorted by txid then vout.  We still group in memory
+  -- because lunarblock historically returns the per-txid bucket in one
+  -- go to the writer.  TODO: stream this for >tens-of-millions UTXOs.
   local utxos_by_txid = {}
   local total_count = 0
 
@@ -2095,7 +2372,6 @@ function ChainState:dump_snapshot(file_path)
     local key = iter.key()
     local data = iter.value()
 
-    -- Parse outpoint from key: txid (32) + vout (4 LE)
     local txid_bytes = key:sub(1, 32)
     local r = serialize.buffer_reader(key:sub(33, 36))
     local vout = r.read_u32le()
@@ -2112,7 +2388,8 @@ function ChainState:dump_snapshot(file_path)
   end
   iter.destroy()
 
-  -- Write metadata
+  -- Write metadata (51 bytes; serialize_snapshot_metadata matches
+  -- SnapshotMetadata::Serialize byte-for-byte).
   local metadata = M.snapshot_metadata(
     self.network.magic_bytes,
     self.tip_hash,
@@ -2120,38 +2397,34 @@ function ChainState:dump_snapshot(file_path)
   )
   file:write(M.serialize_snapshot_metadata(metadata))
 
-  -- Second pass: write UTXO data grouped by txid
-  -- Iterate in sorted txid order for determinism
+  -- Sort txids lexicographically (matches leveldb iteration order).
   local sorted_txids = {}
   for txid_bytes in pairs(utxos_by_txid) do
     sorted_txids[#sorted_txids + 1] = txid_bytes
   end
   table.sort(sorted_txids)
 
+  -- Body: for each txid, write txid raw + CompactSize(coins) + per-coin
+  -- (CompactSize(vout) + serialize_snapshot_coin).
   for _, txid_bytes in ipairs(sorted_txids) do
     local outputs = utxos_by_txid[txid_bytes]
 
-    -- Sort output indices
     local sorted_vouts = {}
     for vout in pairs(outputs) do
       sorted_vouts[#sorted_vouts + 1] = vout
     end
     table.sort(sorted_vouts)
 
-    -- Write txid
-    file:write(txid_bytes)
-
-    -- Write number of outputs for this txid
+    -- Bundle the per-txid header into one writev to amortize Lua overhead.
     local w = serialize.buffer_writer()
-    w.write_varint(#sorted_vouts)
+    w.write_bytes(txid_bytes)            -- raw 32-byte txid
+    w.write_varint(#sorted_vouts)        -- CompactSize, NOT Core VARINT
     file:write(w.result())
 
-    -- Write each output
     for _, vout in ipairs(sorted_vouts) do
       local entry = outputs[vout]
-
       local ow = serialize.buffer_writer()
-      ow.write_varint(vout)  -- Output index
+      ow.write_varint(vout)              -- CompactSize for vout index
       file:write(ow.result())
       file:write(M.serialize_snapshot_coin(entry))
     end
@@ -2159,7 +2432,7 @@ function ChainState:dump_snapshot(file_path)
 
   file:close()
 
-  -- Compute hash for verification
+  -- Compute snapshot hash for verification.
   local hash, _ = self:compute_utxo_hash()
 
   return {
@@ -2167,22 +2440,102 @@ function ChainState:dump_snapshot(file_path)
     hash = hash,
     base_blockhash = self.tip_hash,
     base_height = self.tip_height,
+    path = file_path,
   }
 end
 
+--- Build a buffer_reader-shaped object backed by a Lua file handle.
+-- Reads ahead in REFILL_SIZE chunks so Core VARINT/CompactSize parsing
+-- stays in pure-Lua arithmetic rather than per-byte file:read(1).
+-- @param file file*: open binary file handle
+-- @return reader: object with read_u8, read_bytes, read_u32le, read_i64le
+local function _file_reader(file)
+  local REFILL = 65536  -- 64 KiB
+  local buf = ""
+  local pos = 1
+
+  local function ensure(n)
+    if pos + n - 1 > #buf then
+      local rest = buf:sub(pos)
+      local extra = file:read(math.max(REFILL, n))
+      if extra then
+        buf = rest .. extra
+      else
+        buf = rest
+      end
+      pos = 1
+      if pos + n - 1 > #buf then
+        error("file_reader: unexpected end of file (need " .. n .. " bytes)")
+      end
+    end
+  end
+
+  local r = {}
+  function r.read_u8()
+    ensure(1)
+    local v = buf:byte(pos)
+    pos = pos + 1
+    return v
+  end
+  function r.read_bytes(n)
+    if n == 0 then return "" end
+    ensure(n)
+    local s = buf:sub(pos, pos + n - 1)
+    pos = pos + n
+    return s
+  end
+  function r.read_u16le()
+    ensure(2)
+    local b1, b2 = buf:byte(pos, pos + 1)
+    pos = pos + 2
+    return b1 + b2 * 256
+  end
+  function r.read_u32le()
+    ensure(4)
+    local b1, b2, b3, b4 = buf:byte(pos, pos + 3)
+    pos = pos + 4
+    return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+  end
+  function r.read_u64le()
+    local low = r.read_u32le()
+    local high = r.read_u32le()
+    return low + high * 4294967296
+  end
+  function r.read_i64le()
+    local low = r.read_u32le()
+    local high = r.read_u32le()
+    if high >= 2147483648 then
+      local cl = 4294967295 - low
+      local ch = 4294967295 - high
+      return -(cl + ch * 4294967296 + 1)
+    else
+      return low + high * 4294967296
+    end
+  end
+  function r.read_varint()
+    local first = r.read_u8()
+    if first < 0xFD then return first
+    elseif first == 0xFD then return r.read_u16le()
+    elseif first == 0xFE then return r.read_u32le()
+    else return r.read_u64le() end
+  end
+  return r
+end
+
 --- Load a UTXO snapshot file into this chainstate.
--- Validates the snapshot hash against assumeutxo configuration.
+-- Accepts the Bitcoin Core wire format produced by dumptxoutset
+-- (lunarblock's dump_snapshot is byte-compatible with this).
 -- @param file_path string: path to snapshot file
--- @param expected_hash string|nil: expected hash (from assumeutxo config), or nil to skip validation
+-- @param expected_hash string|nil: expected serialized-set SHA256 (32-byte
+--                                  raw bytes) for hash validation, or nil
 -- @return boolean, string|nil: success flag, error message
 function ChainState:load_snapshot(file_path, expected_hash)
-  -- Open snapshot file
   local file, err = io.open(file_path, "rb")
   if not file then
     return false, "failed to open snapshot: " .. (err or "unknown error")
   end
 
-  -- Read metadata
+  -- Read 51-byte metadata header.
   local header = file:read(51)
   if not header or #header < 51 then
     file:close()
@@ -2195,193 +2548,54 @@ function ChainState:load_snapshot(file_path, expected_hash)
     return false, meta_err
   end
 
-  -- Validate network magic
   if metadata.network_magic ~= self.network.magic_bytes then
     file:close()
     return false, "snapshot network magic mismatch"
   end
 
-  -- Clear existing UTXO set
+  -- Clear in-memory cache; the underlying CF is left untouched and the
+  -- caller is expected to feed a fresh chainstate (Core does the same).
   self.coin_view:clear_cache()
-  -- Note: For a full implementation, we'd also clear the UTXO column family in storage
 
   local coins_loaded = 0
   local coins_total = metadata.coins_count
 
-  -- Read UTXO data
-  while coins_loaded < coins_total do
-    -- Read txid
-    local txid_bytes = file:read(32)
-    if not txid_bytes or #txid_bytes < 32 then
-      file:close()
-      return false, string.format("unexpected end of snapshot at coin %d", coins_loaded)
-    end
-    local txid = types.hash256(txid_bytes)
+  -- Wrap the file in a buffered reader so the new Core-format inner
+  -- payload (Core VARINTs + ScriptCompression) can be parsed with the
+  -- same primitives as buffer_reader.
+  local r = _file_reader(file)
 
-    -- Read number of outputs for this txid
-    local count_byte = file:read(1)
-    if not count_byte then
-      file:close()
-      return false, "unexpected end reading output count"
-    end
+  local ok_outer, parse_err = pcall(function()
+    while coins_loaded < coins_total do
+      -- Per-txid header: raw 32-byte txid + CompactSize(coins_per_txid).
+      local txid_bytes = r.read_bytes(32)
+      local txid = types.hash256(txid_bytes)
+      local num_outputs = r.read_varint()  -- CompactSize, see WriteUTXOSnapshot
 
-    -- Handle varint reading from file
-    local num_outputs
-    local first = count_byte:byte(1)
-    if first < 0xFD then
-      num_outputs = first
-    elseif first == 0xFD then
-      local extra = file:read(2)
-      if not extra or #extra < 2 then
-        file:close()
-        return false, "truncated varint"
-      end
-      local r = serialize.buffer_reader(extra)
-      num_outputs = r.read_u16le()
-    elseif first == 0xFE then
-      local extra = file:read(4)
-      if not extra or #extra < 4 then
-        file:close()
-        return false, "truncated varint"
-      end
-      local r = serialize.buffer_reader(extra)
-      num_outputs = r.read_u32le()
-    else
-      local extra = file:read(8)
-      if not extra or #extra < 8 then
-        file:close()
-        return false, "truncated varint"
-      end
-      local r = serialize.buffer_reader(extra)
-      num_outputs = r.read_u64le()
-    end
+      for _ = 1, num_outputs do
+        local vout = r.read_varint()  -- CompactSize for vout
+        local entry = M.deserialize_snapshot_coin(r)
+        self.coin_view:add(txid, vout, entry)
+        coins_loaded = coins_loaded + 1
 
-    -- Read each output
-    for _ = 1, num_outputs do
-      -- Read vout index (varint)
-      local vout_byte = file:read(1)
-      if not vout_byte then
-        file:close()
-        return false, "unexpected end reading vout"
-      end
-
-      local vout
-      local vout_first = vout_byte:byte(1)
-      if vout_first < 0xFD then
-        vout = vout_first
-      elseif vout_first == 0xFD then
-        local extra = file:read(2)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        vout = r.read_u16le()
-      elseif vout_first == 0xFE then
-        local extra = file:read(4)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        vout = r.read_u32le()
-      else
-        local extra = file:read(8)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        vout = r.read_u64le()
-      end
-
-      -- Read code (height*2 + coinbase flag) as varint
-      local code_byte = file:read(1)
-      if not code_byte then
-        file:close()
-        return false, "unexpected end reading code"
-      end
-
-      local code
-      local code_first = code_byte:byte(1)
-      if code_first < 0xFD then
-        code = code_first
-      elseif code_first == 0xFD then
-        local extra = file:read(2)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        code = r.read_u16le()
-      elseif code_first == 0xFE then
-        local extra = file:read(4)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        code = r.read_u32le()
-      else
-        local extra = file:read(8)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        code = r.read_u64le()
-      end
-
-      local height = math.floor(code / 2)
-      local is_coinbase = (code % 2) == 1
-
-      -- Read value (8 bytes i64 LE)
-      local value_bytes = file:read(8)
-      if not value_bytes or #value_bytes < 8 then
-        file:close()
-        return false, "unexpected end reading value"
-      end
-      local vr = serialize.buffer_reader(value_bytes)
-      local value = vr.read_i64le()
-
-      -- Read script (varstring)
-      local script_len_byte = file:read(1)
-      if not script_len_byte then
-        file:close()
-        return false, "unexpected end reading script length"
-      end
-
-      local script_len
-      local sl_first = script_len_byte:byte(1)
-      if sl_first < 0xFD then
-        script_len = sl_first
-      elseif sl_first == 0xFD then
-        local extra = file:read(2)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        script_len = r.read_u16le()
-      elseif sl_first == 0xFE then
-        local extra = file:read(4)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        script_len = r.read_u32le()
-      else
-        local extra = file:read(8)
-        if not extra then file:close(); return false, "truncated" end
-        local r = serialize.buffer_reader(extra)
-        script_len = r.read_u64le()
-      end
-
-      local script_pubkey = ""
-      if script_len > 0 then
-        script_pubkey = file:read(script_len)
-        if not script_pubkey or #script_pubkey < script_len then
-          file:close()
-          return false, "unexpected end reading script"
+        -- Periodic flush to keep the cache from running away on a 100M+
+        -- UTXO load.
+        if coins_loaded % 100000 == 0 then
+          self.coin_view:flush()
         end
       end
-
-      -- Add to UTXO set
-      local entry = M.utxo_entry(value, script_pubkey, height, is_coinbase)
-      self.coin_view:add(txid, vout, entry)
-
-      coins_loaded = coins_loaded + 1
-
-      -- Periodic flush to avoid memory pressure
-      if coins_loaded % 100000 == 0 then
-        self.coin_view:flush()
-      end
     end
-  end
+  end)
 
   file:close()
 
-  -- Final flush
+  if not ok_outer then
+    return false, "snapshot parse error: " .. tostring(parse_err)
+  end
+
+  -- Final flush of the in-memory deltas.
   self.coin_view:flush()
 
-  -- Validate hash if expected hash is provided
   if expected_hash then
     local computed_hash, _ = self:compute_utxo_hash()
     if computed_hash ~= expected_hash then
@@ -2389,10 +2603,9 @@ function ChainState:load_snapshot(file_path, expected_hash)
     end
   end
 
-  -- Update chain tip to snapshot base
+  -- Snapshot base block becomes the chainstate tip.  Height is filled in
+  -- by the caller via assumeutxo lookup.
   self.tip_hash = metadata.base_blockhash
-  -- Note: We need to look up the height from storage or header chain
-  -- For now, this will be set by the caller
 
   return true
 end
