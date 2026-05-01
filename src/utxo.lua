@@ -2116,6 +2116,103 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
 end
 
 --------------------------------------------------------------------------------
+-- Temporary rollback support for dumptxoutset rollback mode.
+-- Disconnects blocks from the current tip down to (but not including)
+-- target_height, returning the ordered list of disconnected (hash, height)
+-- pairs so callers can re-apply them in order via reapply_disconnected().
+--
+-- Mirrors the behavior of bitcoin-core's TemporaryRollback
+-- (src/rpc/blockchain.cpp) -- it walks from tip back to target_index by
+-- invalidating each block, dumps, then reconsiders to roll forward.  We
+-- bypass the invalid_blocks bookkeeping because we control this rollback
+-- end-to-end and only need the disconnect/reconnect dance.
+--
+-- Returns: list of {hash=hash256, height=int}, ordered from tip-down (so
+-- index 1 was the original tip and the last entry is at target_height+1).
+-- Caller can iterate in reverse to re-apply.
+--------------------------------------------------------------------------------
+
+--- Disconnect blocks from the current tip down to target_height.
+-- After this call, self.tip_height == target_height and the UTXO state
+-- reflects the chain at that height (assuming undo data is available).
+-- The returned list captures the disconnected blocks so they can be
+-- reconnected in order.
+-- @param target_height number: height to roll back to (must be < tip_height)
+-- @return table|nil, string|nil: list of {hash, height} or nil and error
+function ChainState:rollback_chain_to(target_height)
+  if type(target_height) ~= "number" then
+    return nil, "rollback_chain_to: target_height must be a number"
+  end
+  if target_height < 0 then
+    return nil, "rollback_chain_to: negative target height"
+  end
+  if not self.tip_height or not self.tip_hash then
+    return nil, "rollback_chain_to: chain has no tip"
+  end
+  if target_height > self.tip_height then
+    return nil, "rollback_chain_to: target above current tip"
+  end
+
+  local disconnected = {}
+  while self.tip_height > target_height do
+    local tip_hash = self.tip_hash
+    local tip_height = self.tip_height
+    local tip_block = self.storage.get_block(tip_hash)
+    if not tip_block then
+      return nil, string.format(
+        "rollback_chain_to: block data missing at height %d", tip_height)
+    end
+    local tip_header = self.storage.get_header(tip_hash)
+    if not tip_header then
+      return nil, string.format(
+        "rollback_chain_to: header missing at height %d", tip_height)
+    end
+
+    disconnected[#disconnected + 1] = {hash = tip_hash, height = tip_height}
+
+    local prev_hash = tip_header.prev_hash
+    local ok, err = self:disconnect_block(
+      tip_block, tip_height, tip_hash, prev_hash)
+    if not ok then
+      return nil, "rollback_chain_to: disconnect failed at height "
+        .. tostring(tip_height) .. ": " .. tostring(err)
+    end
+  end
+
+  return disconnected
+end
+
+--- Re-apply a list of previously-disconnected blocks (LIFO).
+-- @param disconnected table: list returned by rollback_chain_to()
+-- @return boolean, string|nil: success flag, error message on failure
+function ChainState:reapply_disconnected(disconnected)
+  if type(disconnected) ~= "table" then
+    return nil, "reapply_disconnected: expected list"
+  end
+  -- disconnected[#] was the deepest (lowest height) block; reapply LIFO.
+  for i = #disconnected, 1, -1 do
+    local entry = disconnected[i]
+    local block = self.storage.get_block(entry.hash)
+    if not block then
+      return nil, string.format(
+        "reapply_disconnected: block data missing for height %d",
+        entry.height)
+    end
+    -- Skip BIP68 sequence-lock checks here: connect_block treats
+    -- prev_block_mtp == nil as "do not enforce" which is safe for
+    -- already-validated history we are simply reconnecting.
+    local ok, err = self:connect_block(
+      block, entry.height, entry.hash, nil, nil, true, false, false, nil)
+    if not ok then
+      return nil, string.format(
+        "reapply_disconnected: connect failed at height %d: %s",
+        entry.height, tostring(err))
+    end
+  end
+  return true
+end
+
+--------------------------------------------------------------------------------
 -- Block Invalidation (invalidateblock / reconsiderblock RPC support)
 --------------------------------------------------------------------------------
 
