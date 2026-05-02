@@ -822,15 +822,32 @@ local function main()
       best_header_work, best_header_height
     )
 
-    local ok, err = chain_state:connect_block(
+    -- Wrap connect_block in pcall so we can discard partial in-memory
+    -- mutations on failure. connect_block iterates through txns, calling
+    -- coin_view:spend()/add() for each — those are immediate cache
+    -- mutations. If a later tx in the same block fails validation
+    -- (e.g. tapscript SCRIPT_SIZE), the flush at the end of connect_block
+    -- never runs (so disk is consistent), but the cache is left holding
+    -- spent entries and fresh adds. A retry would then see "Missing UTXO"
+    -- on inputs whose UTXOs the cache thinks are spent. Calling
+    -- coin_view:discard_dirty() drops every dirty cache entry; subsequent
+    -- :get() calls fall back to disk and see the real (pre-attempt) state.
+    --
+    -- This closes the secondary symptom of the 944,186 wedge — see
+    -- project_lunarblock_wedge_2026_04_28: tapscript SCRIPT_SIZE failed,
+    -- then retries reported "Missing UTXO for input 1 of tx 98a09ed2..."
+    -- because that input had been pre-spent in the cache during attempt 1.
+    local pcall_ok, ok_or_err = pcall(chain_state.connect_block, chain_state,
       block, height, block_hash, nil, nil, skip_scripts, nil, true,
       caller_batch_fn)
-    if not ok then
-      -- Raise an error so pcall in connect_pending_blocks catches it.
-      -- Returning nil without error would cause connect_pending_blocks to
-      -- believe the connection succeeded, storing the block and advancing
-      -- the height while the UTXO state was never updated.
-      error(string.format("Failed to connect block %d: %s", height, tostring(err)))
+    if not pcall_ok then
+      -- A Lua error was raised (typically assert() inside connect_block).
+      -- Discard partial in-memory cache mutations from the failed attempt
+      -- so a retry (or any sibling block) sees pre-attempt UTXO state.
+      -- Disk is already consistent (no flush ran).
+      chain_state.coin_view:discard_dirty()
+      -- Re-raise so pcall in connect_pending_blocks catches it.
+      error(string.format("Failed to connect block %d: %s", height, tostring(ok_or_err)))
     end
     -- Run the prune sweep AFTER the block is connected. maybe_prune is
     -- self-throttled (PRUNE_INTERVAL_BLOCKS) and capped per-call

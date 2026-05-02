@@ -2097,4 +2097,69 @@ describe("script", function()
       end)
     end)
   end)
+
+  -- Regression test for the 944,186 wedge: BIP342 tapscripts must be
+  -- exempt from MAX_SCRIPT_SIZE (10,000 bytes). Pre-fix, large
+  -- ordinals/inscription tapscripts (e.g. 64,349 bytes in mainnet block
+  -- 944,186 tx c6ff4027... vin[0]) failed with SCRIPT_ERR_SCRIPT_SIZE.
+  -- See project_lunarblock_wedge_2026_04_28.
+  describe("BIP342 tapscript MAX_SCRIPT_SIZE exemption", function()
+    it("rejects >10,000 byte legacy script (BASE/WITNESS_V0)", function()
+      -- Build a 10,001-byte stream of OP_NOP (0x61). OP_NOP doesn't grow
+      -- the stack so we can isolate the size-gate behaviour from
+      -- stack-overflow / op-count side effects.
+      -- Note: legacy MAX_OPS_PER_SCRIPT is 201; this script has 10,001
+      -- counted opcodes so it would fail either way for legacy. The point
+      -- here is that execute_script returns SCRIPT_SIZE *before* counting,
+      -- so that's the failure mode we expect.
+      local big = string.rep("\x61", 10001)
+      local result, err = script.execute_script(big, {}, {}, {})
+      assert.is_nil(result)
+      assert.equals("SCRIPT_SIZE", err)
+    end)
+
+    it("accepts >10,000 byte tapscript (is_tapscript=true)", function()
+      -- Same script size but tapscript flag set: must NOT trip SCRIPT_SIZE.
+      -- Use OP_NOP so we don't run into stack-size limits while exercising
+      -- the size gate. (Real ordinals tapscripts use giant push payloads
+      -- via OP_PUSHDATA, not 10K loose opcodes; this is a synthetic test
+      -- focused on the size gate alone.)
+      local big = string.rep("\x61", 10001)
+      local result, err = script.execute_script(big,
+        {}, {is_tapscript = true}, {})
+      -- Must not fail with SCRIPT_SIZE. With is_tapscript, the op-count
+      -- assert is also waived, so this should return an empty stack.
+      assert.not_equals("SCRIPT_SIZE", err)
+      assert.is_table(result)
+    end)
+
+    it("accepts ~64KB tapscript (mainnet 944,186 ordinals scale)", function()
+      -- Reproduce the exact size class that wedged lunarblock at 944,186:
+      -- 64,349-byte tapscript. We use OP_NOP padding (no real ordinals
+      -- push payload) — the goal is to assert the size gate, not Schnorr
+      -- verification.
+      local big = string.rep("\x61", 64349)
+      local result, err = script.execute_script(big,
+        {}, {is_tapscript = true}, {})
+      assert.not_equals("SCRIPT_SIZE", err)
+      assert.is_table(result)
+    end)
+
+    it("MAX_OPS_PER_SCRIPT is also waived for tapscript", function()
+      -- BIP342: tapscript exempts MAX_OPS_PER_SCRIPT (201). Large ordinals
+      -- tapscripts can have far more than 201 counted opcodes.
+      -- 250 OP_NOPs (0x61) -> over the 201-op legacy limit.
+      local many_ops = string.rep("\x61", 250)
+      -- Legacy: must fail "too many opcodes" (raised via assert)
+      local ok_legacy = pcall(function()
+        script.execute_script(many_ops, {}, {}, {})
+      end)
+      assert.is_false(ok_legacy)
+      -- Tapscript: must NOT fail with the op-count assert.
+      local ok_tap = pcall(function()
+        script.execute_script(many_ops, {}, {is_tapscript = true}, {})
+      end)
+      assert.is_true(ok_tap)
+    end)
+  end)
 end)
