@@ -662,6 +662,45 @@ local function main()
   chain_state:init()
   io.stdout:write(string.format("Chain state initialized: height=%d\n", chain_state.tip_height or -1)); io.stdout:flush()
 
+  -- BUG-REPORT.md fix #3: post-restart consistency check + auto-rollback.
+  -- Walk back from chain_tip up to 200 blocks; for each block, verify that
+  -- its first ~5 non-coinbase transactions' inputs resolve to a UTXO in
+  -- CF.UTXO or in the block's own undo data. If any block fails, roll back
+  -- to the highest known-good height and let IBD re-apply.
+  --
+  -- This catches the post-EMFILE wedge class: a hard crash leaves
+  -- chain_tip pointing at a block whose UTXO mutations didn't fully reach
+  -- disk. Without this check, IBD continues from the inconsistent state
+  -- and wedges thousands of blocks later when a tx finally references a
+  -- lost UTXO (h=938344 on Apr 28). Skipped if --reindex-chainstate is
+  -- requested (the reindex will rebuild from scratch anyway).
+  if not args.reindex_chainstate and not args.reindex
+      and chain_state.tip_height and chain_state.tip_height > 0 then
+    io.stdout:write("Verifying chainstate consistency (last 200 blocks)...\n")
+    io.stdout:flush()
+    local rolled, final_h, details = chain_state:verify_chainstate_consistency(200, 5)
+    if details.found_inconsistency then
+      io.stdout:write(string.format(
+        "[CHAINSTATE-RECOVERY] Detected inconsistency: %s\n",
+        tostring(details.reason)))
+      if rolled > 0 then
+        io.stdout:write(string.format(
+          "[CHAINSTATE-RECOVERY] Auto-rollback successful: disconnected %d block(s); new tip h=%d\n",
+          rolled, final_h))
+      end
+      if details.undo_missing then
+        io.stdout:write(
+          "[CHAINSTATE-RECOVERY] WARNING: rollback was incomplete (undo data unavailable). "
+          .. "If IBD re-wedges, restart with --reindex-chainstate to rebuild from on-disk blocks.\n")
+      end
+      io.stdout:flush()
+    else
+      io.stdout:write(string.format(
+        "Chainstate consistency check passed (tip h=%d).\n", final_h))
+      io.stdout:flush()
+    end
+  end
+
   -- Initialize header chain
   io.stdout:write("Initializing header chain...\n"); io.stdout:flush()
   local header_chain = sync_mod.new_header_chain(network, db)
@@ -751,10 +790,16 @@ local function main()
   local av_in_index, av_is_ancestor, av_on_best_chain =
     consensus_mod.make_assumevalid_callbacks(network, header_chain)
 
-  -- Wire up block connection callback to update UTXO chain state
-  block_downloader.connect_callback = function(block, height, block_hash)
+  -- Wire up block connection callback to update UTXO chain state.
+  -- The fourth parameter (caller_batch_fn) is the BUG-REPORT.md fix #2
+  -- atomic-barrier hook from sync.lua: it adds the block-body write to
+  -- connect_block's atomic batch so chain_tip + UTXO + UNDO + block body
+  -- all commit together. Pre-2026-04-30 the body was put separately by
+  -- sync.lua AFTER the callback, leaving a window where chain_tip could
+  -- advance past a block whose body was missing on disk.
+  block_downloader.connect_callback = function(block, height, block_hash, caller_batch_fn)
     -- During IBD, skip fsync on every block (nosync=true). The sync.lua loop
-    -- issues a sync flush every utxo_flush_interval blocks (default 2000).
+    -- issues a sync flush every utxo_flush_interval blocks (default 200).
     -- This avoids ~5ms of fsync latency per block, giving ~200x speedup for
     -- small early blocks.
 
@@ -770,7 +815,9 @@ local function main()
       best_header_work, best_header_height
     )
 
-    local ok, err = chain_state:connect_block(block, height, block_hash, nil, nil, skip_scripts, nil, true)
+    local ok, err = chain_state:connect_block(
+      block, height, block_hash, nil, nil, skip_scripts, nil, true,
+      caller_batch_fn)
     if not ok then
       -- Raise an error so pcall in connect_pending_blocks catches it.
       -- Returning nil without error would cause connect_pending_blocks to
