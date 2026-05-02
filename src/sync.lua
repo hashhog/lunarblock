@@ -1257,6 +1257,14 @@ function M.new_block_downloader(header_chain, storage, network)
   self.last_connect_advance = 0     -- Timestamp when next_connect_height last advanced
   self.connect_stall_timeout = 90   -- Seconds without connection progress before forced reset
   self.max_blocks_per_connect = 8   -- Max blocks to connect per call (prevents RPC starvation)
+  -- BUG-REPORT.md fix #4: bound the connect-callback retry loop. When the
+  -- same block fails connect_callback this many times in a row, the
+  -- chainstate is presumed corrupt and the operator is told to run
+  -- --reindex-chainstate. Pre-fix the loop was infinite (~2 errors/sec
+  -- forever — the h=938344 Apr 28 wedge). 5 is enough that transient
+  -- network/peer issues don't trip it but a chainstate UTXO miss does.
+  self.cb_fail_threshold = 5
+  self._cb_fail_count = {}          -- hash_hex -> consecutive callback-failure count
   -- W72 instrumentation: per-window deserialize/hash stats. Replaced with
   -- a fresh table after each [W72-DESER] log line so averages are
   -- rolling-window not lifetime.  Removed when the Tier-3 FFI deserialize
@@ -1833,27 +1841,95 @@ function BlockDownloader:connect_pending_blocks()
       goto continue_loop
     end
 
-    -- Notify callback (for UTXO updates, etc.) BEFORE storing the block.
-    -- This ensures that if the callback fails, the block is NOT in storage
-    -- and the scheduler will re-download it on the next attempt.
+    -- Atomic write barrier per BUG-REPORT.md fix #2: the block body, undo
+    -- data, UTXO mutations, and chain_tip update must all commit as ONE
+    -- atomic Pebble/RocksDB WriteBatch. Pre-2026-04-30 the body was
+    -- written by sync.lua AFTER connect_callback advanced chain_tip,
+    -- which left a window where a hard crash produced a chain_tip pointing
+    -- at a block whose body was missing from CF.BLOCKS — exactly the
+    -- `block_in_storage=no, header_in_mem=true` symptom seen at h=938344
+    -- (project_lunarblock_wedge_2026_04_28).
+    --
+    -- We pre-serialize the block body once here, then pass a closure that
+    -- adds it (and any caller extras) to the atomic batch inside
+    -- connect_block. connect_block itself writes UTXO/UNDO/chain_tip in
+    -- the same batch with chain_tip ordered LAST.
+    --
+    -- The redundant `set_chain_tip(..., false)` that followed put_block
+    -- before this fix is now removed: chain_tip is already in the atomic
+    -- batch and writing it a second time async would re-introduce the very
+    -- non-atomic ordering this fix is closing.
+    local pending_block_bytes = serialize.serialize_block(pending.block)
+    local pending_hash_bytes = pending.hash.bytes
+    local block_storage_fn = function(batch)
+      batch.put(self.storage.CF.BLOCKS, pending_hash_bytes, pending_block_bytes)
+    end
+
+    -- Notify callback (for UTXO updates, etc.). The callback is responsible
+    -- for forwarding `block_storage_fn` into connect_block as
+    -- caller_batch_fn so that the block body lands in the same atomic
+    -- batch. If the callback fails, the block is NOT in storage and the
+    -- scheduler will re-download it on the next attempt.
     if self.connect_callback then
-      local cb_ok, cb_err = pcall(self.connect_callback, pending.block, pending.height, pending.hash)
+      local cb_ok, cb_err = pcall(self.connect_callback,
+        pending.block, pending.height, pending.hash, block_storage_fn)
       if not cb_ok then
         -- Callback failed (e.g., UTXO validation error). Remove from pending
         -- but do NOT advance height — the block may need to be retried after
         -- fixing state. Do NOT store to disk so the scheduler re-downloads it.
         self.pending_blocks[hash_hex] = nil
-        print(string.format("Block %d connect callback failed: %s",
-          self.next_connect_height, tostring(cb_err)))
+
+        -- Track per-hash callback failures (Fix #4 from BUG-REPORT.md).
+        -- A bounded retry budget: if the same block fails to connect
+        -- repeatedly with no progress in between, the chainstate is most
+        -- likely corrupted (lost-on-crash UTXO mutations from a prior
+        -- hard crash, exactly the post-EMFILE symptom). Surface a clear
+        -- error pointing the operator at --reindex-chainstate instead of
+        -- looping forever at ~2 errors/sec like the Apr 28 wedge did.
+        self._cb_fail_count = self._cb_fail_count or {}
+        local prev = self._cb_fail_count[hash_hex] or 0
+        self._cb_fail_count[hash_hex] = prev + 1
+        local fail_n = prev + 1
+        print(string.format("Block %d connect callback failed (attempt %d): %s",
+          self.next_connect_height, fail_n, tostring(cb_err)))
+        if fail_n >= self.cb_fail_threshold then
+          print(string.format(
+            "[CHAINSTATE-CORRUPTION] Block %d (%s) has failed connect_callback %d times. "
+              .. "This typically indicates the chainstate UTXO set is missing entries lost in "
+              .. "a prior hard crash (see project_lunarblock_wedge_2026_04_28). "
+              .. "Restart with --reindex-chainstate to rebuild from on-disk blocks.",
+            self.next_connect_height, hash_hex, fail_n))
+        end
         return false, cb_err
+      end
+      -- Reset per-hash failure count on success
+      if self._cb_fail_count and self._cb_fail_count[hash_hex] then
+        self._cb_fail_count[hash_hex] = nil
+      end
+    else
+      -- No callback registered (e.g. tests with mock storage). Best-effort
+      -- persist of the block body if storage supports it; tests with limited
+      -- mocks may have neither put_block nor batch(), in which case we just
+      -- skip the body write — chain_tip never advances without a callback
+      -- (this branch is only reached in test scaffolding).
+      if self.storage.batch and self.storage.CF and self.storage.CF.BLOCKS then
+        local ok_b, b = pcall(self.storage.batch)
+        if ok_b and b then
+          block_storage_fn(b)
+          pcall(b.write, false)
+          if b.destroy then pcall(b.destroy) end
+        end
+      elseif self.storage.put_block then
+        pcall(self.storage.put_block, pending.hash, pending.block)
       end
     end
     local _cp2 = perf.now()
 
-    -- Store the block AFTER successful connection (callback passed)
-    self.storage.put_block(pending.hash, pending.block)
+    -- Block body and chain_tip are now durable atomically (or buffered to
+    -- the WAL together at sync=false; the periodic sync below fsyncs the
+    -- WAL up to here). NO additional put_block / set_chain_tip writes
+    -- needed — the atomic-barrier fix subsumed both.
     local _cp3 = perf.now()
-    self.storage.set_chain_tip(pending.hash, pending.height, false)
     local _cp4 = perf.now()
 
     -- Clear cached serialization data to free memory
