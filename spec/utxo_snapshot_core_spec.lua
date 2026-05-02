@@ -153,6 +153,55 @@ describe("Core-format UTXO snapshot", function()
       local script_pubkey = utxo.decompress_script(r)
       assert.equal("\xa9\x14" .. h160 .. "\x87", script_pubkey)
     end)
+
+    it("decompress_script recovers uncompressed P2PK (tag 0x04, even Y)",
+       function()
+      -- Generator point G:
+      --   compressed   = 02 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+      --   uncompressed = 04 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+      --                     483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8
+      -- Y is even, so the compressed prefix is 0x02 and the on-disk type
+      -- byte is 0x04 (== 0x02 + 0x02).
+      local x = unhex(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+      local enc = "\x04" .. x
+      local r = serialize.buffer_reader(enc)
+      local script_pubkey = utxo.decompress_script(r)
+      local expected_pubkey = "\x04" .. x .. unhex(
+        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+      assert.equal(67, #script_pubkey)
+      assert.equal(string.char(0x41) .. expected_pubkey .. "\xac",
+        script_pubkey)
+    end)
+
+    it("decompress_script recovers uncompressed P2PK (tag 0x05, odd Y)",
+       function()
+      -- 2*G:
+      --   compressed   = 03 c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
+      -- Y is odd, so on-disk type byte is 0x05 (== 0x02 + 0x03).
+      local x = unhex(
+        "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+      local enc = "\x05" .. x
+      local r = serialize.buffer_reader(enc)
+      local script_pubkey = utxo.decompress_script(r)
+      assert.equal(67, #script_pubkey)
+      assert.equal(0x41, script_pubkey:byte(1))
+      assert.equal(0x04, script_pubkey:byte(2))           -- uncompressed prefix
+      assert.equal(x, script_pubkey:sub(3, 34))           -- x-coord matches
+      assert.equal(0xac, script_pubkey:byte(67))          -- OP_CHECKSIG
+      -- Y must be odd to match the input tag.
+      assert.equal(1, script_pubkey:byte(66) % 2)
+    end)
+
+    it("decompress_script falls back to OP_RETURN for invalid x-coord",
+       function()
+      -- All-0xFF x is not on the secp256k1 curve; secp256k1_ec_pubkey_parse
+      -- must reject it.  decompress_script returns the OP_RETURN sentinel
+      -- so the loader can flag the coin as unspendable.
+      local enc = "\x04" .. string.rep("\xff", 32)
+      local r = serialize.buffer_reader(enc)
+      assert.equal("\x6a", utxo.decompress_script(r))
+    end)
   end)
 
   describe("serialize_snapshot_coin (Core Coin::Serialize parity)", function()
