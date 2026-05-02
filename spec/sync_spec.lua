@@ -1139,4 +1139,51 @@ describe("sync", function()
       end)
     end)
   end)
+
+  -- 2026-05-02 diagnostic split: M.classify_callback_error must distinguish
+  -- consensus-rule failures (script/tx-validation; lunarblock bug, NOT
+  -- chainstate corruption) from real on-disk chainstate corruption (block
+  -- body / undo missing). Pre-fix the bounded-retry banner pinned blame on
+  -- chainstate regardless of cause; the May 1 wave of tapscript SCRIPT_SIZE
+  -- (h=944,186) and script-number-too-long (h=944,188) burned hours
+  -- chasing a chainstate ghost that didn't exist.
+  describe("classify_callback_error", function()
+    it("classifies tapscript / script-rule errors as consensus", function()
+      assert.equal("consensus",
+        sync.classify_callback_error("tapscript execution failed: SCRIPT_SIZE"))
+      assert.equal("consensus",
+        sync.classify_callback_error("script number too long"))
+      assert.equal("consensus",
+        sync.classify_callback_error("Script verification failed for input 3"))
+      assert.equal("consensus",
+        sync.classify_callback_error("Invalid signature in tx ab12cd"))
+      -- "Missing UTXO" reclassified as consensus per project_lunarblock
+      -- 944,186 evidence: it surfaces as a secondary effect of a script
+      -- rule failure that left the cache half-applied.
+      assert.equal("consensus",
+        sync.classify_callback_error(
+          "Missing UTXO for input 1 of tx 98a09ed2ba"))
+    end)
+
+    it("classifies block-body / undo-missing errors as chainstate",
+       function()
+      assert.equal("chainstate",
+        sync.classify_callback_error(
+          "connect_pending_blocks: stalled — block_in_storage=no, "
+            .. "header_in_mem=true"))
+      assert.equal("chainstate",
+        sync.classify_callback_error("undo data missing for height 942100"))
+      assert.equal("chainstate",
+        sync.classify_callback_error("failed to find block in chainstate"))
+    end)
+
+    it("returns 'unknown' on unrecognized error strings", function()
+      assert.equal("unknown",
+        sync.classify_callback_error("something exploded for unknown reasons"))
+      assert.equal("unknown", sync.classify_callback_error(""))
+      assert.equal("unknown", sync.classify_callback_error(nil))
+      assert.equal("unknown",
+        sync.classify_callback_error("ETIMEDOUT on rpc socket"))
+    end)
+  end)
 end)

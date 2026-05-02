@@ -8,6 +8,93 @@ local perf = require("lunarblock.perf")
 local M = {}
 
 --------------------------------------------------------------------------------
+-- classify_callback_error: triage connect_callback pcall errors
+--------------------------------------------------------------------------------
+-- Pre-2026-05-02 the bounded-retry banner unconditionally claimed
+-- "[CHAINSTATE-CORRUPTION]" regardless of why the callback failed. That was
+-- correct for the Apr 28 EMFILE-induced wedge (real lost UTXO mutations) but
+-- actively misleading for the May 1 wave of consensus-rule mismatches:
+-- tapscript SCRIPT_SIZE at 944,186 and script-number-too-long at 944,188 both
+-- fired identical CHAINSTATE-CORRUPTION banners and burned hours of operator
+-- time chasing a chainstate ghost when the real fix was a script.lua rule.
+--
+-- This helper classifies the error string from pcall(self.connect_callback)
+-- into one of three buckets so the caller can emit a banner that names the
+-- right failure class:
+--
+--   "consensus" — script/tx-validation rule mismatch with Bitcoin Core.
+--                 Operator action: file a bug, do NOT --reindex.
+--   "chainstate" — block body / undo data missing on disk; the chain_tip
+--                  advanced past data that never persisted. Operator action:
+--                  --reindex-chainstate.
+--   "unknown"   — couldn't classify; emit a neutral banner with the raw
+--                 error string and let the operator triage.
+--
+-- "Missing UTXO" classification: pre-2026-05-02 we'd have called this
+-- chainstate, but the 944,186 wave proved that a script-rule failure mid-
+-- block can leave the in-memory cache half-applied; the next attempt then
+-- reports "Missing UTXO" as a *secondary* effect of the original consensus
+-- failure. Per the prompt's instruction (and today's evidence), classify
+-- "Missing UTXO" as consensus-failure for now. If we ever see a Missing-UTXO
+-- without a preceding script-rule failure in the same block, reclassify.
+function M.classify_callback_error(err)
+  if err == nil then return "unknown" end
+  local s = tostring(err):lower()
+
+  -- Consensus / script / tx-validation rule failures. These are
+  -- deterministic mismatches with Core's rules and indicate a bug in
+  -- script.lua / utxo.lua / validation.lua, not a corrupt chainstate.
+  local consensus_patterns = {
+    "tapscript execution failed",
+    "script number too long",
+    "script_size",
+    "max_ops",
+    "invalid signature",
+    "script verification failed",
+    "p2wpkh script verification failed",
+    "p2wsh script verification failed",
+    "taproot key%-path signature verification failed",
+    "parallel signature verification failed",
+    "merkle root mismatch",
+    "witness commitment mismatch",
+    "duplicate input",
+    "coinbase scriptsig",
+    "exceeds max_money",
+    "negative value",
+    "transaction has no inputs",
+    "transaction has no outputs",
+    "missing utxo",  -- secondary effect of script failure (see comment above)
+    "bip34 requires height",
+    "bad%-txns",
+    "bad%-blk",
+    "non%-final",
+    "bad sigops",
+  }
+  for _, pat in ipairs(consensus_patterns) do
+    if s:find(pat) then return "consensus" end
+  end
+
+  -- Genuine chainstate / on-disk corruption. The persisted chain_tip has
+  -- advanced past blocks whose body or undo data is missing — exactly the
+  -- post-EMFILE Apr 28 wedge symptom. Operator should --reindex-chainstate.
+  local chainstate_patterns = {
+    "block_in_storage=no",
+    "header_in_mem=true",
+    "undo data missing",
+    "missing undo",
+    "failed to find block in chainstate",
+    "chain_tip pointing at",
+    "block body is missing",
+    "lost in.*hard crash",
+  }
+  for _, pat in ipairs(chainstate_patterns) do
+    if s:find(pat) then return "chainstate" end
+  end
+
+  return "unknown"
+end
+
+--------------------------------------------------------------------------------
 -- HeadersSyncState: Anti-DoS header synchronization (PRESYNC/REDOWNLOAD)
 --------------------------------------------------------------------------------
 -- Implements a two-phase header download to prevent memory exhaustion attacks
@@ -1912,15 +1999,64 @@ function BlockDownloader:connect_pending_blocks()
         local prev = self._cb_fail_count[hash_hex] or 0
         self._cb_fail_count[hash_hex] = prev + 1
         local fail_n = prev + 1
-        print(string.format("Block %d connect callback failed (attempt %d): %s",
-          self.next_connect_height, fail_n, tostring(cb_err)))
+
+        -- Try to extract the failing input/tx coordinates from the error
+        -- string for faster forensic triage. Today's errors include enough
+        -- context to grep ("Missing UTXO for input N of tx HASH",
+        -- "Script verification failed for input N", "tapscript execution
+        -- failed: ...") but the surface for tapscript opcode rule failures
+        -- is much terser, so this is best-effort.
+        local err_str = tostring(cb_err)
+        local fail_input_idx = err_str:match("input (%d+)")
+        local fail_txid = err_str:match("tx ([0-9a-fA-F]+)")
+        local coords = ""
+        if fail_input_idx or fail_txid then
+          coords = string.format(" [tx=%s input=%s]",
+            fail_txid or "?", fail_input_idx or "?")
+        end
+
+        print(string.format(
+          "Block %d connect callback failed (attempt %d)%s: %s",
+          self.next_connect_height, fail_n, coords, err_str))
         if fail_n >= self.cb_fail_threshold then
-          print(string.format(
-            "[CHAINSTATE-CORRUPTION] Block %d (%s) has failed connect_callback %d times. "
-              .. "This typically indicates the chainstate UTXO set is missing entries lost in "
-              .. "a prior hard crash (see project_lunarblock_wedge_2026_04_28). "
-              .. "Restart with --reindex-chainstate to rebuild from on-disk blocks.",
-            self.next_connect_height, hash_hex, fail_n))
+          -- BUG-REPORT.md fix #4 + 2026-05-02 diagnostic split: classify
+          -- the error so the bounded-retry banner names the right failure
+          -- class. The original banner pinned blame on chainstate
+          -- regardless of cause and burned hours of operator time on
+          -- script-rule mismatches (944,186 SCRIPT_SIZE, 944,188
+          -- script-number-too-long).
+          local class = M.classify_callback_error(cb_err)
+          if class == "consensus" then
+            print(string.format(
+              "[CONSENSUS-FAILURE] Block %d (%s) failed connect_callback %d times%s "
+                .. "with a script/tx-validation error: %s. "
+                .. "This is a consensus rule mismatch with Bitcoin Core, NOT chainstate "
+                .. "corruption — file a bug report against lunarblock. Do NOT "
+                .. "--reindex-chainstate (it will not fix a rule mismatch).",
+              self.next_connect_height, hash_hex, fail_n, coords, err_str))
+          elseif class == "chainstate" then
+            print(string.format(
+              "[CHAINSTATE-CORRUPTION] Block %d (%s) failed connect_callback %d times%s "
+                .. "with a chainstate-integrity error: %s. "
+                .. "This typically indicates the chainstate UTXO set / undo data is missing "
+                .. "entries lost in a prior hard crash (see "
+                .. "project_lunarblock_wedge_2026_04_28). Restart with --reindex-chainstate "
+                .. "to rebuild from on-disk blocks.",
+              self.next_connect_height, hash_hex, fail_n, coords, err_str))
+          else
+            -- Unclassified: print neutral banner with raw error so the
+            -- operator can triage manually. Avoid the misleading
+            -- "[CHAINSTATE-CORRUPTION]" label here.
+            print(string.format(
+              "[CONNECT-FAILURE] Block %d (%s) failed connect_callback %d times%s "
+                .. "with an unclassified error: %s. "
+                .. "Triage: if the message looks like a script/tx-validation rule, "
+                .. "treat as a consensus-rule bug (file against lunarblock); if it "
+                .. "looks like missing on-disk data, treat as chainstate corruption "
+                .. "(--reindex-chainstate). Add the pattern to "
+                .. "sync.lua classify_callback_error so future occurrences classify cleanly.",
+              self.next_connect_height, hash_hex, fail_n, coords, err_str))
+          end
         end
         return false, cb_err
       end
