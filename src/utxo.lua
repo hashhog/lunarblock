@@ -540,12 +540,12 @@ end
 
 --- Decompress a scriptPubKey using ScriptCompression.
 -- Reads from the buffer_reader and returns the reconstructed scriptPubKey.
--- For type 0x04/0x05 (uncompressed P2PK) we do NOT attempt to decompress
--- the secp256k1 point — instead we return a marker scriptPubKey of
--- OP_RETURN to keep the loader resilient.  Production code must wire
--- libsecp256k1 here; production load on lunarblock today only happens
--- against snapshots that lunarblock itself wrote, so type 4/5 should
--- not appear yet.  TODO: real EC decompression for cross-impl loads.
+-- For type 0x04/0x05 (uncompressed P2PK) we recover the full y-coordinate
+-- via libsecp256k1 (compressor.cpp:DecompressScript): build a 33-byte
+-- compressed pubkey `(0x02 | (tag & 1)) + x[32]`, parse, and re-serialize
+-- as 65-byte uncompressed.  The reconstructed script is the 67-byte form
+-- `0x41 + pubkey[65] + 0xAC`.  This matches Core 840k+ snapshots which
+-- contain Satoshi-era P2PK coinbases using these tags.
 -- @param r buffer_reader
 -- @return string script_pubkey
 function M.decompress_script(r)
@@ -560,9 +560,21 @@ function M.decompress_script(r)
     local x = r.read_bytes(32)
     return "\x21" .. string.char(nSize) .. x .. "\xac"  -- compressed P2PK
   elseif nSize == 0x04 or nSize == 0x05 then
-    -- Uncompressed P2PK; needs secp256k1 to recover y.  See note above.
-    r.read_bytes(32)
-    return "\x6a"  -- OP_RETURN placeholder; flagged unspendable
+    -- Uncompressed P2PK: build SEC1 compressed input from (tag, x), then
+    -- call libsecp256k1 to recover the 65-byte uncompressed pubkey.
+    -- Per compressor.cpp:DecompressScript, the compressed prefix is
+    --   0x02 | (nSize - 0x02)  == 0x02 for tag 0x04, 0x03 for tag 0x05.
+    local x = r.read_bytes(32)
+    local compressed = string.char(0x02 + (nSize - 0x04)) .. x
+    local uncompressed, err = crypto.decompress_pubkey(compressed)
+    if not uncompressed then
+      -- Mirror Core: an invalid x-coordinate makes the coin unspendable.
+      -- Core leaves the destination empty in that case (see ExtractDestination
+      -- on a malformed script); we use OP_RETURN as a flagged-unspendable
+      -- placeholder so downstream code can detect and skip it.
+      return "\x6a"
+    end
+    return "\x41" .. uncompressed .. "\xac"  -- 67-byte uncompressed P2PK
   else
     local size = nSize - M.N_SPECIAL_SCRIPTS
     if size > M.MAX_SCRIPT_SIZE then
