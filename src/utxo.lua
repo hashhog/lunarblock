@@ -1114,6 +1114,34 @@ function CoinView:clear_cache()
   self.cached_memory_usage = 0
 end
 
+--- Discard all dirty (uncommitted) cache mutations.
+-- Used by connect_block on validation failure: if we're partway through a
+-- block and `assert(...)` fires (e.g. tapscript SCRIPT_SIZE), the in-memory
+-- cache has already been mutated by `:spend(...)` and `:add(...)` calls for
+-- earlier transactions in the block. The flush at the end of connect_block
+-- never ran, so on-disk state is still consistent — but the cache contains
+-- spent entries and fresh adds that don't exist on disk. A retry of the same
+-- block (or a sibling block) would then see "Missing UTXO" because spent
+-- entries return nil from :get(). This method drops every dirty entry
+-- (spent or fresh-added) so the cache mirrors disk again. Clean entries
+-- are kept (they are read-only caches, not mutations).
+--
+-- Closes the secondary symptom of the 944,186 wedge: tapscript SCRIPT_SIZE
+-- failed mid-block, then retries reported "Missing UTXO for input 1 of tx
+-- 98a09ed2..." because that tx's input had been pre-spent in the cache by
+-- the failed first attempt.
+function CoinView:discard_dirty()
+  for key, _ in pairs(self.dirty_list) do
+    local entry = self.cache[key]
+    if entry then
+      self.cached_memory_usage = self.cached_memory_usage - estimate_entry_memory(entry)
+      self.cache[key] = nil
+    end
+  end
+  self.dirty_list = {}
+  self.dirty_count = 0
+end
+
 --- Remove an entry from cache if it's not dirty.
 -- Used to free memory for entries we don't need anymore.
 -- @param txid hash256: transaction ID

@@ -234,6 +234,90 @@ describe("utxo", function()
       assert.equal(2000, view:get(txid1, 1).value)
       assert.equal(3000, view:get(txid2, 0).value)
     end)
+
+    -- Regression test for the secondary symptom of the 944,186 wedge:
+    -- if connect_block fails mid-block (e.g. tapscript SCRIPT_SIZE in a
+    -- later tx), the in-memory cache holds spent entries / fresh adds
+    -- from earlier txns that were never flushed. discard_dirty() drops
+    -- them so retries see disk-resident state. See
+    -- project_lunarblock_wedge_2026_04_28.
+    describe("discard_dirty (connect_block partial-failure recovery)", function()
+      it("reverts spent UTXO so re-get sees the disk entry again", function()
+        local view = utxo.new_coin_view(db)
+        local txid = types.hash256(string.rep("\x42", 32))
+        local entry = utxo.utxo_entry(50000, "\x00\x14" .. string.rep("\x33", 20), 100, false)
+
+        -- Persist the entry to disk first.
+        view:add(txid, 0, entry)
+        view:flush()
+        view:clear_cache()
+
+        -- Sanity: get from disk.
+        assert.is_not_nil(view:get(txid, 0))
+
+        -- Spend without flushing: cache marks it spent. get() returns nil.
+        view:spend(txid, 0)
+        assert.is_nil(view:get(txid, 0))
+        assert.is_true(view:get_dirty_count() > 0)
+
+        -- Discard dirty mutations: the cache entry is dropped, so the
+        -- next get() falls back to disk and finds the original entry.
+        view:discard_dirty()
+        assert.equal(0, view:get_dirty_count())
+        local recovered = view:get(txid, 0)
+        assert.is_not_nil(recovered)
+        assert.equal(entry.value, recovered.value)
+        assert.equal(entry.script_pubkey, recovered.script_pubkey)
+      end)
+
+      it("reverts fresh adds so re-get returns nil (UTXO never created)", function()
+        local view = utxo.new_coin_view(db)
+        local txid = types.hash256(string.rep("\x77", 32))
+        local entry = utxo.utxo_entry(99999, "\xa9\x14" .. string.rep("\x55", 20) .. "\x87", 200, false)
+
+        -- Add a fresh entry (not yet on disk).
+        view:add(txid, 0, entry)
+        assert.is_not_nil(view:get(txid, 0))
+        assert.is_true(view:get_dirty_count() > 0)
+
+        -- Discard: the fresh add is dropped, so get() returns nil
+        -- (the UTXO never reached disk).
+        view:discard_dirty()
+        assert.equal(0, view:get_dirty_count())
+        assert.is_nil(view:get(txid, 0))
+      end)
+
+      it("simulates partial-block failure: spent input + new output", function()
+        -- Mimic the 944,186 scenario: a block contains tx_A that spends
+        -- UTXO_X and creates UTXO_Y, then tx_B fires SCRIPT_SIZE. After
+        -- discard_dirty, UTXO_X must reappear (re-spendable by retry) and
+        -- UTXO_Y must NOT exist (it was never confirmed).
+        local view = utxo.new_coin_view(db)
+        local x_id = types.hash256(string.rep("\xab", 32))
+        local x_ent = utxo.utxo_entry(60000, "\x00\x14" .. string.rep("\xcd", 20), 50, false)
+        view:add(x_id, 0, x_ent)
+        view:flush()
+        view:clear_cache()
+
+        -- Simulate connect_block partial work: tx_A spends X, creates Y.
+        view:spend(x_id, 0)
+        local y_id = types.hash256(string.rep("\xef", 32))
+        local y_ent = utxo.utxo_entry(50000, "\x00\x14" .. string.rep("\x12", 20), 51, false)
+        view:add(y_id, 0, y_ent)
+
+        -- Pre-discard view: X spent, Y exists.
+        assert.is_nil(view:get(x_id, 0))
+        assert.is_not_nil(view:get(y_id, 0))
+
+        -- Now tx_B "fails" — discard the partial mutations.
+        view:discard_dirty()
+
+        -- Post-discard view: X re-visible from disk, Y gone.
+        assert.is_not_nil(view:get(x_id, 0))
+        assert.equal(60000, view:get(x_id, 0).value)
+        assert.is_nil(view:get(y_id, 0))
+      end)
+    end)
   end)
 
   describe("CoinView flush strategy", function()

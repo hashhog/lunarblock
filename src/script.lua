@@ -656,8 +656,14 @@ function M.execute_script(script_bytes, stack, flags, checker)
   flags = flags or {}
   checker = checker or {}
 
-  -- Script size limit (10,000 bytes)
-  if #script_bytes > MAX_SCRIPT_SIZE then
+  -- Script size limit (10,000 bytes).
+  -- BIP342: tapscripts are exempt from MAX_SCRIPT_SIZE — Core's
+  -- interpreter.cpp only enforces this for SigVersion::BASE and
+  -- SigVersion::WITNESS_V0, NOT for SigVersion::TAPSCRIPT. Mainnet has
+  -- many >10 KB tapscripts (ordinals, inscriptions); enforcing the
+  -- legacy cap on tapscript causes a deterministic SCRIPT_SIZE wedge
+  -- (e.g. block 944,186 tx c6ff4027... vin[0] = 64,349-byte tapscript).
+  if not flags.is_tapscript and #script_bytes > MAX_SCRIPT_SIZE then
     return nil, "SCRIPT_SIZE"
   end
 
@@ -727,8 +733,12 @@ function M.execute_script(script_bytes, stack, flags, checker)
     local opcode = op.opcode
     local data = op.data
 
-    -- Count non-push opcodes
-    if is_counted_opcode(opcode) then
+    -- Count non-push opcodes.
+    -- BIP342: tapscript is exempt from MAX_OPS_PER_SCRIPT (Core's
+    -- interpreter.cpp:450-455 only counts ops for BASE / WITNESS_V0).
+    -- Same root cause as the SCRIPT_SIZE exemption above: large
+    -- ordinals/inscription tapscripts blow past MAX_OPS legitimately.
+    if not flags.is_tapscript and is_counted_opcode(opcode) then
       op_count = op_count + 1
       assert(op_count <= MAX_OPS, "too many opcodes")
     end
