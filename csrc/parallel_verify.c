@@ -54,6 +54,18 @@ int secp256k1_ecdsa_signature_parse_der(
     size_t inputlen
 );
 
+int secp256k1_ecdsa_signature_parse_compact(
+    const secp256k1_context* ctx,
+    secp256k1_ecdsa_signature* sig,
+    const unsigned char* input64
+);
+
+int secp256k1_ecdsa_signature_normalize(
+    const secp256k1_context* ctx,
+    secp256k1_ecdsa_signature* sigout,
+    const secp256k1_ecdsa_signature* sigin
+);
+
 int secp256k1_ecdsa_verify(
     const secp256k1_context* ctx,
     const secp256k1_ecdsa_signature* sig,
@@ -127,13 +139,117 @@ static int shutdown_flag = 0;
 #define MIN_PARALLEL_INPUTS 16
 
 /*
- * Parse a DER-encoded signature into secp256k1_ecdsa_signature.
- * Returns 1 on success, 0 on failure.
+ * Lax DER parser for ECDSA signatures.
+ *
+ * Mirrors Bitcoin Core's ecdsa_signature_parse_der_lax (pubkey.cpp) and the
+ * Lua-side lax_der_parse (src/crypto.lua). Required because libsecp256k1's
+ * strict secp256k1_ecdsa_signature_parse_der can SILENTLY ZERO OUT R/S for
+ * non-canonical DER inputs that Bitcoin Core nonetheless accepts at the
+ * BIP66 boundary — verification then fails for a perfectly valid mainnet
+ * block. Ported here so the parallel pool's verify path matches the
+ * single-thread crypto.ecdsa_verify_lax path bit-for-bit.
+ *
+ * Strategy: walk the DER envelope tolerantly, extract R and S as 32-byte
+ * big-endian integers (left-truncate or zero-pad to fit), then build a
+ * 64-byte compact signature and feed it to secp256k1_ecdsa_signature_parse_compact.
+ *
+ * Returns 1 on success (sig populated), 0 on failure.
  */
-static int parse_der_signature(secp256k1_context *ctx,
-                               secp256k1_ecdsa_signature *sig,
-                               const uint8_t *der, size_t derlen) {
-    return secp256k1_ecdsa_signature_parse_der(ctx, sig, der, derlen);
+static int parse_der_signature_lax(secp256k1_context *ctx,
+                                   secp256k1_ecdsa_signature *sig,
+                                   const uint8_t *der, size_t derlen) {
+    size_t pos = 0;
+    size_t lenbyte;
+    size_t rpos, rlen;
+    size_t spos, slen;
+    uint8_t compact[64];
+
+    /* Sequence tag */
+    if (pos >= derlen || der[pos] != 0x30) return 0;
+    pos++;
+
+    /* Sequence length (skip; we don't strictly validate the envelope) */
+    if (pos >= derlen) return 0;
+    lenbyte = der[pos++];
+    if (lenbyte & 0x80) {
+        size_t n_lenbytes = lenbyte - 0x80;
+        if (n_lenbytes > derlen - pos) return 0;
+        pos += n_lenbytes;
+    }
+
+    /* R integer tag */
+    if (pos >= derlen || der[pos] != 0x02) return 0;
+    pos++;
+
+    /* R length */
+    if (pos >= derlen) return 0;
+    lenbyte = der[pos++];
+    if (lenbyte & 0x80) {
+        size_t n_lenbytes = lenbyte - 0x80;
+        if (n_lenbytes > derlen - pos) return 0;
+        rlen = 0;
+        for (size_t k = 0; k < n_lenbytes; k++) {
+            rlen = (rlen << 8) | der[pos++];
+        }
+    } else {
+        rlen = lenbyte;
+    }
+    if (rlen > derlen - pos) return 0;
+    rpos = pos;
+    pos += rlen;
+
+    /* S integer tag */
+    if (pos >= derlen || der[pos] != 0x02) return 0;
+    pos++;
+
+    /* S length */
+    if (pos >= derlen) return 0;
+    lenbyte = der[pos++];
+    if (lenbyte & 0x80) {
+        size_t n_lenbytes = lenbyte - 0x80;
+        if (n_lenbytes > derlen - pos) return 0;
+        slen = 0;
+        for (size_t k = 0; k < n_lenbytes; k++) {
+            slen = (slen << 8) | der[pos++];
+        }
+    } else {
+        slen = lenbyte;
+    }
+    if (slen > derlen - pos) return 0;
+    spos = pos;
+
+    /* Strip leading zeros and left-pad/truncate R and S to 32 bytes each.
+     * Same logic as crypto.lua to_32_bytes: drop leading 0x00 bytes, then
+     * zero-pad on the left to reach exactly 32 bytes. Sigs whose R or S
+     * exceed 32 bytes after stripping are rejected (curve order is < 2^256). */
+    memset(compact, 0, 64);
+
+    {
+        size_t r_off = 0;
+        while (r_off < rlen && der[rpos + r_off] == 0) r_off++;
+        size_t r_eff = rlen - r_off;
+        if (r_eff > 32) return 0;
+        memcpy(compact + (32 - r_eff), der + rpos + r_off, r_eff);
+    }
+
+    {
+        size_t s_off = 0;
+        while (s_off < slen && der[spos + s_off] == 0) s_off++;
+        size_t s_eff = slen - s_off;
+        if (s_eff > 32) return 0;
+        memcpy(compact + 32 + (32 - s_eff), der + spos + s_off, s_eff);
+    }
+
+    if (secp256k1_ecdsa_signature_parse_compact(ctx, sig, compact) != 1) {
+        return 0;
+    }
+    /* Normalize S to low-S form. secp256k1_ecdsa_verify rejects high-S since
+     * libsecp256k1 ~0.3, but Bitcoin Core consensus rules accepted high-S
+     * pre-LOW_S (BIP146). Lua's ecdsa_verify_lax always normalizes; matching
+     * here keeps the deferred-collect path consistent with the immediate
+     * path that wraps the same crypto.ecdsa_verify_lax call. */
+    secp256k1_ecdsa_signature_normalize(ctx, sig, sig);
+    return 1;
 }
 
 /*
@@ -153,6 +269,15 @@ static int parse_pubkey(secp256k1_context *ctx,
  * In production, the Lua side computes the sighash (which requires full
  * tx context) and passes the 32-byte hash for verification. This C code
  * focuses on the parallelization infrastructure.
+ *
+ * NOTE: parses with the LAX DER parser + S normalization to match
+ * crypto.ecdsa_verify_lax. Strict secp256k1_ecdsa_signature_parse_der is
+ * unsafe here because make_collecting_sig_checker collects sigs from BOTH
+ * pre-BIP66 and post-BIP66 inputs into a single batch; the strict parser
+ * silently zeroes R/S on edge-case DER that the BIP66 strict-encoding
+ * check would have caught upstream but that the secp256k1 parser still
+ * accepts as a DER envelope. Bitcoin Core itself uses ecdsa_signature_parse_der_lax
+ * (pubkey.cpp) for the same reason.
  */
 static int verify_ecdsa(secp256k1_context *ctx,
                         const uint8_t *pubkey_bytes, size_t pubkey_len,
@@ -165,7 +290,7 @@ static int verify_ecdsa(secp256k1_context *ctx,
         return 0;
     }
 
-    if (!parse_der_signature(ctx, &sig, sig_der, sig_len)) {
+    if (!parse_der_signature_lax(ctx, &sig, sig_der, sig_len)) {
         return 0;
     }
 
