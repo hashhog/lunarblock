@@ -454,7 +454,14 @@ local function run_import_utxo(args)
     os.exit(1)
   end
 
-  local db = storage_mod.open(datadir)
+  -- import-blocks (line 292) opens the same RocksDB at `datadir/chainstate`,
+  -- and so does the daemon path (line 656). Without the `/chainstate` here,
+  -- import-utxo wrote into a sibling DB at `datadir/` whose chain_tip was
+  -- invisible to a subsequent daemon start and the snapshot UTXOs were
+  -- effectively orphaned. Recovered manually 2026-05-01 by `mv`-ing the
+  -- RocksDB files into `chainstate/`; this prevents the same trap on the
+  -- next operator-driven snapshot import.
+  local db = storage_mod.open(datadir .. "/chainstate")
   local cs = utxo_mod.new_chain_state(db, network)
   cs:init()
 
