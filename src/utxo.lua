@@ -1770,11 +1770,29 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
   -- Determine if we should use parallel verification
   -- Auto-detect: use parallel if available and block has enough inputs
+  --
+  -- 2026-05-02: Disabled by default. The deferred-collect path is broken
+  -- for OP_CHECKMULTISIG: make_collecting_sig_checker.check_sig returns
+  -- true unconditionally so script.lua's OP_CHECKMULTISIG advances
+  -- isig/ikey on what would be a FAILING (sig, pubkey) pair under
+  -- immediate-verify semantics, then the batch ECDSA pass at the end
+  -- rejects those mismatched pairs. Symptom on mainnet block 944,184
+  -- (post-snapshot, post-assumevalid): "Parallel signature verification
+  -- failed: signature verification failed at index 19".
+  --
+  -- Until a CHECKMULTISIG-aware deferred path lands, force use_parallel_verify=false
+  -- so blocks go through make_sig_checker (immediate verify in Lua).
+  -- The C parallel_verify pool remains correct in isolation (the pool
+  -- drains, lax DER + S normalize match Core) — only the Lua-side
+  -- collector wrapping it is wrong. When fixed, flip the gate via the
+  -- LUNARBLOCK_PARALLEL_VERIFY env var without re-touching the gating
+  -- logic.
   local parallel_available = validation.parallel_verify_available()
+  local parallel_force_on = os.getenv("LUNARBLOCK_PARALLEL_VERIFY") == "1"
   local use_parallel_verify = false
   if use_parallel == nil then
-    -- Auto: use parallel if available and block has many inputs
-    if parallel_available and not skip_script_validation then
+    -- Auto: opt-in only. CHECKMULTISIG correctness gap blocks default-on.
+    if parallel_force_on and parallel_available and not skip_script_validation then
       local total_inputs = 0
       for i = 2, #block.transactions do  -- Skip coinbase
         total_inputs = total_inputs + #block.transactions[i].inputs
