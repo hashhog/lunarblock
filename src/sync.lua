@@ -1871,8 +1871,30 @@ function BlockDownloader:connect_pending_blocks()
     -- batch. If the callback fails, the block is NOT in storage and the
     -- scheduler will re-download it on the next attempt.
     if self.connect_callback then
+      -- Watchdog visibility: time the connect_callback. We can't preempt
+      -- pcall() in LuaJIT (no async signals), so a *true* timeout is
+      -- impossible without coroutines + every callback explicitly yielding.
+      -- The realistic best-effort is a post-hoc warning: if the call took
+      -- longer than CB_SLOW_THRESHOLD, surface a [CONNECT-CALLBACK-SLOW]
+      -- banner so an operator can correlate stalls with parallel-verify or
+      -- I/O regressions instead of staring at a silent log. Pre-2026-05-02
+      -- a parallel_verify deadlock (h=944,184) hung pcall forever with no
+      -- log — bounded retry never kicked in. Even a coarse post-hoc warning
+      -- is enough to surface a similar regression next time.
+      local _sock_w = require("socket")
+      local cb_t0 = _sock_w.gettime()
       local cb_ok, cb_err = pcall(self.connect_callback,
         pending.block, pending.height, pending.hash, block_storage_fn)
+      local cb_elapsed = _sock_w.gettime() - cb_t0
+      local CB_SLOW_THRESHOLD = 10.0  -- seconds
+      if cb_elapsed >= CB_SLOW_THRESHOLD then
+        print(string.format(
+          "[CONNECT-CALLBACK-SLOW] Block %d (%s) connect_callback took %.1fs "
+            .. "(threshold %.1fs). If this is recurring, parallel_verify or "
+            .. "RocksDB is likely the bottleneck — check pv_get_num_workers "
+            .. "and chainstate I/O.",
+          self.next_connect_height, hash_hex, cb_elapsed, CB_SLOW_THRESHOLD))
+      end
       if not cb_ok then
         -- Callback failed (e.g., UTXO validation error). Remove from pending
         -- but do NOT advance height — the block may need to be retried after
