@@ -824,6 +824,12 @@ describe("script", function()
   end)
 
   describe("OP_CHECKSIGADD", function()
+    -- BIP342 / Core interpreter.cpp:1089 stack layout (bottom -> top):
+    --   sig, num, pubkey
+    -- Pop order from top: pubkey, num, sig.
+    -- Pre-fix lunarblock popped pubkey, sig, num — wrong by stack-design,
+    -- but masked here because the original tests pushed in the buggy order.
+    -- Tests below now reflect the BIP342 layout.
     it("increments counter when signature is valid", function()
       local pk = string.rep("\x01", 32)
       local sig = "validsig"
@@ -834,12 +840,12 @@ describe("script", function()
         end
       }
 
-      -- Stack: 0, sig, pk (bottom to top)
-      -- OP_CHECKSIGADD should push 1
+      -- BIP342 stack: sig, num, pk (bottom to top); OP_CHECKSIGADD pushes
+      -- num+1=1 because the sig is valid.
       local s = script.build_script({
-        {opcode = script.OP.OP_0, data = nil},  -- push 0
-        {opcode = #sig, data = sig},
-        {opcode = #pk, data = pk},
+        {opcode = #sig, data = sig},            -- sig (bottom)
+        {opcode = script.OP.OP_0, data = nil},  -- num = 0
+        {opcode = #pk, data = pk},              -- pubkey (top)
         {opcode = script.OP.OP_CHECKSIGADD, data = nil},
       })
 
@@ -857,11 +863,11 @@ describe("script", function()
         end
       }
 
-      -- Stack: 5, empty sig, pk
+      -- BIP342 stack: empty sig, num=5, pk
       local s = script.build_script({
-        {opcode = script.OP.OP_5, data = nil},
-        {opcode = script.OP.OP_0, data = nil},  -- empty sig
-        {opcode = #pk, data = pk},
+        {opcode = script.OP.OP_0, data = nil},  -- empty sig (bottom)
+        {opcode = script.OP.OP_5, data = nil},  -- num = 5
+        {opcode = #pk, data = pk},              -- pubkey (top)
         {opcode = script.OP.OP_CHECKSIGADD, data = nil},
       })
 
@@ -2163,55 +2169,77 @@ describe("script", function()
     end)
   end)
 
-  -- Regression test for the 944,188 wedge: BIP342 tapscripts permit 5-byte
-  -- CScriptNum operands for stack-numeric ops (e.g. OP_1ADD/OP_ADD/OP_PICK),
-  -- not just the 4-byte legacy cap. Pre-fix, pop_num() always used max_len=4
-  -- and asserted "script number too long" when a tapscript op consumed a
-  -- legitimate 5-byte intermediate. Core's interpreter.cpp uses
-  -- `nMaxNumSize = 5` for SigVersion::TAPSCRIPT.
+  -- Regression test for the 944,188 wedge: OP_CHECKSIGADD pop order.
+  --
+  -- Per BIP342 / Core interpreter.cpp:1089 the stack layout for
+  -- OP_CHECKSIGADD is `(sig num pubkey -- num)` with pubkey on top.
+  -- The correct pop order from top is: pubkey, num, sig.
+  --
+  -- Pre-fix lunarblock popped pubkey, sig, n — i.e. the second and third
+  -- pops were swapped, handing the 64-byte Schnorr sig to pop_num() and
+  -- wedging mainnet block 944,188 with "script number too long".
   -- See project_lunarblock_wedge_2026_04_28.
-  describe("BIP342 tapscript 5-byte CScriptNum support", function()
-    -- A 5-byte positive CScriptNum: 2^31 = 0x80000000.
-    -- Bitcoin Script encoding: 4 little-endian bytes 0x00 0x00 0x00 0x80
-    -- triggers a sign-byte (high bit set, but value is positive), giving
-    -- the 5-byte encoding 0x00 0x00 0x00 0x80 0x00.
-    local FIVE_BYTE_PUSH = "\x05\x00\x00\x00\x80\x00"  -- OP_PUSHBYTES_5 + 5 bytes
-    local OP_1ADD = "\x8b"
+  describe("BIP342 OP_CHECKSIGADD pop order (944,188 wedge)", function()
+    local OP_CHECKSIGADD = "\xba"
+    -- 64-byte all-zero Schnorr sig (treated as "empty sig pass-through" by
+    -- the no-op checker; checker stub below returns false unconditionally).
+    local SIG64 = string.rep("\x00", 64)
+    -- 32-byte all-zero x-only pubkey
+    local PK32 = string.rep("\x00", 32)
 
-    it("rejects 5-byte CScriptNum in legacy execution", function()
-      -- Push 0x80000000 (5 bytes), then OP_1ADD which pops_num with
-      -- legacy 4-byte cap and must trip "script number too long".
-      local script_bytes = FIVE_BYTE_PUSH .. OP_1ADD
-      local ok = pcall(function()
-        script.execute_script(script_bytes, {}, {}, {})
-      end)
-      assert.is_false(ok)
-    end)
-
-    it("accepts 5-byte CScriptNum in tapscript execution", function()
-      -- Same script with is_tapscript=true: pop_num() defaults to 5 bytes,
-      -- so OP_1ADD reads 0x80000000 (= 2^31), increments to 2^31+1, and
-      -- pushes the result back. Must NOT raise "script number too long".
-      local script_bytes = FIVE_BYTE_PUSH .. OP_1ADD
+    it("pops pubkey, num, sig in that order (no-op checker)", function()
+      -- Build script: <push64 sig> <push 0> <push32 pubkey> OP_CHECKSIGADD
+      -- With a checker that always returns false AND empty-sig short
+      -- circuit: real sig is non-empty so this would error. Use empty sig.
+      -- Final stack layout (bottom->top): "" (empty sig), 0 (num), pk32 (pubkey).
+      local empty_sig = ""
+      local script_bytes =
+        "\x00" ..                    -- OP_0 (empty sig)
+        "\x00" ..                    -- OP_0 (num=0)
+        "\x20" .. PK32 ..            -- pubkey push (32B)
+        OP_CHECKSIGADD
+      -- Checker stub: returns false (no signature verification).
+      local checker = {check_sig = function() return false end}
       local stack, err = script.execute_script(
-        script_bytes, {}, {is_tapscript = true}, {})
+        script_bytes, {}, {is_tapscript = true}, checker)
+      -- Empty sig + invalid sig path: push n unchanged (still 0).
       assert.is_table(stack)
       assert.is_nil(err)
-      -- Result on stack should be 2^31 + 1 = 2147483649, encoded as 5 bytes.
-      assert.equals(2147483649, script.script_num_decode(stack[1], 5))
+      assert.equals(0, script.script_num_decode(stack[1]))
     end)
 
-    it("4-byte CScriptNum still works in tapscript", function()
-      -- Sanity: tapscript must accept normal 4-byte operands too.
-      -- Push 0x7fffffff (4 bytes, max positive without sign byte), OP_1ADD.
-      local four_byte_push = "\x04\xff\xff\xff\x7f"
-      local script_bytes = four_byte_push .. OP_1ADD
+    it("64-byte sig with num=0, valid sig, increments num", function()
+      -- Real-world shape: 64-byte sig, num=0, 32-byte pubkey.
+      -- Pre-fix lunarblock would treat the 64B sig as `n` and assert
+      -- "script number too long". Post-fix the pop order is correct
+      -- and the script runs to completion.
+      local script_bytes =
+        "\x40" .. SIG64 ..           -- 64B sig push
+        "\x00" ..                    -- OP_0 (num=0)
+        "\x20" .. PK32 ..            -- 32B pubkey push
+        OP_CHECKSIGADD
+      local checker = {check_sig = function() return true end}
       local stack, err = script.execute_script(
-        script_bytes, {}, {is_tapscript = true}, {})
+        script_bytes, {}, {is_tapscript = true}, checker)
+      -- Valid path: num+1 = 1 pushed.
       assert.is_table(stack)
       assert.is_nil(err)
-      -- 0x7fffffff + 1 = 0x80000000 = 2147483648.
-      assert.equals(2147483648, script.script_num_decode(stack[1], 5))
+      assert.equals(1, script.script_num_decode(stack[1]))
+    end)
+
+    it("64-byte sig with num=2 increments to 3 on valid sig", function()
+      -- Verifies pop_num reads num correctly (not the sig).
+      local script_bytes =
+        "\x40" .. SIG64 ..           -- 64B sig
+        "\x52" ..                    -- OP_2 (num=2)
+        "\x20" .. PK32 ..            -- pubkey
+        OP_CHECKSIGADD
+      local checker = {check_sig = function() return true end}
+      local stack, err = script.execute_script(
+        script_bytes, {}, {is_tapscript = true}, checker)
+      assert.is_table(stack)
+      assert.is_nil(err)
+      assert.equals(3, script.script_num_decode(stack[1]))
     end)
   end)
 end)
