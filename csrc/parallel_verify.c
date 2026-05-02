@@ -3,6 +3,21 @@
  *
  * Uses a pthread worker pool to verify multiple transaction inputs in parallel.
  * Each worker has its own secp256k1 context for thread-safe verification.
+ *
+ * Workers consume from a single unified queue. Jobs are tagged with a type
+ * discriminator (PV_JOB_INPUT or PV_JOB_SIG) so the same worker pool can
+ * service both pv_verify_batch (legacy input-verify framework) and
+ * pv_verify_signatures (the production hot path that posts pre-computed
+ * sighashes).
+ *
+ * Pre-2026-05-02 the pool was split into two queues: a `next_job` /
+ * `job_count` queue that workers polled, and a separate `sig_next_job` /
+ * `sig_job_count` queue that pv_verify_signatures populated. The latter was
+ * never drained because `sig_worker_func` was never bound to pthread_create —
+ * pv_verify_signatures broadcast on `work_available`, workers woke, saw the
+ * INPUT queue empty, and went back to sleep. The main thread then waited
+ * forever on `work_done`. Lunarblock hung at h=944,184 the first time the
+ * sig path was exercised in production. Closure: unify the queue.
  */
 
 #include <stdint.h>
@@ -46,7 +61,7 @@ int secp256k1_ecdsa_verify(
     const secp256k1_pubkey* pubkey
 );
 
-/* Job structure passed to workers */
+/* Job structure passed to workers (input-verification framework) */
 typedef struct {
     const uint8_t *tx_data;       /* Serialized transaction */
     size_t tx_len;                /* Transaction length */
@@ -58,6 +73,18 @@ typedef struct {
     int result;                   /* 1 = valid, 0 = invalid, -1 = error */
 } verify_job;
 
+/* Pre-computed sighash signature-verification job. Lua computes the sighash
+ * (which requires full tx parsing and script handling) and posts these for
+ * parallel ECDSA verification. */
+typedef struct {
+    const uint8_t *pubkey;        /* Public key bytes (33 or 65) */
+    size_t pubkey_len;            /* Public key length */
+    const uint8_t *sig_der;       /* DER-encoded signature */
+    size_t sig_len;               /* Signature length */
+    const uint8_t *msghash32;     /* 32-byte message hash (sighash) */
+    int result;                   /* 1 = valid, 0 = invalid */
+} sig_verify_job;
+
 /* Worker thread state */
 typedef struct {
     pthread_t thread;
@@ -66,13 +93,26 @@ typedef struct {
     int running;
 } worker_t;
 
+/* Unified job-queue entry.
+ *
+ * The pool is single-batch at a time: pv_verify_batch and
+ * pv_verify_signatures both grab queue_mutex, populate the queue, and wait
+ * for completion before another batch can start. The discriminator lets a
+ * single worker function dispatch to either kind.
+ */
+typedef enum {
+    PV_JOB_INPUT = 1,   /* verify_job *      (placeholder framework) */
+    PV_JOB_SIG   = 2    /* sig_verify_job *  (production hot path)   */
+} pv_job_kind;
+
 /* Global state */
 static worker_t *workers = NULL;
 static int num_workers = 0;
 static int initialized = 0;
 
-/* Job queue */
-static verify_job *job_queue = NULL;
+/* Unified job queue — used for both INPUT and SIG batches */
+static pv_job_kind current_kind = PV_JOB_INPUT;
+static void *job_queue = NULL;       /* verify_job[] or sig_verify_job[] */
 static int job_count = 0;
 static int jobs_completed = 0;
 static int next_job = 0;
@@ -109,13 +149,10 @@ static int parse_pubkey(secp256k1_context *ctx,
 
 /*
  * Verify a single ECDSA signature.
- * This is a simplified stub - real implementation would need full sighash computation.
  *
- * In practice, the Lua side computes the sighash (which requires full tx context)
- * and passes the 32-byte hash for verification. This C code focuses on the
- * parallelization infrastructure.
- *
- * For now, we provide the framework and let Lua do the actual work.
+ * In production, the Lua side computes the sighash (which requires full
+ * tx context) and passes the 32-byte hash for verification. This C code
+ * focuses on the parallelization infrastructure.
  */
 static int verify_ecdsa(secp256k1_context *ctx,
                         const uint8_t *pubkey_bytes, size_t pubkey_len,
@@ -136,17 +173,55 @@ static int verify_ecdsa(secp256k1_context *ctx,
 }
 
 /*
- * Worker thread function.
- * Waits for jobs, processes them, and signals completion.
+ * Process one input-verify job (placeholder framework — Lua side does not
+ * exercise this path in production, but kept so pv_verify_batch still
+ * works for any caller that wants the input-verify scaffolding).
+ */
+static void process_input_job(worker_t *worker, verify_job *job) {
+    (void)worker;
+    /*
+     * The actual verification is a placeholder that marks success. A full
+     * implementation would:
+     * 1. Deserialize the transaction from tx_data
+     * 2. Get the input at input_index
+     * 3. Compute the sighash based on script type and flags
+     * 4. Extract signature and pubkey from scriptSig/witness
+     * 5. Verify the signature
+     *
+     * The production path is process_sig_job below — Lua computes the
+     * sighash and posts pre-computed sig_verify_job entries.
+     */
+    job->result = 1;  /* Placeholder: assume valid */
+}
+
+/*
+ * Process one pre-computed sighash sig-verify job.
+ * Runs ECDSA verify against the worker's per-thread secp256k1 context.
+ */
+static void process_sig_job(worker_t *worker, sig_verify_job *job) {
+    job->result = verify_ecdsa(
+        worker->ctx,
+        job->pubkey, job->pubkey_len,
+        job->sig_der, job->sig_len,
+        job->msghash32
+    );
+}
+
+/*
+ * Unified worker thread function.
+ *
+ * Waits on the unified queue, dispatches per current_kind, signals
+ * completion. There is no per-job-kind worker function because the same
+ * threads must service both kinds of batches — a split queue caused the
+ * h=944,184 deadlock when sig batches went unposted.
  */
 static void *worker_func(void *arg) {
     worker_t *worker = (worker_t *)arg;
 
     while (1) {
-        verify_job *job = NULL;
-        int job_idx = -1;
+        void *job_ptr = NULL;
+        pv_job_kind kind = PV_JOB_INPUT;
 
-        /* Get next job from queue */
         pthread_mutex_lock(&queue_mutex);
 
         while (next_job >= job_count && !shutdown_flag) {
@@ -159,34 +234,24 @@ static void *worker_func(void *arg) {
         }
 
         if (next_job < job_count) {
-            job_idx = next_job++;
-            job = &job_queue[job_idx];
+            int job_idx = next_job++;
+            kind = current_kind;
+            if (kind == PV_JOB_INPUT) {
+                job_ptr = &((verify_job *)job_queue)[job_idx];
+            } else {
+                job_ptr = &((sig_verify_job *)job_queue)[job_idx];
+            }
         }
 
         pthread_mutex_unlock(&queue_mutex);
 
-        /* Process job if we got one */
-        if (job != NULL) {
-            /*
-             * The actual verification is done here.
-             * Currently this is a placeholder that marks success.
-             *
-             * In a full implementation, we would:
-             * 1. Deserialize the transaction from tx_data
-             * 2. Get the input at input_index
-             * 3. Compute the sighash based on script type and flags
-             * 4. Extract signature and pubkey from scriptSig/witness
-             * 5. Verify the signature
-             *
-             * For now, we set result = 1 (valid) as a placeholder.
-             * The real work is done by calling back to Lua for sighash
-             * computation, or by implementing a full C parser/validator.
-             *
-             * This module provides the threading infrastructure.
-             */
-            job->result = 1;  /* Placeholder: assume valid */
+        if (job_ptr != NULL) {
+            if (kind == PV_JOB_INPUT) {
+                process_input_job(worker, (verify_job *)job_ptr);
+            } else {
+                process_sig_job(worker, (sig_verify_job *)job_ptr);
+            }
 
-            /* Signal completion */
             pthread_mutex_lock(&queue_mutex);
             jobs_completed++;
             if (jobs_completed == job_count) {
@@ -296,7 +361,6 @@ int pv_verify_batch(verify_job *jobs, int count) {
     if (count < MIN_PARALLEL_INPUTS || num_workers <= 1) {
         /* Single-threaded verification */
         int failures = 0;
-        secp256k1_context *ctx = workers[0].ctx;
 
         for (int i = 0; i < count; i++) {
             /* Placeholder: mark all as valid */
@@ -312,6 +376,7 @@ int pv_verify_batch(verify_job *jobs, int count) {
     /* Parallel verification */
     pthread_mutex_lock(&queue_mutex);
 
+    current_kind = PV_JOB_INPUT;
     job_queue = jobs;
     job_count = count;
     jobs_completed = 0;
@@ -384,78 +449,10 @@ void pv_shutdown(void) {
 }
 
 /*
- * Extended API: Verify pre-computed sighashes in parallel.
- *
- * This is more practical for Lua integration - Lua computes the sighashes
- * (which requires full tx parsing and script handling) and passes them here
- * for parallel ECDSA verification.
- */
-typedef struct {
-    const uint8_t *pubkey;        /* Public key bytes (33 or 65) */
-    size_t pubkey_len;            /* Public key length */
-    const uint8_t *sig_der;       /* DER-encoded signature */
-    size_t sig_len;               /* Signature length */
-    const uint8_t *msghash32;     /* 32-byte message hash (sighash) */
-    int result;                   /* 1 = valid, 0 = invalid */
-} sig_verify_job;
-
-/* Signature verification job queue */
-static sig_verify_job *sig_job_queue = NULL;
-static int sig_job_count = 0;
-static int sig_jobs_completed = 0;
-static int sig_next_job = 0;
-
-/*
- * Worker function for signature verification.
- */
-static void *sig_worker_func(void *arg) {
-    worker_t *worker = (worker_t *)arg;
-
-    while (1) {
-        sig_verify_job *job = NULL;
-        int job_idx = -1;
-
-        pthread_mutex_lock(&queue_mutex);
-
-        while (sig_next_job >= sig_job_count && !shutdown_flag) {
-            pthread_cond_wait(&work_available, &queue_mutex);
-        }
-
-        if (shutdown_flag) {
-            pthread_mutex_unlock(&queue_mutex);
-            break;
-        }
-
-        if (sig_next_job < sig_job_count) {
-            job_idx = sig_next_job++;
-            job = &sig_job_queue[job_idx];
-        }
-
-        pthread_mutex_unlock(&queue_mutex);
-
-        if (job != NULL) {
-            /* Perform actual ECDSA verification */
-            job->result = verify_ecdsa(
-                worker->ctx,
-                job->pubkey, job->pubkey_len,
-                job->sig_der, job->sig_len,
-                job->msghash32
-            );
-
-            pthread_mutex_lock(&queue_mutex);
-            sig_jobs_completed++;
-            if (sig_jobs_completed == sig_job_count) {
-                pthread_cond_signal(&work_done);
-            }
-            pthread_mutex_unlock(&queue_mutex);
-        }
-    }
-
-    return NULL;
-}
-
-/*
  * Verify a batch of pre-computed signatures in parallel.
+ *
+ * Lua computes the sighashes (which requires full tx parsing and script
+ * handling) and passes them here for parallel ECDSA verification.
  *
  * @param jobs Array of sig_verify_job structures with pubkey, sig, and sighash
  * @param count Number of jobs
@@ -492,21 +489,22 @@ int pv_verify_signatures(sig_verify_job *jobs, int count) {
         return failures;
     }
 
-    /* Parallel verification */
+    /* Parallel verification — uses the unified worker pool */
     pthread_mutex_lock(&queue_mutex);
 
-    sig_job_queue = jobs;
-    sig_job_count = count;
-    sig_jobs_completed = 0;
-    sig_next_job = 0;
+    current_kind = PV_JOB_SIG;
+    job_queue = jobs;
+    job_count = count;
+    jobs_completed = 0;
+    next_job = 0;
 
     pthread_cond_broadcast(&work_available);
 
-    while (sig_jobs_completed < sig_job_count) {
+    while (jobs_completed < job_count) {
         pthread_cond_wait(&work_done, &queue_mutex);
     }
 
-    sig_job_queue = NULL;
+    job_queue = NULL;
 
     pthread_mutex_unlock(&queue_mutex);
 
