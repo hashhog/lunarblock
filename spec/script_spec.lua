@@ -2162,4 +2162,56 @@ describe("script", function()
       assert.is_true(ok_tap)
     end)
   end)
+
+  -- Regression test for the 944,188 wedge: BIP342 tapscripts permit 5-byte
+  -- CScriptNum operands for stack-numeric ops (e.g. OP_1ADD/OP_ADD/OP_PICK),
+  -- not just the 4-byte legacy cap. Pre-fix, pop_num() always used max_len=4
+  -- and asserted "script number too long" when a tapscript op consumed a
+  -- legitimate 5-byte intermediate. Core's interpreter.cpp uses
+  -- `nMaxNumSize = 5` for SigVersion::TAPSCRIPT.
+  -- See project_lunarblock_wedge_2026_04_28.
+  describe("BIP342 tapscript 5-byte CScriptNum support", function()
+    -- A 5-byte positive CScriptNum: 2^31 = 0x80000000.
+    -- Bitcoin Script encoding: 4 little-endian bytes 0x00 0x00 0x00 0x80
+    -- triggers a sign-byte (high bit set, but value is positive), giving
+    -- the 5-byte encoding 0x00 0x00 0x00 0x80 0x00.
+    local FIVE_BYTE_PUSH = "\x05\x00\x00\x00\x80\x00"  -- OP_PUSHBYTES_5 + 5 bytes
+    local OP_1ADD = "\x8b"
+
+    it("rejects 5-byte CScriptNum in legacy execution", function()
+      -- Push 0x80000000 (5 bytes), then OP_1ADD which pops_num with
+      -- legacy 4-byte cap and must trip "script number too long".
+      local script_bytes = FIVE_BYTE_PUSH .. OP_1ADD
+      local ok = pcall(function()
+        script.execute_script(script_bytes, {}, {}, {})
+      end)
+      assert.is_false(ok)
+    end)
+
+    it("accepts 5-byte CScriptNum in tapscript execution", function()
+      -- Same script with is_tapscript=true: pop_num() defaults to 5 bytes,
+      -- so OP_1ADD reads 0x80000000 (= 2^31), increments to 2^31+1, and
+      -- pushes the result back. Must NOT raise "script number too long".
+      local script_bytes = FIVE_BYTE_PUSH .. OP_1ADD
+      local stack, err = script.execute_script(
+        script_bytes, {}, {is_tapscript = true}, {})
+      assert.is_table(stack)
+      assert.is_nil(err)
+      -- Result on stack should be 2^31 + 1 = 2147483649, encoded as 5 bytes.
+      assert.equals(2147483649, script.script_num_decode(stack[1], 5))
+    end)
+
+    it("4-byte CScriptNum still works in tapscript", function()
+      -- Sanity: tapscript must accept normal 4-byte operands too.
+      -- Push 0x7fffffff (4 bytes, max positive without sign byte), OP_1ADD.
+      local four_byte_push = "\x04\xff\xff\xff\x7f"
+      local script_bytes = four_byte_push .. OP_1ADD
+      local stack, err = script.execute_script(
+        script_bytes, {}, {is_tapscript = true}, {})
+      assert.is_table(stack)
+      assert.is_nil(err)
+      -- 0x7fffffff + 1 = 0x80000000 = 2147483648.
+      assert.equals(2147483648, script.script_num_decode(stack[1], 5))
+    end)
+  end)
 end)

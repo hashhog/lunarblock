@@ -703,10 +703,21 @@ function M.execute_script(script_bytes, stack, flags, checker)
     stack[#stack + 1] = val
   end
 
-  -- Helper: pop a number from stack
+  -- Helper: pop a number from stack.
+  -- BIP342: tapscript permits 5-byte CScriptNum operands for stack-numeric
+  -- ops (Core's interpreter.cpp wires CScriptNum with `nMaxNumSize = 5` when
+  -- `sigversion == TAPSCRIPT`, vs the default 4-byte cap for BASE/WITNESS_V0).
+  -- Mainnet block 944,188 wedged here pre-fix because lunarblock applied the
+  -- 4-byte legacy cap to a tapscript with a 5-byte arithmetic operand.
+  -- See project_lunarblock_wedge_2026_04_28.
+  --
+  -- An explicit `max_len` argument (e.g. CLTV/CSV with 5) always wins.
   local function pop_num(max_len)
     local bytes = pop()
-    return M.script_num_decode(bytes, max_len or 4, flags and flags.verify_minimaldata)
+    if max_len == nil then
+      max_len = (flags and flags.is_tapscript) and 5 or 4
+    end
+    return M.script_num_decode(bytes, max_len, flags and flags.verify_minimaldata)
   end
 
   -- Helper: push a number to stack
