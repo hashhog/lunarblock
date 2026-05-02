@@ -696,6 +696,40 @@ function M.ecdsa_recover_compact(sig65, msg_hash32)
   return ffi.string(output, outputlen[0])
 end
 
+--- Decompress a 33-byte SEC1 compressed pubkey to its 65-byte uncompressed form.
+-- Used by the UTXO snapshot loader (compressor.cpp:DecompressScript) when
+-- reconstructing uncompressed-P2PK scriptPubKeys from on-disk type bytes
+-- 0x04/0x05. The input is built as `(0x02 | (tag - 0x02)) + x[32]` per Core.
+-- @param compressed33 string: 33-byte SEC1 compressed pubkey (0x02/0x03 + x32)
+-- @return string|nil: 65-byte uncompressed pubkey (0x04 + x32 + y32) or nil
+-- @return string|nil: error message on failure
+function M.decompress_pubkey(compressed33)
+  if type(compressed33) ~= "string" or #compressed33 ~= 33 then
+    return nil, "decompress_pubkey: input must be a 33-byte string"
+  end
+  local prefix = compressed33:byte(1)
+  if prefix ~= 0x02 and prefix ~= 0x03 then
+    return nil, "decompress_pubkey: invalid SEC1 prefix"
+  end
+  local pubkey = ffi.new("secp256k1_pubkey")
+  if libsecp256k1.secp256k1_ec_pubkey_parse(
+    secp_ctx, pubkey, compressed33, 33
+  ) ~= 1 then
+    return nil, "decompress_pubkey: secp256k1_ec_pubkey_parse failed"
+  end
+  local output = ffi.new("unsigned char[65]")
+  local outputlen = ffi.new("size_t[1]", 65)
+  if libsecp256k1.secp256k1_ec_pubkey_serialize(
+    secp_ctx, output, outputlen, pubkey, 0x0002  -- SECP256K1_EC_UNCOMPRESSED
+  ) ~= 1 then
+    return nil, "decompress_pubkey: secp256k1_ec_pubkey_serialize failed"
+  end
+  if tonumber(outputlen[0]) ~= 65 then
+    return nil, "decompress_pubkey: unexpected serialized length"
+  end
+  return ffi.string(output, 65)
+end
+
 -- Verify a BIP340 Schnorr signature (64 bytes) against a message and x-only pubkey (32 bytes)
 function M.schnorr_verify(xonly_pubkey32, sig64, msg)
   local pubkey = ffi.new("secp256k1_xonly_pubkey")
