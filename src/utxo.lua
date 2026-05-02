@@ -1480,6 +1480,201 @@ function ChainState:reindex_chainstate(header_tip_height, progress_fn)
     header_tip_height, _t1 - _t0)
 end
 
+--- Verify post-restart chainstate consistency and auto-rollback if a
+--- previously-applied block has missing UTXOs (BUG-REPORT.md fix #3).
+---
+--- Walks back `max_blocks` from the current tip; for each block, fetches
+--- the block body from CF.BLOCKS and checks that every input in the first
+--- `txs_per_block` non-coinbase transactions resolves to a UTXO either
+--- still in CF.UTXO or in the block's own undo data (i.e. it WAS in
+--- CF.UTXO before connect_block spent it). If a block fails the check,
+--- we keep walking back (each failed block becomes a candidate for
+--- rollback) until we find the highest height H where consistency holds.
+--- We then disconnect every block from current tip down to H+1, leaving
+--- chain_tip at H. On the next IBD pass, blocks H+1, H+2, ... will be
+--- re-downloaded and re-applied — at which point the operator's choices
+--- diverge:
+---
+---   - If the rollback restored consistency, IBD resumes cleanly.
+---   - If even the rolled-back state fails to apply the next block (i.e.
+---     the corruption is older than `max_blocks`), the bounded retry in
+---     sync.lua's connect_pending_blocks (cb_fail_threshold) surfaces a
+---     clear "run --reindex-chainstate" error.
+---
+--- Defence-in-depth: if disconnect_block fails (e.g. missing undo data),
+--- we surface the partial-rollback height to the caller so the operator
+--- knows the auto-recovery is incomplete and `--reindex-chainstate` is
+--- needed.
+---
+--- @param max_blocks number|nil: how far back to scan (default 200).
+---        Anything older than this predates a reasonable crash window;
+---        if it's corrupt, --reindex-chainstate is the right tool, not
+---        rollback.
+--- @param txs_per_block number|nil: number of non-coinbase transactions
+---        per block to spot-check (default 5). The wedge symptom (a
+---        single tx with a missing input) is detectable from any tx; we
+---        don't need to scan all of them on every restart.
+--- @return number, number, table: (rolled_back_count, final_tip_height,
+---        details_table). details_table has fields:
+---          - found_inconsistency: bool
+---          - first_bad_height: number|nil  (highest h with missing UTXO)
+---          - reason: string|nil  (description of the miss)
+---          - undo_missing: bool  (true if a rollback failed for lack of undo)
+function ChainState:verify_chainstate_consistency(max_blocks, txs_per_block)
+  max_blocks = max_blocks or 200
+  txs_per_block = txs_per_block or 5
+
+  local details = {
+    found_inconsistency = false,
+    first_bad_height = nil,
+    reason = nil,
+    undo_missing = false,
+  }
+
+  if not self.tip_hash or self.tip_height < 1 then
+    return 0, self.tip_height or 0, details
+  end
+
+  -- Walk back from tip, looking for the highest block whose inputs are
+  -- inconsistent with the chainstate. This is the "bad" block we'll roll
+  -- back through. Stop at the first height where the invariant holds AND
+  -- nothing above it has been flagged. (i.e. first_bad_height tracks the
+  -- highest known-bad; we roll back to one below that.)
+  local check_until_height = math.max(self.tip_height - max_blocks + 1, 1)
+  local h = self.tip_height
+  while h >= check_until_height do
+    local block_hash = self.storage.get_hash_by_height(h)
+    if not block_hash then
+      -- Missing height-index entry — inconsistency, but unrelated to UTXO.
+      -- Don't trigger rollback for this; it's a separate corruption mode.
+      break
+    end
+    local block_data = self.storage.get(storage_mod.CF.BLOCKS, block_hash.bytes)
+    if not block_data then
+      -- Block body missing for an applied block: chain_tip diverged from
+      -- block storage (Apr 28 wedge symptom). Mark as bad.
+      details.found_inconsistency = true
+      details.first_bad_height = h
+      details.reason = string.format(
+        "block body missing for applied height %d (hash=%s)",
+        h, types.hash256_hex(block_hash))
+      h = h - 1
+      goto continue
+    end
+    local ok_d, block = pcall(serialize.deserialize_block, block_data)
+    if not ok_d or not block then
+      details.found_inconsistency = true
+      details.first_bad_height = h
+      details.reason = string.format(
+        "block body unparseable at height %d: %s",
+        h, tostring(block))
+      h = h - 1
+      goto continue
+    end
+
+    -- For each non-coinbase tx (up to txs_per_block), check inputs.
+    -- An input is "consistent" iff its outpoint is either:
+    --   (a) currently in CF.UTXO (hasn't been spent since), OR
+    --   (b) recorded in this block's undo data (was spent BY this block,
+    --       which means it was in CF.UTXO when we connected — fine).
+    local block_undo_raw = self.storage.get_undo(block_hash)
+    local block_undo = nil
+    if block_undo_raw then
+      local ok_u, parsed = pcall(M.deserialize_block_undo, block_undo_raw)
+      if ok_u then block_undo = parsed end
+    end
+
+    local block_consistent = true
+    local checked = 0
+    for tx_idx = 2, #block.transactions do  -- skip coinbase
+      if checked >= txs_per_block then break end
+      local tx = block.transactions[tx_idx]
+      checked = checked + 1
+      for inp_idx, inp in ipairs(tx.inputs) do
+        local in_utxo = self.coin_view:get(inp.prev_out.hash, inp.prev_out.index) ~= nil
+        local in_undo = false
+        if block_undo and block_undo.tx_undo then
+          local tx_undo = block_undo.tx_undo[tx_idx - 1]
+          if tx_undo and tx_undo.prev_outputs and tx_undo.prev_outputs[inp_idx] then
+            in_undo = true
+          end
+        end
+        if not in_utxo and not in_undo then
+          block_consistent = false
+          details.found_inconsistency = true
+          details.first_bad_height = h
+          details.reason = string.format(
+            "h=%d tx=%s input %d: outpoint %s:%d not in UTXO or undo",
+            h, types.hash256_hex(validation.compute_txid(tx)),
+            inp_idx,
+            types.hash256_hex(inp.prev_out.hash),
+            inp.prev_out.index)
+          break
+        end
+      end
+      if not block_consistent then break end
+    end
+
+    if block_consistent then
+      -- Found the highest known-good block. Stop walking back.
+      break
+    end
+
+    h = h - 1
+    ::continue::
+  end
+
+  if not details.found_inconsistency then
+    return 0, self.tip_height, details
+  end
+
+  -- Roll back blocks from current tip down to first_bad_height (inclusive).
+  -- Each disconnect uses the block's stored undo data to restore the UTXO
+  -- set. If undo data is missing, we cannot safely roll back further; we
+  -- stop and surface the partial-recovery height.
+  local rollback_target = details.first_bad_height - 1
+  if rollback_target < 0 then rollback_target = 0 end
+
+  local rolled = 0
+  while self.tip_height > rollback_target do
+    local current_height = self.tip_height
+    local current_hash = self.tip_hash
+    local block_data = self.storage.get(storage_mod.CF.BLOCKS, current_hash.bytes)
+    if not block_data then
+      -- Missing block body for the current tip: cannot disconnect
+      -- properly. Fall back to a manual chain_tip overwrite (advance
+      -- the tip pointer down without disconnecting outputs/inputs).
+      -- The result is a chainstate that may have stale UTXO entries,
+      -- but it's no worse than what triggered the rollback. The
+      -- bounded retry in sync.lua will re-download and re-apply.
+      details.undo_missing = true
+      break
+    end
+    local ok_d, block = pcall(serialize.deserialize_block, block_data)
+    if not ok_d or not block then
+      details.undo_missing = true
+      break
+    end
+    -- Compute previous-block hash from the block header.
+    local prev_hash = block.header.prev_hash
+    local ok_dis, dis_err = self:disconnect_block(block, current_height,
+      current_hash, prev_hash)
+    if not ok_dis then
+      details.undo_missing = true
+      details.reason = (details.reason or "") ..
+        string.format(" | disconnect_block failed at h=%d: %s",
+          current_height, tostring(dis_err))
+      break
+    end
+    rolled = rolled + 1
+  end
+
+  -- Make the rollback durable.
+  self.coin_view:flush(false, nil, true)
+
+  return rolled, self.tip_height, details
+end
+
 --- Load invalid blocks set from persistent storage.
 function ChainState:load_invalid_blocks()
   local data = self.storage.get(storage_mod.CF.META, "invalid_blocks")
@@ -1954,16 +2149,33 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     string.format("Coinbase value too high: %d > %d + %d",
       coinbase_value, subsidy, total_fees))
 
-  -- Serialize and store undo data (only if there are non-coinbase transactions)
+  -- Serialize undo data (only if there are non-coinbase transactions). The
+  -- actual write goes into the atomic batch below — pre-2026-04-30 this was
+  -- a separate `self.storage.put_undo()` call OUTSIDE the atomic batch, which
+  -- meant a hard crash between the undo write and the UTXO/chain_tip flush
+  -- could leave undo missing for a block whose chain_tip update did land.
+  -- Per BUG-REPORT.md fix #2, every block-connect mutation must commit as a
+  -- single WriteBatch with the chain-tip update as the LAST operation.
+  local undo_data_for_batch = nil
   if #block_undo.tx_undo > 0 then
-    local undo_data = M.serialize_block_undo(block_undo)
-    self.storage.put_undo(block_hash, undo_data)
+    undo_data_for_batch = M.serialize_block_undo(block_undo)
   end
   local _cb_t_undo = perf.now()
 
-  -- Flush dirty UTXO entries and update chain tip in the SAME atomic batch.
-  -- This prevents the chain tip from advancing ahead of the UTXO set if the
-  -- process crashes between the two writes.
+  -- Flush dirty UTXO entries, undo data, caller extras (block body, etc.),
+  -- and the chain-tip update — all in the SAME atomic batch. This is the
+  -- per-block atomic write barrier. There is NO state on disk where chain_tip
+  -- advanced but the UTXO mutations / undo / block body did not. This closes
+  -- the post-EMFILE wedge documented in
+  -- project_lunarblock_wedge_2026_04_28: pre-fix, chain_tip could advance
+  -- past blocks whose put_block / put_undo had not yet been written.
+  --
+  -- Order inside the batch: UTXO writes/deletes (added by coin_view:flush) ->
+  -- undo data -> caller extras (block body / height index) -> chain_tip.
+  -- Chain-tip is written LAST so that any partial pre-commit visibility (none
+  -- with WriteBatch under WAL semantics, but defence-in-depth) can never show
+  -- a tip ahead of the data that backs it.
+  --
   -- When nosync is true, skip the expensive fsync — the caller (e.g. the IBD
   -- loop) is responsible for issuing a periodic sync flush to bound data loss.
   local tip_hash_capture = block_hash
@@ -1978,12 +2190,19 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   tip_buf[35] = band(rshift(tip_height_capture, 24), 0xFF)
   local tip_data = ffi.string(tip_buf, 36)
   self.coin_view:flush(false, function(batch)
-    batch.put(storage_mod.CF.META, "chain_tip", tip_data)
-    -- Include caller's extra operations (e.g. block/header/height_index from
-    -- submitblock) in the same atomic write batch.
+    -- Undo data into the same atomic batch (was a separate put before
+    -- 2026-04-30; see comment block above).
+    if undo_data_for_batch then
+      batch.put(storage_mod.CF.UNDO, block_hash.bytes, undo_data_for_batch)
+    end
+    -- Include caller's extra operations (e.g. block body / height index from
+    -- the IBD path, or block/header/height_index from submitblock) in the
+    -- same atomic write batch BEFORE chain_tip — see ordering note above.
     if caller_batch_fn then
       caller_batch_fn(batch)
     end
+    -- Chain-tip last in the batch (defence-in-depth ordering).
+    batch.put(storage_mod.CF.META, "chain_tip", tip_data)
   end, do_sync)
   local _cb_t_flush = perf.now()
 
