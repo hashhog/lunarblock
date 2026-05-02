@@ -752,6 +752,21 @@ M.networks.mainnet = {
       hash_serialized = "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
       m_chain_tx_count = 1305397408,
       blockhash = "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
+    },
+    -- hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat from
+    -- /data/nvme1/hashhog-mainnet/), used to recover lunarblock + hotbuns
+    -- mainnet nodes after chainstate corruption. NOT a Bitcoin Core
+    -- chainparams entry; computed locally over the on-disk snapshot
+    -- (165,095,935 coins) by tools/compute-snapshot-hash.py.
+    -- hash_serialized below is uint256.ToString display order (reversed
+    -- bytes), matching the convention used by the four entries above; raw
+    -- HashWriter::GetHash output is a888bcbc200384747c0813c8e7f4650d9bc0
+    -- 847b5147791c3ca869567271af2e (callers reverse before compare; see
+    -- utxo.lua compute_utxo_hash docstring).
+    [944183] = {
+      hash_serialized = "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8",
+      m_chain_tx_count = 1334000000,
+      blockhash = "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
     }
   }
 }
