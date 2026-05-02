@@ -703,21 +703,10 @@ function M.execute_script(script_bytes, stack, flags, checker)
     stack[#stack + 1] = val
   end
 
-  -- Helper: pop a number from stack.
-  -- BIP342: tapscript permits 5-byte CScriptNum operands for stack-numeric
-  -- ops (Core's interpreter.cpp wires CScriptNum with `nMaxNumSize = 5` when
-  -- `sigversion == TAPSCRIPT`, vs the default 4-byte cap for BASE/WITNESS_V0).
-  -- Mainnet block 944,188 wedged here pre-fix because lunarblock applied the
-  -- 4-byte legacy cap to a tapscript with a 5-byte arithmetic operand.
-  -- See project_lunarblock_wedge_2026_04_28.
-  --
-  -- An explicit `max_len` argument (e.g. CLTV/CSV with 5) always wins.
+  -- Helper: pop a number from stack
   local function pop_num(max_len)
     local bytes = pop()
-    if max_len == nil then
-      max_len = (flags and flags.is_tapscript) and 5 or 4
-    end
-    return M.script_num_decode(bytes, max_len, flags and flags.verify_minimaldata)
+    return M.script_num_decode(bytes, max_len or 4, flags and flags.verify_minimaldata)
   end
 
   -- Helper: push a number to stack
@@ -1345,10 +1334,24 @@ function M.execute_script(script_bytes, stack, flags, checker)
 
     -- Taproot
     elseif opcode == M.OP.OP_CHECKSIGADD then
-      -- BIP342: Pop pubkey, then sig, then n. Push n+1 if valid, else n
+      -- BIP342 / Core interpreter.cpp:1089:
+      --   stack layout (bottom -> top): sig, num, pubkey
+      --   Result: push (num + (success ? 1 : 0)) back, popping all three.
+      --
+      -- Pop ORDER from the stack top therefore is:
+      --   1. pubkey  (top of stack, stacktop(-1))
+      --   2. num     (stacktop(-2)) — read as CScriptNum
+      --   3. sig     (stacktop(-3))
+      --
+      -- Pre-fix this code popped pubkey, then sig, then `n` — i.e. the
+      -- second and third pops were swapped. That handed the 64-byte
+      -- Schnorr sig to pop_num(), which asserted "script number too long"
+      -- and wedged mainnet block 944,188 (deterministic; tx contains an
+      -- OP_CHECKSIGADD-style multisig under tapscript).
+      -- See project_lunarblock_wedge_2026_04_28.
       local pubkey = pop()
-      local sig = pop()
       local n = pop_num()
+      local sig = pop()
       local valid = false
       if checker.check_sig then
         valid = checker.check_sig(sig, pubkey)
