@@ -1653,11 +1653,10 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
     else
       return nil, "WITNESS_PROGRAM_WRONG_LENGTH"
     end
-  elseif witness_version == 1 and flags.verify_taproot then
-    -- BIP341/342: Taproot (witness v1)
-    if #witness_program ~= 32 then
-      return nil, "WITNESS_PROGRAM_WRONG_LENGTH"
-    end
+  elseif witness_version == 1 and #witness_program == 32 and flags.verify_taproot then
+    -- BIP341/342: Taproot (witness v1, 32-byte program)
+    -- (Other v1 program lengths fall through to the catch-all per BIP141 forward
+    -- soft-fork compatibility; P2A is matched explicitly below.)
 
     if #witness == 0 then
       return nil, "WITNESS_PROGRAM_WITNESS_EMPTY"
@@ -1764,11 +1763,19 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
       return true
     end
 
+  elseif witness_version == 1
+         and #witness_program == 2
+         and witness_program:byte(1) == 0x4e
+         and witness_program:byte(2) == 0x73 then
+    -- BIP-444 Pay-to-Anchor (P2A): OP_1 <0x4e73>. Always spendable; the relay
+    -- DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag does NOT apply (Core
+    -- script/interpreter.cpp:1990 returns true unconditionally for P2A).
+    return true
   elseif flags.verify_discourage_upgradable_witness then
     -- Unknown witness version with DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag
     return nil, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
   else
-    -- Unknown witness version: anyone-can-spend (future soft fork)
+    -- Unknown witness version/length: anyone-can-spend (future soft fork)
     return true
   end
 end
