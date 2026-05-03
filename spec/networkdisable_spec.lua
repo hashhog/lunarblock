@@ -33,13 +33,14 @@ describe("NetworkDisable rollback gate", function()
     assert.equal(false, r.block_submission_paused)
   end)
 
-  it("submitblock returns paused reject while flag is set", function()
+  it("submitblock returns canonical BIP-22 'rejected' while flag is set", function()
     local r = make_minimal_rpc()
     r.block_submission_paused = true
     -- Garbage hex is fine: gate runs before deserialization.
+    -- BIP-22: canonical "rejected" string, not a long "paused" message.
     local result = r.methods["submitblock"](r, {"00"})
     assert.equal("string", type(result))
-    assert.is_truthy(result:find("paused"))
+    assert.equal("rejected", result)
   end)
 
   it("submitblock proceeds past gate once flag is cleared", function()

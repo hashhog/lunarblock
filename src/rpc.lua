@@ -15,6 +15,110 @@ local storage_mod = require("lunarblock.storage")
 local M = {}
 
 --------------------------------------------------------------------------------
+-- BIP-22 result string mapping
+--------------------------------------------------------------------------------
+
+--- Map an internal block-validation error string to a canonical BIP-22
+-- submitblock result string.
+--
+-- BIP-22: https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki
+-- Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
+--
+-- Consensus rejections go in the JSON-RPC *result* field as short ASCII
+-- strings, NOT as JSON-RPC error objects.
+--
+-- @param err string: internal error/exception message
+-- @return string: canonical BIP-22 result string
+local function bip22_result(err)
+  if err == nil then return nil end  -- success
+  local s = tostring(err):lower()
+
+  -- Already-canonical strings pass through unchanged
+  local canonical = {
+    ["duplicate"] = true, ["inconclusive"] = true, ["duplicate-invalid"] = true,
+    ["high-hash"] = true, ["bad-txnmrklroot"] = true,
+    ["bad-witness-merkle-match"] = true, ["bad-cb-amount"] = true,
+    ["bad-blk-sigops"] = true, ["bad-cb-height"] = true,
+    ["bad-txns-nonfinal"] = true, ["bad-txns-duplicate"] = true,
+    ["rejected"] = true, ["mandatory-script-verify-flag-failed"] = true,
+    ["bad-txns-inputs-missingorspent"] = true,
+  }
+  if canonical[s] then return s end
+
+  -- PoW / difficulty
+  if s:find("proof of work") or s:find("invalid pow") or s:find("does not meet target") then
+    return "high-hash"
+  end
+
+  -- Merkle root
+  if s:find("merkle root") and not s:find("witness") then
+    return "bad-txnmrklroot"
+  end
+
+  -- Witness commitment (BIP141)
+  if s:find("witness commitment") or s:find("witness nonce") then
+    return "bad-witness-merkle-match"
+  end
+
+  -- Coinbase value / subsidy
+  if s:find("coinbase amount") or s:find("subsidy") or s:find("coinbase value") then
+    return "bad-cb-amount"
+  end
+
+  -- Sigops limit
+  if s:find("sigops") then
+    return "bad-blk-sigops"
+  end
+
+  -- Block weight / size
+  if s:find("weight") and s:find("exceed") then
+    return "bad-blk-length"
+  end
+
+  -- BIP34 coinbase height
+  if s:find("bip34") or s:find("coinbase height") or s:find("bad%-cb%-height") then
+    return "bad-cb-height"
+  end
+
+  -- Non-final transactions / sequence lock
+  if s:find("sequence lock") or s:find("non%-final") or s:find("not final") then
+    return "bad-txns-nonfinal"
+  end
+
+  -- Duplicate transactions
+  if s:find("duplicate") and (s:find("tx") or s:find("transaction") or s:find("unspent")) then
+    return "bad-txns-duplicate"
+  end
+
+  -- Missing inputs / UTXO
+  if s:find("missing") and (s:find("input") or s:find("utxo")) then
+    return "bad-txns-inputs-missingorspent"
+  end
+
+  -- Script / signature verification
+  if s:find("script") or s:find("signature") or s:find("checksig") or
+     s:find("tapscript") or s:find("witness program") then
+    return "mandatory-script-verify-flag-failed"
+  end
+
+  -- Timestamp / time
+  if s:find("too far in the future") or s:find("time%-too%-new") then
+    return "time-too-new"
+  end
+  if s:find("before median") or s:find("time%-too%-old") or
+     s:find("timestamp") and s:find("median") then
+    return "time-too-old"
+  end
+
+  -- Previous block not found → inconclusive (orphan block)
+  if s:find("prev.*not found") or s:find("previous block not found") then
+    return "inconclusive"
+  end
+
+  return "rejected"
+end
+
+--------------------------------------------------------------------------------
 -- RPC Error Codes
 --------------------------------------------------------------------------------
 
@@ -4272,7 +4376,8 @@ function RPCServer:register_methods()
     -- Bitcoin Core's NetworkDisable RAII around TemporaryRollback in
     -- rpc/blockchain.cpp::dumptxoutset.
     if rpc.block_submission_paused then
-      return "rejected: block submission paused (dumptxoutset rollback in progress)"
+      -- BIP-22: return canonical string in result field, not a long message
+      return "rejected"
     end
 
     local hexdata = params[1]
@@ -4292,10 +4397,11 @@ function RPCServer:register_methods()
     local ok_val, val_err = pcall(validation.check_block, block)
     local t_validate = os.clock()
     if not ok_val then
-      return tostring(val_err)
+      -- Map internal error strings to canonical BIP-22 result strings
+      return bip22_result(val_err)
     end
     if not val_err then
-      return "invalid"
+      return "rejected"
     end
 
     -- Compute block hash
@@ -4320,7 +4426,9 @@ function RPCServer:register_methods()
             return "duplicate"
           end
         end
-        return "prev-blk-not-found"
+        -- BIP-22 doesn't define "prev-blk-not-found"; use "inconclusive"
+        -- to signal that we can't determine validity without the parent.
+        return "inconclusive"
       end
     end
 
@@ -4379,10 +4487,11 @@ function RPCServer:register_methods()
       local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, skip_scripts, nil, nosync, store_batch_fn)
       local t_connect = os.clock()
       if not ok_conn then
-        return tostring(conn_err)
+        -- Map internal connect_block error strings to canonical BIP-22 strings
+        return bip22_result(conn_err)
       end
       if not conn_err then
-        return "invalid"
+        return "rejected"
       end
 
       -- Periodic timing log
