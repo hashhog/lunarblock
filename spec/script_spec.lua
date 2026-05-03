@@ -2104,6 +2104,71 @@ describe("script", function()
     end)
   end)
 
+  -- Regression test for the 945,394 wedge: verify_witness_program must
+  -- recognise BIP-444 P2A and treat all other unknown witness versions
+  -- (incl. v1 + non-32 program length) as anyone-can-spend per BIP141 /
+  -- Core script/interpreter.cpp:1947-1998. Pre-fix lunarblock failed
+  -- v1 + non-32 with WITNESS_PROGRAM_WRONG_LENGTH, rejecting the P2A
+  -- spend in mainnet block 945,394 tx 26b9fa21bb16d8fb... input 0
+  -- (prevout scriptPubKey 51024e73 = OP_1 <0x4e73>).
+  describe("verify_witness_program forward-soft-fork compatibility (945,394)", function()
+    it("accepts P2A spend (v1 + 0x4e73) with empty witness", function()
+      local ok, err = script.verify_witness_program({}, 1, "\x4e\x73",
+        {verify_taproot = true}, nil)
+      assert.is_true(ok)
+      assert.is_nil(err)
+    end)
+
+    it("accepts P2A even when verify_taproot is off", function()
+      local ok, err = script.verify_witness_program({}, 1, "\x4e\x73", {}, nil)
+      assert.is_true(ok)
+      assert.is_nil(err)
+    end)
+
+    it("accepts P2A even when DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is set", function()
+      -- Per Core interpreter.cpp:1990 P2A returns true unconditionally —
+      -- the DISCOURAGE flag does NOT apply to P2A.
+      local ok, err = script.verify_witness_program({}, 1, "\x4e\x73",
+        {verify_taproot = true, verify_discourage_upgradable_witness = true}, nil)
+      assert.is_true(ok)
+      assert.is_nil(err)
+    end)
+
+    it("accepts unknown v1 program length (anyone-can-spend)", function()
+      -- v1 + 4-byte program: not Taproot, not P2A; must be anyone-can-spend.
+      local ok, err = script.verify_witness_program({}, 1, "\x00\x01\x02\x03",
+        {verify_taproot = true}, nil)
+      assert.is_true(ok)
+      assert.is_nil(err)
+    end)
+
+    it("DISCOURAGE flag rejects unknown v1 length (relay-only)", function()
+      -- v1 + 30-byte program (not P2TR, not P2A); with DISCOURAGE flag
+      -- it must fail; without the flag it would succeed.
+      local ok, err = script.verify_witness_program({}, 1, string.rep("\x00", 30),
+        {verify_taproot = true, verify_discourage_upgradable_witness = true}, nil)
+      assert.is_nil(ok)
+      assert.equals("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM", err)
+    end)
+
+    it("accepts unknown witness version (v2)", function()
+      -- v2 + arbitrary program: anyone-can-spend.
+      local ok, err = script.verify_witness_program({}, 2, string.rep("\x00", 32),
+        {verify_taproot = true}, nil)
+      assert.is_true(ok)
+      assert.is_nil(err)
+    end)
+
+    it("v0 + non-20/non-32 still fails WITNESS_PROGRAM_WRONG_LENGTH", function()
+      -- The v0 length check is consensus per BIP141 and must NOT have
+      -- been weakened by the P2A fix.
+      local ok, err = script.verify_witness_program({}, 0, string.rep("\x00", 16),
+        {verify_taproot = true}, nil)
+      assert.is_nil(ok)
+      assert.equals("WITNESS_PROGRAM_WRONG_LENGTH", err)
+    end)
+  end)
+
   -- Regression test for the 944,186 wedge: BIP342 tapscripts must be
   -- exempt from MAX_SCRIPT_SIZE (10,000 bytes). Pre-fix, large
   -- ordinals/inscription tapscripts (e.g. 64,349 bytes in mainnet block

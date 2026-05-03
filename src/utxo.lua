@@ -2190,8 +2190,9 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
           else
             -- Legacy or P2SH
-            local ok = script.verify_script(inp.script_sig, utxo.script_pubkey, flags, checker)
-            assert(ok, "Script verification failed for input " .. inp_idx)
+            local ok, err = script.verify_script(inp.script_sig, utxo.script_pubkey, flags, checker)
+            assert(ok, string.format("Script verification failed for input %d of tx %s: %s",
+              inp_idx, types.hash256_hex(txid), err or "verify_script returned false"))
           end
 
           -- Cache successful verification
