@@ -2038,9 +2038,14 @@ end
 -- @param tapscript_bytes string: The tapscript to execute
 -- @param witness_stack table: Array of witness stack items (excluding script and control block)
 -- @param checker table: Signature checker with check_sig method for Schnorr verification
+-- @param validation_weight_left number|nil: Initial BIP-342 validation-weight
+--   budget (Core: GetSerializeSize(full_witness.stack) + VALIDATION_WEIGHT_OFFSET).
+--   When nil, the budget gate is NOT seeded — callers that fail to pass
+--   this would silently bypass per-sigop deduction. Native P2TR script-path
+--   spends in utxo.lua MUST pass this; legacy/test entry points may omit it.
 -- @return boolean: true if script succeeds
 -- @return string|nil: Error message on failure
-function M.verify_tapscript(tapscript_bytes, witness_stack, checker)
+function M.verify_tapscript(tapscript_bytes, witness_stack, checker, validation_weight_left)
   -- BIP342: Max script size is not enforced for tapscript (no 10,000 byte limit)
   -- but we still enforce individual stack element size (520 bytes)
 
@@ -2056,6 +2061,20 @@ function M.verify_tapscript(tapscript_bytes, witness_stack, checker)
     verify_checklocktimeverify = true,
     verify_checksequenceverify = true,
   }
+
+  -- BIP-342 validation-weight budget seeding. The OTHER tapscript code path
+  -- (verify_witness_program at script.lua:1735) seeds this from the full
+  -- witness stack. Native P2TR (utxo.lua:2203) calls this 3-arg form which,
+  -- pre-fix, NEVER seeded the budget — meaning the per-sigop deduction in
+  -- OP_CHECKSIG / CHECKSIGVERIFY / CHECKSIGADD (gated on
+  -- flags.validation_weight_init) was a no-op. An adversarial tapscript
+  -- with N CHECKSIGs s.t. 50*N > witness_size + 50 would be REJECTED by
+  -- Core (TAPSCRIPT_VALIDATION_WEIGHT) but ACCEPTED by lunarblock — a
+  -- deterministic consensus split.
+  if validation_weight_left then
+    tapscript_flags.validation_weight_init = true
+    tapscript_flags.validation_weight_left = validation_weight_left
+  end
 
   -- Execute the tapscript using the existing engine with tapscript flags
   return M.execute_witness_script(tapscript_bytes, stack, tapscript_flags, checker)
