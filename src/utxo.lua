@@ -2900,6 +2900,43 @@ function ChainState:compute_muhash()
   return mh:finalize(), count
 end
 
+-- libc fsync/fileno bindings, declared lazily on first use. We avoid
+-- forcing the cdef at module load so embedded LuaJIT environments
+-- without libc symbols (uncommon but possible in static builds) can
+-- still load lunarblock.utxo.
+local _fsync_initialized = false
+local function _ensure_fsync_cdef()
+  if _fsync_initialized then return end
+  pcall(function()
+    ffi.cdef[[
+      int fsync(int fd);
+      int fileno(void *stream);
+    ]]
+  end)
+  _fsync_initialized = true
+end
+
+--- Best-effort fsync of a Lua FILE* before close. Returns true on
+-- success, false on failure (caller can treat as advisory; the data
+-- is still in the kernel page cache after file:flush()). Mirrors
+-- Bitcoin Core's Fdatasync/close pair before the atomic rename in
+-- rpc/blockchain.cpp::dumptxoutset.
+local function _fsync_file(file)
+  _ensure_fsync_cdef()
+  -- `file:flush()` flushes Lua's user-space buffer into the FILE*
+  -- buffer, but FILE* itself buffers too. We drive both ends down to
+  -- the OS layer here.
+  local ok_flush = pcall(function() file:flush() end)
+  if not ok_flush then return false end
+  local ok = pcall(function()
+    local fd = ffi.C.fileno(file)
+    if fd >= 0 then
+      ffi.C.fsync(fd)
+    end
+  end)
+  return ok
+end
+
 --- Dump the UTXO set to a snapshot file in Bitcoin Core wire format.
 -- Mirrors WriteUTXOSnapshot in bitcoin-core/src/rpc/blockchain.cpp.
 -- Outer body loop is grouped by txid using CompactSize counts; inner
@@ -3018,6 +3055,15 @@ function ChainState:dump_snapshot(file_path)
       file:write(M.serialize_snapshot_coin(entry))
     end
   end
+
+  -- Durability barrier before close+rename. Mirrors Bitcoin Core's
+  -- Fdatasync/close in rpc/blockchain.cpp::dumptxoutset; without this
+  -- a power loss between close+rename and the OS flushing dirty pages
+  -- could leave the renamed final path visible with zero-length /
+  -- torn contents. Best-effort: failures fall back to close-and-pray.
+  -- The atomic rename is performed by the caller (rpc.lua dumptxoutset
+  -- handler) which writes us a `.incomplete` path and renames after.
+  _fsync_file(file)
 
   file:close()
 
