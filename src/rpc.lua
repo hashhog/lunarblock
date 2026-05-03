@@ -4435,6 +4435,17 @@ function RPCServer:register_methods()
     -- Determine height: tip + 1 since we verified prev_hash == tip_hash above
     local new_height = (rpc.chain_state and rpc.chain_state.tip_height or 0) + 1
 
+    -- BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
+    -- block timestamp must be strictly greater than the median-time-past
+    -- of the previous 11 blocks.
+    -- Reference: bitcoin-core/src/validation.cpp:4092
+    if rpc.chain_state and rpc.chain_state.tip_height and rpc.chain_state.tip_height >= 0 then
+      local prev_mtp = get_median_time_past(rpc.storage, rpc.chain_state.tip_hash)
+      if block.header.timestamp <= prev_mtp then
+        return "time-too-old"
+      end
+    end
+
     -- If chain_state has a connect_block method, use it.
     -- Block/header/height_index storage writes are included in the same atomic
     -- WriteBatch as the UTXO flush and chain tip update via caller_batch_fn.
