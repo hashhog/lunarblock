@@ -14,6 +14,43 @@ local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 local M = {}
 
 --------------------------------------------------------------------------------
+-- BIP-30: duplicate-coinbase prevention
+--------------------------------------------------------------------------------
+-- Per Core validation.cpp:6189 IsBIP30Repeat, two mainnet blocks
+-- INTENTIONALLY duplicate an earlier coinbase txid; BIP-30 enforcement
+-- must skip these (otherwise our chain replays the historical
+-- duplicate and bails). Both pre-date BIP-34 activation.
+--
+-- Hashes are big-endian display (uint256.ToString) — we reverse them
+-- to internal little-endian on lookup. types.hash256_from_hex does
+-- exactly that, so we can just call it.
+--
+-- For all OTHER blocks, BIP-30 is enforced unconditionally: no
+-- transaction (coinbase or otherwise) in the new block may have a txid
+-- that matches an existing UTXO in the chainstate (Core
+-- validation.cpp:2467-2476). Post-BIP-34 this is essentially academic
+-- (BIP-34's height-in-coinbase makes coinbase txids unique), but the
+-- check is consensus-critical for from-genesis IBD and for any future
+-- soft-fork that breaks BIP-34 uniqueness.
+local BIP30_EXEMPT_MAINNET = {
+  -- height -> big-endian display hash (uint256.ToString format)
+  [91842] = "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+  [91880] = "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+}
+
+-- Returns true iff the (network, height, block_hash) triple matches one
+-- of the historical BIP-30 exemption blocks. Network-aware so testnet /
+-- regtest don't accidentally inherit the mainnet exemption.
+local function is_bip30_exempt(network_name, height, block_hash)
+  if network_name ~= "mainnet" then return false end
+  local exempt_hex = BIP30_EXEMPT_MAINNET[height]
+  if not exempt_hex then return false end
+  local expect = types.hash256_from_hex(exempt_hex)
+  return block_hash and types.hash256_eq(block_hash, expect)
+end
+M.is_bip30_exempt = is_bip30_exempt
+
+--------------------------------------------------------------------------------
 -- Fast UTXO Serialization (FFI-based, avoids buffer_writer/reader overhead)
 --------------------------------------------------------------------------------
 
@@ -1804,6 +1841,34 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   for _, tx in ipairs(block.transactions) do
     if not mining.is_final_tx(tx, height, lock_time_cutoff) then
       return nil, "non-final transaction: bad-txns-nonfinal"
+    end
+  end
+
+  -- BIP-30: tx-overwrite prevention. Per Core validation.cpp:2402-2476,
+  -- ConnectBlock enforces "no transaction in this block may have a txid
+  -- whose outputs already exist as UTXOs", with two known mainnet
+  -- exemption blocks (h=91842, h=91880) that intentionally duplicate
+  -- earlier coinbases. Core also short-circuits the check post-BIP34
+  -- (since BIP-34 makes coinbase txids unique by embedding height) but
+  -- explicitly preserves enforcement above height 1,983,702 because
+  -- pre-BIP-34 coinbases with indicated heights at that level can still
+  -- collide. Simplest correct policy: enforce always, except the two
+  -- exempt blocks. Cost is one HaveCoin lookup per tx output per block —
+  -- negligible vs script verification.
+  --
+  -- Pre-fix lunarblock had no enforcement, so a malicious miner could
+  -- mine a block whose coinbase txid duplicated an existing UTXO and
+  -- silently overwrite it (CVE-2012-1909 family). Practically blocked
+  -- by BIP-34 on current mainnet, but the check is a spec requirement.
+  local enforce_bip30 = not is_bip30_exempt(self.network.name, height, block_hash)
+  if enforce_bip30 then
+    for _, tx in ipairs(block.transactions) do
+      local check_txid = validation.compute_txid(tx)
+      for vout_idx = 1, #tx.outputs do
+        if self.coin_view:have(check_txid, vout_idx - 1) then
+          return nil, "bad-txns-BIP30: tried to overwrite transaction"
+        end
+      end
     end
   end
 
