@@ -4779,6 +4779,28 @@ function RPCServer:register_methods()
         message = "Rollback target above current tip"})
     end
 
+    -- Pruned-mode pre-check. Mirrors Bitcoin Core
+    -- rpc/blockchain.cpp:dumptxoutset:
+    --   if (IsPruneMode() &&
+    --       target_index->nHeight <
+    --       node.chainman->m_blockman.GetFirstBlock()->nHeight)
+    --       throw "Block height N not available (pruned data).
+    --              Use a height after M.";
+    -- lunarblock has PARTIAL pruning per Cat C audit: the pruner tracks
+    -- `prune_height` (highest pruned height). When --prune was set we
+    -- fail fast so a rewind doesn't begin reading blocks that have been
+    -- DELETEd from CF.BLOCKS.
+    if target_height ~= nil and rpc.pruner and rpc.pruner.enabled
+       and rpc.pruner.prune_height > 0
+       and target_height <= rpc.pruner.prune_height then
+      local first_available = rpc.pruner.prune_height + 1
+      error({code = M.ERROR.MISC_ERROR,
+        message = string.format(
+          "Block height %d not available (pruned data). "
+            .. "Use a height after %d.",
+          target_height, first_available - 1)})
+    end
+
     local utxo_mod = require("lunarblock.utxo")
     local _ = utxo_mod  -- chain_state methods dispatch via :method
 
