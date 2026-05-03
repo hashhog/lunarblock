@@ -1197,7 +1197,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
     elseif opcode == M.OP.OP_HASH256 then
       push(crypto.hash256(pop()))
     elseif opcode == M.OP.OP_CODESEPARATOR then
-      codesep_pos = i
+      -- BIP-341: record the 0-based opcode INDEX, not the 1-based Lua loop
+      -- counter.  Core's `opcode_pos` is 0-based (interpreter.cpp:433,1055),
+      -- committed to the tapscript sigmsg at interpreter.cpp:1565.
+      -- `i` is 1-indexed in Lua, so the 0-based index is `i - 1`.
+      codesep_pos = i - 1
       if checker.set_codesep then
         checker.set_codesep(codesep_pos)
       end
