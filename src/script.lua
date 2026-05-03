@@ -91,6 +91,25 @@ local MAX_SCRIPT_SIZE = 10000
 local VALIDATION_WEIGHT_OFFSET = 50
 local VALIDATION_WEIGHT_PER_SIGOP_PASSED = 50
 
+--- BIP-342 IsOpSuccess: true if `opcode` is one of the reserved opcodes
+-- whose presence in a tapscript causes immediate-success short-circuit
+-- (Core script/script.cpp::IsOpSuccess). Bytes: 0x50 (OP_RESERVED),
+-- 0x62 (OP_VER), 0x7e-0x81, 0x83-0x86, 0x89-0x8a, 0x8d-0x8e, 0x95-0x99,
+-- 0xbb-0xfe.  Used by ExecuteWitnessScript pre-scan
+-- (interpreter.cpp:1846); a tapscript containing any of these MUST be
+-- accepted unconditionally — overrides every other check including
+-- disabled-opcode and stack-element-size limits.
+function M.is_op_success(opcode)
+  return opcode == 0x50
+      or opcode == 0x62
+      or (opcode >= 0x7e and opcode <= 0x81)
+      or (opcode >= 0x83 and opcode <= 0x86)
+      or (opcode >= 0x89 and opcode <= 0x8a)
+      or (opcode >= 0x8d and opcode <= 0x8e)
+      or (opcode >= 0x95 and opcode <= 0x99)
+      or (opcode >= 0xbb and opcode <= 0xfe)
+end
+
 --- Compute the byte length of a Bitcoin compact-size encoding for n.
 -- Mirrors Core's GetSizeOfCompactSize (serialize.h):
 --   <  0xfd            -> 1 byte
@@ -1557,6 +1576,67 @@ end
 -- @return boolean: true if script succeeds and cleanstack is satisfied
 -- @return string|nil: Error message on failure
 function M.execute_witness_script(script_bytes, stack, flags, checker)
+  -- BIP-342: tapscript OP_SUCCESS pre-scan. Per Core
+  -- script/interpreter.cpp:1836-1856 ExecuteWitnessScript, when
+  -- sigversion is TAPSCRIPT we walk the script with GetOp, and if any
+  -- IsOpSuccess opcode is encountered we return success immediately —
+  -- this overrides everything (disabled-opcode error()s, stack-element
+  -- size limits, MAX_OPS, all of it). If GetOp fails BEFORE we hit an
+  -- OP_SUCCESS, that's BAD_OPCODE.
+  --
+  -- Concretely: any tapscript starting with OP_RESERVED (0x50),
+  -- OP_VER (0x62), OP_CAT (0x7e), OP_SUBSTR (0x7f), ..., OP_RSHIFT (0x99),
+  -- or 0xbb..0xfe MUST be accepted by lunarblock just as Core would.
+  -- Pre-fix lunarblock would error() on disabled opcodes (OP_CAT etc.)
+  -- and consensus-split from Core the moment any future soft fork
+  -- assigned semantics to one of those bytes.
+  if flags and flags.is_tapscript then
+    local pos = 1
+    local len = #script_bytes
+    while pos <= len do
+      local opcode = script_bytes:byte(pos)
+      pos = pos + 1
+      if opcode >= 0x01 and opcode <= 0x4b then
+        -- direct push: skip payload
+        if pos + opcode - 1 > len then
+          return nil, "BAD_OPCODE"
+        end
+        pos = pos + opcode
+      elseif opcode == 0x4c then
+        -- OP_PUSHDATA1
+        if pos > len then return nil, "BAD_OPCODE" end
+        local n = script_bytes:byte(pos)
+        pos = pos + 1
+        if pos + n - 1 > len then return nil, "BAD_OPCODE" end
+        pos = pos + n
+      elseif opcode == 0x4d then
+        -- OP_PUSHDATA2
+        if pos + 1 > len then return nil, "BAD_OPCODE" end
+        local n = script_bytes:byte(pos) + script_bytes:byte(pos + 1) * 256
+        pos = pos + 2
+        if pos + n - 1 > len then return nil, "BAD_OPCODE" end
+        pos = pos + n
+      elseif opcode == 0x4e then
+        -- OP_PUSHDATA4
+        if pos + 3 > len then return nil, "BAD_OPCODE" end
+        local b1, b2, b3, b4 = script_bytes:byte(pos, pos + 3)
+        local n = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+        pos = pos + 4
+        if pos + n - 1 > len then return nil, "BAD_OPCODE" end
+        pos = pos + n
+      elseif M.is_op_success(opcode) then
+        -- Per Core: SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS triggers
+        -- DISCOURAGE_OP_SUCCESS (mempool/standardness only). Otherwise
+        -- short-circuit success — this overrides every other check.
+        if flags.verify_discourage_op_success then
+          return nil, "DISCOURAGE_OP_SUCCESS"
+        end
+        return true
+      end
+      -- non-push, non-OP_SUCCESS opcode: continue scanning
+    end
+  end
+
   -- Execute the script
   local result, err = M.execute_script(script_bytes, stack, flags, checker)
   if not result then
