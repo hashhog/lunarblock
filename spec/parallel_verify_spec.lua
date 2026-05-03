@@ -208,4 +208,277 @@ describe("parallel_verify", function()
       assert.is_true(ok, "high-S sig should still verify after lax+normalize: " .. tostring(err))
     end)
   end)
+
+  -- CHECKMULTISIG correctness gate (2026-05-02). Regression for the silent-
+  -- pass collector: pre-fix, make_collecting_sig_checker.check_sig returned
+  -- true for every (sig, pubkey) tuple, so OP_CHECKMULTISIG's m-of-n trial
+  -- pairing in script.lua advanced isig on FAILED pairs and then the batch
+  -- ECDSA pass at end-of-block rejected the wrong tuples. Post-fix, the
+  -- inline_verify flag drives check_sig to do real ECDSA inline, mirroring
+  -- make_sig_checker exactly so the trial-pairing loop sees real results.
+  describe("multisig collector inline-verify", function()
+    local script
+    local types
+    local serialize
+
+    setup(function()
+      script = require("lunarblock.script")
+      types = require("lunarblock.types")
+      serialize = require("lunarblock.serialize")
+    end)
+
+    -- Helper: build a synthetic m-of-n multisig redeem script and a
+    -- transaction that spends a P2SH output wrapping it. Returns the tx,
+    -- the redeem script, and the per-key (privkey, pubkey, sig) triples.
+    local function build_multisig_tx(m, n, sign_indexes)
+      local prev_hash = types.hash256(string.rep("\xab", 32))
+      local tx = types.transaction(1, {}, {}, 0)
+      tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), "", 0xFFFFFFFF)
+      tx.outputs[1] = types.txout(100000, string.rep("\x00", 22))
+
+      -- Generate n keys.
+      local keys = {}
+      for i = 1, n do
+        local seed = string.format("%064x", 0xC0DE0000 + i)
+        local privkey = (seed:gsub('..', function(cc)
+          return string.char(tonumber(cc, 16))
+        end))
+        local pubkey = crypto.pubkey_from_privkey(privkey, true)
+        keys[i] = { privkey = privkey, pubkey = pubkey }
+      end
+
+      -- Build the m-of-n redeem script:
+      -- OP_<m> <pk1> <pk2> ... <pkn> OP_<n> OP_CHECKMULTISIG
+      local parts = { string.char(0x50 + m) }  -- OP_m
+      for i = 1, n do
+        parts[#parts + 1] = string.char(33)
+        parts[#parts + 1] = keys[i].pubkey
+      end
+      parts[#parts + 1] = string.char(0x50 + n)  -- OP_n
+      parts[#parts + 1] = string.char(0xae)      -- OP_CHECKMULTISIG
+      local redeem = table.concat(parts)
+
+      -- Compute the legacy sighash for the spend (script_code = redeem).
+      local hash_type = 0x01  -- SIGHASH_ALL
+      local sighash = validation.signature_hash_legacy(
+        tx, 0, redeem, hash_type, "")
+
+      -- Sign with the requested key indexes.
+      for _, idx in ipairs(sign_indexes) do
+        keys[idx].sig = crypto.ecdsa_sign(keys[idx].privkey, sighash) ..
+                        string.char(hash_type)
+      end
+
+      return tx, redeem, keys
+    end
+
+    -- Helper: build the scriptSig for an m-of-n P2SH multisig.
+    -- scriptSig = OP_0 <sig1> <sig2> ... <sigm> <redeem>
+    local function build_multisig_scriptsig(sigs, redeem)
+      local parts = { string.char(0x00) }  -- OP_0 (CHECKMULTISIG dummy)
+      for _, s in ipairs(sigs) do
+        if #s < 0x4c then
+          parts[#parts + 1] = string.char(#s) .. s
+        else
+          parts[#parts + 1] = string.char(0x4c, #s) .. s
+        end
+      end
+      parts[#parts + 1] = string.char(0x4c, #redeem) .. redeem
+      return table.concat(parts)
+    end
+
+    it("script.has_multisig_op detects 0xae as opcode", function()
+      -- 2-of-2: OP_2 <pk1> <pk2> OP_2 OP_CHECKMULTISIG
+      local pk = string.rep("\x02", 33)
+      local s = string.char(0x52) .. string.char(33) .. pk
+                .. string.char(33) .. pk
+                .. string.char(0x52, 0xae)
+      assert.is_true(script.has_multisig_op(s))
+      -- OP_CHECKMULTISIGVERIFY (0xaf) too
+      local s2 = string.char(0x52) .. string.char(33) .. pk
+                 .. string.char(33) .. pk
+                 .. string.char(0x52, 0xaf)
+      assert.is_true(script.has_multisig_op(s2))
+    end)
+
+    it("script.has_multisig_op ignores 0xae inside push payload", function()
+      -- A 33-byte push containing 0xae bytes followed by OP_CHECKSIG.
+      -- The 0xae bytes are inside the push, not opcodes.
+      local payload = string.rep("\xae", 33)
+      local s = string.char(33) .. payload .. string.char(0xac)  -- OP_CHECKSIG
+      assert.is_false(script.has_multisig_op(s))
+    end)
+
+    it("script.has_multisig_op false for P2PKH", function()
+      local p2pkh = string.char(0x76, 0xa9, 0x14) ..
+                    string.rep("\x01", 20) ..
+                    string.char(0x88, 0xac)
+      assert.is_false(script.has_multisig_op(p2pkh))
+    end)
+
+    it("collector inline mode: 2-of-3 valid sigs verify correctly", function()
+      -- Sign with keys 1 and 2 (positional match: keys 1 and 2 in the n=3
+      -- pubkey list). The multisig trial loop should pair them correctly.
+      local tx, redeem, keys = build_multisig_tx(2, 3, { 1, 2 })
+
+      -- Build the spending input with collected (m=2) sigs.
+      local script_sig = build_multisig_scriptsig({
+        keys[1].sig, keys[2].sig
+      }, redeem)
+      tx.inputs[1].script_sig = script_sig
+
+      -- Use the deferred-collect path with inline_verify gated by the
+      -- has_multisig scan.  P2SH classification: the redeem is in the
+      -- last push of script_sig.
+      local p2sh_script = script.make_p2sh_script(crypto.hash160(redeem))
+      assert.is_true(
+        script.has_multisig_op(redeem),
+        "redeem must trip the multisig scanner"
+      )
+
+      local flags = {
+        verify_p2sh = true,
+        verify_dersig = true,
+        verify_strictenc = true,
+      }
+      local collector = {}
+      local checker = validation.make_collecting_sig_checker(
+        tx, 0, 100000, p2sh_script, flags, collector, nil,
+        true  -- inline_verify=true (gated by has_multisig scan in connect_block)
+      )
+
+      local ok = script.verify_script(script_sig, p2sh_script, flags, checker)
+      assert.is_true(ok, "valid 2-of-3 multisig must verify under inline_verify")
+
+      -- Inline mode: nothing should be added to the collector because every
+      -- check_sig verified inline.
+      assert.equals(0, #collector)
+    end)
+
+    it("collector inline mode: 2-of-3 with one invalid sig fails", function()
+      -- Sign with key 1 (valid) and key 4-that-doesn't-exist (we corrupt
+      -- key 3's sig so it's invalid).  The trial loop should fail to pair.
+      local tx, redeem, keys = build_multisig_tx(2, 3, { 1, 2 })
+      -- Corrupt key 2's sig: zero out the DER body.  Trial pairing should
+      -- skip past key 2 (sig invalid for any pubkey) and fail because there
+      -- aren't enough valid sigs.
+      keys[2].sig = string.rep("\x00", #keys[2].sig - 1) .. string.char(0x01)
+
+      local script_sig = build_multisig_scriptsig({
+        keys[1].sig, keys[2].sig
+      }, redeem)
+      tx.inputs[1].script_sig = script_sig
+
+      local p2sh_script = script.make_p2sh_script(crypto.hash160(redeem))
+      local flags = {
+        verify_p2sh = true,
+        verify_dersig = true,
+        verify_strictenc = true,
+        verify_nullfail = true,
+      }
+      local collector = {}
+      local checker = validation.make_collecting_sig_checker(
+        tx, 0, 100000, p2sh_script, flags, collector, nil,
+        true  -- inline_verify=true
+      )
+
+      -- Pre-fix this would silently pass (collector returns true unconditionally,
+      -- batch verify catches it later but with a misleading "index N" error).
+      -- Post-fix, verify_script should reject it directly with NULLFAIL or
+      -- a script-eval failure during the multisig trial loop.
+      local ok, err = pcall(script.verify_script, script_sig, p2sh_script, flags, checker)
+      assert.is_false(
+        ok and err == true,
+        "invalid multisig sig must be rejected (got ok=" .. tostring(ok) ..
+        ", err=" .. tostring(err) .. ")"
+      )
+    end)
+
+    it("collector deferred mode: single-sig P2PKH still uses parallel batch", function()
+      -- P2PKH (no multisig): inline_verify=false, sig is appended to the
+      -- collector for batch verification at end-of-block. This is the
+      -- common-case parallel speedup path that we preserve.
+      local prev_hash = types.hash256(string.rep("\xcd", 32))
+      local tx = types.transaction(1, {}, {}, 0)
+      tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), "", 0xFFFFFFFF)
+      tx.outputs[1] = types.txout(50000, string.rep("\x00", 22))
+
+      local privkey = (string.format("%064x", 0xBEEF42)):gsub('..',
+        function(cc) return string.char(tonumber(cc, 16)) end)
+      local pubkey = crypto.pubkey_from_privkey(privkey, true)
+      local pkh = crypto.hash160(pubkey)
+      local p2pkh = script.make_p2pkh_script(pkh)
+      assert.is_false(script.has_multisig_op(p2pkh))
+
+      -- Sign
+      local hash_type = 0x01
+      local sighash = validation.signature_hash_legacy(tx, 0, p2pkh, hash_type, "")
+      local sig = crypto.ecdsa_sign(privkey, sighash) .. string.char(hash_type)
+
+      -- Build scriptSig: <sig> <pubkey>
+      tx.inputs[1].script_sig = string.char(#sig) .. sig ..
+                                string.char(#pubkey) .. pubkey
+
+      local flags = { verify_dersig = true, verify_strictenc = true }
+      local collector = {}
+      local checker = validation.make_collecting_sig_checker(
+        tx, 0, 50000, p2pkh, flags, collector, nil,
+        false  -- inline_verify=false: parallel speedup
+      )
+
+      local ok = script.verify_script(tx.inputs[1].script_sig, p2pkh, flags, checker)
+      assert.is_true(ok, "P2PKH must verify under deferred-collect")
+
+      -- Deferred mode: the sig should be in the collector, NOT inline-verified.
+      assert.equals(1, #collector,
+        "P2PKH (single check_sig) must defer 1 sig to the collector")
+      assert.equals(pubkey, collector[1].pubkey)
+    end)
+
+    it("collector cross-check: inline result == single-thread result on multisig", function()
+      -- Regression: replicate the OP_CHECKMULTISIG m-of-n trial-pairing on
+      -- a synthetic input and verify the parallel-verify path (collecting
+      -- + inline_verify) matches the single-threaded make_sig_checker path
+      -- bit-for-bit.
+      --
+      -- Specifically tests: 2-of-3 where the wallet provides sigs in the
+      -- canonical (sorted-by-pubkey-index) order. Both checkers must
+      -- accept it.
+      for _, signers in ipairs({ {1, 2}, {1, 3}, {2, 3} }) do
+        local tx, redeem, keys = build_multisig_tx(2, 3, signers)
+        local script_sig = build_multisig_scriptsig({
+          keys[signers[1]].sig, keys[signers[2]].sig
+        }, redeem)
+        tx.inputs[1].script_sig = script_sig
+
+        local p2sh_script = script.make_p2sh_script(crypto.hash160(redeem))
+        local flags = {
+          verify_p2sh = true,
+          verify_dersig = true,
+          verify_strictenc = true,
+        }
+
+        -- Single-threaded reference path
+        local serial_checker = validation.make_sig_checker(
+          tx, 0, 100000, p2sh_script, flags)
+        local serial_ok = script.verify_script(
+          script_sig, p2sh_script, flags, serial_checker)
+
+        -- Parallel-verify path with inline_verify=true (CHECKMULTISIG gate)
+        local collector = {}
+        local parallel_checker = validation.make_collecting_sig_checker(
+          tx, 0, 100000, p2sh_script, flags, collector, nil, true)
+        local parallel_ok = script.verify_script(
+          script_sig, p2sh_script, flags, parallel_checker)
+
+        assert.equals(serial_ok, parallel_ok,
+          string.format("signers=%d,%d: parallel(%s) != serial(%s)",
+            signers[1], signers[2],
+            tostring(parallel_ok), tostring(serial_ok)))
+        assert.is_true(parallel_ok,
+          string.format("signers=%d,%d should verify",
+            signers[1], signers[2]))
+      end
+    end)
+  end)
 end)
