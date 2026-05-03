@@ -2110,6 +2110,13 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             local witness = inp.witness or {}
             assert(#witness > 0, "taproot witness empty")
 
+            -- Capture the original full witness BEFORE annex strip — Core's
+            -- BIP-342 validation-weight budget seeds from
+            -- ::GetSerializeSize(witness.stack) (interpreter.cpp:1981) which
+            -- includes the annex when present. Used below to seed the
+            -- script-path tapscript executor.
+            local full_witness = inp.witness or {}
+
             -- Witness program is the 32-byte x-only output key
             local witness_program = utxo.script_pubkey:sub(3, 34)
 
@@ -2165,6 +2172,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               assert((#control_block - 33) % 32 == 0, "taproot invalid control block size")
 
               local leaf_version = bit.band(string.byte(control_block, 1), 0xFE)
+              local control_parity = bit.band(string.byte(control_block, 1), 0x01)
               local internal_key = string.sub(control_block, 2, 33)
 
               -- Compute tapleaf hash
@@ -2182,11 +2190,20 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
                 end
               end
 
-              -- Compute tweaked key and verify it matches the output key
+              -- Compute tweaked key and verify it matches BOTH the x-only
+              -- output key AND the parity bit. Core's CheckTapTweak passes
+              -- control[0] & 1 as the expected parity (interpreter.cpp:
+              -- VerifyTaprootCommitment); accepting only an x-coord match
+              -- would let a control_block with the wrong parity bit spend
+              -- through, splitting from Core (which rejects). The
+              -- P2SH-wrapped path at script.lua:1707-1717 already does
+              -- this — bring native P2TR to parity.
               local tweak = crypto.tagged_hash("TapTweak", internal_key .. current)
-              local tweaked_key = crypto.tweak_pubkey(internal_key, tweak)
+              local tweaked_key, tweaked_parity = crypto.tweak_pubkey(internal_key, tweak)
               assert(tweaked_key and tweaked_key == witness_program,
                 "taproot commitment mismatch")
+              assert(tweaked_parity == control_parity,
+                "taproot parity mismatch")
 
               -- Execute tapscript if leaf version is 0xC0 (BIP342)
               if leaf_version == 0xC0 then
@@ -2200,8 +2217,22 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
                 local tapscript_checker = validation.make_tapscript_checker(
                   tx, inp_idx - 1, prev_outputs, leaf_hash, annex)
 
+                -- BIP-342 validation-weight budget: seed from the FULL
+                -- witness stack (annex INCLUDED, control + script + args
+                -- INCLUDED), matching Core's
+                -- ::GetSerializeSize(witness.stack) at interpreter.cpp:1981.
+                -- Pre-fix this 3-arg call left the budget unseeded → per-
+                -- sigop deduction in CHECKSIG/CHECKSIGVERIFY/CHECKSIGADD
+                -- silently bypassed for the entire native P2TR script-path.
+                -- Adversarial tapscript with N CHECKSIGs s.t.
+                -- 50*N > witness_size + 50 would split lunarblock from Core
+                -- (Core rejects TAPSCRIPT_VALIDATION_WEIGHT, lunarblock
+                -- accepted).
+                local validation_weight =
+                  script.serialized_witness_stack_size(full_witness) + 50
+
                 local ok, err = script.verify_tapscript(
-                  tapscript, script_witness, tapscript_checker)
+                  tapscript, script_witness, tapscript_checker, validation_weight)
                 assert(ok, "tapscript execution failed: " .. (err or "unknown"))
               end
               -- Other leaf versions: succeed unconditionally (future soft fork)
