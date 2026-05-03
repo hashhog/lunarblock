@@ -1088,6 +1088,43 @@ function M.check_block_header(header, network)
 end
 
 --------------------------------------------------------------------------------
+-- BIP-34 Height Encoding
+--------------------------------------------------------------------------------
+
+--- Build the canonical BIP-34 byte encoding for a block height.
+-- Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448):
+--   height == 0  → "\x00"            (OP_0, single byte)
+--   1..16        → "\x51".."\x60"    (OP_1..OP_16, single byte)
+--   otherwise    → length-prefixed sign-magnitude CScriptNum
+-- @param height number: Block height (non-negative integer)
+-- @return string: Canonical byte string
+function M.encode_bip34_height(height)
+  if height == 0 then
+    return "\x00"  -- OP_0
+  end
+  if height >= 1 and height <= 16 then
+    return string.char(0x50 + height)  -- OP_1..OP_16
+  end
+  -- CScriptNum: minimal little-endian sign-magnitude with length prefix.
+  local le = {}
+  local h = height
+  while h > 0 do
+    le[#le + 1] = h % 256
+    h = math.floor(h / 256)
+  end
+  -- If high bit of last byte is set, append zero sign byte.
+  if le[#le] >= 0x80 then
+    le[#le + 1] = 0x00
+  end
+  -- Prepend length byte.
+  local bytes = { #le }
+  for _, b in ipairs(le) do
+    bytes[#bytes + 1] = b
+  end
+  return string.char(unpack(bytes))
+end
+
+--------------------------------------------------------------------------------
 -- Full Block Validation
 --------------------------------------------------------------------------------
 
@@ -1154,34 +1191,21 @@ function M.check_block(block, network, height)
   -- Verify witness commitment
   assert(M.check_witness_commitment(block), "witness commitment mismatch")
 
-  -- BIP34: height in coinbase scriptSig
+  -- BIP34: coinbase scriptSig must start with the byte-exact canonical
+  -- encoding of the block height.
+  -- Bitcoin Core validation.cpp:4151-4159:
+  --   CScript expect = CScript() << nHeight;
+  --   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
   if height and height >= network.bip34_height then
     local coinbase_sig = block.transactions[1].inputs[1].script_sig
-    if #coinbase_sig > 0 then
-      local first_byte = coinbase_sig:byte(1)
-      local encoded_height
-      if first_byte == 0x00 then
-        -- OP_0 pushes 0
-        encoded_height = 0
-      elseif first_byte >= 0x51 and first_byte <= 0x60 then
-        -- OP_1 through OP_16 push values 1-16
-        encoded_height = first_byte - 0x50
-      elseif first_byte == 0x4f then
-        -- OP_1NEGATE pushes -1
-        encoded_height = -1
-      elseif first_byte >= 1 and first_byte <= 4 and #coinbase_sig >= first_byte + 1 then
-        -- Standard BIP34: first byte is push length (1-4), followed by LE height
-        encoded_height = 0
-        for i = 1, first_byte do
-          encoded_height = encoded_height + coinbase_sig:byte(i + 1) * (256 ^ (i - 1))
-        end
-      else
-        error("invalid BIP34 height encoding")
-      end
-      assert(encoded_height == height,
-             "BIP34 height mismatch: expected " .. height .. ", got " .. encoded_height)
-    else
-      error("empty coinbase scriptSig (BIP34 requires height)")
+    local expect = M.encode_bip34_height(height)
+    local n = #expect
+    assert(#coinbase_sig >= n, "BIP34: coinbase scriptSig too short for height " .. height)
+    for i = 1, n do
+      assert(coinbase_sig:byte(i) == expect:byte(i),
+             "BIP34 height mismatch at byte " .. i ..
+             ": expected " .. string.format("0x%02x", expect:byte(i)) ..
+             " got " .. string.format("0x%02x", coinbase_sig:byte(i)))
     end
   end
 
