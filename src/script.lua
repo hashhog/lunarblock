@@ -85,6 +85,38 @@ local MAX_STACK_SIZE = 1000
 local MAX_SCRIPT_ELEMENT_SIZE = 520
 local MAX_SCRIPT_SIZE = 10000
 
+-- BIP-342 tapscript validation-weight constants (script.h):
+--   VALIDATION_WEIGHT_OFFSET            = 50  (initial budget bump)
+--   VALIDATION_WEIGHT_PER_SIGOP_PASSED  = 50  (per-sigop deduction)
+local VALIDATION_WEIGHT_OFFSET = 50
+local VALIDATION_WEIGHT_PER_SIGOP_PASSED = 50
+
+--- Compute the byte length of a Bitcoin compact-size encoding for n.
+-- Mirrors Core's GetSizeOfCompactSize (serialize.h):
+--   <  0xfd            -> 1 byte
+--   <= 0xffff          -> 3 bytes
+--   <= 0xffffffff      -> 5 bytes
+--   else               -> 9 bytes
+function M.compact_size_len(n)
+  if n < 0xfd then return 1 end
+  if n <= 0xffff then return 3 end
+  if n <= 0xffffffff then return 5 end
+  return 9
+end
+
+--- Compute the on-the-wire serialized size of a witness stack the way
+-- Core's `::GetSerializeSize(witness.stack)` does it: a compact-size
+-- item count followed by, for each item, its compact-size length
+-- prefix and the item bytes themselves. Used to seed the BIP-342
+-- tapscript validation-weight budget at the leaf entry point.
+function M.serialized_witness_stack_size(items)
+  local total = M.compact_size_len(#items)
+  for _, it in ipairs(items) do
+    total = total + M.compact_size_len(#it) + #it
+  end
+  return total
+end
+
 -- Check if a public key is compressed (33 bytes, starts with 0x02 or 0x03)
 local function is_compressed_pubkey(pubkey)
   if #pubkey ~= 33 then
@@ -1176,6 +1208,22 @@ function M.execute_script(script_bytes, stack, flags, checker)
 
       -- BIP342: Tapscript-specific OP_CHECKSIG behavior
       if flags.is_tapscript then
+        -- BIP-342 validation-weight budget: decrement by 50 BEFORE
+        -- pubkey inspection, gated on #sig > 0 AND init. Mirrors Core's
+        -- success = !sig.empty() check at interpreter.cpp:357-366.
+        -- Per Core's comment, "Passing with an upgradable public key
+        -- version is also counted", so the deduction fires before the
+        -- 32-byte vs unknown branching below. The init guard mirrors
+        -- Core's m_validation_weight_left_init: direct test entries
+        -- that don't go through verify_witness_program don't seed the
+        -- budget and are not consensus paths.
+        if #sig > 0 and flags.validation_weight_init then
+          flags.validation_weight_left =
+            flags.validation_weight_left - VALIDATION_WEIGHT_PER_SIGOP_PASSED
+          if flags.validation_weight_left < 0 then
+            return nil, "TAPSCRIPT_VALIDATION_WEIGHT"
+          end
+        end
         -- Empty pubkey (0 bytes) is a consensus error in tapscript
         if #pubkey == 0 then
           return nil, "TAPSCRIPT_EMPTY_PUBKEY"
@@ -1223,6 +1271,14 @@ function M.execute_script(script_bytes, stack, flags, checker)
       local sig = pop()
 
       if flags.is_tapscript then
+        -- BIP-342 validation-weight budget: same gate as CHECKSIG.
+        if #sig > 0 and flags.validation_weight_init then
+          flags.validation_weight_left =
+            flags.validation_weight_left - VALIDATION_WEIGHT_PER_SIGOP_PASSED
+          if flags.validation_weight_left < 0 then
+            return nil, "TAPSCRIPT_VALIDATION_WEIGHT"
+          end
+        end
         if #pubkey == 0 then
           return nil, "TAPSCRIPT_EMPTY_PUBKEY"
         end
@@ -1429,6 +1485,21 @@ function M.execute_script(script_bytes, stack, flags, checker)
       local pubkey = pop()
       local n = pop_num()
       local sig = pop()
+      -- BIP-342 validation-weight budget: decrement by 50 BEFORE pubkey
+      -- inspection / Schnorr verify, gated on #sig > 0. Empty sigs do
+      -- NOT consume budget — Core only decrements when
+      -- `success = !sig.empty()` (interpreter.cpp:357-366).
+      -- Only consult the counter when the budget has been seeded
+      -- (verify_witness_program seeds it for the BIP-342 leaf entry).
+      -- Direct test entries that drive CHECKSIGADD without going through
+      -- the v1 entry don't seed the budget and are not consensus paths.
+      if #sig > 0 and flags.validation_weight_init then
+        flags.validation_weight_left =
+          flags.validation_weight_left - VALIDATION_WEIGHT_PER_SIGOP_PASSED
+        if flags.validation_weight_left < 0 then
+          return nil, "TAPSCRIPT_VALIDATION_WEIGHT"
+        end
+      end
       local valid = false
       if checker.check_sig then
         valid = checker.check_sig(sig, pubkey)
@@ -1651,6 +1722,15 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
         local tap_flags = {}
         for k, v in pairs(flags) do tap_flags[k] = v end
         tap_flags.is_tapscript = true
+
+        -- BIP-342 validation-weight budget (interpreter.cpp:1981):
+        --   m_validation_weight_left = GetSerializeSize(witness.stack)
+        --                              + VALIDATION_WEIGHT_OFFSET (50)
+        -- `witness` here is the ORIGINAL pre-pop stack (annex INCLUDED,
+        -- control block + script INCLUDED, args INCLUDED), matching
+        -- what Core passes to ::GetSerializeSize(witness.stack).
+        tap_flags.validation_weight_left = M.serialized_witness_stack_size(witness) + 50
+        tap_flags.validation_weight_init = true
 
         return M.execute_witness_script(tap_script, tap_stack, tap_flags, checker)
       else
