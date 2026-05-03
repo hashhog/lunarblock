@@ -416,6 +416,14 @@ function M.new(config)
   self.pruner = config.pruner
   self.running = false
   self.request_wallet = nil  -- Current request's wallet context
+  -- NetworkDisable flag: when true, `submitblock` and any P2P
+  -- block-handler callsite that consults this flag must refuse new
+  -- blocks. Set during `dumptxoutset rollback`'s rewind→dump→replay
+  -- dance to mirror Bitcoin Core's NetworkDisable RAII guard around
+  -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset. Peers stay
+  -- connected; only block acceptance is gated. Lua single-threaded so
+  -- a plain boolean is sufficient.
+  self.block_submission_paused = false
   -- Register built-in methods
   self:register_methods()
   return self
@@ -4259,6 +4267,14 @@ function RPCServer:register_methods()
   --- submitblock: Submit a new block to the network.
   -- @param hexdata string: Block data in hex
   self.methods["submitblock"] = function(rpc, params)
+    -- NetworkDisable gate: refuse submissions while a `dumptxoutset
+    -- rollback` rewind→dump→replay dance is in progress. Mirrors
+    -- Bitcoin Core's NetworkDisable RAII around TemporaryRollback in
+    -- rpc/blockchain.cpp::dumptxoutset.
+    if rpc.block_submission_paused then
+      return "rejected: block submission paused (dumptxoutset rollback in progress)"
+    end
+
     local hexdata = params[1]
     if type(hexdata) ~= "string" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Block hex data required"})
@@ -4804,47 +4820,80 @@ function RPCServer:register_methods()
     local utxo_mod = require("lunarblock.utxo")
     local _ = utxo_mod  -- chain_state methods dispatch via :method
 
-    -- Stage 1: roll back if requested.
-    local disconnected = nil
-    if target_height ~= nil and target_height < (current_tip_height or 0) then
-      local list, rerr = rpc.chain_state:rollback_chain_to(target_height)
-      if not list then
-        error({code = M.ERROR.MISC_ERROR,
-          message = "Could not roll back to requested height: "
-            .. tostring(rerr)})
-      end
-      disconnected = list
+    -- NetworkDisable RAII (Lua pcall + finally pattern). Mirrors
+    -- Bitcoin Core's NetworkDisable wrapper around TemporaryRollback in
+    -- rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance
+    -- for the duration of the rewind→dump→replay dance and restore on
+    -- every exit path (success, error). Only activate when there's
+    -- actual rewind work; a "latest" dump doesn't need the gate.
+    local network_pause_active =
+      target_height ~= nil and target_height < (current_tip_height or 0)
+    if network_pause_active then
+      rpc.block_submission_paused = true
     end
 
-    -- Stage 2: dump.  If the dump fails we still try to re-apply the
-    -- disconnected blocks so the node is left at the original tip.
-    local tmppath = path .. ".incomplete"
-    local result, err = rpc.chain_state:dump_snapshot(tmppath)
+    -- Wrap the rewind→dump→replay dance in a pcall so any error
+    -- (Lua-style table error or runtime exception) lands in `caught`
+    -- and we always clear the pause flag. If `caught` is non-nil we
+    -- re-throw it after the flag is restored.
+    local result, err
+    local rok, caught = pcall(function()
+      -- Stage 1: roll back if requested.
+      local disconnected = nil
+      if target_height ~= nil and target_height < (current_tip_height or 0) then
+        local list, rerr = rpc.chain_state:rollback_chain_to(target_height)
+        if not list then
+          error({code = M.ERROR.MISC_ERROR,
+            message = "Could not roll back to requested height: "
+              .. tostring(rerr)})
+        end
+        disconnected = list
+      end
 
-    -- Stage 3: re-apply if we rolled back.  This must run regardless of
-    -- whether the dump succeeded, otherwise a failed dump would leave
-    -- the node stuck at the rollback height.
-    if disconnected and #disconnected > 0 then
-      local rok, rerr = rpc.chain_state:reapply_disconnected(disconnected)
-      if not rok then
+      -- Stage 2: dump.  If the dump fails we still try to re-apply the
+      -- disconnected blocks so the node is left at the original tip.
+      local tmppath = path .. ".incomplete"
+      local r, e = rpc.chain_state:dump_snapshot(tmppath)
+      result = r
+      err = e
+
+      -- Stage 3: re-apply if we rolled back.  This must run regardless of
+      -- whether the dump succeeded, otherwise a failed dump would leave
+      -- the node stuck at the rollback height.
+      if disconnected and #disconnected > 0 then
+        local rok2, rerr = rpc.chain_state:reapply_disconnected(disconnected)
+        if not rok2 then
+          os.remove(tmppath)
+          error({code = M.ERROR.MISC_ERROR,
+            message = "rollback dump succeeded but re-applying blocks "
+              .. "failed: " .. tostring(rerr)
+              .. " (chain may need reindex)"})
+        end
+      end
+
+      if not result then
+        os.remove(tmppath)
+        error({code = M.ERROR.MISC_ERROR, message = err or "dump failed"})
+      end
+
+      local rok3, rerr3 = os.rename(tmppath, path)
+      if not rok3 then
         os.remove(tmppath)
         error({code = M.ERROR.MISC_ERROR,
-          message = "rollback dump succeeded but re-applying blocks "
-            .. "failed: " .. tostring(rerr)
-            .. " (chain may need reindex)"})
+          message = "rename failed: " .. tostring(rerr3)})
       end
+    end)
+
+    -- NetworkDisable RAII restore (covers success AND pcall-caught
+    -- error). Done before re-throwing so subsequent submitblock
+    -- requests don't see stale state.
+    if network_pause_active then
+      rpc.block_submission_paused = false
     end
 
-    if not result then
-      os.remove(tmppath)
-      error({code = M.ERROR.MISC_ERROR, message = err or "dump failed"})
-    end
-
-    local rok, rerr = os.rename(tmppath, path)
     if not rok then
-      os.remove(tmppath)
-      error({code = M.ERROR.MISC_ERROR,
-        message = "rename failed: " .. tostring(rerr)})
+      -- Re-throw the caught error to the outer JSON-RPC dispatch.
+      error(caught)
     end
 
     local base_hash_hex = types.hash256_hex(result.base_blockhash)
