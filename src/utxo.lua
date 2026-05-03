@@ -8,6 +8,7 @@ local script = require("lunarblock.script")
 local storage_mod = require("lunarblock.storage")
 local perf = require("lunarblock.perf")
 local sig_cache = require("lunarblock.sig_cache")
+local mining = require("lunarblock.mining")
 local bit = require("bit")
 local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 local M = {}
@@ -1790,6 +1791,22 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- Check if BIP68 (CSV) is active at this height
   local enforce_bip68 = height >= self.network.csv_height
 
+  -- ContextualCheckBlock: enforce IsFinalTx for every transaction
+  -- (Bitcoin Core validation.cpp:4146). Consensus rule — runs even under
+  -- skip_script_validation (assumevalid only skips script verification).
+  -- lock_time_cutoff = MTP when BIP-113/CSV is active, block timestamp otherwise.
+  local lock_time_cutoff
+  if enforce_bip68 and prev_block_mtp then
+    lock_time_cutoff = prev_block_mtp
+  else
+    lock_time_cutoff = block.header.timestamp
+  end
+  for _, tx in ipairs(block.transactions) do
+    if not mining.is_final_tx(tx, height, lock_time_cutoff) then
+      return nil, "non-final transaction: bad-txns-nonfinal"
+    end
+  end
+
   -- Flags for sigop counting (depends on height)
   local sigop_flags = {
     verify_p2sh = height >= self.network.bip34_height,
@@ -1928,6 +1945,10 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             goto skip_verification
           end
 
+          -- Consensus-only script flags (MANDATORY_SCRIPT_VERIFY_FLAGS parity).
+          -- verify_nullfail and verify_witness_pubkeytype are policy-only
+          -- (STANDARD_SCRIPT_VERIFY_FLAGS per Bitcoin Core policy/policy.h:125,128)
+          -- and must NOT be set in the block-connect validation path.
           local flags = {
             verify_p2sh = height >= self.network.bip34_height,
             verify_dersig = height >= self.network.bip66_height,
@@ -1935,8 +1956,6 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             verify_checksequenceverify = height >= self.network.csv_height,
             verify_witness = height >= self.network.segwit_height,
             verify_nulldummy = height >= self.network.segwit_height,
-            verify_nullfail = height >= self.network.segwit_height,
-            verify_witness_pubkeytype = height >= self.network.segwit_height,
             verify_taproot = height >= self.network.taproot_height,
           }
 
