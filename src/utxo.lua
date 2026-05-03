@@ -1799,28 +1799,33 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- Determine if we should use parallel verification
   -- Auto-detect: use parallel if available and block has enough inputs
   --
-  -- 2026-05-02: Disabled by default. The deferred-collect path is broken
-  -- for OP_CHECKMULTISIG: make_collecting_sig_checker.check_sig returns
-  -- true unconditionally so script.lua's OP_CHECKMULTISIG advances
-  -- isig/ikey on what would be a FAILING (sig, pubkey) pair under
-  -- immediate-verify semantics, then the batch ECDSA pass at the end
-  -- rejects those mismatched pairs. Symptom on mainnet block 944,184
-  -- (post-snapshot, post-assumevalid): "Parallel signature verification
-  -- failed: signature verification failed at index 19".
+  -- 2026-05-02 (initial): deferred-collect was broken for OP_CHECKMULTISIG:
+  -- make_collecting_sig_checker.check_sig returned true unconditionally so
+  -- script.lua's OP_CHECKMULTISIG advanced isig/ikey on what would be a
+  -- FAILING (sig, pubkey) pair under immediate-verify semantics, then the
+  -- batch ECDSA pass at the end rejected those mismatched pairs. Symptom
+  -- on mainnet block 944,184 (post-snapshot, post-assumevalid): "Parallel
+  -- signature verification failed: signature verification failed at
+  -- index 19".
   --
-  -- Until a CHECKMULTISIG-aware deferred path lands, force use_parallel_verify=false
-  -- so blocks go through make_sig_checker (immediate verify in Lua).
-  -- The C parallel_verify pool remains correct in isolation (the pool
-  -- drains, lax DER + S normalize match Core) — only the Lua-side
-  -- collector wrapping it is wrong. When fixed, flip the gate via the
-  -- LUNARBLOCK_PARALLEL_VERIFY env var without re-touching the gating
-  -- logic.
+  -- 2026-05-02 (fix): script.has_multisig_op now lets the per-input call
+  -- site detect CHECKMULTISIG-bearing scripts and pass inline_verify=true
+  -- to make_collecting_sig_checker. The collector then verifies inline
+  -- (returning the real result) for those inputs while non-multisig
+  -- inputs (single-sig P2WPKH/P2PKH/P2TR keypath — the dominant case)
+  -- still get the parallel batch speedup. Default flipped back ON.
+  --
+  -- The LUNARBLOCK_PARALLEL_VERIFY env var is preserved as a
+  -- belt-and-suspenders kill switch:
+  --   - "0" or "off" → force off (emergency disable, never use parallel)
+  --   - unset / anything else → default on (auto-detect by input count)
   local parallel_available = validation.parallel_verify_available()
-  local parallel_force_on = os.getenv("LUNARBLOCK_PARALLEL_VERIFY") == "1"
+  local parallel_env = os.getenv("LUNARBLOCK_PARALLEL_VERIFY")
+  local parallel_kill_switch = (parallel_env == "0") or (parallel_env == "off")
   local use_parallel_verify = false
   if use_parallel == nil then
-    -- Auto: opt-in only. CHECKMULTISIG correctness gap blocks default-on.
-    if parallel_force_on and parallel_available and not skip_script_validation then
+    -- Auto: ON by default. Disabled only if kill switch set or pool unavailable.
+    if not parallel_kill_switch and parallel_available and not skip_script_validation then
       local total_inputs = 0
       for i = 2, #block.transactions do  -- Skip coinbase
         total_inputs = total_inputs + #block.transactions[i].inputs
@@ -1828,7 +1833,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       use_parallel_verify = total_inputs >= 16
     end
   else
-    use_parallel_verify = use_parallel and parallel_available
+    use_parallel_verify = use_parallel and parallel_available and not parallel_kill_switch
   end
 
   -- Collect signatures for parallel verification
@@ -1949,14 +1954,63 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             return tx_prev_outputs
           end
 
+          -- Determine which scripts to run based on output type. We classify
+          -- BEFORE creating the checker so we can decide inline_verify for
+          -- the deferred-collect path (CHECKMULTISIG correctness gate, see
+          -- make_collecting_sig_checker for full rationale).
+          local script_type = script.classify_script(utxo.script_pubkey)
+
+          -- Scan for OP_CHECKMULTISIG/CHECKMULTISIGVERIFY in any script that
+          -- will be executed against the legacy/P2SH `checker` below. The
+          -- script_sig itself is normally push-only sig+pubkey data, but
+          -- two cases reach inner scripts that may contain multisig:
+          --   (a) P2SH: the redeem script is the LAST push of script_sig.
+          --   (b) P2SH-wrapped witness (P2SH-P2WPKH / P2SH-P2WSH): the
+          --       redeem is a witness program; the actual sig-bearing script
+          --       is then the witness script (last witness item) for P2WSH.
+          --       P2SH-P2WPKH is synthetic P2PKH (no multisig). For P2SH-P2WSH
+          --       we additionally scan the witness script.
+          --   (c) Plain script_pubkey contains the multisig opcode (bare
+          --       multisig, sometimes still seen on mainnet).
+          local legacy_has_multisig = false
+          if script.has_multisig_op(utxo.script_pubkey) then
+            legacy_has_multisig = true
+          elseif flags.verify_p2sh and script_type == "p2sh" then
+            local redeem = script.extract_last_push(inp.script_sig)
+            if redeem then
+              if script.has_multisig_op(redeem) then
+                legacy_has_multisig = true
+              elseif flags.verify_witness then
+                -- P2SH-P2WSH: redeem is a witness v0 program 0x00 0x20 <h32>;
+                -- the actual sig-bearing script is the last witness item.
+                local wv, wp = script.is_witness_program(redeem)
+                if wv == 0 and wp and #wp == 32 then
+                  -- P2WSH inner: witness script is the last witness item.
+                  local witness_stack = inp.witness or {}
+                  if #witness_stack > 0 then
+                    local inner_ws = witness_stack[#witness_stack]
+                    if inner_ws and script.has_multisig_op(inner_ws) then
+                      legacy_has_multisig = true
+                    end
+                  end
+                end
+                -- P2SH-P2WPKH (wv=0, #wp=20) is synthetic P2PKH — no multisig.
+                -- Witness v1 (taproot) doesn't use the legacy checker for
+                -- ECDSA, and tapscript disables CHECKMULTISIG anyway.
+              end
+            end
+          end
+
           -- Select checker: collecting (deferred ECDSA) when parallel mode
           -- is active, or immediate when serial.  Taproot (Schnorr) is always
           -- verified immediately — only ECDSA is deferred to the batch pass.
+          -- Inline-verify is forced when CHECKMULTISIG is reachable so the
+          -- script's m-of-n trial pairing sees real check_sig results.
           local checker
           if use_parallel_verify then
             checker = validation.make_collecting_sig_checker(
               tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs,
-              get_tx_prev_outputs()
+              get_tx_prev_outputs(), legacy_has_multisig
             )
           else
             checker = validation.make_sig_checker(
@@ -1965,9 +2019,6 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             )
           end
 
-          -- Determine which scripts to run based on output type
-          local script_type = script.classify_script(utxo.script_pubkey)
-
           if script_type == "p2wpkh" or script_type == "p2wsh" then
             -- SegWit: scriptSig must be empty, use witness stack
             assert(#inp.script_sig == 0, "SegWit input must have empty scriptSig")
@@ -1975,6 +2026,8 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             local witness_stack = inp.witness or {}
             if script_type == "p2wpkh" then
               -- P2WPKH: witness = {sig, pubkey}, execute synthetic P2PKH
+              -- The synthetic script is OP_DUP OP_HASH160 <20> OP_EQUALVERIFY
+              -- OP_CHECKSIG — never multisig — so inline_verify=false.
               assert(#witness_stack == 2, "P2WPKH requires exactly 2 witness items")
               local pkh = utxo.script_pubkey:sub(3, 22)
               local synthetic_script = script.make_p2pkh_script(pkh)
@@ -1986,7 +2039,8 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               local segwit_checker
               if use_parallel_verify then
                 segwit_checker = validation.make_collecting_sig_checker(
-                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs,
+                  nil, false
                 )
               else
                 segwit_checker = validation.make_sig_checker(
@@ -2011,10 +2065,15 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               segwit_flags.is_segwit = true
               segwit_flags.is_witness_v0 = true  -- Enable WITNESS_PUBKEYTYPE check
               segwit_flags.witness_script = witness_script
+              -- Scan the witness script: P2WSH multisig is the canonical place
+              -- for modern multisig. CHECKMULTISIG inside witness_script must
+              -- gate inline verify or the m-of-n trial pairing breaks.
+              local p2wsh_has_multisig = script.has_multisig_op(witness_script)
               local segwit_checker
               if use_parallel_verify then
                 segwit_checker = validation.make_collecting_sig_checker(
-                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs,
+                  nil, p2wsh_has_multisig
                 )
               else
                 segwit_checker = validation.make_sig_checker(

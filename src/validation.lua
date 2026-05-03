@@ -1595,14 +1595,29 @@ end
 -- verify immediately.  Only ECDSA (the bottleneck for pre-taproot blocks) is
 -- deferred.
 --
+-- CHECKMULTISIG inline-verify mode (2026-05-02 fix): If `inline_verify` is
+-- truthy, check_sig performs ECDSA verification inline and returns the real
+-- result — bypassing the collector. This is required for OP_CHECKMULTISIG /
+-- OP_CHECKMULTISIGVERIFY whose `m`-of-`n` trial-and-error pairing in
+-- script.lua advances `isig`/`ikey` based on the boolean returned by
+-- check_sig. With deferred-collect (always-true return) the trial loop
+-- silently advances on FAILED pairs and the batch pass at the end then
+-- rejects the wrong (sig, pubkey) tuples — observed at h=944,184. Callers
+-- in connect_block scan the relevant scripts (script.has_multisig_op +
+-- extract_last_push for P2SH redeem) and set inline_verify=true when any
+-- multisig opcode is reachable. Other scripts (single-sig P2WPKH/P2PKH,
+-- P2TR keypath) keep the parallel speedup.
+--
 -- @param tx transaction: The transaction being verified
 -- @param input_index number: 0-based input index
 -- @param prev_output_value number: Satoshi value of the prev output
 -- @param prev_script_pubkey string: scriptPubKey of the prev output
 -- @param flags table: Script verification flags
 -- @param collector table: Array to append {pubkey, sig_der, sighash} to
+-- @param prev_outputs table|nil: Per-input prev_outputs for taproot key-path
+-- @param inline_verify boolean|nil: If true, verify ECDSA inline (CHECKMULTISIG)
 -- @return table: Checker compatible with make_sig_checker interface
-function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector, prev_outputs)
+function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector, prev_outputs, inline_verify)
   flags = flags or {}
   local checker = {}
 
@@ -1624,10 +1639,10 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
     return {}
   end
 
-  --- Deferred ECDSA check: compute sighash immediately (must happen in script
-  -- execution order) but push (pubkey, sig_der, sighash) to collector instead
-  -- of calling ecdsa_verify.  Returns true (optimistic) so script execution
-  -- can continue; the batch verify pass at the end will catch any failures.
+  --- ECDSA check: in deferred mode, compute sighash and push (pubkey, sig_der,
+  -- sighash) to the collector for batch verification at end-of-block.  In
+  -- inline mode (CHECKMULTISIG-bearing scripts) verify immediately and
+  -- return the real result so OP_CHECKMULTISIG's trial pairing works.
   function checker.check_sig(sig, pubkey)
     if #sig == 0 then
       return false
@@ -1661,6 +1676,17 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
       sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
     else
       sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig)
+    end
+
+    if inline_verify then
+      -- Inline ECDSA: required for OP_CHECKMULTISIG correctness. The
+      -- trial-and-error pairing loop in script.lua's CHECKMULTISIG handler
+      -- depends on the *real* verify result.
+      if flags.verify_dersig or flags.verify_strictenc or flags.verify_low_s then
+        return crypto.ecdsa_verify(pubkey, sig_der, sighash)
+      else
+        return crypto.ecdsa_verify_lax(pubkey, sig_der, sighash)
+      end
     end
 
     -- Push to collector for deferred parallel ECDSA verification

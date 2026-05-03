@@ -623,6 +623,83 @@ function M.is_push_only(script_bytes)
   return true
 end
 
+--- Check if a script contains OP_CHECKMULTISIG or OP_CHECKMULTISIGVERIFY.
+-- Walks the script in opcode order, skipping push payloads correctly so a
+-- 0xae byte INSIDE a push (e.g. inside a 33-byte pubkey) is not mistaken
+-- for an opcode. Used by the parallel-verify collector to gate the
+-- inline-verify path: CHECKMULTISIG's trial-and-error sig/key pairing
+-- depends on check_sig returning the *real* verify result, which the
+-- deferred collector cannot do (collected sigs are batch-verified after
+-- the script runs). For scripts with multisig, we fall back to inline
+-- verify; for everything else we keep the parallel speedup.
+--
+-- This is a fast hot-path scanner. It does NOT try to handle malformed
+-- scripts; on a parse error it returns false (the conservative default
+-- that avoids classifying garbage as multisig). The script engine will
+-- catch parse errors at execution time.
+--
+-- @param script_bytes string: The raw script bytes
+-- @return boolean: true if any 0xae or 0xaf occurs as an opcode
+function M.has_multisig_op(script_bytes)
+  if not script_bytes or #script_bytes == 0 then
+    return false
+  end
+  local len = #script_bytes
+  local pos = 1
+  while pos <= len do
+    local opcode = script_bytes:byte(pos)
+    pos = pos + 1
+    if opcode >= 0x01 and opcode <= 0x4b then
+      -- Direct push: skip N data bytes
+      pos = pos + opcode
+    elseif opcode == 0x4c then
+      -- OP_PUSHDATA1
+      if pos > len then return false end
+      local data_len = script_bytes:byte(pos)
+      pos = pos + 1 + data_len
+    elseif opcode == 0x4d then
+      -- OP_PUSHDATA2
+      if pos + 1 > len then return false end
+      local data_len = script_bytes:byte(pos) + script_bytes:byte(pos + 1) * 256
+      pos = pos + 2 + data_len
+    elseif opcode == 0x4e then
+      -- OP_PUSHDATA4
+      if pos + 3 > len then return false end
+      local b1, b2, b3, b4 = script_bytes:byte(pos, pos + 3)
+      local data_len = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+      pos = pos + 4 + data_len
+    elseif opcode == 0xae or opcode == 0xaf then
+      -- OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY as an opcode.
+      return true
+    end
+    -- Other opcodes: just advance (already done above).
+  end
+  return false
+end
+
+--- Extract the last push payload from a script.
+-- Used to find the P2SH redeem script (which is the last push of the
+-- input's scriptSig). Returns nil if the script ends on a non-push or
+-- on a parse error.
+-- @param script_bytes string: The raw script bytes
+-- @return string|nil: the last push payload, or nil
+function M.extract_last_push(script_bytes)
+  if not script_bytes or #script_bytes == 0 then
+    return nil
+  end
+  local ok, ops = pcall(M.parse_script, script_bytes)
+  if not ok or not ops or #ops == 0 then
+    return nil
+  end
+  local last = ops[#ops]
+  if last.opcode <= M.OP.OP_PUSHDATA4 and last.data ~= nil then
+    return last.data
+  end
+  -- Numeric pushes (OP_1NEGATE, OP_1..OP_16) are technically pushes too, but
+  -- they don't carry a redeem-script payload, so return nil.
+  return nil
+end
+
 -- Check if an opcode counts towards the 201 limit (non-push opcodes)
 local function is_counted_opcode(opcode)
   return opcode > M.OP.OP_16
