@@ -242,8 +242,9 @@ describe("consensus", function()
         assert.is_true(regtest.pow_no_retarget)
       end)
 
-      it("has all soft forks at height 0", function()
-        assert.equals(0, regtest.bip34_height)
+      it("has BIP-34 at height 1 and other soft forks at height 0", function()
+        -- Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1 for regtest
+        assert.equals(1, regtest.bip34_height)
         assert.equals(0, regtest.bip65_height)
         assert.equals(0, regtest.bip66_height)
         assert.equals(0, regtest.segwit_height)
