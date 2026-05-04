@@ -440,7 +440,18 @@ local secp_ctx = libsecp256k1.secp256k1_context_create(
   bit.bor(0x0101, 0x0201)  -- VERIFY | SIGN
 )
 
--- Verify an ECDSA signature (DER-encoded) against a message hash and public key
+-- Verify an ECDSA signature (DER-encoded) against a message hash and public key.
+-- NOTE: secp256k1_ecdsa_verify only accepts normalised (low-S) signatures.
+-- Bitcoin Core consensus (GetBlockScriptFlags) does NOT include
+-- SCRIPT_VERIFY_LOW_S for pre-segwit spends (BIP-146 / policy/policy.h) —
+-- so a high-S signature that is otherwise DER-valid is a consensus-valid
+-- spend.  We must normalise the parsed signature before calling
+-- secp256k1_ecdsa_verify so that high-S sigs are accepted when the flag
+-- is absent.  The low-S *rejection* check is handled separately by
+-- check_signature_encoding in script.lua, gated on flags.verify_low_s.
+-- Reference: secp256k1.h "secp256k1_ecdsa_signature_normalize must be
+-- called before verification" when the signature source cannot guarantee
+-- low-S; parallel_verify.c applies the same normalise-then-verify idiom.
 function M.ecdsa_verify(pubkey_bytes, sig_der, msg_hash32)
   local pubkey = ffi.new("secp256k1_pubkey")
   if libsecp256k1.secp256k1_ec_pubkey_parse(
@@ -455,6 +466,12 @@ function M.ecdsa_verify(pubkey_bytes, sig_der, msg_hash32)
   ) ~= 1 then
     return false, "invalid DER signature"
   end
+
+  -- Normalise to low-S form before verification.  secp256k1_ecdsa_verify
+  -- rejects high-S signatures; normalising here does not enforce the
+  -- LOW_S policy — that is handled by check_signature_encoding (script.lua)
+  -- when flags.verify_low_s is set (mempool / standard path only).
+  libsecp256k1.secp256k1_ecdsa_signature_normalize(secp_ctx, sig, sig)
 
   local result = libsecp256k1.secp256k1_ecdsa_verify(secp_ctx, sig, msg_hash32, pubkey)
   return result == 1
