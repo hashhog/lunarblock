@@ -60,6 +60,12 @@ local function bip22_result(err)
     return "bad-witness-merkle-match"
   end
 
+  -- Coinbase scriptSig length (consensus/tx_check.cpp "bad-cb-length"; 2..100 bytes)
+  -- Must precede the generic "script" catch below.
+  if s:find("coinbase scriptsig") and (s:find("too long") or s:find("too short") or s:find("out of range")) then
+    return "bad-cb-length"
+  end
+
   -- Coinbase value / subsidy
   if s:find("coinbase amount") or s:find("subsidy") or s:find("coinbase value") then
     return "bad-cb-amount"
@@ -4514,14 +4520,15 @@ function RPCServer:register_methods()
         )
       end
 
-      local ok_conn, conn_err = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, skip_scripts, nil, nosync, store_batch_fn)
+      local ok_conn, conn_ret1, conn_ret2 = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, skip_scripts, nil, nosync, store_batch_fn)
       local t_connect = os.clock()
       if not ok_conn then
-        -- Map internal connect_block error strings to canonical BIP-22 strings
-        return bip22_result(conn_err)
+        -- connect_block threw an error (conn_ret1 is the error message)
+        return bip22_result(conn_ret1)
       end
-      if not conn_err then
-        return "rejected"
+      if not conn_ret1 then
+        -- connect_block returned (nil, error_string) — normal failure path
+        return bip22_result(conn_ret2 or "rejected")
       end
 
       -- Periodic timing log
