@@ -40,7 +40,7 @@ local function bip22_result(err)
     ["bad-witness-merkle-match"] = true, ["bad-cb-amount"] = true,
     ["bad-blk-sigops"] = true, ["bad-cb-height"] = true,
     ["bad-txns-nonfinal"] = true, ["bad-txns-duplicate"] = true,
-    ["rejected"] = true, ["mandatory-script-verify-flag-failed"] = true,
+    ["rejected"] = true, ["block-script-verify-flag-failed"] = true,
     ["bad-txns-inputs-missingorspent"] = true,
   }
   if canonical[s] then return s end
@@ -113,10 +113,12 @@ local function bip22_result(err)
     return "bad-txns-vout-toolarge"
   end
 
-  -- Script / signature verification
+  -- Script / signature verification failures at connect-block stage.
+  -- Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
+  -- Covers disabled opcodes (OP_CAT 0x7e + 14 peers), signature failures, etc.
   if s:find("script") or s:find("signature") or s:find("checksig") or
-     s:find("tapscript") or s:find("witness program") then
-    return "mandatory-script-verify-flag-failed"
+     s:find("tapscript") or s:find("witness program") or s:find("disabled opcode") then
+    return "block-script-verify-flag-failed"
   end
 
   -- Timestamp / time
