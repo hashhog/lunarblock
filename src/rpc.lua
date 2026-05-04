@@ -2946,8 +2946,15 @@ function RPCServer:register_methods()
         batch.put(storage_mod.CF.HEADERS, hash_bytes, header_data)
         batch.put(storage_mod.CF.HEIGHT_INDEX, height_key, hash_bytes)
       end
-      local ok, err = rpc.chain_state:connect_block(
-        block, new_height, block_hash, nil, nil, false, nil, false, store_batch_fn
+      -- Route through accept_block: adds check_block (PoW, merkle, weight,
+      -- BIP-34) and correct MTP computation for IsFinalTx / BIP-68.
+      -- Pre-refactor this path called connect_block with nil MTP args.
+      local ok, err = rpc.chain_state:accept_block(
+        block, new_height, block_hash, {
+          skip_scripts    = false,
+          nosync          = false,
+          caller_batch_fn = store_batch_fn,
+        }
       )
       if not ok then
         error({code = M.ERROR.VERIFY_ERROR,
@@ -3046,10 +3053,12 @@ function RPCServer:register_methods()
         batch.put(storage_mod.CF.HEIGHT_INDEX, height_key, hash_bytes)
       end
 
-      -- Connect the block to chain state.
+      -- Connect the block to chain state via the unified accept_block pipeline.
       -- Self-mined blocks are always at the chain tip (well above any assumevalid height),
       -- so skip_scripts will be false in practice.  Still use the proper check for
       -- correctness in case assumevalid is unset or the height happens to fall below it.
+      -- accept_block adds: check_block (PoW, merkle, weight, BIP-34) + correct MTP for
+      -- IsFinalTx / BIP-68.  Pre-refactor this path called connect_block with nil MTP.
       local gen_skip_scripts = false
       if rpc.av_in_index and rpc.av_is_ancestor and rpc.av_on_best_chain and rpc.header_chain then
         local gen_hash_hex = types.hash256_hex(block_hash)
@@ -3061,7 +3070,11 @@ function RPCServer:register_methods()
           gen_bh_work, gen_bh_height
         )
       end
-      local ok, err = rpc.chain_state:connect_block(block, new_height, block_hash, nil, nil, gen_skip_scripts, nil, false, store_batch_fn)
+      local ok, err = rpc.chain_state:accept_block(block, new_height, block_hash, {
+        skip_scripts    = gen_skip_scripts,
+        nosync          = false,
+        caller_batch_fn = store_batch_fn,
+      })
       if not ok then
         error({code = M.ERROR.VERIFY_ERROR, message = "Failed to connect block: " .. tostring(err)})
       end
@@ -4413,17 +4426,6 @@ function RPCServer:register_methods()
     end
     local t_deser = os.clock()
 
-    -- Basic validation
-    local ok_val, val_err = pcall(validation.check_block, block)
-    local t_validate = os.clock()
-    if not ok_val then
-      -- Map internal error strings to canonical BIP-22 result strings
-      return bip22_result(val_err)
-    end
-    if not val_err then
-      return "rejected"
-    end
-
     -- Compute block hash
     local block_hash = validation.compute_block_hash(block.header)
 
@@ -4455,28 +4457,11 @@ function RPCServer:register_methods()
     -- Determine height: tip + 1 since we verified prev_hash == tip_hash above
     local new_height = (rpc.chain_state and rpc.chain_state.tip_height or 0) + 1
 
-    -- BIP-34 contextual check (validation.cpp:4151-4159 ContextualCheckBlock):
-    -- coinbase scriptSig must begin with the byte-exact canonical encoding of
-    -- new_height. Only fires once BIP-34 is active for this network.
-    -- NOTE: check_block() above is called without height so it only does
-    -- context-free checks; this is the height-contextual counterpart.
-    if rpc.network and rpc.network.bip34_height and new_height >= rpc.network.bip34_height then
-      local coinbase_sig = block.transactions[1].inputs[1].script_sig
-      local expect = validation.encode_bip34_height(new_height)
-      local n = #expect
-      if #coinbase_sig < n then
-        return "bad-cb-height"
-      end
-      for i = 1, n do
-        if coinbase_sig:byte(i) ~= expect:byte(i) then
-          return "bad-cb-height"
-        end
-      end
-    end
-
     -- BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
     -- block timestamp must be strictly greater than the median-time-past
-    -- of the previous 11 blocks.
+    -- of the previous 11 blocks.  This is a *header-level* rule checked
+    -- before block acceptance; accept_block computes MTP again internally
+    -- for IsFinalTx and BIP-68, so the two computations are consistent.
     -- Reference: bitcoin-core/src/validation.cpp:4092
     if rpc.chain_state and rpc.chain_state.tip_height and rpc.chain_state.tip_height >= 0 then
       local prev_mtp = get_median_time_past(rpc.storage, rpc.chain_state.tip_hash)
@@ -4485,12 +4470,17 @@ function RPCServer:register_methods()
       end
     end
 
-    -- If chain_state has a connect_block method, use it.
+    -- Route through accept_block (unified pipeline: check_block with correct
+    -- height → MTP computation → connect_block with real prev_block_mtp and
+    -- get_block_mtp).  Pre-refactor this site called connect_block directly
+    -- with nil MTP args, silently disabling BIP-113 IsFinalTx and BIP-68
+    -- time-based sequence locks post-CSV.  The inline BIP-34 check that used
+    -- to follow check_block here is now inside accept_block → check_block
+    -- (height is passed so the BIP-34 arm fires).
+    --
     -- Block/header/height_index storage writes are included in the same atomic
     -- WriteBatch as the UTXO flush and chain tip update via caller_batch_fn.
-    -- This prevents a crash from leaving the height index pointing to a block
-    -- whose UTXOs haven't been applied.
-    if rpc.chain_state and rpc.chain_state.connect_block then
+    if rpc.chain_state and rpc.chain_state.accept_block then
       -- During bulk import (many sequential submitblock calls), skip fsync on
       -- most blocks and only sync every 500 blocks to amortize the cost.
       -- After IBD, post-tip blocks are rare enough that always syncing is fine,
@@ -4534,14 +4524,20 @@ function RPCServer:register_methods()
         )
       end
 
-      local ok_conn, conn_ret1, conn_ret2 = pcall(rpc.chain_state.connect_block, rpc.chain_state, block, new_height, block_hash, nil, nil, skip_scripts, nil, nosync, store_batch_fn)
+      local t_validate = os.clock()
+      local ok_conn, conn_ret1, conn_ret2 = pcall(rpc.chain_state.accept_block, rpc.chain_state,
+        block, new_height, block_hash, {
+          skip_scripts     = skip_scripts,
+          nosync           = nosync,
+          caller_batch_fn  = store_batch_fn,
+        })
       local t_connect = os.clock()
       if not ok_conn then
-        -- connect_block threw an error (conn_ret1 is the error message)
+        -- accept_block threw an error (conn_ret1 is the error message)
         return bip22_result(conn_ret1)
       end
       if not conn_ret1 then
-        -- connect_block returned (nil, error_string) — normal failure path
+        -- accept_block returned (nil, error_string) — normal failure path
         return bip22_result(conn_ret2 or "rejected")
       end
 

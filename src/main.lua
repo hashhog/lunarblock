@@ -385,10 +385,29 @@ local function run_import_blocks(args)
       -- Compute block hash
       local block_hash = validation.compute_block_hash(block.header)
 
-      -- Connect the block to chain state (skip script validation for speed during import)
-      local skip_scripts = true
-      local connect_ok, connect_err = chain_state:connect_block(
-        block, frame_height, block_hash, nil, nil, skip_scripts)
+      -- Context-free validation: check_block with height for BIP-34.
+      -- Operator-controlled import path still validates structural
+      -- invariants (PoW, merkle, weight, BIP-34 height, per-tx sanity)
+      -- so a corrupted or malicious .dat file is caught before chainstate
+      -- is modified. skip_check_block=false (default).
+      local ok_chk, chk_err = pcall(validation.check_block, block,
+        chain_state.network, frame_height)
+      if not ok_chk then
+        io.stderr:write(string.format(
+          "Error validating block at height %d: %s\n",
+          frame_height, tostring(chk_err)))
+        os.exit(1)
+      end
+
+      -- Connect block through unified accept_block pipeline.
+      -- skip_check_block=true because we already validated above.
+      -- skip_scripts=true: operator import for speed; no peer-supplied data.
+      -- prev_block_mtp + get_block_mtp computed inside accept_block.
+      local connect_ok, connect_err = chain_state:accept_block(
+        block, frame_height, block_hash, {
+          skip_check_block = true,
+          skip_scripts     = true,
+        })
       if not connect_ok then
         io.stderr:write(string.format("Error connecting block at height %d: %s\n",
           frame_height, tostring(connect_err)))
@@ -837,9 +856,20 @@ local function main()
     -- project_lunarblock_wedge_2026_04_28: tapscript SCRIPT_SIZE failed,
     -- then retries reported "Missing UTXO for input 1 of tx 98a09ed2..."
     -- because that input had been pre-spent in the cache during attempt 1.
-    local pcall_ok, ok_or_err = pcall(chain_state.connect_block, chain_state,
-      block, height, block_hash, nil, nil, skip_scripts, nil, true,
-      caller_batch_fn)
+    -- Route through accept_block (unified pipeline). sync.lua's
+    -- connect_pending_blocks has already run validation.check_block with the
+    -- correct height, so skip_check_block=true avoids a redundant pass here.
+    -- accept_block will still compute prev_block_mtp and get_block_mtp
+    -- correctly from storage, fixing the silent BIP-113 IsFinalTx + BIP-68
+    -- time-based sequence-lock degradation that existed when connect_block
+    -- was called directly with nil MTP args.
+    local pcall_ok, ok_or_err = pcall(chain_state.accept_block, chain_state,
+      block, height, block_hash, {
+        skip_check_block = true,    -- already validated by sync.lua above
+        skip_scripts     = skip_scripts,
+        nosync           = true,    -- IBD: caller-managed periodic flush
+        caller_batch_fn  = caller_batch_fn,
+      })
     if not pcall_ok then
       -- A Lua error was raised (typically assert() inside connect_block).
       -- Discard partial in-memory cache mutations from the failed attempt
