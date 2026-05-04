@@ -921,8 +921,9 @@ M.networks.regtest = {
     [0] = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
   },
 
-  -- All soft forks active from height 0
-  bip34_height = 0,
+  -- All soft forks active from height 0 except BIP-34 which activates at 1
+  -- (Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1 for regtest)
+  bip34_height = 1,
   bip65_height = 0,
   bip66_height = 0,
   csv_height = 0,

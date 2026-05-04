@@ -4435,6 +4435,25 @@ function RPCServer:register_methods()
     -- Determine height: tip + 1 since we verified prev_hash == tip_hash above
     local new_height = (rpc.chain_state and rpc.chain_state.tip_height or 0) + 1
 
+    -- BIP-34 contextual check (validation.cpp:4151-4159 ContextualCheckBlock):
+    -- coinbase scriptSig must begin with the byte-exact canonical encoding of
+    -- new_height. Only fires once BIP-34 is active for this network.
+    -- NOTE: check_block() above is called without height so it only does
+    -- context-free checks; this is the height-contextual counterpart.
+    if rpc.network and rpc.network.bip34_height and new_height >= rpc.network.bip34_height then
+      local coinbase_sig = block.transactions[1].inputs[1].script_sig
+      local expect = validation.encode_bip34_height(new_height)
+      local n = #expect
+      if #coinbase_sig < n then
+        return "bad-cb-height"
+      end
+      for i = 1, n do
+        if coinbase_sig:byte(i) ~= expect:byte(i) then
+          return "bad-cb-height"
+        end
+      end
+    end
+
     -- BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
     -- block timestamp must be strictly greater than the median-time-past
     -- of the previous 11 blocks.
