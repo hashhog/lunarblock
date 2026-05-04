@@ -101,6 +101,12 @@ local function bip22_result(err)
     return "bad-txns-inputs-missingorspent"
   end
 
+  -- Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
+  -- check_transaction asserts: "output N has negative value"
+  if s:find("negative value") then
+    return "bad-txns-vout-negative"
+  end
+
   -- Script / signature verification
   if s:find("script") or s:find("signature") or s:find("checksig") or
      s:find("tapscript") or s:find("witness program") then
