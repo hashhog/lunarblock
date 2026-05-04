@@ -2475,6 +2475,130 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 end
 
 --------------------------------------------------------------------------------
+-- Accept Block (unified entry-point helper — mirrors Core ProcessNewBlock)
+--------------------------------------------------------------------------------
+-- All 5 block-acceptance entry points (submitblock RPC, IBD
+-- connect_callback, generateblock RPC, generatetoaddress RPC,
+-- import-blocks CLI) MUST route through this function instead of calling
+-- connect_block directly.
+--
+-- Mirrors Bitcoin Core's Chainstate::ProcessNewBlock pipeline
+-- (validation.cpp) in three stages:
+--
+--   Stage 1: context-free  — validation.check_block (PoW, merkle, weight,
+--            per-tx sanity, legacy-sigop cap, witness commitment, BIP-34
+--            byte-prefix when height is supplied)
+--   Stage 2: MTP computation — derives prev_block_mtp from the 11-block
+--            sliding window so IsFinalTx and BIP-68 use the correct
+--            cutoff.  Pre-refactor ALL callers passed nil, silently
+--            disabling BIP-113 IsFinalTx (used block timestamp instead of
+--            MTP post-CSV) and disabling BIP-68 time-based sequence locks
+--            (the `prev_block_mtp and get_block_mtp` guard short-circuited
+--            to false).
+--   Stage 3: contextual  — chain_state:connect_block (IsFinalTx, BIP-30,
+--            BIP-68, sigop-cost cap, per-input UTXO + scripts, coinbase
+--            value).
+--
+-- @param block table: deserialized block
+-- @param height number: block height (new tip height)
+-- @param block_hash hash256: pre-computed block hash
+-- @param opts table: {
+--   skip_check_block  = bool,   -- skip Stage 1 (only for genesis; default false)
+--   skip_scripts      = bool,   -- assumevalid skip (default false)
+--   use_parallel      = bool|nil, -- nil = auto-detect
+--   nosync            = bool,   -- skip fsync (default false)
+--   caller_batch_fn   = fn|nil, -- injected into connect_block's atomic batch
+-- }
+-- @return true, fees on success; nil, error_string on failure
+-- Note: on failure the caller must call coin_view:discard_dirty() if the
+-- connect attempt left partial in-memory mutations.
+
+--- Compute median-time-past for a given chain tip hash (11-block window).
+-- This is the storage-layer counterpart of rpc.lua's local
+-- get_median_time_past.  Kept in utxo.lua so accept_block can use it
+-- without a circular require on rpc.lua.
+local function compute_mtp_from_storage(storage, tip_hash)
+  if not storage or not tip_hash then
+    return os.time()
+  end
+  local timestamps = {}
+  local current_hash = tip_hash
+  for _ = 1, 11 do
+    local header = storage.get_header(current_hash)
+    if not header then break end
+    timestamps[#timestamps + 1] = header.timestamp
+    current_hash = header.prev_hash
+  end
+  if #timestamps == 0 then
+    return os.time()
+  end
+  table.sort(timestamps)
+  return timestamps[math.ceil(#timestamps / 2)]
+end
+
+function ChainState:accept_block(block, height, block_hash, opts)
+  opts = opts or {}
+
+  -- Stage 1: context-free validation (check_block).
+  -- Covers: header PoW, future-time gate, >=1 tx, first-coinbase,
+  -- no-other-coinbase, per-tx check_transaction (neg-output, too-large,
+  -- dup-input, etc.), block weight cap, legacy-sigop cap, merkle root
+  -- recompute (CVE-2012-2459 malleation guard), witness commitment
+  -- recompute, BIP-34 byte-prefix if height is supplied and active.
+  -- Always runs unless opts.skip_check_block is true (genesis only).
+  if not opts.skip_check_block then
+    local ok_val, val_err = pcall(validation.check_block, block, self.network, height)
+    if not ok_val then
+      return nil, tostring(val_err)
+    end
+    -- check_block returns true on success; any non-true value is a bug
+    if not val_err then
+      return nil, "check_block returned false (unexpected)"
+    end
+  end
+
+  -- Stage 2: compute prev_block_mtp for IsFinalTx (BIP-113) and BIP-68.
+  -- The tip_hash at this point is the parent (prev) block because
+  -- connect_block hasn't advanced the tip yet.
+  -- get_block_mtp is a closure over self.storage so BIP-68 time-based
+  -- sequence locks can look up any ancestor's MTP.
+  local prev_block_mtp = nil
+  local get_block_mtp = nil
+  if self.tip_hash and height > 0 then
+    prev_block_mtp = compute_mtp_from_storage(self.storage, self.tip_hash)
+    -- get_block_mtp(h) returns the MTP of the block AT height h.
+    -- BIP-68 calls this for the block that confirmed each input's UTXO.
+    -- We walk storage to find the block hash at height h, then compute
+    -- its 11-block MTP window.
+    local storage_ref = self.storage
+    get_block_mtp = function(h)
+      -- Look up the block hash at height h from the height index.
+      local h_key = string.char(
+        math.floor(h / 16777216) % 256,
+        math.floor(h / 65536) % 256,
+        math.floor(h / 256) % 256,
+        h % 256
+      )
+      local hash_bytes = storage_ref.get(storage_ref.CF.HEIGHT_INDEX, h_key)
+      if not hash_bytes then return 0 end
+      local h_hash = types.hash256(hash_bytes)
+      return compute_mtp_from_storage(storage_ref, h_hash)
+    end
+  end
+
+  -- Stage 3: contextual validation + UTXO mutations.
+  -- BIP-113 IsFinalTx, BIP-30, BIP-68 sequence locks, sigop-cost cap,
+  -- coinbase maturity, per-input UTXO lookup + script verification,
+  -- coinbase value cap.  All run inside connect_block.
+  return self:connect_block(
+    block, height, block_hash,
+    prev_block_mtp, get_block_mtp,
+    opts.skip_scripts, opts.use_parallel,
+    opts.nosync, opts.caller_batch_fn
+  )
+end
+
+--------------------------------------------------------------------------------
 -- Disconnect Block (for chain reorganization)
 --------------------------------------------------------------------------------
 
