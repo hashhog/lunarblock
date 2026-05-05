@@ -469,6 +469,19 @@ local function calculate_difficulty(bits)
   return diff
 end
 
+--- Convert compact bits to 64-char big-endian hex target string (Core format).
+-- consensus.bits_to_target returns a 32-byte big-endian string.
+-- @param bits number: compact nBits
+-- @return string: 64-char lowercase hex
+local function bits_to_target_hex(bits)
+  local target = consensus.bits_to_target(bits)
+  local hex = {}
+  for i = 1, 32 do
+    hex[i] = string.format("%02x", target:byte(i))
+  end
+  return table.concat(hex)
+end
+
 --- Calculate chainwork from target.
 -- Chainwork = 2^256 / (target + 1)
 -- Since we can't do 256-bit math easily, we approximate using the bits format.
@@ -867,18 +880,31 @@ function RPCServer:register_methods()
     -- Core: prune_height ? value+1 : 0).
     local pruner = rpc.pruner
     local is_pruned = pruner and pruner.enabled or false
+    -- Compute bits/target/time from current tip header
+    local tip_bits_hex = string.format("%08x", current_bits)
+    local tip_target_hex = bits_to_target_hex(current_bits)
+    local tip_time = 0
+    if rpc.storage and rpc.chain_state and rpc.chain_state.tip_hash then
+      local h = rpc.storage.get_header(rpc.chain_state.tip_hash)
+      if h then tip_time = h.timestamp end
+    end
+
     local result = {
       chain = rpc.network.name,
       blocks = tip_height,
       headers = header_height,
       bestblockhash = types.hash256_hex(tip_hash),
       difficulty = difficulty,
+      time = tip_time,
       mediantime = mediantime,
       verificationprogress = verification_progress,
       initialblockdownload = initial_block_download,
       chainwork = chainwork,
+      bits = tip_bits_hex,
+      target = tip_target_hex,
       pruned = is_pruned,
       softforks = softforks,
+      warnings = "",
     }
     if is_pruned then
       result.pruneheight = pruner.prune_height > 0
@@ -1125,6 +1151,28 @@ function RPCServer:register_methods()
       end
     end
 
+    -- Get chainwork from chain state if available
+    local block_chainwork = string.rep("0", 64)
+    if rpc.chain_state and rpc.chain_state.chainwork then
+      block_chainwork = rpc.chain_state.chainwork
+    end
+
+    -- Build coinbase_tx from first transaction (Core 27+ field)
+    local coinbase_tx_obj = nil
+    if block.transactions and #block.transactions > 0 then
+      local cb = block.transactions[1]
+      local cb_inp = (cb.inputs and #cb.inputs > 0) and cb.inputs[1] or nil
+      coinbase_tx_obj = {
+        version  = cb.version,
+        locktime = cb.locktime,
+        sequence = cb_inp and cb_inp.sequence or 0xffffffff,
+        coinbase = cb_inp and M.hex_encode(cb_inp.script_sig) or "",
+      }
+      if cb_inp and cb_inp.witness and #cb_inp.witness > 0 then
+        coinbase_tx_obj.witness = M.hex_encode(cb_inp.witness[1])
+      end
+    end
+
     -- Build result
     local result = {
       hash = blockhash,
@@ -1141,8 +1189,11 @@ function RPCServer:register_methods()
       mediantime = mediantime,
       nonce = block.header.nonce,
       bits = string.format("%08x", block.header.bits),
+      target = bits_to_target_hex(block.header.bits),
       difficulty = difficulty,
+      chainwork = block_chainwork,
       nTx = #block.transactions,
+      coinbase_tx = coinbase_tx_obj,
     }
 
     if previousblockhash then
@@ -1793,6 +1844,7 @@ function RPCServer:register_methods()
         if bit.band(svc, 8) ~= 0 then svc_names[#svc_names + 1] = "WITNESS" end
         if bit.band(svc, 1024) ~= 0 then svc_names[#svc_names + 1] = "NETWORK_LIMITED" end
         local is_inbound = p.inbound or false
+        local ping_sec = (p.latency_ms or 0) / 1000
         peers[#peers + 1] = {
           id = i - 1,
           addr = p.ip .. ":" .. p.port,
@@ -1802,23 +1854,36 @@ function RPCServer:register_methods()
           relaytxes = (p.version_info and p.version_info.relay) or true,
           lastsend = math.floor(p.last_send or 0),
           lastrecv = math.floor(p.last_recv or 0),
+          last_transaction = 0,
+          last_block = 0,
           bytessent = p.bytes_sent or 0,
           bytesrecv = p.bytes_recv or 0,
           conntime = math.floor(p.conn_time or 0),
           timeoffset = (p.version_info and p.version_recv_time and p.version_recv_time > 0)
             and (p.version_info.timestamp - math.floor(p.version_recv_time))
             or 0,
-          pingtime = (p.latency_ms or 0) / 1000,
+          pingtime = ping_sec,
+          minping = ping_sec,
           version = (p.version_info and p.version_info.version) or 0,
           subver = p.user_agent or "",
           inbound = is_inbound,
           bip152_hb_to = false,
           bip152_hb_from = false,
           startingheight = p.start_height or 0,
+          presynced_headers = -1,
           synced_headers = -1,
           synced_blocks = -1,
           inflight = {},
+          addr_relay_enabled = true,
+          addr_processed = 0,
+          addr_rate_limited = 0,
+          permissions = {},
+          minfeefilter = 0,
+          bytessent_per_msg = {},
+          bytesrecv_per_msg = {},
           connection_type = is_inbound and "inbound" or "outbound-full-relay",
+          transport_protocol_type = "v1",
+          session_id = "",
         }
       end
     end
@@ -4661,12 +4726,28 @@ function RPCServer:register_methods()
       pooledtx = rpc.mempool.tx_count or 0
     end
 
+    local bits_hex = string.format("%08x", current_bits)
+    local target_hex = bits_to_target_hex(current_bits)
+
     return {
       blocks = tip_height,
+      currentblocksize = 0,
+      currentblockweight = 0,
+      currentblocktx = 0,
+      bits = bits_hex,
       difficulty = difficulty,
+      target = target_hex,
+      blockmintxfee = 0.00001000,
       networkhashps = 0,
       pooledtx = pooledtx,
       chain = rpc.network.name,
+      next = {
+        height = tip_height + 1,
+        bits = bits_hex,
+        difficulty = difficulty,
+        target = target_hex,
+      },
+      warnings = "",
     }
   end
 
