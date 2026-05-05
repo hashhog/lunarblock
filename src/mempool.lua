@@ -3,7 +3,32 @@ local serialize = require("lunarblock.serialize")
 local validation = require("lunarblock.validation")
 local consensus = require("lunarblock.consensus")
 local script_mod = require("lunarblock.script")
+local mining = require("lunarblock.mining")
 local M = {}
+
+--- Compute median-time-past for the current chain tip.
+-- Reads the last 11 block headers via chain_state.storage and returns their
+-- median timestamp.  Used for BIP-113 IsFinalTx and BIP-68 SequenceLocks at
+-- mempool accept time.  Returns os.time() as a fallback when storage is absent.
+-- Reference: Bitcoin Core CBlockIndex::GetMedianTimePast (chain.h).
+local function get_tip_mtp(chain_state)
+  local storage = chain_state and chain_state.storage
+  local tip_hash = chain_state and chain_state.tip_hash
+  if not storage or not tip_hash then
+    return os.time()
+  end
+  local timestamps = {}
+  local current_hash = tip_hash
+  for _ = 1, 11 do
+    local header = storage.get_header(current_hash)
+    if not header then break end
+    timestamps[#timestamps + 1] = header.timestamp
+    current_hash = header.prev_hash
+  end
+  if #timestamps == 0 then return os.time() end
+  table.sort(timestamps)
+  return timestamps[math.ceil(#timestamps / 2)]
+end
 
 -- Cluster mempool: union-find for tracking transaction clusters
 local uf_parent = {}
@@ -336,12 +361,25 @@ function Mempool:accept_transaction(tx, allow_rbf)
       tx_weight_check, M.MAX_STANDARD_TX_WEIGHT)
   end
 
+  -- 2c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
+  -- Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp ~line 819).
+  -- nextHeight = tipHeight + 1; lockTimeCutoff = MTP of current tip (BIP-113).
+  local tip_height = self.chain_state.tip_height
+  local tip_mtp = get_tip_mtp(self.chain_state)
+  local next_height = tip_height + 1
+  if not mining.is_final_tx(tx, next_height, tip_mtp) then
+    return false, "bad-txns-nonfinal"
+  end
+
   -- 3. Check all inputs exist (in UTXO set or mempool)
   local input_total = 0
   local missing_inputs = false
   local conflicts = {}  -- existing mempool txs that spend the same outputs
+  -- Per-input UTXO heights for BIP-68 sequence lock checks (step 3b).
+  -- Mempool-parent inputs use synthetic height tipHeight+1 (Core convention).
+  local input_heights = {}  -- indexed 1..#tx.inputs
 
-  for _, inp in ipairs(tx.inputs) do
+  for i, inp in ipairs(tx.inputs) do
     local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
 
     -- Check if another mempool tx already spends this output
@@ -356,6 +394,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
 
     -- Look up UTXO from chain state
     local utxo = self.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+    local is_mempool_parent = false
 
     -- If not in UTXO set, check if it's an output of a mempool tx
     if not utxo then
@@ -369,6 +408,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
           height = parent_entry.height,
           is_coinbase = false,
         }
+        is_mempool_parent = true
       else
         missing_inputs = true
       end
@@ -378,11 +418,15 @@ function Mempool:accept_transaction(tx, allow_rbf)
       input_total = input_total + utxo.value
       -- Coinbase maturity
       if utxo.is_coinbase then
-        local tip_height = self.chain_state.tip_height
         if tip_height - utxo.height < consensus.COINBASE_MATURITY then
           return false, "spending immature coinbase"
         end
       end
+      -- Save per-input UTXO height for BIP-68 sequence lock check.
+      -- Mempool parents use synthetic height tipHeight+1 per Core convention.
+      input_heights[i] = is_mempool_parent and (next_height) or utxo.height
+    else
+      input_heights[i] = 0
     end
   end
 
@@ -404,6 +448,34 @@ function Mempool:accept_transaction(tx, allow_rbf)
   local fee = input_total - output_total
   if fee < 0 then
     return false, "outputs exceed inputs"
+  end
+
+  -- 5b. BIP-68 SequenceLocks: per-input relative locktimes (CSV).
+  -- Reference: Bitcoin Core CheckSequenceLocksAtTip() (validation.cpp ~line 887).
+  -- Only enforced when CSV is active (tip_height >= csv_height) and tx.version >= 2.
+  local csv_height = (self.chain_state.network and self.chain_state.network.csv_height) or 419328
+  if tx.version >= 2 and tip_height >= csv_height then
+    local enforce_bip68 = true
+    -- get_utxo_height(inp): returns the height the UTXO was confirmed (or synthetic).
+    -- get_block_mtp(h): returns the MTP of block at height h; we use tip_mtp
+    --   conservatively for all heights (may false-reject time-locked txs near the
+    --   boundary but never false-admits).
+    local function get_utxo_height_for_seq(inp)
+      for j, inp2 in ipairs(tx.inputs) do
+        if inp2 == inp then
+          return input_heights[j] or (next_height)
+        end
+      end
+      return next_height
+    end
+    local function get_block_mtp_conservative(_h)
+      return tip_mtp
+    end
+    local min_h, min_t = validation.calculate_sequence_locks(
+      tx, next_height, get_utxo_height_for_seq, get_block_mtp_conservative, enforce_bip68)
+    if not validation.check_sequence_locks(min_h, min_t, next_height, tip_mtp) then
+      return false, "non-BIP68-final"
+    end
   end
 
   -- 6. Check fee rate
