@@ -990,6 +990,10 @@ local function main()
     max_outbound = (args.maxpeers == 0) and 0 or 8,
     nov2transport = args.nov2transport,
     peerbloomfilters = args.peerbloomfilters,
+    -- BIP-159: when prune mode is enabled, peers see NODE_NETWORK_LIMITED
+    -- in our outbound version handshake.  args.prune > 0 selects between
+    -- archive-mode and limited-archive serving.
+    prune_mode = (type(args.prune) == "number" and args.prune > 0),
     data_dir = datadir,
   })
   peer_manager.our_height = header_chain.header_tip_height
@@ -1254,6 +1258,14 @@ local function main()
   peer_manager:register_handler("getdata", function(peer, payload)
     local items = p2p.deserialize_inv(payload)
     local not_found = {}
+    -- BIP-159 peer-served-blocks gate: when prune mode is on and the
+    -- pruner has actually deleted blocks below the keep window, the
+    -- `db.get_block(item.hash)` call below will return nil for those
+    -- hashes and we fall through to the `not_found` branch — which
+    -- emits the correct `notfound` reply per Core's net_processing.cpp
+    -- behaviour.  An honest peer respecting our NODE_NETWORK_LIMITED
+    -- bit should not request these in the first place; the not_found
+    -- reply is the per-protocol fallback for misbehaving peers.
     for _, item in ipairs(items) do
       if item.type == p2p.INV_TYPE.MSG_WITNESS_TX or item.type == p2p.INV_TYPE.MSG_TX then
         local txid_hex = types.hash256_hex(item.hash)

@@ -123,8 +123,9 @@ Peer.__index = Peer
 -- @param use_v2 boolean: use BIP324 v2 encrypted transport (optional, default true)
 -- @param proxy_config table: proxy configuration (optional)
 -- @param peerbloomfilters boolean: advertise NODE_BLOOM (BIP-35) (optional, default false — matches Core)
+-- @param prune_mode boolean: advertise NODE_NETWORK_LIMITED (BIP-159) (optional, default false; set when --prune > 0)
 -- @return Peer: new peer object
-function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfilters)
+function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfilters, prune_mode)
   local self = setmetatable({}, Peer)
   self.ip = ip
   self.port = port or (network and network.port) or 8333
@@ -179,6 +180,16 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
     self.peerbloomfilters = false
   else
     self.peerbloomfilters = peerbloomfilters and true or false
+  end
+  -- BIP-159 / NODE_NETWORK_LIMITED advertisement gate. Default false.
+  -- Set when prune mode is enabled (`--prune > 0` at the CLI).  Mirrors
+  -- Core's `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
+  -- `IsPruneMode()` is true).  When true, our_services() ORs the bit
+  -- into the version-handshake services bitfield.
+  if prune_mode == nil then
+    self.prune_mode = false
+  else
+    self.prune_mode = prune_mode and true or false
   end
 
   -- Erlay (BIP330)
@@ -603,7 +614,7 @@ function Peer:start_handshake()
   -- Compute and remember the services we advertise (NODE_NETWORK|NODE_WITNESS,
   -- plus NODE_BLOOM when --peerbloomfilters is enabled — see BIP-35 / Core
   -- net_processing.cpp MEMPOOL handler).
-  self.our_services = p2p.our_services(self.peerbloomfilters)
+  self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode)
   -- Send version message
   local payload = p2p.serialize_version({
     version = p2p.PROTOCOL_VERSION,
@@ -662,7 +673,7 @@ function Peer:handle_version(payload)
     self.nonce = math.random(1, 2^52)
     -- Track the services we advertise so the BIP-35 mempool handler can gate
     -- on whether we promised NODE_BLOOM to this specific peer.
-    self.our_services = p2p.our_services(self.peerbloomfilters)
+    self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode)
     local ver_payload = p2p.serialize_version({
       version = p2p.PROTOCOL_VERSION,
       services = self.our_services,
