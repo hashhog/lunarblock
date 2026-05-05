@@ -121,6 +121,14 @@ local function bip22_result(err)
     return "bad-txns-vout-toolarge"
   end
 
+  -- Non-coinbase tx where sum(inputs) < sum(outputs).
+  -- Core consensus/tx_verify.cpp::CheckTxInputs:
+  --   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+  -- utxo.lua asserts: "Transaction outputs exceed inputs"
+  if s:find("outputs exceed inputs") then
+    return "bad-txns-in-belowout"
+  end
+
   -- Script / signature verification failures at connect-block stage.
   -- Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
   -- Covers disabled opcodes (OP_CAT 0x7e + 14 peers), signature failures, etc.
