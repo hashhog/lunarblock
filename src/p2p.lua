@@ -24,11 +24,23 @@ M.SERVICES = {
 
 --- Compute the service-flags bitfield we advertise to peers.
 -- @param peerbloomfilters boolean: include NODE_BLOOM (BIP-35 mempool support)
--- @return number: services bitfield (NODE_NETWORK|NODE_WITNESS [|NODE_BLOOM])
-function M.our_services(peerbloomfilters)
-  local s = require("bit").bor(M.SERVICES.NODE_NETWORK, M.SERVICES.NODE_WITNESS)
+-- @param prune_mode boolean: include NODE_NETWORK_LIMITED (BIP-159, 1<<10).
+--   When true, signals to peers that we serve only the recent ~288-block
+--   window.  Mirrors Core's `init.cpp` (`nLocalServices |=
+--   NODE_NETWORK_LIMITED` when `IsPruneMode()` is true).  Core advertises
+--   NODE_NETWORK alongside NODE_NETWORK_LIMITED in the auto-prune case
+--   (the node still has the recent-288 window), so we keep NODE_NETWORK
+--   set as well.
+-- @return number: services bitfield (NODE_NETWORK|NODE_WITNESS
+--   [|NODE_BLOOM] [|NODE_NETWORK_LIMITED])
+function M.our_services(peerbloomfilters, prune_mode)
+  local bit = require("bit")
+  local s = bit.bor(M.SERVICES.NODE_NETWORK, M.SERVICES.NODE_WITNESS)
   if peerbloomfilters then
-    s = require("bit").bor(s, M.SERVICES.NODE_BLOOM)
+    s = bit.bor(s, M.SERVICES.NODE_BLOOM)
+  end
+  if prune_mode then
+    s = bit.bor(s, M.SERVICES.NODE_NETWORK_LIMITED)
   end
   return s
 end
