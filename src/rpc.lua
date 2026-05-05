@@ -101,6 +101,14 @@ local function bip22_result(err)
     return "bad-txns-inputs-missingorspent"
   end
 
+  -- Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
+  -- Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase").
+  -- utxo.lua asserts: "Coinbase output not mature"
+  -- mempool.lua returns: "spending immature coinbase"
+  if s:find("immature") or s:find("not mature") or s:find("premature") then
+    return "bad-txns-premature-spend-of-coinbase"
+  end
+
   -- Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
   -- check_transaction asserts: "output N has negative value"
   if s:find("negative value") then
