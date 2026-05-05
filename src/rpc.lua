@@ -1363,11 +1363,18 @@ function RPCServer:register_methods()
   self.methods["getrawmempool"] = function(rpc, params)
     local verbose = params[1] or false
     if not rpc.mempool then
+      -- Empty mempool: return empty array (non-verbose) or empty object (verbose).
+      -- Use cjson.empty_array_mt so the empty table serialises as [] not {}.
       if verbose then return {} end
-      return {}
+      return setmetatable({}, cjson.empty_array_mt)
     end
     if not verbose then
-      return rpc.mempool:get_raw_mempool()
+      local txids = rpc.mempool:get_raw_mempool()
+      -- Guard against empty-table-vs-empty-array cjson ambiguity.
+      if #txids == 0 then
+        return setmetatable({}, cjson.empty_array_mt)
+      end
+      return txids
     end
     -- Verbose: return details for each tx
     local result = {}
