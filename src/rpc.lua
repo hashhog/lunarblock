@@ -579,6 +579,7 @@ function M.new(config)
   self.block_submission_paused = false
   -- Register built-in methods
   self:register_methods()
+  self:setup_w47b_methods()
   return self
 end
 
@@ -5263,6 +5264,468 @@ function RPCServer:register_methods()
       tip_hash         = base_hash_hex,
       base_height      = au_height,
       path             = path,
+    }
+  end
+end
+
+--------------------------------------------------------------------------------
+-- W47B: gettxoutsetinfo / getnetworkhashps / gettxoutproof / verifytxoutproof
+--        / getrpcinfo
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp + merkleblock.cpp
+--------------------------------------------------------------------------------
+
+-- Bitcoin Core CalcTreeWidth: height 0 = leaves (nTx), height nHeight = root (1)
+local function w47b_tree_width(n_tx, height)
+  return math.floor((n_tx + bit.lshift(1, height) - 1) / bit.lshift(1, height))
+end
+
+-- Bitcoin Core CalcHash: height 0 returns txids[pos]; height > 0 hashes children
+-- Returns a raw 32-byte string.
+local function w47b_calc_hash(crypto, txids, n_tx, height, pos)
+  if height == 0 then
+    return txids[pos + 1]  -- 1-based Lua indexing
+  end
+  local left  = w47b_calc_hash(crypto, txids, n_tx, height - 1, pos * 2)
+  local right
+  local right_pos = pos * 2 + 1
+  if right_pos < w47b_tree_width(n_tx, height - 1) then
+    right = w47b_calc_hash(crypto, txids, n_tx, height - 1, right_pos)
+  else
+    right = left  -- duplicate last hash (Core convention)
+  end
+  return crypto.hash256(left .. right)
+end
+
+-- Bitcoin Core TraverseAndBuild: emits bits and hashes for the partial merkle tree.
+-- Returns hashes (array of raw 32-byte strings), bits (array of 0/1).
+local function w47b_traverse_and_build(crypto, txids, n_tx, match_set, height, pos, hashes, bits)
+  -- fParentOfMatch: does any leaf in [pos<<height, (pos+1)<<height) match?
+  local lo = bit.lshift(pos, height)
+  local hi = math.min(bit.lshift(pos + 1, height), n_tx)
+  local parent_match = false
+  for i = lo, hi - 1 do
+    if match_set[i] then  -- 0-based leaf index
+      parent_match = true
+      break
+    end
+  end
+  -- emit bit
+  bits[#bits + 1] = parent_match and 1 or 0
+  if height == 0 or not parent_match then
+    -- leaf or non-matching internal node: emit hash, stop descending
+    hashes[#hashes + 1] = w47b_calc_hash(crypto, txids, n_tx, height, pos)
+  else
+    -- matching internal node: recurse into children
+    w47b_traverse_and_build(crypto, txids, n_tx, match_set, height - 1, pos * 2, hashes, bits)
+    local right_pos = pos * 2 + 1
+    if right_pos < w47b_tree_width(n_tx, height - 1) then
+      w47b_traverse_and_build(crypto, txids, n_tx, match_set, height - 1, right_pos, hashes, bits)
+    end
+  end
+end
+
+-- Pack an array of bits into bytes (LSB-first within each byte).
+local function w47b_bits_to_bytes(bits)
+  local n_bytes = math.ceil(#bits / 8)
+  local result = {}
+  for i = 1, n_bytes do
+    local byte_val = 0
+    for b = 0, 7 do
+      local bit_idx = (i - 1) * 8 + b + 1
+      if bit_idx <= #bits and bits[bit_idx] == 1 then
+        byte_val = byte_val + bit.lshift(1, b)
+      end
+    end
+    result[i] = string.char(byte_val)
+  end
+  return table.concat(result)
+end
+
+-- Encode a uint32 as 4-byte LE string.
+local function w47b_le32(n)
+  return string.char(
+    bit.band(n, 0xFF),
+    bit.band(bit.rshift(n, 8), 0xFF),
+    bit.band(bit.rshift(n, 16), 0xFF),
+    bit.band(bit.rshift(n, 24), 0xFF)
+  )
+end
+
+-- Encode varint.
+local function w47b_encode_varint(n)
+  if n < 0xFD then
+    return string.char(n)
+  elseif n <= 0xFFFF then
+    return string.char(0xFD, bit.band(n, 0xFF), bit.band(bit.rshift(n, 8), 0xFF))
+  else
+    return string.char(0xFE,
+      bit.band(n, 0xFF),
+      bit.band(bit.rshift(n, 8), 0xFF),
+      bit.band(bit.rshift(n, 16), 0xFF),
+      bit.band(bit.rshift(n, 24), 0xFF))
+  end
+end
+
+-- Bitcoin Core TraverseAndExtract: parse the partial merkle tree and return
+-- matched txids and the computed root hash.
+-- Returns: root_hash (32-byte string), matched_txids (array of hex strings)
+-- or nil + err_string on failure.
+local function w47b_traverse_and_extract(crypto, n_tx, hashes, bits, bit_pos_ref, hash_pos_ref, height, pos)
+  if bit_pos_ref[1] >= #bits then
+    return nil, "overread bits"
+  end
+  local parent_match = bits[bit_pos_ref[1] + 1] == 1
+  bit_pos_ref[1] = bit_pos_ref[1] + 1
+
+  if height == 0 or not parent_match then
+    if hash_pos_ref[1] >= #hashes then
+      return nil, "overread hashes"
+    end
+    local h = hashes[hash_pos_ref[1] + 1]
+    hash_pos_ref[1] = hash_pos_ref[1] + 1
+    local matched = {}
+    if height == 0 and parent_match and pos < n_tx then
+      matched[1] = h
+    end
+    return h, nil, matched
+  else
+    -- recurse left
+    local left, lerr, lmatched = w47b_traverse_and_extract(
+      crypto, n_tx, hashes, bits, bit_pos_ref, hash_pos_ref, height - 1, pos * 2)
+    if not left then return nil, lerr end
+    local right, rmatched
+    local right_pos = pos * 2 + 1
+    if right_pos < w47b_tree_width(n_tx, height - 1) then
+      local rerr
+      right, rerr, rmatched = w47b_traverse_and_extract(
+        crypto, n_tx, hashes, bits, bit_pos_ref, hash_pos_ref, height - 1, right_pos)
+      if not right then return nil, rerr end
+    else
+      right = left
+      rmatched = {}
+    end
+    local root = crypto.hash256(left .. right)
+    -- merge matched lists
+    local all_matched = {}
+    if lmatched then for _, v in ipairs(lmatched) do all_matched[#all_matched + 1] = v end end
+    if rmatched then for _, v in ipairs(rmatched) do all_matched[#all_matched + 1] = v end end
+    return root, nil, all_matched
+  end
+end
+
+function RPCServer:setup_w47b_methods()
+  local crypto = require("lunarblock.crypto")
+  local utxo_mod = require("lunarblock.utxo")
+
+  -- gettxoutsetinfo: count UTXOs and sum values
+  self.methods["gettxoutsetinfo"] = function(rpc, _params)
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    local tip_height  = rpc.chain_state.tip_height or 0
+    local tip_hash    = rpc.chain_state.tip_hash
+    local tip_hash_hex = tip_hash and types.hash256_hex(tip_hash) or string.rep("0", 64)
+
+    -- Iterate UTXO column family
+    local n_txouts   = 0
+    local total_sats = 0
+    local bogosize   = 0
+
+    if rpc.storage.iterator then
+      local iter = rpc.storage.iterator(storage_mod.CF.UTXO)
+      iter.seek_to_first()
+      while iter.valid() do
+        local v = iter.value()
+        if v then
+          local ok, entry = pcall(utxo_mod.deserialize_utxo_entry, v)
+          if ok and entry then
+            n_txouts   = n_txouts + 1
+            total_sats = total_sats + (entry.value or 0)
+            -- bogosize: Core uses 32+4+1+8+len(script)
+            local script_len = entry.script_pubkey and #entry.script_pubkey or 0
+            bogosize = bogosize + 32 + 4 + 1 + 8 + script_len
+          end
+        end
+        iter.next()
+      end
+      iter.destroy()
+    end
+
+    -- txoutset_hash: SHA256d of serialized UTXO set (best-effort empty hash if unavailable)
+    local txoutset_hash_hex = string.rep("0", 64)
+
+    return {
+      height         = tip_height,
+      bestblock      = tip_hash_hex,
+      txouts         = n_txouts,
+      bogosize       = bogosize,
+      hash_serialized_3 = txoutset_hash_hex,
+      total_amount   = total_sats / 1e8,
+    }
+  end
+
+  -- getnetworkhashps: estimate network hash rate over last nblocks
+  self.methods["getnetworkhashps"] = function(rpc, params)
+    local nblocks = (params and type(params[1]) == "number") and math.floor(params[1]) or 120
+    local height  = (params and type(params[2]) == "number") and math.floor(params[2]) or -1
+
+    if not rpc.chain_state or not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+
+    local tip_h = rpc.chain_state.tip_height or 0
+    if height < 0 or height > tip_h then height = tip_h end
+
+    -- Need at least 2 blocks
+    if height < 1 then return 0 end
+
+    -- window: [start_h .. height]
+    local start_h = (nblocks == 0) and 0 or math.max(0, height - nblocks)
+
+    local function get_header_at(h)
+      local hh = rpc.storage.get_hash_by_height(h)
+      if not hh then return nil end
+      return rpc.storage.get_header(hh), hh
+    end
+
+    local top_hdr, top_hh = get_header_at(height)
+    local bot_hdr, _      = get_header_at(start_h)
+    if not top_hdr or not bot_hdr then return 0 end
+
+    local time_diff = top_hdr.timestamp - bot_hdr.timestamp
+    if time_diff <= 0 then return 0 end
+
+    -- Chainwork diff via header_chain.headers entries
+    local function get_work(hh_val)
+      if not rpc.header_chain then return 0 end
+      local hex = types.hash256_hex(hh_val)
+      local entry = rpc.header_chain.headers and rpc.header_chain.headers[hex]
+      return entry and (entry.total_work or 0) or 0
+    end
+
+    local work_top = get_work(top_hh)
+    local work_bot = get_work(
+      (function()
+        local _, bh = get_header_at(start_h)
+        return bh
+      end)()
+    )
+
+    local work_diff = work_top - work_bot
+    if work_diff <= 0 then
+      -- Fallback: estimate from difficulty at tip
+      local bits = top_hdr.bits or 0x1d00ffff
+      -- target = difficulty_1 / difficulty; hashes = 2^256 / target ≈ work per block
+      -- simple estimate: (height - start_h) * 2^32 / time_diff
+      local n_blocks = height - start_h
+      return math.floor(n_blocks * 4294967296 / time_diff)
+    end
+
+    return math.floor(work_diff / time_diff)
+  end
+
+  -- gettxoutproof: produce a CMerkleBlock hex for the given txids in a block
+  self.methods["gettxoutproof"] = function(rpc, params)
+    if not params or type(params[1]) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "gettxoutproof requires [{txids}, blockhash?]"})
+    end
+
+    local txid_hexes = {}
+    for _, v in ipairs(params[1]) do
+      if type(v) ~= "string" or #v ~= 64 then
+        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid: " .. tostring(v)})
+      end
+      txid_hexes[#txid_hexes + 1] = v:lower()
+    end
+
+    if #txid_hexes == 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "txids list is empty"})
+    end
+
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    -- Find the block
+    local block
+    if params[2] and type(params[2]) == "string" and #params[2] == 64 then
+      local bh = types.hash256_from_hex(params[2])
+      block = rpc.storage.get_block(bh)
+      if not block then
+        error({code = M.ERROR.MISC_ERROR,
+               message = "Block not found: " .. params[2]})
+      end
+    else
+      -- Require blockhash: lunarblock txindex stores file offsets, not block hashes
+      error({code = M.ERROR.MISC_ERROR,
+             message = "Transaction not yet in block index. Use blockhash parameter."})
+    end
+
+    -- Collect txids for the block
+    local block_txids = {}
+    for _, tx in ipairs(block.transactions) do
+      block_txids[#block_txids + 1] = validation.compute_txid(tx).bytes
+    end
+    local n_tx = #block_txids
+
+    -- Build match set (0-based)
+    local match_set = {}
+    local found = {}
+    for i, txid_raw in ipairs(block_txids) do
+      local h = types.hash256_hex(types.hash256(txid_raw))
+      for _, want in ipairs(txid_hexes) do
+        if h == want then
+          match_set[i - 1] = true  -- 0-based
+          found[want] = true
+          break
+        end
+      end
+    end
+
+    for _, want in ipairs(txid_hexes) do
+      if not found[want] then
+        error({code = M.ERROR.MISC_ERROR,
+               message = "Transaction not in block: " .. want})
+      end
+    end
+
+    -- Compute tree height
+    local n_height = 0
+    while bit.lshift(1, n_height) < n_tx do n_height = n_height + 1 end
+
+    -- Build partial merkle tree
+    local hashes, bits = {}, {}
+    w47b_traverse_and_build(crypto, block_txids, n_tx, match_set, n_height, 0, hashes, bits)
+
+    -- Encode: 80-byte header | nTx LE32 | varint hash_count | hashes | varint flag_bytes | flag_bytes
+    local header_bytes = serialize.serialize_block_header(block.header)
+    local flag_bytes   = w47b_bits_to_bytes(bits)
+
+    local out_parts = {
+      header_bytes,
+      w47b_le32(n_tx),
+      w47b_encode_varint(#hashes),
+    }
+    for _, h in ipairs(hashes) do
+      out_parts[#out_parts + 1] = h
+    end
+    out_parts[#out_parts + 1] = w47b_encode_varint(#flag_bytes)
+    out_parts[#out_parts + 1] = flag_bytes
+
+    local wire = table.concat(out_parts)
+    -- Hex-encode
+    local hex_parts = {}
+    for i = 1, #wire do
+      hex_parts[i] = string.format("%02x", wire:byte(i))
+    end
+    return table.concat(hex_parts)
+  end
+
+  -- verifytxoutproof: verify a CMerkleBlock hex, return matched txids
+  self.methods["verifytxoutproof"] = function(rpc, params)
+    if not params or type(params[1]) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "verifytxoutproof requires a hex string"})
+    end
+
+    local hex = params[1]
+    if #hex % 2 ~= 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Odd-length hex string"})
+    end
+
+    -- Decode hex to binary
+    local raw = {}
+    for i = 1, #hex, 2 do
+      raw[#raw + 1] = string.char(tonumber(hex:sub(i, i + 1), 16))
+    end
+    local data = table.concat(raw)
+
+    if #data < 80 + 4 then
+      error({code = M.ERROR.MISC_ERROR, message = "Proof too short"})
+    end
+
+    local r = serialize.buffer_reader(data)
+
+    -- Read 80-byte header
+    local header_raw = r.read_bytes(80)
+    -- Compute block hash from header
+    local block_hash_raw = crypto.hash256(header_raw)
+    local block_hash_hex = types.hash256_hex(types.hash256(block_hash_raw))
+
+    -- nTx (uint32 LE)
+    local n_tx = r.read_u32le()
+    if n_tx == 0 then
+      return {}
+    end
+
+    -- hash_count varint
+    local hash_count = r.read_varint()
+    local hashes_raw = {}
+    for _ = 1, hash_count do
+      hashes_raw[#hashes_raw + 1] = r.read_bytes(32)
+    end
+
+    -- flag byte count varint + bytes
+    local flag_byte_count = r.read_varint()
+    local flag_bytes_raw = r.read_bytes(flag_byte_count)
+
+    -- Unpack bits (LSB-first)
+    local bits = {}
+    for i = 1, flag_byte_count do
+      local byte_val = flag_bytes_raw:byte(i)
+      for b = 0, 7 do
+        bits[#bits + 1] = (bit.band(bit.rshift(byte_val, b), 1) == 1) and 1 or 0
+      end
+    end
+
+    -- Compute tree height
+    local n_height = 0
+    while bit.lshift(1, n_height) < n_tx do n_height = n_height + 1 end
+
+    local bit_pos_ref  = {0}
+    local hash_pos_ref = {0}
+    local root, err, matched_list = w47b_traverse_and_extract(
+      crypto, n_tx, hashes_raw, bits, bit_pos_ref, hash_pos_ref, n_height, 0)
+
+    if not root then
+      error({code = M.ERROR.MISC_ERROR, message = "Invalid proof: " .. tostring(err)})
+    end
+
+    -- Verify root matches header merkle root
+    -- Header merkle root is at bytes 36-67 (after version 4B + prev_hash 32B)
+    local header_merkle_root = header_raw:sub(37, 68)  -- 1-based
+    if root ~= header_merkle_root then
+      error({code = M.ERROR.MISC_ERROR, message = "Merkle root mismatch"})
+    end
+
+    -- Verify block is in our chain
+    if rpc.storage then
+      local bh = types.hash256_from_hex(block_hash_hex)
+      local stored = rpc.storage.get_header(bh)
+      if not stored then
+        error({code = M.ERROR.MISC_ERROR,
+               message = "Block " .. block_hash_hex .. " not found in chain"})
+      end
+    end
+
+    -- Return matched txids as display hex (reversed, like Core)
+    local result = {}
+    for _, raw_hash in ipairs(matched_list) do
+      result[#result + 1] = types.hash256_hex(types.hash256(raw_hash))
+    end
+    return result
+  end
+
+  -- getrpcinfo: list active RPC commands and logpath
+  self.methods["getrpcinfo"] = function(_rpc, _params)
+    return {
+      active_commands = setmetatable({}, cjson.empty_array_mt),
+      logpath         = "",
     }
   end
 end
