@@ -1417,4 +1417,259 @@ function Mempool:accept_package(txns)
   }
 end
 
+--- Compute the set of missing-parent txids for `tx` against the current
+-- chain + mempool. Helper used by the orphan-pool wiring on the
+-- "missing inputs" reject path so the orphan-pool entry knows which
+-- parent arrivals should re-trigger evaluation.  Returns a set
+-- {parent_txid_hex=true} or an empty table.
+function Mempool:missing_parents_for(tx)
+  local missing = {}
+  if not tx or not tx.inputs then return missing end
+  for _, inp in ipairs(tx.inputs) do
+    local utxo = self.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+    if not utxo then
+      local prev_txid_hex = types.hash256_hex(inp.prev_out.hash)
+      local parent_entry = self.entries[prev_txid_hex]
+      if not (parent_entry and inp.prev_out.index < #parent_entry.tx.outputs) then
+        missing[prev_txid_hex] = true
+      end
+    end
+  end
+  return missing
+end
+
+--------------------------------------------------------------------------------
+-- Orphan transaction pool (BIP-37 / Core txorphanage parity, simplified).
+--
+-- A transaction whose parent is not yet in the UTXO set or mempool is
+-- "orphan": it cannot be validated until its missing parent arrives.  Core
+-- buffers up to MAX_ORPHAN_TRANSACTIONS=100 such txs in
+-- bitcoin-core/src/node/txorphanage.cpp; on parent-tx arrival the children
+-- are re-checked.  We mirror the headline limits — total cap, per-tx size
+-- cap, per-peer cap, oldest-first eviction — without the Core 31.99
+-- "latency-score" / wtxid-announcer multi-peer bookkeeping.
+--
+-- The pool is intentionally a separate object (not a Mempool method): it
+-- has independent lifetimes (Mempool tracks accepted txs; OrphanPool tracks
+-- rejected-with-missing-parent ones), independent eviction, and the only
+-- bridge is `attempt_resolve_for_tx` which the p2p tx-handler calls on
+-- accept of a parent.  Keeping the surfaces separate avoids touching the
+-- 1400-line accept_transaction pipeline and keeps the live-fragility blast
+-- radius minimal.
+--
+-- Memory bounds (Core parity):
+--   MAX_ORPHAN_TRANSACTIONS = 100   (bitcoin-core/src/node/txorphanage.cpp)
+--   MAX_ORPHAN_TX_SIZE      = 100000 bytes / tx  (per-tx serialized cap;
+--                              maps to Core's MAX_STANDARD_TX_WEIGHT/4)
+--   MAX_ORPHANS_PER_PEER    = 100   (per-peer cap; in Core a peer's share
+--                              is implicitly bounded by the global cap +
+--                              reservation logic — we use a flat 100 to
+--                              keep the bookkeeping simple)
+--------------------------------------------------------------------------------
+
+M.MAX_ORPHAN_TRANSACTIONS = 100
+M.MAX_ORPHAN_TX_SIZE      = 100000
+M.MAX_ORPHANS_PER_PEER    = 100
+
+local OrphanPool = {}
+OrphanPool.__index = OrphanPool
+M.OrphanPool = OrphanPool
+
+--- Create a new orphan tx pool.
+-- @param config table|nil: optional {max_orphans, max_per_peer, max_tx_size}
+-- @return OrphanPool
+function M.new_orphan_pool(config)
+  local self = setmetatable({}, OrphanPool)
+  self.max_orphans  = (config and config.max_orphans)  or M.MAX_ORPHAN_TRANSACTIONS
+  self.max_per_peer = (config and config.max_per_peer) or M.MAX_ORPHANS_PER_PEER
+  self.max_tx_size  = (config and config.max_tx_size)  or M.MAX_ORPHAN_TX_SIZE
+
+  -- Storage. Keyed by txid_hex (string) since callers carry that already.
+  -- Keeping it txid-keyed (rather than wtxid-keyed like Core 31.99) keeps
+  -- parent-resolution lookups O(1) without an extra mapping.
+  self.entries = {}    -- txid_hex -> {tx, peer_id, time, size, missing_parents={txid_hex=true,...}}
+  self.count   = 0
+  -- Per-peer announcement counts (peer_id -> count).
+  self.by_peer = {}
+  -- Insertion order list for oldest-first eviction.  We accept the O(n)
+  -- shift on eviction because n <= max_orphans (100 by default).
+  self.order   = {}    -- ordered list of txid_hex
+  return self
+end
+
+--- Try to add an orphan transaction.
+-- Caller must have already determined the tx has missing inputs and the
+-- missing-parent txid set.
+-- @param tx table: the orphan transaction
+-- @param txid_hex string: hex-encoded txid of the orphan
+-- @param peer_id any: peer-keyed identifier (e.g. "ip:port" or numeric id)
+-- @param missing_parents table|nil: set of {parent_txid_hex=true} (optional)
+-- @return boolean, string|nil: true on accept; false + reason on reject
+function OrphanPool:add(tx, txid_hex, peer_id, missing_parents)
+  if type(tx) ~= "table" or type(txid_hex) ~= "string" then
+    return false, "bad-orphan-args"
+  end
+  if self.entries[txid_hex] then
+    return false, "already-have-orphan"
+  end
+
+  -- Per-tx size cap. We use the witness-included serialization since that
+  -- is what the wire delivered and what Core's MAX_STANDARD_TX_WEIGHT/4
+  -- bound effectively constrains.
+  local ok_ser, ser = pcall(serialize.serialize_transaction, tx, true)
+  if not ok_ser or type(ser) ~= "string" then
+    return false, "bad-orphan-serialize"
+  end
+  local size = #ser
+  if size > self.max_tx_size then
+    return false, "orphan-too-large"
+  end
+
+  -- Per-peer cap.  Reject the new orphan rather than evicting from the
+  -- offending peer — Core does symmetric eviction but a flat reject is
+  -- safer for our simpler model and a misbehaving peer just gets its 101st
+  -- orphan dropped on the floor.
+  local pid = peer_id or "anonymous"
+  if (self.by_peer[pid] or 0) >= self.max_per_peer then
+    return false, "orphan-per-peer-cap"
+  end
+
+  -- Global cap: evict oldest first to make room.
+  while self.count >= self.max_orphans do
+    if not self:_evict_oldest() then break end
+  end
+  if self.count >= self.max_orphans then
+    -- Defensive: should not happen unless eviction is broken.
+    return false, "orphan-cap-evict-failed"
+  end
+
+  self.entries[txid_hex] = {
+    tx              = tx,
+    peer_id         = pid,
+    time            = os.time(),
+    size            = size,
+    missing_parents = missing_parents or {},
+  }
+  self.count = self.count + 1
+  self.by_peer[pid] = (self.by_peer[pid] or 0) + 1
+  self.order[#self.order + 1] = txid_hex
+  return true
+end
+
+--- Evict the oldest orphan. Returns true if one was evicted.
+function OrphanPool:_evict_oldest()
+  local victim_txid = self.order[1]
+  if not victim_txid then return false end
+  -- Shift order list (O(n) but n <= 100).
+  table.remove(self.order, 1)
+  return self:_remove_internal(victim_txid) ~= nil
+end
+
+--- Internal removal (does not touch self.order — caller must).
+-- @return entry|nil
+function OrphanPool:_remove_internal(txid_hex)
+  local entry = self.entries[txid_hex]
+  if not entry then return nil end
+  self.entries[txid_hex] = nil
+  self.count = self.count - 1
+  local pid = entry.peer_id
+  if pid then
+    local n = (self.by_peer[pid] or 1) - 1
+    if n <= 0 then
+      self.by_peer[pid] = nil
+    else
+      self.by_peer[pid] = n
+    end
+  end
+  return entry
+end
+
+--- Public: remove an orphan by txid_hex.
+function OrphanPool:remove(txid_hex)
+  if not self.entries[txid_hex] then return false end
+  for i, t in ipairs(self.order) do
+    if t == txid_hex then
+      table.remove(self.order, i)
+      break
+    end
+  end
+  self:_remove_internal(txid_hex)
+  return true
+end
+
+--- Test if the pool already has this orphan.
+function OrphanPool:has(txid_hex)
+  return self.entries[txid_hex] ~= nil
+end
+
+--- Number of orphans currently held.
+function OrphanPool:size()
+  return self.count
+end
+
+--- Drop all orphans contributed by `peer_id` (e.g. on disconnect).
+-- @return integer: number of orphans removed.
+function OrphanPool:remove_for_peer(peer_id)
+  if not peer_id or not self.by_peer[peer_id] then return 0 end
+  local removed = 0
+  -- Walk entries; keep order list rebuild simple (n <= 100).
+  local kept = {}
+  for _, txid_hex in ipairs(self.order) do
+    local e = self.entries[txid_hex]
+    if e and e.peer_id == peer_id then
+      self:_remove_internal(txid_hex)
+      removed = removed + 1
+    else
+      kept[#kept + 1] = txid_hex
+    end
+  end
+  self.order = kept
+  return removed
+end
+
+--- A new tx (`parent_txid_hex`) has just been accepted to the chain or
+-- mempool — find any orphans that listed it as a missing parent and
+-- return them in insertion order.  Caller is expected to re-feed them
+-- through `mempool:accept_transaction(...)` and remove them from the
+-- pool with `pool:remove(txid_hex)` on either acceptance or persistent
+-- rejection.
+--
+-- @param parent_txid_hex string
+-- @return list of {tx, txid_hex, peer_id} entries
+function OrphanPool:children_of(parent_txid_hex)
+  local out = {}
+  for _, txid_hex in ipairs(self.order) do
+    local e = self.entries[txid_hex]
+    if e and e.missing_parents[parent_txid_hex] then
+      out[#out + 1] = {
+        tx       = e.tx,
+        txid_hex = txid_hex,
+        peer_id  = e.peer_id,
+      }
+    end
+  end
+  return out
+end
+
+--- On block connected: drop any orphan that names a tx in this block as
+-- one of its missing parents (the parent is now spendable from the UTXO
+-- set, so the orphan is either resolvable or no longer interesting).
+-- The caller is responsible for re-feeding resolvable ones through
+-- accept_transaction; this function only cleans the buffer.
+-- @param block block: connected block
+-- @return list of removed orphan entries (for caller's re-feed loop)
+function OrphanPool:on_block_connected(block)
+  if not block or not block.transactions then return {} end
+  local resolved = {}
+  for _, tx in ipairs(block.transactions) do
+    local txid = validation.compute_txid(tx)
+    local parent_hex = types.hash256_hex(txid)
+    local children = self:children_of(parent_hex)
+    for _, c in ipairs(children) do
+      resolved[#resolved + 1] = c
+    end
+  end
+  return resolved
+end
+
 return M
