@@ -523,7 +523,52 @@ function M.new_header_chain(network, storage)
   self.height_to_hash = {}       -- height -> hash_hex
   self.syncing = false
   self.sync_peer = nil           -- peer currently syncing headers from
+  -- Per-peer counter of consecutive unconnecting-headers messages.
+  -- Mirrors Bitcoin Core's nUnconnectingHeaders accounting in
+  -- net_processing.cpp::ProcessHeadersMessage.  Keyed by peer.id (or
+  -- tostring(peer) when no id available).  Incremented when the first
+  -- header of a batch fails to connect AND low-work-sync also can't
+  -- absorb it; reset on any successful connecting batch.  When the
+  -- counter would exceed MAX_NUM_UNCONNECTING_HEADERS_MSGS (=10),
+  -- handle_headers returns a "exceeded:..." sentinel error so main.lua
+  -- escalates to the +100 ban.  Pre-fix, lunarblock returned (-1, err)
+  -- on the FIRST orphan and main.lua banned immediately.  See
+  -- CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+  -- (Pattern B), extended to Part-2 impls.
+  self.unconnecting_headers_count = {}
   return self
+end
+
+-- Bitcoin Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS (net_processing.cpp).
+-- Tolerate up to 10 unlinked-headers messages from a peer before banning.
+M.MAX_NUM_UNCONNECTING_HEADERS_MSGS = 10
+HeaderChain.MAX_NUM_UNCONNECTING_HEADERS_MSGS = 10
+
+--- Increment the per-peer unconnecting-headers counter and return whether
+-- the caller should ban the peer.
+-- @param peer table: peer that just sent the unconnecting batch
+-- @return boolean: true if the counter has exceeded the threshold
+function HeaderChain:note_unconnecting_headers(peer)
+  local key = peer and (peer.id or tostring(peer)) or "unknown"
+  local next_count = (self.unconnecting_headers_count[key] or 0) + 1
+  self.unconnecting_headers_count[key] = next_count
+  return next_count > HeaderChain.MAX_NUM_UNCONNECTING_HEADERS_MSGS
+end
+
+--- Reset the per-peer counter (called on every successful connecting
+-- headers batch — mirrors Core's nUnconnectingHeaders = 0).
+-- @param peer table: peer whose counter to clear
+function HeaderChain:reset_unconnecting_headers(peer)
+  local key = peer and (peer.id or tostring(peer)) or "unknown"
+  self.unconnecting_headers_count[key] = nil
+end
+
+--- Read the current per-peer unconnecting-headers count (used by tests).
+-- @param peer table: peer to query
+-- @return number: current counter value (zero if no entry)
+function HeaderChain:get_unconnecting_headers_count(peer)
+  local key = peer and (peer.id or tostring(peer)) or "unknown"
+  return self.unconnecting_headers_count[key] or 0
 end
 
 --------------------------------------------------------------------------------
@@ -1235,8 +1280,42 @@ function HeaderChain:handle_headers(peer, payload)
       end
       return 0  -- Headers queued in PRESYNC, not yet accepted
     end
-    -- Invalid headers - caller should ban peer
+    -- Core-parity unconnecting-headers gate (Pattern B closure).
+    -- "unknown parent" on the FIRST header of the batch is the
+    -- nUnconnectingHeaders case in Core's
+    -- net_processing.cpp::ProcessHeadersMessage.  Tolerate up to
+    -- MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 successive misses before
+    -- escalating to a ban; under threshold we return (0, nil) so
+    -- main.lua does NOT ban.  All other errors (bad PoW, bad MTP,
+    -- bad difficulty, checkpoint violation) bypass the counter and
+    -- go straight to the legacy ban path.
+    if err:match("unknown parent") and accepted == 0 then
+      local exceeded = self:note_unconnecting_headers(peer)
+      if exceeded then
+        -- Reset the counter on the way out so a re-connect from the
+        -- same peer starts fresh; main.lua will ban via add_ban_score.
+        self:reset_unconnecting_headers(peer)
+        return -1, string.format(
+          "too many unconnecting headers (count > %d)",
+          HeaderChain.MAX_NUM_UNCONNECTING_HEADERS_MSGS
+        )
+      end
+      -- Under threshold: do NOT ban the peer.  Re-issue getheaders to
+      -- drive Core's FindForkInGlobalIndex behavior.  The
+      -- :start_sync() call will pick the same peer if it's still our
+      -- best sync candidate.
+      self:start_sync(peer)
+      return 0
+    end
+    -- Invalid headers (bad PoW, MTP, etc.) - caller should ban peer
     return -1, err
+  end
+
+  -- A successful, fully-connecting batch resets the per-peer
+  -- unconnecting-headers counter (Core's nUnconnectingHeaders = 0 in
+  -- the success path of ProcessHeadersMessage).
+  if accepted and accepted > 0 then
+    self:reset_unconnecting_headers(peer)
   end
 
   -- If we got a full batch (2000 headers), request more
