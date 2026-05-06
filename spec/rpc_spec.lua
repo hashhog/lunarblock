@@ -648,6 +648,165 @@ describe("rpc", function()
     end)
   end)
 
+  describe("setban / listbanned / clearbanned", function()
+    -- Mock peer_manager with the minimal surface the RPC layer needs.
+    local function make_ban_pm()
+      local pm = {
+        banned = {},
+        peer_list = {},
+      }
+      function pm:ban_peer(ip, duration)
+        duration = duration or 86400
+        self.banned[ip] = os.time() + duration
+      end
+      function pm:unban_peer(ip)
+        self.banned[ip] = nil
+      end
+      function pm:is_banned(ip)
+        return self.banned[ip] and self.banned[ip] > os.time()
+      end
+      function pm:get_banned_list()
+        local result, now = {}, os.time()
+        for ip, ban_until in pairs(self.banned) do
+          if ban_until > now then
+            result[#result + 1] = {ip = ip, ban_until = ban_until}
+          end
+        end
+        return result
+      end
+      function pm:clear_expired_bans() end
+      function pm:_save_bans() self._save_calls = (self._save_calls or 0) + 1 end
+      return pm
+    end
+
+    it("setban add: bans an IP and persists", function()
+      local pm = make_ban_pm()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"setban","params":["1.2.3.4","add"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.equal(cjson.null, decoded.error)
+      assert.is_true(pm:is_banned("1.2.3.4"))
+    end)
+
+    it("setban add with explicit duration", function()
+      local pm = make_ban_pm()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local before = os.time()
+      local request = '{"method":"setban","params":["5.6.7.8","add",3600],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.equal(cjson.null, decoded.error)
+      assert.is_true(pm.banned["5.6.7.8"] >= before + 3600)
+      assert.is_true(pm.banned["5.6.7.8"] <  before + 3700)
+    end)
+
+    it("setban add with absolute=true treats bantime as epoch", function()
+      local pm = make_ban_pm()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local target = os.time() + 7200
+      local request = string.format(
+        '{"method":"setban","params":["9.9.9.9","add",%d,true],"id":1}', target)
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.equal(cjson.null, decoded.error)
+      -- Allow ±2s slack for the os.time() drift between RPC and test.
+      assert.is_true(pm.banned["9.9.9.9"] >= target - 2)
+      assert.is_true(pm.banned["9.9.9.9"] <= target + 2)
+    end)
+
+    it("setban add fails when already banned", function()
+      local pm = make_ban_pm()
+      pm:ban_peer("1.2.3.4")
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"setban","params":["1.2.3.4","add"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.is_table(decoded.error)
+      assert.truthy(decoded.error.message:match("already banned"))
+    end)
+
+    it("setban remove unbans an IP", function()
+      local pm = make_ban_pm()
+      pm:ban_peer("10.0.0.1")
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"setban","params":["10.0.0.1","remove"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.equal(cjson.null, decoded.error)
+      assert.is_falsy(pm:is_banned("10.0.0.1"))
+    end)
+
+    it("setban remove fails when not banned", function()
+      local pm = make_ban_pm()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"setban","params":["172.16.0.1","remove"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.is_table(decoded.error)
+      assert.truthy(decoded.error.message:match("not previously banned"))
+    end)
+
+    it("setban rejects invalid command", function()
+      local pm = make_ban_pm()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"setban","params":["1.2.3.4","ban"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.is_table(decoded.error)
+      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+    end)
+
+    it("listbanned returns Core-shape entries", function()
+      local pm = make_ban_pm()
+      pm:ban_peer("203.0.113.1", 3600)
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"listbanned","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.equal(cjson.null, decoded.error)
+      assert.equal(1, #decoded.result)
+      local entry = decoded.result[1]
+      assert.equal("203.0.113.1", entry.address)
+      assert.is_number(entry.banned_until)
+      assert.is_number(entry.ban_duration)
+      assert.is_number(entry.time_remaining)
+      assert.is_true(entry.time_remaining > 0)
+    end)
+
+    it("listbanned returns empty array when no bans", function()
+      local pm = make_ban_pm()
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"listbanned","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.equal(cjson.null, decoded.error)
+      assert.same({}, decoded.result)
+    end)
+
+    it("clearbanned drops every entry", function()
+      local pm = make_ban_pm()
+      pm:ban_peer("1.1.1.1")
+      pm:ban_peer("2.2.2.2")
+      pm:ban_peer("3.3.3.3")
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local request = '{"method":"clearbanned","params":[],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.equal(cjson.null, decoded.error)
+      assert.same({}, pm.banned)
+    end)
+
+    it("setban requires peer_manager", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local request = '{"method":"setban","params":["1.2.3.4","add"],"id":1}'
+      local response = server:handle_request(request)
+      local decoded = cjson.decode(response)
+      assert.is_table(decoded.error)
+      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
+    end)
+  end)
+
   describe("RPC error codes", function()
     it("defines standard JSON-RPC error codes", function()
       assert.equal(-32700, rpc.ERROR.PARSE_ERROR)
