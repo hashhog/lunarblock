@@ -72,6 +72,14 @@ M.NET_ADDR_SIZE = {
 -- Maximum address size (BIP155)
 M.MAX_ADDRV2_SIZE = 512
 
+-- Wire-decode bounds. Mirrors Bitcoin Core net_processing.cpp.
+-- A peer-supplied compact-size count above any of these is a protocol
+-- violation; reject before allocating to prevent OOM DoS.
+M.MAX_INV_SIZE = 50000        -- net_processing.cpp:126 MAX_INV_SZ
+M.MAX_HEADERS_RESULTS = 2000  -- net_processing.h:50 MAX_HEADERS_RESULTS
+M.MAX_ADDR_TO_SEND = 1000     -- net_processing.cpp:190 MAX_ADDR_TO_SEND
+M.MAX_LOCATOR_SZ = 101        -- BIP-152: max getheaders/getblocks locator entries
+
 M.INV_TYPE = {
   ERROR = 0,
   MSG_TX = 1,
@@ -433,6 +441,9 @@ end
 function M.deserialize_inv(data)
   local r = serialize.buffer_reader(data)
   local count = r.read_varint()
+  if count > M.MAX_INV_SIZE then
+    error("inv message size = " .. tostring(count) .. " exceeds MAX_INV_SIZE")
+  end
   local items = {}
   for i = 1, count do
     items[i] = {
@@ -476,6 +487,9 @@ function M.deserialize_getblocks(data)
   local r = serialize.buffer_reader(data)
   local version = r.read_u32le()
   local count = r.read_varint()
+  if count > M.MAX_LOCATOR_SZ then
+    error("locator size = " .. tostring(count) .. " exceeds MAX_LOCATOR_SZ")
+  end
   local block_locator_hashes = {}
   for i = 1, count do
     block_locator_hashes[i] = r.read_hash256()
@@ -515,6 +529,9 @@ end
 function M.deserialize_headers(data)
   local r = serialize.buffer_reader(data)
   local count = r.read_varint()
+  if count > M.MAX_HEADERS_RESULTS then
+    error("headers message size = " .. tostring(count) .. " exceeds MAX_HEADERS_RESULTS")
+  end
   local headers = {}
   for i = 1, count do
     headers[i] = serialize.deserialize_block_header(r)
@@ -558,6 +575,9 @@ end
 function M.deserialize_addr(data)
   local r = serialize.buffer_reader(data)
   local count = r.read_varint()
+  if count > M.MAX_ADDR_TO_SEND then
+    error("addr message size = " .. tostring(count) .. " exceeds MAX_ADDR_TO_SEND")
+  end
   local addresses = {}
   for i = 1, count do
     addresses[i] = {
@@ -706,6 +726,9 @@ end
 function M.deserialize_addrv2(data)
   local r = serialize.buffer_reader(data)
   local count = r.read_varint()
+  if count > M.MAX_ADDR_TO_SEND then
+    error("addrv2 message size = " .. tostring(count) .. " exceeds MAX_ADDR_TO_SEND")
+  end
   local addresses = {}
   for i = 1, count do
     local timestamp = r.read_u32le()
