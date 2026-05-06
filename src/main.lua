@@ -98,6 +98,7 @@ local function parse_args(argv)
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
+      print("      --txindex                   Maintain a full transaction index (txid → blockhash) for getrawtransaction")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --import-utxo FILE          Import UTXO snapshot from Core dumptxoutset file (AssumeUTXO)")
       print("      --pid PATH                  Path to PID file (default: <datadir>/lunarblock.pid)")
@@ -163,6 +164,17 @@ local function parse_args(argv)
       i = i + 1
       local v = argv[i]
       args.peerbloomfilters = (v == "1" or v == "true" or v == "yes" or v == "on")
+    elseif arg == "--txindex" or arg:match("^%-%-txindex=") then
+      -- Pattern C0 (2026-05-06): enable inline txindex maintenance.
+      -- Accepts "--txindex" (bare) or "--txindex=BOOL".  Mirrors
+      -- bitcoin-core's -txindex CLI flag.  Default off; live mainnet
+      -- runs unaffected unless the operator opts in on next restart.
+      local v = arg:match("^%-%-txindex=(.*)$")
+      if v == nil then
+        args.txindex = true
+      else
+        args.txindex = (v == "1" or v == "true" or v == "yes" or v == "on")
+      end
     elseif arg == "--import-blocks" then
       i = i + 1
       args.import_blocks = argv[i]
@@ -293,6 +305,9 @@ local function run_import_blocks(args)
 
   -- Initialize chain state
   local chain_state = utxo_mod.new_chain_state(db, network)
+  if args.txindex then
+    chain_state:set_txindex_enabled(true)
+  end
   chain_state:init()
   local tip_height = chain_state.tip_height or 0
   print(string.format("Chain tip at height %d, starting import", tip_height))
@@ -685,6 +700,15 @@ local function main()
   -- Initialize chain state
   io.stdout:write("Initializing chain state...\n"); io.stdout:flush()
   local chain_state = utxo_mod.new_chain_state(db, network)
+  -- Pattern C0 (2026-05-06): enable txindex if requested.  Off by default
+  -- so the live mainnet IBD path (which is intentionally not restarted in
+  -- this fix wave) keeps the same hot loop.  When on, connect_block writes
+  -- (txid → blockhash||height_le) into CF.TX_INDEX inside the per-block
+  -- atomic batch, and disconnect_block deletes those keys symmetrically.
+  if args.txindex then
+    chain_state:set_txindex_enabled(true)
+    io.stdout:write("txindex enabled (Pattern C0).\n"); io.stdout:flush()
+  end
   chain_state:init()
   io.stdout:write(string.format("Chain state initialized: height=%d\n", chain_state.tip_height or -1)); io.stdout:flush()
 
