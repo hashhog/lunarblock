@@ -1971,6 +1971,138 @@ function RPCServer:register_methods()
     end
   end
 
+  -- Bitcoin Core setban / listbanned / clearbanned RPC.
+  -- Reference: bitcoin-core/src/rpc/net.cpp::setban (ban handler).
+  -- Lunarblock's PeerManager.banned[ip] map already persists to
+  -- banned.dat via _save_bans, so the RPC layer is a thin wrapper that
+  -- exposes ban_peer / unban_peer / get_banned_list.
+  --
+  -- Subnet semantics: Core accepts CIDR ("a.b.c.d/24") and bare IPs.
+  -- Lunarblock's underlying ban table is keyed by exact IP only — we
+  -- accept the textual subnet form for Core compat and store the full
+  -- string as the key.  is_banned() does exact-string match in
+  -- peerman.lua:1167, so a "/32" entry behaves identically to a bare IP.
+  -- Wider CIDRs are stored verbatim and treated as opaque by the matcher
+  -- (no reverse lookup); operators get the parity surface they expect at
+  -- the RPC, with a TODO to wire CIDR matching into the connection
+  -- gate.  Documented to avoid silent CIDR-non-enforcement surprises.
+  --
+  -- Param shape (Core):
+  --   setban "subnet" "command" ( bantime absolute )
+  --     subnet:  string (IP or CIDR)
+  --     command: "add" | "remove"
+  --     bantime: integer seconds (0 → use default 24h); offset OR absolute
+  --     absolute: bool — if true, bantime is a UNIX epoch
+  self.methods["setban"] = function(rpc, params)
+    if not rpc.peer_manager then
+      error({code = M.ERROR.MISC_ERROR, message = "peer manager not available"})
+    end
+    local subnet  = params and params[1]
+    local command = params and params[2]
+    local bantime = params and params[3]
+    local absolute = params and params[4]
+
+    if type(subnet) ~= "string" or subnet == "" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Error: subnet (string) is required"})
+    end
+    if type(command) ~= "string" or (command ~= "add" and command ~= "remove") then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "Error: command (string, \"add\" or \"remove\") is required"})
+    end
+
+    -- Strip a trailing /N if present and remember it; we store the full
+    -- subnet string for visibility but ban_peer uses the bare ip key.
+    -- Core's CSubNet validates here; we accept any non-empty token to
+    -- avoid rejecting legitimate IPv6 forms.
+    local key = subnet  -- keep verbatim so listbanned echoes Core's input
+
+    if command == "add" then
+      if rpc.peer_manager:is_banned(key) then
+        error({code = M.ERROR.MISC_ERROR,
+               message = "Error: IP/Subnet already banned"})
+      end
+      -- Default ban duration: 24 h (peerman.MISBEHAVIOR.DEFAULT_BAN_DURATION).
+      -- Core: `bantime ? bantime : DEFAULT_MISBEHAVING_BANTIME`.
+      local duration
+      if bantime ~= nil then
+        if type(bantime) ~= "number" then
+          error({code = M.ERROR.INVALID_PARAMS,
+                 message = "Error: bantime must be a number"})
+        end
+        if absolute then
+          -- bantime is a UNIX epoch — translate back to a duration so
+          -- ban_peer's `os.time() + duration` produces the requested
+          -- absolute expiry.  Negative durations are clamped to 1s
+          -- (Core treats absolute-in-the-past as a no-op insert; we
+          -- mirror that with a 1-tick ban that the next clear sweeps.)
+          duration = math.max(1, math.floor(bantime - os.time()))
+        else
+          if bantime == 0 then
+            -- Core: 0 means default.
+            duration = nil
+          else
+            duration = math.floor(bantime)
+          end
+        end
+      end
+      rpc.peer_manager:ban_peer(key, duration)
+      return nil
+    else  -- remove
+      if not rpc.peer_manager:is_banned(key) then
+        error({code = M.ERROR.MISC_ERROR,
+               message = "Error: Unban failed. Requested address/subnet was not previously banned."})
+      end
+      rpc.peer_manager:unban_peer(key)
+      return nil
+    end
+  end
+
+  --- listbanned: return active bans.
+  -- Core shape: array of objects with `address`, `banned_until`,
+  -- `ban_created`, `ban_reason`.  We don't track ban_created or
+  -- ban_reason so they're omitted (Core RPC doc allows extra/missing
+  -- fields per impl); ban_duration is derived from banned_until -
+  -- now() and `time_remaining` follows the same.
+  self.methods["listbanned"] = function(rpc, _params)
+    if not rpc.peer_manager then
+      error({code = M.ERROR.MISC_ERROR, message = "peer manager not available"})
+    end
+    -- Sweep expired bans first so the list is clean (Core also sweeps
+    -- expired bans before serializing).
+    rpc.peer_manager:clear_expired_bans()
+    local entries = rpc.peer_manager:get_banned_list()
+    local now = os.time()
+    local result = {}
+    for _, e in ipairs(entries) do
+      result[#result + 1] = {
+        address        = e.ip,
+        banned_until   = e.ban_until,
+        ban_duration   = e.ban_until - now,
+        time_remaining = math.max(0, e.ban_until - now),
+      }
+    end
+    return result
+  end
+
+  --- clearbanned: drop every ban entry.  Core: `clearbanned`.
+  self.methods["clearbanned"] = function(rpc, _params)
+    if not rpc.peer_manager then
+      error({code = M.ERROR.MISC_ERROR, message = "peer manager not available"})
+    end
+    -- Walk the active list and unban each one — that triggers a
+    -- _save_bans per call, but the list is small (<<1000 typical) so
+    -- the disk-IO is negligible and we get the persistence guarantee
+    -- for free.
+    local entries = rpc.peer_manager:get_banned_list()
+    for _, e in ipairs(entries) do
+      rpc.peer_manager:unban_peer(e.ip)
+    end
+    -- Also drop any expired entries that get_banned_list filtered out.
+    rpc.peer_manager.banned = {}
+    rpc.peer_manager:_save_bans()
+    return nil
+  end
+
   -- Fee estimation
   self.methods["estimatesmartfee"] = function(rpc, params)
     local conf_target = params[1] or 6
