@@ -2758,9 +2758,58 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- ── Stage 5: REORG.  Disconnect from tip down to common_height (using
   -- the existing rollback_chain_to which restores UTXOs from undo data),
   -- then connect each side-branch block in order.
+  --
+  -- Pattern B (mempool refill on reorg): before tearing the active
+  -- chain down, snapshot the block bodies that are about to be
+  -- disconnected so we can re-feed their non-coinbase transactions
+  -- into the mempool after rollback completes.  Without this snapshot
+  -- the txs would be silently dropped — wallets would see a
+  -- "confirmed then vanished" tx, and the mempool would mis-estimate
+  -- fees against a chain that no longer reflects observed traffic.
+  -- Bitcoin Core does the equivalent in `Chainstate::DisconnectTip` →
+  -- `MaybeUpdateMempoolForReorg` (validation.cpp); camlcoin parity at
+  -- lib/sync.ml:2354-2363.  See
+  -- CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+  --
+  -- We capture blocks ONLY when a mempool reference is provided
+  -- (opts.mempool); the IBD path that doesn't carry a mempool stays
+  -- on the cheap "no-snapshot" code path.
+  local disconnected_blocks = nil
+  if opts.mempool then
+    disconnected_blocks = {}
+    -- Walk active-chain heights newest-first (matches the order
+    -- rollback_chain_to disconnects in) so the captured block bodies
+    -- mirror the disconnect sequence.  Refill order doesn't matter
+    -- for correctness — accept_transaction handles parent/child
+    -- relationships on its own — but keeping the order consistent
+    -- with disconnect makes diagnosis easier.
+    local h = self.tip_height
+    while h > common_height do
+      local h_hash = self.storage.get_hash_by_height(h)
+      if h_hash then
+        local h_block = self.storage.get_block(h_hash)
+        if h_block then
+          disconnected_blocks[#disconnected_blocks + 1] = h_block
+        end
+      end
+      h = h - 1
+    end
+  end
+
   local disconnected, dc_err = self:rollback_chain_to(common_height)
   if not disconnected then
     return nil, "reorg-disconnect-failed: " .. tostring(dc_err)
+  end
+
+  -- Refill the mempool with txs from the disconnected blocks BEFORE
+  -- the connect loop runs.  If a side-branch block confirms one of
+  -- the re-added txs, on_block_connected (called by the caller after
+  -- this returns) will remove it cleanly.  Coinbase txs are skipped
+  -- inside Mempool:block_disconnected.
+  if opts.mempool and disconnected_blocks then
+    for _, dblk in ipairs(disconnected_blocks) do
+      opts.mempool:block_disconnected(dblk)
+    end
   end
 
   -- side_chain is newest-first; iterate oldest → newest to connect in order.
