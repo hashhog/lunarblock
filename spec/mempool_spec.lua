@@ -394,6 +394,112 @@ describe("mempool", function()
     end)
   end)
 
+  describe("block disconnection (reorg refill)", function()
+    -- Pattern B (mempool refill on reorg): when a block is disconnected
+    -- during a reorg, its non-coinbase txs must be re-fed to the
+    -- mempool.  See
+    -- CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
+    -- and Bitcoin Core validation.cpp DisconnectTip +
+    -- MaybeUpdateMempoolForReorg.
+
+    it("re-adds disconnected non-coinbase tx to mempool", function()
+      local prev_txid = types.hash256(string.rep("\x01", 32))
+      local prev_txid_hex = types.hash256_hex(prev_txid)
+
+      local chain_state = make_mock_chain_state()
+      add_utxo(chain_state, prev_txid_hex, 0, 100000)
+
+      local mp = mempool.new(chain_state)
+
+      -- Build a non-coinbase tx that spends the available UTXO.
+      local tx = make_tx(1, {}, {}, 0)
+      tx.inputs[1] = make_input(prev_txid, 0)
+      tx.outputs[1] = make_output(90000)
+      local txid = validation.compute_txid(tx)
+      local txid_hex = types.hash256_hex(txid)
+
+      -- Build a coinbase tx (transactions[1]) so the block layout
+      -- matches a real mined block.
+      local coinbase = make_tx(1, {}, {}, 0)
+      coinbase.inputs[1] = types.txin(
+        types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+        "\x03\x01\x02\x03",
+        0xFFFFFFFF
+      )
+      coinbase.outputs[1] = make_output(5000000000)
+
+      local header = types.block_header(
+        1, types.hash256_zero(), types.hash256_zero(),
+        os.time(), 0x207fffff, 0)
+      local block = types.block(header, {coinbase, tx})
+
+      -- Mempool starts empty; disconnect should re-admit the tx.
+      assert.equal(0, mp.tx_count)
+      mp:block_disconnected(block)
+      assert.equal(1, mp.tx_count, "tx should be re-admitted post-disconnect")
+      assert.is_not_nil(mp:get_entry(txid_hex))
+    end)
+
+    it("skips coinbase transaction (transactions[1])", function()
+      local chain_state = make_mock_chain_state()
+      local mp = mempool.new(chain_state)
+
+      -- Block with only a coinbase.  block_disconnected must not error
+      -- and must not add the coinbase to the mempool.
+      local coinbase = make_tx(1, {}, {}, 0)
+      coinbase.inputs[1] = types.txin(
+        types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+        "\x03\x01\x02\x03",
+        0xFFFFFFFF
+      )
+      coinbase.outputs[1] = make_output(5000000000)
+
+      local header = types.block_header(
+        1, types.hash256_zero(), types.hash256_zero(),
+        os.time(), 0x207fffff, 0)
+      local block = types.block(header, {coinbase})
+
+      mp:block_disconnected(block)
+      assert.equal(0, mp.tx_count)
+    end)
+
+    it("swallows accept_transaction failures (best-effort)", function()
+      -- Tx with no inputs / no UTXO backing → accept_transaction will
+      -- reject.  block_disconnected must not propagate the failure.
+      local chain_state = make_mock_chain_state()
+      local mp = mempool.new(chain_state)
+
+      local coinbase = make_tx(1, {}, {}, 0)
+      coinbase.inputs[1] = types.txin(
+        types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+        "\x03\x01\x02\x03",
+        0xFFFFFFFF
+      )
+      coinbase.outputs[1] = make_output(5000000000)
+
+      local bad_tx = make_tx(1, {}, {}, 0)
+      bad_tx.inputs[1] = make_input(types.hash256(string.rep("\x99", 32)), 0)
+      bad_tx.outputs[1] = make_output(50000)
+
+      local header = types.block_header(
+        1, types.hash256_zero(), types.hash256_zero(),
+        os.time(), 0x207fffff, 0)
+      local block = types.block(header, {coinbase, bad_tx})
+
+      -- Must not throw.
+      assert.has_no.errors(function() mp:block_disconnected(block) end)
+      assert.equal(0, mp.tx_count, "invalid tx must not enter mempool")
+    end)
+
+    it("nil/empty block is a no-op", function()
+      local chain_state = make_mock_chain_state()
+      local mp = mempool.new(chain_state)
+      assert.has_no.errors(function() mp:block_disconnected(nil) end)
+      assert.has_no.errors(function() mp:block_disconnected({}) end)
+      assert.equal(0, mp.tx_count)
+    end)
+  end)
+
   describe("mempool trimming", function()
     it("evicts lowest fee-rate transactions when full", function()
       local chain_state = make_mock_chain_state()
