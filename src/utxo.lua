@@ -1310,6 +1310,22 @@ function M.new_chain_state(storage, network)
     on_block_connected = nil,     -- function(block_hash, block_data)
     on_block_disconnected = nil,  -- function(block_hash)
   }
+  -- Pattern C0 (2026-05-06): inline txindex maintenance.  When enabled,
+  -- connect_block writes (txid → block_hash || height_le) into CF.TX_INDEX
+  -- inside the per-block atomic batch, and disconnect_block deletes those
+  -- same keys inside the disconnect batch.  This is the lunarblock analog
+  -- of bitcoin-core/src/index/txindex.cpp's CustomAppend / CustomRemove
+  -- via BaseIndex::BlockConnected / BlockDisconnected.  See findings
+  -- CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md.
+  --
+  -- The value layout is `block_hash (32B) || height (4B LE)` so the
+  -- existing rpc.lua / rest.lua getrawtransaction reader (which reads
+  -- bytes 1..32 as the block hash) keeps working unmodified.  Wiring is
+  -- inline rather than via indexmanager.lua / txindex.lua because those
+  -- modules were never plumbed into the block-connect callback (dead code
+  -- today, only exercised by spec/txindex_spec.lua).  Inline wiring is
+  -- the smallest correct fix per the 2026-05-05 audit.
+  self.txindex_enabled = false
   -- W77-CB: rolling-window sub-phase breakdown of connect_block.  W75-CONN
   -- in sync.lua measures the callback as a black box (cb_avg ≈ 700–850ms
   -- during IBD, dominating the ~900ms/block budget).  This inner window
@@ -1321,6 +1337,14 @@ function M.new_chain_state(storage, network)
                   flush_t = 0, cb_t = 0, total_t = 0,
                   tx_max = 0, flush_max = 0, total_max = 0 }
   return self
+end
+
+-- Late toggle for txindex.  Used by main.lua after parse_args to flip the
+-- flag on without forcing every test/harness to wire constructor args.
+-- Disabled-by-default to keep IBD perf identical for the live mainnet
+-- node (which is intentionally not restarted in the Pattern C0 wave).
+function ChainState:set_txindex_enabled(enabled)
+  self.txindex_enabled = enabled and true or false
 end
 
 function ChainState:init()
@@ -1921,9 +1945,19 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- Collect signatures for parallel verification
   local parallel_sigs = use_parallel_verify and {} or nil
 
+  -- Pattern C0 txindex (see ChainState ctor).  Collect this block's txids
+  -- here so we can write them into CF.TX_INDEX inside the atomic batch
+  -- below, alongside the UTXO/undo/chain_tip mutations.  An empty list
+  -- when txindex is disabled costs nothing.
+  local block_txid_bytes = self.txindex_enabled and {} or nil
+
   for tx_idx, tx in ipairs(block.transactions) do
     local txid = validation.compute_txid(tx)
     local is_coinbase = (tx_idx == 1)
+
+    if block_txid_bytes then
+      block_txid_bytes[#block_txid_bytes + 1] = txid.bytes
+    end
 
     if is_coinbase then
       -- Coinbase only has legacy sigops (no UTXOs to look up)
@@ -2410,11 +2444,26 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   tip_buf[34] = band(rshift(tip_height_capture, 16), 0xFF)
   tip_buf[35] = band(rshift(tip_height_capture, 24), 0xFF)
   local tip_data = ffi.string(tip_buf, 36)
+  -- Pattern C0: pre-compute the per-tx txindex value (block_hash || height
+  -- LE) once per block; tip_buf above is exactly that 36-byte layout.
+  -- Reusing it avoids per-tx string allocation overhead.
+  local txindex_value = block_txid_bytes and tip_data or nil
   self.coin_view:flush(false, function(batch)
     -- Undo data into the same atomic batch (was a separate put before
     -- 2026-04-30; see comment block above).
     if undo_data_for_batch then
       batch.put(storage_mod.CF.UNDO, block_hash.bytes, undo_data_for_batch)
+    end
+    -- Pattern C0 txindex (txid → block_hash||height_le).  Writing inside
+    -- the same atomic batch as the UTXO/undo/chain_tip update guarantees
+    -- there is no on-disk state in which the tip advanced past a block
+    -- whose txindex entries are still missing.  Symmetrical with the
+    -- delete in disconnect_block; reverts cleanly on reorg.  Skipped
+    -- when txindex_enabled is false (default).
+    if block_txid_bytes then
+      for i = 1, #block_txid_bytes do
+        batch.put(storage_mod.CF.TX_INDEX, block_txid_bytes[i], txindex_value)
+      end
     end
     -- Include caller's extra operations (e.g. block body / height index from
     -- the IBD path, or block/header/height_index from submitblock) in the
@@ -2897,6 +2946,12 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
     end
   end
 
+  -- Pattern C0: collect txids from this block so we can delete their
+  -- CF.TX_INDEX entries inside the disconnect atomic batch.  Symmetrical
+  -- with the connect path.  Ref: bitcoin-core BaseIndex::BlockDisconnected
+  -- → CTxIndex::CustomRemove.
+  local block_txid_bytes = self.txindex_enabled and {} or nil
+
   -- Process transactions in reverse order
   -- Note: block_undo.tx_undo[i] corresponds to block.transactions[i+1]
   -- because coinbase (tx index 1) has no undo data
@@ -2904,6 +2959,10 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
     local tx = block.transactions[tx_idx]
     local txid = validation.compute_txid(tx)
     local is_coinbase = (tx_idx == 1)
+
+    if block_txid_bytes then
+      block_txid_bytes[#block_txid_bytes + 1] = txid.bytes
+    end
 
     -- Remove outputs from UTXO set (they were added during connect)
     for vout_idx = 1, #tx.outputs do
@@ -2939,6 +2998,16 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
     -- Remove undo data for this block
     if had_undo then
       batch.delete(storage_mod.CF.UNDO, disconnect_hash.bytes)
+    end
+    -- Pattern C0: drop txindex entries for every tx in the disconnected
+    -- block, atomically with the UTXO restore + chain_tip rewind.  After
+    -- this commits, getrawtransaction(<txid>) for any tx confirmed only
+    -- in this block returns "no such tx" — matching nimrod's
+    -- correct-PASS behavior in the cross-impl table.
+    if block_txid_bytes then
+      for i = 1, #block_txid_bytes do
+        batch.delete(storage_mod.CF.TX_INDEX, block_txid_bytes[i])
+      end
     end
     -- Update chain tip to the previous block
     if new_tip_hash then
