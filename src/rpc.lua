@@ -4511,6 +4511,539 @@ function RPCServer:register_methods()
   end
 
   ----------------------------------------------------------------------------
+  -- Wallet signing RPCs (signrawtransactionwith{wallet,key})
+  ----------------------------------------------------------------------------
+  --
+  -- Reference: bitcoin-core/src/rpc/rawtransaction.cpp:signrawtransactionwithkey
+  --            bitcoin-core/src/wallet/rpc/spend.cpp:signrawtransactionwithwallet
+  --            camlcoin/lib/rpc.ml:signrawtransactionwithkey (best-in-class)
+  --
+  -- Both handlers share a common signing core: decode tx, locate the prev_out
+  -- script_pubkey + value for each input (from caller-provided prevTxs, or
+  -- wallet UTXOs, or the chain UTXO CF), classify the SPK, look up the matching
+  -- key (by hash160 / address), produce the sighash, ECDSA-sign, and write
+  -- the witness or scriptSig.  P2TR (Schnorr) is not signed because lunarblock
+  -- ships ECDSA-only crypto today (M.schnorr_sign is unavailable); the input
+  -- is left untouched and `complete=false` is reported.
+
+  --- WIF or 64-hex privkey -> {privkey32, pubkey, pkh, compressed}
+  -- Returns nil on parse failure so the caller can skip silently like Core.
+  local function decode_priv_key_string(s)
+    if type(s) ~= "string" then return nil end
+    local crypto = require("lunarblock.crypto")
+    local addr_mod = require("lunarblock.address")
+    local privkey32, compressed
+    if #s == 64 and s:match("^[0-9A-Fa-f]+$") then
+      privkey32 = M.hex_decode(s)
+      compressed = true
+    else
+      local _, payload = addr_mod.base58check_decode(s)
+      if not payload then return nil end
+      if #payload == 33 and payload:byte(33) == 0x01 then
+        privkey32 = payload:sub(1, 32); compressed = true
+      elseif #payload == 32 then
+        privkey32 = payload; compressed = false
+      else
+        return nil
+      end
+    end
+    local pubkey = crypto.pubkey_from_privkey(privkey32, compressed)
+    if not pubkey then return nil end
+    local pkh = crypto.hash160(pubkey)
+    return {privkey = privkey32, pubkey = pubkey, pkh = pkh, compressed = compressed}
+  end
+
+  --- Look up prevout (value, script_pubkey) for `tx_input`.
+  --
+  -- Resolution order:
+  --   1. caller-provided `prev_lookup` map (from prevTxs[] arg) keyed by
+  --      txid_le .. vout_u32le
+  --   2. wallet.utxos[] map (when a wallet is bound to the request)
+  --   3. chain UTXO CF via rpc.storage (confirmed UTXO set)
+  --
+  -- Returns nil if no source has the outpoint.
+  local function resolve_prevout(rpc, tx_input, prev_lookup)
+    local utxo_mod = require("lunarblock.utxo")
+    local outpoint_key = tx_input.prev_out.hash.bytes .. string.char(
+      bit.band(tx_input.prev_out.index, 0xFF),
+      bit.band(bit.rshift(tx_input.prev_out.index, 8), 0xFF),
+      bit.band(bit.rshift(tx_input.prev_out.index, 16), 0xFF),
+      bit.band(bit.rshift(tx_input.prev_out.index, 24), 0xFF))
+
+    if prev_lookup and prev_lookup[outpoint_key] then
+      return prev_lookup[outpoint_key]
+    end
+    if rpc.wallet and rpc.wallet.utxos and rpc.wallet.utxos[outpoint_key] then
+      local u = rpc.wallet.utxos[outpoint_key]
+      return {value = u.value, script_pubkey = u.script_pubkey}
+    end
+    if rpc.storage then
+      local data = rpc.storage.get(storage_mod.CF.UTXO, outpoint_key)
+      if data then
+        local entry = utxo_mod.deserialize_utxo_entry(data)
+        return {value = entry.value, script_pubkey = entry.script_pubkey}
+      end
+    end
+    return nil
+  end
+
+  --- Parse the optional `prevtxs` arg from signrawtransactionwith{key,wallet}.
+  --
+  -- Each entry is {txid, vout, scriptPubKey, [redeemScript], [witnessScript],
+  -- [amount]}.  Returns a map keyed by outpoint_key (txid_le .. vout_u32le).
+  local function parse_prevtxs(prevtxs_raw)
+    if prevtxs_raw == nil then return {} end
+    if type(prevtxs_raw) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "prevtxs must be an array"})
+    end
+    local out = {}
+    for i, e in ipairs(prevtxs_raw) do
+      if type(e) ~= "table" or type(e.txid) ~= "string" or type(e.vout) ~= "number"
+         or type(e.scriptPubKey) ~= "string" then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = "prevtxs[" .. (i - 1) .. "]: requires txid, vout, scriptPubKey"})
+      end
+      local txid = types.hash256_from_hex(e.txid)
+      local key = txid.bytes .. string.char(
+        bit.band(e.vout, 0xFF),
+        bit.band(bit.rshift(e.vout, 8), 0xFF),
+        bit.band(bit.rshift(e.vout, 16), 0xFF),
+        bit.band(bit.rshift(e.vout, 24), 0xFF))
+      local amount_sat = 0
+      if e.amount ~= nil then
+        amount_sat = math.floor(tonumber(e.amount) * consensus.COIN + 0.5)
+      end
+      out[key] = {
+        value = amount_sat,
+        script_pubkey = M.hex_decode(e.scriptPubKey),
+        redeem_script = e.redeemScript and M.hex_decode(e.redeemScript) or nil,
+        witness_script = e.witnessScript and M.hex_decode(e.witnessScript) or nil,
+      }
+    end
+    return out
+  end
+
+  --- Sign one input with a matched key.  Returns true on success and writes
+  -- the witness or scriptSig back into `tx`.  Returns false if the script type
+  -- is unsupported (P2TR) or no key matched.
+  local function sign_one_input(tx, i, prev, key_info, sighash_type)
+    local crypto = require("lunarblock.crypto")
+    local script_type, hash_or_program = script_mod.classify_script(prev.script_pubkey)
+
+    if script_type == "p2wpkh" then
+      local script_code = script_mod.make_p2pkh_script(hash_or_program)
+      local sighash = validation.signature_hash_segwit_v0(
+        tx, i - 1, script_code, prev.value, sighash_type)
+      local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
+      sig = sig .. string.char(sighash_type)
+      tx.inputs[i].witness = {sig, key_info.pubkey}
+      tx.segwit = true
+      return true
+    elseif script_type == "p2pkh" then
+      local sighash = validation.signature_hash_legacy(
+        tx, i - 1, prev.script_pubkey, sighash_type)
+      local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
+      sig = sig .. string.char(sighash_type)
+      local w = serialize.buffer_writer()
+      w.write_varstr(sig)
+      w.write_varstr(key_info.pubkey)
+      tx.inputs[i].script_sig = w.result()
+      return true
+    elseif script_type == "p2sh" and prev.redeem_script then
+      -- P2SH-wrapped segwit (BIP141): treat as P2WPKH inside scriptSig push.
+      local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
+      if rdm_type == "p2wpkh" then
+        local script_code = script_mod.make_p2pkh_script(rdm_hash)
+        local sighash = validation.signature_hash_segwit_v0(
+          tx, i - 1, script_code, prev.value, sighash_type)
+        local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
+        sig = sig .. string.char(sighash_type)
+        tx.inputs[i].witness = {sig, key_info.pubkey}
+        -- scriptSig: push redeem_script
+        local w = serialize.buffer_writer()
+        w.write_varstr(prev.redeem_script)
+        tx.inputs[i].script_sig = w.result()
+        tx.segwit = true
+        return true
+      end
+      -- pure P2SH (multisig etc.) not handled in this minimal port.
+      return false
+    end
+    -- p2tr (Schnorr) and p2wsh/multisig fall through to "not signed" — Core
+    -- reports `complete=false` plus per-input error in this case.
+    return false
+  end
+
+  --- Common impl shared by signrawtransactionwithkey and -withwallet.
+  -- @param rpc RPCServer
+  -- @param hex_tx string
+  -- @param key_resolver function(spk) -> key_info|nil
+  -- @param prev_lookup table: outpoint_key -> {value, script_pubkey, ...}
+  -- @param sighash_type number
+  local function sign_raw_tx_common(rpc, hex_tx, key_resolver, prev_lookup, sighash_type)
+    local raw = M.hex_decode(hex_tx)
+    local ok, tx = pcall(serialize.deserialize_transaction, raw)
+    if not ok then
+      error({code = M.ERROR.DESERIALIZATION_ERROR,
+        message = "TX decode failed: " .. tostring(tx)})
+    end
+
+    local errors = {}
+    local complete = true
+    for i, tx_input in ipairs(tx.inputs) do
+      local prev = resolve_prevout(rpc, tx_input, prev_lookup)
+      if not prev then
+        complete = false
+        errors[#errors + 1] = {
+          txid = types.hash256_hex(tx_input.prev_out.hash),
+          vout = tx_input.prev_out.index,
+          error = "Input not found or already spent",
+        }
+      else
+        local key_info = key_resolver(prev.script_pubkey, prev)
+        if not key_info then
+          complete = false
+        else
+          local signed = sign_one_input(tx, i, prev, key_info, sighash_type)
+          if not signed then
+            complete = false
+            errors[#errors + 1] = {
+              txid = types.hash256_hex(tx_input.prev_out.hash),
+              vout = tx_input.prev_out.index,
+              error = "Unsupported script type for signing",
+            }
+          end
+        end
+      end
+    end
+
+    -- Re-flag segwit if any input has a witness.
+    for _, inp in ipairs(tx.inputs) do
+      if inp.witness and #inp.witness > 0 then
+        tx.segwit = true; break
+      end
+    end
+
+    local hex_signed = M.hex_encode(serialize.serialize_transaction(tx, tx.segwit))
+    local result = {hex = hex_signed, complete = complete}
+    if #errors > 0 then result.errors = errors end
+    return result
+  end
+
+  -- Map a textual sighash type to its byte value.  Default ALL.
+  local function parse_sighash_type(s)
+    if s == nil or s == cjson.null then return consensus.SIGHASH.ALL end
+    if type(s) == "number" then return s end
+    local map = {
+      ["ALL"] = consensus.SIGHASH.ALL,
+      ["NONE"] = consensus.SIGHASH.NONE,
+      ["SINGLE"] = consensus.SIGHASH.SINGLE,
+      ["ALL|ANYONECANPAY"] = bit.bor(consensus.SIGHASH.ALL, 0x80),
+      ["NONE|ANYONECANPAY"] = bit.bor(consensus.SIGHASH.NONE, 0x80),
+      ["SINGLE|ANYONECANPAY"] = bit.bor(consensus.SIGHASH.SINGLE, 0x80),
+    }
+    return map[s] or consensus.SIGHASH.ALL
+  end
+
+  --- signrawtransactionwithkey: sign a raw tx using caller-supplied private keys.
+  -- params: [hex_tx, [keys...], [prevtxs[]], "sighashtype"]
+  -- Reference: bitcoin-core/src/rpc/rawtransaction.cpp signrawtransactionwithkey
+  self.methods["signrawtransactionwithkey"] = function(rpc, params)
+    local hex_tx = params[1]
+    local keys_raw = params[2]
+    local prevtxs_raw = params[3]
+    local sighash_type = parse_sighash_type(params[4])
+
+    if type(hex_tx) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Usage: signrawtransactionwithkey <hexstring> [privatekey,...] ([prevtxs])"})
+    end
+    if type(keys_raw) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "privatekeys must be an array of WIF strings"})
+    end
+
+    local decoded_keys = {}
+    for _, k in ipairs(keys_raw) do
+      local d = decode_priv_key_string(k)
+      if d then decoded_keys[#decoded_keys + 1] = d end
+    end
+
+    local prev_lookup = parse_prevtxs(prevtxs_raw)
+
+    local key_resolver = function(spk, prev)
+      local script_type, hash_or_program = script_mod.classify_script(spk)
+      if script_type == "p2pkh" or script_type == "p2wpkh" then
+        for _, dk in ipairs(decoded_keys) do
+          if dk.pkh == hash_or_program then return dk end
+        end
+      elseif script_type == "p2sh" and prev and prev.redeem_script then
+        local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
+        if rdm_type == "p2wpkh" then
+          for _, dk in ipairs(decoded_keys) do
+            if dk.pkh == rdm_hash then return dk end
+          end
+        end
+      end
+      return nil
+    end
+
+    return sign_raw_tx_common(rpc, hex_tx, key_resolver, prev_lookup, sighash_type)
+  end
+
+  --- signrawtransactionwithwallet: sign a raw tx using the loaded wallet's keys.
+  -- params: [hex_tx, [prevtxs[]], "sighashtype"]
+  -- Reference: bitcoin-core/src/wallet/rpc/spend.cpp signrawtransactionwithwallet
+  self.methods["signrawtransactionwithwallet"] = function(rpc, params)
+    local hex_tx = params[1]
+    local prevtxs_raw = params[2]
+    local sighash_type = parse_sighash_type(params[3])
+
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+    if wallet.is_encrypted and wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+    if type(hex_tx) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Usage: signrawtransactionwithwallet <hexstring> ([prevtxs] \"sighashtype\")"})
+    end
+
+    -- Refresh wallet UTXOs so resolve_prevout can fall through to wallet.utxos.
+    if rpc.chain_state then wallet:scan_utxos(rpc.chain_state) end
+
+    local prev_lookup = parse_prevtxs(prevtxs_raw)
+
+    -- Build pkh -> key_info index for fast match.
+    local crypto = require("lunarblock.crypto")
+    local pkh_index = {}
+    for _, info in pairs(wallet.keys) do
+      if info.privkey and info.pubkey then
+        pkh_index[crypto.hash160(info.pubkey)] = info
+      end
+    end
+
+    local key_resolver = function(spk, prev)
+      local script_type, hash_or_program = script_mod.classify_script(spk)
+      if script_type == "p2pkh" or script_type == "p2wpkh" then
+        return pkh_index[hash_or_program]
+      elseif script_type == "p2sh" and prev and prev.redeem_script then
+        local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
+        if rdm_type == "p2wpkh" then return pkh_index[rdm_hash] end
+      end
+      return nil
+    end
+
+    -- Bind wallet so resolve_prevout can also see wallet.utxos.
+    local saved = rpc.wallet
+    rpc.wallet = wallet
+    local ok, result = pcall(sign_raw_tx_common, rpc, hex_tx, key_resolver,
+                             prev_lookup, sighash_type)
+    rpc.wallet = saved
+    if not ok then error(result) end
+    return result
+  end
+
+  --- walletcreatefundedpsbt: build a funded PSBT with coin selection.
+  -- params: [inputs, outputs, locktime, options, bip32derivs]
+  -- Reference: bitcoin-core/src/wallet/rpc/spend.cpp walletcreatefundedpsbt
+  --
+  -- Coin selection draws from wallet.utxos to cover output total + fee, after
+  -- the caller-supplied inputs are counted toward the total-in.  The result is
+  -- an unsigned PSBT (no signatures) with witness_utxo populated for each
+  -- input we have UTXO data for.
+  self.methods["walletcreatefundedpsbt"] = function(rpc, params)
+    local psbt_mod = require("lunarblock.psbt")
+    local wallet_mod = require("lunarblock.wallet")
+
+    local inputs_raw = params[1] or {}
+    local outputs_raw = params[2]
+    local locktime = params[3] or 0
+    local options = params[4] or {}
+    local bip32derivs = params[5]
+    local _ = bip32derivs  -- unused stub-arg
+
+    if type(outputs_raw) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Outputs must be an array"})
+    end
+    if type(inputs_raw) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Inputs must be an array"})
+    end
+
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+    if rpc.chain_state then wallet:scan_utxos(rpc.chain_state) end
+
+    -- 1. Build outputs, tally total-out and find OP_RETURN positions.
+    local outputs = {}
+    local total_out = 0
+    local subtract_set = {}
+    if type(options.subtractFeeFromOutputs) == "table" then
+      for _, idx in ipairs(options.subtractFeeFromOutputs) do
+        subtract_set[idx] = true
+      end
+    end
+    for _, out_spec in ipairs(outputs_raw) do
+      for key, val in pairs(out_spec) do
+        if key == "data" then
+          local data_bytes = M.hex_decode(val)
+          outputs[#outputs + 1] = types.txout(0,
+            script_mod.make_nulldata_script(data_bytes))
+        else
+          local addr_type, program = address_mod.decode_address(key,
+            rpc.network and rpc.network.name)
+          if not addr_type then
+            error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid address: " .. key})
+          end
+          local spk
+          if addr_type == "p2wpkh" then spk = script_mod.make_p2wpkh_script(program)
+          elseif addr_type == "p2wsh" then spk = script_mod.make_p2wsh_script(program)
+          elseif addr_type == "p2pkh" then spk = script_mod.make_p2pkh_script(program)
+          elseif addr_type == "p2sh" then spk = script_mod.make_p2sh_script(program)
+          elseif addr_type == "p2tr" then spk = script_mod.make_p2tr_script(program)
+          else error({code = M.ERROR.INVALID_ADDRESS, message = "Unsupported address type"})
+          end
+          local sat = math.floor(tonumber(val) * consensus.COIN + 0.5)
+          outputs[#outputs + 1] = types.txout(sat, spk)
+          total_out = total_out + sat
+        end
+        break
+      end
+    end
+
+    -- 2. Build initial input list from caller-supplied inputs.
+    local inputs = {}
+    local input_utxos = {}  -- parallel array of {value, script_pubkey} or nil
+    local user_total_in = 0
+    for _, inp in ipairs(inputs_raw) do
+      if type(inp.txid) ~= "string" or #inp.txid ~= 64 or type(inp.vout) ~= "number" then
+        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid input txid/vout"})
+      end
+      local txid = types.hash256_from_hex(inp.txid)
+      local sequence = inp.sequence or 0xFFFFFFFD
+      inputs[#inputs + 1] = types.txin(types.outpoint(txid, inp.vout), "", sequence)
+      -- Try to populate UTXO data from wallet/storage.
+      local outpoint_key = txid.bytes .. string.char(
+        bit.band(inp.vout, 0xFF),
+        bit.band(bit.rshift(inp.vout, 8), 0xFF),
+        bit.band(bit.rshift(inp.vout, 16), 0xFF),
+        bit.band(bit.rshift(inp.vout, 24), 0xFF))
+      local prev = nil
+      if wallet.utxos[outpoint_key] then
+        local u = wallet.utxos[outpoint_key]
+        prev = {value = u.value, script_pubkey = u.script_pubkey}
+        user_total_in = user_total_in + u.value
+      elseif rpc.storage then
+        local utxo_mod = require("lunarblock.utxo")
+        local data = rpc.storage.get(storage_mod.CF.UTXO, outpoint_key)
+        if data then
+          local entry = utxo_mod.deserialize_utxo_entry(data)
+          prev = {value = entry.value, script_pubkey = entry.script_pubkey}
+          user_total_in = user_total_in + entry.value
+        end
+      end
+      input_utxos[#input_utxos + 1] = prev
+    end
+
+    -- 3. Coin selection over wallet UTXOs to cover the shortfall + fee.
+    local fee_rate = options.feeRate or wallet:estimate_fee_rate(options.conf_target) or 1
+    local est_overhead = 11
+    local est_input_vsize = 68
+    local est_output_vsize = 31
+    local est_vsize = est_overhead + (#inputs + 1) * est_input_vsize
+                      + (#outputs + 1) * est_output_vsize
+    local fee = math.ceil(est_vsize * fee_rate)
+
+    local needed = total_out + fee - user_total_in
+    local change_pos = -1
+    local change = 0
+
+    if needed > 0 then
+      -- Skip user-claimed UTXOs to avoid double-spending.
+      local claimed = {}
+      for _, inp in ipairs(inputs) do
+        local k = inp.prev_out.hash.bytes .. string.char(
+          bit.band(inp.prev_out.index, 0xFF),
+          bit.band(bit.rshift(inp.prev_out.index, 8), 0xFF),
+          bit.band(bit.rshift(inp.prev_out.index, 16), 0xFF),
+          bit.band(bit.rshift(inp.prev_out.index, 24), 0xFF))
+        claimed[k] = true
+      end
+      local available = {}
+      for k, u in pairs(wallet.utxos) do
+        if not claimed[k] then
+          available[#available + 1] = {utxo = u, key = k}
+        end
+      end
+      if #available == 0 and needed > 0 then
+        error({code = M.ERROR.WALLET_ERROR, message = "Insufficient funds"})
+      end
+      local selected = wallet_mod.select_coins(available, needed, fee_rate)
+      if not selected then
+        error({code = M.ERROR.WALLET_ERROR, message = "Insufficient funds"})
+      end
+      local extra_in = 0
+      for _, item in ipairs(selected) do
+        inputs[#inputs + 1] = types.txin(
+          types.outpoint(item.utxo.txid, item.utxo.vout), "", 0xFFFFFFFD)
+        input_utxos[#input_utxos + 1] = {
+          value = item.utxo.value, script_pubkey = item.utxo.script_pubkey}
+        extra_in = extra_in + item.utxo.value
+      end
+
+      -- Recompute fee + change with the final input count.
+      est_vsize = est_overhead + #inputs * est_input_vsize
+                  + (#outputs + 1) * est_output_vsize
+      fee = math.ceil(est_vsize * fee_rate)
+      local total_in = user_total_in + extra_in
+      change = total_in - total_out - fee
+      if change > wallet_mod.DUST_THRESHOLD then
+        local change_address = options.changeAddress or wallet:get_change_address()
+        local ct, cp = address_mod.decode_address(change_address,
+          rpc.network and rpc.network.name)
+        local cspk
+        if ct == "p2wpkh" then cspk = script_mod.make_p2wpkh_script(cp)
+        elseif ct == "p2wsh" then cspk = script_mod.make_p2wsh_script(cp)
+        elseif ct == "p2tr" then cspk = script_mod.make_p2tr_script(cp)
+        else cspk = script_mod.make_p2pkh_script(cp)
+        end
+        local cp_idx = options.changePosition
+        if type(cp_idx) == "number" and cp_idx >= 0 and cp_idx <= #outputs then
+          table.insert(outputs, cp_idx + 1, types.txout(change, cspk))
+          change_pos = cp_idx
+        else
+          outputs[#outputs + 1] = types.txout(change, cspk)
+          change_pos = #outputs - 1
+        end
+      else
+        fee = fee + change
+        change = 0
+      end
+    end
+
+    -- 4. Build unsigned tx + PSBT.
+    local tx = types.transaction(2, inputs, outputs, locktime)
+    local psbt = psbt_mod.new(tx)
+    -- Populate witness_utxo for each input we have prev data for.
+    for i, prev in ipairs(input_utxos) do
+      if prev then
+        psbt.inputs[i].witness_utxo = {
+          value = prev.value, script_pubkey = prev.script_pubkey}
+      end
+    end
+
+    return {
+      psbt = psbt_mod.to_base64(psbt),
+      fee = fee / consensus.COIN,
+      changepos = change_pos,
+    }
+  end
+
+  ----------------------------------------------------------------------------
   -- Additional Blockchain / Mining / Mempool RPCs
   ----------------------------------------------------------------------------
 
