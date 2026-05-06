@@ -804,6 +804,45 @@ function Mempool:on_block_connected(block)
 end
 
 --------------------------------------------------------------------------------
+-- Block Disconnection (reorg refill)
+--------------------------------------------------------------------------------
+
+--- Handle block disconnection during a reorg: re-add the block's
+-- non-coinbase transactions to the mempool, best-effort.
+--
+-- This is the lunarblock analog of Bitcoin Core's
+-- `MaybeUpdateMempoolForReorg` (validation.cpp), invoked from
+-- `Chainstate::DisconnectTip`.  When a block is disconnected during a
+-- reorg the txs it contained leave the chain — to avoid silently
+-- dropping them we try to re-admit each one to the mempool.  The full
+-- `accept_transaction` pipeline runs against the new tip's UTXO state
+-- (BIP-113 IsFinalTx, BIP-68 SequenceLocks, standardness, conflicts
+-- against new-chain UTXOs), so a tx that's no longer valid against the
+-- post-reorg chain is correctly rejected here.  Coinbase txs are
+-- skipped — coinbase outputs were unspent at disconnect (the undo
+-- restored them) and coinbase is a non-standard mempool entry by
+-- definition (`accept_transaction` rejects `is_coinbase`).
+--
+-- Reference: bitcoin-core/src/validation.cpp DisconnectTip +
+-- MaybeUpdateMempoolForReorg.  Camlcoin parity: lib/sync.ml:2354-2363.
+--
+-- @param block block: The disconnected block
+function Mempool:block_disconnected(block)
+  if not block or not block.transactions then return end
+  -- Skip transactions[1] (coinbase): coinbase has no inputs to admit
+  -- and accept_transaction explicitly rejects coinbase txs.
+  for i = 2, #block.transactions do
+    local tx = block.transactions[i]
+    -- Best-effort: ignore failures (tx may now conflict with the new
+    -- chain, exceed mempool size, etc.).  Core's removeForReorg has
+    -- the same swallow-and-continue policy.
+    pcall(function()
+      self:accept_transaction(tx)
+    end)
+  end
+end
+
+--------------------------------------------------------------------------------
 -- Mempool Trimming
 --------------------------------------------------------------------------------
 

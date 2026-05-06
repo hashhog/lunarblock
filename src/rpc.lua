@@ -4563,7 +4563,7 @@ function RPCServer:register_methods()
 
         local result, sb_err = rpc.chain_state:accept_side_branch_block(
           block, block_hash,
-          { skip_scripts = false, nosync = false }
+          { skip_scripts = false, nosync = false, mempool = rpc.mempool }
         )
         if result == "connected" then
           -- Reorg succeeded; B3 is now the active tip.  Sync the
