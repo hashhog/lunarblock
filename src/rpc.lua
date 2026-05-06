@@ -4537,9 +4537,64 @@ function RPCServer:register_methods()
             return "duplicate"
           end
         end
-        -- BIP-22 doesn't define "prev-blk-not-found"; use "inconclusive"
-        -- to signal that we can't determine validity without the parent.
-        return "inconclusive"
+
+        -- Side-branch path (Pattern Z fix, 2026-05-06).  The block doesn't
+        -- extend our active tip, but if its parent header is known we can
+        -- store it as a side-branch and trigger a reorg if/when this
+        -- branch becomes strictly heavier than the active chain.  This is
+        -- the analog of Bitcoin Core's
+        -- ProcessNewBlock → AcceptBlock → ActivateBestChain dispatch
+        -- (validation.cpp).  Pre-fix, lunarblock returned "inconclusive"
+        -- here unconditionally and dropped the block, so heavier chains
+        -- arriving via submitblock could never trigger a tip flip.
+        --
+        -- Stage 1 (full block validation) runs BEFORE we hand off to the
+        -- side-branch path so we don't persist a malformed block.  We
+        -- pass `nil` for height because BIP-34 + ContextualCheckBlock
+        -- require the side-branch's own ancestor height, which
+        -- accept_side_branch_block computes as part of its walk.
+        local val_ok, val_err = pcall(validation.check_block, block, rpc.network, nil)
+        if not val_ok then
+          return bip22_result(tostring(val_err))
+        end
+        if not val_err then
+          return bip22_result("rejected")
+        end
+
+        local result, sb_err = rpc.chain_state:accept_side_branch_block(
+          block, block_hash,
+          { skip_scripts = false, nosync = false }
+        )
+        if result == "connected" then
+          -- Reorg succeeded; B3 is now the active tip.  Sync the
+          -- block_downloader / mempool just like the best-chain path.
+          if rpc.block_downloader and rpc.block_downloader.next_connect_height then
+            local new_h = rpc.chain_state.tip_height or 0
+            if new_h >= rpc.block_downloader.next_connect_height then
+              rpc.block_downloader.next_connect_height = new_h + 1
+              rpc.block_downloader.next_download_height = new_h + 1
+            end
+          end
+          if rpc.mempool then
+            rpc.mempool:on_block_connected(block)
+          end
+          return cjson.null  -- best-chain accept (post-reorg)
+        elseif result == "stored" then
+          -- Block stored as a side-branch but active chain unchanged.
+          -- Core surfaces this as "inconclusive" (rpc/mining.cpp:1100).
+          return "inconclusive"
+        else
+          -- sb_err in {"unknown-parent", "side-branch-no-common-ancestor",
+          -- "side-branch-header-gap", "reorg-depth-exceeded",
+          -- "reorg-disconnect-failed: ...", "reorg-connect-failed: ..."}.
+          -- All of these surface as "inconclusive" except the actual
+          -- connect failures, which indicate a malformed candidate and
+          -- should map to "rejected".
+          if sb_err and sb_err:find("^reorg%-connect%-failed") then
+            return bip22_result(sb_err)
+          end
+          return "inconclusive"
+        end
       end
     end
 
