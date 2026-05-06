@@ -1060,12 +1060,31 @@ end
 -- @param extra_batch_fn function|nil: optional callback(batch) to add extra
 --        operations to the same atomic write batch (e.g. chain tip update)
 -- @param sync boolean|nil: if true, force sync write (default: false)
-function CoinView:flush(reallocate, extra_batch_fn, sync)
+-- @param reorg_batch table|nil: optional shared write-batch (Pattern D
+--        multi-block atomicity).  When provided, dirty UTXO entries +
+--        extra_batch_fn ops are APPENDED to this batch instead of
+--        committed; the caller (multi-block reorg) is responsible for
+--        eventually calling batch.write() on the shared batch.  In this
+--        mode, the per-flush write/clear of self._persistent_batch is
+--        skipped — there is no on-disk state visible until the shared
+--        batch commits.  Dirty tracking and cache flag clearing still
+--        happen so subsequent disconnect/connect_block calls within the
+--        same reorg don't re-emit the same ops.  See
+--        ChainState:accept_side_branch_block.
+function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
   if self.dirty_count == 0 and not extra_batch_fn then return end
 
-  -- Reuse persistent batch to avoid create/destroy overhead per flush
-  local batch = self._persistent_batch
-  batch.clear()
+  -- Reuse persistent batch to avoid create/destroy overhead per flush.
+  -- In Pattern D multi-block reorg mode, append to the caller-supplied
+  -- shared batch instead so the entire disconnect+connect sequence
+  -- commits as a single atomic write.
+  local batch
+  if reorg_batch then
+    batch = reorg_batch  -- do NOT clear; appending to shared batch
+  else
+    batch = self._persistent_batch
+    batch.clear()
+  end
   local writes = 0
   local deletes = 0
 
@@ -1076,15 +1095,36 @@ function CoinView:flush(reallocate, extra_batch_fn, sync)
         -- Delete from disk (entry was spent and was on disk)
         batch.delete(storage_mod.CF.UTXO, key)
         deletes = deletes + 1
-        -- Remove from cache
-        self.cached_memory_usage = self.cached_memory_usage - estimate_entry_memory(entry)
-        self.cache[key] = nil
+        -- In Pattern D deferred mode, KEEP the spent entry in cache
+        -- (with spent=true) so subsequent CoinView:have / :get during
+        -- the same multi-block reorg see the spent state from cache
+        -- instead of falling through to disk — the disk delete is
+        -- queued in the shared batch and won't be visible until the
+        -- final commit.  Clear the dirty flag so the next flush
+        -- doesn't double-emit the delete.  Also keep the cache entry
+        -- so a subsequent re-add (e.g. UTXO created by side-branch
+        -- block) goes through CoinView:add's existing-entry path.
+        if reorg_batch then
+          clear_flags(entry)
+        else
+          -- Non-deferred path: drop the entry from cache (the disk
+          -- delete is being committed now, so the disk read fallback
+          -- after this point will correctly return nil).
+          self.cached_memory_usage = self.cached_memory_usage
+            - estimate_entry_memory(entry)
+          self.cache[key] = nil
+        end
       else
         -- Write to disk
         local data = M.serialize_utxo_entry(entry)
         batch.put(storage_mod.CF.UTXO, key, data)
         writes = writes + 1
-        -- Clear flags - entry is now clean and not fresh (it's on disk)
+        -- Clear flags - entry is now clean and not fresh.  In
+        -- non-deferred mode this is true on disk after the immediate
+        -- batch.write below; in Pattern D deferred mode the disk
+        -- write is queued in the shared batch.  Either way the cache
+        -- copy reflects the post-batch state, so subsequent reads
+        -- via cache hit return the correct value.
         clear_flags(entry)
       end
     end
@@ -1095,8 +1135,12 @@ function CoinView:flush(reallocate, extra_batch_fn, sync)
     extra_batch_fn(batch)
   end
 
-  -- Execute batch
-  batch.write(sync or false)
+  -- Execute batch — UNLESS we're in Pattern D deferred mode, where the
+  -- caller (accept_side_branch_block) commits the shared batch once at
+  -- the end of the multi-block reorg.
+  if not reorg_batch then
+    batch.write(sync or false)
+  end
 
   -- Update stats
   self.stats.disk_writes = self.stats.disk_writes + writes
@@ -1840,8 +1884,13 @@ end
 -- @param nosync If true, skip fsync on flush (caller is responsible for periodic sync)
 -- @param caller_batch_fn function|nil: optional callback(batch) to add extra operations
 --        (e.g. block/header/height_index storage) to the same atomic write batch
+-- @param reorg_batch table|nil: optional shared write-batch (Pattern D
+--        multi-block atomicity).  When set, this connect's UTXO/undo/txindex/
+--        caller_batch_fn/chain_tip ops are appended to the shared batch
+--        instead of committed; the caller (accept_side_branch_block)
+--        commits once at the end of the multi-block reorg.
 -- @return true on success, nil and error message on failure
-function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel, nosync, caller_batch_fn)
+function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel, nosync, caller_batch_fn, reorg_batch)
   local _cb_t0 = perf.now()
 
   -- Build undo data as we go - one TxUndo per non-coinbase transaction
@@ -2473,7 +2522,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     end
     -- Chain-tip last in the batch (defence-in-depth ordering).
     batch.put(storage_mod.CF.META, "chain_tip", tip_data)
-  end, do_sync)
+  end, do_sync, reorg_batch)
   local _cb_t_flush = perf.now()
 
   -- Update in-memory tip (only after the atomic write succeeds)
@@ -2697,7 +2746,16 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   --   • a hash that's on the active chain (height-index match), OR
   --   • genesis / a missing parent (treated as fatal here — submitblock
   --     should not have accepted A1+A2 if the active chain is malformed).
-  local MAX_REORG_DEPTH = 1000
+  --
+  -- Pattern D (multi-block atomicity, 2026-05-05): cap lowered from
+  -- 1000 → 100.  The reorg now wraps the entire disconnect+connect
+  -- sequence in ONE RocksDB WriteBatch (committed once at the end),
+  -- and the in-memory dirty-UTXO set grows linearly with reorg depth
+  -- before commit.  100 is the audit-mandated ceiling
+  -- (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md)
+  -- and bounds peak memory while still spanning the deepest plausible
+  -- reorg.
+  local MAX_REORG_DEPTH = 100
 
   -- Pre-build active-chain hash → height map for the most-recent
   -- MAX_REORG_DEPTH heights.  We use this to cheaply identify the common
@@ -2845,16 +2903,61 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     end
   end
 
-  local disconnected, dc_err = self:rollback_chain_to(common_height)
+  -- ── Pattern D (multi-block atomicity, 2026-05-05): open ONE shared
+  -- RocksDB WriteBatch and thread it through every per-block disconnect
+  -- and per-block connect within this reorg.  CoinView:flush(),
+  -- disconnect_block, and connect_block all detect the non-nil
+  -- reorg_batch arg and APPEND their UTXO/undo/txindex/header/height-
+  -- index/chain_tip ops to it instead of committing.  Final commit is
+  -- one batch.write(sync=true) below.  A crash anywhere between the
+  -- start of the disconnect loop and the final commit leaves disk in
+  -- the PRE-reorg state — chain_tip still points at the old active
+  -- tip, UTXO/undo/txindex still reflect the old chain — so on
+  -- restart the reorg simply hasn't happened yet (the side-branch
+  -- block bodies stored above are harmless and will be re-considered
+  -- next time a deeper side-branch arrives).
+  --
+  -- Reference (Bitcoin Core): src/validation.cpp Chainstate::DisconnectTip
+  -- + Chainstate::ConnectTip use a CCoinsViewCache layer over the disk
+  -- chainstate; partial mutations stay in memory until ActivateBestChain
+  -- flushes once at the end via FlushStateToDisk.  This shared-batch
+  -- design is the lunarblock analog.
+  --
+  -- IMPORTANT: every code path that returns from this point onward must
+  -- either commit-and-return-success or destroy the batch and roll back
+  -- the in-memory CoinView (via discard_dirty) so a follow-up
+  -- accept_side_branch_block call doesn't see stale dirty entries.
+  local reorg_batch = self.storage.batch()
+  local function abort_reorg(err_msg)
+    -- Tear down the shared batch and drop in-memory dirty mutations so
+    -- the on-disk pre-reorg state is the only state visible.  No
+    -- chain_tip mutation is committed (we never called batch.write).
+    reorg_batch.destroy()
+    -- discard_dirty drops every dirty cache entry — both the entries
+    -- restored by partial disconnects and the entries spent/added by
+    -- partial connects.  Clean entries (read-only cache) are kept.
+    self.coin_view:discard_dirty()
+    -- Restore in-memory tip to the on-disk truth (the pre-reorg active
+    -- tip) so a later submitblock sees a consistent chain head.
+    local restored_hash, restored_height = self.storage.get_chain_tip()
+    if restored_hash then
+      self.tip_hash = restored_hash
+      self.tip_height = restored_height
+    end
+    return nil, err_msg
+  end
+
+  local disconnected, dc_err = self:rollback_chain_to(common_height, reorg_batch)
   if not disconnected then
-    return nil, "reorg-disconnect-failed: " .. tostring(dc_err)
+    return abort_reorg("reorg-disconnect-failed: " .. tostring(dc_err))
   end
 
   -- Refill the mempool with txs from the disconnected blocks BEFORE
   -- the connect loop runs.  If a side-branch block confirms one of
   -- the re-added txs, on_block_connected (called by the caller after
   -- this returns) will remove it cleanly.  Coinbase txs are skipped
-  -- inside Mempool:block_disconnected.
+  -- inside Mempool:block_disconnected.  Mempool is in-memory only so
+  -- it's outside the chainstate atomic batch.
   if opts.mempool and disconnected_blocks then
     for _, dblk in ipairs(disconnected_blocks) do
       opts.mempool:block_disconnected(dblk)
@@ -2874,9 +2977,9 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     else
       sb_block = self.storage.get_block(entry.hash)
       if not sb_block then
-        return nil, string.format(
+        return abort_reorg(string.format(
           "reorg-connect-failed: side-branch block missing at height %d",
-          entry.height)
+          entry.height))
       end
     end
 
@@ -2907,14 +3010,23 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
       sb_block, entry.height, entry.hash,
       nil, nil,
       opts.skip_scripts, false,
-      opts.nosync, store_batch_fn
+      opts.nosync, store_batch_fn,
+      reorg_batch
     )
     if not ok_conn then
-      return nil, string.format(
+      return abort_reorg(string.format(
         "reorg-connect-failed at height %d: %s",
-        entry.height, tostring(err_conn))
+        entry.height, tostring(err_conn)))
     end
   end
+
+  -- ── Single atomic commit for the entire reorg.  Sync=true: even if
+  -- the caller passed opts.nosync (the IBD fast-path), a reorg always
+  -- crosses the chain head and is a low-frequency event, so the fsync
+  -- cost is negligible and the durability guarantee is mandatory.
+  -- After this returns, the tip flip is durable and crash-recoverable.
+  reorg_batch.write(true)
+  reorg_batch.destroy()
 
   return "connected"
 end
@@ -2928,8 +3040,13 @@ end
 -- @param height The height of the block
 -- @param block_hash The hash of the block being disconnected
 -- @param prev_hash The hash of the previous block (becomes new tip)
+-- @param reorg_batch table|nil: optional shared write-batch (Pattern D
+--        multi-block atomicity).  When set, this disconnect's UTXO/undo/
+--        txindex/chain_tip ops are appended to the shared batch instead
+--        of committed; the caller (accept_side_branch_block) commits
+--        once at the end of the multi-block reorg.
 -- @return true on success, nil and error message on failure
-function ChainState:disconnect_block(block, height, block_hash, prev_hash)
+function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg_batch)
   -- Clear signature cache on reorg to avoid stale entries
   self.sig_cache:clear()
 
@@ -3016,7 +3133,7 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash)
       w.write_u32le(new_tip_height)
       batch.put(storage_mod.CF.META, "chain_tip", w.result())
     end
-  end, true)
+  end, true, reorg_batch)
 
   -- Update in-memory tip
   self.tip_height = new_tip_height
@@ -3055,8 +3172,13 @@ end
 -- The returned list captures the disconnected blocks so they can be
 -- reconnected in order.
 -- @param target_height number: height to roll back to (must be < tip_height)
+-- @param reorg_batch table|nil: optional shared write-batch (Pattern D
+--        multi-block atomicity).  Threaded through to each per-block
+--        disconnect_block so the entire rollback commits as one atomic
+--        write when the caller (accept_side_branch_block) finally
+--        executes batch.write().
 -- @return table|nil, string|nil: list of {hash, height} or nil and error
-function ChainState:rollback_chain_to(target_height)
+function ChainState:rollback_chain_to(target_height, reorg_batch)
   if type(target_height) ~= "number" then
     return nil, "rollback_chain_to: target_height must be a number"
   end
@@ -3089,7 +3211,7 @@ function ChainState:rollback_chain_to(target_height)
 
     local prev_hash = tip_header.prev_hash
     local ok, err = self:disconnect_block(
-      tip_block, tip_height, tip_hash, prev_hash)
+      tip_block, tip_height, tip_hash, prev_hash, reorg_batch)
     if not ok then
       return nil, "rollback_chain_to: disconnect failed at height "
         .. tostring(tip_height) .. ": " .. tostring(err)
