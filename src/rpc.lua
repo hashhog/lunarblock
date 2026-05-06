@@ -5642,8 +5642,33 @@ function RPCServer:setup_w47b_methods()
       iter.destroy()
     end
 
-    -- txoutset_hash: SHA256d of serialized UTXO set (best-effort empty hash if unavailable)
-    local txoutset_hash_hex = string.rep("0", 64)
+    -- hash_serialized_3: SHA256d (HashWriter::GetHash) over the canonical
+    -- TxOutSer stream of every (outpoint, coin) in the chainstate, in
+    -- (txid lex-asc, vout uint32-asc) order.  Byte-identical to Bitcoin
+    -- Core 31.99 `gettxoutsetinfo hash_type=hash_serialized_3`
+    -- (kernel/coinstats.cpp ComputeUTXOStats + HashWriter, hash.h:115-119).
+    --
+    -- Earlier this method returned `string.rep("0", 64)`; the corpus
+    -- full-state phase flagged the divergence in the May 5 reorg run.
+    -- compute_utxo_hash is the same primitive the assumeutxo strict
+    -- gate uses (validation.cpp:5904-5915), so wiring it through here
+    -- closes the gettxoutsetinfo gap without introducing a second hasher.
+    local txoutset_hash_hex
+    if rpc.chain_state and rpc.chain_state.compute_utxo_hash then
+      local ok, raw = pcall(rpc.chain_state.compute_utxo_hash, rpc.chain_state)
+      if ok and type(raw) == "string" and #raw == 32 then
+        -- uint256.GetHex() reverses bytes for display (big-endian).
+        local hex_chars = {}
+        for i = 32, 1, -1 do
+          hex_chars[#hex_chars + 1] = string.format("%02x", raw:byte(i))
+        end
+        txoutset_hash_hex = table.concat(hex_chars)
+      else
+        txoutset_hash_hex = string.rep("0", 64)
+      end
+    else
+      txoutset_hash_hex = string.rep("0", 64)
+    end
 
     return {
       height         = tip_height,
