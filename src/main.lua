@@ -926,6 +926,13 @@ local function main()
     min_relay_fee = 1000,
   })
 
+  -- Orphan tx pool (Core txorphanage parity).  Buffers up to 100 txs that
+  -- arrived before their parent so we can re-evaluate them on parent
+  -- arrival rather than dropping them on the floor and waiting for a
+  -- re-announce.  Bounded by mempool_mod.MAX_ORPHAN_TRANSACTIONS,
+  -- MAX_ORPHAN_TX_SIZE and MAX_ORPHANS_PER_PEER (see src/mempool.lua).
+  local orphan_pool = mempool_mod.new_orphan_pool()
+
   -- Bitcoin Core-compatible mempool.dat (kernel/mempool_persist.cpp).
   -- Load any prior dump now; persistence on shutdown is wired into the
   -- main-loop cleanup section below.
@@ -1002,6 +1009,17 @@ local function main()
       end
     end
     fee_estimator:on_block(height)
+    -- Drain orphan pool: any orphan that named a tx in this block as a
+    -- missing parent is now resolvable from the UTXO set.  Re-feed
+    -- through the mempool acceptance pipeline; reject-on-persistent-fail
+    -- is fine because we removed the orphan entry first.
+    if orphan_pool and block and block.transactions then
+      local resolved = orphan_pool:on_block_connected(block)
+      for _, c in ipairs(resolved) do
+        orphan_pool:remove(c.txid_hex)
+        pcall(function() mempool:accept_transaction(c.tx) end)
+      end
+    end
     -- Call previous callback (ZMQ, etc.)
     if prev_on_block_connected then
       prev_on_block_connected(block_hash, block)
@@ -1093,6 +1111,10 @@ local function main()
     end
   end)
 
+  -- Forward declaration so the tx handler can recurse into orphan
+  -- resolution after a successful parent accept.
+  local try_resolve_orphans
+
   peer_manager:register_handler("tx", function(peer, payload)
     local ok, err = pcall(function()
       local tx = serialize.deserialize_transaction(payload)
@@ -1114,6 +1136,19 @@ local function main()
         if zmq_notifier then
           zmq_notifier:on_tx_added(txid.bytes, payload)
         end
+        -- Re-check orphan pool: any orphan that named this tx as a missing
+        -- parent may now be admissible.  Iterates with cycle protection
+        -- via the orphan_pool's removal on each loop.
+        try_resolve_orphans(txid_hex)
+      elseif reason == "missing inputs" then
+        -- Buffer in orphan pool so that when the parent arrives we can
+        -- re-evaluate.  Bounded; rejections are silent.
+        local txid = validation.compute_txid(tx)
+        local txid_hex = types.hash256_hex(txid)
+        local missing = mempool:missing_parents_for(tx)
+        local pid = (peer and peer.ip and peer.port)
+                    and (peer.ip .. ":" .. peer.port) or "anonymous"
+        orphan_pool:add(tx, txid_hex, pid, missing)
       else
         -- Log rejection if verbose
         local _ = reason
@@ -1123,6 +1158,31 @@ local function main()
       peer_manager:add_ban_score(peer, 10, tostring(err))
     end
   end)
+
+  -- After a tx is accepted to the mempool, re-feed any orphans that
+  -- listed it as a missing parent.  Worklist style with depth-bounded
+  -- recursion: each accepted child is itself enqueued so transitive
+  -- chains drain in one call.
+  try_resolve_orphans = function(parent_txid_hex)
+    local worklist = {parent_txid_hex}
+    local seen = {}
+    while #worklist > 0 do
+      local cur = table.remove(worklist)
+      if not seen[cur] then
+        seen[cur] = true
+        local children = orphan_pool:children_of(cur)
+        for _, c in ipairs(children) do
+          -- Always remove first; on persistent reject we don't want to
+          -- keep retrying the same tx every time the parent re-resolves.
+          orphan_pool:remove(c.txid_hex)
+          local accepted = mempool:accept_transaction(c.tx)
+          if accepted then
+            worklist[#worklist + 1] = c.txid_hex
+          end
+        end
+      end
+    end
+  end
 
   -- BIP 35: respond to "mempool" by sending inv of every txid in our mempool.
   -- Reference: bitcoin-core/src/net_processing.cpp ProcessMessage MEMPOOL handler

@@ -2142,4 +2142,159 @@ describe("mempool", function()
     end)
   end)
 
+  --------------------------------------------------------------------------
+  -- Orphan transaction pool (Core txorphanage parity, simplified)
+  --------------------------------------------------------------------------
+  describe("OrphanPool", function()
+
+    -- Helper: build a small valid tx with a single input/output so the
+    -- pool's serialize_transaction call doesn't blow up.
+    local function make_small_tx(parent_txid_bytes, vout)
+      local tx = make_tx(1, {}, {}, 0)
+      tx.inputs[1]  = make_input(parent_txid_bytes, vout or 0)
+      tx.outputs[1] = make_output(50000)
+      return tx
+    end
+
+    it("respects MAX_ORPHAN_TRANSACTIONS = 100", function()
+      assert.equal(100, mempool.MAX_ORPHAN_TRANSACTIONS)
+      assert.equal(100000, mempool.MAX_ORPHAN_TX_SIZE)
+      assert.equal(100, mempool.MAX_ORPHANS_PER_PEER)
+    end)
+
+    it("creates an empty pool with default bounds", function()
+      local pool = mempool.new_orphan_pool()
+      assert.equal(0, pool:size())
+      assert.equal(100, pool.max_orphans)
+      assert.equal(100, pool.max_per_peer)
+      assert.equal(100000, pool.max_tx_size)
+    end)
+
+    it("adds and looks up an orphan", function()
+      local pool = mempool.new_orphan_pool()
+      local parent = types.hash256(string.rep("\xaa", 32))
+      local parent_hex = types.hash256_hex(parent)
+      local tx = make_small_tx(parent)
+      local ok = pool:add(tx, "deadbeef", "127.0.0.1:18444",
+        {[parent_hex] = true})
+      assert.is_true(ok)
+      assert.is_true(pool:has("deadbeef"))
+      assert.equal(1, pool:size())
+    end)
+
+    it("rejects a duplicate orphan", function()
+      local pool = mempool.new_orphan_pool()
+      local parent = types.hash256(string.rep("\xbb", 32))
+      local tx = make_small_tx(parent)
+      local ok1 = pool:add(tx, "abcd", "p1", {})
+      assert.is_true(ok1)
+      local ok2, reason = pool:add(tx, "abcd", "p1", {})
+      assert.is_false(ok2)
+      assert.equal("already-have-orphan", reason)
+    end)
+
+    it("rejects an oversized orphan", function()
+      -- Use a tiny custom pool so we don't have to construct a 100KB tx.
+      local pool = mempool.new_orphan_pool({max_tx_size = 50})
+      local parent = types.hash256(string.rep("\xcc", 32))
+      local tx = make_small_tx(parent)
+      local ok, reason = pool:add(tx, "ee", "p1", {})
+      assert.is_false(ok)
+      assert.equal("orphan-too-large", reason)
+    end)
+
+    it("enforces per-peer cap", function()
+      local pool = mempool.new_orphan_pool({max_per_peer = 2})
+      local parent = types.hash256(string.rep("\xdd", 32))
+      local tx1 = make_small_tx(parent, 0)
+      local tx2 = make_small_tx(parent, 1)
+      local tx3 = make_small_tx(parent, 2)
+      assert.is_true(pool:add(tx1, "t1", "samepeer", {}))
+      assert.is_true(pool:add(tx2, "t2", "samepeer", {}))
+      local ok, reason = pool:add(tx3, "t3", "samepeer", {})
+      assert.is_false(ok)
+      assert.equal("orphan-per-peer-cap", reason)
+    end)
+
+    it("evicts oldest when global cap reached", function()
+      local pool = mempool.new_orphan_pool({max_orphans = 3})
+      local parent = types.hash256(string.rep("\xee", 32))
+      pool:add(make_small_tx(parent, 0), "t1", "p", {})
+      pool:add(make_small_tx(parent, 1), "t2", "p", {})
+      pool:add(make_small_tx(parent, 2), "t3", "p", {})
+      assert.equal(3, pool:size())
+      pool:add(make_small_tx(parent, 3), "t4", "p", {})
+      assert.equal(3, pool:size())
+      -- Oldest ("t1") should have been evicted.
+      assert.is_false(pool:has("t1"))
+      assert.is_true(pool:has("t4"))
+    end)
+
+    it("returns children of a resolved parent in insertion order", function()
+      local pool = mempool.new_orphan_pool()
+      local parent = types.hash256(string.rep("\x11", 32))
+      local parent_hex = types.hash256_hex(parent)
+      pool:add(make_small_tx(parent, 0), "child1", "p1", {[parent_hex] = true})
+      pool:add(make_small_tx(parent, 1), "child2", "p1", {[parent_hex] = true})
+      -- Unrelated orphan with a different missing parent
+      local other = types.hash256(string.rep("\x22", 32))
+      pool:add(make_small_tx(other, 0), "child3", "p2",
+        {[types.hash256_hex(other)] = true})
+
+      local kids = pool:children_of(parent_hex)
+      assert.equal(2, #kids)
+      assert.equal("child1", kids[1].txid_hex)
+      assert.equal("child2", kids[2].txid_hex)
+    end)
+
+    it("removes orphans for a disconnected peer", function()
+      local pool = mempool.new_orphan_pool()
+      local parent = types.hash256(string.rep("\x33", 32))
+      pool:add(make_small_tx(parent, 0), "x1", "alice", {})
+      pool:add(make_small_tx(parent, 1), "x2", "alice", {})
+      pool:add(make_small_tx(parent, 2), "x3", "bob",   {})
+      assert.equal(3, pool:size())
+      local removed = pool:remove_for_peer("alice")
+      assert.equal(2, removed)
+      assert.equal(1, pool:size())
+      assert.is_false(pool:has("x1"))
+      assert.is_false(pool:has("x2"))
+      assert.is_true(pool:has("x3"))
+    end)
+  end)
+
+  --------------------------------------------------------------------------
+  -- missing_parents_for: identifies which input prev-txids are absent
+  -- from both UTXO set and mempool.  Used by the orphan-pool wiring.
+  --------------------------------------------------------------------------
+  describe("Mempool:missing_parents_for", function()
+    it("reports every absent parent", function()
+      local cs = make_mock_chain_state()
+      local mp = mempool.new(cs)
+      local p1 = types.hash256(string.rep("\xa1", 32))
+      local p2 = types.hash256(string.rep("\xa2", 32))
+      local tx = make_tx(1, {}, {}, 0)
+      tx.inputs[1] = make_input(p1, 0)
+      tx.inputs[2] = make_input(p2, 0)
+      tx.outputs[1] = make_output(50000)
+
+      local missing = mp:missing_parents_for(tx)
+      assert.is_true(missing[types.hash256_hex(p1)])
+      assert.is_true(missing[types.hash256_hex(p2)])
+    end)
+
+    it("does NOT mark parents satisfied by UTXO set", function()
+      local cs = make_mock_chain_state()
+      local mp = mempool.new(cs)
+      local p1 = types.hash256(string.rep("\xb1", 32))
+      add_utxo(cs, types.hash256_hex(p1), 0, 100000)
+      local tx = make_tx(1, {}, {}, 0)
+      tx.inputs[1] = make_input(p1, 0)
+      tx.outputs[1] = make_output(50000)
+
+      local missing = mp:missing_parents_for(tx)
+      assert.is_nil(missing[types.hash256_hex(p1)])
+    end)
+  end)
+
 end)
