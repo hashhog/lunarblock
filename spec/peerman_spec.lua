@@ -676,6 +676,118 @@ describe("peerman", function()
 
   end)
 
+  describe("announce_block (BIP-130)", function()
+
+    local types = require("lunarblock.types")
+
+    -- Build a deterministic 80-byte header for announce tests.
+    local function make_test_header()
+      return types.block_header(
+        1,                                            -- version
+        types.hash256_zero(),                         -- prev_hash
+        types.hash256_zero(),                         -- merkle_root
+        1296688602,                                   -- timestamp (regtest genesis)
+        0x207fffff,                                   -- bits
+        2                                             -- nonce
+      )
+    end
+
+    local function make_mock_peer(id, send_headers)
+      return {
+        id = id,
+        state = peer_mod.STATE.ESTABLISHED,
+        send_headers = send_headers,
+        sent = {},
+        send_message = function(self, cmd, payload)
+          self.sent[#self.sent + 1] = {command = cmd, payload = payload}
+        end,
+      }
+    end
+
+    it("sends `headers` to peers that opted in via sendheaders", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local p_hdr = make_mock_peer(1, true)
+      pm.peer_list = {p_hdr}
+
+      local hdr = make_test_header()
+      local block_hash = types.hash256_zero()
+      pm:announce_block(block_hash, hdr)
+
+      assert.equals(1, #p_hdr.sent)
+      assert.equals("headers", p_hdr.sent[1].command)
+
+      -- Decode the headers payload and confirm one header round-trips.
+      local decoded = p2p.deserialize_headers(p_hdr.sent[1].payload)
+      assert.equals(1, #decoded)
+      assert.equals(hdr.timestamp, decoded[1].timestamp)
+      assert.equals(hdr.nonce, decoded[1].nonce)
+    end)
+
+    it("sends `inv` to peers that did NOT send sendheaders", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local p_inv = make_mock_peer(1, false)
+      pm.peer_list = {p_inv}
+
+      local hdr = make_test_header()
+      local block_hash = types.hash256_zero()
+      pm:announce_block(block_hash, hdr)
+
+      assert.equals(1, #p_inv.sent)
+      assert.equals("inv", p_inv.sent[1].command)
+
+      local items = p2p.deserialize_inv(p_inv.sent[1].payload)
+      assert.equals(1, #items)
+      assert.equals(p2p.INV_TYPE.MSG_BLOCK, items[1].type)
+    end)
+
+    it("branches per-peer in a mixed fleet", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local p_hdr = make_mock_peer(1, true)
+      local p_inv = make_mock_peer(2, false)
+      local p_hdr2 = make_mock_peer(3, true)
+      -- Connecting peer should be skipped entirely.
+      local p_pending = make_mock_peer(4, true)
+      p_pending.state = peer_mod.STATE.CONNECTING
+
+      pm.peer_list = {p_hdr, p_inv, p_hdr2, p_pending}
+
+      pm:announce_block(types.hash256_zero(), make_test_header())
+
+      assert.equals(1, #p_hdr.sent)
+      assert.equals("headers", p_hdr.sent[1].command)
+      assert.equals(1, #p_inv.sent)
+      assert.equals("inv", p_inv.sent[1].command)
+      assert.equals(1, #p_hdr2.sent)
+      assert.equals("headers", p_hdr2.sent[1].command)
+      assert.equals(0, #p_pending.sent)
+    end)
+
+    it("falls back to inv when header is nil", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local p = make_mock_peer(1, true)
+      pm.peer_list = {p}
+
+      pm:announce_block(types.hash256_zero(), nil)
+
+      assert.equals(1, #p.sent)
+      assert.equals("inv", p.sent[1].command)
+    end)
+
+    it("respects optional filter_fn", function()
+      local pm = peerman.new(test_network, nil, nil)
+      local p_keep = make_mock_peer(1, true)
+      local p_skip = make_mock_peer(2, true)
+      pm.peer_list = {p_keep, p_skip}
+
+      pm:announce_block(types.hash256_zero(), make_test_header(),
+        function(p) return p.id == 1 end)
+
+      assert.equals(1, #p_keep.sent)
+      assert.equals(0, #p_skip.sent)
+    end)
+
+  end)
+
   describe("get_established_peers", function()
 
     it("returns only established peers", function()
