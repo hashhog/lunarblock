@@ -911,12 +911,13 @@ local function main()
     if pruner.enabled then
       pruner:maybe_prune(height)
     end
-    -- Broadcast inv to peers for newly connected blocks (skip during IBD)
+    -- Announce newly connected blocks to peers (skip during IBD).
+    -- BIP-130: peers that sent `sendheaders` get a `headers` announce;
+    -- everyone else gets the legacy `inv` announce. PeerManager:announce_block
+    -- branches per peer based on the send_headers flag set by peer.lua's
+    -- sendheaders handler.
     if block_downloader.ibd_complete then
-      local inv_payload = p2p.serialize_inv({
-        {type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash}
-      })
-      peer_manager:broadcast("inv", inv_payload)
+      peer_manager:announce_block(block_hash, block.header)
     end
   end
 

@@ -1531,6 +1531,41 @@ function PeerManager:broadcast(command, payload, filter_fn)
   end
 end
 
+--- Announce a newly connected block to all established peers.
+-- Per BIP-130, peers that previously sent a `sendheaders` message expect
+-- header announces (`headers` with one entry); other peers get the legacy
+-- `inv` announce. Without this branch, peers that opted into headers
+-- announces never receive direct header notifications and must wait for
+-- the next inv→getheaders→headers round-trip, slowing tip propagation
+-- and contributing to header-sync DoS surface area.
+--
+-- Reference: bitcoin-core/src/net_processing.cpp PeerManagerImpl::MaybeSendBlock
+-- and camlcoin/lib/peer_manager.ml::announce_block.
+--
+-- @param block_hash string: 32-byte block hash (raw bytes)
+-- @param header table: block_header object (for headers announce)
+-- @param filter_fn function: optional filter function(peer) -> boolean
+function PeerManager:announce_block(block_hash, header, filter_fn)
+  local inv_payload = p2p.serialize_inv({
+    {type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash}
+  })
+  local headers_payload = nil
+  for _, p in ipairs(self.peer_list) do
+    if p.state == peer_mod.STATE.ESTABLISHED then
+      if not filter_fn or filter_fn(p) then
+        if p.send_headers and header then
+          if not headers_payload then
+            headers_payload = p2p.serialize_headers({header})
+          end
+          p:send_message("headers", headers_payload)
+        else
+          p:send_message("inv", inv_payload)
+        end
+      end
+    end
+  end
+end
+
 --- Get all established peers.
 -- @return table: list of established Peer objects
 function PeerManager:get_established_peers()
