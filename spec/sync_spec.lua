@@ -1104,6 +1104,84 @@ describe("sync", function()
         -- Should detect completion since connect_height > tip_height (0)
         assert.is_true(downloader:is_complete())
       end)
+
+      -- Wave 8 (May 7 2026) regression: ibd_complete must NOT fire while
+      -- headers extend past the current best block, even if pending and
+      -- inflight are momentarily empty.  Pre-fix, the gate at the bottom
+      -- of connect_pending_blocks compared only next_connect_height vs
+      -- header_tip_height; if next_connect_height transiently equalled
+      -- header_tip_height + 1 (e.g. via the invalid-skip path) while the
+      -- downloader was still working through the buffered header range,
+      -- the latch fired and main.lua's outer loop stopped scheduling.
+      -- Reproduces the May 6 21:25Z h=948241 wedge.
+      it("does not fire while header_tip > best_block (Wave 8 regression)", function()
+        -- Scenario: chain_tip at h=948207, header_tip at h=948241.
+        -- In the unit-test mock world we just stub the header chain's
+        -- header_tip_height directly; the real HeaderChain doesn't have
+        -- 948k synthetic headers and creating that many would dominate
+        -- the runtime.
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 948208  -- i.e. best_block = 948207
+        chain.header_tip_height = 948241          -- 34 headers ahead
+
+        -- Pending and inflight are empty, but headers extend past
+        -- best_block.  The OLD gate (next_connect_height >
+        -- header_tip_height) is false here, so this case alone isn't
+        -- the bug; but call connect_pending_blocks to confirm no
+        -- accidental latch.
+        downloader:connect_pending_blocks()
+        assert.is_false(downloader:is_complete())
+
+        -- Now simulate the racy path: invalid-skip bumped
+        -- next_connect_height past header_tip_height while pending
+        -- still has unconnected blocks below it.  Pre-fix, only the
+        -- height comparison ran and the flag latched.  Post-fix, the
+        -- non-empty pending buffer holds the latch off.
+        downloader.next_connect_height = 948242  -- header_tip + 1
+        downloader.pending_blocks["pending-stub-hash"] = {
+          height = 948235,
+          hash = "stub",
+          block = nil,
+        }
+        downloader:connect_pending_blocks()
+        assert.is_false(downloader:is_complete(),
+          "ibd_complete must not latch while pending_blocks is non-empty")
+
+        -- Same with inflight non-empty, pending empty.
+        downloader.pending_blocks = {}
+        downloader.inflight["inflight-stub-hash"] = {
+          peer = nil,
+          request_time = 0,
+          timeout = 60,
+        }
+        downloader:connect_pending_blocks()
+        assert.is_false(downloader:is_complete(),
+          "ibd_complete must not latch while inflight is non-empty")
+
+        -- Drain both: now the latch is allowed to fire.
+        downloader.inflight = {}
+        downloader:connect_pending_blocks()
+        assert.is_true(downloader:is_complete(),
+          "ibd_complete should latch once next_connect>header_tip and both buffers are empty")
+      end)
+
+      -- Wave 8 defensive un-latch: if a stale ibd_complete=true is
+      -- inherited (e.g. from a code path we didn't anticipate) and
+      -- main.lua then calls schedule_downloads because header_tip
+      -- advanced past chain_tip, we should self-correct rather than
+      -- silently no-op forever.
+      it("clears stale ibd_complete when headers extend past best_block", function()
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.ibd_complete = true
+        downloader.next_connect_height = 948208     -- best_block = 948207
+        chain.header_tip_height = 948241            -- headers ahead
+
+        local peer = create_mock_peer(1, 948241)
+        downloader:schedule_downloads({peer})
+
+        assert.is_false(downloader.ibd_complete,
+          "schedule_downloads should clear ibd_complete when header_tip > best_block")
+      end)
     end)
 
     describe("batched getdata", function()
