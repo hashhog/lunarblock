@@ -305,6 +305,176 @@ describe("crypto", function()
       assert.is_false(valid)
       assert.equals("invalid x-only public key", err)
     end)
+
+    -- BIP-340 published test vectors exercising schnorr_sign.
+    -- Source: bitcoin-core/src/secp256k1/src/modules/schnorrsig/tests_impl.h
+    -- (the libsecp256k1 vendored vectors, identical to bip-0340/test-vectors.csv).
+    -- All inputs deterministic; sig output is byte-identical given the aux_rand.
+    local bip340_signing_vectors = {
+      {
+        index = 0,
+        secret_key = "0000000000000000000000000000000000000000000000000000000000000003",
+        public_key = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+        aux_rand   = "0000000000000000000000000000000000000000000000000000000000000000",
+        message    = "0000000000000000000000000000000000000000000000000000000000000000",
+        signature  = "e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca821525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c0",
+      },
+      {
+        index = 1,
+        secret_key = "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef",
+        public_key = "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659",
+        aux_rand   = "0000000000000000000000000000000000000000000000000000000000000001",
+        message    = "243f6a8885a308d313198a2e03707344a4093822299f31d0082efa98ec4e6c89",
+        signature  = "6896bd60eeae296db48a229ff71dfe071bde413e6d43f917dc8dcf8c78de33418906d11ac976abccb20b091292bff4ea897efcb639ea871cfa95f6de339e4b0a",
+      },
+      {
+        index = 2,
+        secret_key = "c90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b14e5c9",
+        public_key = "dd308afec5777e13121fa72b9cc1b7cc0139715309b086c960e18fd969774eb8",
+        aux_rand   = "c87aa53824b4d7ae2eb035a2b5bbbccc080e76cdc6d1692c4b0b62d798e6d906",
+        message    = "7e2d58d8b3bcdf1abadec7829054f90dda9805aab56c77333024b9d0a508b75c",
+        signature  = "5831aaeed7b44bb74e5eab94ba9d4294c49bcf2a60728d8b4c200f50dd313c1bab745879a5ad954a72c45a91c3a51d3c7adea98d82f8481e0e1e03674a6f3fb7",
+      },
+      {
+        index = 3,
+        secret_key = "0b432b2677937381aef05bb02a66ecd012773062cf3fa2549e44f58ed2401710",
+        public_key = "25d1dff95105f5253c4022f628a996ad3a0d95fbf21d468a1b33f8c160d8f517",
+        aux_rand   = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        message    = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        signature  = "7eb0509757e246f19449885651611cb965ecc1a187dd51b64fda1edc9637d5ec97582b9cb13db3933705b32ba982af5af25fd78881ebb32771fc5922efc66ea3",
+      },
+    }
+
+    it("schnorr_sign matches BIP-340 vector 0 (sk=3, msg=0, aux=0)", function()
+      local v = bip340_signing_vectors[1]
+      local sk = hex_to_bin(v.secret_key)
+      local msg = hex_to_bin(v.message)
+      local aux = hex_to_bin(v.aux_rand)
+      local sig, err = crypto.schnorr_sign(sk, msg, aux)
+      assert.is_nil(err)
+      assert.is_string(sig)
+      assert.equals(64, #sig)
+      assert.equals(v.signature, bin_to_hex(sig))
+    end)
+
+    it("schnorr_sign matches BIP-340 signing vectors 1-3 (non-zero aux + message)", function()
+      -- Vectors copied verbatim from bip-0340/test-vectors.csv (rows 1-3),
+      -- cross-checked against bitcoin-core/src/secp256k1/src/modules/schnorrsig/tests_impl.h.
+      for i = 2, #bip340_signing_vectors do
+        local v = bip340_signing_vectors[i]
+        local sk = hex_to_bin(v.secret_key)
+        local pk = hex_to_bin(v.public_key)
+        local msg = hex_to_bin(v.message)
+        local aux = hex_to_bin(v.aux_rand)
+        local sig = crypto.schnorr_sign(sk, msg, aux)
+        assert.equals(v.signature, bin_to_hex(sig),
+          "BIP-340 vector " .. tostring(v.index) .. " signature mismatch")
+        -- And the produced sig must verify under the published xonly pubkey.
+        assert.is_true(crypto.schnorr_verify(pk, sig, msg),
+          "BIP-340 vector " .. tostring(v.index) .. " verify failed")
+      end
+    end)
+
+    it("schnorr_sign result verifies via schnorr_verify (cross-check)", function()
+      local v = bip340_signing_vectors[1]
+      local sk = hex_to_bin(v.secret_key)
+      local pk = hex_to_bin(v.public_key)
+      local msg = hex_to_bin(v.message)
+      local aux = hex_to_bin(v.aux_rand)
+      local sig = crypto.schnorr_sign(sk, msg, aux)
+      assert.is_true(crypto.schnorr_verify(pk, sig, msg))
+    end)
+
+    it("schnorr_sign default aux_rand (nil) equals all-zero aux_rand", function()
+      -- Per BIP-340 §"Default Signing", NULL aux is equivalent to zeros.
+      local v = bip340_signing_vectors[1]
+      local sk = hex_to_bin(v.secret_key)
+      local msg = hex_to_bin(v.message)
+      local sig_default = crypto.schnorr_sign(sk, msg, nil)
+      local sig_zero = crypto.schnorr_sign(sk, msg, string.rep("\x00", 32))
+      assert.equals(bin_to_hex(sig_zero), bin_to_hex(sig_default))
+    end)
+
+    it("schnorr_sign round-trips for random (sk, msg) pairs", function()
+      for _ = 1, 16 do
+        local sk = crypto.random_bytes(32)
+        -- Force a valid (non-zero, < n) seckey by setting the high byte to a
+        -- safe value. Skipping CSPRNG-rejection edge cases keeps the test
+        -- hermetic without weakening the signing path itself.
+        sk = string.char(0x42) .. sk:sub(2)
+        local msg = crypto.random_bytes(32)
+        local sig, err = crypto.schnorr_sign(sk, msg, crypto.random_bytes(32))
+        assert.is_nil(err)
+        assert.equals(64, #sig)
+        -- Recover the x-only pubkey from sk (drop parity byte from compressed).
+        local pk_compressed = crypto.pubkey_from_privkey(sk, true)
+        assert.is_string(pk_compressed)
+        local pk_xonly = pk_compressed:sub(2, 33)
+        assert.is_true(crypto.schnorr_verify(pk_xonly, sig, msg))
+      end
+    end)
+
+    it("schnorr_sign rejects all-zero seckey (invalid for the curve)", function()
+      local sk = string.rep("\x00", 32)
+      local msg = string.rep("\x00", 32)
+      local sig, err = crypto.schnorr_sign(sk, msg, nil)
+      assert.is_nil(sig)
+      assert.matches("keypair_create", err)
+    end)
+
+    it("schnorr_sign asserts on wrong-length privkey", function()
+      assert.has_error(function()
+        crypto.schnorr_sign(string.rep("\x01", 31), string.rep("\x00", 32))
+      end)
+    end)
+
+    it("schnorr_sign asserts on wrong-length msg", function()
+      assert.has_error(function()
+        crypto.schnorr_sign(string.rep("\x01", 32), string.rep("\x00", 33))
+      end)
+    end)
+
+    it("schnorr_sign asserts on wrong-length aux_rand", function()
+      assert.has_error(function()
+        crypto.schnorr_sign(
+          string.rep("\x01", 32), string.rep("\x00", 32), string.rep("\xff", 16)
+        )
+      end)
+    end)
+
+    it("taproot_tweak_seckey produces a seckey whose xonly pubkey matches tweak_pubkey", function()
+      -- BIP-341: applying TapTweak on the seckey side and on the pubkey side
+      -- must yield the same x-only output. This is the round-trip the wallet
+      -- relies on for BIP-86 key-path spends.
+      local sk = string.rep("\x42", 32)
+      local pk_compressed = crypto.pubkey_from_privkey(sk, true)
+      local internal_xonly = pk_compressed:sub(2, 33)
+      local tweak = crypto.tagged_hash("TapTweak", internal_xonly)
+
+      local tweaked_sk, err = crypto.taproot_tweak_seckey(sk, tweak)
+      assert.is_nil(err)
+      assert.equals(32, #tweaked_sk)
+
+      -- xonly(pubkey_from_privkey(tweaked_sk)) must equal tweak_pubkey side.
+      local tweaked_pk = crypto.pubkey_from_privkey(tweaked_sk, true)
+      local tweaked_xonly_via_sk = tweaked_pk:sub(2, 33)
+      local tweaked_xonly_via_pk = crypto.tweak_pubkey(internal_xonly, tweak)
+      assert.equals(bin_to_hex(tweaked_xonly_via_pk), bin_to_hex(tweaked_xonly_via_sk))
+
+      -- And the tweaked seckey signs in a way that verifies under the tweaked
+      -- xonly pubkey — the property the wallet's P2TR signing branch needs.
+      local msg = crypto.sha256("taproot-tweak-roundtrip")
+      local sig = crypto.schnorr_sign(tweaked_sk, msg, string.rep("\x00", 32))
+      assert.is_true(crypto.schnorr_verify(tweaked_xonly_via_pk, sig, msg))
+    end)
+
+    it("taproot_tweak_seckey rejects all-zero seckey", function()
+      local sk = string.rep("\x00", 32)
+      local tweak = string.rep("\x00", 32)
+      local out, err = crypto.taproot_tweak_seckey(sk, tweak)
+      assert.is_nil(out)
+      assert.matches("keypair_create", err)
+    end)
   end)
 
   describe("sha256_init streaming", function()
