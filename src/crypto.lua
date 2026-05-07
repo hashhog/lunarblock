@@ -369,6 +369,38 @@ ffi.cdef[[
     const unsigned char* tweak32
   );
 
+  /* BIP340 keypair + sign (libsecp256k1 extrakeys + schnorrsig modules).
+   * The keypair API is required by secp256k1_schnorrsig_sign32 — Core uses it
+   * via KeyPair::SignSchnorr (bitcoin-core/src/key.cpp:532-560). The fixed
+   * 96-byte size matches the public typedef in secp256k1_extrakeys.h:33-35. */
+  typedef struct { unsigned char data[96]; } secp256k1_keypair;
+
+  int secp256k1_keypair_create(
+    const secp256k1_context* ctx,
+    secp256k1_keypair* keypair,
+    const unsigned char* seckey32
+  );
+
+  int secp256k1_keypair_sec(
+    const secp256k1_context* ctx,
+    unsigned char* seckey32_out,
+    const secp256k1_keypair* keypair
+  );
+
+  int secp256k1_keypair_xonly_tweak_add(
+    const secp256k1_context* ctx,
+    secp256k1_keypair* keypair,
+    const unsigned char* tweak32
+  );
+
+  int secp256k1_schnorrsig_sign32(
+    const secp256k1_context* ctx,
+    unsigned char* sig64,
+    const unsigned char* msg32,
+    const secp256k1_keypair* keypair,
+    const unsigned char* aux_rand32
+  );
+
   /* ElligatorSwift for BIP324 */
   typedef int (*secp256k1_ellswift_xdh_hash_function)(
     unsigned char *output,
@@ -757,6 +789,74 @@ function M.schnorr_verify(xonly_pubkey32, sig64, msg)
     secp_ctx, sig64, msg, #msg, pubkey
   )
   return result == 1
+end
+
+--- Sign a 32-byte message with BIP-340 Schnorr (libsecp256k1 schnorrsig_sign32).
+-- Mirrors Core's CKey::SignSchnorr (bitcoin-core/src/key.cpp:273-277), modulo
+-- defense-in-depth verify (caller can re-check via M.schnorr_verify).
+-- @param privkey32  string: 32-byte secret key (must be in (0, n))
+-- @param msg32      string: 32-byte message (typically a TapSighash digest)
+-- @param aux_rand32 string|nil: 32 bytes of fresh randomness for nonce
+--                              hardening. Per BIP-340 §"Default Signing", nil
+--                              is equivalent to all-zero aux_rand. We default
+--                              to zero so the published BIP-340 test vectors
+--                              are reproducible; production callers should
+--                              pass crypto.random_bytes(32) explicitly (Core
+--                              does this in MutableTransactionSignatureCreator
+--                              via GetRandBytes). See design doc §6a.
+-- @return string|nil 64-byte BIP-340 signature, or nil + err on failure
+function M.schnorr_sign(privkey32, msg32, aux_rand32)
+  assert(type(privkey32) == "string" and #privkey32 == 32,
+    "privkey32 must be a 32-byte string")
+  assert(type(msg32) == "string" and #msg32 == 32,
+    "msg32 must be a 32-byte string")
+  if aux_rand32 ~= nil then
+    assert(type(aux_rand32) == "string" and #aux_rand32 == 32,
+      "aux_rand32 must be a 32-byte string or nil")
+  end
+
+  local kp = ffi.new("secp256k1_keypair")
+  if libsecp256k1.secp256k1_keypair_create(secp_ctx, kp, privkey32) ~= 1 then
+    return nil, "keypair_create failed (invalid seckey)"
+  end
+
+  local sig64 = ffi.new("unsigned char[64]")
+  local aux_ptr = aux_rand32 and ffi.cast("const unsigned char*", aux_rand32) or nil
+  if libsecp256k1.secp256k1_schnorrsig_sign32(
+    secp_ctx, sig64, msg32, kp, aux_ptr
+  ) ~= 1 then
+    return nil, "schnorrsig_sign32 failed"
+  end
+  return ffi.string(sig64, 64)
+end
+
+--- Apply a BIP-341 TapTweak to a 32-byte secret key in-place via the
+-- libsecp256k1 keypair API and return the tweaked seckey as a 32-byte string.
+-- This is the seckey-side mirror of M.tweak_pubkey, used for BIP-86 key-path
+-- spends (tweak = tagged_hash("TapTweak", internal_xonly)) and BIP-341
+-- script-path spends (tweak = tagged_hash("TapTweak", internal_xonly ||
+-- merkle_root)). Caller computes the tweak; this just applies it.
+-- @param privkey32 string: 32-byte secret key
+-- @param tweak32   string: 32-byte tweak
+-- @return string|nil 32-byte tweaked seckey, or nil + err on failure
+function M.taproot_tweak_seckey(privkey32, tweak32)
+  assert(type(privkey32) == "string" and #privkey32 == 32,
+    "privkey32 must be a 32-byte string")
+  assert(type(tweak32) == "string" and #tweak32 == 32,
+    "tweak32 must be a 32-byte string")
+
+  local kp = ffi.new("secp256k1_keypair")
+  if libsecp256k1.secp256k1_keypair_create(secp_ctx, kp, privkey32) ~= 1 then
+    return nil, "keypair_create failed (invalid seckey)"
+  end
+  if libsecp256k1.secp256k1_keypair_xonly_tweak_add(secp_ctx, kp, tweak32) ~= 1 then
+    return nil, "keypair_xonly_tweak_add failed"
+  end
+  local out = ffi.new("unsigned char[32]")
+  if libsecp256k1.secp256k1_keypair_sec(secp_ctx, out, kp) ~= 1 then
+    return nil, "keypair_sec failed"
+  end
+  return ffi.string(out, 32)
 end
 
 --------------------------------------------------------------------------------
