@@ -20,6 +20,13 @@ local M = {}
 
 M.MAX_GETUTXOS_OUTPOINTS = 15   -- Max outpoints per getutxos request
 M.MAX_HEADERS_COUNT = 2000      -- Max headers per request
+M.DEFAULT_HEADERS_COUNT = 5     -- Default ?count= when omitted (Core parity, rest.cpp:518)
+
+-- BIP-157 filter type names → numeric type id.
+-- Bitcoin Core: BlockFilterTypeByName ("basic" → BlockFilterType::BASIC = 0).
+M.FILTER_TYPE_BY_NAME = {
+  basic = 0,
+}
 
 --------------------------------------------------------------------------------
 -- Response Format Types
@@ -252,6 +259,93 @@ local function calculate_difficulty(bits_val)
 end
 
 --------------------------------------------------------------------------------
+-- Chaininfo Helpers (duplicated from rpc.lua to keep rest.lua dependency-free)
+--
+-- Bitcoin Core's rest_chaininfo (rest.cpp:716) just shells out to
+-- getblockchaininfo().HandleRequest().  We can't do that here without dragging
+-- the entire rpc.lua module (~6600 LOC) into rest.lua just for one helper, so
+-- the chaininfo body is reproduced from rpc.lua's getblockchaininfo handler
+-- (rpc.lua:819-920) plus the buried-softfork helper.  Keep this in sync if
+-- you change the RPC shape.
+--------------------------------------------------------------------------------
+
+--- Convert compact bits to 64-char big-endian hex target string (Core format).
+-- Mirrors rpc.lua bits_to_target_hex.
+-- @param bits number: compact nBits
+-- @return string: 64-char lowercase hex
+local function bits_to_target_hex(bits)
+  local target = consensus.bits_to_target(bits)
+  local hex = {}
+  for i = 1, 32 do
+    hex[i] = string.format("%02x", target:byte(i))
+  end
+  return table.concat(hex)
+end
+
+--- Get median time of past 11 blocks.
+-- Mirrors rpc.lua get_median_time_past.
+-- @param storage table: Storage object
+-- @param tip_hash hash256: Chain tip hash
+-- @return number: Median timestamp
+local function get_median_time_past(storage, tip_hash)
+  if not storage or not tip_hash then
+    return os.time()
+  end
+
+  local timestamps = {}
+  local current_hash = tip_hash
+
+  for _ = 1, 11 do
+    local header = storage.get_header(current_hash)
+    if not header then break end
+    timestamps[#timestamps + 1] = header.timestamp
+    current_hash = header.prev_hash
+  end
+
+  if #timestamps == 0 then
+    return os.time()
+  end
+
+  table.sort(timestamps)
+  return timestamps[math.ceil(#timestamps / 2)]
+end
+
+--- build_deployment_state: buried-softfork projection.
+-- Mirrors rpc.lua build_deployment_state (rpc.lua:765-808).
+-- @param tip_height number
+-- @param net table: network params
+-- @return table: deployments keyed by name
+local function build_deployment_state(tip_height, net)
+  local function buried_entry(activation_height)
+    local h = activation_height or 0
+    return {
+      type                  = "buried",
+      active                = tip_height >= h,
+      height                = h,
+      min_activation_height = h,
+    }
+  end
+
+  local deployments = {}
+  if net.bip34_height   then deployments.bip34   = buried_entry(net.bip34_height) end
+  if net.bip65_height   then deployments.bip65   = buried_entry(net.bip65_height) end
+  if net.bip66_height   then deployments.bip66   = buried_entry(net.bip66_height) end
+  if net.csv_height     then deployments.csv     = buried_entry(net.csv_height) end
+  if net.segwit_height  then deployments.segwit  = buried_entry(net.segwit_height) end
+  if net.taproot_height then deployments.taproot = buried_entry(net.taproot_height) end
+
+  -- testdummy: always buried-active (regtest test vehicle).
+  deployments.testdummy = {
+    type                  = "buried",
+    active                = true,
+    height                = 0,
+    min_activation_height = 0,
+  }
+
+  return deployments
+end
+
+--------------------------------------------------------------------------------
 -- REST Server Object
 --------------------------------------------------------------------------------
 
@@ -267,6 +361,16 @@ function M.new(config)
   self.mempool = config.mempool
   self.storage = config.storage
   self.network = config.network or consensus.networks.mainnet
+  -- Optional pruner (lunarblock.prune); when present, exposed via /rest/chaininfo
+  -- pruneheight / automatic_pruning fields exactly as getblockchaininfo does.
+  self.pruner = config.pruner
+  -- Optional index_manager (lunarblock.indexmanager); required for the
+  -- /rest/blockfilter/* endpoints.  When nil, those endpoints return 400.
+  -- We accept either index_manager (preferred) or filter_index directly.
+  self.index_manager = config.index_manager
+  self.filter_index = config.filter_index
+    or (self.index_manager and self.index_manager.get_filterindex
+        and self.index_manager.get_filterindex())
   self.running = false
   return self
 end
@@ -964,6 +1068,286 @@ function RESTServer:handle_mempool_info()
   })
 end
 
+--- GET /rest/chaininfo.json
+-- Returns blockchain state.  Mirrors Bitcoin Core's rest_chaininfo
+-- (rest.cpp:716), which just delegates to getblockchaininfo().HandleRequest().
+-- We reproduce the rpc.lua getblockchaininfo handler shape here (rpc.lua:819).
+function RESTServer:handle_chaininfo(format)
+  if format ~= M.FORMAT.JSON then
+    return error_response(400, "output format not found (available: json)")
+  end
+
+  local tip_height = 0
+  local tip_hash = types.hash256_zero()
+  local header_height = 0
+  local difficulty = 1.0
+  local mediantime = os.time()
+  local current_bits = self.network.pow_limit_bits
+
+  if self.chain_state then
+    tip_height = self.chain_state.tip_height or 0
+    tip_hash = self.chain_state.tip_hash or types.hash256_zero()
+    header_height = self.chain_state.header_tip_height or tip_height
+
+    if self.storage then
+      local header = self.storage.get_header(tip_hash)
+      if header then
+        current_bits = header.bits
+        difficulty = calculate_difficulty(header.bits)
+        mediantime = get_median_time_past(self.storage, tip_hash)
+      end
+    else
+      difficulty = calculate_difficulty(current_bits)
+    end
+  end
+
+  -- Verification progress estimate
+  local estimated_total_blocks = 880000
+  if self.network.name == "testnet" or self.network.name == "testnet4" then
+    estimated_total_blocks = 2800000
+  elseif self.network.name == "regtest" then
+    estimated_total_blocks = tip_height > 0 and tip_height or 1
+  end
+  local verification_progress = tip_height / estimated_total_blocks
+  if verification_progress > 1.0 then verification_progress = 1.0 end
+
+  -- IBD heuristic: tip > 24h old.
+  local initial_block_download = false
+  if self.storage and self.chain_state and self.chain_state.tip_hash then
+    local header = self.storage.get_header(self.chain_state.tip_hash)
+    if header then
+      local age = os.time() - header.timestamp
+      initial_block_download = age > 24 * 60 * 60
+    end
+  end
+
+  local chainwork = self.chain_state and self.chain_state.chainwork
+  if not chainwork then
+    chainwork = string.rep("0", 64)
+  end
+
+  local softforks = build_deployment_state(tip_height, self.network)
+
+  -- Pruning shape: same projection as getblockchaininfo.  `pruned` is always
+  -- present; `pruneheight` and `automatic_pruning` only when prune is on.
+  local pruner = self.pruner
+  local is_pruned = pruner and pruner.enabled or false
+
+  local tip_bits_hex = string.format("%08x", current_bits)
+  local tip_target_hex = bits_to_target_hex(current_bits)
+  local tip_time = 0
+  if self.storage and self.chain_state and self.chain_state.tip_hash then
+    local h = self.storage.get_header(self.chain_state.tip_hash)
+    if h then tip_time = h.timestamp end
+  end
+
+  local result = {
+    chain = self.network.name,
+    blocks = tip_height,
+    headers = header_height,
+    bestblockhash = types.hash256_hex(tip_hash),
+    difficulty = difficulty,
+    time = tip_time,
+    mediantime = mediantime,
+    verificationprogress = verification_progress,
+    initialblockdownload = initial_block_download,
+    chainwork = chainwork,
+    bits = tip_bits_hex,
+    target = tip_target_hex,
+    pruned = is_pruned,
+    softforks = softforks,
+    warnings = "",
+  }
+  if is_pruned then
+    result.pruneheight = pruner.prune_height > 0
+      and (pruner.prune_height + 1) or 0
+    result.automatic_pruning = pruner.automatic and true or false
+    if pruner.automatic then
+      result.prune_target_size = pruner.target_mb * 1024 * 1024
+    end
+  end
+
+  return json_response(result)
+end
+
+--------------------------------------------------------------------------------
+-- BIP-157 Block-Filter Helpers
+--------------------------------------------------------------------------------
+
+--- Look up a filter for a block hash.  Tries the wired filter_index first
+-- (preferred), then falls back to a direct CF read so REST works even when
+-- the consumer hasn't passed an index_manager.  Returns the same shape as
+-- blockfilter.new_index().get_filter(): {filter, filter_hash, filter_header}.
+-- @param self  RESTServer
+-- @param block_hash hash256
+-- @return table|nil, string|nil
+local function lookup_filter(self, block_hash)
+  if self.filter_index and self.filter_index.is_enabled
+     and self.filter_index.is_enabled() then
+    local info, err = self.filter_index.get_filter(block_hash)
+    if info then return info end
+    return nil, err
+  end
+  -- Direct fallback: read the raw CF entry put_filter wrote.
+  if self.storage and self.storage.get then
+    local data = self.storage.get("block_filter", block_hash.bytes)
+    if not data then
+      return nil, "filter not found"
+    end
+    local r = serialize.buffer_reader(data)
+    return {
+      filter_hash   = r.read_hash256(),
+      filter_header = r.read_hash256(),
+      filter        = r.read_varstr(),
+    }
+  end
+  return nil, "filter index not enabled"
+end
+
+--- Walk forward from a starting block hash, collecting filters for up to
+-- `count` blocks on the active chain.  Mirrors rest_filter_header's loop
+-- (rest.cpp:546-561) which uses ActiveChain::Next.  Here we use the height
+-- index: locate height-of-hash, then get_hash_by_height(h+1), etc.
+-- @return table list of filter-info entries, in order
+local function walk_filters_forward(self, start_hash, count)
+  local results = {}
+  if not self.storage then return results end
+
+  -- Find starting height via the height index iterator.
+  local start_height = nil
+  if self.storage.iterator then
+    local iter = self.storage.iterator("height")
+    if iter then
+      iter.seek_to_first()
+      while iter.valid() do
+        local v = iter.value()
+        if v and #v == 32 and v == start_hash.bytes then
+          local k = iter.key()
+          start_height = k:byte(1) * 16777216 + k:byte(2) * 65536
+                       + k:byte(3) * 256 + k:byte(4)
+          break
+        end
+        iter.next()
+      end
+      iter.destroy()
+    end
+  end
+
+  if not start_height then return results end
+
+  for h = start_height, start_height + count - 1 do
+    local hash
+    if h == start_height then
+      hash = start_hash
+    elseif self.storage.get_hash_by_height then
+      hash = self.storage.get_hash_by_height(h)
+    end
+    if not hash then break end
+
+    local info = lookup_filter(self, hash)
+    if not info then break end
+    results[#results + 1] = info
+
+    if #results >= count then break end
+  end
+
+  return results
+end
+
+--- GET /rest/blockfilter/<filtertype>/<hash>.[bin|hex|json]
+-- Returns the BIP-157 GCS filter for a single block.  Reference:
+-- bitcoin-core/src/rest.cpp::rest_block_filter (rest.cpp:622).
+function RESTServer:handle_blockfilter(filtertype_str, hash_hex, format)
+  if not M.FILTER_TYPE_BY_NAME[filtertype_str:lower()] then
+    return error_response(400, "Unknown filtertype " .. filtertype_str)
+  end
+  if #hash_hex ~= 64 or not hash_hex:match("^[0-9a-fA-F]+$") then
+    return error_response(400, "Invalid hash: " .. hash_hex)
+  end
+  if not (self.filter_index or self.storage) then
+    return error_response(400, "Index is not enabled for filtertype " .. filtertype_str)
+  end
+
+  local block_hash = types.hash256_from_hex(hash_hex)
+  local info, err = lookup_filter(self, block_hash)
+  if not info then
+    return error_response(404, "Filter not found." ..
+      ((err and " " .. err) or ""))
+  end
+
+  local encoded = info.filter or ""
+
+  if format == M.FORMAT.BIN then
+    -- Core writes `DataStream ssResp; ssResp << filter;` which serializes the
+    -- filter as a CompactSize-prefixed bytestring.
+    local w = serialize.buffer_writer()
+    w.write_varstr(encoded)
+    return bin_response(w.result())
+  elseif format == M.FORMAT.HEX then
+    local w = serialize.buffer_writer()
+    w.write_varstr(encoded)
+    return hex_response(w.result())
+  elseif format == M.FORMAT.JSON then
+    return json_response({ filter = hex_encode(encoded) })
+  else
+    return error_response(400, "output format not found (available: .bin, .hex, .json)")
+  end
+end
+
+--- GET /rest/blockfilterheaders/<filtertype>/<count>/<hash>.[bin|hex|json]
+-- (and the new ?count= form via /rest/blockfilterheaders/<filtertype>/<hash>)
+-- Returns up to `count` filter headers walking forward from hash on the
+-- active chain.  Reference: bitcoin-core/src/rest.cpp::rest_filter_header
+-- (rest.cpp:500).
+function RESTServer:handle_blockfilterheaders(filtertype_str, count_str, hash_hex, format)
+  if not M.FILTER_TYPE_BY_NAME[filtertype_str:lower()] then
+    return error_response(400, "Unknown filtertype " .. filtertype_str)
+  end
+  local count = tonumber(count_str)
+  if not count or count < 1 or count > M.MAX_HEADERS_COUNT then
+    return error_response(400, string.format(
+      "Header count is invalid or out of acceptable range (1-%d): %s",
+      M.MAX_HEADERS_COUNT, tostring(count_str)))
+  end
+  if #hash_hex ~= 64 or not hash_hex:match("^[0-9a-fA-F]+$") then
+    return error_response(400, "Invalid hash: " .. hash_hex)
+  end
+  if not (self.filter_index or self.storage) then
+    return error_response(400, "Index is not enabled for filtertype " .. filtertype_str)
+  end
+
+  local block_hash = types.hash256_from_hex(hash_hex)
+  local infos = walk_filters_forward(self, block_hash, count)
+  if #infos == 0 then
+    return error_response(404, "Filter not found.")
+  end
+
+  if format == M.FORMAT.BIN then
+    -- Core's serialization is `for (const uint256& h : hs) ssHeader << h;`
+    -- which is a raw concatenation of 32-byte little-endian hashes (uint256
+    -- internal byte order is the same byte order we hold the hash in).
+    local w = serialize.buffer_writer()
+    for _, info in ipairs(infos) do
+      w.write_hash256(info.filter_header)
+    end
+    return bin_response(w.result())
+  elseif format == M.FORMAT.HEX then
+    local w = serialize.buffer_writer()
+    for _, info in ipairs(infos) do
+      w.write_hash256(info.filter_header)
+    end
+    return hex_response(w.result())
+  elseif format == M.FORMAT.JSON then
+    local arr = {}
+    for i, info in ipairs(infos) do
+      arr[i] = types.hash256_hex(info.filter_header)
+    end
+    return json_response(arr)
+  else
+    return error_response(400, "output format not found (available: .bin, .hex, .json)")
+  end
+end
+
 --------------------------------------------------------------------------------
 -- Request Router
 --------------------------------------------------------------------------------
@@ -996,11 +1380,21 @@ function RESTServer:route(method, path)
     return self:handle_tx(txid_hex, format)
   end
 
-  -- /rest/headers/<count>/<hash>
+  -- /rest/headers/<count>/<hash>  (path form, deprecated upstream but still
+  -- accepted for back-compat — Core rest.cpp:474-484 keeps both.)
   local count_str, header_hash = clean_path:match("^/rest/headers/(%d+)/([0-9a-fA-F]+)$")
   if count_str and header_hash then
     format = format or M.FORMAT.JSON
     return self:handle_headers(count_str, header_hash, format)
+  end
+
+  -- /rest/headers/<hash>?count=N  (query-param form, Core rest.cpp:485-495).
+  -- Default count=5 when omitted, matching Core's GetQueryParameter("count").value_or("5").
+  header_hash = clean_path:match("^/rest/headers/([0-9a-fA-F]+)$")
+  if header_hash then
+    format = format or M.FORMAT.JSON
+    local q_count = query_params.count or tostring(M.DEFAULT_HEADERS_COUNT)
+    return self:handle_headers(q_count, header_hash, format)
   end
 
   -- /rest/blockhashbyheight/<height>
@@ -1035,6 +1429,37 @@ function RESTServer:route(method, path)
       return error_response(400, "output format not found (available: json)")
     end
     return self:handle_mempool_info()
+  end
+
+  -- /rest/chaininfo  (json only, like Core)
+  if clean_path:match("^/rest/chaininfo$") then
+    format = format or M.FORMAT.JSON
+    return self:handle_chaininfo(format)
+  end
+
+  -- /rest/blockfilterheaders/<filtertype>/<count>/<hash>  (path-form count)
+  --   or /rest/blockfilterheaders/<filtertype>/<hash>?count=N (query-form)
+  -- Match path-form first since it's more specific.
+  local fh_type, fh_count, fh_hash = clean_path:match(
+    "^/rest/blockfilterheaders/([^/]+)/(%d+)/([0-9a-fA-F]+)$")
+  if fh_type and fh_count and fh_hash then
+    format = format or M.FORMAT.JSON
+    return self:handle_blockfilterheaders(fh_type, fh_count, fh_hash, format)
+  end
+  fh_type, fh_hash = clean_path:match(
+    "^/rest/blockfilterheaders/([^/]+)/([0-9a-fA-F]+)$")
+  if fh_type and fh_hash then
+    format = format or M.FORMAT.JSON
+    fh_count = query_params.count or tostring(M.DEFAULT_HEADERS_COUNT)
+    return self:handle_blockfilterheaders(fh_type, fh_count, fh_hash, format)
+  end
+
+  -- /rest/blockfilter/<filtertype>/<hash>
+  local bf_type, bf_hash = clean_path:match(
+    "^/rest/blockfilter/([^/]+)/([0-9a-fA-F]+)$")
+  if bf_type and bf_hash then
+    format = format or M.FORMAT.JSON
+    return self:handle_blockfilter(bf_type, bf_hash, format)
   end
 
   return error_response(404, "Not found")
