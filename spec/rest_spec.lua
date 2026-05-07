@@ -688,10 +688,366 @@ describe("rest", function()
       assert.equal(2000, rest.MAX_HEADERS_COUNT)
     end)
 
+    it("defines default headers count for ?count= form", function()
+      assert.equal(5, rest.DEFAULT_HEADERS_COUNT)
+    end)
+
     it("defines format types", function()
       assert.equal("json", rest.FORMAT.JSON)
       assert.equal("bin", rest.FORMAT.BIN)
       assert.equal("hex", rest.FORMAT.HEX)
+    end)
+
+    it("knows the BIP-157 basic filter type", function()
+      assert.equal(0, rest.FILTER_TYPE_BY_NAME.basic)
+    end)
+  end)
+
+  --------------------------------------------------------------------------------
+  -- /rest/chaininfo  (REST wave 2026-05-06)
+  --------------------------------------------------------------------------------
+
+  describe("/rest/chaininfo endpoint", function()
+    -- Build a minimal storage that returns a header for the configured tip.
+    -- The chaininfo handler reads tip header.bits / tip header.timestamp and
+    -- walks 11 ancestors via prev_hash for mediantime — we wire all of those
+    -- through one closure-driven mock.
+    local function make_mock(tip_height)
+      local block = make_test_block()
+      local tip_hash = types.hash256(string.rep("\xcd", 32))
+      return {
+        tip_hash = tip_hash,
+        block = block,
+        storage = {
+          get_header = function() return block.header end,
+        },
+        chain_state = {
+          tip_height = tip_height or 100,
+          tip_hash = tip_hash,
+          header_tip_height = tip_height or 100,
+        },
+      }
+    end
+
+    it("returns 400 for non-JSON format", function()
+      local m = make_mock()
+      local server = rest.new({
+        storage = m.storage,
+        chain_state = m.chain_state,
+        network = consensus.networks.mainnet,
+      })
+      local response = server:route("GET", "/rest/chaininfo.bin")
+      local status = parse_http_response(response)
+      assert.equal(400, status)
+    end)
+
+    it("returns chaininfo JSON shape (Core parity)", function()
+      local m = make_mock(100)
+      local server = rest.new({
+        storage = m.storage,
+        chain_state = m.chain_state,
+        network = consensus.networks.mainnet,
+      })
+
+      local response = server:route("GET", "/rest/chaininfo.json")
+      local status, content_type, body = parse_http_response(response)
+
+      assert.equal(200, status)
+      assert.truthy(content_type:match("application/json"))
+
+      local d = cjson.decode(body)
+      assert.equal("mainnet",            d.chain)
+      assert.equal(100,                  d.blocks)
+      assert.equal(100,                  d.headers)
+      assert.equal(types.hash256_hex(m.tip_hash), d.bestblockhash)
+      assert.is_number(d.difficulty)
+      assert.is_number(d.mediantime)
+      assert.is_number(d.verificationprogress)
+      assert.is_boolean(d.initialblockdownload)
+      assert.is_string(d.chainwork)
+      assert.equal(64, #d.chainwork)
+      assert.is_string(d.bits)
+      assert.equal(8,  #d.bits)
+      assert.is_string(d.target)
+      assert.equal(64, #d.target)
+      assert.equal(false, d.pruned)
+      assert.is_table(d.softforks)
+      -- Mainnet has bip34/bip65/bip66/csv/segwit/taproot all defined.
+      assert.equal("buried", d.softforks.bip34.type)
+      assert.equal("buried", d.softforks.taproot.type)
+      assert.equal(true,  d.softforks.testdummy.active)
+      -- At height 100, only testdummy (height=0) is active on mainnet.
+      assert.equal(false, d.softforks.bip34.active)
+    end)
+
+    it("activates buried softforks past their height", function()
+      local m = make_mock(800000)  -- past taproot
+      local server = rest.new({
+        storage = m.storage,
+        chain_state = m.chain_state,
+        network = consensus.networks.mainnet,
+      })
+
+      local response = server:route("GET", "/rest/chaininfo.json")
+      local status, _, body = parse_http_response(response)
+      assert.equal(200, status)
+      local d = cjson.decode(body)
+      assert.equal(true, d.softforks.bip34.active)
+      assert.equal(true, d.softforks.bip65.active)
+      assert.equal(true, d.softforks.taproot.active)
+    end)
+
+    it("populates pruneheight + automatic_pruning when pruner is enabled", function()
+      local m = make_mock(100)
+      local server = rest.new({
+        storage     = m.storage,
+        chain_state = m.chain_state,
+        network     = consensus.networks.mainnet,
+        pruner = {
+          enabled      = true,
+          prune_height = 50,
+          automatic    = true,
+          target_mb    = 600,
+        },
+      })
+
+      local response = server:route("GET", "/rest/chaininfo.json")
+      local _, _, body = parse_http_response(response)
+      local d = cjson.decode(body)
+      assert.equal(true, d.pruned)
+      -- Core: pruneheight = prune_height + 1 (first UNPRUNED block).
+      assert.equal(51, d.pruneheight)
+      assert.equal(true, d.automatic_pruning)
+      assert.equal(600 * 1024 * 1024, d.prune_target_size)
+    end)
+  end)
+
+  --------------------------------------------------------------------------------
+  -- /rest/headers ?count=N  (REST wave 2026-05-06)
+  --------------------------------------------------------------------------------
+
+  describe("/rest/headers ?count= form", function()
+    it("accepts ?count= query param (Core parity)", function()
+      local block = make_test_block()
+      local block_hash = types.hash256(string.rep("\xcd", 32))
+      local block_hash_hex = types.hash256_hex(block_hash)
+
+      local mock_storage = {
+        get_header = function(hash)
+          if hash.bytes == block_hash.bytes then return block.header end
+          return nil
+        end,
+        iterator = function() return nil end,
+      }
+
+      local server = rest.new({storage = mock_storage})
+      local response = server:route("GET",
+        "/rest/headers/" .. block_hash_hex .. ".json?count=1")
+      local status, content_type, body = parse_http_response(response)
+      assert.equal(200, status)
+      assert.truthy(content_type:match("application/json"))
+      local d = cjson.decode(body)
+      assert.equal(1, #d)
+    end)
+
+    it("defaults count=5 when ?count= omitted", function()
+      local block = make_test_block()
+      local block_hash = types.hash256(string.rep("\xcd", 32))
+      local block_hash_hex = types.hash256_hex(block_hash)
+
+      local mock_storage = {
+        get_header = function(hash)
+          if hash.bytes == block_hash.bytes then return block.header end
+          return nil
+        end,
+        iterator = function() return nil end,
+      }
+
+      local server = rest.new({storage = mock_storage})
+      local response = server:route("GET",
+        "/rest/headers/" .. block_hash_hex .. ".json")
+      local status, _, body = parse_http_response(response)
+      assert.equal(200, status)
+      local d = cjson.decode(body)
+      -- We only seeded one header; loop terminates after 1 even though
+      -- count defaults to 5 — confirms the route matched and didn't 404.
+      assert.equal(1, #d)
+    end)
+
+    it("rejects ?count= out of range", function()
+      local server = rest.new({storage = {get_header = function() return nil end}})
+      local response = server:route("GET",
+        "/rest/headers/" .. string.rep("a", 64) .. ".json?count=3000")
+      local status, _, body = parse_http_response(response)
+      assert.equal(400, status)
+      assert.truthy(body:match("out of acceptable range"))
+    end)
+  end)
+
+  --------------------------------------------------------------------------------
+  -- /rest/blockfilter and /rest/blockfilterheaders  (REST wave 2026-05-06)
+  --------------------------------------------------------------------------------
+
+  describe("/rest/blockfilter endpoint", function()
+    -- Build a fake "filter index" that satisfies the lookup contract used by
+    -- rest.lua::lookup_filter().  We give one block_hash a synthetic filter.
+    local function make_indexed_storage(block_hash, filter_payload, filter_header)
+      local serialize_mod = require("lunarblock.serialize")
+      local w = serialize_mod.buffer_writer()
+      w.write_hash256(types.hash256(string.rep("\xfa", 32)))    -- filter_hash
+      w.write_hash256(filter_header)                            -- filter_header
+      w.write_varstr(filter_payload)                            -- filter_data
+      local cf_bytes = w.result()
+
+      return {
+        get = function(cf, key)
+          if cf == "block_filter" and key == block_hash.bytes then
+            return cf_bytes
+          end
+          return nil
+        end,
+      }
+    end
+
+    it("returns 400 for unknown filtertype", function()
+      local server = rest.new({storage = {get = function() return nil end}})
+      local response = server:route("GET",
+        "/rest/blockfilter/exotic/" .. string.rep("a", 64) .. ".json")
+      local status, _, body = parse_http_response(response)
+      assert.equal(400, status)
+      assert.truthy(body:match("Unknown filtertype"))
+    end)
+
+    it("returns 404 when the filter is not indexed", function()
+      local server = rest.new({storage = {get = function() return nil end}})
+      local response = server:route("GET",
+        "/rest/blockfilter/basic/" .. string.rep("a", 64) .. ".json")
+      local status = parse_http_response(response)
+      assert.equal(404, status)
+    end)
+
+    it("returns the filter as JSON for the basic filtertype", function()
+      local block_hash = types.hash256(string.rep("\xab", 32))
+      local payload = "\x10\x20\x30\x40"
+      local fheader = types.hash256(string.rep("\xfb", 32))
+      local server = rest.new({
+        storage = make_indexed_storage(block_hash, payload, fheader),
+      })
+
+      local response = server:route("GET",
+        "/rest/blockfilter/basic/" .. types.hash256_hex(block_hash) .. ".json")
+      local status, content_type, body = parse_http_response(response)
+      assert.equal(200, status)
+      assert.truthy(content_type:match("application/json"))
+      local d = cjson.decode(body)
+      assert.equal("10203040", d.filter)
+    end)
+  end)
+
+  describe("/rest/blockfilterheaders endpoint", function()
+    -- Mock a height index + filter store: heights 100..104, each block_hash
+    -- = "\xCC" .. 31 bytes of (counter), each filter_header = "\xFE" .. 31
+    -- bytes of (counter).  Used to verify the path-form (count in URL) and
+    -- query-form (?count=N) both walk forward correctly.
+    local function make_filter_chain_storage(start_height, count)
+      local serialize_mod = require("lunarblock.serialize")
+      local hashes = {}
+      local cf_filter = {}
+      local cf_height = {}
+      for i = 0, count - 1 do
+        local h = start_height + i
+        local bh = string.char(0xCC) .. string.char(i) .. string.rep("\x00", 30)
+        local fh = string.char(0xFE) .. string.char(i) .. string.rep("\x00", 30)
+        hashes[h] = types.hash256(bh)
+
+        local w = serialize_mod.buffer_writer()
+        w.write_hash256(types.hash256(string.rep("\xfa", 32)))
+        w.write_hash256(types.hash256(fh))
+        w.write_varstr("\x01\x02")
+        cf_filter[bh] = w.result()
+
+        cf_height[string.char(
+          math.floor(h / 16777216) % 256,
+          math.floor(h / 65536)    % 256,
+          math.floor(h / 256)      % 256,
+          h % 256
+        )] = bh
+      end
+
+      return {
+        first_hash = hashes[start_height],
+        first_height = start_height,
+        storage = {
+          get = function(cf, key)
+            if cf == "block_filter" then return cf_filter[key] end
+            return nil
+          end,
+          get_hash_by_height = function(h) return hashes[h] end,
+          iterator = function(cf)
+            if cf ~= "height" then return nil end
+            local keys = {}
+            for k, _ in pairs(cf_height) do keys[#keys + 1] = k end
+            table.sort(keys)
+            local i = 0
+            local it = {}
+            function it.seek_to_first() i = 1 end
+            function it.valid() return keys[i] ~= nil end
+            function it.key() return keys[i] end
+            function it.value() return cf_height[keys[i]] end
+            function it.next() i = i + 1 end
+            function it.destroy() end
+            return it
+          end,
+        },
+      }
+    end
+
+    it("returns 400 for unknown filtertype", function()
+      local server = rest.new({storage = {get = function() return nil end}})
+      local response = server:route("GET",
+        "/rest/blockfilterheaders/exotic/5/" .. string.rep("a", 64) .. ".json")
+      local status, _, body = parse_http_response(response)
+      assert.equal(400, status)
+      assert.truthy(body:match("Unknown filtertype"))
+    end)
+
+    it("returns 400 for count out of range (path form)", function()
+      local server = rest.new({storage = {get = function() return nil end}})
+      local response = server:route("GET",
+        "/rest/blockfilterheaders/basic/3000/" .. string.rep("a", 64) .. ".json")
+      local status, _, body = parse_http_response(response)
+      assert.equal(400, status)
+      assert.truthy(body:match("out of acceptable range"))
+    end)
+
+    it("returns N filter headers (path form)", function()
+      local m = make_filter_chain_storage(100, 3)
+      local server = rest.new({storage = m.storage})
+
+      local response = server:route("GET",
+        "/rest/blockfilterheaders/basic/3/" ..
+        types.hash256_hex(m.first_hash) .. ".json")
+      local status, content_type, body = parse_http_response(response)
+      assert.equal(200, status)
+      assert.truthy(content_type:match("application/json"))
+      local d = cjson.decode(body)
+      assert.equal(3, #d)
+      for _, hex in ipairs(d) do
+        assert.equal(64, #hex)
+      end
+    end)
+
+    it("returns N filter headers (query-param form)", function()
+      local m = make_filter_chain_storage(200, 3)
+      local server = rest.new({storage = m.storage})
+
+      local response = server:route("GET",
+        "/rest/blockfilterheaders/basic/" ..
+        types.hash256_hex(m.first_hash) .. ".json?count=2")
+      local status, _, body = parse_http_response(response)
+      assert.equal(200, status)
+      local d = cjson.decode(body)
+      assert.equal(2, #d)
     end)
   end)
 
