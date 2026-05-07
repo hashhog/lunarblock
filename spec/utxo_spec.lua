@@ -800,6 +800,29 @@ describe("utxo", function()
       assert.equal(15000000000, stats.total_value)
       assert.equal(150, stats.total_btc)
     end)
+
+    -- Wave 9 regression (2026-05-07): connect_genesis() previously
+    -- inserted the genesis coinbase output into CF.UTXO with comment
+    -- "we still add it for consistency".  Bitcoin Core's ConnectBlock
+    -- short-circuits on the genesis hash (validation.cpp:2337-2343) and
+    -- does NOT add the genesis coinbase.  The lunarblock seed made every
+    -- UTXO-set hash (HASH_SERIALIZED via gettxoutsetinfo, MUHASH, and
+    -- the dump_snapshot bytes) diverge from Core by exactly one entry,
+    -- which surfaced as a UTXO_HASH_DIVERGENCE on the diff-test
+    -- corpus entry `regression/reorg-via-submitblock` after a 3-deep
+    -- reorg.  Fix: drop the seed; rely on Core's genesis special-case.
+    -- Reference: bitcoin-core/src/validation.cpp ConnectBlock
+    --            (genesis-skip fast-path, lines 2337-2343 in 31.99).
+    it("does NOT seed the genesis coinbase into the UTXO set (Core parity)",
+       function()
+      -- After init(), the chain tip should point at the regtest genesis
+      -- but the UTXO set must be empty.  Pre-fix this asserted 1.
+      assert.equal(0, chain_state.tip_height)
+      local stats = chain_state:get_utxo_stats()
+      assert.equal(0, stats.utxo_count,
+        "genesis coinbase must not be present in chainstate (Core parity)")
+      assert.equal(0, stats.total_value)
+    end)
   end)
 
   describe("undo data serialization", function()

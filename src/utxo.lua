@@ -1492,17 +1492,28 @@ function ChainState:connect_genesis()
   self.storage.put_header(block_hash, header)
   self.storage.put_height_index(0, block_hash)
 
-  -- Add the coinbase UTXO to the UTXO set
-  -- Note: genesis coinbase is technically unspendable in Bitcoin Core,
-  -- but we still add it for consistency
-  for vout_idx, out in ipairs(coinbase_tx.outputs) do
-    if #out.script_pubkey == 0 or out.script_pubkey:byte(1) ~= 0x6a then
-      self.coin_view:add(txid, vout_idx - 1, M.utxo_entry(
-        out.value, out.script_pubkey, 0, true
-      ))
-    end
-  end
-  self.coin_view:flush()
+  -- DELIBERATELY do NOT add the genesis coinbase output to the UTXO set.
+  --
+  -- Bitcoin Core's ConnectBlock short-circuits on the genesis hash and
+  -- skips connection of its transactions entirely
+  -- (bitcoin-core/src/validation.cpp:2337-2343); the genesis coinbase
+  -- is therefore unspendable AND absent from the chainstate.  Any UTXO-
+  -- set hash (HASH_SERIALIZED via gettxoutsetinfo.hash_serialized_3,
+  -- MUHASH via gettxoutsetinfo.hash_type=muhash, or the dumptxoutset
+  -- on-wire bytes) is computed over the chainstate, so seeding the
+  -- genesis coinbase here makes every cross-impl UTXO-set comparison
+  -- diverge from Core by exactly one entry.
+  --
+  -- Found by Wave 9 reorg-via-submitblock corpus 2026-05-07: lunarblock
+  -- post-reorg utxo_after diverged from Core; root cause was this seed
+  -- (off-by-one).  Pre-fix dump_snapshot worked around the same gap
+  -- with an inline genesis-txid skip (still in tree below); compute_utxo_hash
+  -- and compute_muhash had no such workaround so the divergence
+  -- surfaced via gettxoutsetinfo.  Fixing at the source keeps every
+  -- consumer of CF.UTXO byte-compatible with Core.
+  --
+  -- See: bitcoin-core/src/validation.cpp ConnectBlock genesis special-case;
+  --      CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
 
   -- Set chain tip to genesis
   self.tip_hash = block_hash
@@ -1576,9 +1587,13 @@ function ChainState:reindex_chainstate(header_tip_height, progress_fn)
   self.tip_hash = nil
   self.tip_height = -1
 
-  -- 3. Reseed genesis. We can't call connect_genesis (it puts the
-  --    block to storage; genesis is already there). Instead, replay
-  --    the genesis coinbase output add and set chain_tip = 0.
+  -- 3. Reseed genesis chain-tip pointer.  We do NOT add the genesis
+  --    coinbase to the UTXO set: Core's ConnectBlock short-circuits on
+  --    genesis (validation.cpp:2337-2343) and lunarblock's
+  --    connect_genesis() now matches that.  Reindexing must produce the
+  --    same chainstate as a fresh-from-genesis IBD or every UTXO-set
+  --    hash (HASH_SERIALIZED / MUHASH / dumptxoutset bytes) splits from
+  --    Core by exactly one entry.
   local gen_hash = self.storage.get_hash_by_height(0)
   if not gen_hash then
     return nil, "reindex: genesis block missing from height index"
@@ -1587,15 +1602,10 @@ function ChainState:reindex_chainstate(header_tip_height, progress_fn)
   if not gen_block then
     return nil, "reindex: genesis block body missing from CF.BLOCKS"
   end
-  local gen_coinbase = gen_block.transactions[1]
-  local gen_txid = validation.compute_txid(gen_coinbase)
-  for vout_idx, out in ipairs(gen_coinbase.outputs) do
-    if #out.script_pubkey == 0 or out.script_pubkey:byte(1) ~= 0x6a then
-      self.coin_view:add(gen_txid, vout_idx - 1, M.utxo_entry(
-        out.value, out.script_pubkey, 0, true
-      ))
-    end
-  end
+  -- Force a flush() of (now empty) dirty entries that carries the
+  -- chain_tip update inside the same atomic batch.  flush()'s
+  -- early-return at dirty_count==0 is bypassed because we pass an
+  -- extra_batch_fn.
   self.coin_view:flush(false, function(batch)
     local w = serialize.buffer_writer()
     w.write_hash256(gen_hash)
@@ -3867,11 +3877,11 @@ function ChainState:dump_snapshot(file_path)
   -- block's coinbase output to the UTXO set
   -- (bitcoin-core/src/validation.cpp:2337-2343 short-circuits on the
   -- genesis hash and skips ConnectBlock for its transactions).
-  -- lunarblock's connect_genesis() inserts it for "consistency", which
-  -- diverged the dump's coins_count by 1 vs Core.  Compute the genesis
-  -- coinbase txid here and skip exactly that entry so the wire format
-  -- (51-byte metadata, coins_count=0 on a fresh chain) is byte-identical
-  -- to Core's regtest dump.
+  -- lunarblock's connect_genesis() now matches Core (no insert), so
+  -- this skip is defence-in-depth for legacy datadirs that were
+  -- written before the W9 fix landed (they still carry the genesis
+  -- entry in CF.UTXO and would otherwise diverge by exactly one entry).
+  -- New datadirs / fresh IBDs hit the no-op path here.
   local genesis_coinbase_txid_bytes = nil
   do
     local ok, gen_block_hash = pcall(self.storage.get_hash_by_height, 0)
