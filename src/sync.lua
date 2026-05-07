@@ -1462,6 +1462,27 @@ end
 -- @param peers table: list of established peers with NODE_NETWORK service
 function BlockDownloader:schedule_downloads(peers)
   if #peers == 0 then return end
+  -- Wave 8 defensive un-latch: if ibd_complete was set but headers now
+  -- extend past best_block, clear it so we resume scheduling.  Belt-and-
+  -- braces against the premature-fire race fixed in connect_pending_blocks
+  -- (see line ~2268).  main.lua's outer loop only calls schedule_downloads
+  -- when header_tip > chain_tip, so reaching this branch with
+  -- ibd_complete=true is an inconsistency we should self-correct rather
+  -- than wedge on.
+  --
+  -- next_connect_height > 0 guards against the contrived test setup
+  -- where a brand-new downloader with all-zero state is asked to
+  -- "download genesis" — main.lua never enters this path with
+  -- next_connect_height == 0 because chain_state.tip_height + 1 >= 1
+  -- once genesis is initialised.
+  if self.ibd_complete
+      and self.next_connect_height > 0
+      and self.next_connect_height <= self.header_chain.header_tip_height then
+    self.ibd_complete = false
+    print(string.format(
+      "[IBD-RELATCH] header_tip=%d advanced past best_block=%d; resuming downloads",
+      self.header_chain.header_tip_height, self.next_connect_height - 1))
+  end
   if self.ibd_complete then return end
 
   local socket = require("socket")
@@ -2264,8 +2285,47 @@ function BlockDownloader:connect_pending_blocks()
     ::continue_loop::
   end
 
-  -- Check if IBD is complete
-  if self.next_connect_height > self.header_chain.header_tip_height then
+  -- Check if IBD is complete.
+  --
+  -- Wave 8 (May 7 2026) tightened this gate: the prior version only
+  -- compared next_connect_height vs. header_tip_height, which fired
+  -- prematurely when the loop's invalid-skip path (line 2002) bumped
+  -- next_connect_height past header_tip_height while real blocks were
+  -- still pending or in-flight from peers.  Observed scenario: a
+  -- SIGTERM during IBD persisted chain_tip=948207 but headers
+  -- 948208–948241 to disk; on restart the chain reloaded with
+  -- header_tip=948241, the downloader pulled 948208–948221, and a
+  -- transient drain of pending/inflight let the prior gate fire even
+  -- though 20 blocks were still missing.  After ibd_complete=true,
+  -- main.lua's scheduler loop stops calling schedule_downloads (it
+  -- gates on header_tip > chain_tip, but more importantly
+  -- schedule_downloads itself early-returns on ibd_complete), so the
+  -- node wedges permanently with header_tip > best_block and zero
+  -- GETDATAs.
+  --
+  -- Three conjunctive conditions are now required:
+  --   1. next_connect_height > header_tip_height
+  --      (best_block >= header_tip — every known header has been
+  --       connected to the chain)
+  --   2. #pending_blocks == 0
+  --      (no buffered, downloaded-but-not-yet-connected blocks)
+  --   3. #inflight == 0
+  --      (no outstanding GETDATAs)
+  --
+  -- Even with (1) tightened to >=, (2) and (3) defend against the
+  -- racy case where a brief drain of in-flight makes next_connect ==
+  -- header_tip + 1 momentarily (e.g. invalid-skip path) while late
+  -- arrivals are still in the network pipe.
+  --
+  -- Bitcoin Core's IsInitialBlockDownload() in validation.cpp is
+  -- derived from chain state (work + tip age), not latched by a
+  -- one-shot flag.  This local fix preserves the latched-flag shape
+  -- because flipping to derived would touch every is_complete()
+  -- caller; the latch is acceptable as long as it's only set when
+  -- we've genuinely caught up.
+  if self.next_connect_height > self.header_chain.header_tip_height
+      and next(self.pending_blocks) == nil
+      and next(self.inflight) == nil then
     self.ibd_complete = true
     print("\nInitial Block Download complete!")
   end
