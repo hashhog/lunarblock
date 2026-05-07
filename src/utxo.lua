@@ -9,6 +9,7 @@ local storage_mod = require("lunarblock.storage")
 local perf = require("lunarblock.perf")
 local sig_cache = require("lunarblock.sig_cache")
 local mining = require("lunarblock.mining")
+local blockfilter = require("lunarblock.blockfilter")
 local bit = require("bit")
 local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 local M = {}
@@ -1370,6 +1371,29 @@ function M.new_chain_state(storage, network)
   -- today, only exercised by spec/txindex_spec.lua).  Inline wiring is
   -- the smallest correct fix per the 2026-05-05 audit.
   self.txindex_enabled = false
+  -- BIP-157 Phase 2 (2026-05-07): inline block-filter index maintenance.
+  -- Pattern C0 sibling for blockfilterindex.  When enabled, connect_block
+  -- builds the BIP-158 basic GCS filter for the block (using the spent
+  -- script_pubkeys we already collect into block_undo) and writes
+  --   CF.BLOCK_FILTER[block_hash]            -> {filter_hash, filter_header,
+  --                                              filter_data}
+  --   CF.BLOCK_FILTER_HEIGHT[height (4B BE)] -> block_hash
+  --   CF.META["filterindex_height"]          -> height (4B LE)
+  --   CF.META["filterindex_last_header"]     -> filter_header (32B)
+  -- inside the per-block atomic batch.  disconnect_block deletes those
+  -- same keys atomically and rewinds last_header to the previous block's
+  -- filter header (read from CF.BLOCK_FILTER_HEIGHT[height-1] before the
+  -- batch commits — symmetric with bitcoin-core's
+  -- src/index/blockfilterindex.cpp::CustomRemove which does
+  --   m_last_header = ReadFilterHeader(block.height - 1, *block.prev_hash))
+  -- Wiring is inline rather than via indexmanager.lua / blockfilter.lua's
+  -- new_index() because those modules' put_filter / disconnect_block call
+  -- self.storage.batch() directly (their own mini-batch), which would
+  -- leave a window where chain_tip rewound but the filter index didn't
+  -- (or vice versa) on a hard crash mid-reorg.  Rolling the writes into
+  -- the connect/disconnect atomic batch (and the multi-block reorg
+  -- batch via Pattern D) is the smallest correct fix.
+  self.filterindex_enabled = false
   -- W77-CB: rolling-window sub-phase breakdown of connect_block.  W75-CONN
   -- in sync.lua measures the callback as a black box (cb_avg ≈ 700–850ms
   -- during IBD, dominating the ~900ms/block budget).  This inner window
@@ -1389,6 +1413,13 @@ end
 -- node (which is intentionally not restarted in the Pattern C0 wave).
 function ChainState:set_txindex_enabled(enabled)
   self.txindex_enabled = enabled and true or false
+end
+
+-- Late toggle for BIP-157 block-filter index.  Mirrors set_txindex_enabled.
+-- Off by default so the live mainnet IBD path is bit-for-bit unchanged
+-- unless the operator passes --blockfilterindex on next restart.
+function ChainState:set_filterindex_enabled(enabled)
+  self.filterindex_enabled = enabled and true or false
 end
 
 function ChainState:init()
@@ -2497,6 +2528,72 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- LE) once per block; tip_buf above is exactly that 36-byte layout.
   -- Reusing it avoids per-tx string allocation overhead.
   local txindex_value = block_txid_bytes and tip_data or nil
+
+  -- BIP-157 Phase 2: build the basic block filter and chain its header
+  -- onto the previous block's filter header, all OUTSIDE the batch
+  -- closure (filter construction is pure CPU work; only the resulting
+  -- bytes go into the atomic batch).  Skipped when the filter index is
+  -- disabled, so default-config IBD pays nothing.
+  --
+  -- The undo data we feed into extract_basic_filter_elements is a flat
+  -- list of {script_pubkey = ...} tables.  block_undo is structured as
+  -- {tx_undo = { {prev_outputs = { utxo_entry, ... }}, ... }} where each
+  -- utxo_entry already carries .script_pubkey, so we just flatten.
+  local filter_blob, filter_height_key, filter_header_bytes
+  if self.filterindex_enabled then
+    local flat_undo = {}
+    for _, txu in ipairs(block_undo.tx_undo) do
+      for _, prev in ipairs(txu.prev_outputs) do
+        flat_undo[#flat_undo + 1] = { script_pubkey = prev.script_pubkey }
+      end
+    end
+    local filter_data = blockfilter.build_basic_filter(block, block_hash, flat_undo)
+    local filter_hash = blockfilter.compute_filter_hash(filter_data)
+    -- prev_header is the on-disk last_header (filter index advances
+    -- strictly with the active chain tip; under Pattern D multi-block
+    -- reorg, _last_header will already have been rolled back by the
+    -- preceding disconnect_block calls in the same shared batch and we
+    -- read it from the in-memory cache via ChainState — but for the
+    -- common single-block-extension case we just read the latest CF.META
+    -- entry).  We cache the in-flight value across this same connect
+    -- to keep the chain consistent if the caller is replaying multiple
+    -- blocks back-to-back.
+    local prev_header
+    if self._filterindex_pending_header then
+      prev_header = self._filterindex_pending_header
+    else
+      local raw = self.storage.get(storage_mod.CF.META, "filterindex_last_header")
+      if raw and #raw == 32 then
+        prev_header = types.hash256(raw)
+      else
+        prev_header = types.hash256_zero()
+      end
+    end
+    local filter_header = blockfilter.compute_filter_header(filter_hash, prev_header)
+    -- Serialize the per-block filter blob (filter_hash || filter_header
+    -- || varstr(filter_data)) — same layout that blockfilter.lua's
+    -- index.put_filter wrote when it owned its own batch, so existing
+    -- readers (rest.lua lookup_filter, blockfilter.new_index().get_filter,
+    -- the build_async coroutine) keep working unmodified.
+    local fw = serialize.buffer_writer()
+    fw.write_hash256(filter_hash)
+    fw.write_hash256(filter_header)
+    fw.write_varstr(filter_data)
+    filter_blob = fw.result()
+    -- 4-byte big-endian height key (matches blockfilter.lua encode_height
+    -- so the height index is byte-compatible with the legacy module).
+    filter_height_key = string.char(
+      math.floor(height / 16777216) % 256,
+      math.floor(height / 65536) % 256,
+      math.floor(height / 256) % 256,
+      height % 256
+    )
+    filter_header_bytes = filter_header.bytes
+    -- Cache the in-flight header so the next connect_block in the same
+    -- multi-block reorg picks it up before this batch lands on disk.
+    self._filterindex_pending_header = filter_header
+  end
+
   self.coin_view:flush(false, function(batch)
     -- Undo data into the same atomic batch (was a separate put before
     -- 2026-04-30; see comment block above).
@@ -2513,6 +2610,25 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       for i = 1, #block_txid_bytes do
         batch.put(storage_mod.CF.TX_INDEX, block_txid_bytes[i], txindex_value)
       end
+    end
+    -- BIP-157 Phase 2 block-filter index.  Atomic with chain_tip so a
+    -- crash between filter-write and tip-advance is impossible.  See
+    -- bitcoin-core/src/index/blockfilterindex.cpp::CustomAppend (the
+    -- mainline path) and ::CustomRemove (mirror in disconnect_block).
+    if filter_blob then
+      batch.put(storage_mod.CF.BLOCK_FILTER, block_hash.bytes, filter_blob)
+      batch.put(storage_mod.CF.BLOCK_FILTER_HEIGHT, filter_height_key,
+                block_hash.bytes)
+      -- best_height (4-byte LE, matching blockfilter.lua's encoding).
+      local hbuf = ffi.new("uint8_t[4]")
+      hbuf[0] = band(height, 0xFF)
+      hbuf[1] = band(rshift(height, 8), 0xFF)
+      hbuf[2] = band(rshift(height, 16), 0xFF)
+      hbuf[3] = band(rshift(height, 24), 0xFF)
+      batch.put(storage_mod.CF.META, "filterindex_height",
+                ffi.string(hbuf, 4))
+      batch.put(storage_mod.CF.META, "filterindex_last_header",
+                filter_header_bytes)
     end
     -- Include caller's extra operations (e.g. block body / height index from
     -- the IBD path, or block/header/height_index from submitblock) in the
@@ -3069,6 +3185,58 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
   -- → CTxIndex::CustomRemove.
   local block_txid_bytes = self.txindex_enabled and {} or nil
 
+  -- BIP-157 Phase 2: when the filter index is on, look up the previous
+  -- block's filter header BEFORE we open the batch.  Mirrors
+  -- bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove which calls
+  --   m_last_header = ReadFilterHeader(block.height - 1, *block.prev_hash)
+  -- after writing the rewind batch.  We read upfront because in Pattern D
+  -- multi-block reorg the rewind ops are queued in a shared batch (not
+  -- yet on disk) — the read sees the still-current disk state, which is
+  -- exactly what we want (the active-chain filter header at height-1).
+  -- Subsequent disconnects within the same reorg keep walking downward,
+  -- and the in-memory _filterindex_pending_header captures each step so
+  -- the eventual connect_block calls (after rollback finishes) start
+  -- their header chain from the correct rewound point even though the
+  -- on-disk CF.META["filterindex_last_header"] hasn't been committed.
+  local filter_prev_height_key, filter_prev_header_bytes
+  local filter_height_key_self
+  if self.filterindex_enabled then
+    -- Encode this block's height (for delete) — 4-byte BE.
+    filter_height_key_self = string.char(
+      math.floor(height / 16777216) % 256,
+      math.floor(height / 65536) % 256,
+      math.floor(height / 256) % 256,
+      height % 256
+    )
+    if height > 0 then
+      local prev_h = height - 1
+      filter_prev_height_key = string.char(
+        math.floor(prev_h / 16777216) % 256,
+        math.floor(prev_h / 65536) % 256,
+        math.floor(prev_h / 256) % 256,
+        prev_h % 256
+      )
+      -- Look up prev block's hash via CF.BLOCK_FILTER_HEIGHT, then load
+      -- its filter blob and slice out the filter_header (bytes 33..64
+      -- after the 32-byte filter_hash).
+      local prev_hash_bytes = self.storage.get(
+        storage_mod.CF.BLOCK_FILTER_HEIGHT, filter_prev_height_key)
+      if prev_hash_bytes and #prev_hash_bytes == 32 then
+        local prev_blob = self.storage.get(
+          storage_mod.CF.BLOCK_FILTER, prev_hash_bytes)
+        if prev_blob and #prev_blob >= 64 then
+          filter_prev_header_bytes = prev_blob:sub(33, 64)
+        end
+      end
+    end
+    -- Fallback: genesis (height==1 disconnect) or missing prev filter
+    -- → reset to all-zero header (matches blockfilter.lua's index
+    -- .disconnect_block fallback and Core's pre-genesis sentinel).
+    if not filter_prev_header_bytes then
+      filter_prev_header_bytes = string.rep("\0", 32)
+    end
+  end
+
   -- Process transactions in reverse order
   -- Note: block_undo.tx_undo[i] corresponds to block.transactions[i+1]
   -- because coinbase (tx index 1) has no undo data
@@ -3126,6 +3294,29 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
         batch.delete(storage_mod.CF.TX_INDEX, block_txid_bytes[i])
       end
     end
+    -- BIP-157 Phase 2: filter rewind.  Atomic with chain_tip rewind so a
+    -- crash mid-reorg cannot leave a filter pointing at a hash that's no
+    -- longer on the active chain (or vice versa).  In Pattern D
+    -- multi-block reorg, every per-block disconnect appends to the same
+    -- shared batch as its UTXO/undo/txindex deletes — the entire reorg
+    -- commits as ONE write.  Mirrors
+    -- bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove.
+    if filter_height_key_self then
+      batch.delete(storage_mod.CF.BLOCK_FILTER, disconnect_hash.bytes)
+      batch.delete(storage_mod.CF.BLOCK_FILTER_HEIGHT, filter_height_key_self)
+      -- Rewind best_height to height-1 (4B LE).
+      local rewind_h = new_tip_height
+      local hbuf = ffi.new("uint8_t[4]")
+      hbuf[0] = band(rewind_h, 0xFF)
+      hbuf[1] = band(rshift(rewind_h, 8), 0xFF)
+      hbuf[2] = band(rshift(rewind_h, 16), 0xFF)
+      hbuf[3] = band(rshift(rewind_h, 24), 0xFF)
+      batch.put(storage_mod.CF.META, "filterindex_height",
+                ffi.string(hbuf, 4))
+      -- Rewind last_header to prev block's filter header (32B).
+      batch.put(storage_mod.CF.META, "filterindex_last_header",
+                filter_prev_header_bytes)
+    end
     -- Update chain tip to the previous block
     if new_tip_hash then
       local w = serialize.buffer_writer()
@@ -3134,6 +3325,15 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
       batch.put(storage_mod.CF.META, "chain_tip", w.result())
     end
   end, true, reorg_batch)
+
+  -- BIP-157 Phase 2: keep _filterindex_pending_header in lockstep with
+  -- the rewound state so the next connect_block (running in the SAME
+  -- Pattern D reorg shared batch — disk-committed last_header is still
+  -- the old value) chains its new filter onto the correct prev_header.
+  -- See the connect_block side for the cache-or-disk read.
+  if self.filterindex_enabled and filter_prev_header_bytes then
+    self._filterindex_pending_header = types.hash256(filter_prev_header_bytes)
+  end
 
   -- Update in-memory tip
   self.tip_height = new_tip_height
