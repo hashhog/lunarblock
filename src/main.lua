@@ -99,6 +99,7 @@ local function parse_args(argv)
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --txindex                   Maintain a full transaction index (txid → blockhash) for getrawtransaction")
+      print("      --blockfilterindex          Maintain a BIP-157/158 basic block-filter index (compact filters per block)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --import-utxo FILE          Import UTXO snapshot from Core dumptxoutset file (AssumeUTXO)")
       print("      --pid PATH                  Path to PID file (default: <datadir>/lunarblock.pid)")
@@ -174,6 +175,21 @@ local function parse_args(argv)
         args.txindex = true
       else
         args.txindex = (v == "1" or v == "true" or v == "yes" or v == "on")
+      end
+    elseif arg == "--blockfilterindex" or arg:match("^%-%-blockfilterindex=") then
+      -- BIP-157 Phase 2 (2026-05-07): enable inline block-filter index
+      -- (basic GCS filter per block) maintained atomically with
+      -- chainstate.  Accepts "--blockfilterindex" (bare) or
+      -- "--blockfilterindex=BOOL".  Mirrors bitcoin-core's
+      -- -blockfilterindex=basic CLI flag.  Default off; live mainnet
+      -- IBD path is bit-for-bit unchanged unless the operator opts in
+      -- on next restart.
+      local v = arg:match("^%-%-blockfilterindex=(.*)$")
+      if v == nil then
+        args.blockfilterindex = true
+      else
+        args.blockfilterindex = (v == "1" or v == "true" or v == "yes"
+                                 or v == "on" or v == "basic")
       end
     elseif arg == "--import-blocks" then
       i = i + 1
@@ -307,6 +323,9 @@ local function run_import_blocks(args)
   local chain_state = utxo_mod.new_chain_state(db, network)
   if args.txindex then
     chain_state:set_txindex_enabled(true)
+  end
+  if args.blockfilterindex then
+    chain_state:set_filterindex_enabled(true)
   end
   chain_state:init()
   local tip_height = chain_state.tip_height or 0
@@ -708,6 +727,18 @@ local function main()
   if args.txindex then
     chain_state:set_txindex_enabled(true)
     io.stdout:write("txindex enabled (Pattern C0).\n"); io.stdout:flush()
+  end
+  -- BIP-157 Phase 2 (2026-05-07): enable filter index if requested.
+  -- Off by default — see set_filterindex_enabled in src/utxo.lua.  When
+  -- on, connect_block builds the BIP-158 basic filter and writes the
+  -- filter+height-index entries plus the filter_last_header chain into
+  -- the per-block atomic batch, and disconnect_block deletes them
+  -- symmetrically (with prev_header rewind via Core's CustomRemove
+  -- semantics).
+  if args.blockfilterindex then
+    chain_state:set_filterindex_enabled(true)
+    io.stdout:write("blockfilterindex enabled (BIP-157 Phase 2).\n")
+    io.stdout:flush()
   end
   chain_state:init()
   io.stdout:write(string.format("Chain state initialized: height=%d\n", chain_state.tip_height or -1)); io.stdout:flush()
