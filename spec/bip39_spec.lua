@@ -190,4 +190,78 @@ describe("bip39", function()
       end
     end)
   end)
+
+  --------------------------------------------------------------------------
+  -- Wallet integration: import_mnemonic + get_mnemonic
+  --------------------------------------------------------------------------
+  describe("wallet integration", function()
+    local wallet
+    local consensus
+
+    setup(function()
+      wallet = require("lunarblock.wallet")
+      consensus = require("lunarblock.consensus")
+    end)
+
+    it("import_mnemonic builds a usable wallet", function()
+      local m = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+      local w, err = wallet.import_mnemonic(m, "TREZOR", consensus.networks.mainnet)
+      assert.is_nil(err)
+      assert.is_truthy(w)
+      assert.is_false(w.is_locked)
+      -- Wallet should expose addresses (gap_limit=20 by default).
+      assert.is_true(#w.addresses >= 1)
+    end)
+
+    it("import_mnemonic rejects bad checksum", function()
+      local bad = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"
+      local w, err = wallet.import_mnemonic(bad, "", consensus.networks.mainnet)
+      assert.is_nil(w)
+      assert.is_truthy(err)
+      assert.is_truthy(err:match("checksum"))
+    end)
+
+    it("get_mnemonic round-trips through encrypt/lock/unlock", function()
+      local m = "legal winner thank year wave sausage worth useful legal winner thank yellow"
+      local w, err = wallet.import_mnemonic(m, "", consensus.networks.mainnet, nil, "wallet-pw")
+      assert.is_nil(err)
+      assert.is_truthy(w)
+      assert.is_true(w.is_encrypted)
+
+      local words = w:get_mnemonic()
+      assert.are.equal(m, table.concat(words, " "))
+
+      w:lock()
+      local _, locked_err = w:get_mnemonic()
+      assert.is_truthy(locked_err)
+      assert.is_truthy(locked_err:match("locked"))
+
+      assert.is_true(w:unlock("wallet-pw"))
+      local words2 = w:get_mnemonic()
+      assert.are.equal(m, table.concat(words2, " "))
+    end)
+
+    it("legacy from_seed wallets have no mnemonic", function()
+      local seed = string.rep("\0", 32)
+      local w = wallet.from_seed(seed, consensus.networks.mainnet)
+      local words, err = w:get_mnemonic()
+      assert.is_nil(words)
+      assert.is_truthy(err)
+      assert.is_truthy(err:match("not created"))
+    end)
+
+    it("seed derivation matches BIP-39 spec for vector 1", function()
+      -- The wallet master key should match what BIP-32 produces from the
+      -- BIP-39 seed for vector 1 (passphrase "TREZOR"). This is the
+      -- end-to-end check that our PBKDF2 + master_key_from_seed wiring
+      -- produces something Trezor / Sparrow / Electrum could re-derive.
+      local m = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+      local seed = bip39.mnemonic_to_seed(m, "TREZOR")
+      local from_mnemonic = wallet.master_key_from_seed(seed)
+      local imported, err = wallet.import_mnemonic(m, "TREZOR", nil)
+      assert.is_nil(err)
+      assert.are.equal(from_mnemonic.key, imported.master_key.key)
+      assert.are.equal(from_mnemonic.chain_code, imported.master_key.chain_code)
+    end)
+  end)
 end)
