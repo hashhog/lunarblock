@@ -4749,6 +4749,14 @@ function RPCServer:register_methods()
       tx.inputs[i].script_sig = w.result()
       return true
     elseif script_type == "p2sh" and prev.redeem_script then
+      -- BIP-16: the caller-supplied redeem_script must commit to the P2SH
+      -- scriptPubKey.  Without this guard, signrawtransactionwithkey would
+      -- happily produce a witness signature bound to whatever script the
+      -- prevtxs payload claimed — Core rejects on EQUALVERIFY but the
+      -- partial signature has already leaked.  W31.
+      if not crypto.verify_p2sh_commitment(prev.redeem_script, prev.script_pubkey) then
+        return false
+      end
       -- P2SH-wrapped segwit (BIP141): treat as P2WPKH inside scriptSig push.
       local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
       if rdm_type == "p2wpkh" then
@@ -4894,6 +4902,14 @@ function RPCServer:register_methods()
           if dk.pkh == hash_or_program then return dk end
         end
       elseif script_type == "p2sh" and prev and prev.redeem_script then
+        -- W31: short-circuit before searching keys if the supplied
+        -- redeem_script doesn't commit to the P2SH scriptPubKey.  Avoids
+        -- ever returning a key that would then be used to sign a sighash
+        -- bound to an attacker-chosen script.
+        local crypto = require("lunarblock.crypto")
+        if not crypto.verify_p2sh_commitment(prev.redeem_script, spk) then
+          return nil
+        end
         local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
         if rdm_type == "p2wpkh" then
           for _, dk in ipairs(decoded_keys) do
@@ -4983,6 +4999,11 @@ function RPCServer:register_methods()
       if script_type == "p2pkh" or script_type == "p2wpkh" then
         return pkh_index[hash_or_program]
       elseif script_type == "p2sh" and prev and prev.redeem_script then
+        -- W31: refuse to surface a wallet key when the supplied
+        -- redeem_script doesn't commit to the P2SH scriptPubKey.
+        if not crypto.verify_p2sh_commitment(prev.redeem_script, spk) then
+          return nil
+        end
         local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
         if rdm_type == "p2wpkh" then return pkh_index[rdm_hash] end
       elseif script_type == "p2wsh" and prev and prev.witness_script then
