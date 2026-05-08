@@ -225,6 +225,34 @@ function M.hash160_type(data)
   return types.hash160(M.hash160(data))
 end
 
+-- BIP-16 P2SH commitment check: verify that hash160(redeem_script) equals
+-- the 20-byte hash committed to in a P2SH scriptPubKey of the form
+--   OP_HASH160 <20-byte hash> OP_EQUAL    (23 bytes total)
+-- Without this check, a signer/finalizer that trusts a caller-supplied
+-- redeem_script will sign or finalize a transaction that the network will
+-- reject with EQUALVERIFY, leaking partial signatures or producing an
+-- invalid transaction.  Reference: bitcoin-core/src/script/sign.cpp
+-- ProduceSignature + bitcoin-core/src/script/interpreter.cpp EvalScript
+-- (P2SH branch) — the same hash equality the consensus interpreter enforces.
+-- @param redeem_script string: the redeem script (raw bytes)
+-- @param script_pubkey string: the 23-byte P2SH scriptPubKey (raw bytes)
+-- @return boolean: true if the commitment matches, false otherwise
+function M.verify_p2sh_commitment(redeem_script, script_pubkey)
+  if type(redeem_script) ~= "string" or type(script_pubkey) ~= "string" then
+    return false
+  end
+  if #script_pubkey ~= 23 then
+    return false
+  end
+  -- Validate scriptPubKey shape: a9 14 <20 bytes> 87
+  if script_pubkey:byte(1) ~= 0xa9 or
+     script_pubkey:byte(2) ~= 0x14 or
+     script_pubkey:byte(23) ~= 0x87 then
+    return false
+  end
+  return M.hash160(redeem_script) == script_pubkey:sub(3, 22)
+end
+
 -- HMAC-SHA512: used for BIP32 key derivation
 function M.hmac_sha512(key, data)
   local md = ffi.new("unsigned char[64]")
