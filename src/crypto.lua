@@ -284,6 +284,30 @@ function M.verify_p2wsh_commitment(witness_script, script_pubkey)
   return M.sha256(witness_script) == script_pubkey:sub(3, 34)
 end
 
+-- BIP-174 PSBT_IN_NON_WITNESS_UTXO commitment check (CVE-2020-14199 family).
+--
+-- A PSBT producer that supplies a `non_witness_utxo` whose hash does NOT
+-- match the input's `prev_out.hash` can steer a downstream signer/finalizer
+-- into emitting partial sigs against an attacker-chosen prevout — the
+-- scriptPubKey, value, and scriptCode all come from the *attacker-supplied*
+-- transaction, not the on-chain UTXO.  Bitcoin Core enforces this in
+-- `PSBTInput::IsSane` (src/psbt.cpp) by hashing the embedded tx and
+-- comparing against the spent outpoint's txid.  This helper replicates
+-- that exact byte-equality check.
+--
+-- @param non_witness_utxo_bytes string: the wire-serialized previous tx
+--   (NON-witness serialization, since txid is hash256 of base form)
+-- @param expected_txid_bytes string: 32 little-endian bytes from
+--   psbt.tx.inputs[i].prev_out.hash.bytes
+-- @return boolean: true if hash256(serialize(prev_tx, no witness)) matches
+function M.verify_non_witness_utxo_txid(non_witness_utxo_bytes, expected_txid_bytes)
+  if type(non_witness_utxo_bytes) ~= "string" then return false end
+  if type(expected_txid_bytes) ~= "string" or #expected_txid_bytes ~= 32 then
+    return false
+  end
+  return M.hash256(non_witness_utxo_bytes) == expected_txid_bytes
+end
+
 -- HMAC-SHA512: used for BIP32 key derivation
 function M.hmac_sha512(key, data)
   local md = ffi.new("unsigned char[64]")
