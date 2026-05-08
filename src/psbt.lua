@@ -747,6 +747,14 @@ function M.sign_input(psbt, input_index, privkey, pubkey, sighash_type)
       psbt.tx, input_index, script_code, sighash_type
     )
   elseif script_type == "p2sh" and inp.redeem_script then
+    -- BIP-16: refuse to sign unless the supplied redeem_script actually
+    -- commits to the P2SH scriptPubKey.  Otherwise a malicious or buggy
+    -- caller could trick this signer into producing a sighash bound to a
+    -- redeem script that the network will reject (EQUALVERIFY), leaking a
+    -- partial signature for an unintended script.  W31.
+    if not crypto.verify_p2sh_commitment(inp.redeem_script, script_pubkey) then
+      error("P2SH redeem_script does not commit to scriptPubKey (hash160 mismatch)")
+    end
     -- P2SH - check if it wraps segwit
     local redeem_type = script.classify_script(inp.redeem_script)
     if redeem_type == "p2wpkh" then
@@ -965,6 +973,15 @@ function M.finalize_input(psbt, input_index)
     inp.final_script_sig = w.result()
 
   elseif script_type == "p2sh" and inp.redeem_script then
+    -- BIP-16: refuse to finalize unless the supplied redeem_script actually
+    -- commits to the P2SH scriptPubKey.  An unguarded finalizer would emit
+    -- a transaction the network rejects (EQUALVERIFY) and could be steered
+    -- by an upstream PSBT producer into committing partial sigs to a script
+    -- the signer never agreed to.  Applies to both P2SH-P2WPKH and pure
+    -- P2SH paths.  W31.
+    if not crypto.verify_p2sh_commitment(inp.redeem_script, script_pubkey) then
+      error("P2SH redeem_script does not commit to scriptPubKey (hash160 mismatch)")
+    end
     local redeem_type = script.classify_script(inp.redeem_script)
 
     if redeem_type == "p2wpkh" then
