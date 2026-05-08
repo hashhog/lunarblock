@@ -55,6 +55,14 @@ ffi.cdef[[
 
   /* Random bytes */
   int RAND_bytes(unsigned char *buf, int num);
+
+  /* PBKDF2-HMAC: used for BIP-39 mnemonic→seed (HMAC-SHA512, 2048 iter, dklen=64).
+   * Distinct from wallet.lua's derive_key (HMAC-SHA512, 25k iter, dklen=48 for
+   * AES-256 key+IV; 8-byte salt). DO NOT reuse derive_key for BIP-39: salt
+   * prefix, iteration count, and output length are all different. */
+  int PKCS5_PBKDF2_HMAC(const char *pass, int passlen,
+                        const unsigned char *salt, int saltlen, int iter,
+                        const EVP_MD *digest, int keylen, unsigned char *out);
 ]]
 
 local libcrypto = ffi.load("crypto")
@@ -245,6 +253,37 @@ function M.random_bytes(n)
   local ret = libcrypto.RAND_bytes(buf, n)
   assert(ret == 1, "RAND_bytes failed")
   return ffi.string(buf, n)
+end
+
+--- PBKDF2-HMAC-SHA512 via OpenSSL.
+-- Used by BIP-39 mnemonic→seed derivation (2048 iterations, dklen=64,
+-- salt = "mnemonic" + passphrase). Distinct from wallet.lua's derive_key,
+-- which uses 25 000 iterations and produces 48 bytes (key+IV) for AES-256
+-- wallet-at-rest encryption — DO NOT swap one for the other.
+-- Reference: BIP-39 §"From mnemonic to seed".
+-- @param password  string: input password (UTF-8 / NFKD-normalized bytes)
+-- @param salt      string: salt bytes
+-- @param iter      number: iteration count (BIP-39 = 2048)
+-- @param dklen     number: derived key length in bytes (BIP-39 = 64)
+-- @return string: dklen-byte derived key
+function M.pbkdf2_hmac_sha512(password, salt, iter, dklen)
+  assert(type(password) == "string", "password must be a string")
+  assert(type(salt) == "string", "salt must be a string")
+  assert(type(iter) == "number" and iter >= 1, "iter must be >= 1")
+  assert(type(dklen) == "number" and dklen >= 1, "dklen must be >= 1")
+
+  local out = ffi.new("unsigned char[?]", dklen)
+  if libcrypto.PKCS5_PBKDF2_HMAC(
+    password, #password,
+    salt, #salt,
+    iter,
+    libcrypto.EVP_sha512(),
+    dklen,
+    out
+  ) ~= 1 then
+    error("PKCS5_PBKDF2_HMAC failed")
+  end
+  return ffi.string(out, dklen)
 end
 
 -- libsecp256k1 FFI declarations
