@@ -4715,9 +4715,16 @@ function RPCServer:register_methods()
     return out
   end
 
-  --- Sign one input with a matched key.  Returns true on success and writes
-  -- the witness or scriptSig back into `tx`.  Returns false if the script type
-  -- is unsupported (P2TR) or no key matched.
+  --- Sign one input with a matched key (or set of keys).  Returns true on
+  -- success and writes the witness or scriptSig back into `tx`.  Returns
+  -- false if the script type is unsupported (e.g. P2TR) or no key matched.
+  --
+  -- `key_info` may be a single {privkey, pubkey, type=...} record (legacy
+  -- callers, P2WPKH/P2PKH/P2SH-P2WPKH path), or for P2WSH multisig the
+  -- resolver may return `{multi=true, keys={{privkey,pubkey}, ...}}` so the
+  -- caller can supply 1..M cosigner keys at once. The function will degrade
+  -- gracefully (return false + complete=false) if a multisig witnessScript
+  -- has fewer than M matching keys.
   local function sign_one_input(tx, i, prev, key_info, sighash_type)
     local crypto = require("lunarblock.crypto")
     local script_type, hash_or_program = script_mod.classify_script(prev.script_pubkey)
@@ -4760,8 +4767,25 @@ function RPCServer:register_methods()
       end
       -- pure P2SH (multisig etc.) not handled in this minimal port.
       return false
+    elseif script_type == "p2wsh" and prev.witness_script then
+      -- P2WSH (BIP-143). Caller supplied a witnessScript; sighash is
+      -- computed with witnessScript as scriptCode. wallet.sign_input_p2wsh
+      -- handles single-key vs M-of-N CHECKMULTISIG layout.
+      local wallet_mod = require("lunarblock.wallet")
+      local keys
+      if key_info and key_info.multi and key_info.keys then
+        keys = key_info.keys
+      else
+        keys = {key_info}
+      end
+      local stack, err = wallet_mod.sign_input_p2wsh(
+        tx, i - 1, prev.witness_script, prev.value, keys, sighash_type)
+      if not stack then return false, err end
+      tx.inputs[i].witness = stack
+      tx.segwit = true
+      return true
     end
-    -- p2tr (Schnorr) and p2wsh/multisig fall through to "not signed" — Core
+    -- p2tr (Schnorr) and other shapes fall through to "not signed" — Core
     -- reports `complete=false` plus per-input error in this case.
     return false
   end
@@ -4876,6 +4900,33 @@ function RPCServer:register_methods()
             if dk.pkh == rdm_hash then return dk end
           end
         end
+      elseif script_type == "p2wsh" and prev and prev.witness_script then
+        -- Multisig: gather every decoded key whose pubkey appears in the
+        -- witnessScript, in canonical script order. Single-key witnessScript
+        -- (e.g. <pk> OP_CHECKSIG): match by pubkey-equality fallback.
+        local m, _n, ms_pubkeys = script_mod.parse_multisig_script(prev.witness_script)
+        if m and ms_pubkeys then
+          local matched = {}
+          for _, pk in ipairs(ms_pubkeys) do
+            for _, dk in ipairs(decoded_keys) do
+              if dk.pubkey == pk then
+                matched[#matched + 1] = {privkey = dk.privkey, pubkey = dk.pubkey}
+                break
+              end
+            end
+          end
+          if #matched >= m then
+            return {multi = true, keys = matched}
+          end
+          return nil
+        end
+        -- Single-key witness script: match the first decoded key whose pubkey
+        -- bytes appear in the witnessScript.
+        for _, dk in ipairs(decoded_keys) do
+          if prev.witness_script:find(dk.pubkey, 1, true) then
+            return {privkey = dk.privkey, pubkey = dk.pubkey}
+          end
+        end
       end
       return nil
     end
@@ -4917,6 +4968,16 @@ function RPCServer:register_methods()
       end
     end
 
+    -- Index wallet keys by pubkey-bytes too, for matching against witness
+    -- scripts that embed the full pubkey directly (P2WSH multisig + bare
+    -- single-key <pk> CHECKSIG).
+    local pubkey_index = {}
+    for _, info in pairs(wallet.keys) do
+      if info.privkey and info.pubkey then
+        pubkey_index[info.pubkey] = info
+      end
+    end
+
     local key_resolver = function(spk, prev)
       local script_type, hash_or_program = script_mod.classify_script(spk)
       if script_type == "p2pkh" or script_type == "p2wpkh" then
@@ -4924,6 +4985,27 @@ function RPCServer:register_methods()
       elseif script_type == "p2sh" and prev and prev.redeem_script then
         local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
         if rdm_type == "p2wpkh" then return pkh_index[rdm_hash] end
+      elseif script_type == "p2wsh" and prev and prev.witness_script then
+        local m, _n, ms_pubkeys = script_mod.parse_multisig_script(prev.witness_script)
+        if m and ms_pubkeys then
+          local matched = {}
+          for _, pk in ipairs(ms_pubkeys) do
+            local info = pubkey_index[pk]
+            if info then
+              matched[#matched + 1] = {privkey = info.privkey, pubkey = info.pubkey}
+            end
+          end
+          if #matched >= m then
+            return {multi = true, keys = matched}
+          end
+          return nil
+        end
+        -- Single-key witness script: match by embedded pubkey.
+        for pk, info in pairs(pubkey_index) do
+          if prev.witness_script:find(pk, 1, true) then
+            return {privkey = info.privkey, pubkey = info.pubkey}
+          end
+        end
       end
       return nil
     end

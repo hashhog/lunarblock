@@ -983,10 +983,39 @@ function M.finalize_input(psbt, input_index)
     end
 
   elseif script_type == "p2wsh" and inp.witness_script then
-    -- P2WSH: witness = [sig, pubkey, witness_script] (simplified for single-sig)
-    -- Note: Multi-sig would need different handling
-    inp.final_script_witness = {sig, pubkey, inp.witness_script}
-    inp.final_script_sig = ""
+    -- P2WSH: detect M-of-N CHECKMULTISIG and assemble accordingly.
+    -- Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature +
+    -- BIP-143 (witness stack for v0 P2WSH).
+    local m, _n, pubkeys = script.parse_multisig_script(inp.witness_script)
+    if m and pubkeys then
+      -- Multisig: witness = [OP_0, sig_1, ..., sig_M, witness_script]
+      -- The leading OP_0 is the well-known CHECKMULTISIG dummy element
+      -- (off-by-one bug per BIP-147 / Core consensus).
+      -- Signatures are ordered by canonical witnessScript pubkey order; we
+      -- collect from inp.partial_sigs in pubkey-list order and stop once we
+      -- have M.
+      local stack = {""}  -- empty bytes for the OP_0 dummy
+      local collected = 0
+      for _, pk in ipairs(pubkeys) do
+        if collected >= m then break end
+        local s = inp.partial_sigs[hex_encode(pk)]
+        if s then
+          stack[#stack + 1] = s
+          collected = collected + 1
+        end
+      end
+      if collected < m then
+        return false  -- not enough signatures yet
+      end
+      stack[#stack + 1] = inp.witness_script
+      inp.final_script_witness = stack
+      inp.final_script_sig = ""
+    else
+      -- Single-key witness script (e.g. <pubkey> OP_CHECKSIG): preserve the
+      -- legacy [sig, pubkey, witness_script] template.
+      inp.final_script_witness = {sig, pubkey, inp.witness_script}
+      inp.final_script_sig = ""
+    end
 
   else
     return false  -- Unsupported type
