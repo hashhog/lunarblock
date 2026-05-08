@@ -253,6 +253,37 @@ function M.verify_p2sh_commitment(redeem_script, script_pubkey)
   return M.hash160(redeem_script) == script_pubkey:sub(3, 22)
 end
 
+-- BIP-141 P2WSH commitment check: verify that sha256(witnessScript) equals
+-- the 32-byte hash committed to in a P2WSH scriptPubKey of the form
+--   OP_0 <32-byte hash>            (34 bytes total: 0x00 0x20 <32 bytes>)
+-- Note this is a SINGLE sha256 (NOT hash256) per BIP-141.  The consensus
+-- interpreter at src/script.lua:1785 does `crypto.sha256(witness_script)`;
+-- this helper replicates that exact byte-equivalence so a PSBT signer or
+-- finalizer cannot be steered into binding a partial signature to a
+-- caller-supplied witnessScript that doesn't satisfy the spk commitment.
+-- Without this check, the network rejects the assembled tx on the P2WSH
+-- hash-mismatch path of EvalScript, but the signature has already escaped.
+-- W38; companion to W31's verify_p2sh_commitment.
+-- Reference: bitcoin-core/src/script/sign.cpp ProduceSignature +
+-- bitcoin-core/src/script/interpreter.cpp ExecuteWitnessProgram (P2WSH).
+-- @param witness_script string: the witness script (raw bytes)
+-- @param script_pubkey string: the 34-byte P2WSH scriptPubKey (raw bytes)
+-- @return boolean: true if the commitment matches, false otherwise
+function M.verify_p2wsh_commitment(witness_script, script_pubkey)
+  if type(witness_script) ~= "string" or type(script_pubkey) ~= "string" then
+    return false
+  end
+  if #script_pubkey ~= 34 then
+    return false
+  end
+  -- Validate scriptPubKey shape: 00 20 <32 bytes>
+  if script_pubkey:byte(1) ~= 0x00 or
+     script_pubkey:byte(2) ~= 0x20 then
+    return false
+  end
+  return M.sha256(witness_script) == script_pubkey:sub(3, 34)
+end
+
 -- HMAC-SHA512: used for BIP32 key derivation
 function M.hmac_sha512(key, data)
   local md = ffi.new("unsigned char[64]")
