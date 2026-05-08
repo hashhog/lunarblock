@@ -1218,6 +1218,87 @@ end
 -- Transaction Creation and Signing
 --------------------------------------------------------------------------------
 
+--- Sign a P2WSH input given a witnessScript and one-or-more signing keys.
+--
+-- Computes the BIP-143 segwit-v0 sighash with the witnessScript as scriptCode,
+-- signs once per `signKeys` entry, and returns the witness stack ready to be
+-- assigned to `tx.inputs[inputIdx + 1].witness`. For a bare single-key
+-- witnessScript (`<pubkey> OP_CHECKSIG`) the stack is `[sig, witnessScript]`.
+-- For an M-of-N CHECKMULTISIG witnessScript the stack is
+-- `[OP_0_dummy, sig_1, ..., sig_M, witnessScript]` where signatures are
+-- ordered by canonical witnessScript pubkey order (Core's
+-- `ProduceSignature`/`SignStep` semantics).
+--
+-- Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature
+--            BIP-143 (segwit v0 sighash + P2WSH witness layout).
+--
+-- @param tx            transaction
+-- @param inputIdx      number: 0-based input index
+-- @param witnessScript string: raw witnessScript bytes (also used as scriptCode)
+-- @param value         number: prevout value in satoshis
+-- @param signKeys      table: array of {privkey=string, pubkey=string}.
+--                      For multisig, supply each cosigner whose key the
+--                      caller controls (caller can pass <M keys for partial
+--                      signing — finalization is the caller's responsibility).
+-- @param hashType      number: SIGHASH byte (default SIGHASH.ALL)
+-- @return table: witness stack (array of byte-strings) on success.
+-- @return nil, string: error string on failure.
+function M.sign_input_p2wsh(tx, inputIdx, witnessScript, value, signKeys, hashType)
+  hashType = hashType or consensus.SIGHASH.ALL
+  if type(witnessScript) ~= "string" or #witnessScript == 0 then
+    return nil, "witnessScript must be non-empty bytes"
+  end
+  if type(signKeys) ~= "table" or #signKeys == 0 then
+    return nil, "signKeys must be a non-empty array"
+  end
+
+  local sighash = validation.signature_hash_segwit_v0(
+    tx, inputIdx, witnessScript, value, hashType)
+
+  -- Detect M-of-N multisig.
+  local m, _n, ms_pubkeys = script.parse_multisig_script(witnessScript)
+
+  if m and ms_pubkeys then
+    -- Multisig: produce signatures for each provided key, ordered by canonical
+    -- witnessScript pubkey order. Stop once we have M.
+    local sig_by_pk = {}
+    for _, k in ipairs(signKeys) do
+      if not k.privkey or not k.pubkey then
+        return nil, "signKeys entry missing privkey/pubkey"
+      end
+      local sig, err = crypto.ecdsa_sign(k.privkey, sighash)
+      if not sig then return nil, err or "signing failed" end
+      sig_by_pk[k.pubkey] = sig .. string.char(hashType)
+    end
+
+    local stack = {""}  -- OP_0 dummy element (CHECKMULTISIG off-by-one)
+    local collected = 0
+    for _, pk in ipairs(ms_pubkeys) do
+      if collected >= m then break end
+      local s = sig_by_pk[pk]
+      if s then
+        stack[#stack + 1] = s
+        collected = collected + 1
+      end
+    end
+    if collected < m then
+      return nil, string.format(
+        "P2WSH multisig: have %d signatures, need %d", collected, m)
+    end
+    stack[#stack + 1] = witnessScript
+    return stack
+  end
+
+  -- Single-key witnessScript (e.g. `<pubkey> OP_CHECKSIG`).
+  local k = signKeys[1]
+  if not k.privkey then
+    return nil, "signKeys[1] missing privkey"
+  end
+  local sig, err = crypto.ecdsa_sign(k.privkey, sighash)
+  if not sig then return nil, err or "signing failed" end
+  return {sig .. string.char(hashType), witnessScript}
+end
+
 --- Estimate fee rate for a transaction.
 -- @param conf_target number: Desired confirmation target in blocks (default 6)
 -- @return number: Fee rate in sat/vB

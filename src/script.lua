@@ -566,6 +566,82 @@ function M.make_p2a_script()
   return M.P2A_SCRIPT
 end
 
+--- Parse a bare M-of-N CHECKMULTISIG script.
+-- Recognises the canonical form `OP_M <pk1> <pk2> ... <pkN> OP_N OP_CHECKMULTISIG`
+-- where M and N are 1..16 (encoded as OP_1..OP_16 = 0x51..0x60), each pubkey
+-- push is a direct push of 33 (compressed) or 65 (uncompressed) bytes, and the
+-- terminating opcode is OP_CHECKMULTISIG (0xae). Used by the wallet/PSBT
+-- finalizer to detect multisig witnessScripts and assemble the correct
+-- `[OP_0, sig1, sig2, ..., sigM, witnessScript]` witness stack.
+-- Reference: bitcoin-core/src/script/standard.cpp::MatchMultisig
+-- @param script_bytes string: raw witnessScript bytes
+-- @return number|nil: M (signatures required) or nil if not multisig
+-- @return number|nil: N (total pubkeys) or nil
+-- @return table|nil:  Array of pubkey strings in canonical script order, or nil
+function M.parse_multisig_script(script_bytes)
+  if not script_bytes or #script_bytes < 1 + 1 + 33 + 1 + 1 then
+    -- Need at least: OP_1, push(33-byte pk), OP_1, OP_CHECKMULTISIG
+    return nil, nil, nil
+  end
+
+  local ok, ops = pcall(M.parse_script, script_bytes)
+  if not ok or not ops or #ops < 4 then
+    return nil, nil, nil
+  end
+
+  -- Last opcode must be OP_CHECKMULTISIG
+  local last = ops[#ops]
+  if last.opcode ~= M.OP.OP_CHECKMULTISIG or last.data ~= nil then
+    return nil, nil, nil
+  end
+
+  -- First opcode must be OP_1..OP_16 (M)
+  local m_op = ops[1]
+  if m_op.data ~= nil
+     or m_op.opcode < M.OP.OP_1 or m_op.opcode > M.OP.OP_16 then
+    return nil, nil, nil
+  end
+  local m = m_op.opcode - 0x50
+
+  -- Second-to-last opcode must be OP_1..OP_16 (N)
+  local n_op = ops[#ops - 1]
+  if n_op.data ~= nil
+     or n_op.opcode < M.OP.OP_1 or n_op.opcode > M.OP.OP_16 then
+    return nil, nil, nil
+  end
+  local n = n_op.opcode - 0x50
+
+  -- Pubkey pushes are ops[2..#ops-2]; expect exactly N of them.
+  local pk_count = #ops - 3
+  if pk_count ~= n then
+    return nil, nil, nil
+  end
+
+  local pubkeys = {}
+  for i = 2, #ops - 2 do
+    local op = ops[i]
+    if op.data == nil then
+      return nil, nil, nil
+    end
+    -- Only direct pushes of 33 or 65 bytes; tolerate PUSHDATA1 of same lengths
+    -- (Core's IsValidSignatureEncoding/MatchMultisig allows both forms).
+    if op.opcode > M.OP.OP_PUSHDATA1 then
+      return nil, nil, nil
+    end
+    local plen = #op.data
+    if plen ~= 33 and plen ~= 65 then
+      return nil, nil, nil
+    end
+    pubkeys[#pubkeys + 1] = op.data
+  end
+
+  if m < 1 or m > n then
+    return nil, nil, nil
+  end
+
+  return m, n, pubkeys
+end
+
 -- Classify a script and extract the hash/data
 -- Returns type string ("p2pkh", "p2sh", "p2wpkh", "p2wsh", "p2tr", "p2a", "nulldata", "nonstandard")
 -- and the extracted hash (or nil for nulldata/p2a/nonstandard)
