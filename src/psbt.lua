@@ -772,6 +772,17 @@ function M.sign_input(psbt, input_index, privkey, pubkey, sighash_type)
       )
     end
   elseif script_type == "p2wsh" and inp.witness_script then
+    -- BIP-141: refuse to sign unless the supplied witness_script actually
+    -- commits to the P2WSH scriptPubKey (sha256(witnessScript) == spk[2:34]).
+    -- Without this check, a malicious or buggy PSBT producer could steer
+    -- this signer into emitting a partial signature bound to a witnessScript
+    -- the network will reject on hash-mismatch — leaking a sig for an
+    -- unintended script.  Mirror of the W31 P2SH idiom one branch up.
+    -- (P2SH-wrapped P2WSH is not currently implemented at psbt.lua:760;
+    -- when it lands, an analogous check belongs there too.)  W38.
+    if not crypto.verify_p2wsh_commitment(inp.witness_script, script_pubkey) then
+      error("P2WSH witness_script does not commit to scriptPubKey (sha256 mismatch)")
+    end
     -- P2WSH
     script_code = inp.witness_script
     sighash = validation.signature_hash_segwit_v0(
@@ -1000,6 +1011,17 @@ function M.finalize_input(psbt, input_index)
     end
 
   elseif script_type == "p2wsh" and inp.witness_script then
+    -- BIP-141: refuse to finalize unless the supplied witness_script commits
+    -- to the P2WSH scriptPubKey.  An unguarded finalizer would emit a tx the
+    -- network rejects on the P2WSH hash-mismatch path of EvalScript and
+    -- could be steered by an upstream PSBT producer into committing partial
+    -- sigs to a script the signer never agreed to.  Same shape as the W31
+    -- P2SH finalizer guard above.  (P2SH-wrapped P2WSH not implemented in
+    -- the P2SH branch at psbt.lua:987; when it lands, mirror this check
+    -- there.)  W38.
+    if not crypto.verify_p2wsh_commitment(inp.witness_script, script_pubkey) then
+      error("P2WSH witness_script does not commit to scriptPubKey (sha256 mismatch)")
+    end
     -- P2WSH: detect M-of-N CHECKMULTISIG and assemble accordingly.
     -- Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature +
     -- BIP-143 (witness stack for v0 P2WSH).
