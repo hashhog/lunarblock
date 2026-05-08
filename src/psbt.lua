@@ -508,6 +508,17 @@ function M.deserialize(data)
 
       if key_type == M.IN_NON_WITNESS_UTXO then
         assert(#entry.key == 1, "Invalid non-witness UTXO key")
+        -- BIP-174 / CVE-2020-14199: the embedded prev-tx must hash to the
+        -- spent outpoint.  Otherwise an attacker-supplied PSBT can steer a
+        -- signer's scriptPubKey/value/scriptCode lookups against an
+        -- arbitrary fake transaction.  Mirror of bitcoin-core/src/psbt.cpp
+        -- `PSBTInput::IsSane` — wire it on the deserialize path so the
+        -- malformed PSBT is rejected before any signer touches it.  W41.
+        local expected_txid = psbt.tx.inputs[i].prev_out.hash.bytes
+        if not crypto.verify_non_witness_utxo_txid(entry.value, expected_txid) then
+          error("PSBT non_witness_utxo txid mismatch at input " .. (i - 1) ..
+                " (prev_out.hash != hash256(serialize(non_witness_utxo)))")
+        end
         inp.non_witness_utxo = serialize.deserialize_transaction(entry.value)
 
       elseif key_type == M.IN_WITNESS_UTXO then
@@ -715,16 +726,52 @@ function M.sign_input(psbt, input_index, privkey, pubkey, sighash_type)
     pubkey = crypto.pubkey_from_privkey(privkey, true)
   end
 
-  -- Get UTXO information
+  -- Get UTXO information.
+  --
+  -- W41 / CVE-2020-14199 hardening: if a non_witness_utxo is present we
+  -- (a) verify its hash actually matches the spent outpoint (deserialize
+  --     should have caught this, but defenders-in-depth — a PSBT can be
+  --     mutated post-deserialize), and
+  -- (b) when BOTH non_witness_utxo and witness_utxo are present, cross-
+  --     check that they agree on (value, scriptPubKey).  Otherwise an
+  --     attacker can lie about the value in witness_utxo (which is what
+  --     BIP-143 segwit-v0 sighash actually commits to) while the txid
+  --     check passes against the non_witness_utxo, tricking the signer
+  --     into binding a sig to a fee the user never approved.  This is
+  --     the precise CVE-2020-14199 oracle.  Bitcoin Core enforces this
+  --     in PSBTInput::IsSane.
+  local tx_input = psbt.tx.inputs[input_index + 1]
+  local nw_prev_out = nil
+  if inp.non_witness_utxo then
+    -- Defender-in-depth: re-verify txid here (deserialize already checked).
+    local nw_bytes = serialize.serialize_transaction(inp.non_witness_utxo, false)
+    if not crypto.verify_non_witness_utxo_txid(nw_bytes, tx_input.prev_out.hash.bytes) then
+      error("PSBT non_witness_utxo txid mismatch at input " .. input_index ..
+            " (prev_out.hash != hash256(serialize(non_witness_utxo)))")
+    end
+    nw_prev_out = inp.non_witness_utxo.outputs[tx_input.prev_out.index + 1]
+    if not nw_prev_out then
+      error("PSBT non_witness_utxo vout index out of range at input " .. input_index)
+    end
+  end
+
   local utxo_value, script_pubkey
   if inp.witness_utxo then
     utxo_value = inp.witness_utxo.value
     script_pubkey = inp.witness_utxo.script_pubkey
-  elseif inp.non_witness_utxo then
-    local tx_input = psbt.tx.inputs[input_index + 1]
-    local prev_out = inp.non_witness_utxo.outputs[tx_input.prev_out.index + 1]
-    utxo_value = prev_out.value
-    script_pubkey = prev_out.script_pubkey
+    -- CVE-2020-14199 cross-check: when both UTXO views are present they
+    -- MUST agree on the spent output, byte for byte.
+    if nw_prev_out then
+      if nw_prev_out.value ~= utxo_value or
+         nw_prev_out.script_pubkey ~= script_pubkey then
+        error("PSBT witness_utxo disagrees with non_witness_utxo at input " ..
+              input_index ..
+              " (value/scriptPubKey mismatch — CVE-2020-14199 oracle)")
+      end
+    end
+  elseif nw_prev_out then
+    utxo_value = nw_prev_out.value
+    script_pubkey = nw_prev_out.script_pubkey
   else
     error("Missing UTXO information for input " .. input_index)
   end
@@ -761,6 +808,19 @@ function M.sign_input(psbt, input_index, privkey, pubkey, sighash_type)
       -- P2SH-P2WPKH
       local pkh = crypto.hash160(pubkey)
       script_code = script.make_p2pkh_script(pkh)
+      sighash = validation.signature_hash_segwit_v0(
+        psbt.tx, input_index, script_code, utxo_value, sighash_type
+      )
+    elseif redeem_type == "p2wsh" and inp.witness_script then
+      -- P2SH-P2WSH (W41): BIP-143 sighash with witness_script as scriptCode.
+      -- redeem_script is the `0020 <sha256(witnessScript)>` envelope; we
+      -- MUST verify that envelope commits to the witness_script itself,
+      -- mirroring the W38 native-P2WSH guard one branch down.  Without
+      -- this, an attacker swaps in any witness_script of their choice.
+      if not crypto.verify_p2wsh_commitment(inp.witness_script, inp.redeem_script) then
+        error("P2SH-P2WSH witness_script does not commit to redeem_script (sha256 mismatch)")
+      end
+      script_code = inp.witness_script
       sighash = validation.signature_hash_segwit_v0(
         psbt.tx, input_index, script_code, utxo_value, sighash_type
       )
@@ -988,8 +1048,8 @@ function M.finalize_input(psbt, input_index)
     -- commits to the P2SH scriptPubKey.  An unguarded finalizer would emit
     -- a transaction the network rejects (EQUALVERIFY) and could be steered
     -- by an upstream PSBT producer into committing partial sigs to a script
-    -- the signer never agreed to.  Applies to both P2SH-P2WPKH and pure
-    -- P2SH paths.  W31.
+    -- the signer never agreed to.  Applies to P2SH-P2WPKH, P2SH-P2WSH, and
+    -- pure P2SH paths.  W31 (+ W41 P2SH-P2WSH branch).
     if not crypto.verify_p2sh_commitment(inp.redeem_script, script_pubkey) then
       error("P2SH redeem_script does not commit to scriptPubKey (hash160 mismatch)")
     end
@@ -1001,13 +1061,77 @@ function M.finalize_input(psbt, input_index)
       w.write_varstr(inp.redeem_script)
       inp.final_script_sig = w.result()
       inp.final_script_witness = {sig, pubkey}
-    else
-      -- Pure P2SH: scriptSig = <sig> <pubkey> <redeem_script>
+
+    elseif redeem_type == "p2wsh" and inp.witness_script then
+      -- P2SH-P2WSH (W41): scriptSig = <push redeem_script>, witness = the
+      -- BIP-141 P2WSH stack against the witness_script.  Same shape as the
+      -- native-P2WSH branch below; we MUST also re-verify that
+      -- witness_script commits to the redeem_script's `0020 <sha256>`
+      -- envelope, otherwise an unguarded finalizer leaks partial sigs the
+      -- same way the W31/W38 audit found for the unwrapped paths.
+      if not crypto.verify_p2wsh_commitment(inp.witness_script, inp.redeem_script) then
+        error("P2SH-P2WSH witness_script does not commit to redeem_script (sha256 mismatch)")
+      end
+      local m, _n, pubkeys = script.parse_multisig_script(inp.witness_script)
+      local witness_stack
+      if m and pubkeys then
+        local stack = {""}  -- OP_0 CHECKMULTISIG dummy (BIP-147)
+        local collected = 0
+        for _, pk in ipairs(pubkeys) do
+          if collected >= m then break end
+          local s = inp.partial_sigs[hex_encode(pk)]
+          if s then
+            stack[#stack + 1] = s
+            collected = collected + 1
+          end
+        end
+        if collected < m then
+          return false  -- not enough signatures yet
+        end
+        stack[#stack + 1] = inp.witness_script
+        witness_stack = stack
+      else
+        witness_stack = {sig, pubkey, inp.witness_script}
+      end
       local w = serialize.buffer_writer()
-      w.write_varstr(sig)
-      w.write_varstr(pubkey)
       w.write_varstr(inp.redeem_script)
       inp.final_script_sig = w.result()
+      inp.final_script_witness = witness_stack
+
+    else
+      -- Pure P2SH: detect M-of-N CHECKMULTISIG and assemble accordingly.
+      -- Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature
+      -- (TxoutType::MULTISIG branch at sign.cpp:670 — leading empty push
+      -- works around the CHECKMULTISIG off-by-one bug, then M sigs in
+      -- canonical pubkey order, then PushAll appends the serialized
+      -- redeem_script).  Falls back to the legacy single-sig template if
+      -- the redeem_script doesn't parse as multisig.  W41.
+      local m, _n, pubkeys = script.parse_multisig_script(inp.redeem_script)
+      if m and pubkeys then
+        local w = serialize.buffer_writer()
+        w.write_varstr("")  -- OP_0 multisig dummy
+        local collected = 0
+        for _, pk in ipairs(pubkeys) do
+          if collected >= m then break end
+          local s = inp.partial_sigs[hex_encode(pk)]
+          if s then
+            w.write_varstr(s)
+            collected = collected + 1
+          end
+        end
+        if collected < m then
+          return false  -- not enough signatures yet
+        end
+        w.write_varstr(inp.redeem_script)
+        inp.final_script_sig = w.result()
+      else
+        -- Single-key redeem_script: scriptSig = <sig> <pubkey> <redeem_script>
+        local w = serialize.buffer_writer()
+        w.write_varstr(sig)
+        w.write_varstr(pubkey)
+        w.write_varstr(inp.redeem_script)
+        inp.final_script_sig = w.result()
+      end
     end
 
   elseif script_type == "p2wsh" and inp.witness_script then
@@ -1016,9 +1140,8 @@ function M.finalize_input(psbt, input_index)
     -- network rejects on the P2WSH hash-mismatch path of EvalScript and
     -- could be steered by an upstream PSBT producer into committing partial
     -- sigs to a script the signer never agreed to.  Same shape as the W31
-    -- P2SH finalizer guard above.  (P2SH-wrapped P2WSH not implemented in
-    -- the P2SH branch at psbt.lua:987; when it lands, mirror this check
-    -- there.)  W38.
+    -- P2SH finalizer guard above.  W38.  P2SH-wrapped variant landed in
+    -- the P2SH branch above as part of W41.
     if not crypto.verify_p2wsh_commitment(inp.witness_script, script_pubkey) then
       error("P2WSH witness_script does not commit to scriptPubKey (sha256 mismatch)")
     end
@@ -1060,9 +1183,16 @@ function M.finalize_input(psbt, input_index)
     return false  -- Unsupported type
   end
 
-  -- Clear non-final fields
+  -- Clear non-final fields per BIP-174.  Once an input has FINAL_SCRIPTSIG
+  -- and/or FINAL_SCRIPTWITNESS the producer/finalizer fields are dropped:
+  -- partial_sigs, sighash_type, redeem_script, witness_script,
+  -- bip32_derivations.  non_witness_utxo / witness_utxo are retained for
+  -- the BIP-174 reasons (extractor needs to verify amounts).  W41.
   inp.partial_sigs = {}
   inp.bip32_derivations = {}
+  inp.sighash_type = nil
+  inp.redeem_script = nil
+  inp.witness_script = nil
 
   return true
 end
