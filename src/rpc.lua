@@ -4472,6 +4472,98 @@ function RPCServer:register_methods()
     return wif
   end
 
+  --- getwalletmnemonic: Reveal the BIP-39 mnemonic for the loaded wallet.
+  -- The wallet must be unlocked, and must have been created via
+  -- importmnemonic / a mnemonic-aware createwallet flow. Returns the
+  -- mnemonic as a single space-separated string plus a backup-hygiene
+  -- warning. Treat the response like dumpprivkey output: never log it,
+  -- never copy it into chat, write it down off-machine.
+  -- @return table: { mnemonic = "...", word_count = N, warning = "..." }
+  self.methods["getwalletmnemonic"] = function(rpc, _params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    if wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+
+    local words, mnem_err = wallet:get_mnemonic()
+    if not words then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = mnem_err or "No mnemonic available for this wallet"})
+    end
+
+    return {
+      mnemonic = table.concat(words, " "),
+      word_count = #words,
+      warning = "BACKUP HYGIENE: anyone with this phrase can spend your"
+        .. " coins. Write it down on paper, store it offline, never paste"
+        .. " it into chat / cloud / screenshots. The wallet does NOT store"
+        .. " your BIP-39 passphrase — keep that backed up separately.",
+    }
+  end
+
+  --- importmnemonic: Restore a wallet from a BIP-39 mnemonic.
+  -- Creates a new wallet (or replaces the loaded one) from the supplied
+  -- 12/15/18/21/24-word mnemonic. The mnemonic is validated (word
+  -- membership + BIP-39 checksum) before any wallet state is touched.
+  -- @param mnemonic string: BIP-39 mnemonic phrase
+  -- @param bip39_passphrase string: BIP-39 passphrase (default "")
+  -- @param wallet_name string: name to register with the wallet manager
+  --                            (required if a wallet manager is configured)
+  -- @return table: { wallet_name, address_count, message }
+  self.methods["importmnemonic"] = function(rpc, params)
+    local mnem = params[1] or params.mnemonic
+    if type(mnem) ~= "string" or #mnem == 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "mnemonic is required"})
+    end
+    local bip39_pp = params[2] or params.bip39_passphrase or ""
+    local wname = params[3] or params.wallet_name
+
+    local network = consensus.networks.mainnet
+    local storage = nil
+    if rpc.wallet_manager then
+      network = rpc.wallet_manager.network or network
+      storage = rpc.wallet_manager.storage
+    elseif rpc.wallet then
+      network = rpc.wallet.network or network
+      storage = rpc.wallet.storage
+    end
+
+    local wallet_obj = require("lunarblock.wallet")
+    local new_wallet, imp_err = wallet_obj.import_mnemonic(
+      mnem, bip39_pp, network, storage, nil  -- wallet-encryption pw not exposed here
+    )
+    if not new_wallet then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "importmnemonic: " .. tostring(imp_err)})
+    end
+
+    if rpc.wallet_manager then
+      if not wname or wname == "" then
+        error({code = M.ERROR.INVALID_PARAMS,
+               message = "wallet_name is required when a wallet manager is loaded"})
+      end
+      rpc.wallet_manager.wallets[wname] = new_wallet
+      local path = rpc.wallet_manager:get_wallet_path(wname)
+      new_wallet:save(path)
+      return {
+        wallet_name = wname,
+        address_count = #new_wallet.addresses,
+        message = "Mnemonic imported. BACK UP your phrase off-machine.",
+      }
+    else
+      -- Legacy single-wallet mode.
+      rpc.wallet = new_wallet
+      return {
+        address_count = #new_wallet.addresses,
+        message = "Mnemonic imported (single-wallet mode). BACK UP your phrase off-machine.",
+      }
+    end
+  end
+
   --- importprivkey: Import a private key.
   -- @param privkey string: Private key in WIF format
   -- @param label string: (ignored)

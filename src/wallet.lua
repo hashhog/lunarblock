@@ -7,6 +7,7 @@ local address = require("lunarblock.address")
 local script = require("lunarblock.script")
 local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
+local bip39 = require("lunarblock.bip39")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -678,6 +679,16 @@ function M.new(network, storage)
   self.address_type = "p2wpkh"     -- Default address type
   self.fee_estimator = nil         -- Optional fee estimator
   self.mempool = nil               -- Optional mempool reference
+  -- BIP-39 mnemonic (only present when wallet was created/imported via
+  -- import_mnemonic or create_with_mnemonic). 12/15/18/21/24 ASCII words.
+  -- Encrypted at rest alongside the master key when the wallet is locked.
+  self.mnemonic_words = nil        -- table of words, or nil
+  self.encrypted_mnemonic = nil    -- ciphertext (if encrypted + locked)
+  self.bip39_passphrase = nil      -- BIP-39 passphrase used at import (NOT
+                                   -- the wallet-encryption passphrase). For
+                                   -- now stored in-memory only; required to
+                                   -- re-derive the seed if a future caller
+                                   -- wants to migrate to a different node.
   return self
 end
 
@@ -734,6 +745,110 @@ function M.from_seed(seed, network, storage, passphrase)
 end
 
 --------------------------------------------------------------------------------
+-- BIP-39 mnemonic import / generate
+--------------------------------------------------------------------------------
+
+--- Import a wallet from a BIP-39 mnemonic.
+-- The mnemonic is validated (word membership + checksum), converted to a
+-- 64-byte seed via PBKDF2-HMAC-SHA512(2048, "mnemonic"+bip39_passphrase, 64),
+-- and fed into BIP-32 master_key_from_seed. The mnemonic itself is stored
+-- on the wallet (encrypted at rest if a wallet-encryption passphrase is
+-- set) so that getwalletmnemonic can return it for backup.
+--
+-- @param mnemonic       string|table: BIP-39 mnemonic (12/15/18/21/24 words)
+-- @param bip39_passphrase string|nil: BIP-39 passphrase (default "").
+--                                     Distinct from wallet_passphrase!
+-- @param network        table|nil: network params (default mainnet)
+-- @param storage        table|nil: storage backend
+-- @param wallet_passphrase string|nil: AES wallet-encryption passphrase
+--                                      (encrypts mnemonic + master key at rest)
+-- @return Wallet|nil, string|nil: wallet on success, nil + err on failure
+function M.import_mnemonic(mnemonic, bip39_passphrase, network, storage, wallet_passphrase)
+  bip39_passphrase = bip39_passphrase or ""
+
+  -- Normalise mnemonic to a list of words.
+  local words
+  if type(mnemonic) == "string" then
+    words = {}
+    for w in mnemonic:gmatch("%S+") do words[#words + 1] = w end
+  elseif type(mnemonic) == "table" then
+    words = mnemonic
+  else
+    return nil, "mnemonic must be a string or list of words"
+  end
+
+  -- Validate (word membership + checksum) BEFORE building the wallet, so a
+  -- typo'd mnemonic doesn't end up persisted. The haskoin failure mode of
+  -- the day was a silent bypass; we want a hard error here.
+  local ok, err = bip39.validate_mnemonic(words)
+  if not ok then
+    return nil, err
+  end
+
+  local seed = bip39.mnemonic_to_seed(words, bip39_passphrase)
+  if #seed ~= 64 then
+    return nil, "bip39: unexpected seed length " .. #seed
+  end
+
+  local wallet = M.new(network, storage)
+  wallet.master_key = M.master_key_from_seed(seed)
+  wallet.mnemonic_words = words
+  wallet.bip39_passphrase = bip39_passphrase
+  wallet.is_locked = false
+
+  if wallet_passphrase and #wallet_passphrase > 0 then
+    wallet:encrypt(wallet_passphrase)
+  else
+    wallet.is_encrypted = false
+  end
+
+  wallet:generate_addresses(wallet.gap_limit)
+  return wallet
+end
+
+--- Create a brand-new wallet with a freshly generated BIP-39 mnemonic.
+-- The caller MUST back up the returned mnemonic — the wallet stores it
+-- (encrypted if wallet_passphrase is set) but it is the user's job to
+-- write it down off-machine. Returns the wallet AND the mnemonic words
+-- so the caller can display them once at create time.
+-- @param n_words           number|nil: 12/15/18/21/24 (default 24)
+-- @param bip39_passphrase  string|nil: BIP-39 passphrase
+-- @param network           table|nil
+-- @param storage           table|nil
+-- @param wallet_passphrase string|nil: AES wallet-encryption passphrase
+-- @return Wallet, table:    wallet, mnemonic words
+function M.create_with_mnemonic(n_words, bip39_passphrase, network, storage, wallet_passphrase)
+  n_words = n_words or 24
+  bip39_passphrase = bip39_passphrase or ""
+
+  local words = bip39.generate_mnemonic(n_words)
+  local wallet, err = M.import_mnemonic(words, bip39_passphrase, network, storage, wallet_passphrase)
+  if not wallet then
+    -- Should be impossible — we just generated the mnemonic — but propagate.
+    error("create_with_mnemonic: " .. tostring(err))
+  end
+  return wallet, words
+end
+
+--- Get the BIP-39 mnemonic for this wallet.
+-- The wallet must be unlocked. Returns nil + err if the wallet was not
+-- created via import_mnemonic / create_with_mnemonic (e.g. legacy random
+-- 32-byte-seed wallets predate BIP-39 wiring and have no mnemonic).
+-- WARNING TO CALLERS: this leaks the wallet's master secret. Treat the
+-- returned words like the on-disk wallet file: never log, never serialize,
+-- only display for one-time user backup.
+-- @return table|nil, string|nil: list of words, or nil + err
+function Wallet:get_mnemonic()
+  if self.is_locked then
+    return nil, "Wallet is locked"
+  end
+  if not self.mnemonic_words then
+    return nil, "Wallet was not created from a BIP-39 mnemonic"
+  end
+  return self.mnemonic_words
+end
+
+--------------------------------------------------------------------------------
 -- Wallet Encryption
 --------------------------------------------------------------------------------
 
@@ -754,6 +869,18 @@ function Wallet:encrypt(passphrase)
   local plaintext = self.master_key.key .. self.master_key.chain_code
   self.encrypted_master_key = M.aes_encrypt(plaintext, key, iv)
 
+  -- If the wallet has an associated BIP-39 mnemonic, encrypt it with the
+  -- same key/IV so a stolen wallet file cannot leak the recovery phrase.
+  -- Storing the mnemonic at all is a deliberate trade-off: it lets the
+  -- user run getwalletmnemonic for backup, at the cost of ciphertext that
+  -- decrypts to the recovery phrase under the wallet passphrase.
+  if self.mnemonic_words then
+    local m_plain = table.concat(self.mnemonic_words, " ")
+    self.encrypted_mnemonic = M.aes_encrypt(m_plain, key, iv)
+  else
+    self.encrypted_mnemonic = nil
+  end
+
   self.is_encrypted = true
   self.is_locked = false  -- Still unlocked after encryption
 end
@@ -773,6 +900,10 @@ function Wallet:lock()
   for addr, key_info in pairs(self.keys) do
     key_info.privkey = nil
   end
+
+  -- Clear mnemonic from memory; encrypted_mnemonic stays for re-unlock.
+  self.mnemonic_words = nil
+  self.bip39_passphrase = nil
 
   self.is_locked = true
 end
@@ -807,6 +938,24 @@ function Wallet:unlock(passphrase)
   local seed_key = plaintext:sub(1, 32)
   local chain_code = plaintext:sub(33, 64)
   self.master_key = M.extended_key(seed_key, chain_code, 0, "\0\0\0\0", 0, true)
+
+  -- Restore mnemonic if present (encrypted under same key/IV).
+  if self.encrypted_mnemonic then
+    local m_plain, m_err = M.aes_decrypt(self.encrypted_mnemonic, key, iv)
+    if m_plain then
+      local words = {}
+      for w in m_plain:gmatch("%S+") do words[#words + 1] = w end
+      -- Cheap sanity: 12/15/18/21/24 words. If corrupt, drop without
+      -- failing unlock — the master key is the source of truth.
+      if ({[12]=true,[15]=true,[18]=true,[21]=true,[24]=true})[#words] then
+        self.mnemonic_words = words
+      end
+    else
+      -- Same caveat: unlock should not fail just because the mnemonic
+      -- ciphertext is unreadable.
+      _ = m_err
+    end
+  end
 
   -- Regenerate private keys for all addresses
   for addr, key_info in pairs(self.keys) do
@@ -1600,13 +1749,26 @@ function Wallet:serialize()
     -- Store encrypted key
     data.encrypted_master_key = M.hex_encode(self.encrypted_master_key)
     data.encryption_salt = M.hex_encode(self.encryption_salt)
+    -- Encrypted mnemonic (optional; only present for BIP-39 wallets).
+    if self.encrypted_mnemonic then
+      data.encrypted_mnemonic = M.hex_encode(self.encrypted_mnemonic)
+    end
   else
     -- Store unencrypted (for non-encrypted wallets)
     if self.master_key then
       data.master_key = M.hex_encode(self.master_key.key)
       data.master_chain_code = M.hex_encode(self.master_key.chain_code)
     end
+    -- Plaintext mnemonic for unencrypted wallets (matches plaintext master
+    -- key handling above; user opted out of at-rest encryption).
+    if self.mnemonic_words then
+      data.mnemonic = table.concat(self.mnemonic_words, " ")
+    end
   end
+
+  -- BIP-39 passphrase is intentionally NOT persisted. It is required to
+  -- regenerate the seed externally; users must remember/back it up
+  -- separately, the same way Trezor / Electrum / Sparrow do.
 
   return encode(data)
 end
@@ -1696,6 +1858,9 @@ function M.load(filepath, network, storage, passphrase)
     -- Load encrypted key
     wallet.encrypted_master_key = M.hex_decode(data.encrypted_master_key)
     wallet.encryption_salt = M.hex_decode(data.encryption_salt)
+    if data.encrypted_mnemonic then
+      wallet.encrypted_mnemonic = M.hex_decode(data.encrypted_mnemonic)
+    end
     wallet.is_locked = true
 
     -- Try to unlock if passphrase provided
@@ -1712,6 +1877,13 @@ function M.load(filepath, network, storage, passphrase)
       local chain_code = M.hex_decode(data.master_chain_code)
       wallet.master_key = M.extended_key(seed_key, chain_code, 0, "\0\0\0\0", 0, true)
       wallet.is_locked = false
+    end
+    if data.mnemonic and type(data.mnemonic) == "string" then
+      local words = {}
+      for w in data.mnemonic:gmatch("%S+") do words[#words + 1] = w end
+      if ({[12]=true,[15]=true,[18]=true,[21]=true,[24]=true})[#words] then
+        wallet.mnemonic_words = words
+      end
     end
   end
 
