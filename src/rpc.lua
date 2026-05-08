@@ -4776,6 +4776,23 @@ function RPCServer:register_methods()
       -- pure P2SH (multisig etc.) not handled in this minimal port.
       return false
     elseif script_type == "p2wsh" and prev.witness_script then
+      -- BIP-141: refuse to sign unless the supplied witness_script actually
+      -- commits to the P2WSH scriptPubKey (sha256(witnessScript) == spk[2:34]).
+      -- W37 audit flagged this branch as understated; W38 closed the PSBT
+      -- side (psbt.lua:774, 1011), this site closes it for the raw-tx RPC
+      -- path.  Same bug class one BIP up the stack from the W31 P2SH guard
+      -- ten lines above: an unguarded signer would emit a partial sig bound
+      -- to a caller-supplied witnessScript the network rejects on the P2WSH
+      -- hash-mismatch path of EvalScript — but the sig has already escaped.
+      -- Mirrors the W31 RPC idiom (return false, surfaced as per-input
+      -- complete=false + "Unsupported script type for signing").  W39.
+      -- (P2SH-wrapped P2WSH is not currently reached from this RPC path;
+      -- when it lands, an analogous check belongs in the P2SH branch above
+      -- alongside the existing verify_p2sh_commitment, mirroring W38's
+      -- psbt.lua hooks.)
+      if not crypto.verify_p2wsh_commitment(prev.witness_script, prev.script_pubkey) then
+        return false
+      end
       -- P2WSH (BIP-143). Caller supplied a witnessScript; sighash is
       -- computed with witnessScript as scriptCode. wallet.sign_input_p2wsh
       -- handles single-key vs M-of-N CHECKMULTISIG layout.
@@ -4917,6 +4934,17 @@ function RPCServer:register_methods()
           end
         end
       elseif script_type == "p2wsh" and prev and prev.witness_script then
+        -- W39: short-circuit before searching keys if the supplied
+        -- witness_script doesn't commit to the P2WSH scriptPubKey
+        -- (sha256(witnessScript) == spk[2:34]).  Avoids ever returning a
+        -- key (single or multi-cosigner set) that would then be used to
+        -- sign a sighash bound to an attacker-chosen script.  Mirror of
+        -- the W31 P2SH guard one branch up; companion to W38's PSBT-side
+        -- hooks at psbt.lua:774, 1011.
+        local crypto_mod = require("lunarblock.crypto")
+        if not crypto_mod.verify_p2wsh_commitment(prev.witness_script, spk) then
+          return nil
+        end
         -- Multisig: gather every decoded key whose pubkey appears in the
         -- witnessScript, in canonical script order. Single-key witnessScript
         -- (e.g. <pk> OP_CHECKSIG): match by pubkey-equality fallback.
@@ -5007,6 +5035,15 @@ function RPCServer:register_methods()
         local rdm_type, rdm_hash = script_mod.classify_script(prev.redeem_script)
         if rdm_type == "p2wpkh" then return pkh_index[rdm_hash] end
       elseif script_type == "p2wsh" and prev and prev.witness_script then
+        -- W39: refuse to surface a wallet key (or cosigner set) when the
+        -- supplied witness_script doesn't commit to the P2WSH scriptPubKey.
+        -- Mirror of the W31 P2SH wallet-resolver guard ten lines above and
+        -- the W38 PSBT-side hooks at psbt.lua:774, 1011.  W37 audit flagged
+        -- this branch as understated; closing it here completes the
+        -- raw-tx RPC side (along with sites 1 + 2).
+        if not crypto.verify_p2wsh_commitment(prev.witness_script, spk) then
+          return nil
+        end
         local m, _n, ms_pubkeys = script_mod.parse_multisig_script(prev.witness_script)
         if m and ms_pubkeys then
           local matched = {}
