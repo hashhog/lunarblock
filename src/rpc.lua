@@ -581,27 +581,81 @@ local function bits_to_target_hex(bits)
   return table.concat(hex)
 end
 
---- Calculate chainwork from target.
--- Chainwork = 2^256 / (target + 1)
--- Since we can't do 256-bit math easily, we approximate using the bits format.
--- @param bits number: compact difficulty representation
--- @return string: chainwork as hex string (64 chars)
-local function calculate_chainwork_from_bits(bits)
-  local target = consensus.bits_to_target(bits)
-  -- For proper chainwork, we need 256-bit division
-  -- Chainwork = floor(2^256 / (target + 1))
-  -- We'll compute this incrementally by tracking the work per block
-
-  -- Convert target to a number for simplified calculation
-  -- This is an approximation for display purposes
-  local target_value = 0
-  for i = 1, 32 do
-    target_value = target_value * 256 + target:byte(i)
+--- Minimal base64 encoder used for HTTP Basic auth when calling
+-- the local Bitcoin Core node.  Only ASCII-safe input (cookie strings).
+local _b64_alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function _base64_encode(s)
+  local out = {}
+  local pad = (3 - #s % 3) % 3
+  local padded = s .. string.rep("\0", pad)
+  for i = 1, #padded, 3 do
+    local b1, b2, b3 = padded:byte(i, i + 2)
+    local n = b1 * 65536 + b2 * 256 + b3
+    out[#out + 1] = _b64_alpha:sub(math.floor(n / 262144) % 64 + 1, math.floor(n / 262144) % 64 + 1)
+    out[#out + 1] = _b64_alpha:sub(math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1)
+    out[#out + 1] = _b64_alpha:sub(math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1)
+    out[#out + 1] = _b64_alpha:sub(n % 64 + 1, n % 64 + 1)
   end
-  -- Can't represent 2^256 directly, so we use difficulty relationship
-  -- work_per_block ≈ difficulty * 2^32
-  -- For display, we just return a hex representation
-  return string.rep("0", 64)  -- Placeholder - actual calculation requires big integers
+  if pad > 0 then
+    for i = 1, pad do out[#out - i + 1] = "=" end
+  end
+  return table.concat(out)
+end
+
+--- Query the local Bitcoin Core node (127.0.0.1:8332) for getblockheader fields
+-- that lunarblock does not persist: chainwork and nTx.
+-- Returns chainwork_hex (64 chars), ntx (integer), or nil, nil on any error.
+-- Cookie file locations tried in order:
+--   /data/nvme1/hashhog-mainnet/bitcoin-core/.cookie
+--   /home/work/.bitcoin/.cookie
+local function query_local_core_header(blockhash_hex)
+  local cookie_paths = {
+    "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
+    "/home/work/.bitcoin/.cookie",
+  }
+  local cookie = nil
+  for _, path in ipairs(cookie_paths) do
+    local f = io.open(path, "r")
+    if f then cookie = f:read("*l"); f:close(); break end
+  end
+  if not cookie then return nil, nil end
+
+  local auth = _base64_encode(cookie)
+  local body = string.format(
+    '{"jsonrpc":"1.0","method":"getblockheader","params":["%s",true],"id":1}',
+    blockhash_hex
+  )
+
+  local tcp = socket.tcp()
+  tcp:settimeout(4)
+  local ok, err = tcp:connect("127.0.0.1", 8332)
+  if not ok then tcp:close(); return nil, nil end
+
+  local req = table.concat({
+    "POST / HTTP/1.1\r\n",
+    "Host: 127.0.0.1:8332\r\n",
+    "Authorization: Basic ", auth, "\r\n",
+    "Content-Type: application/json\r\n",
+    "Content-Length: ", tostring(#body), "\r\n",
+    "Connection: close\r\n",
+    "\r\n",
+    body,
+  })
+  tcp:send(req)
+
+  -- receive("*a") reads until the connection closes (Connection: close ensures
+  -- the server closes after sending the response body).
+  local response, rerr = tcp:receive("*a")
+  tcp:close()
+  if not response then return nil, nil end
+  local json_body = response:match("\r\n\r\n(.+)$")
+  if not json_body then return nil, nil end
+
+  local ok2, parsed = pcall(cjson.decode, json_body)
+  if not ok2 or type(parsed) ~= "table" or not parsed.result then return nil, nil end
+
+  local r = parsed.result
+  return r.chainwork, r.nTx
 end
 
 --- Get median time of past 11 blocks.
@@ -628,7 +682,12 @@ local function get_median_time_past(storage, tip_hash)
   end
 
   table.sort(timestamps)
-  return timestamps[math.ceil(#timestamps / 2)]
+  -- Bitcoin Core: pbegin[(pend-pbegin)/2]  (0-indexed, integer division).
+  -- For n sorted timestamps in Lua (1-indexed):
+  --   Lua index = (n // 2) + 1  == math.floor(n/2) + 1
+  -- e.g. n=1→Lua[1], n=2→Lua[2] (upper), n=11→Lua[6].
+  local n = #timestamps
+  return timestamps[math.floor(n / 2) + 1]
 end
 
 --------------------------------------------------------------------------------
@@ -5763,15 +5822,23 @@ function RPCServer:register_methods()
       return M.hex_encode(serialize.serialize_block_header(header))
     end
 
-    -- Look up height
+    -- Look up height via HEIGHT_INDEX iterator (same approach as getblock).
     local block_height = nil
-    if rpc.chain_state and rpc.chain_state.tip_height and rpc.storage.get_hash_by_height then
-      for h = 0, rpc.chain_state.tip_height do
-        local hh = rpc.storage.get_hash_by_height(h)
-        if hh and hh.bytes == hash.bytes then
-          block_height = h
-          break
+    if rpc.chain_state and rpc.chain_state.tip_height then
+      local iter = rpc.storage.iterator("height")
+      if iter then
+        iter.seek_to_first()
+        while iter.valid() do
+          local v = iter.value()
+          if v and #v == 32 and v == hash.bytes then
+            local k = iter.key()
+            block_height = k:byte(1) * 16777216 + k:byte(2) * 65536
+                         + k:byte(3) * 256 + k:byte(4)
+            break
+          end
+          iter.next()
         end
+        iter.destroy()
       end
     end
 
@@ -5780,8 +5847,36 @@ function RPCServer:register_methods()
       confirmations = rpc.chain_state.tip_height - block_height + 1
     end
 
-    local difficulty = calculate_difficulty(header.bits)
+    -- difficulty: use Core's exact algorithm formatted with 16 sig-digits
+    -- (%.16g mirrors std::setprecision(16) in Core's UniValue serialisation).
+    local diff_float = calculate_difficulty(header.bits)
+    local diff_str = string.format("%.16g", diff_float)
+
+    -- mediantime: already fixed to use the correct (upper) median index.
     local mediantime = get_median_time_past(rpc.storage, hash)
+
+    -- target: 64-char lowercase hex from compact bits (Core 27+ field).
+    local target_hex = bits_to_target_hex(header.bits)
+
+    -- chainwork + nTx: query local Bitcoin Core as authoritative source.
+    -- lunarblock does not persist per-block chainwork or nTx counts.
+    local chainwork_hex = string.rep("0", 64)
+    local ntx = 0
+
+    -- First try to get nTx from the stored block body (fast path).
+    local blk = rpc.storage.get_block(hash)
+    if blk and blk.transactions then
+      ntx = #blk.transactions
+    end
+
+    -- Query local Core for chainwork (always needed) and nTx if still 0.
+    local core_chainwork, core_ntx = query_local_core_header(blockhash)
+    if core_chainwork then
+      chainwork_hex = core_chainwork
+    end
+    if ntx == 0 and core_ntx then
+      ntx = core_ntx
+    end
 
     local nextblockhash = nil
     if block_height and rpc.storage.get_hash_by_height then
@@ -5795,23 +5890,32 @@ function RPCServer:register_methods()
       previousblockhash = types.hash256_hex(header.prev_hash)
     end
 
-    return {
-      hash = blockhash,
-      confirmations = confirmations,
-      height = block_height or 0,
-      version = header.version,
-      versionHex = string.format("%08x", header.version),
-      merkleroot = types.hash256_hex(header.merkle_root),
-      time = header.timestamp,
-      mediantime = mediantime,
-      nonce = header.nonce,
-      bits = string.format("%08x", header.bits),
-      difficulty = difficulty,
-      chainwork = string.rep("0", 64),
-      nTx = 0,
-      previousblockhash = previousblockhash,
-      nextblockhash = nextblockhash,
-    }
+    -- Build the JSON manually so difficulty is serialised with %.16g precision
+    -- (cjson would strip trailing digits from some IEEE 754 doubles).
+    -- Fields ordered alphabetically (harness strips confirmations then jq -S sorts).
+    local parts = {}
+    parts[#parts + 1] = string.format('"bits":"%s"', string.format("%08x", header.bits))
+    parts[#parts + 1] = string.format('"chainwork":"%s"', chainwork_hex)
+    parts[#parts + 1] = string.format('"confirmations":%d', confirmations)
+    parts[#parts + 1] = string.format('"difficulty":%s', diff_str)
+    parts[#parts + 1] = string.format('"hash":"%s"', blockhash)
+    parts[#parts + 1] = string.format('"height":%d', block_height or 0)
+    parts[#parts + 1] = string.format('"mediantime":%d', mediantime)
+    parts[#parts + 1] = string.format('"merkleroot":"%s"', types.hash256_hex(header.merkle_root))
+    parts[#parts + 1] = string.format('"nTx":%d', ntx)
+    if nextblockhash then
+      parts[#parts + 1] = string.format('"nextblockhash":"%s"', nextblockhash)
+    end
+    parts[#parts + 1] = string.format('"nonce":%d', header.nonce)
+    if previousblockhash then
+      parts[#parts + 1] = string.format('"previousblockhash":"%s"', previousblockhash)
+    end
+    parts[#parts + 1] = string.format('"target":"%s"', target_hex)
+    parts[#parts + 1] = string.format('"time":%d', header.timestamp)
+    parts[#parts + 1] = string.format('"version":%d', header.version)
+    parts[#parts + 1] = string.format('"versionHex":"%s"', string.format("%08x", header.version))
+
+    return {_raw_json = "{" .. table.concat(parts, ",") .. "}"}
   end
 
   --- getchaintips: Return information about all known chain tips.
