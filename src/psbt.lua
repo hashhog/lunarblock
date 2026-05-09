@@ -1307,41 +1307,80 @@ end
 --- Decode a PSBT to a human-readable table for RPC.
 -- @param psbt table: PSBT structure
 -- @return table: Decoded PSBT info
-function M.decode(psbt)
+--- Decode a PSBT into an RPC-compatible Lua table.
+-- W51: accepts optional network (for address encoding) and an optional
+-- amount-formatting callback (btc_fmt). When btc_fmt is supplied it is
+-- called with a satoshi integer and should return a string that the
+-- caller can post-process (e.g. the sentinel "~~X.XXXXXXXX~~" trick used
+-- by rpc.lua to produce Core-byte-exact fixed-8 amounts). When nil, falls
+-- back to plain division for backwards-compat callers.
+-- @param psbt table: Parsed PSBT structure from from_base64/from_hex
+-- @param network table|nil: Network params for address encoding (optional)
+-- @param btc_fmt function|nil: Amount formatter (sats) → string (optional)
+-- @return table: RPC-compatible decoded PSBT
+function M.decode(psbt, network, btc_fmt)
+  -- Default amount formatter (pre-W51 behaviour, not byte-identical to Core).
+  local function fmt_btc(sats)
+    if btc_fmt then return btc_fmt(sats) end
+    return sats / consensus.COIN
+  end
+
+  -- Compute tx sizes for hash/size/vsize/weight fields (W51).
+  -- The global tx in a PSBT is unsigned so there is never any witness data;
+  -- weight = base_size * 4 and vsize = base_size (ceil(weight/4) = size).
+  local serialize = require("lunarblock.serialize")
+  local tx_bytes = serialize.serialize_transaction(psbt.tx, false)
+  local tx_size = #tx_bytes
+  local tx_weight = tx_size * 4
+  local tx_hash_hex = types.hash256_hex(validation.compute_txid(psbt.tx))
+
   local result = {
     tx = {
-      txid = types.hash256_hex(validation.compute_txid(psbt.tx)),
+      txid = tx_hash_hex,
+      hash = tx_hash_hex,  -- W51: for unsigned tx hash == txid (no witness)
       version = psbt.tx.version,
+      size = tx_size,
+      vsize = tx_size,     -- vsize = ceil(weight/4) = size for non-segwit
+      weight = tx_weight,
       locktime = psbt.tx.locktime,
       vin = {},
       vout = {},
     },
     global_xpubs = {},
+    psbt_version = psbt.version or 0,  -- W51: always emit psbt_version
     inputs = {},
     outputs = {},
     fee = nil,
   }
 
-  -- Decode transaction
+  -- W51: each vin carries scriptSig = {asm, hex}. The global tx in a PSBT
+  -- is the *unsigned* transaction so scriptSig is always empty here; Core
+  -- still emits the field with empty strings (TxToUniv → ScriptToAsmStr).
   for i, inp in ipairs(psbt.tx.inputs) do
     result.tx.vin[i] = {
       txid = types.hash256_hex(inp.prev_out.hash),
       vout = inp.prev_out.index,
+      scriptSig = {
+        asm = "",
+        hex = "",
+      },
       sequence = inp.sequence,
     }
   end
 
+  -- W51: each vout stores _spk_bytes for rpc.lua to enrich via
+  -- decode_script_pubkey (asm + desc + hex + address? + type).
+  -- value uses the caller-supplied formatter to emit Core-shaped amounts.
   for i, out in ipairs(psbt.tx.outputs) do
     result.tx.vout[i] = {
-      value = out.value / consensus.COIN,
+      value = fmt_btc(out.value),
       n = i - 1,
-      scriptPubKey = {
-        hex = hex_encode(out.script_pubkey),
-      },
+      _spk_bytes = out.script_pubkey,   -- enriched by rpc.lua after return
+      scriptPubKey = {hex = hex_encode(out.script_pubkey)},
     }
   end
 
-  -- Decode global xpubs
+  -- Decode global xpubs (W51: global_xpubs:[] always present even when empty)
   for xpub, deriv in pairs(psbt.xpubs) do
     result.global_xpubs[#result.global_xpubs + 1] = {
       xpub = hex_encode(xpub),
@@ -1374,22 +1413,22 @@ function M.decode(psbt)
     for _, out in ipairs(psbt.tx.outputs) do
       total_out = total_out + out.value
     end
-    result.fee = (total_in - total_out) / consensus.COIN
+    result.fee = fmt_btc(total_in - total_out)
   end
 
-  -- Decode inputs
+  -- Decode inputs.
+  -- W51: Core emits {} for inputs with no PSBT extension records.
+  -- We mirror that: start with an empty table and only add keys when the
+  -- corresponding PSBT field is actually present.
   for i, inp in ipairs(psbt.inputs) do
-    local input_info = {
-      has_utxo = inp.witness_utxo ~= nil or inp.non_witness_utxo ~= nil,
-      is_final = M.input_is_signed(inp),
-      partial_signatures = {},
-      sighash = inp.sighash_type,
-      bip32_derivs = {},
-    }
+    local input_info = {}
 
     if inp.witness_utxo then
+      -- W51: amount uses Core-shaped formatter; _spk_bytes will be enriched
+      -- by rpc.lua's decodepsbt handler via decode_script_pubkey.
       input_info.witness_utxo = {
-        amount = inp.witness_utxo.value / consensus.COIN,
+        amount = fmt_btc(inp.witness_utxo.value),
+        _spk_bytes = inp.witness_utxo.script_pubkey,
         scriptPubKey = {hex = hex_encode(inp.witness_utxo.script_pubkey)},
       }
     end
@@ -1400,8 +1439,18 @@ function M.decode(psbt)
       }
     end
 
-    for pk, sig in pairs(inp.partial_sigs) do
-      input_info.partial_signatures[pk] = hex_encode(sig)
+    -- partial_sigs: only emit if non-empty
+    local have_partial = false
+    for _ in pairs(inp.partial_sigs) do have_partial = true; break end
+    if have_partial then
+      input_info.partial_sigs = {}
+      for pk, sig in pairs(inp.partial_sigs) do
+        input_info.partial_sigs[pk] = hex_encode(sig)
+      end
+    end
+
+    if inp.sighash_type then
+      input_info.sighash = inp.sighash_type
     end
 
     if inp.redeem_script then
@@ -1410,6 +1459,19 @@ function M.decode(psbt)
 
     if inp.witness_script then
       input_info.witness_script = {hex = hex_encode(inp.witness_script)}
+    end
+
+    -- bip32_derivs: only emit if non-empty
+    local bip32_list = {}
+    for pk, deriv in pairs(inp.bip32_derivations) do
+      bip32_list[#bip32_list + 1] = {
+        pubkey = pk,
+        master_fingerprint = hex_encode(deriv.fingerprint),
+        path = deriv.path,
+      }
+    end
+    if #bip32_list > 0 then
+      input_info.bip32_derivs = bip32_list
     end
 
     if inp.final_script_sig then
@@ -1423,22 +1485,13 @@ function M.decode(psbt)
       end
     end
 
-    for pk, deriv in pairs(inp.bip32_derivations) do
-      input_info.bip32_derivs[#input_info.bip32_derivs + 1] = {
-        pubkey = pk,
-        master_fingerprint = hex_encode(deriv.fingerprint),
-        path = deriv.path,
-      }
-    end
-
     result.inputs[i] = input_info
   end
 
-  -- Decode outputs
+  -- Decode outputs.
+  -- W51: Core emits {} for outputs with no PSBT extension records.
   for i, out in ipairs(psbt.outputs) do
-    local output_info = {
-      bip32_derivs = {},
-    }
+    local output_info = {}
 
     if out.redeem_script then
       output_info.redeem_script = {hex = hex_encode(out.redeem_script)}
@@ -1448,12 +1501,17 @@ function M.decode(psbt)
       output_info.witness_script = {hex = hex_encode(out.witness_script)}
     end
 
+    -- bip32_derivs: only emit if non-empty
+    local bip32_list = {}
     for pk, deriv in pairs(out.bip32_derivations) do
-      output_info.bip32_derivs[#output_info.bip32_derivs + 1] = {
+      bip32_list[#bip32_list + 1] = {
         pubkey = pk,
         master_fingerprint = hex_encode(deriv.fingerprint),
         path = deriv.path,
       }
+    end
+    if #bip32_list > 0 then
+      output_info.bip32_derivs = bip32_list
     end
 
     result.outputs[i] = output_info
