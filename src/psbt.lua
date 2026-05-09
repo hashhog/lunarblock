@@ -2202,4 +2202,9 @@ function M.decode(psbt, network, btc_fmt)
   return result
 end
 
+-- W55: expose build_non_witness_utxo_json as M.tx_to_univ so that
+-- decoderawtransaction in rpc.lua can share the same TxToUniv emitter
+-- that decodepsbt uses, achieving byte-identity with Bitcoin Core.
+M.tx_to_univ = build_non_witness_utxo_json
+
 return M

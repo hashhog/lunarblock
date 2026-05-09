@@ -1864,43 +1864,45 @@ function RPCServer:register_methods()
     return result
   end
 
-  self.methods["decoderawtransaction"] = function(_rpc, params)
+  self.methods["decoderawtransaction"] = function(rpc, params)
+    -- W55: refactored to share the TxToUniv emitter (psbt_mod.tx_to_univ /
+    -- build_non_witness_utxo_json) that decodepsbt already uses.  This fixes
+    -- all five corpus divergences in one pass:
+    --   • amount formatting: btc_sentinel → bare fixed-8 decimal (not float64)
+    --   • scriptPubKey: full {asm, desc, hex, address?, type} shape
+    --   • rawtr() descriptor for P2TR outputs
+    --   • coinbase vin: {coinbase, sequence, txinwitness?} instead of normal shape
+    --   • txinwitness: emitted for every vin that has a non-empty witness stack
+    --   • scriptSig.asm with sighash-decode for non-coinbase inputs
+    --   • hash/size/vsize/weight top-level fields
     local hex = params[1]
-    assert(type(hex) == "string", "Transaction hex required")
+    if type(hex) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Transaction hex required"})
+    end
     local raw = M.hex_decode(hex)
     local tx = serialize.deserialize_transaction(raw)
-    local txid = validation.compute_txid(tx)
 
-    local vin = {}
-    for i, inp in ipairs(tx.inputs) do
-      vin[i] = {
-        txid = types.hash256_hex(inp.prev_out.hash),
-        vout = inp.prev_out.index,
-        scriptSig = {
-          hex = M.hex_encode(inp.script_sig),
-        },
-        sequence = inp.sequence,
-      }
+    local psbt_mod = require("lunarblock.psbt")
+    -- tx_to_univ = build_non_witness_utxo_json(tx, network, fmt_btc)
+    -- Passes btc_sentinel so amounts encode as fixed-8 sentinel strings that
+    -- strip_btc_sentinels() will unwrap to bare numeric literals.
+    local result = psbt_mod.tx_to_univ(tx, rpc.network, btc_sentinel)
+
+    -- Ensure vin/vout encode as JSON arrays even when empty.
+    if result.vin then
+      setmetatable(result.vin, cjson.array_mt)
+      for _, vin_entry in ipairs(result.vin) do
+        if vin_entry.txinwitness then
+          setmetatable(vin_entry.txinwitness, cjson.array_mt)
+        end
+      end
+    end
+    if result.vout then
+      setmetatable(result.vout, cjson.array_mt)
     end
 
-    local vout = {}
-    for i, out in ipairs(tx.outputs) do
-      vout[i] = {
-        value = out.value / consensus.COIN,
-        n = i - 1,
-        scriptPubKey = {
-          hex = M.hex_encode(out.script_pubkey),
-        },
-      }
-    end
-
-    return {
-      txid = types.hash256_hex(txid),
-      version = tx.version,
-      locktime = tx.locktime,
-      vin = vin,
-      vout = vout,
-    }
+    local json = strip_btc_sentinels(cjson.encode(result))
+    return {_raw_json = json}
   end
 
   -- Network methods
