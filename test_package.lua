@@ -8,6 +8,9 @@ local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
 local p2p = require("lunarblock.p2p")
 
+-- Standard P2PKH scriptPubKey: OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG
+local P2PKH_SCRIPT = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
+
 local function make_tx(version, inputs, outputs, locktime)
   return types.transaction(version or 1, inputs or {}, outputs or {}, locktime or 0)
 end
@@ -21,7 +24,7 @@ local function make_input(txid_hash, vout, sequence)
 end
 
 local function make_output(value, script_pubkey)
-  return types.txout(value, script_pubkey or string.rep("\x00", 25))
+  return types.txout(value, script_pubkey or P2PKH_SCRIPT)
 end
 
 local function make_mock_chain_state(utxos)
@@ -43,7 +46,7 @@ local function add_utxo(chain_state, txid_hex, vout, value, script_pubkey, heigh
   local key = txid_hex .. ":" .. vout
   chain_state.coin_view.utxos[key] = {
     value = value,
-    script_pubkey = script_pubkey or string.rep("\x00", 25),
+    script_pubkey = script_pubkey or P2PKH_SCRIPT,
     height = height or 500000,
     is_coinbase = is_coinbase or false
   }

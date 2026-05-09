@@ -9,6 +9,9 @@ local types = require("types")
 local mempool = require("mempool")
 local validation = require("validation")
 
+-- Standard P2PKH scriptPubKey: OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG
+local P2PKH_SCRIPT = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
+
 local passed = 0
 local failed = 0
 
@@ -58,7 +61,7 @@ end
 
 -- Helper to create output
 local function make_output(value, script_pubkey)
-  return types.txout(value, script_pubkey or string.rep("\x00", 25))
+  return types.txout(value, script_pubkey or P2PKH_SCRIPT)
 end
 
 -- Helper to create mock chain state
@@ -82,7 +85,7 @@ local function add_utxo(chain_state, txid_hex, vout, value, script_pubkey, heigh
   local key = txid_hex .. ":" .. vout
   chain_state.coin_view.utxos[key] = {
     value = value,
-    script_pubkey = script_pubkey or string.rep("\x00", 25),
+    script_pubkey = script_pubkey or P2PKH_SCRIPT,
     height = height or 500000,
     is_coinbase = is_coinbase or false
   }
