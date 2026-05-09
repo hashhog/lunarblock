@@ -186,40 +186,75 @@ M.ERROR = {
 --- Disassemble a script to human-readable ASM format.
 -- @param script_bytes string: The raw script bytes
 -- @return string: Space-separated assembly representation
+-- Format one decoded op/data token into the ASM string (Core convention).
+local function format_asm_token(opcode, data)
+  if data then
+    return M.hex_encode(data)
+  elseif opcode == 0x00 then
+    -- W51: Core ScriptToAsmStr emits "0" not "OP_0"
+    return "0"
+  elseif opcode == 0x4f then
+    return "-1"
+  elseif opcode >= 0x51 and opcode <= 0x60 then
+    return tostring(opcode - 0x50)
+  elseif script_mod.OP_NAMES[opcode] then
+    return script_mod.OP_NAMES[opcode]
+  else
+    return string.format("0x%02x", opcode)
+  end
+end
+
+-- Disassemble a script into Core-compatible ASM string.
+-- Mirrors Core's ScriptToAsmStr: processes opcodes one-by-one and appends
+-- "[error]" if a truncated push is encountered (partial-disassembly behaviour).
+-- This is needed for non-standard scripts like OP_RETURN with a truncated push.
 local function disassemble_script(script_bytes)
   if #script_bytes == 0 then
     return ""
   end
-  local ok, ops = pcall(script_mod.parse_script, script_bytes)
-  if not ok then
-    return "[error]"
-  end
   local parts = {}
-  for _, op in ipairs(ops) do
-    local opcode = op.opcode
-    local data = op.data
-    if data then
-      -- Push data: show as hex
-      parts[#parts + 1] = M.hex_encode(data)
-    elseif opcode == 0x00 then
-      -- W51: Core's ScriptToAsmStr emits "0" not "OP_0" (matching Core's
-      -- GetOpName which returns "0" for OP_0 in its ASM serialisation path)
-      parts[#parts + 1] = "0"
-    elseif opcode == 0x4f then
-      -- OP_1NEGATE → "-1" (Core ASM convention, not "OP_1NEGATE")
-      parts[#parts + 1] = "-1"
-    elseif opcode >= 0x51 and opcode <= 0x60 then
-      -- OP_1..OP_16 → "1".."16" (Core ASM convention)
-      parts[#parts + 1] = tostring(opcode - 0x50)
-    elseif opcode >= 0x01 and opcode <= 0x4b then
-      -- Direct push but no data (shouldn't happen with valid parse)
-      parts[#parts + 1] = "OP_PUSHBYTES_" .. opcode
-    elseif script_mod.OP_NAMES[opcode] then
-      parts[#parts + 1] = script_mod.OP_NAMES[opcode]
+  local pos = 1
+  local len = #script_bytes
+  local error_flag = false
+
+  while pos <= len do
+    local opcode = script_bytes:byte(pos)
+    pos = pos + 1
+
+    local data_len = 0
+    if opcode >= 0x01 and opcode <= 0x4b then
+      data_len = opcode
+    elseif opcode == 0x4c then
+      if pos > len then error_flag = true; break end
+      data_len = script_bytes:byte(pos); pos = pos + 1
+    elseif opcode == 0x4d then
+      if pos + 1 > len then error_flag = true; break end
+      data_len = script_bytes:byte(pos) + script_bytes:byte(pos + 1) * 256
+      pos = pos + 2
+    elseif opcode == 0x4e then
+      if pos + 3 > len then error_flag = true; break end
+      local b1, b2, b3, b4 = script_bytes:byte(pos, pos + 3)
+      data_len = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+      pos = pos + 4
+    end
+
+    if data_len > 0 then
+      if pos + data_len - 1 > len then
+        -- Truncated push: emit what we have as error
+        error_flag = true; break
+      end
+      local data = script_bytes:sub(pos, pos + data_len - 1)
+      pos = pos + data_len
+      parts[#parts + 1] = format_asm_token(opcode, data)
     else
-      parts[#parts + 1] = string.format("0x%02x", opcode)
+      parts[#parts + 1] = format_asm_token(opcode, nil)
     end
   end
+
+  if error_flag then
+    parts[#parts + 1] = "[error]"
+  end
+
   return table.concat(parts, " ")
 end
 
@@ -3652,6 +3687,265 @@ function RPCServer:register_methods()
     local json = strip_btc_sentinels(cjson.encode(decoded))
 
     return {_raw_json = json}
+  end
+
+  -- ---------------------------------------------------------------------------
+  -- decodescript
+  -- Reference: bitcoin-core/src/rpc/rawtransaction.cpp (decodescript handler)
+  --
+  -- Shape: {asm, desc, type, address?, p2sh?, segwit?}
+  -- CRITICAL: top-level has NO `hex` field (ScriptToUniv include_hex=false).
+  -- Inner segwit object DOES have `hex` (ScriptToUniv include_hex=true).
+  --
+  -- can_wrap types: pubkey, pubkeyhash, multisig, nonstandard,
+  --   witness_v0_keyhash, witness_v0_scripthash.
+  --   Extra conditions: not OP_RETURN prefix (unspendable), no OP_CHECKSIGADD.
+  --   Valid ops (HasValidOps) is also required — we assume valid scripts here.
+  --
+  -- can_wrap_P2WSH types: pubkey (compressed 33B only), pubkeyhash,
+  --   nonstandard, multisig (all keys compressed).
+  --   witness_v0_* are already segwit → excluded.
+  --
+  -- Segwit wrap:
+  --   pubkey    → P2WPKH(Hash160(pubkey))
+  --   pubkeyhash → P2WPKH(raw 20-byte hash from script bytes [4..23])
+  --   others    → P2WSH(SHA256(script))
+  -- ---------------------------------------------------------------------------
+  self.methods["decodescript"] = function(rpc, params)
+    local hex = params[1]
+    if type(hex) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Script hex string required"})
+    end
+
+    -- Decode hex → raw bytes (Lua string)
+    local script_bytes
+    if hex == "" then
+      script_bytes = ""
+    else
+      local ok, decoded = pcall(M.hex_decode, hex)
+      if not ok then
+        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid hex: " .. tostring(decoded)})
+      end
+      script_bytes = decoded
+    end
+
+    local crypto = require("lunarblock.crypto")
+    local network_name = rpc.network and rpc.network.name or "mainnet"
+    local hrp = address_mod.BECH32_HRP[network_name] or "bc"
+
+    -- -------------------------------------------------------------------------
+    -- Helpers
+    -- -------------------------------------------------------------------------
+
+    -- Get script type using rpc.lua's decode_script_pubkey logic (same as
+    -- decode_script_pubkey but without the hex field, following Core's
+    -- ScriptToUniv with include_hex=false).
+    local function get_script_type(script)
+      -- Bare P2PK: 33/65-byte pubkey + OP_CHECKSIG
+      if #script == 35 and script:byte(1) == 0x21 and script:byte(35) == 0xac then
+        return "pubkey"
+      end
+      if #script == 67 and script:byte(1) == 0x41 and script:byte(67) == 0xac then
+        return "pubkey"
+      end
+      -- Bare multisig: OP_M <pubkeys> OP_N OP_CHECKMULTISIG
+      if #script >= 3 and script:byte(#script) == 0xae then
+        local first = script:byte(1)
+        if first >= 0x51 and first <= 0x60 then
+          return "multisig"
+        end
+      end
+      -- classify_script covers p2pkh/p2sh/p2wpkh/p2wsh/p2a/p2tr/nulldata/nonstandard
+      local stype = script_mod.classify_script(script)
+      local type_map = {
+        p2pkh        = "pubkeyhash",
+        p2sh         = "scripthash",
+        p2wpkh       = "witness_v0_keyhash",
+        p2wsh        = "witness_v0_scripthash",
+        p2tr         = "witness_v1_taproot",
+        p2a          = "anchor",
+        nulldata     = "nulldata",
+        nonstandard  = "nonstandard",
+      }
+      return type_map[stype] or "nonstandard"
+    end
+
+    -- Extract address for a script (mirrors decode_script_pubkey address logic).
+    local function get_address(script, stype_raw)
+      local stype, program = script_mod.classify_script(script)
+      if stype == "p2pkh" and program then
+        local ver = network_name == "mainnet" and 0x00 or 0x6F
+        return address_mod.base58check_encode(ver, program)
+      elseif stype == "p2sh" and program then
+        local ver = network_name == "mainnet" and 0x05 or 0xC4
+        return address_mod.base58check_encode(ver, program)
+      elseif stype == "p2wpkh" and program then
+        return address_mod.segwit_encode(hrp, 0, program)
+      elseif stype == "p2wsh" and program then
+        return address_mod.segwit_encode(hrp, 0, program)
+      elseif stype == "p2tr" and program then
+        return address_mod.segwit_encode(hrp, 1, program)
+      end
+      -- pubkey type: no address (Core suppresses it)
+      return nil
+    end
+
+    -- Build descriptor string (mirrors decode_script_pubkey desc logic).
+    local function get_desc(script, addr, stype)
+      local desc_inner
+      if stype == "witness_v1_taproot" and #script == 34 then
+        local xonly_hex = M.hex_encode(script:sub(3, 34))
+        desc_inner = "rawtr(" .. xonly_hex .. ")"
+      elseif addr then
+        desc_inner = "addr(" .. addr .. ")"
+      else
+        desc_inner = "raw(" .. M.hex_encode(script) .. ")"
+      end
+      local csum = address_mod.descriptor_checksum(desc_inner)
+      if csum then
+        return desc_inner .. "#" .. csum
+      end
+      return desc_inner
+    end
+
+    -- Build P2SH wrap address: P2SH(hash160(script)).
+    local function p2sh_wrap_address(script)
+      local h = crypto.hash160(script)
+      local ver = network_name == "mainnet" and 0x05 or 0xC4
+      return address_mod.base58check_encode(ver, h)
+    end
+
+    -- Build P2WPKH script: OP_0 <20-byte hash>.
+    local function make_p2wpkh(hash20)
+      return "\x00\x14" .. hash20
+    end
+
+    -- Build P2WSH script: OP_0 <sha256(script)>.
+    local function make_p2wsh(script)
+      return "\x00\x20" .. crypto.sha256(script)
+    end
+
+    -- Check if script contains OP_CHECKSIGADD (0xba).
+    local function has_checksigadd(script)
+      for i = 1, #script do
+        if script:byte(i) == 0xba then return true end
+      end
+      return false
+    end
+
+    -- Extract pubkey from P2PK script: <pushLen> <pubkey> OP_CHECKSIG.
+    local function extract_p2pk_pubkey(script)
+      if #script < 35 then return nil end
+      local pushlen = script:byte(1)
+      if (pushlen == 33 or pushlen == 65) and #script == pushlen + 2 then
+        return script:sub(2, 1 + pushlen)
+      end
+      return nil
+    end
+
+    -- Extract pubkeys from multisig: OP_M <pubkeys> OP_N OP_CHECKMULTISIG.
+    local function extract_multisig_pubkeys(script)
+      local keys = {}
+      if #script < 4 or script:byte(#script) ~= 0xae then return nil end
+      local i = 2  -- skip OP_M
+      while i <= #script - 2 do
+        local pushlen = script:byte(i)
+        if pushlen == 0 then break end
+        if i + pushlen > #script then return nil end
+        keys[#keys + 1] = script:sub(i + 1, i + pushlen)
+        i = i + 1 + pushlen
+      end
+      return keys
+    end
+
+    -- Check all pubkeys are compressed (33 bytes, prefix 0x02 or 0x03).
+    local function all_compressed(keys)
+      for _, k in ipairs(keys) do
+        if #k ~= 33 then return false end
+        local prefix = k:byte(1)
+        if prefix ~= 0x02 and prefix ~= 0x03 then return false end
+      end
+      return true
+    end
+
+    -- -------------------------------------------------------------------------
+    -- Build top-level result (no `hex` field — Core's include_hex=false)
+    -- -------------------------------------------------------------------------
+    local stype = get_script_type(script_bytes)
+    local addr  = get_address(script_bytes, stype)
+    -- pubkey type: Core suppresses address
+    if stype == "pubkey" then addr = nil end
+
+    local result = {
+      asm  = disassemble_script(script_bytes),
+      desc = get_desc(script_bytes, addr, stype),
+      type = stype,
+    }
+    if addr then result.address = addr end
+
+    -- -------------------------------------------------------------------------
+    -- can_wrap logic (mirrors Core's decodescript switch + guards)
+    -- -------------------------------------------------------------------------
+    local can_wrap_types = {
+      pubkey                = true,
+      pubkeyhash            = true,
+      multisig              = true,
+      nonstandard           = true,
+      witness_v0_keyhash    = true,
+      witness_v0_scripthash = true,
+    }
+    local is_op_return = #script_bytes >= 1 and script_bytes:byte(1) == 0x6a
+    local can_wrap = can_wrap_types[stype] and not is_op_return and not has_checksigadd(script_bytes)
+
+    if can_wrap then
+      result.p2sh = p2sh_wrap_address(script_bytes)
+
+      -- can_wrap_P2WSH: pubkey (compressed only), pubkeyhash, nonstandard,
+      -- multisig (compressed only). Already-segwit types excluded.
+      local can_wrap_p2wsh = false
+      if stype == "pubkey" then
+        local pk = extract_p2pk_pubkey(script_bytes)
+        can_wrap_p2wsh = pk ~= nil and #pk == 33
+      elseif stype == "multisig" then
+        local keys = extract_multisig_pubkeys(script_bytes)
+        can_wrap_p2wsh = keys ~= nil and all_compressed(keys)
+      elseif stype == "pubkeyhash" or stype == "nonstandard" then
+        can_wrap_p2wsh = true
+      end
+
+      if can_wrap_p2wsh then
+        -- Build the witness script
+        local wit_script
+        if stype == "pubkey" then
+          -- P2WPKH from Hash160(pubkey)
+          local pk = extract_p2pk_pubkey(script_bytes)
+          wit_script = make_p2wpkh(crypto.hash160(pk))
+        elseif stype == "pubkeyhash" then
+          -- P2WPKH from the raw 20-byte hash embedded in the P2PKH script
+          -- P2PKH: OP_DUP OP_HASH160 <20B> OP_EQUALVERIFY OP_CHECKSIG
+          -- bytes 4..23 (Lua 1-based: sub(4,23))
+          wit_script = make_p2wpkh(script_bytes:sub(4, 23))
+        else
+          -- P2WSH from SHA256(script) for multisig / nonstandard
+          wit_script = make_p2wsh(script_bytes)
+        end
+
+        local wstype = get_script_type(wit_script)
+        local waddr  = get_address(wit_script, wstype)
+        local segwit_obj = {
+          asm  = disassemble_script(wit_script),
+          desc = get_desc(wit_script, waddr, wstype),
+          hex  = M.hex_encode(wit_script),  -- inner segwit DOES have hex
+          type = wstype,
+        }
+        if waddr then segwit_obj.address = waddr end
+        segwit_obj["p2sh-segwit"] = p2sh_wrap_address(wit_script)
+
+        result.segwit = segwit_obj
+      end
+    end
+
+    return result
   end
 
   self.methods["analyzepsbt"] = function(rpc, params)

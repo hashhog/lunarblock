@@ -693,9 +693,59 @@ function M.classify_script(script)
     return "p2tr", script:sub(3, 34)
   end
 
-  -- Nulldata: starts with OP_RETURN (0x6a)
+  -- Nulldata: starts with OP_RETURN (0x6a) AND all remaining bytes are
+  -- well-formed push-only (IsPushOnly check mirrors Bitcoin Core Solver).
+  -- A script with a truncated push after OP_RETURN is NONSTANDARD.
   if len >= 1 and script:byte(1) == 0x6a then
-    return "nulldata", nil
+    local j = 2  -- Lua 1-based; byte index after OP_RETURN
+    local is_push_only = true
+    while j <= len do
+      local op = script:byte(j)
+      if op >= 0x01 and op <= 0x4b then
+        -- Direct push: need `op` more bytes
+        if j + op > len then
+          is_push_only = false; break
+        end
+        j = j + 1 + op
+      elseif op == 0x4c then  -- OP_PUSHDATA1
+        if j + 1 > len then
+          is_push_only = false; break
+        end
+        local dlen = script:byte(j + 1)
+        if j + 1 + dlen > len then
+          is_push_only = false; break
+        end
+        j = j + 2 + dlen
+      elseif op == 0x4d then  -- OP_PUSHDATA2
+        if j + 2 > len then
+          is_push_only = false; break
+        end
+        local dlen = script:byte(j + 1) + script:byte(j + 2) * 256
+        if j + 2 + dlen > len then
+          is_push_only = false; break
+        end
+        j = j + 3 + dlen
+      elseif op == 0x4e then  -- OP_PUSHDATA4
+        if j + 4 > len then
+          is_push_only = false; break
+        end
+        local dlen = script:byte(j + 1) + script:byte(j + 2) * 256 +
+                     script:byte(j + 3) * 65536 + script:byte(j + 4) * 16777216
+        if j + 4 + dlen > len then
+          is_push_only = false; break
+        end
+        j = j + 5 + dlen
+      elseif op == 0x00 or (op >= 0x4f and op <= 0x60) then
+        -- OP_0 (0x00) or OP_1NEGATE (0x4f) or OP_1..OP_16 (0x51..0x60): valid push ops
+        j = j + 1
+      else
+        -- Opcode > OP_16 or non-push opcode → not push-only
+        is_push_only = false; break
+      end
+    end
+    if is_push_only then
+      return "nulldata", nil
+    end
   end
 
   return "nonstandard", nil
