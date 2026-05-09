@@ -1,6 +1,7 @@
 --- BIP174/BIP370 Partially Signed Bitcoin Transaction (PSBT) support
 -- Implements creation, serialization, signing, combining, and finalization.
 
+local bit = require("bit")
 local serialize = require("lunarblock.serialize")
 local types = require("lunarblock.types")
 local validation = require("lunarblock.validation")
@@ -1304,6 +1305,346 @@ function M.count_unsigned(psbt)
   return count
 end
 
+--------------------------------------------------------------------------------
+-- W53: decodepsbt input-side record helpers
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp:1117-1213
+--            bitcoin-core/src/core_io.cpp (ScriptToAsmStr, SighashToStr)
+--            bitcoin-core/src/script/interpreter.cpp (IsValidSignatureEncoding)
+--------------------------------------------------------------------------------
+
+-- Map PSBT_IN_SIGHASH_TYPE integer to Core's string label.
+-- Reference: core_io.cpp SighashToStr (~line 343).
+-- Unknown type returns ""; 0x00 is intentionally absent.
+local SIGHASH_NAMES = {
+  [0x01] = "ALL",
+  [0x02] = "NONE",
+  [0x03] = "SINGLE",
+  [0x81] = "ALL|ANYONECANPAY",
+  [0x82] = "NONE|ANYONECANPAY",
+  [0x83] = "SINGLE|ANYONECANPAY",
+}
+
+local function sighash_to_str(n)
+  -- Only the low byte is the sighash flag (PSBT stores 4-byte LE uint32).
+  return SIGHASH_NAMES[n % 256] or ""
+end
+
+-- Mirrors interpreter.cpp IsValidSignatureEncoding (+ sighash byte).
+-- Accepts a Lua string (raw bytes).  Returns true iff it looks like a
+-- DER-encoded ECDSA signature with a trailing sighash byte (9..73 bytes).
+local function is_valid_der_sig(data)
+  local n = #data
+  if n < 9 or n > 73 then return false end
+  if data:byte(1) ~= 0x30 then return false end
+  if data:byte(2) ~= n - 3 then return false end
+  local lenR = data:byte(4)
+  if 5 + lenR >= n then return false end
+  local lenS = data:byte(6 + lenR)
+  if lenR + lenS + 7 ~= n then return false end
+  if data:byte(3) ~= 0x02 then return false end
+  if lenR == 0 then return false end
+  if bit.band(data:byte(5), 0x80) ~= 0 then return false end
+  if lenR > 1 and data:byte(5) == 0x00 and
+     bit.band(data:byte(6), 0x80) == 0 then
+    return false
+  end
+  if data:byte(lenR + 5) ~= 0x02 then return false end
+  if lenS == 0 then return false end
+  if bit.band(data:byte(lenR + 7), 0x80) ~= 0 then return false end
+  if lenS > 1 and data:byte(lenR + 7) == 0x00 and
+     bit.band(data:byte(lenR + 8), 0x80) == 0 then
+    return false
+  end
+  return true
+end
+
+-- ScriptToAsmStr with fAttemptSighashDecode=true.
+-- For push-data operands whose byte length > 4 that pass the DER check,
+-- the trailing sighash byte is stripped and a "[TYPE]" suffix is appended
+-- (e.g. "[ALL]").  Otherwise behaves identically to disassemble_script in
+-- rpc.lua (plain hex for push-data > 4, CScriptNum decimal for <= 4,
+-- opcode names for non-push).
+-- Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr.
+local function disassemble_asm_sighash(script_bytes)
+  if not script_bytes or #script_bytes == 0 then return "" end
+  local ok, ops = pcall(script.parse_script, script_bytes)
+  if not ok then return "[error]" end
+
+  local parts = {}
+  for _, op in ipairs(ops) do
+    local opcode = op.opcode
+    local data   = op.data
+
+    if data then
+      -- Push-data operand.
+      if #data <= 4 then
+        -- CScriptNum: decode little-endian with sign bit.
+        local v = 0
+        for j = 1, #data do
+          v = v + data:byte(j) * (256 ^ (j - 1))
+        end
+        if #data > 0 and bit.band(data:byte(#data), 0x80) ~= 0 then
+          local mask = 0x80 * (256 ^ (#data - 1))
+          v = -(v - mask)
+        end
+        parts[#parts + 1] = tostring(math.floor(v))
+      else
+        -- Attempt sighash decode: strip last byte if DER check passes.
+        local suffix = ""
+        local display = data
+        if is_valid_der_sig(data) then
+          local sh_name = sighash_to_str(data:byte(#data))
+          if sh_name ~= "" then
+            display = data:sub(1, #data - 1)
+            suffix = "[" .. sh_name .. "]"
+          end
+        end
+        parts[#parts + 1] = hex_encode(display) .. suffix
+      end
+    else
+      -- Non-push opcode — mirror rpc.lua disassemble_script naming.
+      if opcode == 0x00 then
+        parts[#parts + 1] = "0"
+      elseif opcode == 0x4f then
+        parts[#parts + 1] = "-1"
+      elseif opcode >= 0x51 and opcode <= 0x60 then
+        parts[#parts + 1] = tostring(opcode - 0x50)
+      elseif script.OP_NAMES[opcode] then
+        parts[#parts + 1] = script.OP_NAMES[opcode]
+      else
+        parts[#parts + 1] = string.format("0x%02x", opcode)
+      end
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+-- Plain disassembly (no sighash decode) — used for redeem_script / witness_script.
+local function disassemble_plain(script_bytes)
+  if not script_bytes or #script_bytes == 0 then return "" end
+  local ok, ops = pcall(script.parse_script, script_bytes)
+  if not ok then return "[error]" end
+
+  local parts = {}
+  for _, op in ipairs(ops) do
+    local opcode = op.opcode
+    local data   = op.data
+    if data then
+      parts[#parts + 1] = hex_encode(data)
+    elseif opcode == 0x00 then
+      parts[#parts + 1] = "0"
+    elseif opcode == 0x4f then
+      parts[#parts + 1] = "-1"
+    elseif opcode >= 0x51 and opcode <= 0x60 then
+      parts[#parts + 1] = tostring(opcode - 0x50)
+    elseif script.OP_NAMES[opcode] then
+      parts[#parts + 1] = script.OP_NAMES[opcode]
+    else
+      parts[#parts + 1] = string.format("0x%02x", opcode)
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+-- Map script.classify_script result to Bitcoin Core type strings.
+local SCRIPT_TYPE_MAP = {
+  p2pkh        = "pubkeyhash",
+  p2sh         = "scripthash",
+  p2wpkh       = "witness_v0_keyhash",
+  p2wsh        = "witness_v0_scripthash",
+  p2tr         = "witness_v1_taproot",
+  p2a          = "anchor",
+  nulldata     = "nulldata",
+  nonstandard  = "nonstandard",
+}
+
+-- Classify a raw script into a Core type name.
+local function get_script_type_name(script_bytes)
+  if not script_bytes or #script_bytes == 0 then return "nonstandard" end
+  -- Bare P2PK: <33 or 65 bytes> OP_CHECKSIG
+  if (#script_bytes == 35 and script_bytes:byte(1) == 0x21 and
+      script_bytes:byte(35) == 0xac) then
+    return "pubkey"
+  end
+  if (#script_bytes == 67 and script_bytes:byte(1) == 0x41 and
+      script_bytes:byte(67) == 0xac) then
+    return "pubkey"
+  end
+  -- Bare multisig: OP_M <pubkeys...> OP_N OP_CHECKMULTISIG
+  if (#script_bytes >= 3 and script_bytes:byte(#script_bytes) == 0xae) then
+    local first = script_bytes:byte(1)
+    if first >= 0x51 and first <= 0x60 then
+      return "multisig"
+    end
+  end
+  local stype = script.classify_script(script_bytes)
+  return SCRIPT_TYPE_MAP[stype] or "nonstandard"
+end
+
+-- Build {asm, hex, type} for redeem_script / witness_script.
+-- Reference: Core's ScriptToUniv with include_address=false (no desc, no address).
+local function build_script_type_json(script_bytes)
+  return {
+    asm  = disassemble_plain(script_bytes),
+    hex  = hex_encode(script_bytes),
+    type = get_script_type_name(script_bytes),
+  }
+end
+
+-- Build the full TxToUniv shape for non_witness_utxo (without "hex" field).
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp line ~1142:
+--   TxToUniv(*input.non_witness_utxo, uint256(), non_wit, /*include_hex=*/false)
+--
+-- Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}
+-- vin[i]: {txid, vout, scriptSig:{asm,hex}, sequence[, txinwitness]}
+--         OR {coinbase, sequence} for coinbase inputs
+-- vout[i]: {value, n, scriptPubKey:{asm,hex,type,desc?,address?}}
+--
+-- "hash" is the wtxid (same as txid for non-segwit txs).
+-- "size"   = total serialized size with witness.
+-- "weight" = base_size * 3 + total_size  (BIP-141 formula).
+-- "vsize"  = ceil(weight / 4).
+local function build_non_witness_utxo_json(prev_tx, network, fmt_btc)
+  local txid_hex  = types.hash256_hex(validation.compute_txid(prev_tx))
+  local wtxid_hex = types.hash256_hex(validation.compute_wtxid(prev_tx))
+
+  -- Size calculations.
+  local base_bytes    = serialize.serialize_transaction(prev_tx, false)
+  local total_bytes   = serialize.serialize_transaction(prev_tx, true)
+  local base_size     = #base_bytes
+  local total_size    = #total_bytes
+  -- weight = base_size * 3 + total_size  (matches Core's GetTransactionWeight)
+  local weight        = base_size * 3 + total_size
+  local vsize         = math.ceil(weight / 4)
+
+  -- vin array
+  local vin = {}
+  local ZERO_HASH = string.rep("\0", 32)
+  for idx, inp in ipairs(prev_tx.inputs) do
+    local is_coinbase = (inp.prev_out.hash.bytes == ZERO_HASH and
+                         inp.prev_out.index == 0xffffffff)
+    local vin_obj
+    if is_coinbase then
+      vin_obj = {
+        coinbase = hex_encode(inp.script_sig),
+        sequence = inp.sequence,
+      }
+    else
+      vin_obj = {
+        txid = types.hash256_hex(inp.prev_out.hash),
+        vout = inp.prev_out.index,
+        scriptSig = {
+          asm = disassemble_asm_sighash(inp.script_sig),
+          hex = hex_encode(inp.script_sig),
+        },
+        sequence = inp.sequence,
+      }
+    end
+    -- txinwitness — only when the witness stack is non-empty.
+    if inp.witness and #inp.witness > 0 then
+      local wit_arr = {}
+      for j, item in ipairs(inp.witness) do
+        wit_arr[j] = hex_encode(item)
+      end
+      vin_obj.txinwitness = wit_arr
+    end
+    vin[idx] = vin_obj
+  end
+
+  -- vout array — full scriptPubKey with desc + address (same shape as
+  -- buildVerboseTxJson vout; rpc.lua's decode_script_pubkey does this but
+  -- that function lives in rpc.lua and is not importable from psbt.lua).
+  -- We inline the logic here using the same address.lua + script.lua calls
+  -- that decode_script_pubkey uses.
+  local address_mod = require("lunarblock.address")
+  local network_name = network and network.name or "mainnet"
+  local hrp = address_mod.BECH32_HRP and address_mod.BECH32_HRP[network_name] or "bc"
+
+  local function encode_spk(spk)
+    local stype_raw, program = script.classify_script(spk)
+    local core_type = SCRIPT_TYPE_MAP[stype_raw] or "nonstandard"
+    -- Bare P2PK overrides
+    if (#spk == 35 and spk:byte(1) == 0x21 and spk:byte(35) == 0xac) or
+       (#spk == 67 and spk:byte(1) == 0x41 and spk:byte(67) == 0xac) then
+      core_type = "pubkey"
+    end
+    -- Bare multisig override
+    if #spk >= 3 and spk:byte(#spk) == 0xae then
+      local first = spk:byte(1)
+      if first >= 0x51 and first <= 0x60 then
+        core_type = "multisig"
+      end
+    end
+
+    local spk_obj = {
+      asm  = disassemble_plain(spk),
+      hex  = hex_encode(spk),
+      type = core_type,
+    }
+
+    -- Address
+    local addr
+    if stype_raw == "p2pkh" and program then
+      local ver = network_name == "mainnet" and 0x00 or 0x6F
+      addr = address_mod.base58check_encode(ver, program)
+    elseif stype_raw == "p2sh" and program then
+      local ver = network_name == "mainnet" and 0x05 or 0xC4
+      addr = address_mod.base58check_encode(ver, program)
+    elseif stype_raw == "p2wpkh" and program then
+      addr = address_mod.segwit_encode(hrp, 0, program)
+    elseif stype_raw == "p2wsh" and program then
+      addr = address_mod.segwit_encode(hrp, 0, program)
+    elseif stype_raw == "p2tr" and program then
+      addr = address_mod.segwit_encode(hrp, 1, program)
+    end
+    -- Suppress address for bare pubkey (same as rpc.lua decode_script_pubkey)
+    if core_type ~= "pubkey" and addr then
+      spk_obj.address = addr
+    end
+
+    -- BIP-380 descriptor
+    local desc_inner
+    if addr then
+      desc_inner = "addr(" .. addr .. ")"
+    else
+      desc_inner = "raw(" .. hex_encode(spk) .. ")"
+    end
+    local csum
+    if address_mod.descriptor_checksum then
+      local csum_val, _ = address_mod.descriptor_checksum(desc_inner)
+      csum = csum_val
+    end
+    if csum then
+      spk_obj.desc = desc_inner .. "#" .. csum
+    else
+      spk_obj.desc = desc_inner
+    end
+
+    return spk_obj
+  end
+
+  local vout = {}
+  for idx, out in ipairs(prev_tx.outputs) do
+    vout[idx] = {
+      value = fmt_btc(out.value),
+      n     = idx - 1,
+      scriptPubKey = encode_spk(out.script_pubkey),
+    }
+  end
+
+  return {
+    txid     = txid_hex,
+    hash     = wtxid_hex,
+    version  = prev_tx.version,
+    size     = total_size,
+    vsize    = vsize,
+    weight   = weight,
+    locktime = prev_tx.locktime,
+    vin      = vin,
+    vout     = vout,
+  }
+end
+
 --- Decode a PSBT to a human-readable table for RPC.
 -- @param psbt table: PSBT structure
 -- @return table: Decoded PSBT info
@@ -1434,31 +1775,37 @@ function M.decode(psbt, network, btc_fmt)
     end
 
     if inp.non_witness_utxo then
-      input_info.non_witness_utxo = {
-        txid = types.hash256_hex(validation.compute_txid(inp.non_witness_utxo)),
-      }
+      -- W53: full TxToUniv shape (hash, size, vsize, weight, vin[], vout[]).
+      -- Reference: rawtransaction.cpp:1142 TxToUniv(…, include_hex=false).
+      input_info.non_witness_utxo = build_non_witness_utxo_json(
+        inp.non_witness_utxo, network, fmt_btc)
     end
 
-    -- partial_sigs: only emit if non-empty
+    -- partial_signatures: only emit if non-empty.
+    -- W53: field name is "partial_signatures" (not "partial_sigs").
     local have_partial = false
     for _ in pairs(inp.partial_sigs) do have_partial = true; break end
     if have_partial then
-      input_info.partial_sigs = {}
+      input_info.partial_signatures = {}
       for pk, sig in pairs(inp.partial_sigs) do
-        input_info.partial_sigs[pk] = hex_encode(sig)
+        input_info.partial_signatures[pk] = hex_encode(sig)
       end
     end
 
     if inp.sighash_type then
-      input_info.sighash = inp.sighash_type
+      -- W53: emit a string label ("ALL", "NONE", "SINGLE", …) not an integer.
+      -- Reference: core_io.cpp SighashToStr; rawtransaction.cpp:1169.
+      input_info.sighash = sighash_to_str(inp.sighash_type)
     end
 
     if inp.redeem_script then
-      input_info.redeem_script = {hex = hex_encode(inp.redeem_script)}
+      -- W53: {asm, hex, type} — no desc, no address.
+      -- Reference: rawtransaction.cpp:1173-1182 ScriptToUniv(include_address=false).
+      input_info.redeem_script = build_script_type_json(inp.redeem_script)
     end
 
     if inp.witness_script then
-      input_info.witness_script = {hex = hex_encode(inp.witness_script)}
+      input_info.witness_script = build_script_type_json(inp.witness_script)
     end
 
     -- bip32_derivs: only emit if non-empty
@@ -1475,7 +1822,12 @@ function M.decode(psbt, network, btc_fmt)
     end
 
     if inp.final_script_sig then
-      input_info.final_scriptSig = {hex = hex_encode(inp.final_script_sig)}
+      -- W53: asm uses ScriptToAsmStr(script, fAttemptSighashDecode=true).
+      -- Reference: rawtransaction.cpp:1201.
+      input_info.final_scriptSig = {
+        asm = disassemble_asm_sighash(inp.final_script_sig),
+        hex = hex_encode(inp.final_script_sig),
+      }
     end
 
     if inp.final_script_witness then
