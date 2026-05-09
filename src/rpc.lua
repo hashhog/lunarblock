@@ -202,7 +202,15 @@ local function disassemble_script(script_bytes)
       -- Push data: show as hex
       parts[#parts + 1] = M.hex_encode(data)
     elseif opcode == 0x00 then
-      parts[#parts + 1] = "OP_0"
+      -- W51: Core's ScriptToAsmStr emits "0" not "OP_0" (matching Core's
+      -- GetOpName which returns "0" for OP_0 in its ASM serialisation path)
+      parts[#parts + 1] = "0"
+    elseif opcode == 0x4f then
+      -- OP_1NEGATE → "-1" (Core ASM convention, not "OP_1NEGATE")
+      parts[#parts + 1] = "-1"
+    elseif opcode >= 0x51 and opcode <= 0x60 then
+      -- OP_1..OP_16 → "1".."16" (Core ASM convention)
+      parts[#parts + 1] = tostring(opcode - 0x50)
     elseif opcode >= 0x01 and opcode <= 0x4b then
       -- Direct push but no data (shouldn't happen with valid parse)
       parts[#parts + 1] = "OP_PUSHBYTES_" .. opcode
@@ -220,7 +228,7 @@ end
 --------------------------------------------------------------------------------
 
 --- Decode a scriptPubKey into RPC-compatible format.
--- Returns an object with: type, asm, hex, and optionally address.
+-- Returns an object with: type, asm, hex, desc, and optionally address.
 -- @param script_pubkey string: The raw scriptPubKey bytes
 -- @param network table: Network configuration for address encoding
 -- @return table: Decoded scriptPubKey object
@@ -279,7 +287,55 @@ function M.decode_script_pubkey(script_pubkey, network)
     result.address = address_mod.segwit_encode(hrp, 1, program)
   end
 
+  -- W51: BIP-380 descriptor with 8-char checksum.
+  -- Mirrors Core's InferDescriptor (script/descriptor.cpp:2897) in the
+  -- no-provider context: addr(<address>)#<csum> for standard scripts,
+  -- raw(<hex>)#<csum> otherwise.
+  local desc_inner
+  if result.address then
+    desc_inner = "addr(" .. result.address .. ")"
+  else
+    desc_inner = "raw(" .. M.hex_encode(script_pubkey) .. ")"
+  end
+  local csum, csum_err = address_mod.descriptor_checksum(desc_inner)
+  if csum then
+    result.desc = desc_inner .. "#" .. csum
+  else
+    result.desc = desc_inner  -- fallback (should never happen for valid inputs)
+    _ = csum_err
+  end
+
+  -- W51: Core's ScriptToUniv suppresses the `address` field for bare-pubkey
+  -- (type="pubkey") outputs. The implied P2PKH address would be misleading.
+  if result.type == "pubkey" then
+    result.address = nil
+  end
+
   return result
+end
+
+--- Format a satoshi amount the way Bitcoin Core's ValueFromAmount does:
+-- %s%d.%08d (core_io.cpp:285).  Always 8 fractional digits.
+-- Returns a sentinel string "~~X.XXXXXXXX~~" so the caller can later
+-- strip the quotes from the cjson-encoded output via gsub.
+-- @param sats number: Amount in satoshis (integer-valued Lua number)
+-- @return string: Sentinel-wrapped fixed-8 decimal string
+local function btc_sentinel(sats)
+  local neg = sats < 0
+  local abs_sats = neg and -sats or sats
+  local whole = math.floor(abs_sats / 100000000)
+  local frac = abs_sats % 100000000
+  return string.format("~~%s%d.%08d~~", neg and "-" or "", whole, frac)
+end
+
+--- Strip sentinel wrappers from a cjson-encoded JSON string.
+-- Replaces "~~X.XXXXXXXX~~" (with quotes) with the bare number X.XXXXXXXX.
+-- This is the companion to btc_sentinel(); together they let us embed
+-- Core-byte-exact fixed-precision amounts in tables that cjson encodes.
+-- @param json string: cjson-encoded JSON with embedded sentinels
+-- @return string: JSON with sentinels replaced by bare numeric literals
+local function strip_btc_sentinels(json)
+  return (json:gsub('"~~(-?%d+%.%d+)~~"', '%1'))
 end
 
 --------------------------------------------------------------------------------
@@ -672,6 +728,18 @@ function RPCServer:handle_single_request(request)
     return nil
   end
 
+  -- W51: handlers that need Core-byte-exact JSON (e.g. decodepsbt) can
+  -- return {_raw_json = "<pre-encoded result string>"} to bypass cjson's
+  -- float serialisation.  We embed the raw fragment directly instead of
+  -- re-encoding the result table.
+  if type(result) == "table" and result._raw_json then
+    return {
+      _raw_json_result = result._raw_json,
+      error = cjson.null,
+      id = id,
+    }
+  end
+
   return {
     result = result,
     error = cjson.null,
@@ -734,6 +802,26 @@ function RPCServer:handle_request(request_body)
       return "", 204
     end
 
+    -- W51: splice any _raw_json_result fragments into the batch output.
+    -- We build each element separately so raw fragments are not re-quoted.
+    local has_raw = false
+    for _, r in ipairs(responses) do
+      if r._raw_json_result then has_raw = true; break end
+    end
+    if has_raw then
+      local parts = {}
+      for _, r in ipairs(responses) do
+        if r._raw_json_result then
+          local outer = cjson.encode({result = cjson.null, error = r.error, id = r.id})
+          outer = outer:gsub('"result":null', '"result":' .. r._raw_json_result, 1)
+          parts[#parts + 1] = outer
+        else
+          parts[#parts + 1] = cjson.encode(r)
+        end
+      end
+      return "[" .. table.concat(parts, ",") .. "]", nil
+    end
+
     return cjson.encode(responses), nil
   end
 
@@ -743,6 +831,16 @@ function RPCServer:handle_request(request_body)
   -- Handle notification (no response)
   if response == nil then
     return "", 204
+  end
+
+  -- W51: if the handler produced a pre-encoded result fragment, splice it
+  -- directly into the JSON wrapper instead of re-encoding through cjson
+  -- (which would quote the string).
+  if response._raw_json_result then
+    local outer = cjson.encode({result = cjson.null, error = response.error, id = response.id})
+    -- Replace the null result placeholder with the raw fragment.
+    outer = outer:gsub('"result":null', '"result":' .. response._raw_json_result, 1)
+    return outer, nil
   end
 
   return cjson.encode(response), nil
@@ -3484,10 +3582,66 @@ function RPCServer:register_methods()
       error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Invalid PSBT: " .. tostring(psbt)})
     end
 
-    -- Suppress unused warning
-    local _ = rpc
+    -- W51: decode the PSBT into a Lua table with Core-byte-parity shape.
+    -- btc_sentinel() embeds "~~X.XXXXXXXX~~" placeholders for amount fields
+    -- (so cjson doesn't collapse them to plain integers).
+    -- strip_btc_sentinels() removes the quotes+tildes from the encoded JSON.
+    -- decode_script_pubkey() enriches each scriptPubKey with asm/desc/type
+    -- and suppresses address for pubkey-type outputs (W50 prescription).
+    local decoded = psbt_mod.decode(psbt, rpc.network, btc_sentinel)
 
-    return psbt_mod.decode(psbt)
+    -- Enrich every scriptPubKey field with asm, desc, type, and address
+    -- (using the full decode_script_pubkey that knows the active network).
+    for _, vout_entry in ipairs(decoded.tx.vout) do
+      if vout_entry._spk_bytes then
+        vout_entry.scriptPubKey = M.decode_script_pubkey(vout_entry._spk_bytes, rpc.network)
+        vout_entry._spk_bytes = nil
+      end
+    end
+    if decoded.inputs then
+      for _, inp in ipairs(decoded.inputs) do
+        if inp.witness_utxo and inp.witness_utxo._spk_bytes then
+          inp.witness_utxo.scriptPubKey = M.decode_script_pubkey(
+            inp.witness_utxo._spk_bytes, rpc.network)
+          inp.witness_utxo._spk_bytes = nil
+        end
+      end
+    end
+
+    -- W51: Core always emits global_xpubs as an array (even when empty).
+    -- cjson encodes empty Lua tables as {} (object); use cjson.empty_array
+    -- for an empty xpubs list, and array_mt for a non-empty one.
+    if #decoded.global_xpubs == 0 then
+      decoded.global_xpubs = cjson.empty_array
+    else
+      setmetatable(decoded.global_xpubs, cjson.array_mt)
+    end
+
+    -- W51: Core always emits top-level `proprietary: []` and `unknown: {}`
+    -- regardless of PSBT content.
+    decoded.proprietary = cjson.empty_array
+    decoded.unknown = {}  -- empty object (not array)
+
+    -- W51: inputs/outputs arrays must encode as JSON arrays even when their
+    -- element objects are empty ({}).  Apply array_mt.
+    if decoded.inputs then
+      setmetatable(decoded.inputs, cjson.array_mt)
+    end
+    if decoded.outputs then
+      setmetatable(decoded.outputs, cjson.array_mt)
+    end
+    -- Same for tx.vin and tx.vout
+    if decoded.tx.vin then
+      setmetatable(decoded.tx.vin, cjson.array_mt)
+    end
+    if decoded.tx.vout then
+      setmetatable(decoded.tx.vout, cjson.array_mt)
+    end
+
+    -- Encode and strip sentinel amounts (btc_sentinel → bare number).
+    local json = strip_btc_sentinels(cjson.encode(decoded))
+
+    return {_raw_json = json}
   end
 
   self.methods["analyzepsbt"] = function(rpc, params)

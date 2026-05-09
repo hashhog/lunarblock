@@ -438,16 +438,38 @@ for i = 1, #DESC_INPUT_CHARSET do
   DESC_INPUT_MAP[DESC_INPUT_CHARSET:byte(i)] = i - 1
 end
 
--- PolyMod for descriptor checksum (BCH code over GF(32))
+-- 40-bit XOR helper.  LuaJIT's bit library is 32-bit only (wraps at 2^32),
+-- so we cannot use bit.bxor directly on the BCH generator polynomials
+-- (0xf5dee51989 etc.) that BIP-380 uses — they are 40-bit constants.
+-- We split each operand into a high byte (bits 32-39) and a low dword
+-- (bits 0-31), XOR the halves separately with the 32-bit-safe bit.bxor,
+-- and recombine.  All intermediate values are ≤ 2^40 so they fit in a
+-- 64-bit double without precision loss.
+-- W51 fix: bit.bxor was silently truncating to 32 bits, producing wrong
+-- BIP-380 descriptor checksums (e.g. #3pfrsrvg instead of #234qj6rv).
+local function xor40(a, b)
+  local a_lo = a % 0x100000000   -- bits 0-31
+  local a_hi = math.floor(a / 0x100000000)  -- bits 32-39 (0-255)
+  local b_lo = b % 0x100000000
+  local b_hi = math.floor(b / 0x100000000)
+  local lo = bit.bxor(a_lo, b_lo)
+  if lo < 0 then lo = lo + 0x100000000 end  -- unsigned
+  local hi = bit.bxor(a_hi, b_hi)
+  if hi < 0 then hi = hi + 256 end
+  return hi * 0x100000000 + lo
+end
+
+-- PolyMod for descriptor checksum (BCH code over GF(32)).
+-- Uses xor40 instead of bit.bxor to avoid 32-bit truncation.
 local function desc_polymod(c, val)
   local c0 = math.floor(c / 0x800000000)  -- c >> 35
-  c = ((c % 0x800000000) * 32 + val) % 0x10000000000  -- ((c & 0x7ffffffff) << 5) ^ val
+  c = ((c % 0x800000000) * 32 + val) % 0x10000000000  -- ((c & 0x7ffffffff) << 5) + val
 
-  if c0 % 2 >= 1 then c = bit.bxor(c, 0xf5dee51989) end
-  if c0 % 4 >= 2 then c = bit.bxor(c, 0xa9fdca3312) end
-  if c0 % 8 >= 4 then c = bit.bxor(c, 0x1bab10e32d) end
-  if c0 % 16 >= 8 then c = bit.bxor(c, 0x3706b1677a) end
-  if c0 % 32 >= 16 then c = bit.bxor(c, 0x644d626ffd) end
+  if c0 % 2  >= 1  then c = xor40(c, 0xf5dee51989) end
+  if c0 % 4  >= 2  then c = xor40(c, 0xa9fdca3312) end
+  if c0 % 8  >= 4  then c = xor40(c, 0x1bab10e32d) end
+  if c0 % 16 >= 8  then c = xor40(c, 0x3706b1677a) end
+  if c0 % 32 >= 16 then c = xor40(c, 0x644d626ffd) end
 
   return c
 end
@@ -464,7 +486,7 @@ function M.descriptor_checksum(desc)
     if pos == nil then
       return nil, "invalid character in descriptor"
     end
-    -- PolyMod with lower 5 bits
+    -- PolyMod with lower 5 bits (pos ≤ 94, so bit.band(pos,31) is safe)
     c = desc_polymod(c, bit.band(pos, 31))
     -- Accumulate class (upper bits)
     cls = cls * 3 + math.floor(pos / 32)
@@ -486,14 +508,19 @@ function M.descriptor_checksum(desc)
     c = desc_polymod(c, 0)
   end
 
-  -- XOR with 1 (prevents appending zeros from being undetectable)
-  c = bit.bxor(c, 1)
+  -- XOR with 1 (prevents appending zeros from being undetectable).
+  -- c ≤ 2^40, so xor40 needed here too for correctness (though XOR with 1
+  -- only affects bit 0, bit.bxor would coincidentally work here; use xor40
+  -- for consistency).
+  c = xor40(c, 1)
 
-  -- Convert to 8-character checksum
+  -- Extract 8 groups of 5 bits from the 40-bit result.  bit.rshift is
+  -- 32-bit only, so use arithmetic shifts instead.
   local checksum = {}
   for i = 0, 7 do
-    local idx = bit.band(bit.rshift(c, 5 * (7 - i)), 31) + 1
-    checksum[i + 1] = DESC_CHECKSUM_CHARSET:sub(idx, idx)
+    local shift = 5 * (7 - i)
+    local v = math.floor(c / (2 ^ shift)) % 32
+    checksum[i + 1] = DESC_CHECKSUM_CHARSET:sub(v + 1, v + 1)
   end
 
   return table.concat(checksum)
