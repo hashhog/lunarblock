@@ -168,6 +168,22 @@ M.REPLACEMENT_MIN_FEE_BUMP = 1000 -- Minimum fee increase for RBF (sat/KB)
 -- 4_000_000), but a node treats them as non-standard at relay time.
 M.MAX_STANDARD_TX_WEIGHT = 400000
 
+-- IsStandardTx version range (Bitcoin Core policy/policy.h TX_MIN/MAX_STANDARD_VERSION).
+-- Versions 1-3 are standard; 0 and >3 are rejected at relay.
+M.TX_MIN_STANDARD_VERSION = 1
+M.TX_MAX_STANDARD_VERSION = 3
+
+-- Maximum scriptSig size for a standard input (Bitcoin Core policy/policy.h:62).
+M.MAX_STANDARD_SCRIPTSIG_SIZE = 1650
+
+-- Dust relay fee rate used for GetDustThreshold (Core policy/policy.h:68).
+-- Units: satoshis per kilobyte.  Default: 3000 sat/kvB.
+M.DUST_RELAY_FEE_RATE = 3000
+
+-- Maximum datacarrier (OP_RETURN) script size in bytes (policy/policy.h:84).
+-- Default = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 100000 bytes.
+M.MAX_OP_RETURN_RELAY = 100000
+
 -- BIP125 RBF Constants
 M.MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD  -- Sequence number signaling RBF
 M.MAX_REPLACEMENT_CANDIDATES = 100       -- Max transactions that can be evicted by RBF
@@ -351,7 +367,14 @@ function Mempool:accept_transaction(tx, allow_rbf)
     return false, "coinbase transactions not accepted"
   end
 
-  -- 2b. IsStandardTx weight cap (relay policy, not consensus).
+  -- 2b. IsStandardTx: version range (Bitcoin Core policy/policy.cpp:102-105).
+  -- Versions outside [1, 3] are rejected with reason "version".
+  if tx.version < M.TX_MIN_STANDARD_VERSION or tx.version > M.TX_MAX_STANDARD_VERSION then
+    return false, string.format("version: tx version %d not in [%d, %d]",
+      tx.version, M.TX_MIN_STANDARD_VERSION, M.TX_MAX_STANDARD_VERSION)
+  end
+
+  -- 2b2. IsStandardTx weight cap (relay policy, not consensus).
   -- Bitcoin Core: policy/policy.cpp:111-115 — txs with weight greater
   -- than MAX_STANDARD_TX_WEIGHT (400_000) are rejected at relay with
   -- reason "tx-size".  Consensus still allows up to MAX_BLOCK_WEIGHT.
@@ -359,6 +382,74 @@ function Mempool:accept_transaction(tx, allow_rbf)
   if tx_weight_check > M.MAX_STANDARD_TX_WEIGHT then
     return false, string.format("tx-size: weight %d exceeds %d",
       tx_weight_check, M.MAX_STANDARD_TX_WEIGHT)
+  end
+
+  -- 2b3. IsStandardTx per-input scriptSig checks (Bitcoin Core policy/policy.cpp:117-134).
+  -- Each scriptSig must be (a) push-only and (b) at most MAX_STANDARD_SCRIPTSIG_SIZE bytes.
+  for _, inp in ipairs(tx.inputs) do
+    local ss = inp.script_sig or ""
+    if #ss > M.MAX_STANDARD_SCRIPTSIG_SIZE then
+      return false, string.format("scriptsig-size: %d > %d", #ss, M.MAX_STANDARD_SCRIPTSIG_SIZE)
+    end
+    if #ss > 0 and not script_mod.is_push_only(ss) then
+      return false, "scriptsig-not-pushonly"
+    end
+  end
+
+  -- 2b4. IsStandardTx per-output scriptPubKey check (Bitcoin Core policy/policy.cpp:139-155).
+  -- Each output must be a standard script type; nonstandard outputs are rejected with
+  -- reason "scriptpubkey".  OP_RETURN (nulldata) outputs are additionally size-limited
+  -- to MAX_OP_RETURN_RELAY bytes total across all OP_RETURN outputs in the tx.
+  -- Reference: Bitcoin Core IsStandard() + IsStandardTx() loop, policy.cpp:80-155.
+  local datacarrier_bytes_left = M.MAX_OP_RETURN_RELAY
+  for _, out in ipairs(tx.outputs) do
+    local script_type = script_mod.classify_script(out.script_pubkey)
+    if script_type == "nonstandard" then
+      return false, "scriptpubkey"
+    end
+    if script_type == "nulldata" then
+      local script_size = #out.script_pubkey
+      if script_size > datacarrier_bytes_left then
+        return false, "datacarrier"
+      end
+      datacarrier_bytes_left = datacarrier_bytes_left - script_size
+    end
+  end
+
+  -- 2b5. Dust check (Bitcoin Core policy/policy.cpp:158-162).
+  -- An output is dust if its value is below GetDustThreshold for its script type.
+  -- IsUnspendable outputs (OP_RETURN) have a threshold of 0 (always allowed at value 0+).
+  -- Bitcoin Core now allows exactly 1 dust output (MAX_DUST_OUTPUTS_PER_TX=1) to
+  -- support ephemeral anchors; more than 1 dust output is rejected with "dust".
+  -- Reference: Bitcoin Core GetDustThreshold() + GetDust() + IsStandardTx(), policy.cpp:27-162.
+  local dust_count = 0
+  for _, out in ipairs(tx.outputs) do
+    local spk = out.script_pubkey
+    -- IsUnspendable: starts with OP_RETURN (0x6a), threshold = 0 (dust_threshold = 0)
+    local is_unspendable = (#spk >= 1 and spk:byte(1) == 0x6a)
+    if not is_unspendable then
+      -- Compute GetDustThreshold: nSize = serialized output size + estimated input size.
+      -- Witness programs get the 75% segwit discount on the input witness portion.
+      local nSize = 8 + 1 + #spk  -- value(8) + compactsize(1) + script bytes
+      local script_type = script_mod.classify_script(spk)
+      local is_witness = (script_type == "p2wpkh" or script_type == "p2wsh"
+                          or script_type == "p2tr" or script_type == "p2a")
+      if is_witness then
+        -- 32(prev_hash) + 4(prev_index) + 1(script_sig_len) + (107/4)(witness) + 4(sequence)
+        nSize = nSize + 32 + 4 + 1 + 27 + 4  -- = 68 (Core uses 98 for P2WPKH total)
+      else
+        -- 32(prev_hash) + 4(prev_index) + 1(script_sig_len) + 107(script_sig) + 4(sequence)
+        nSize = nSize + 32 + 4 + 1 + 107 + 4  -- = 148 (Core uses 182 for P2PKH total)
+      end
+      local dust_threshold = math.floor(M.DUST_RELAY_FEE_RATE * nSize / 1000)
+      if out.value < dust_threshold then
+        dust_count = dust_count + 1
+      end
+    end
+  end
+  -- MAX_DUST_OUTPUTS_PER_TX = 1: allow at most one dust output (ephemeral dust).
+  if dust_count > 1 then
+    return false, "dust"
   end
 
   -- 2c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
