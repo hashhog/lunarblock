@@ -289,10 +289,18 @@ function M.decode_script_pubkey(script_pubkey, network)
 
   -- W51: BIP-380 descriptor with 8-char checksum.
   -- Mirrors Core's InferDescriptor (script/descriptor.cpp:2897) in the
-  -- no-provider context: addr(<address>)#<csum> for standard scripts,
-  -- raw(<hex>)#<csum> otherwise.
+  -- no-provider context.
+  -- For witness_v1_taproot (OP_1 <32-byte x-only key>), Core emits
+  --   rawtr(<32-byte-hex>)#<csum>
+  -- because InferDescriptor recognises the x-only key and wraps it in
+  -- RawTrDescriptor rather than AddressDescriptor.
+  -- For all other standard scripts, Core falls through to addr()/raw().
   local desc_inner
-  if result.address then
+  if result.type == "witness_v1_taproot" and #script_pubkey == 34 then
+    -- Extract 32-byte x-only pubkey (bytes 3..34, i.e. after OP_1 + push32)
+    local xonly_hex = M.hex_encode(script_pubkey:sub(3, 34))
+    desc_inner = "rawtr(" .. xonly_hex .. ")"
+  elseif result.address then
     desc_inner = "addr(" .. result.address .. ")"
   else
     desc_inner = "raw(" .. M.hex_encode(script_pubkey) .. ")"

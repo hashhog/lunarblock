@@ -2,6 +2,7 @@
 -- Implements creation, serialization, signing, combining, and finalization.
 
 local bit = require("bit")
+local cjson = require("cjson")
 local serialize = require("lunarblock.serialize")
 local types = require("lunarblock.types")
 local validation = require("lunarblock.validation")
@@ -33,12 +34,24 @@ M.IN_WITNESS_SCRIPT = 0x05
 M.IN_BIP32_DERIVATION = 0x06
 M.IN_FINAL_SCRIPTSIG = 0x07
 M.IN_FINAL_SCRIPTWITNESS = 0x08
+-- BIP-371 Taproot input types
+M.IN_TAP_KEY_SIG = 0x13
+M.IN_TAP_SCRIPT_SIG = 0x14
+M.IN_TAP_LEAF_SCRIPT = 0x15
+M.IN_TAP_BIP32_DERIVATION = 0x16
+M.IN_TAP_INTERNAL_KEY = 0x17
+M.IN_TAP_MERKLE_ROOT = 0x18
 M.IN_PROPRIETARY = 0xFC
 
 -- Output key types
 M.OUT_REDEEM_SCRIPT = 0x00
 M.OUT_WITNESS_SCRIPT = 0x01
 M.OUT_BIP32_DERIVATION = 0x02
+-- BIP-371 Taproot output types
+M.OUT_TAP_INTERNAL_KEY = 0x05
+M.OUT_TAP_TREE = 0x06
+M.OUT_TAP_BIP32_DERIVATION = 0x07
+M.OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08
 M.OUT_PROPRIETARY = 0xFC
 
 -- Separator byte (end of map)
@@ -74,6 +87,13 @@ function M.psbt_input()
     bip32_derivations = {},       -- pubkey_hex -> {fingerprint, path_array}
     final_script_sig = nil,       -- Final scriptSig
     final_script_witness = nil,   -- Final witness stack (array of strings)
+    -- BIP-371 Taproot fields
+    tap_key_sig = nil,            -- 64/65 byte Schnorr sig (0x13)
+    tap_script_sigs = {},         -- xonly_hex.."."..leaf_hash_hex -> sig_hex (0x14)
+    tap_scripts = {},             -- (script_hex..":"..leaf_ver) -> [control_block_hex,...] (0x15)
+    tap_bip32_derivs = {},        -- xonly_hex -> {leaf_hashes=[hash_hex,...], fingerprint, path} (0x16)
+    tap_internal_key = nil,       -- 32-byte x-only pubkey hex (0x17)
+    tap_merkle_root = nil,        -- 32-byte merkle root hex (0x18)
     unknown = {},                 -- key_hex -> value (unknown fields)
   }
 end
@@ -85,6 +105,11 @@ function M.psbt_output()
     redeem_script = nil,          -- P2SH redeem script
     witness_script = nil,         -- P2WSH witness script
     bip32_derivations = {},       -- pubkey_hex -> {fingerprint, path_array}
+    -- BIP-371 Taproot output fields
+    tap_internal_key = nil,       -- 32-byte x-only pubkey hex (0x05)
+    tap_tree = {},                -- array of {depth, leaf_ver, script_hex} (0x06)
+    tap_bip32_derivs = {},        -- xonly_hex -> {leaf_hashes=[...], fingerprint, path} (0x07)
+    musig2_participants = {},     -- agg_pubkey_hex -> [participant_pubkey_hex,...] (0x08)
     unknown = {},                 -- key_hex -> value (unknown fields)
   }
 end
@@ -580,6 +605,67 @@ function M.deserialize(data)
           inp.final_script_witness[j] = vr.read_varstr()
         end
 
+      -- BIP-371 Taproot input fields
+      elseif key_type == M.IN_TAP_KEY_SIG then
+        -- key = [type_byte], value = 64 or 65 byte Schnorr sig
+        assert(#entry.key == 1, "Invalid tap_key_sig key")
+        inp.tap_key_sig = entry.value
+
+      elseif key_type == M.IN_TAP_SCRIPT_SIG then
+        -- key = [type_byte(1)] + [xonly_pubkey(32)] + [leaf_hash(32)], value = sig
+        assert(#entry.key == 65, "Invalid tap_script_sig key length")
+        local xonly_hex = hex_encode(entry.key:sub(2, 33))
+        local leaf_hash_hex = hex_encode(entry.key:sub(34, 65))
+        local map_key = xonly_hex .. "." .. leaf_hash_hex
+        inp.tap_script_sigs[map_key] = entry.value
+
+      elseif key_type == M.IN_TAP_LEAF_SCRIPT then
+        -- key = [type_byte(1)] + [control_block(>=33)], value = script + leaf_ver(1)
+        assert(#entry.key >= 34, "Invalid tap_leaf_script key length")
+        assert(#entry.value >= 1, "Invalid tap_leaf_script value length")
+        local control_block = entry.key:sub(2)
+        local control_block_hex = hex_encode(control_block)
+        local leaf_ver = entry.value:byte(#entry.value)
+        local leaf_script = entry.value:sub(1, #entry.value - 1)
+        local leaf_script_hex = hex_encode(leaf_script)
+        local map_key = leaf_script_hex .. ":" .. leaf_ver
+        if not inp.tap_scripts[map_key] then
+          inp.tap_scripts[map_key] = {script = leaf_script, leaf_ver = leaf_ver, control_blocks = {}}
+        end
+        local cb_list = inp.tap_scripts[map_key].control_blocks
+        cb_list[#cb_list + 1] = control_block
+
+      elseif key_type == M.IN_TAP_BIP32_DERIVATION then
+        -- key = [type_byte(1)] + [xonly_pubkey(32)], value = N*leaf_hash(32) + key_origin
+        assert(#entry.key == 33, "Invalid tap_bip32_derivation key length")
+        local xonly_hex = hex_encode(entry.key:sub(2, 33))
+        local vr = serialize.buffer_reader(entry.value)
+        local num_leaf_hashes = vr.read_varint()
+        local leaf_hashes = {}
+        for _ = 1, num_leaf_hashes do
+          leaf_hashes[#leaf_hashes + 1] = hex_encode(vr.read_bytes(32))
+        end
+        local fingerprint = vr.read_bytes(4)
+        local path = {}
+        while vr.remaining() >= 4 do
+          path[#path + 1] = vr.read_u32le()
+        end
+        inp.tap_bip32_derivs[xonly_hex] = {
+          leaf_hashes = leaf_hashes,
+          fingerprint = fingerprint,
+          path = path,
+        }
+
+      elseif key_type == M.IN_TAP_INTERNAL_KEY then
+        assert(#entry.key == 1, "Invalid tap_internal_key key")
+        assert(#entry.value == 32, "Invalid tap_internal_key value length")
+        inp.tap_internal_key = entry.value
+
+      elseif key_type == M.IN_TAP_MERKLE_ROOT then
+        assert(#entry.key == 1, "Invalid tap_merkle_root key")
+        assert(#entry.value == 32, "Invalid tap_merkle_root value length")
+        inp.tap_merkle_root = entry.value
+
       else
         inp.unknown[hex_encode(entry.key)] = entry.value
       end
@@ -611,6 +697,55 @@ function M.deserialize(data)
           path[#path + 1] = vr.read_u32le()
         end
         out.bip32_derivations[hex_encode(pubkey)] = {fingerprint = fingerprint, path = path}
+
+      -- BIP-371 Taproot output fields
+      elseif key_type == M.OUT_TAP_INTERNAL_KEY then
+        assert(#entry.key == 1, "Invalid out_tap_internal_key key")
+        assert(#entry.value == 32, "Invalid out_tap_internal_key value length")
+        out.tap_internal_key = entry.value
+
+      elseif key_type == M.OUT_TAP_TREE then
+        -- value = array of (depth:u8, leaf_ver:u8, script:varstr)
+        local vr = serialize.buffer_reader(entry.value)
+        while vr.remaining() >= 2 do
+          local depth = vr.read_u8()
+          local leaf_ver = vr.read_u8()
+          local leaf_script = vr.read_varstr()
+          out.tap_tree[#out.tap_tree + 1] = {depth = depth, leaf_ver = leaf_ver, script = leaf_script}
+        end
+
+      elseif key_type == M.OUT_TAP_BIP32_DERIVATION then
+        -- key = [type_byte(1)] + [xonly_pubkey(32)], value = N*leaf_hash(32) + key_origin
+        assert(#entry.key == 33, "Invalid out_tap_bip32_derivation key length")
+        local xonly_hex = hex_encode(entry.key:sub(2, 33))
+        local vr = serialize.buffer_reader(entry.value)
+        local num_leaf_hashes = vr.read_varint()
+        local leaf_hashes = {}
+        for _ = 1, num_leaf_hashes do
+          leaf_hashes[#leaf_hashes + 1] = hex_encode(vr.read_bytes(32))
+        end
+        local fingerprint = vr.read_bytes(4)
+        local path = {}
+        while vr.remaining() >= 4 do
+          path[#path + 1] = vr.read_u32le()
+        end
+        out.tap_bip32_derivs[xonly_hex] = {
+          leaf_hashes = leaf_hashes,
+          fingerprint = fingerprint,
+          path = path,
+        }
+
+      elseif key_type == M.OUT_MUSIG2_PARTICIPANT_PUBKEYS then
+        -- key = [type_byte(1)] + [agg_pubkey(33)], value = N participant_pubkeys (33 bytes each)
+        assert(#entry.key == 34, "Invalid musig2 key length")
+        local agg_pubkey_hex = hex_encode(entry.key:sub(2, 34))
+        local participants = {}
+        local pos = 1
+        while pos + 32 <= #entry.value do
+          participants[#participants + 1] = hex_encode(entry.value:sub(pos, pos + 32))
+          pos = pos + 33
+        end
+        out.musig2_participants[agg_pubkey_hex] = participants
 
       else
         out.unknown[hex_encode(entry.key)] = entry.value
@@ -1603,8 +1738,14 @@ local function build_non_witness_utxo_json(prev_tx, network, fmt_btc)
     end
 
     -- BIP-380 descriptor
+    -- For witness_v1_taproot (OP_1 <32-byte x-only key>), Core emits
+    --   rawtr(<32-byte-hex>)#<csum> (InferDescriptor RawTrDescriptor path).
+    -- For all other standard scripts, emit addr()/raw().
     local desc_inner
-    if addr then
+    if core_type == "witness_v1_taproot" and #spk == 34 then
+      local xonly_hex = hex_encode(spk:sub(3, 34))
+      desc_inner = "rawtr(" .. xonly_hex .. ")"
+    elseif addr then
       desc_inner = "addr(" .. addr .. ")"
     else
       desc_inner = "raw(" .. hex_encode(spk) .. ")"
@@ -1643,6 +1784,28 @@ local function build_non_witness_utxo_json(prev_tx, network, fmt_btc)
     vin      = vin,
     vout     = vout,
   }
+end
+
+-- Format a BIP-32 derivation path array to Bitcoin Core string notation.
+-- Reference: bitcoin-core/src/util/bip32.cpp WriteHDKeypath with apostrophe=false.
+-- Hardened components use 'h' suffix, not "'".
+-- Empty path returns "m".
+-- @param path table: Array of uint32 path indices (with 0x80000000 for hardened)
+-- @return string: e.g. "m/84h/1h/0h/0/0"
+local function format_bip32_path(path)
+  if not path or #path == 0 then return "m" end
+  local parts = {"m"}
+  for _, idx in ipairs(path) do
+    -- idx comes from read_u32le() which returns a Lua number in [0, 4294967295].
+    -- Hardened bit is 0x80000000 = 2147483648. Lua doubles can represent this
+    -- exactly (2^31 < 2^53). No bit library needed; plain arithmetic works.
+    if idx >= 2147483648 then
+      parts[#parts + 1] = "/" .. (idx - 2147483648) .. "h"
+    else
+      parts[#parts + 1] = "/" .. idx
+    end
+  end
+  return table.concat(parts)
 end
 
 --- Decode a PSBT to a human-readable table for RPC.
@@ -1814,11 +1977,104 @@ function M.decode(psbt, network, btc_fmt)
       bip32_list[#bip32_list + 1] = {
         pubkey = pk,
         master_fingerprint = hex_encode(deriv.fingerprint),
-        path = deriv.path,
+        path = format_bip32_path(deriv.path),
       }
     end
     if #bip32_list > 0 then
+      -- Sort by pubkey hex (Core iterates std::map sorted by compressed pubkey)
+      table.sort(bip32_list, function(a, b) return a.pubkey < b.pubkey end)
       input_info.bip32_derivs = bip32_list
+    end
+
+    -- BIP-371 taproot input fields
+    -- taproot_key_path_sig (0x13)
+    if inp.tap_key_sig then
+      input_info.taproot_key_path_sig = hex_encode(inp.tap_key_sig)
+    end
+
+    -- taproot_script_path_sigs (0x14) — array of {pubkey, leaf_hash, sig}
+    -- Core iterates m_tap_script_sigs std::map<(xonly,leaf_hash),...> in lex order
+    local tap_script_sigs_list = {}
+    for map_key, sig in pairs(inp.tap_script_sigs) do
+      -- map_key is "xonly_hex.leaf_hash_hex"
+      local dot = map_key:find("%.", 1, true)
+      local xonly_h = map_key:sub(1, dot - 1)
+      local leaf_h = map_key:sub(dot + 1)
+      tap_script_sigs_list[#tap_script_sigs_list + 1] = {
+        pubkey = xonly_h,
+        leaf_hash = leaf_h,
+        sig = hex_encode(sig),
+      }
+    end
+    if #tap_script_sigs_list > 0 then
+      table.sort(tap_script_sigs_list, function(a, b)
+        if a.pubkey ~= b.pubkey then return a.pubkey < b.pubkey end
+        return a.leaf_hash < b.leaf_hash
+      end)
+      input_info.taproot_script_path_sigs = tap_script_sigs_list
+    end
+
+    -- taproot_scripts (0x15) — array of {script, leaf_ver, control_blocks[]}
+    -- Core iterates m_tap_scripts: std::map<(script,leaf_ver), set<control_block>>
+    local tap_scripts_list = {}
+    for _, leaf_info in pairs(inp.tap_scripts) do
+      local cb_hex_list = {}
+      for _, cb in ipairs(leaf_info.control_blocks) do
+        cb_hex_list[#cb_hex_list + 1] = hex_encode(cb)
+      end
+      table.sort(cb_hex_list)
+      tap_scripts_list[#tap_scripts_list + 1] = {
+        script = hex_encode(leaf_info.script),
+        leaf_ver = leaf_info.leaf_ver,
+        control_blocks = cb_hex_list,
+      }
+    end
+    if #tap_scripts_list > 0 then
+      table.sort(tap_scripts_list, function(a, b)
+        if a.script ~= b.script then return a.script < b.script end
+        return a.leaf_ver < b.leaf_ver
+      end)
+      input_info.taproot_scripts = tap_scripts_list
+    end
+
+    -- taproot_bip32_derivs (0x16) — array of {pubkey, master_fingerprint, path, leaf_hashes[]}
+    -- Core iterates m_tap_bip32_paths: std::map<XOnlyPubKey,...> lex sorted
+    local tap_bip32_list = {}
+    for xonly_h, td in pairs(inp.tap_bip32_derivs) do
+      local leaf_hashes_sorted = {}
+      for _, lh in ipairs(td.leaf_hashes) do
+        leaf_hashes_sorted[#leaf_hashes_sorted + 1] = lh
+      end
+      table.sort(leaf_hashes_sorted)
+      tap_bip32_list[#tap_bip32_list + 1] = {
+        pubkey = xonly_h,
+        master_fingerprint = hex_encode(td.fingerprint),
+        path = format_bip32_path(td.path),
+        leaf_hashes = leaf_hashes_sorted,
+      }
+    end
+    if #tap_bip32_list > 0 then
+      table.sort(tap_bip32_list, function(a, b) return a.pubkey < b.pubkey end)
+      -- Ensure leaf_hashes always emits as a JSON array (even when empty)
+      for _, entry in ipairs(tap_bip32_list) do
+        if #entry.leaf_hashes == 0 then
+          entry.leaf_hashes = cjson.empty_array
+        else
+          setmetatable(entry.leaf_hashes, cjson.array_mt)
+        end
+      end
+      setmetatable(tap_bip32_list, cjson.array_mt)
+      input_info.taproot_bip32_derivs = tap_bip32_list
+    end
+
+    -- taproot_internal_key (0x17)
+    if inp.tap_internal_key then
+      input_info.taproot_internal_key = hex_encode(inp.tap_internal_key)
+    end
+
+    -- taproot_merkle_root (0x18)
+    if inp.tap_merkle_root then
+      input_info.taproot_merkle_root = hex_encode(inp.tap_merkle_root)
     end
 
     if inp.final_script_sig then
@@ -1859,11 +2115,85 @@ function M.decode(psbt, network, btc_fmt)
       bip32_list[#bip32_list + 1] = {
         pubkey = pk,
         master_fingerprint = hex_encode(deriv.fingerprint),
-        path = deriv.path,
+        path = format_bip32_path(deriv.path),
       }
     end
     if #bip32_list > 0 then
+      table.sort(bip32_list, function(a, b) return a.pubkey < b.pubkey end)
       output_info.bip32_derivs = bip32_list
+    end
+
+    -- BIP-371 taproot output fields
+
+    -- musig2_participant_pubkeys (0x08) — array of {aggregate_pubkey, participant_pubkeys[]}
+    -- Core iterates m_musig2_participants: std::map<CPubKey, vector<CPubKey>> (lex by agg_pubkey)
+    local musig2_list = {}
+    for agg_hex, participants in pairs(out.musig2_participants) do
+      -- participants is already a list of hex strings
+      local part_sorted = {}
+      for _, p in ipairs(participants) do
+        part_sorted[#part_sorted + 1] = p
+      end
+      table.sort(part_sorted)
+      musig2_list[#musig2_list + 1] = {
+        aggregate_pubkey = agg_hex,
+        participant_pubkeys = part_sorted,
+      }
+    end
+    if #musig2_list > 0 then
+      table.sort(musig2_list, function(a, b) return a.aggregate_pubkey < b.aggregate_pubkey end)
+      for _, m in ipairs(musig2_list) do
+        setmetatable(m.participant_pubkeys, cjson.array_mt)
+      end
+      setmetatable(musig2_list, cjson.array_mt)
+      output_info.musig2_participant_pubkeys = musig2_list
+    end
+
+    -- taproot_bip32_derivs (0x07) — array of {pubkey, master_fingerprint, path, leaf_hashes[]}
+    local out_tap_bip32_list = {}
+    for xonly_h, td in pairs(out.tap_bip32_derivs) do
+      local leaf_hashes_sorted = {}
+      for _, lh in ipairs(td.leaf_hashes) do
+        leaf_hashes_sorted[#leaf_hashes_sorted + 1] = lh
+      end
+      table.sort(leaf_hashes_sorted)
+      out_tap_bip32_list[#out_tap_bip32_list + 1] = {
+        pubkey = xonly_h,
+        master_fingerprint = hex_encode(td.fingerprint),
+        path = format_bip32_path(td.path),
+        leaf_hashes = leaf_hashes_sorted,
+      }
+    end
+    if #out_tap_bip32_list > 0 then
+      table.sort(out_tap_bip32_list, function(a, b) return a.pubkey < b.pubkey end)
+      for _, entry in ipairs(out_tap_bip32_list) do
+        if #entry.leaf_hashes == 0 then
+          entry.leaf_hashes = cjson.empty_array
+        else
+          setmetatable(entry.leaf_hashes, cjson.array_mt)
+        end
+      end
+      setmetatable(out_tap_bip32_list, cjson.array_mt)
+      output_info.taproot_bip32_derivs = out_tap_bip32_list
+    end
+
+    -- taproot_internal_key (0x05)
+    if out.tap_internal_key then
+      output_info.taproot_internal_key = hex_encode(out.tap_internal_key)
+    end
+
+    -- taproot_tree (0x06) — array of {depth, leaf_ver, script}
+    if #out.tap_tree > 0 then
+      local tree_arr = {}
+      for _, leaf in ipairs(out.tap_tree) do
+        tree_arr[#tree_arr + 1] = {
+          depth = leaf.depth,
+          leaf_ver = leaf.leaf_ver,
+          script = hex_encode(leaf.script),
+        }
+      end
+      setmetatable(tree_arr, cjson.array_mt)
+      output_info.taproot_tree = tree_arr
     end
 
     result.outputs[i] = output_info
