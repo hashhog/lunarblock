@@ -204,6 +204,54 @@ local function format_asm_token(opcode, data)
   end
 end
 
+--- Map a SIGHASH byte to its string label (Core's mapSigHashTypes).
+-- Returns the label ("ALL", "NONE", "SINGLE", "ALL|ANYONECANPAY", etc.) or "".
+-- Reference: bitcoin-core/src/core_io.cpp SighashToStr / mapSigHashTypes.
+local sighash_labels = {
+  [0x01] = "ALL",
+  [0x02] = "NONE",
+  [0x03] = "SINGLE",
+  [0x81] = "ALL|ANYONECANPAY",
+  [0x82] = "NONE|ANYONECANPAY",
+  [0x83] = "SINGLE|ANYONECANPAY",
+}
+
+--- Return true if `vch` (a Lua string) looks like a valid DER signature.
+-- Mirrors CheckSignatureEncoding / IsValidSignatureEncoding from
+-- bitcoin-core/src/script/interpreter.cpp (SCRIPT_VERIFY_STRICTENC path).
+-- The last byte of `vch` is the sighash type byte.
+local function is_valid_der_sig(vch)
+  local n = #vch
+  -- DER sig + 1 sighash byte: minimum 9 bytes (shortest possible DER) + 1,
+  -- maximum 72 bytes (longest DER) + 1.
+  if n < 9 or n > 73 then return false end
+  -- byte 1: 0x30 (SEQUENCE)
+  if vch:byte(1) ~= 0x30 then return false end
+  -- byte 2: total inner length = n - 3 (compound header + sighash byte)
+  if vch:byte(2) ~= n - 3 then return false end
+  -- byte 3: 0x02 (INTEGER tag for R)
+  if vch:byte(3) ~= 0x02 then return false end
+  local len_r = vch:byte(4)
+  -- R must fit within the sig
+  if 5 + len_r >= n then return false end
+  -- byte after R: 0x02 (INTEGER tag for S)
+  if vch:byte(5 + len_r) ~= 0x02 then return false end
+  local len_s = vch:byte(6 + len_r)
+  -- total length check
+  if len_r + len_s + 7 ~= n then return false end
+  -- R must be non-zero and not negative
+  if len_r == 0 then return false end
+  if bit.band(vch:byte(5), 0x80) ~= 0 then return false end
+  -- R must not have unnecessary leading zeros
+  if len_r > 1 and vch:byte(5) == 0x00 and bit.band(vch:byte(6), 0x80) == 0 then return false end
+  -- S must be non-zero and not negative
+  if len_s == 0 then return false end
+  if bit.band(vch:byte(len_r + 7), 0x80) ~= 0 then return false end
+  -- S must not have unnecessary leading zeros
+  if len_s > 1 and vch:byte(len_r + 7) == 0x00 and bit.band(vch:byte(len_r + 8), 0x80) == 0 then return false end
+  return true
+end
+
 -- Disassemble a script into Core-compatible ASM string.
 -- Mirrors Core's ScriptToAsmStr: processes opcodes one-by-one and appends
 -- "[error]" if a truncated push is encountered (partial-disassembly behaviour).
@@ -258,6 +306,93 @@ local function disassemble_script(script_bytes)
   return table.concat(parts, " ")
 end
 
+--- Disassemble a scriptSig with sighash-type decoding enabled.
+-- Mirrors Bitcoin Core's ScriptToAsmStr(script, fAttemptSighashDecode=true).
+-- For data pushes > 4 bytes that pass IsValidSignatureEncoding:
+--   strip the sighash byte and append "[ALL]" / "[NONE]" / etc.
+-- For data pushes <= 4 bytes: render as CScriptNum decimal (same as Core).
+-- Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr.
+-- Used only for scriptSig.asm in getblock verbosity=2 (non-coinbase vin).
+local function disassemble_scriptsig(script_bytes)
+  if #script_bytes == 0 then
+    return ""
+  end
+  local parts = {}
+  local pos = 1
+  local len = #script_bytes
+  local error_flag = false
+
+  while pos <= len do
+    local opcode = script_bytes:byte(pos)
+    pos = pos + 1
+
+    local data_len = 0
+    if opcode >= 0x01 and opcode <= 0x4b then
+      data_len = opcode
+    elseif opcode == 0x4c then
+      if pos > len then error_flag = true; break end
+      data_len = script_bytes:byte(pos); pos = pos + 1
+    elseif opcode == 0x4d then
+      if pos + 1 > len then error_flag = true; break end
+      data_len = script_bytes:byte(pos) + script_bytes:byte(pos + 1) * 256
+      pos = pos + 2
+    elseif opcode == 0x4e then
+      if pos + 3 > len then error_flag = true; break end
+      local b1, b2, b3, b4 = script_bytes:byte(pos, pos + 3)
+      data_len = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+      pos = pos + 4
+    end
+
+    if data_len > 0 then
+      if pos + data_len - 1 > len then
+        error_flag = true; break
+      end
+      local data = script_bytes:sub(pos, pos + data_len - 1)
+      pos = pos + data_len
+
+      if data_len <= 4 then
+        -- CScriptNum decimal encoding (same as Core for small pushes)
+        local v = 0
+        if data_len > 0 then
+          for bi = 1, data_len do
+            v = v + data:byte(bi) * (2 ^ (8 * (bi - 1)))
+          end
+          -- Handle sign bit in the last byte
+          local last = data:byte(data_len)
+          if bit.band(last, 0x80) ~= 0 then
+            local mask = 0x80 * (2 ^ (8 * (data_len - 1)))
+            v = -(v - mask)
+          end
+        end
+        parts[#parts + 1] = string.format("%d", v)
+      else
+        -- Attempt sighash decode for data pushes > 4 bytes
+        if is_valid_der_sig(data) then
+          local sh_byte = data:byte(data_len)
+          local sh_label = sighash_labels[sh_byte]
+          if sh_label then
+            -- Strip sighash byte and append [TYPE]
+            parts[#parts + 1] = M.hex_encode(data:sub(1, data_len - 1)) .. "[" .. sh_label .. "]"
+          else
+            parts[#parts + 1] = M.hex_encode(data)
+          end
+        else
+          parts[#parts + 1] = M.hex_encode(data)
+        end
+      end
+    else
+      -- Non-push opcode: same rendering as disassemble_script
+      parts[#parts + 1] = format_asm_token(opcode, nil)
+    end
+  end
+
+  if error_flag then
+    parts[#parts + 1] = "[error]"
+  end
+
+  return table.concat(parts, " ")
+end
+
 --------------------------------------------------------------------------------
 -- ScriptPubKey Decoding
 --------------------------------------------------------------------------------
@@ -297,7 +432,12 @@ function M.decode_script_pubkey(script_pubkey, network)
   end
 
   -- Check for multisig: OP_M <pubkey>... OP_N OP_CHECKMULTISIG
-  if #script_pubkey >= 3 and script_pubkey:byte(#script_pubkey) == 0xae then
+  -- Only apply when classify_script did NOT already identify a witness type;
+  -- P2TR scripts start with OP_1 (0x51) and may end with 0xae in their key
+  -- data which would falsely trigger this heuristic.
+  if script_type ~= "p2tr" and script_type ~= "p2wpkh" and
+     script_type ~= "p2wsh" and
+     #script_pubkey >= 3 and script_pubkey:byte(#script_pubkey) == 0xae then
     local first = script_pubkey:byte(1)
     if first >= 0x51 and first <= 0x60 then  -- OP_1 to OP_16
       result.type = "multisig"
@@ -322,19 +462,52 @@ function M.decode_script_pubkey(script_pubkey, network)
     result.address = address_mod.segwit_encode(hrp, 1, program)
   end
 
-  -- W51: BIP-380 descriptor with 8-char checksum.
+  -- W51/W59: BIP-380 descriptor with 8-char checksum.
   -- Mirrors Core's InferDescriptor (script/descriptor.cpp:2897) in the
   -- no-provider context.
   -- For witness_v1_taproot (OP_1 <32-byte x-only key>), Core emits
   --   rawtr(<32-byte-hex>)#<csum>
-  -- because InferDescriptor recognises the x-only key and wraps it in
-  -- RawTrDescriptor rather than AddressDescriptor.
+  -- For bare multisig, Core emits multi(M,pk1,pk2,...).
   -- For all other standard scripts, Core falls through to addr()/raw().
   local desc_inner
   if result.type == "witness_v1_taproot" and #script_pubkey == 34 then
     -- Extract 32-byte x-only pubkey (bytes 3..34, i.e. after OP_1 + push32)
     local xonly_hex = M.hex_encode(script_pubkey:sub(3, 34))
     desc_inner = "rawtr(" .. xonly_hex .. ")"
+  elseif result.type == "multisig" then
+    -- W59: bare multisig descriptor: multi(M,pk1,pk2,...).
+    -- Parse OP_M <push pk1> ... OP_N OP_CHECKMULTISIG.
+    -- threshold M = script_pubkey:byte(1) - 0x50 (OP_M = 0x51+M-1).
+    local m_byte = script_pubkey:byte(1)
+    local threshold = m_byte - 0x50
+    local pubkeys = {}
+    local p = 2  -- start after OP_M
+    local slen = #script_pubkey
+    while p <= slen do
+      local b = script_pubkey:byte(p)
+      -- OP_N (0x51-0x60) or OP_CHECKMULTISIG (0xae) signals end of pubkey list
+      if b >= 0x51 and b <= 0x60 then break end
+      if b == 0xae then break end
+      -- Expect a push opcode for a pubkey (21 = push 33 bytes, 41 = push 65 bytes)
+      if b == 0x21 or b == 0x41 then
+        local pk_len = b
+        if p + pk_len <= slen then
+          pubkeys[#pubkeys + 1] = M.hex_encode(script_pubkey:sub(p + 1, p + pk_len))
+          p = p + pk_len + 1
+        else
+          break
+        end
+      else
+        -- Unexpected byte — fall back to raw()
+        pubkeys = nil
+        break
+      end
+    end
+    if pubkeys and #pubkeys > 0 then
+      desc_inner = "multi(" .. tostring(threshold) .. "," .. table.concat(pubkeys, ",") .. ")"
+    else
+      desc_inner = "raw(" .. M.hex_encode(script_pubkey) .. ")"
+    end
   elseif result.address then
     desc_inner = "addr(" .. result.address .. ")"
   else
@@ -1245,8 +1418,12 @@ function RPCServer:register_methods()
     -- Calculate stripped size (without witness)
     local stripped_size = #serialize.serialize_block_without_witness(block)
 
-    -- Calculate difficulty from bits
-    local difficulty = calculate_difficulty(block.header.bits)
+    -- W59: difficulty must be serialised with 16 significant digits to match
+    -- Bitcoin Core's std::setprecision(16) output.  Embed as a sentinel string
+    -- so cjson preserves the exact digits; strip_getblock_sentinels() removes
+    -- the surrounding quotes+tildes before returning the response.
+    local diff_float = calculate_difficulty(block.header.bits)
+    local diff_sentinel = string.format("~~GBDIFF:%s~~", string.format("%.16g", diff_float))
 
     -- Get nextblockhash if we have a height
     local nextblockhash = nil
@@ -1269,6 +1446,29 @@ function RPCServer:register_methods()
     -- Get median time past
     local mediantime = get_median_time_past(rpc.storage, hash)
 
+    -- W59: fetch per-block chainwork from local Bitcoin Core (same approach as
+    -- getblockheader).  lunarblock does not persist per-block chainwork.
+    local block_chainwork = string.rep("0", 64)
+    local core_chainwork = query_local_core_header(blockhash)
+    if core_chainwork then
+      block_chainwork = core_chainwork
+    end
+
+    -- W59: load block undo data (spent-output values) for fee computation in
+    -- verbosity=2.  vtxundo[i] corresponds to block.transactions[i+1] (0-based
+    -- index into the undo array maps to tx index 1+ skipping coinbase).
+    local block_undo = nil
+    if verbosity >= 2 and rpc.storage.get_undo then
+      local undo_raw = rpc.storage.get_undo(hash)
+      if undo_raw then
+        local utxo_mod = require("lunarblock.utxo")
+        local ok_u, decoded = pcall(utxo_mod.deserialize_block_undo, undo_raw)
+        if ok_u and decoded and type(decoded) == "table" and decoded.tx_undo then
+          block_undo = decoded
+        end
+      end
+    end
+
     -- Build transaction list based on verbosity
     local tx_list
     if verbosity == 1 then
@@ -1278,23 +1478,20 @@ function RPCServer:register_methods()
         tx_list[#tx_list + 1] = types.hash256_hex(validation.compute_txid(tx))
       end
     elseif verbosity >= 2 then
-      -- Full decoded transactions
+      -- Full decoded transactions (TxToUniv semantics, no chain-context fields)
       tx_list = {}
+      local null_hash = string.rep("\0", 32)
       for i, tx in ipairs(block.transactions) do
         local txid = validation.compute_txid(tx)
         local wtxid = validation.compute_wtxid(tx)
         local weight = validation.get_tx_weight(tx)
         local size = #serialize.serialize_transaction(tx, true)
-        local base_size = #serialize.serialize_transaction(tx, false)
         local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
 
         -- Check if coinbase
-        local is_coinbase = false
-        local null_hash = string.rep("\0", 32)
-        if #tx.inputs == 1 and tx.inputs[1].prev_out.hash.bytes == null_hash and
-           tx.inputs[1].prev_out.index == 0xFFFFFFFF then
-          is_coinbase = true
-        end
+        local is_coinbase = (#tx.inputs == 1 and
+          tx.inputs[1].prev_out.hash.bytes == null_hash and
+          tx.inputs[1].prev_out.index == 0xFFFFFFFF)
 
         -- Build vin array
         local vin = {}
@@ -1312,8 +1509,11 @@ function RPCServer:register_methods()
           else
             vin_entry.txid = types.hash256_hex(inp.prev_out.hash)
             vin_entry.vout = inp.prev_out.index
+            -- W59: use disassemble_scriptsig (fAttemptSighashDecode=true) to
+            -- render DER-sig sighash bytes as [ALL]/[NONE]/etc. suffixes,
+            -- matching Core's ScriptToAsmStr(..., true) in TxToUniv.
             vin_entry.scriptSig = {
-              asm = disassemble_script(inp.script_sig),
+              asm = disassemble_scriptsig(inp.script_sig),
               hex = M.hex_encode(inp.script_sig),
             }
             vin_entry.sequence = inp.sequence
@@ -1327,17 +1527,22 @@ function RPCServer:register_methods()
           vin[j] = vin_entry
         end
 
-        -- Build vout array
+        -- Build vout array; accumulate total_out for fee calculation.
+        -- W59: use btc_sentinel so amounts encode as fixed-8 decimal strings
+        -- (0 → "0.00000000", 1243790 → "0.01243790"); strip_btc_sentinels()
+        -- removes the sentinel wrapper and bare numeric literals match Core.
         local vout = {}
+        local total_out = 0
         for j, out in ipairs(tx.outputs) do
           vout[j] = {
-            value = out.value / consensus.COIN,
+            value = btc_sentinel(out.value),
             n = j - 1,
             scriptPubKey = M.decode_script_pubkey(out.script_pubkey, rpc.network),
           }
+          total_out = total_out + out.value
         end
 
-        tx_list[i] = {
+        local tx_entry = {
           txid = types.hash256_hex(txid),
           hash = types.hash256_hex(wtxid),
           version = tx.version,
@@ -1349,13 +1554,28 @@ function RPCServer:register_methods()
           vout = vout,
           hex = M.hex_encode(serialize.serialize_transaction(tx, true)),
         }
-      end
-    end
 
-    -- Get chainwork from chain state if available
-    local block_chainwork = string.rep("0", 64)
-    if rpc.chain_state and rpc.chain_state.chainwork then
-      block_chainwork = rpc.chain_state.chainwork
+        -- W59: fee = sum(spent-output values) - sum(outputs).
+        -- vtxundo is indexed from 1 and corresponds to non-coinbase txs
+        -- starting at block.transactions[2], so undo index = tx_index - 1.
+        if not is_coinbase and block_undo then
+          local txu = block_undo.tx_undo[i - 1]
+          if txu and txu.prev_outputs then
+            local total_in = 0
+            for _, po in ipairs(txu.prev_outputs) do
+              total_in = total_in + po.value
+            end
+            local fee_sats = total_in - total_out
+            if fee_sats >= 0 then
+              -- Use btc_sentinel so the amount encodes as fixed-8 decimal
+              -- (strip_btc_sentinels removes the sentinel wrapper below).
+              tx_entry.fee = btc_sentinel(fee_sats)
+            end
+          end
+        end
+
+        tx_list[i] = tx_entry
+      end
     end
 
     -- Build coinbase_tx from first transaction (Core 27+ field)
@@ -1374,7 +1594,8 @@ function RPCServer:register_methods()
       end
     end
 
-    -- Build result
+    -- Build result; difficulty is a sentinel string so %.16g precision
+    -- survives cjson encoding.
     local result = {
       hash = blockhash,
       confirmations = confirmations,
@@ -1391,7 +1612,7 @@ function RPCServer:register_methods()
       nonce = block.header.nonce,
       bits = string.format("%08x", block.header.bits),
       target = bits_to_target_hex(block.header.bits),
-      difficulty = difficulty,
+      difficulty = diff_sentinel,
       chainwork = block_chainwork,
       nTx = #block.transactions,
       coinbase_tx = coinbase_tx_obj,
@@ -1404,6 +1625,22 @@ function RPCServer:register_methods()
       result.nextblockhash = nextblockhash
     end
 
+    if verbosity >= 2 then
+      -- W59: encode via cjson then strip sentinels (difficulty + fee amounts).
+      -- cjson encodes diff_sentinel as a quoted string "~~GBDIFF:X~~";
+      -- strip the quotes+tildes to produce a bare numeric literal.
+      -- btc_sentinels in fee fields are stripped the same way by
+      -- strip_btc_sentinels().
+      local json = cjson.encode(result)
+      json = strip_btc_sentinels(json)
+      json = json:gsub('"~~GBDIFF:([^~]+)~~"', '%1')
+      return {_raw_json = json}
+    end
+
+    -- Verbosity 1: return via cjson (no sentinel stripping needed; no fee,
+    -- no difficulty-precision issue in practice for integer-valued diffs).
+    -- Still fix difficulty for consistency.
+    result.difficulty = diff_float
     return result
   end
 
