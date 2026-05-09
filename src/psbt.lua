@@ -514,12 +514,22 @@ function M.deserialize(data)
         -- arbitrary fake transaction.  Mirror of bitcoin-core/src/psbt.cpp
         -- `PSBTInput::IsSane` — wire it on the deserialize path so the
         -- malformed PSBT is rejected before any signer touches it.  W41.
+        --
+        -- W46 fix: txid is the hash of the NON-witness serialization (BIP-141:
+        -- txid = hash(tx without segwit marker/flag/witness), wtxid = with).
+        -- Core's PSBTInput::IsSane calls `non_witness_utxo->GetHash()` which
+        -- uses the legacy (no-witness) serializer.  Hashing `entry.value`
+        -- directly fails for segwit-witness'd prev-txs because those bytes
+        -- include marker+flag+witness.  Round-trip through the deserializer
+        -- to strip those, then re-serialize with `include_witness=false`.
+        local prev_tx = serialize.deserialize_transaction(entry.value)
+        local nw_bytes = serialize.serialize_transaction(prev_tx, false)
         local expected_txid = psbt.tx.inputs[i].prev_out.hash.bytes
-        if not crypto.verify_non_witness_utxo_txid(entry.value, expected_txid) then
+        if not crypto.verify_non_witness_utxo_txid(nw_bytes, expected_txid) then
           error("PSBT non_witness_utxo txid mismatch at input " .. (i - 1) ..
                 " (prev_out.hash != hash256(serialize(non_witness_utxo)))")
         end
-        inp.non_witness_utxo = serialize.deserialize_transaction(entry.value)
+        inp.non_witness_utxo = prev_tx
 
       elseif key_type == M.IN_WITNESS_UTXO then
         assert(#entry.key == 1, "Invalid witness UTXO key")
