@@ -175,6 +175,113 @@ describe("PSBT W41 — finalizepsbt + NON_WITNESS_UTXO consistency", function()
       assert.is_false(crypto.verify_non_witness_utxo_txid(prev_bytes, "tooshort"))
     end)
 
+    -- W46 regression: the deserialize-path txid check used to hash the
+    -- raw `entry.value` bytes from the PSBT.  When the embedded prev-tx
+    -- carries a segwit marker+flag+witness, those bytes hash to wtxid,
+    -- not txid — so honest PSBTs failed decode with "txid mismatch".  The
+    -- fix routes through deserialize → re-serialize(include_witness=false)
+    -- before hashing.  This mirrors bitcoin-core PSBTInput::IsSane which
+    -- calls non_witness_utxo->GetHash() (the no-witness serializer).
+    --
+    -- See tools/psbt-byte-identity-corpus.json entries 2 and 3 for the
+    -- exact upstream fixture (rpc_psbt.json valid[0] full + valid[2]).
+    it("deserializer accepts a non_witness_utxo with embedded segwit witness (W46)", function()
+      -- Build a segwit prev-tx (marker+flag+witness items present).  Its
+      -- bytes-with-witness hash != txid, so a naive hash256(raw) would fail.
+      local prev_segwit = types.transaction(1,
+        { types.txin(types.outpoint(types.hash256(string.rep("\x77", 32)), 0),
+                     "", 0xffffffff) },
+        { types.txout(50000000,
+                      script_mod.make_p2pkh_script(string.rep("\x21", 20))) },
+        0)
+      prev_segwit.segwit = true
+      prev_segwit.inputs[1].witness = {
+        string.rep("\x33", 71),  -- pretend signature
+        string.rep("\x44", 33),  -- pretend pubkey
+      }
+      -- Sanity: the with-witness bytes really do differ from no-witness.
+      local with_w = serialize.serialize_transaction(prev_segwit, true)
+      local no_w   = serialize.serialize_transaction(prev_segwit, false)
+      assert.is_true(#with_w > #no_w)
+      assert.is_not.equal(crypto.hash256(with_w), crypto.hash256(no_w))
+
+      local prev_txid = validation.compute_txid(prev_segwit)
+      local outer = types.transaction(2,
+        { types.txin(types.outpoint(prev_txid, 0), "", 0xfffffffd) },
+        { types.txout(40000000,
+                      script_mod.make_p2pkh_script(string.rep("\x55", 20))) },
+        0)
+      local p = psbt_mod.new(outer)
+      p.inputs[1].non_witness_utxo = prev_segwit
+
+      -- Round-trip via PSBT.  lunarblock's PSBT serializer follows Core
+      -- (psbt.h:306 TX_NO_WITNESS) — it strips witness on the wire.  So
+      -- the round-tripped non_witness_utxo will not carry segwit data;
+      -- what we're testing is that decode SUCCEEDS in the first place.
+      -- Pre-W46, the to_base64 step was fine (it wrote no-witness bytes),
+      -- but then on re-decode the txid check still failed because *some*
+      -- producers (Core in particular: psbt.h:513 TX_WITH_WITNESS) emit
+      -- segwit-bearing non_witness_utxo blobs.  Simulate that case by
+      -- byte-injecting a with-witness blob into a hand-crafted PSBT.
+      local outer_bytes = serialize.serialize_transaction(outer, false)
+      local function vi(n)
+        if n < 0xfd then return string.char(n) end
+        if n < 0x10000 then return "\xfd" .. string.char(n % 256) .. string.char(math.floor(n/256)) end
+        error("varint too large for test")
+      end
+      local nw_bytes_with_witness = with_w  -- with marker+flag+witness
+      local hand_psbt =
+        "psbt\xff" ..
+        -- global map: PSBT_GLOBAL_UNSIGNED_TX (key=0x00) → outer_bytes
+        vi(1) .. "\x00" .. vi(#outer_bytes) .. outer_bytes ..
+        -- end of global map
+        "\x00" ..
+        -- input 0 map: PSBT_IN_NON_WITNESS_UTXO (key=0x00) → with-witness blob
+        vi(1) .. "\x00" .. vi(#nw_bytes_with_witness) .. nw_bytes_with_witness ..
+        "\x00" ..
+        -- output 0 map: empty
+        "\x00"
+      -- Sanity: len mod 3 → padded base64.
+      local hand_b64 = psbt_mod.base64_encode(hand_psbt)
+
+      local p_back
+      assert.has_no.errors(function() p_back = psbt_mod.from_base64(hand_b64) end)
+      assert.is_not_nil(p_back.inputs[1].non_witness_utxo)
+      -- The witness data round-trips at deserialize because Core (and
+      -- lunarblock post-W46) parses with TX_WITH_WITNESS on the wire.
+      assert.is_true(p_back.inputs[1].non_witness_utxo.segwit)
+      assert.equals(2, #p_back.inputs[1].non_witness_utxo.inputs[1].witness)
+    end)
+
+    it("deserializer still rejects a genuinely forged non_witness_utxo after W46", function()
+      -- Defenders-in-depth: prove the W46 round-trip fix did NOT
+      -- accidentally disable the IsSane check itself.  Same shape as the
+      -- forged-utxo test below, but specifically guards against a
+      -- "fix-deletes-the-check" regression.
+      local pkh = string.rep("\x66", 20)
+      local prev_real = types.transaction(2,
+        { types.txin(types.outpoint(types.hash256(string.rep("\xaa", 32)), 0),
+                     "", 0xffffffff) },
+        { types.txout(40000000, script_mod.make_p2pkh_script(pkh)) },
+        0)
+      local prev_real_txid = validation.compute_txid(prev_real)
+      local outer = types.transaction(2,
+        { types.txin(types.outpoint(prev_real_txid, 0), "", 0xfffffffd) },
+        { types.txout(35000000, script_mod.make_p2pkh_script(pkh)) },
+        0)
+      local prev_fake = types.transaction(2,
+        { types.txin(types.outpoint(types.hash256(string.rep("\xbb", 32)), 0),
+                     "", 0xffffffff) },
+        { types.txout(99999999, script_mod.make_p2pkh_script(pkh)) },
+        0)
+      local p_bad = psbt_mod.new(outer)
+      p_bad.inputs[1].non_witness_utxo = prev_fake
+      local bad_b64 = psbt_mod.to_base64(p_bad)
+      local ok, err = pcall(psbt_mod.from_base64, bad_b64)
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find("non_witness_utxo txid mismatch"))
+    end)
+
     it("psbt deserializer rejects a forged non_witness_utxo (CVE-2020-14199 family)", function()
       -- Construct a valid PSBT, then mutate the embedded non_witness_utxo
       -- so its hash no longer matches prev_out.hash.  Re-serialize and
