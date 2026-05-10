@@ -4913,6 +4913,129 @@ function RPCServer:register_methods()
     return addresses
   end
 
+  self.methods["createmultisig"] = function(rpc, params)
+    -- Suppress unused warning
+    local _ = rpc
+
+    local nrequired = params[1]
+    local pubkeys_param = params[2]
+    local address_type = params[3] or "legacy"
+
+    -- Validate nrequired
+    if type(nrequired) ~= "number" or math.floor(nrequired) ~= nrequired then
+      error({code = M.ERROR.INVALID_PARAMS, message = "nrequired must be an integer"})
+    end
+    nrequired = math.floor(nrequired)
+
+    -- Validate pubkeys array
+    if type(pubkeys_param) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "keys must be an array"})
+    end
+    local n = #pubkeys_param
+    if n == 0 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "keys array must not be empty"})
+    end
+    if nrequired < 1 or nrequired > n then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = string.format("nrequired (%d) must be between 1 and %d", nrequired, n)})
+    end
+    if n > 20 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Number of keys exceeds 20"})
+    end
+
+    -- Validate address_type
+    if address_type ~= "legacy" and address_type ~= "bech32" and address_type ~= "p2sh-segwit" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Invalid address_type '" .. tostring(address_type) .. "'. Must be legacy, bech32, or p2sh-segwit"})
+    end
+
+    -- Parse and validate each pubkey (must be hex, 33 bytes compressed)
+    local pubkey_bytes = {}
+    for i, hex in ipairs(pubkeys_param) do
+      if type(hex) ~= "string" then
+        error({code = M.ERROR.INVALID_PARAMS, message = string.format("Key %d must be a hex string", i - 1)})
+      end
+      if #hex ~= 66 or not hex:match("^[0-9a-fA-F]+$") then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = string.format("Key %d must be a compressed public key (33 bytes, 66 hex chars)", i - 1)})
+      end
+      local prefix = tonumber(hex:sub(1, 2), 16)
+      if prefix ~= 0x02 and prefix ~= 0x03 then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = string.format("Key %d is not a compressed public key (prefix must be 02 or 03)", i - 1)})
+      end
+      -- Decode hex → bytes
+      local bytes = {}
+      for j = 1, #hex, 2 do
+        bytes[#bytes + 1] = string.char(tonumber(hex:sub(j, j + 1), 16))
+      end
+      pubkey_bytes[i] = table.concat(bytes)
+    end
+
+    -- Build redeemScript: OP_M <push33 pk1> ... <push33 pkN> OP_N OP_CHECKMULTISIG
+    local parts = {}
+    parts[#parts + 1] = string.char(0x50 + nrequired)  -- OP_M (OP_1..OP_16)
+    for _, pk in ipairs(pubkey_bytes) do
+      parts[#parts + 1] = "\x21" .. pk  -- 0x21 = 33, push 33-byte compressed pubkey
+    end
+    parts[#parts + 1] = string.char(0x50 + n)  -- OP_N
+    parts[#parts + 1] = "\xae"                 -- OP_CHECKMULTISIG
+    local redeem_script = table.concat(parts)
+
+    -- Hex-encode redeemScript
+    local redeem_hex = {}
+    for k = 1, #redeem_script do
+      redeem_hex[k] = string.format("%02x", redeem_script:byte(k))
+    end
+    local redeem_script_hex = table.concat(redeem_hex)
+
+    -- Build multi() descriptor body (no wrapper): multi(M,hex1,hex2,...)
+    local pk_hex_list = {}
+    for i, hex in ipairs(pubkeys_param) do
+      pk_hex_list[i] = hex:lower()
+    end
+    local multi_inner = string.format("multi(%d,%s)", nrequired, table.concat(pk_hex_list, ","))
+
+    local crypto = require("lunarblock.crypto")
+    local network_name = "mainnet"
+
+    local address
+    local descriptor_body
+
+    if address_type == "legacy" then
+      -- sh(multi(M,...)) → P2SH; script_to_p2sh handles hash160 internally
+      address = address_mod.script_to_p2sh(redeem_script, network_name)
+      descriptor_body = "sh(" .. multi_inner .. ")"
+
+    elseif address_type == "bech32" then
+      -- wsh(multi(M,...)) → P2WSH
+      address = address_mod.script_to_p2wsh(redeem_script, network_name)
+      descriptor_body = "wsh(" .. multi_inner .. ")"
+
+    else
+      -- p2sh-segwit: sh(wsh(multi(M,...))) → P2SH-of-P2WSH
+      -- Inner witness script is the redeemScript; P2WSH witness program = sha256(redeemScript)
+      local witness_script_hash = crypto.sha256(redeem_script)
+      -- Build the P2WSH script (OP_0 <32-byte hash>) and P2SH it
+      local p2wsh_script = "\x00\x20" .. witness_script_hash  -- OP_0 PUSH32 <hash>
+      address = address_mod.script_to_p2sh(p2wsh_script, network_name)
+      descriptor_body = "sh(wsh(" .. multi_inner .. "))"
+    end
+
+    -- Add BIP-380 checksum
+    local checksum = address_mod.descriptor_checksum(descriptor_body)
+    if not checksum then
+      error({code = M.ERROR.MISC_ERROR, message = "Failed to compute descriptor checksum"})
+    end
+    local descriptor = descriptor_body .. "#" .. checksum
+
+    return {
+      address = address,
+      redeemScript = redeem_script_hex,
+      descriptor = descriptor,
+    }
+  end
+
   ----------------------------------------------------------------------------
   -- Multi-Wallet Management RPCs
   ----------------------------------------------------------------------------
