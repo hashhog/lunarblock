@@ -307,6 +307,39 @@ function M.reconcile_sketches(remote_sketch_bytes, local_txids, capacity)
 end
 
 --------------------------------------------------------------------------------
+-- Salt Combination (Bitcoin Core txreconciliation.cpp:ComputeSalt)
+--------------------------------------------------------------------------------
+
+--- Combine two Erlay salts using the same method as Bitcoin Core.
+-- Core uses TaggedHash("Tx Relay Salting") << LE64(min) << LE64(max) and
+-- extracts two uint64 values; we return only the first (k0) since short_txid
+-- uses k1=0.  Salts are sorted in ascending order before hashing to ensure
+-- both peers arrive at the same result regardless of which salt is "ours".
+-- This replaces the previous bit.bxor-of-lower-32-bits approach, which lost
+-- the upper 32 bits of both salts entirely.
+-- @param s1 number: first salt (up to 52-bit Lua number)
+-- @param s2 number: second salt (up to 52-bit Lua number)
+-- @return number: combined salt (first 8 bytes of tagged hash, as Lua number)
+function M.compute_combined_salt(s1, s2)
+  local w = serialize.buffer_writer()
+  -- Sort salts ascending so both peers produce the same hash
+  local lo, hi = math.min(s1, s2), math.max(s1, s2)
+  w.write_u64le(lo)
+  w.write_u64le(hi)
+  local salt_bytes = w.result()
+  -- Tagged hash: SHA256(SHA256("Tx Relay Salting") || SHA256("Tx Relay Salting") || payload)
+  local h = crypto.tagged_hash("Tx Relay Salting", salt_bytes)
+  -- Extract first 8 bytes as LE u64 (k0 for SipHash)
+  local result = 0
+  local factor = 1
+  for i = 1, 8 do
+    result = result + h:byte(i) * factor
+    factor = factor * 256
+  end
+  return result
+end
+
+--------------------------------------------------------------------------------
 -- Message Serialization (BIP330)
 --------------------------------------------------------------------------------
 
@@ -453,11 +486,10 @@ function M.negotiate(state, their_version, their_salt, our_salt, is_initiator)
   state.our_salt = our_salt
   state.is_initiator = is_initiator
 
-  -- Combined salt: XOR of both salts, ensures both parties contribute
-  state.combined_salt = bit.bxor(
-    tonumber(bit.band(their_salt, 0xFFFFFFFF)),
-    tonumber(bit.band(our_salt, 0xFFFFFFFF))
-  )
+  -- Combined salt: use tagged-hash combination (Core txreconciliation.cpp:ComputeSalt).
+  -- Previous code used bit.bxor of only the lower 32 bits, silently discarding
+  -- the upper 32 bits of both salts.
+  state.combined_salt = M.compute_combined_salt(their_salt, our_salt)
 end
 
 --- Check if it's time to initiate reconciliation.

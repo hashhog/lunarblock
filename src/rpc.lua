@@ -5173,7 +5173,8 @@ function RPCServer:register_methods()
       if rpc.wallet then
         return {""}
       end
-      return {}
+      -- cjson encodes empty Lua tables as {} (object); force [] for empty array.
+      return setmetatable({}, cjson.empty_array_mt)
     end
 
     return rpc.wallet_manager:list_wallets()
@@ -5327,7 +5328,7 @@ function RPCServer:register_methods()
     local include_unconfirmed = min_conf == 0
 
     local utxos = wallet:list_unspent(include_unconfirmed)
-    local result = {}
+    local result = setmetatable({}, cjson.empty_array_mt)
     for _, u in ipairs(utxos) do
       result[#result + 1] = {
         txid = u.txid,
@@ -6824,11 +6825,12 @@ function RPCServer:register_methods()
     -- If the wallet has a get_transactions method, use it
     if wallet.get_transactions then
       local txns = wallet:get_transactions(count, skip)
-      return txns or {}
+      if txns and #txns > 0 then return txns end
+      return setmetatable({}, cjson.empty_array_mt)
     end
 
-    -- Fallback: return empty list
-    return {}
+    -- Fallback: return empty list (cjson needs empty_array_mt to encode as []).
+    return setmetatable({}, cjson.empty_array_mt)
   end
 
   --- testmempoolaccept: Dry-run mempool validation for raw transactions.
@@ -7740,7 +7742,8 @@ function RPCServer:setup_w47b_methods()
     -- nTx (uint32 LE)
     local n_tx = r.read_u32le()
     if n_tx == 0 then
-      return {}
+      -- cjson encodes bare {} as object; force [] for empty txid array.
+      return setmetatable({}, cjson.empty_array_mt)
     end
 
     -- hash_count varint

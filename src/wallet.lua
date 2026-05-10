@@ -2060,7 +2060,8 @@ end
 --- Get list of loaded wallet names.
 -- @return table: Array of wallet names
 function WalletManager:list_wallets()
-  local names = {}
+  local cjson = require("cjson")
+  local names = setmetatable({}, cjson.empty_array_mt)
   for name, _ in pairs(self.wallets) do
     names[#names + 1] = name
   end

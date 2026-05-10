@@ -874,10 +874,10 @@ function Peer:process_messages()
         if self.erlay_salt > 0 then
           self.erlay_enabled = true
           self.erlay_version = math.min(rcncl.version, erlay.VERSION)
-          -- Combined salt: XOR of both salts
-          self.erlay_combined_salt = bit.bxor(
-            tonumber(bit.band(self.erlay_salt, 0xFFFFFFFF)),
-            tonumber(bit.band(self.erlay_their_salt, 0xFFFFFFFF))
+          -- Combined salt: tagged-hash combination matching Core's ComputeSalt.
+          -- Previous bit.bxor of lower-32-bits only silently discarded upper bits.
+          self.erlay_combined_salt = erlay.compute_combined_salt(
+            self.erlay_salt, self.erlay_their_salt
           )
         end
       end

@@ -307,7 +307,10 @@ local function get_median_time_past(storage, tip_hash)
   end
 
   table.sort(timestamps)
-  return timestamps[math.ceil(#timestamps / 2)]
+  -- Bitcoin Core: pbegin[(pend-pbegin)/2] (upper-middle for even n).
+  -- Lua 1-indexed equivalent: floor(n/2)+1.
+  local n = #timestamps
+  return timestamps[math.floor(n / 2) + 1]
 end
 
 --- build_deployment_state: buried-softfork projection.
