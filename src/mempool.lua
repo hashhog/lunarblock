@@ -27,7 +27,11 @@ local function get_tip_mtp(chain_state)
   end
   if #timestamps == 0 then return os.time() end
   table.sort(timestamps)
-  return timestamps[math.ceil(#timestamps / 2)]
+  -- Bitcoin Core: pbegin[(pend-pbegin)/2] (0-indexed, integer division picks
+  -- upper-middle for even n).  Lua 1-indexed: floor(n/2)+1.
+  -- math.ceil(n/2) is wrong for even n (picks lower-middle).
+  local n = #timestamps
+  return timestamps[math.floor(n / 2) + 1]
 end
 
 -- Cluster mempool: union-find for tracking transaction clusters
