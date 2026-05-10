@@ -183,6 +183,13 @@ M.REPLACEMENT_MIN_FEE_BUMP = 1000 -- Minimum fee increase for RBF (sat/KB)
 -- 4_000_000), but a node treats them as non-standard at relay time.
 M.MAX_STANDARD_TX_WEIGHT = 400000
 
+-- Maximum sigop cost for a standard transaction (Bitcoin Core policy/policy.h:44).
+-- = MAX_BLOCK_SIGOPS_COST / 5 = 80000 / 5 = 16000.
+-- Transactions whose total sigop cost (legacy*4 + P2SH*4 + witness*1) exceeds
+-- this value are rejected at relay with "bad-txns-too-many-sigops".
+-- Reference: bitcoin-core/src/validation.cpp:941-943.
+M.MAX_STANDARD_TX_SIGOPS_COST = 16000
+
 -- CVE-2017-12842 minimum non-witness size (Bitcoin Core policy/policy.h:40).
 -- Transactions whose non-witness serialization is < 65 bytes can be used
 -- to construct inner-merkle-node collisions in SPV proofs.  Core rejects
@@ -750,6 +757,27 @@ function Mempool:accept_transaction(tx, allow_rbf)
   local wit_ok, wit_err = M.is_witness_standard(tx, resolved_utxos)
   if not wit_ok then
     return false, wit_err
+  end
+
+  -- 3d. Sigop cost gate (Bitcoin Core validation.cpp:908,941-943).
+  -- GetTransactionSigOpCost with STANDARD_SCRIPT_VERIFY_FLAGS (P2SH+witness).
+  -- Transactions whose total sigop cost exceeds MAX_STANDARD_TX_SIGOPS_COST
+  -- (16000 = MAX_BLOCK_SIGOPS_COST/5) are rejected with "bad-txns-too-many-sigops".
+  -- Reference: bitcoin-core/src/validation.cpp:908+941-943.
+  do
+    local inp_to_resolved = {}
+    for i, inp in ipairs(tx.inputs) do
+      inp_to_resolved[inp] = resolved_utxos[i]
+    end
+    local function get_prev_for_sigops(inp)
+      return inp_to_resolved[inp]
+    end
+    local sigop_flags = { verify_p2sh = true, verify_witness = true }
+    local tx_sigop_cost = validation.get_transaction_sigop_cost(tx, get_prev_for_sigops, sigop_flags)
+    if tx_sigop_cost > M.MAX_STANDARD_TX_SIGOPS_COST then
+      return false, string.format("bad-txns-too-many-sigops: sigop cost %d > %d",
+        tx_sigop_cost, M.MAX_STANDARD_TX_SIGOPS_COST)
+    end
   end
 
   -- 4. Check P2A (anchor) output policy

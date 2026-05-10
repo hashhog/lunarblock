@@ -1986,9 +1986,14 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     end
   end
 
-  -- Flags for sigop counting (depends on height)
+  -- Flags for sigop counting (depends on height).
+  -- Bitcoin Core validation.cpp GetBlockScriptFlags: P2SH is always enabled
+  -- (Core comment: "For simplicity, always leave P2SH+WITNESS+TAPROOT on
+  -- except for the two violating blocks").  Using bip34_height here was wrong
+  -- — P2SH activated at block 173,805, long before BIP34 (227,931).
+  -- Reference: bitcoin-core/src/validation.cpp:2260-2262.
   local sigop_flags = {
-    verify_p2sh = height >= self.network.bip34_height,
+    verify_p2sh = true,
     verify_witness = height >= self.network.segwit_height,
   }
 
@@ -2138,8 +2143,11 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           -- verify_nullfail and verify_witness_pubkeytype are policy-only
           -- (STANDARD_SCRIPT_VERIFY_FLAGS per Bitcoin Core policy/policy.h:125,128)
           -- and must NOT be set in the block-connect validation path.
+          -- P2SH: always enabled per GetBlockScriptFlags (Core validation.cpp:2260-2262).
+          -- Using bip34_height here was wrong — P2SH activated at block 173,805,
+          -- long before BIP34 (227,931).
           local flags = {
-            verify_p2sh = height >= self.network.bip34_height,
+            verify_p2sh = true,
             verify_dersig = height >= self.network.bip66_height,
             verify_checklocktimeverify = height >= self.network.bip65_height,
             verify_checksequenceverify = height >= self.network.csv_height,
