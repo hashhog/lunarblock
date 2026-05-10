@@ -207,6 +207,182 @@ M.MAX_PACKAGE_VSIZE = 101000             -- Max total vsize (weight / 4)
 -- Pay-to-Anchor (P2A) Constants
 M.ANCHOR_AMOUNT = 0                      -- P2A outputs must have zero value
 
+-- IsWitnessStandard limits (Bitcoin Core policy/policy.h).
+-- P2WSH redeem script size limit (Core policy/policy.h:56).
+M.MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600
+-- P2WSH stack item count limit, excluding the redeem script itself (policy.h:58).
+M.MAX_STANDARD_P2WSH_STACK_ITEMS = 100
+-- P2WSH stack item size limit per element (policy.h:60).
+M.MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80
+-- Tapscript (leaf version 0xc0) stack item size limit (policy.h:62).
+M.MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80
+-- Annex tag: witness stack element starting with 0x50 is an annex (BIP 341).
+M.ANNEX_TAG = 0x50
+-- Taproot leaf version mask (BIP 341).
+M.TAPROOT_LEAF_MASK = 0xfe
+-- Tapscript leaf version (BIP 342).
+M.TAPROOT_LEAF_TAPSCRIPT = 0xc0
+
+--------------------------------------------------------------------------------
+-- IsWitnessStandard (Bitcoin Core policy/policy.cpp:265-352)
+--------------------------------------------------------------------------------
+
+--- Check whether the witness data for each input of a transaction is standard.
+-- This enforces the 6 policy gates from Bitcoin Core IsWitnessStandard():
+--   Gate 1: P2A input with non-empty witness → reject (bad-witness-nonstandard).
+--   Gate 2: P2SH-wrapped witness — extract redeemScript; fail if parse fails or
+--            stack is empty (mirrors EvalScript with SCRIPT_VERIFY_NONE).
+--   Gate 3: non-witness prevScript paired with non-empty witness → reject.
+--   Gate 4: P2WSH (v0, 32-byte program) limits:
+--            redeem script ≤ 3600 B; stack items ≤ 100; each item ≤ 80 B.
+--   Gate 5: P2TR (v1, 32-byte program, non-P2SH-wrapped):
+--            annex (0x50 prefix) → reject; tapscript leaf (0xc0) → each element ≤ 80 B;
+--            empty stack → reject.
+--   Gate 6: coinbase is exempt (checked by caller — coinbase is skipped before this).
+--
+-- @param tx      transaction: the transaction to check.
+-- @param utxos   table[i] = {script_pubkey=string, ...}: resolved prevouts keyed 1..#tx.inputs.
+--                A nil entry means the input was missing — caller must not call this function
+--                when inputs are missing (we skip nil entries for safety).
+-- @return boolean, string: true if standard; false + reason string if not.
+-- Reference: Bitcoin Core policy/policy.cpp:265-352.
+function M.is_witness_standard(tx, utxos)
+  for i, inp in ipairs(tx.inputs) do
+    -- Skip inputs with no witness data (Core: "We don't care if witness for
+    -- this input is empty, since it must not be bloated.")
+    local witness = inp.witness  -- array of byte-strings, or nil
+    if witness and #witness > 0 then
+      local utxo = utxos[i]
+      if not utxo then
+        -- Missing UTXO: cannot evaluate. Treat as non-standard for safety.
+        return false, "bad-witness-nonstandard"
+      end
+
+      local prev_script = utxo.script_pubkey
+      local script_type = script_mod.classify_script(prev_script)
+
+      -- Gate 1: P2A input with any witness → reject (witness stuffing).
+      -- Reference: Core policy.cpp:283-285.
+      if script_type == "p2a" then
+        return false, "bad-witness-nonstandard"
+      end
+
+      local is_p2sh = (script_type == "p2sh")
+      if is_p2sh then
+        -- Gate 2: P2SH-wrapped witness path.
+        -- Extract the redeemScript from the scriptSig push stack.
+        -- Core does EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE, ...).
+        -- We replicate the push-execution: parse the scriptSig as push-only
+        -- and collect the pushed data items onto a stack, then take the top.
+        -- Reference: Core policy.cpp:288-298.
+        local script_sig = inp.script_sig or ""
+        local stack = {}
+        local ok_parse, ops = pcall(script_mod.parse_script, script_sig)
+        if not ok_parse then
+          return false, "bad-witness-nonstandard"
+        end
+        for _, op in ipairs(ops) do
+          if op.data then
+            -- push opcode: push data onto stack
+            stack[#stack + 1] = op.data
+          elseif op.opcode == 0x00 then
+            -- OP_0: push empty byte vector
+            stack[#stack + 1] = ""
+          elseif op.opcode >= 0x51 and op.opcode <= 0x60 then
+            -- OP_1..OP_16: push minimal encoding of 1..16
+            local n = op.opcode - 0x50
+            stack[#stack + 1] = string.char(n)
+          elseif op.opcode == 0x4f then
+            -- OP_1NEGATE: push minimal encoding of -1
+            stack[#stack + 1] = "\x81"
+          else
+            -- Non-push opcode: EvalScript with SCRIPT_VERIFY_NONE would
+            -- execute it, but for our purposes (extracting the redeemScript)
+            -- we treat non-pushes as a failure (Core's EvalScript would
+            -- not fail on NOPs etc., but Core also checks IsPushOnly later;
+            -- the key invariant is: if EvalScript fails → return false).
+            return false, "bad-witness-nonstandard"
+          end
+        end
+        if #stack == 0 then
+          return false, "bad-witness-nonstandard"
+        end
+        -- The redeemScript is the top stack element.
+        prev_script = stack[#stack]
+      end
+
+      -- Gate 3: non-witness prevScript with non-empty witness → reject.
+      -- Reference: Core policy.cpp:304-306 ("Non-witness program must not be
+      -- associated with any witness").
+      local wit_version, wit_program = script_mod.is_witness_program(prev_script)
+      if not wit_version then
+        return false, "bad-witness-nonstandard"
+      end
+
+      -- Gate 4: P2WSH (v0, 32-byte program) limits.
+      -- Reference: Core policy.cpp:308-319.
+      if wit_version == 0 and #wit_program == 32 then
+        -- The last witness stack element is the serialized witness script.
+        local ws = witness[#witness]
+        if #ws > M.MAX_STANDARD_P2WSH_SCRIPT_SIZE then
+          return false, "bad-witness-nonstandard"
+        end
+        local n_stack = #witness - 1  -- stack items excluding the script
+        if n_stack > M.MAX_STANDARD_P2WSH_STACK_ITEMS then
+          return false, "bad-witness-nonstandard"
+        end
+        for j = 1, n_stack do
+          if #witness[j] > M.MAX_STANDARD_P2WSH_STACK_ITEM_SIZE then
+            return false, "bad-witness-nonstandard"
+          end
+        end
+      end
+
+      -- Gate 5: P2TR (v1, 32-byte program, NOT P2SH-wrapped).
+      -- Reference: Core policy.cpp:321-349.
+      if wit_version == 1 and #wit_program == 32 and not is_p2sh then
+        local stack = witness  -- array 1..N
+
+        -- Annex detection: if ≥2 elements and last element starts with 0x50.
+        if #stack >= 2 and #stack[#stack] >= 1
+           and stack[#stack]:byte(1) == M.ANNEX_TAG then
+          -- Annexes are nonstandard (BIP 341; no semantics defined yet).
+          return false, "bad-witness-nonstandard"
+        end
+
+        if #stack >= 2 then
+          -- Script-path spend.
+          -- Peel the control block (last element of stack after removing annex).
+          local control_block = stack[#stack]
+          -- stack without last element for item-size check:
+          local n_items = #stack - 2  -- items before script and control block
+          if #control_block == 0 then
+            return false, "bad-witness-nonstandard"
+          end
+          -- Check leaf version: (control_block[0] & TAPROOT_LEAF_MASK).
+          if bit.band(control_block:byte(1), M.TAPROOT_LEAF_MASK)
+             == M.TAPROOT_LEAF_TAPSCRIPT then
+            -- Tapscript: every remaining stack element must be ≤ 80 bytes.
+            for j = 1, n_items do
+              if #stack[j] > M.MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE then
+                return false, "bad-witness-nonstandard"
+              end
+            end
+          end
+        elseif #stack == 1 then
+          -- Key-path spend: no policy limits beyond annex (already checked).
+          -- (no-op)
+        else
+          -- 0 stack elements: already invalid by consensus; reject as nonstandard.
+          -- Reference: Core policy.cpp:345-348.
+          return false, "bad-witness-nonstandard"
+        end
+      end
+    end  -- if witness non-empty
+  end
+  return true
+end
+
 --------------------------------------------------------------------------------
 -- BIP125 RBF Signaling
 --------------------------------------------------------------------------------
@@ -496,6 +672,8 @@ function Mempool:accept_transaction(tx, allow_rbf)
   -- Per-input UTXO heights for BIP-68 sequence lock checks (step 3b).
   -- Mempool-parent inputs use synthetic height tipHeight+1 (Core convention).
   local input_heights = {}  -- indexed 1..#tx.inputs
+  -- Resolved prevouts for IsWitnessStandard (step 3c).
+  local resolved_utxos = {}  -- indexed 1..#tx.inputs
 
   for i, inp in ipairs(tx.inputs) do
     local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
@@ -533,6 +711,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
     end
 
     if utxo then
+      resolved_utxos[i] = utxo
       input_total = input_total + utxo.value
       -- Coinbase maturity
       if utxo.is_coinbase then
@@ -550,6 +729,16 @@ function Mempool:accept_transaction(tx, allow_rbf)
 
   if missing_inputs then
     return false, "missing inputs"
+  end
+
+  -- 3c. IsWitnessStandard (Bitcoin Core policy/policy.cpp:265-352).
+  -- Enforces witness policy gates for each input: P2A stuffing rejection,
+  -- P2SH-wrapped witness redeemScript extraction, non-witness/witness pairing,
+  -- P2WSH size/count limits, P2TR annex and tapscript item-size limits.
+  -- Coinbase exempt — guaranteed non-coinbase by step 2 above.
+  local wit_ok, wit_err = M.is_witness_standard(tx, resolved_utxos)
+  if not wit_ok then
+    return false, wit_err
   end
 
   -- 4. Check P2A (anchor) output policy
