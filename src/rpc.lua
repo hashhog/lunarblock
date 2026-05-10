@@ -1969,7 +1969,17 @@ function RPCServer:register_methods()
 
   self.methods["getrawtransaction"] = function(rpc, params)
     local txid_hex = params[1]
-    local verbose = params[2] or false
+    -- W60: parse verbosity as integer 0/1/2 (not just bool).
+    --   false / 0        → 0 (raw hex)
+    --   true  / 1        → 1 (verbose JSON, no prevout)
+    --   2                → 2 (verbose JSON + per-vin prevout + fee)
+    local verbosity = 0
+    local vp = params[2]
+    if vp == true or vp == 1 then
+      verbosity = 1
+    elseif vp == 2 then
+      verbosity = 2
+    end
     local blockhash_hex = params[3]
 
     -- Validate txid parameter
@@ -2077,7 +2087,7 @@ function RPCServer:register_methods()
     end
 
     -- Non-verbose: return raw hex
-    if not verbose then
+    if verbosity == 0 then
       return M.hex_encode(serialize.serialize_transaction(tx, true))
     end
 
@@ -2089,6 +2099,34 @@ function RPCServer:register_methods()
     local txid = validation.compute_txid(tx)
     local wtxid = validation.compute_wtxid(tx)
 
+    -- W60: load undo data for verbosity=2 prevout enrichment + fee.
+    -- Same pattern as W59 getblock verbosity=2: get_undo → deserialize_block_undo.
+    -- block_undo is nil if unavailable; prevout enrichment degrades gracefully.
+    local block_undo = nil
+    local tx_in_block_idx = nil  -- 0-based index of this tx in block.transactions
+    if verbosity >= 2 and found_blockhash and block and rpc.storage and rpc.storage.get_undo then
+      local bh_bytes = types.hash256_from_hex(found_blockhash)
+      local undo_raw = rpc.storage.get_undo(bh_bytes)
+      if undo_raw then
+        local utxo_mod = require("lunarblock.utxo")
+        local ok_u, decoded = pcall(utxo_mod.deserialize_block_undo, undo_raw)
+        if ok_u and decoded and type(decoded) == "table" and decoded.tx_undo then
+          block_undo = decoded
+        end
+      end
+      -- Find the 0-based index of this tx in the block for undo indexing.
+      if block then
+        local null_hash_b = string.rep("\0", 32)
+        for idx, btx in ipairs(block.transactions) do
+          local btx_txid_hex = types.hash256_hex(validation.compute_txid(btx))
+          if btx_txid_hex == txid_hex then
+            tx_in_block_idx = idx - 1  -- convert to 0-based
+            break
+          end
+        end
+      end
+    end
+
     -- Build vin array
     local vin = {}
     local is_coinbase = false
@@ -2097,6 +2135,8 @@ function RPCServer:register_methods()
        tx.inputs[1].prev_out.index == 0xFFFFFFFF then
       is_coinbase = true
     end
+
+    local total_in = 0   -- accumulated for fee (verbosity=2 only)
 
     for i, inp in ipairs(tx.inputs) do
       local vin_entry = {}
@@ -2113,7 +2153,7 @@ function RPCServer:register_methods()
         vin_entry.txid = types.hash256_hex(inp.prev_out.hash)
         vin_entry.vout = inp.prev_out.index
         vin_entry.scriptSig = {
-          asm = disassemble_script(inp.script_sig),
+          asm = disassemble_scriptsig(inp.script_sig),
           hex = M.hex_encode(inp.script_sig),
         }
         vin_entry.sequence = inp.sequence
@@ -2123,18 +2163,39 @@ function RPCServer:register_methods()
             vin_entry.txinwitness[j] = M.hex_encode(wit)
           end
         end
+
+        -- W60: per-vin prevout enrichment (verbosity=2).
+        -- undo index: tx_in_block_idx is 1-based in block (coinbase = idx 1),
+        -- so undo index = tx_in_block_idx - 1 (block_undo.tx_undo is 0-indexed
+        -- for non-coinbase txs, i.e. tx_undo[1] = block.txs[2]'s spent inputs).
+        if verbosity >= 2 and block_undo and tx_in_block_idx and tx_in_block_idx >= 1 then
+          local txu = block_undo.tx_undo[tx_in_block_idx]
+          if txu and txu.prev_outputs and txu.prev_outputs[i] then
+            local po = txu.prev_outputs[i]
+            total_in = total_in + po.value
+            vin_entry.prevout = {
+              generated = po.is_coinbase and true or false,
+              height = po.height,
+              value = btc_sentinel(po.value),
+              scriptPubKey = M.decode_script_pubkey(po.script_pubkey, rpc.network),
+            }
+          end
+        end
       end
       vin[i] = vin_entry
     end
 
     -- Build vout array
+    -- W60: use btc_sentinel for value (fixed-8 decimal precision, same as W59 getblock).
     local vout = {}
+    local total_out = 0
     for i, out in ipairs(tx.outputs) do
       vout[i] = {
-        value = out.value / consensus.COIN,
+        value = btc_sentinel(out.value),
         n = i - 1,
         scriptPubKey = M.decode_script_pubkey(out.script_pubkey, rpc.network),
       }
+      total_out = total_out + out.value
     end
 
     -- Build result
@@ -2151,8 +2212,43 @@ function RPCServer:register_methods()
       hex = M.hex_encode(serialize.serialize_transaction(tx, true)),
     }
 
+    -- W60: fee (verbosity=2, non-coinbase, undo data available).
+    if verbosity >= 2 and not is_coinbase and block_undo and tx_in_block_idx and tx_in_block_idx >= 1 then
+      local txu = block_undo.tx_undo[tx_in_block_idx]
+      if txu and txu.prev_outputs and #txu.prev_outputs > 0 then
+        local fee_sats = total_in - total_out
+        if fee_sats >= 0 then
+          result.fee = btc_sentinel(fee_sats)
+        end
+      end
+    end
+
     -- Add block info if transaction is confirmed
     if found_blockhash then
+      -- W60: in_active_chain (verbosity=2 with explicit blockhash).
+      if verbosity >= 2 and blockhash_hex then
+        result.in_active_chain = true
+        if rpc.chain_state and rpc.chain_state.tip_height then
+          -- Verify block is actually in active chain by checking height→hash mapping.
+          if block_height and rpc.storage then
+            -- check if canonical hash at this height matches.
+            local canon_hash_data = rpc.storage.get and
+              rpc.storage.get("height", string.char(
+                math.floor(block_height / 16777216) % 256,
+                math.floor(block_height / 65536) % 256,
+                math.floor(block_height / 256) % 256,
+                block_height % 256
+              ))
+            -- If we can verify, do so; otherwise default true (Core does not emit
+            -- in_active_chain=false unless called with wrong blockhash context).
+            if canon_hash_data then
+              local canon_hash_hex = M.hex_encode(canon_hash_data):sub(1, 64)
+              result.in_active_chain = (canon_hash_hex == found_blockhash)
+            end
+          end
+        end
+      end
+
       result.blockhash = found_blockhash
       if block_time then
         result.time = block_time
@@ -2192,7 +2288,18 @@ function RPCServer:register_methods()
       end
     end
 
-    return result
+    -- W60: verbosity=2 encodes via cjson + strip_btc_sentinels so that
+    -- btc_sentinel() wrappers in vout.value, prevout.value, and fee become
+    -- bare fixed-8 decimal literals (matching Core's TxToUniv format).
+    if verbosity >= 2 then
+      local json = strip_btc_sentinels(cjson.encode(result))
+      return {_raw_json = json}
+    end
+
+    -- verbosity=1: cjson encodes directly (vout.value was btc_sentinel but
+    -- strip is still needed for that path too).
+    local json = strip_btc_sentinels(cjson.encode(result))
+    return {_raw_json = json}
   end
 
   self.methods["decoderawtransaction"] = function(rpc, params)
