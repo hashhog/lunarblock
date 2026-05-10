@@ -39,9 +39,20 @@ local uf_parent = {}
 local uf_rank = {}
 
 local function uf_find(x)
-  while uf_parent[x] ~= x do
-    uf_parent[x] = uf_parent[uf_parent[x]]
+  if x == nil then return nil end
+  -- Path-compression walk.  If a parent entry was removed (uf_parent[x] == nil
+  -- but x itself is non-nil) the node became an orphan root; re-anchor it.
+  while uf_parent[x] ~= nil and uf_parent[x] ~= x do
+    local grandparent = uf_parent[uf_parent[x]]
+    if grandparent ~= nil then
+      uf_parent[x] = grandparent  -- path compression
+    end
     x = uf_parent[x]
+  end
+  -- Re-root an orphaned node so future calls are O(1).
+  if uf_parent[x] == nil then
+    uf_parent[x] = x
+    uf_rank[x] = uf_rank[x] or 0
   end
   return x
 end
@@ -830,7 +841,35 @@ function Mempool:accept_transaction(tx, allow_rbf)
         eviction_count, M.MAX_REPLACEMENT_CANDIDATES)
     end
 
-    -- BIP125 Rule #3: New tx must pay higher fee than all conflicting txs combined
+    -- EntriesAndTxidsDisjoint (rbf.cpp:85-98): the replacement tx's in-mempool
+    -- ancestors must not overlap with the direct conflict set.  This prevents
+    -- a replacement from being a descendant of one of the transactions it is
+    -- trying to evict (cyclic replacement).  Ancestors are collected here,
+    -- before conflicts are removed from the mempool, so the check is valid.
+    do
+      local repl_ancestors = {}
+      for _, inp in ipairs(tx.inputs) do
+        local prev_hex = types.hash256_hex(inp.prev_out.hash)
+        local parent = self.entries[prev_hex]
+        if parent then
+          repl_ancestors[prev_hex] = true
+          for anc_hex in pairs(parent.ancestors) do
+            repl_ancestors[anc_hex] = true
+          end
+        end
+      end
+      for anc_hex in pairs(repl_ancestors) do
+        if conflicts[anc_hex] then
+          return false, string.format(
+            "replacement tx %s spends conflicting transaction %s",
+            types.hash256_hex(validation.compute_txid(tx)), anc_hex)
+        end
+      end
+    end
+
+    -- BIP125 Rule #3: Replacement fees must be >= original fees (rbf.cpp:109).
+    -- Equal fees satisfy Rule #3; Rule #4 then enforces the incremental relay
+    -- fee.  Core uses strict less-than here, not less-than-or-equal.
     local conflicting_fees = 0
     for conflict_hex in pairs(all_conflicts) do
       local entry = self.entries[conflict_hex]
@@ -838,8 +877,8 @@ function Mempool:accept_transaction(tx, allow_rbf)
         conflicting_fees = conflicting_fees + entry.fee
       end
     end
-    if fee <= conflicting_fees then
-      return false, string.format("replacement fee not higher than conflicting txs: %d <= %d",
+    if fee < conflicting_fees then
+      return false, string.format("replacement fee not higher than conflicting txs: %d < %d",
         fee, conflicting_fees)
     end
 
@@ -852,21 +891,32 @@ function Mempool:accept_transaction(tx, allow_rbf)
         additional_fee, required_additional)
     end
 
-    -- BIP125 Rule #2: New tx must not add new unconfirmed inputs
-    -- (spends only confirmed outputs or outputs from transactions being replaced)
-    -- First, collect txids being replaced
-    local replaced_txids = {}
-    for conflict_hex in pairs(all_conflicts) do
-      replaced_txids[conflict_hex] = true
+    -- BIP125 Rule #2: The replacement may only include an unconfirmed input if
+    -- that specific outpoint (txid:vout) was already an input of one of the
+    -- conflicting transactions.  We collect all (txid, vout) outpoints that
+    -- appear in any conflicting tx and use that as the allowed set.
+    -- Reference: BIP 125 rule 2; old Core src/validation.cpp HasNoNewUnconfirmed.
+    local conflict_input_outpoints = {}  -- "txhex:vout" → true
+    for conflict_hex in pairs(conflicts) do   -- only direct conflicts, not descendants
+      local ce = self.entries[conflict_hex]
+      if ce then
+        for _, inp in ipairs(ce.tx.inputs) do
+          local k = types.hash256_hex(inp.prev_out.hash) .. ":" .. inp.prev_out.index
+          conflict_input_outpoints[k] = true
+        end
+      end
     end
 
-    -- Check each input of the new transaction
+    -- Check each input of the replacement tx
     for _, inp in ipairs(tx.inputs) do
       local prev_hex = types.hash256_hex(inp.prev_out.hash)
       local prev_entry = self.entries[prev_hex]
-      -- If input references a mempool tx that is NOT being replaced, reject
-      if prev_entry and not replaced_txids[prev_hex] then
-        return false, "replacement adds new unconfirmed input"
+      if prev_entry then
+        -- This input spends an unconfirmed mempool UTXO.
+        local outpoint_key = prev_hex .. ":" .. inp.prev_out.index
+        if not conflict_input_outpoints[outpoint_key] then
+          return false, "replacement adds new unconfirmed input"
+        end
       end
     end
 
