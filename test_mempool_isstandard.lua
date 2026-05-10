@@ -208,6 +208,133 @@ do
   end
 end
 
+-- ── Part 6: CVE-2017-12842 — non-witness size >= 65 bytes ───────────────────
+
+print("\n=== Part 6: CVE-2017-12842 tx-size-small gate ===")
+
+-- The minimum standard non-witness tx size is 65 bytes.
+-- A 1-in / 1-out tx with empty scriptSig and a 25-byte P2PKH output has:
+--   4 (version) + 1 (vin count) + 41 (input: 32+4+1+0+4) +
+--   1 (vout count) + 8+1+25 (output) + 4 (locktime) = 85 bytes → accepted.
+-- We need to get BELOW 65.  A minimal tx: 1-in / 0-out is too degenerate
+-- (fails check_transaction "no outputs").  Instead, build a tx with a
+-- P2PKH output carrying a tiny (1-byte) scriptPubKey — that won't pass
+-- classify_script, so craft one that will, but shrink inputs.
+-- Easiest: use 0-byte scriptSig and an outpoint that still makes the
+-- non-witness size < 65.  Actually the minimal valid structure we can
+-- get to: 4+1+41+1+9+4 = 60 bytes → below 65, so it should be rejected.
+-- Build that tx manually: 1 input (prev 32-byte hash + 4-byte index +
+-- 1-byte empty scriptSig len + 4-byte sequence) = 41 bytes of input.
+-- 1 output: 8-byte value + 1-byte empty scriptPubKey len = 9 bytes.
+-- Total: 4+1+41+1+9+4 = 60 bytes.  Use a degenerate 1-byte nulldata output:
+-- 0x6a (just OP_RETURN, valid nulldata, 1 byte) → 8+1+1 = 10 byte vout.
+-- Non-witness size: 4+1+41+1+10+4 = 61 bytes < 65 → tx-size-small.
+do
+  local base_txid = types.hash256(string.rep("\x40", 32))
+  local base_txid_hex = types.hash256_hex(base_txid)
+  local cs = make_mock_chain()
+  -- Provide a UTXO for our input so the tx doesn't fail on "missing inputs".
+  -- The output we use: 1-byte nulldata OP_RETURN (0x6a), value 1000000.
+  add_utxo(cs, base_txid_hex, 0, 1000000, "\x6a")
+
+  local mp = mempool.new(cs)
+
+  -- Build a tx whose non-witness serialization is < 65 bytes.
+  -- Input: empty scriptSig, output: 1-byte OP_RETURN, fee = 0 (value in == value out).
+  -- Non-witness: 4+1+(32+4+1+0+4)+1+(8+1+1)+4 = 4+1+41+1+10+4 = 61 bytes.
+  local inp = types.txin(types.outpoint(base_txid, 0), "", 0xFFFFFFFE)
+  local out = types.txout(1000000, "\x6a")
+  local tx_small = types.transaction(1, {inp}, {out}, 0)
+
+  local ok, reason = mp:accept_transaction(tx_small)
+  check("non-witness size 61 → rejected with tx-size-small", not ok,
+        "reason: " .. tostring(reason))
+  check("rejection reason starts with 'tx-size-small'",
+        reason and reason:find("^tx%-size%-small") ~= nil,
+        "got: " .. tostring(reason))
+end
+
+-- A normal P2PKH tx is well above 65 bytes non-witness.
+do
+  local base_txid = types.hash256(string.rep("\x41", 32))
+  local base_txid_hex = types.hash256_hex(base_txid)
+  local cs = make_mock_chain()
+  add_utxo(cs, base_txid_hex, 0, 5000000)
+  local mp = mempool.new(cs)
+  local tx = make_tx(base_txid, 0, 4990000, p2pkh_script())
+  local ok, reason = mp:accept_transaction(tx)
+  check("normal P2PKH tx (>=65 bytes non-witness) → accepted", ok,
+        "reason: " .. tostring(reason))
+end
+
+-- ── Part 7: WITNESS_UNKNOWN outputs are standard ─────────────────────────────
+
+print("\n=== Part 7: WITNESS_UNKNOWN (v2-v16 witness programs) are standard ===")
+
+-- Bitcoin Core Solver() returns WITNESS_UNKNOWN for witness programs with
+-- version != 0 that are not v1+32 Taproot.  IsStandard() accepts these
+-- (only NONSTANDARD returns false).  Lunarblock must do the same.
+do
+  -- classify_script unit test: OP_2 <32 bytes> = v2+32 witness program.
+  -- 0x52 0x20 <32 bytes> — not P2TR (that's 0x51 0x20), so WITNESS_UNKNOWN.
+  local v2_32 = "\x52\x20" .. string.rep("\xab", 32)
+  local st = script.classify_script(v2_32)
+  check("classify_script: OP_2 <32-byte program> → witness_unknown",
+        st == "witness_unknown", "got: " .. tostring(st))
+
+  -- OP_3 <20-byte program> — v3+20
+  local v3_20 = "\x53\x14" .. string.rep("\xcd", 20)
+  local st2 = script.classify_script(v3_20)
+  check("classify_script: OP_3 <20-byte program> → witness_unknown",
+        st2 == "witness_unknown", "got: " .. tostring(st2))
+
+  -- OP_16 <2-byte program> — v16+2 (minimum valid witness program size)
+  local v16_2 = "\x60\x02\xef\xbe"
+  local st3 = script.classify_script(v16_2)
+  check("classify_script: OP_16 <2-byte program> → witness_unknown",
+        st3 == "witness_unknown", "got: " .. tostring(st3))
+end
+
+-- Mempool must admit a tx with a WITNESS_UNKNOWN (v2+32) output.
+do
+  local base_txid = types.hash256(string.rep("\x50", 32))
+  local base_txid_hex = types.hash256_hex(base_txid)
+  local cs = make_mock_chain()
+  add_utxo(cs, base_txid_hex, 0, 5000000)
+  local mp = mempool.new(cs)
+
+  -- v2+32 output (WITNESS_UNKNOWN, standard per Core)
+  local v2_32_spk = "\x52\x20" .. string.rep("\xab", 32)
+  local inp = types.txin(types.outpoint(base_txid, 0), "", 0xFFFFFFFE)
+  local out = types.txout(4990000, v2_32_spk)
+  local tx = types.transaction(1, {inp}, {out}, 0)
+
+  local ok, reason = mp:accept_transaction(tx)
+  check("v2+32 witness_unknown output → accepted by mempool", ok,
+        "reason: " .. tostring(reason))
+end
+
+-- v0 with wrong program size (not 20 or 32): NONSTANDARD in Core → rejected.
+do
+  local base_txid = types.hash256(string.rep("\x51", 32))
+  local base_txid_hex = types.hash256_hex(base_txid)
+  local cs = make_mock_chain()
+  add_utxo(cs, base_txid_hex, 0, 5000000)
+  local mp = mempool.new(cs)
+
+  -- OP_0 <10-byte program> — v0+10 is NONSTANDARD in Core (not 20 or 32)
+  local v0_10_spk = "\x00\x0a" .. string.rep("\xbb", 10)
+  local inp = types.txin(types.outpoint(base_txid, 0), "", 0xFFFFFFFE)
+  local out = types.txout(4990000, v0_10_spk)
+  local tx = types.transaction(1, {inp}, {out}, 0)
+
+  local ok, reason = mp:accept_transaction(tx)
+  check("v0+10-byte program (NONSTANDARD) → rejected with scriptpubkey", not ok,
+        "reason: " .. tostring(reason))
+  check("rejection reason is 'scriptpubkey'",
+        reason == "scriptpubkey", "got: " .. tostring(reason))
+end
+
 -- ── summary ──────────────────────────────────────────────────────────────────
 
 print(string.format("\n%d passed, %d failed", pass, fail))
