@@ -693,6 +693,29 @@ function M.classify_script(script)
     return "p2tr", script:sub(3, 34)
   end
 
+  -- WITNESS_UNKNOWN: any valid witness program not matched above.
+  -- Bitcoin Core Solver() (solver.cpp:172-175): if the script is a witness
+  -- program with version != 0 (and not v1+32 Taproot, not P2A) it returns
+  -- WITNESS_UNKNOWN.  IsStandard() accepts WITNESS_UNKNOWN as standard
+  -- (only NONSTANDARD triggers a false return).  We must do the same so
+  -- that forward-compat segwit outputs (v2-v16, 2-40 byte programs) are
+  -- not rejected at the relay gate with "scriptpubkey".
+  -- Note: v0 with wrong size (not 20 or 32) is NONSTANDARD in Core and
+  -- should remain "nonstandard" here (handled by fallthrough below).
+  do
+    local vbyte = script:byte(1)
+    local version
+    if vbyte >= 0x52 and vbyte <= 0x60 then  -- OP_2..OP_16 (v2-v16)
+      version = vbyte - 0x50
+    end
+    if version then
+      local prog_len = script:byte(2)
+      if prog_len and prog_len >= 2 and prog_len <= 40 and len == 2 + prog_len then
+        return "witness_unknown", nil
+      end
+    end
+  end
+
   -- Nulldata: starts with OP_RETURN (0x6a) AND all remaining bytes are
   -- well-formed push-only (IsPushOnly check mirrors Bitcoin Core Solver).
   -- A script with a truncated push after OP_RETURN is NONSTANDARD.
