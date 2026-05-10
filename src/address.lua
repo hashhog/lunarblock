@@ -992,6 +992,17 @@ function M.parse_descriptor(desc_str)
     result.is_range = key.is_range
     result.tree = tree_str  -- Store raw tree for now
 
+  elseif desc_type == "rawtr" then
+    -- rawtr(XONLY_HEX) — BIP-386: raw x-only taproot key, issolvable=true
+    -- inner must be a 64-hex-char x-only pubkey (32 bytes)
+    if not inner:match("^[0-9a-fA-F]+$") then
+      return nil, "rawtr: inner must be hex"
+    end
+    if #inner ~= 64 then
+      return nil, "rawtr: x-only pubkey must be 32 bytes (64 hex chars)"
+    end
+    result.xonly_hex = inner:lower()
+
   elseif desc_type == "addr" then
     -- addr(ADDRESS)
     result.address = inner
@@ -1228,12 +1239,18 @@ function M.get_descriptor_info(desc_str)
     return nil, "failed to compute checksum"
   end
 
+  -- Per BIP-380: addr() and raw() are not solvable (no signing info).
+  -- All other descriptor types (pkh, wpkh, pk, sh, wsh, tr, rawtr,
+  -- multi, sortedmulti, combo) are solvable.
+  local not_solvable_types = { addr = true, raw = true }
+  local issolvable = not not_solvable_types[parsed.type]
+
   return {
     descriptor = desc .. "#" .. checksum,
     checksum = checksum,
     isrange = parsed.is_range or false,
-    issolvable = true,  -- Simplified - would check if we have all keys
-    hasprivatekeys = false,  -- Would check key types
+    issolvable = issolvable,
+    hasprivatekeys = false,  -- Only true when WIF private key embedded
   }
 end
 
