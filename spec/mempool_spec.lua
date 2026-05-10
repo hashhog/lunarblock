@@ -24,9 +24,15 @@ describe("mempool", function()
     )
   end
 
-  -- Helper to create output
+  -- Helper to create output.
+  -- Default script is a valid P2PKH (OP_DUP OP_HASH160 <20-byte hash>
+  -- OP_EQUALVERIFY OP_CHECKSIG) so that IsStandardTx() accepts it.
+  -- The all-zeros 25-byte script that was used previously is classified
+  -- as "nonstandard" and caused every test that called accept_transaction
+  -- to fail the standardness gate before reaching the RBF checks.
   local function make_output(value, script_pubkey)
-    return types.txout(value, script_pubkey or string.rep("\x00", 25))
+    local default_p2pkh = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
+    return types.txout(value, script_pubkey or default_p2pkh)
   end
 
   -- Helper to create a mock chain state with coin view
@@ -304,7 +310,7 @@ describe("mempool", function()
 
       local ok, err = mp:accept_transaction(tx2)
       assert.is_false(ok)
-      assert.equal("replacement fee not higher than original", err)
+      assert.truthy(err:match("replacement fee not higher"))
     end)
 
     it("rejects replacement when original does not signal RBF", function()
@@ -1237,7 +1243,11 @@ describe("mempool", function()
         assert.is_not_nil(mp:get_entry(replace_hex))  -- Replacement present
       end)
 
-      it("requires replacement fee to be strictly higher than conflicting fees", function()
+      -- BIP-125 Rule #3 uses strict less-than (Bitcoin Core rbf.cpp:109):
+      -- replacement_fees < original_fees → reject.  Equal fees PASS Rule #3
+      -- and fall through to Rule #4 (incremental relay fee), which rejects
+      -- them unless the additional fee covers min-relay-fee × vsize.
+      it("Rule #3: rejects replacement with strictly lower fee (Core rbf.cpp:109)", function()
         local prev_txid = types.hash256(string.rep("\x01", 32))
         local prev_txid_hex = types.hash256_hex(prev_txid)
 
@@ -1250,16 +1260,51 @@ describe("mempool", function()
         tx1.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFD)
         tx1.outputs[1] = make_output(90000)  -- 10000 sat fee
 
-        mp:accept_transaction(tx1)
+        local ok1, _ = mp:accept_transaction(tx1)
+        assert.is_true(ok1)
 
-        -- Same fee (not higher)
+        -- Strictly lower fee: must be rejected by Rule #3
         local tx2 = make_tx(1, {}, {}, 0)
         tx2.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFD)
-        tx2.outputs[1] = make_output(90000)  -- Same 10000 sat fee
+        tx2.outputs[1] = make_output(95000)  -- 5000 sat fee (lower than 10000)
 
         local ok, err = mp:accept_transaction(tx2)
         assert.is_false(ok)
         assert.truthy(err:match("replacement fee not higher"))
+      end)
+
+      it("Rule #3: equal fee passes Rule #3, rejected by Rule #4 (incremental relay)", function()
+        -- Two transactions with the same total fee but different txids (split
+        -- outputs).  tx2 conflicts with tx1 and has an equal net fee, so Rule
+        -- #3 passes (fee < original_fee is false) but Rule #4 rejects because
+        -- additional_fee = 0 and min-relay-fee * vsize > 0.
+        local prev_txid = types.hash256(string.rep("\x01", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+
+        local mp = mempool.new(chain_state)
+
+        local tx1 = make_tx(1, {}, {}, 0)
+        tx1.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFD)
+        tx1.outputs[1] = make_output(90000)  -- 10000 sat fee
+
+        local ok1, _ = mp:accept_transaction(tx1)
+        assert.is_true(ok1)
+
+        -- tx2 spends the same UTXO (conflicts with tx1) with the same total fee
+        -- but has two outputs (different txid from tx1, same fee).
+        local tx2 = make_tx(1, {}, {}, 0)
+        tx2.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFD)
+        tx2.outputs[1] = make_output(45000)  -- two outputs, same total (10000 sat fee)
+        tx2.outputs[2] = make_output(45000)
+
+        local ok, err = mp:accept_transaction(tx2)
+        assert.is_false(ok)
+        -- Rule #4 fires: "insufficient fee for relay" (additional_fee=0 < required)
+        assert.truthy(err:match("insufficient fee for relay"),
+          "expected 'insufficient fee for relay' got: " .. tostring(err))
       end)
 
       it("requires incremental relay fee payment", function()
@@ -1353,6 +1398,44 @@ describe("mempool", function()
         local ok, err = mp:accept_transaction(tx2)
         assert.is_false(ok)
         assert.equal("replacement adds new unconfirmed input", err)
+      end)
+
+      -- EntriesAndTxidsDisjoint (Bitcoin Core rbf.cpp:85-98):
+      -- A replacement tx whose in-mempool ancestors include one of the direct
+      -- conflict txids must be rejected.  Without this gate a tx could "replace"
+      -- one of its own ancestors, creating a cycle.
+      it("EntriesAndTxidsDisjoint: rejects replacement that is a descendant of its conflict", function()
+        local chain_state = make_mock_chain_state()
+
+        -- UTXO for the root tx
+        local root_utxo = types.hash256(string.rep("\x01", 32))
+        local root_utxo_hex = types.hash256_hex(root_utxo)
+        add_utxo(chain_state, root_utxo_hex, 0, 100000000)
+
+        local mp = mempool.new(chain_state)
+
+        -- Tx A: in mempool, signals RBF, spends confirmed UTXO
+        local tx_a = make_tx(1, {}, {}, 0)
+        tx_a.inputs[1] = make_input(root_utxo, 0, 0xFFFFFFFD)
+        tx_a.outputs[1] = make_output(99990000)  -- leaves 10000 sat fee
+
+        local ok_a, hex_a = mp:accept_transaction(tx_a)
+        assert.is_true(ok_a, "tx A should be accepted")
+        local txid_a = validation.compute_txid(tx_a)
+
+        -- Tx B: spends output of Tx A (so Tx A is an ancestor of Tx B)
+        --        also signals RBF and conflicts with Tx A by spending the SAME
+        --        confirmed UTXO.  This means Tx A is both a conflict (direct) and
+        --        an ancestor of Tx B — EntriesAndTxidsDisjoint must reject it.
+        local tx_b = make_tx(1, {}, {}, 0)
+        tx_b.inputs[1] = make_input(root_utxo, 0, 0xFFFFFFFD)  -- conflicts with Tx A
+        tx_b.inputs[2] = make_input(txid_a, 0, 0xFFFFFFFD)      -- Tx A is ancestor of Tx B
+        tx_b.outputs[1] = make_output(199970000)
+
+        local ok_b, err_b = mp:accept_transaction(tx_b)
+        assert.is_false(ok_b, "Tx B should be rejected: ancestor overlaps with conflict")
+        assert.truthy(tostring(err_b):match("conflicting transaction"),
+          "expected 'conflicting transaction' in error, got: " .. tostring(err_b))
       end)
 
       it("evicts descendants of replaced transaction", function()
