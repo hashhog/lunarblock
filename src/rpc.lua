@@ -3870,11 +3870,80 @@ function RPCServer:register_methods()
     local address_mod = require("lunarblock.address")
     local addr = params[1]
     assert(type(addr) == "string", "Address required")
-    local addr_type = address_mod.decode_address(addr, rpc.network.name)
-    return {
-      isvalid = addr_type ~= nil,
-      address = addr,
-    }
+
+    local network_name = rpc.network and rpc.network.name or "mainnet"
+    local hrp = address_mod.BECH32_HRP[network_name] or "bc"
+
+    -- Invalid response (Core 27+ format): no address field.
+    -- error_locations must be a JSON array ([]), not object ({}).
+    local function invalid_response()
+      return {
+        isvalid = false,
+        error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
+        error_locations = cjson.empty_array,
+      }
+    end
+
+    -- Try SegWit (bech32 / bech32m) first — returns nil gracefully on failure.
+    local witness_version, witness_program = address_mod.segwit_decode(hrp, addr)
+
+    if witness_version then
+      -- Valid SegWit address.
+      local wp_hex = M.hex_encode(witness_program)
+      -- isscript: true when witness program > 20 bytes (P2WSH=32, P2TR=32).
+      local isscript = #witness_program > 20
+
+      -- Build scriptPubKey: version opcode (0x00 for v0, 0x51+v for v1+) + push + program.
+      local version_opcode
+      if witness_version == 0 then
+        version_opcode = "\x00"
+      else
+        version_opcode = string.char(0x50 + witness_version)
+      end
+      local push_byte = string.char(#witness_program)
+      local script_bytes = version_opcode .. push_byte .. witness_program
+      local spk_hex = M.hex_encode(script_bytes)
+
+      return {
+        address        = addr,
+        isscript       = isscript,
+        isvalid        = true,
+        iswitness      = true,
+        scriptPubKey   = spk_hex,
+        witness_program = wp_hex,
+        witness_version = witness_version,
+      }
+    end
+
+    -- Try Base58Check — base58_decode uses assert() so wrap in pcall.
+    local ok, b58_version, b58_payload = pcall(address_mod.base58check_decode, addr)
+
+    if ok and b58_version then
+      local V = address_mod.VERSION
+      if b58_version == V.MAINNET_P2PKH or b58_version == V.TESTNET_P2PKH then
+        -- P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        local script_bytes = script_mod.make_p2pkh_script(b58_payload)
+        return {
+          address      = addr,
+          isscript     = false,
+          isvalid      = true,
+          iswitness    = false,
+          scriptPubKey = M.hex_encode(script_bytes),
+        }
+      elseif b58_version == V.MAINNET_P2SH or b58_version == V.TESTNET_P2SH then
+        -- P2SH: OP_HASH160 <20> OP_EQUAL
+        local script_bytes = script_mod.make_p2sh_script(b58_payload)
+        return {
+          address      = addr,
+          isscript     = true,
+          isvalid      = true,
+          iswitness    = false,
+          scriptPubKey = M.hex_encode(script_bytes),
+        }
+      end
+    end
+
+    return invalid_response()
   end
 
   self.methods["stop"] = function(_rpc, _params)
