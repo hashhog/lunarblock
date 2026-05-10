@@ -172,6 +172,12 @@ M.REPLACEMENT_MIN_FEE_BUMP = 1000 -- Minimum fee increase for RBF (sat/KB)
 -- 4_000_000), but a node treats them as non-standard at relay time.
 M.MAX_STANDARD_TX_WEIGHT = 400000
 
+-- CVE-2017-12842 minimum non-witness size (Bitcoin Core policy/policy.h:40).
+-- Transactions whose non-witness serialization is < 65 bytes can be used
+-- to construct inner-merkle-node collisions in SPV proofs.  Core rejects
+-- them at relay (validation.cpp:812-814, PreChecks).
+M.MIN_STANDARD_TX_NONWITNESS_SIZE = 65
+
 -- IsStandardTx version range (Bitcoin Core policy/policy.h TX_MIN/MAX_STANDARD_VERSION).
 -- Versions 1-3 are standard; 0 and >3 are rejected at relay.
 M.TX_MIN_STANDARD_VERSION = 1
@@ -388,6 +394,20 @@ function Mempool:accept_transaction(tx, allow_rbf)
       tx_weight_check, M.MAX_STANDARD_TX_WEIGHT)
   end
 
+  -- 2b2b. CVE-2017-12842: non-witness serialized size must be >= 65 bytes.
+  -- Bitcoin Core validation.cpp:812-814 (PreChecks, outside IsStandardTx):
+  --   if (::GetSerializeSize(TX_NO_WITNESS(tx)) < MIN_STANDARD_TX_NONWITNESS_SIZE)
+  --     return state.Invalid(…, "tx-size-small");
+  -- MIN_STANDARD_TX_NONWITNESS_SIZE = 65 (policy/policy.h:40).
+  -- A 64-byte base transaction can be crafted to collide with an internal
+  -- merkle node hash, allowing SPV fraud proofs.  This gate closes that
+  -- attack at relay time.
+  local nonwitness_size = #serialize.serialize_transaction(tx, false)
+  if nonwitness_size < M.MIN_STANDARD_TX_NONWITNESS_SIZE then
+    return false, string.format("tx-size-small: non-witness size %d < %d",
+      nonwitness_size, M.MIN_STANDARD_TX_NONWITNESS_SIZE)
+  end
+
   -- 2b3. IsStandardTx per-input scriptSig checks (Bitcoin Core policy/policy.cpp:117-134).
   -- Each scriptSig must be (a) push-only and (b) at most MAX_STANDARD_SCRIPTSIG_SIZE bytes.
   for _, inp in ipairs(tx.inputs) do
@@ -404,6 +424,9 @@ function Mempool:accept_transaction(tx, allow_rbf)
   -- Each output must be a standard script type; nonstandard outputs are rejected with
   -- reason "scriptpubkey".  OP_RETURN (nulldata) outputs are additionally size-limited
   -- to MAX_OP_RETURN_RELAY bytes total across all OP_RETURN outputs in the tx.
+  -- "witness_unknown" outputs (v2-v16 with 2-40 byte programs) are accepted as
+  -- standard per Bitcoin Core Solver() WITNESS_UNKNOWN + IsStandard() which only
+  -- rejects TxoutType::NONSTANDARD, not WITNESS_UNKNOWN (policy.cpp:80-98).
   -- Reference: Bitcoin Core IsStandard() + IsStandardTx() loop, policy.cpp:80-155.
   local datacarrier_bytes_left = M.MAX_OP_RETURN_RELAY
   for _, out in ipairs(tx.outputs) do
