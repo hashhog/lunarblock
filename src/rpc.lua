@@ -3052,13 +3052,18 @@ function RPCServer:register_methods()
       confirmations = 0
     end
 
-    return {
+    -- W61: use btc_sentinel so value encodes as fixed-8 decimal (e.g.
+    -- 0.03600000) instead of raw float64 division which collapses trailing
+    -- zeros (0.036).  Matches Core's ValueFromAmount format.
+    local result = {
       bestblock = tip_hash_hex,
       confirmations = confirmations,
-      value = entry.value / consensus.COIN,
+      value = btc_sentinel(entry.value),
       scriptPubKey = M.decode_script_pubkey(entry.script_pubkey, rpc.network),
       coinbase = is_coinbase,
     }
+    local json = strip_btc_sentinels(cjson.encode(result))
+    return {_raw_json = json}
   end
 
   -- disconnectnode: address (ip:port) OR nodeid.  Bitcoin Core:
