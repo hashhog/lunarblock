@@ -1139,6 +1139,14 @@ function M.descriptor_to_script(desc, index, network)
     end
     return nil, "unsupported address type"
 
+  elseif desc.type == "rawtr" then
+    -- BIP-386: rawtr(XONLY) — script is OP_1 <32-byte x-only>, no tweak.
+    -- xonly_hex was validated to 64 hex chars by parse_descriptor.
+    local xonly_bytes = desc.xonly_hex:gsub("%x%x", function(h)
+      return string.char(tonumber(h, 16))
+    end)
+    return script_mod.make_p2tr_script(xonly_bytes)
+
   elseif desc.type == "raw" then
     return desc.script
 
