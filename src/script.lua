@@ -1596,15 +1596,24 @@ function M.execute_script(script_bytes, stack, flags, checker)
     -- Locktime opcodes
     elseif opcode == M.OP.OP_CHECKLOCKTIMEVERIFY then
       if flags.verify_checklocktimeverify then
+        -- BIP65 / Bitcoin Core interpreter.cpp:529-558
+        -- Stack must not be empty (SCRIPT_ERR_INVALID_STACK_OPERATION).
         assert(#stack > 0, "CHECKLOCKTIMEVERIFY requires stack value")
-        local locktime = pop_num(5)  -- Allow 5-byte numbers for locktime
-        push(M.script_num_encode(locktime))  -- Don't consume from stack
+        -- Read top of stack WITHOUT consuming it (Core uses stacktop(-1)).
+        -- 5-byte CScriptNum: avoids year-2038 problem on uint32 nLockTime.
+        -- interpreter.cpp:546: CScriptNum nLockTime(stacktop(-1), fRequireMinimal, 5)
+        local locktime = M.script_num_decode(peek(), 5, flags and flags.verify_minimaldata)
+        -- Negative locktime is invalid (SCRIPT_ERR_NEGATIVE_LOCKTIME).
+        -- interpreter.cpp:551-552
         assert(locktime >= 0, "negative locktime")
+        -- Compare script locktime against transaction locktime.
+        -- interpreter.cpp:555-556: CheckLockTime(nLockTime) → SCRIPT_ERR_UNSATISFIED_LOCKTIME
         if checker.check_locktime then
           if not checker.check_locktime(locktime) then
             error("CHECKLOCKTIMEVERIFY failed")
           end
         end
+        -- Stack is left unchanged: stacktop(-1) is not popped by CLTV.
       else
         -- When CLTV is not active, it acts as NOP2
         if flags.verify_discourage_upgradable_nops then
