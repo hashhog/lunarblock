@@ -24,6 +24,19 @@ M.MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3
 -- Maximum high-bandwidth peers
 M.MAX_HIGH_BANDWIDTH_PEERS = 3
 
+-- Maximum transactions in a compact block.
+-- Core: MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 4000000 / 40 = 100000
+-- (blockencodings.cpp:64, consensus/consensus.h)
+M.MAX_CMPCTBLOCK_TX_COUNT = 100000
+
+-- Maximum bucket depth in the short-ID hash map before we declare DoS / hash-flood.
+-- Core: bucket_size > 12 → READ_STATUS_FAILED (blockencodings.cpp:110)
+M.MAX_SHORT_ID_BUCKET_SIZE = 12
+
+-- Maximum prefilled-transaction index (fits in uint16, per DifferenceFormatter).
+-- Core: lastprefilledindex > numeric_limits<uint16_t>::max() → INVALID (blockencodings.cpp:78)
+M.MAX_PREFILLED_INDEX = 65535
+
 --------------------------------------------------------------------------------
 -- Compact Block Construction
 --------------------------------------------------------------------------------
@@ -93,6 +106,7 @@ function M.new_partial_block()
   self.txn_available = {}   -- index -> transaction or nil
   self.prefilled_count = 0
   self.mempool_count = 0
+  self.extra_count = 0
   self.tx_count = 0
   self.k0 = nil
   self.k1 = nil
@@ -103,15 +117,46 @@ end
 --- Initialize the partial block from a compact block.
 -- Attempts to fill transactions from mempool.
 -- @param cmpctblock table: deserialized compact block
--- @param mempool table: mempool object with get_by_wtxid method (optional)
+-- @param mempool table: mempool object with iter_by_wtxid method (optional)
+-- @param extra_txn table: extra {wtxid_bytes, tx} pairs beyond mempool (optional)
 -- @return string|nil: error message or nil on success
-function PartiallyDownloadedBlock:init(cmpctblock, mempool)
+--
+-- Gates (matching Bitcoin Core blockencodings.cpp::PartiallyDownloadedBlock::InitData):
+--  G1  header null or both-lists-empty → INVALID
+--  G2  total tx count > 100000 → INVALID
+--  G3  already initialized (header not nil or txn_available not empty) → INVALID
+--  G4  null tx inside a prefilled entry → INVALID
+--  G5  lastprefilledindex > 65535 → INVALID
+--  G6  lastprefilledindex jumps beyond (short_ids + prefilled_so_far) → INVALID
+--  G7  any short-ID map bucket depth > 12 → FAILED (DoS protection)
+--  G8  short-ID duplicate in cmpctblock → FAILED (short ID collision)
+--  G9  mempool collision: two txns map to same short ID → dequeue both
+function PartiallyDownloadedBlock:init(cmpctblock, mempool, extra_txn)
+  -- G1: header null check and both-lists-empty check
+  -- (Core blockencodings.cpp:62-63)
   if not cmpctblock.header then
     return "invalid compact block: missing header"
   end
+  if #cmpctblock.short_ids == 0 and #cmpctblock.prefilled_txns == 0 then
+    return "invalid compact block: both short_ids and prefilled_txns are empty"
+  end
+
+  -- G2: total transaction count limit
+  -- MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 4000000 / 40 = 100000
+  -- (Core blockencodings.cpp:64-65)
+  local total_tx_count = #cmpctblock.short_ids + #cmpctblock.prefilled_txns
+  if total_tx_count > M.MAX_CMPCTBLOCK_TX_COUNT then
+    return "invalid compact block: too many transactions"
+  end
+
+  -- G3: re-initialization guard — prevent calling init twice on same object
+  -- (Core blockencodings.cpp:67)
+  if self.header ~= nil or #self.txn_available > 0 then
+    return "invalid compact block: already initialized"
+  end
 
   self.header = cmpctblock.header
-  self.tx_count = p2p.cmpctblock_tx_count(cmpctblock)
+  self.tx_count = total_tx_count
 
   -- Initialize transaction slots
   for i = 1, self.tx_count do
@@ -119,52 +164,157 @@ function PartiallyDownloadedBlock:init(cmpctblock, mempool)
   end
 
   -- Process prefilled transactions
-  for _, prefilled in ipairs(cmpctblock.prefilled_txns) do
-    local index = prefilled.index + 1  -- Convert to 1-based
-    if index < 1 or index > self.tx_count then
-      return "invalid prefilled index: " .. (prefilled.index)
+  -- Core uses a cumulative lastprefilledindex (differential offsets are decoded by
+  -- DifferenceFormatter before reaching here; each prefilled.index is already the
+  -- absolute 0-based index in the block).
+  local lastprefilledindex = -1
+  for i, prefilled in ipairs(cmpctblock.prefilled_txns) do
+    -- G4: null tx check (Core blockencodings.cpp:74-76)
+    if not prefilled.tx then
+      return "invalid compact block: null transaction in prefilled"
     end
-    if self.txn_available[index] then
-      return "duplicate prefilled index: " .. (prefilled.index)
+
+    -- Accumulate absolute index from the stored (already-decoded) absolute index.
+    -- Note: p2p.lua deserialize_cmpctblock already decodes differential → absolute
+    -- index, so prefilled.index is already absolute 0-based.
+    local abs_index = prefilled.index
+
+    -- G5: lastprefilledindex must not exceed uint16 max (Core line 78-79)
+    if abs_index > M.MAX_PREFILLED_INDEX then
+      return "invalid compact block: prefilled index overflows uint16"
     end
-    self.txn_available[index] = prefilled.tx
+    if abs_index <= lastprefilledindex then
+      return "invalid compact block: prefilled index not increasing"
+    end
+    lastprefilledindex = abs_index
+
+    -- G6: prefilled index must not jump past (num_short_ids + num_prefilled_so_far)
+    -- i.e. lastprefilledindex <= shorttxids.size() + (i - 1)   [0-based comparison]
+    -- (Core blockencodings.cpp:80-85)
+    if abs_index > #cmpctblock.short_ids + (i - 1) then
+      return "invalid compact block: prefilled index skips beyond available short IDs"
+    end
+
+    local slot = abs_index + 1  -- Convert to 1-based
+    if self.txn_available[slot] then
+      return "invalid compact block: duplicate prefilled index"
+    end
+    self.txn_available[slot] = prefilled.tx
     self.prefilled_count = self.prefilled_count + 1
   end
 
-  -- Compute SipHash key
+  -- Compute SipHash key from header + nonce
   local header_bytes = serialize.serialize_block_header(self.header)
   self.k0, self.k1 = crypto.siphash_key_from_header(header_bytes, cmpctblock.nonce)
 
-  -- Build short ID to index map
-  local short_idx = 1
+  -- Build short ID to block-index map.
+  -- Track per-bucket depth for DoS protection (G7).
+  -- Use a bucket-depth counter keyed the same way as the short_id_map.
+  local bucket_depth = {}  -- short_id -> count of times seen
+  local index_offset = 0
   for i = 1, self.tx_count do
+    -- Skip over slots already filled by prefilled txns
     if not self.txn_available[i] then
-      if short_idx > #cmpctblock.short_ids then
-        return "short ID count mismatch"
+      local short_id = cmpctblock.short_ids[i - index_offset]
+      if not short_id then
+        return "invalid compact block: short ID count mismatch"
       end
-      local short_id = cmpctblock.short_ids[short_idx]
-      -- Check for collision
+
+      -- G7: bucket depth > 12 → DoS protection (Core blockencodings.cpp:110-111)
+      -- This approximates the unordered_map bucket-size check: well-formed blocks
+      -- should have a roughly uniform short-ID distribution.
+      bucket_depth[short_id] = (bucket_depth[short_id] or 0) + 1
+      if bucket_depth[short_id] > M.MAX_SHORT_ID_BUCKET_SIZE then
+        return nil, true  -- READ_STATUS_FAILED: hash-flood DoS
+      end
+
+      -- G8: short ID collision within cmpctblock itself (Core line 115-116)
       if self.short_id_map[short_id] then
-        -- Short ID collision - need to request full block
-        return "short ID collision"
+        return nil, true  -- READ_STATUS_FAILED: short ID collision
       end
       self.short_id_map[short_id] = i
-      short_idx = short_idx + 1
+    else
+      index_offset = index_offset + 1
     end
   end
 
+  -- G8 final check: the number of entries in short_id_map must equal #short_ids
+  -- (Core blockencodings.cpp:115-116 — separate map.size() != cmpctblock.shorttxids.size() check)
+  local map_count = 0
+  for _ in pairs(self.short_id_map) do map_count = map_count + 1 end
+  if map_count ~= #cmpctblock.short_ids then
+    return nil, true  -- READ_STATUS_FAILED: short ID collision
+  end
+
   -- Try to fill from mempool
+  -- G9: collision handling — two mempool txns map to same short ID → dequeue both
+  -- (Core blockencodings.cpp:118-144)
+  local have_txn = {}  -- track which slots have been claimed (separate from txn_available)
+  -- Mark prefilled slots as already have
+  for i = 1, self.tx_count do
+    if self.txn_available[i] then
+      have_txn[i] = true
+    end
+  end
+
+  local short_id_count = #cmpctblock.short_ids
   if mempool and mempool.iter_by_wtxid then
     for wtxid, tx in mempool:iter_by_wtxid() do
       local short_id = crypto.compact_block_short_id(self.k0, self.k1, wtxid)
       local index = self.short_id_map[short_id]
-      if index and not self.txn_available[index] then
-        -- Verify wtxid matches (to handle collisions)
-        local computed_wtxid = validation.compute_wtxid(tx)
-        if computed_wtxid.bytes == wtxid then
+      if index then
+        if not have_txn[index] then
           self.txn_available[index] = tx
+          have_txn[index] = true
           self.mempool_count = self.mempool_count + 1
+        else
+          -- Two mempool txns hash to same short ID → clear the slot so we request it
+          if self.txn_available[index] then
+            self.txn_available[index] = nil
+            self.mempool_count = self.mempool_count - 1
+          end
         end
+      end
+      -- Early exit when all short IDs are satisfied
+      if self.mempool_count == short_id_count then
+        break
+      end
+    end
+  end
+
+  -- Extra txn pool (recently evicted, orphan pool, etc.)
+  -- (Core blockencodings.cpp:147-176)
+  if extra_txn then
+    for _, entry in ipairs(extra_txn) do
+      local wtxid_bytes = entry[1]
+      local tx = entry[2]
+      local short_id = crypto.compact_block_short_id(self.k0, self.k1, wtxid_bytes)
+      local index = self.short_id_map[short_id]
+      if index then
+        if not have_txn[index] then
+          self.txn_available[index] = tx
+          have_txn[index] = true
+          self.mempool_count = self.mempool_count + 1
+          self.extra_count = self.extra_count + 1
+        else
+          -- Collision between mempool and extra, or two extra txns.
+          -- Only dequeue if wtxid actually differs (use raw wtxid comparison).
+          -- Core: compare GetWitnessHash() — here we compare the wtxid bytes
+          -- (Core blockencodings.cpp:163-169)
+          if self.txn_available[index] then
+            local existing_wtxid = validation.compute_wtxid(self.txn_available[index])
+            if existing_wtxid.bytes ~= wtxid_bytes then
+              self.txn_available[index] = nil
+              self.mempool_count = self.mempool_count - 1
+              if self.extra_count > 0 then
+                self.extra_count = self.extra_count - 1
+              end
+            end
+          end
+        end
+      end
+      if self.mempool_count == short_id_count then
+        break
       end
     end
   end
@@ -224,9 +374,22 @@ function PartiallyDownloadedBlock:fill_from_blocktxn(transactions)
   return nil
 end
 
---- Reconstruct the full block.
+--- Reconstruct the full block from all available transactions.
+-- After reconstruction the object is invalidated — header is cleared and
+-- txn_available is wiped.  This matches Core's FillBlock semantics:
+--   header.SetNull(); txn_available.clear();
+-- (Core blockencodings.cpp:211-212)
+--
+-- @param check_mutated optional function(block) → bool: mutation check hook.
+--   If provided, called after assembling the block; returns nil,"mutated block"
+--   when it returns true.  Mirrors Core's IsBlockMutated call in FillBlock.
 -- @return table|nil, string: full block or nil with error message
-function PartiallyDownloadedBlock:reconstruct()
+function PartiallyDownloadedBlock:reconstruct(check_mutated)
+  -- G10: header null check — must be initialized (Core blockencodings.cpp:193)
+  if not self.header then
+    return nil, "not initialized"
+  end
+
   if not self:is_complete() then
     return nil, "block is not complete"
   end
@@ -237,7 +400,19 @@ function PartiallyDownloadedBlock:reconstruct()
   end
 
   local types = require("lunarblock.types")
-  return types.block(self.header, transactions), nil
+  local block = types.block(self.header, transactions)
+
+  -- G11: invalidate the object after filling — prevents double-use
+  -- (Core blockencodings.cpp:211-212)
+  self.header = nil
+  self.txn_available = {}
+
+  -- G12: mutation check hook (Core blockencodings.cpp:219-221)
+  if check_mutated and check_mutated(block) then
+    return nil, "mutated block (possible short ID collision)"
+  end
+
+  return block, nil
 end
 
 M.PartiallyDownloadedBlock = PartiallyDownloadedBlock
