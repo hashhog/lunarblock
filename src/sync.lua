@@ -240,29 +240,22 @@ function HeadersSyncState:compute_commitment(block_hash)
 end
 
 --- Check if difficulty transition is permitted.
--- Simplified check: ensure bits don't change by more than 4x in either direction.
--- @param prev_bits number: previous block's bits
--- @param next_bits number: next block's bits
--- @param height number: height of next block
--- @return boolean: true if transition is valid
+-- Delegates to consensus.permitted_difficulty_transition which implements
+-- Bitcoin Core PermittedDifficultyTransition (src/pow.cpp:89-136).
+--
+-- Summary of rules:
+--   * Networks with pow_allow_min_difficulty (testnet, regtest): always true.
+--   * Retarget boundary: new target must be within 4x in either direction of
+--     old_bits * {MIN,MAX}_TIMESPAN / TARGET_TIMESPAN (after pow_limit clamp
+--     and GetCompact/SetCompact rounding).
+--   * Non-retarget block: bits must be identical to previous block.
+--
+-- @param prev_bits number: compact bits from the immediately preceding block
+-- @param next_bits number: compact bits claimed by the new block
+-- @param height number: height of the new block
+-- @return boolean: true if transition is permitted
 function HeadersSyncState:permitted_difficulty_transition(prev_bits, next_bits, height)
-  -- At difficulty adjustment boundary, allow any valid transition
-  if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
-    return true
-  end
-
-  -- For testnet with min difficulty rules
-  if self.network.pow_allow_min_difficulty then
-    -- Allow transition to min difficulty
-    if next_bits == self.network.pow_limit_bits then
-      return true
-    end
-    -- Also allow returning to prev difficulty
-    return true  -- Simplified for testnet
-  end
-
-  -- Non-adjustment block: bits must match previous
-  return prev_bits == next_bits
+  return consensus.permitted_difficulty_transition(self.network, height, prev_bits, next_bits)
 end
 
 --------------------------------------------------------------------------------

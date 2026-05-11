@@ -321,6 +321,58 @@ describe("validation", function()
 
       assert.is_true(validation.check_proof_of_work(genesis_header, regtest))
     end)
+
+    -- W83: pow_limit check — reject bits that encode a target above pow_limit.
+    -- Bitcoin Core DeriveTarget: if (bnTarget > pow_limit) return false.
+    it("W83 — rejects bits encoding target above pow_limit", function()
+      local mainnet = consensus.networks.mainnet
+
+      -- Build a header whose bits field encodes a target EASIER than mainnet's
+      -- pow_limit (0x1d00ffff).  0x1e00ffff encodes a target 256x easier.
+      -- Even if the hash (incorrectly) met that easier target, check_proof_of_work
+      -- must return false because the declared target exceeds pow_limit.
+      local easy_bits = 0x1e00ffff  -- target >> pow_limit for mainnet
+      local header = types.block_header(
+        1,
+        types.hash256_zero(),
+        types.hash256_zero(),
+        mainnet.genesis.timestamp,
+        easy_bits,
+        0
+      )
+      -- No need to find a valid nonce — the target-exceeds-pow_limit check fires first.
+      assert.is_false(validation.check_proof_of_work(header, mainnet))
+    end)
+
+    it("W83 — accepts bits equal to pow_limit (boundary case)", function()
+      -- 0x1d00ffff is exactly mainnet pow_limit.  target == pow_limit is permitted.
+      -- We use the genesis block which is known to have a valid PoW.
+      local mainnet = consensus.networks.mainnet
+      local genesis_header = types.block_header(
+        mainnet.genesis.version,
+        types.hash256_zero(),
+        types.hash256_from_hex("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"),
+        mainnet.genesis.timestamp,
+        mainnet.genesis.bits,  -- 0x1d00ffff == pow_limit
+        mainnet.genesis.nonce
+      )
+      assert.is_true(validation.check_proof_of_work(genesis_header, mainnet))
+    end)
+
+    it("W83 — regtest accepts its own pow_limit_bits (0x207fffff)", function()
+      -- Regtest has a very easy pow_limit.  Use the real regtest genesis header
+      -- (known-valid PoW) to confirm that bits == pow_limit_bits is accepted.
+      local regtest = consensus.networks.regtest
+      local genesis_header = types.block_header(
+        regtest.genesis.version,
+        types.hash256_zero(),
+        types.hash256_from_hex("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"),
+        regtest.genesis.timestamp,
+        regtest.genesis.bits,   -- 0x207fffff == pow_limit for regtest
+        regtest.genesis.nonce
+      )
+      assert.is_true(validation.check_proof_of_work(genesis_header, regtest))
+    end)
   end)
 
   describe("check_merkle_root", function()
