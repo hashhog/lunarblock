@@ -237,8 +237,11 @@ end
 -- @param payout_script string: Script pubkey for block reward
 -- @param config table: Optional configuration (max_weight, block_reserved_weight,
 --                      max_sigops, block_min_fee_rate)
+-- @param get_block_info function|nil: Optional fn(height) -> {mtp, version} for
+--   BIP9 deployment state queries.  When nil, defaults to VERSIONBITS_TOP_BITS
+--   (correct for all-buried-deployment networks such as mainnet today).
 -- @return table, block: BIP22 template and block object
-function M.create_block_template(mempool, chain_state, network, payout_script, config)
+function M.create_block_template(mempool, chain_state, network, payout_script, config, get_block_info)
   -- BUG FIX: apply ClampOptions so callers cannot supply out-of-range values.
   -- Core miner.cpp:79 ClampOptions().
   config = M.clamp_options(config)
@@ -373,9 +376,16 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   local bits = chain_state.storage.get_header(prev_hash).bits
   -- In a real implementation, compute next required bits at retarget heights
 
+  -- Compute block version via BIP9 state machine.
+  -- Bitcoin Core miner.cpp uses VersionBitsCache::ComputeBlockVersion to set
+  -- the signaling bits for any STARTED or LOCKED_IN deployments (versionbits.cpp:265-279).
+  -- We pass the optional get_block_info callback; when nil, compute_block_version
+  -- returns VERSIONBITS_TOP_BITS (correct for all-buried-deployment networks).
+  local block_version = consensus.compute_block_version(network, height, get_block_info)
+
   -- Build block header
   local header = types.block_header(
-    0x20000000,  -- version with no signaling bits
+    block_version,
     prev_hash,
     merkle_root,
     os.time(),

@@ -651,25 +651,27 @@ function M.get_deployment_state(deployment, period, threshold, height, get_block
       end
 
     elseif state == STATE.STARTED then
-      -- Check for timeout first (FAILED)
-      if block.mtp >= deployment.timeout then
-        state = STATE.FAILED
-      else
-        -- Count signaling blocks in this period
-        local count = 0
-        local period_start = period_end_height - period + 1
-        for bh = period_start, period_end_height do
-          local b = get_block_info(bh)
-          if b and M.versionbits_condition(b.version, deployment.bit) then
-            count = count + 1
-          end
+      -- Count signaling blocks in this period first.
+      -- Bitcoin Core versionbits.cpp:86-98: threshold check precedes timeout
+      -- check so that LOCKED_IN takes priority over FAILED when both
+      -- conditions are met in the same period.
+      local count = 0
+      local period_start = period_end_height - period + 1
+      for bh = period_start, period_end_height do
+        local b = get_block_info(bh)
+        if b and M.versionbits_condition(b.version, deployment.bit) then
+          count = count + 1
         end
-
-        if count >= threshold then
-          state = STATE.LOCKED_IN
-        end
-        -- Otherwise stay in STARTED
       end
+
+      if count >= threshold then
+        state = STATE.LOCKED_IN
+      elseif block.mtp >= deployment.timeout then
+        -- Only transition to FAILED when threshold was NOT met.
+        -- Core: if (count >= nThreshold) LOCKED_IN else if (mtp >= timeout) FAILED
+        state = STATE.FAILED
+      end
+      -- Otherwise stay in STARTED
 
     elseif state == STATE.LOCKED_IN then
       -- Check if we can activate
@@ -728,6 +730,47 @@ function M.get_deployment_state_for_block(deployment, period, threshold, height,
   end
 
   return M.get_deployment_state(deployment, period, threshold, prev_period_end, get_block_info)
+end
+
+--- Compute the block version for a new block to be mined.
+-- Mirrors Bitcoin Core VersionBitsCache::ComputeBlockVersion (versionbits.cpp:265-279).
+-- Starts from VERSIONBITS_TOP_BITS and ORs in the Mask() for each deployment
+-- that is in STARTED or LOCKED_IN state (per BIP9: miners MUST signal during
+-- LOCKED_IN and SHOULD signal during STARTED).
+-- @param net table: network config (must have .deployments list and .versionbits_period/.versionbits_threshold)
+-- @param height number: height of the block being built (= prev_height + 1)
+-- @param get_block_info function: fn(height) -> {timestamp, mtp, version}
+-- @return number: nVersion for the new block header
+function M.compute_block_version(net, height, get_block_info)
+  local nVersion = M.VERSIONBITS_TOP_BITS
+
+  local deployments = net.deployments
+  if not deployments then
+    -- No active BIP9 deployments on this network; return base version.
+    return nVersion
+  end
+
+  local period    = net.versionbits_period
+  local threshold = net.versionbits_threshold
+
+  for _, dep in ipairs(deployments) do
+    -- State is determined for the block being built, so we query height - 1
+    -- as the "previous" block (same as Core's pindexPrev argument).
+    local prev_height = height - 1
+    local state
+    if prev_height < 0 then
+      state = M.DEPLOYMENT_STATE.DEFINED
+    else
+      state = M.get_deployment_state_for_block(dep, period, threshold, height, get_block_info)
+    end
+
+    -- Core: signal for STARTED and LOCKED_IN (versionbits.cpp:273)
+    if state == M.DEPLOYMENT_STATE.LOCKED_IN or state == M.DEPLOYMENT_STATE.STARTED then
+      nVersion = bit.bor(nVersion, bit.lshift(1, dep.bit))
+    end
+  end
+
+  return nVersion
 end
 
 --------------------------------------------------------------------------------

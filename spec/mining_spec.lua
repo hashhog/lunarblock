@@ -958,4 +958,102 @@ describe("mining", function()
     end)
   end)
 
+  -- -------------------------------------------------------------------------
+  -- W91: compute_block_version wiring in create_block_template
+  -- Bug fixed: mining.lua used hardcoded 0x20000000 (no BIP9 signaling);
+  -- must call consensus.compute_block_version.
+  -- -------------------------------------------------------------------------
+  describe("W91 compute_block_version wiring", function()
+    local function make_block_info_fn(blocks)
+      return function(h) return blocks[h] end
+    end
+
+    it("uses VERSIONBITS_TOP_BITS for networks without a deployments list", function()
+      -- Mainnet and regtest have no .deployments key -> version is VERSIONBITS_TOP_BITS
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      local network = consensus.networks.regtest
+
+      local mempool = make_mock_mempool({})
+      local template, _ = mining.create_block_template(mempool, chain_state, network, payout_script)
+
+      -- For a network with no active BIP9 deployments the version must equal TOP_BITS.
+      assert.equal(consensus.VERSIONBITS_TOP_BITS, template.version)
+    end)
+
+    it("signals signaling bits when a deployment is in STARTED state", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(25)
+
+      -- Build a synthetic network with one deployment on bit 1 that will be in
+      -- STARTED state at height 26 (the block being assembled).
+      local period    = 10
+      local threshold = 8
+      local dep = {bit = 1, start_time = 1000, timeout = 9999, min_activation_height = 0}
+      local test_net = {
+        name                  = "regtest",
+        versionbits_period    = period,
+        versionbits_threshold = threshold,
+        deployments           = {dep},
+        pow_limit_bits        = consensus.networks.regtest.pow_limit_bits,
+        segwit_height         = 0,
+        taproot_height        = 0,
+        bip34_height          = 1,
+        pow_no_retarget       = true,
+        pow_allow_min_difficulty = true,
+      }
+
+      -- Period 0 (h=0..9): MTP >= start_time -> state at end of period 0 = STARTED.
+      -- Period 1 (h=10..19): blocks in this period see STARTED.
+      -- Period 2 starts at h=20; blocks here also query period 1 end (h=19) = STARTED.
+      local blocks = {}
+      for h = 0, 25 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      local get_block_info = make_block_info_fn(blocks)
+
+      local mempool = make_mock_mempool({})
+      local template, _ = mining.create_block_template(
+        mempool, chain_state, test_net, payout_script, nil, get_block_info)
+
+      -- The version must have the deployment bit set
+      local expected = bit.bor(consensus.VERSIONBITS_TOP_BITS, bit.lshift(1, dep.bit))
+      assert.equal(expected, template.version)
+      -- Top 3 bits must still be 001
+      assert.equal(consensus.VERSIONBITS_TOP_BITS,
+        bit.band(template.version, consensus.VERSIONBITS_TOP_MASK))
+    end)
+
+    it("does NOT signal when deployment is DEFINED (not yet started)", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(5)
+
+      local dep = {bit = 1, start_time = 9999, timeout = 99999, min_activation_height = 0}
+      local test_net = {
+        name                  = "regtest",
+        versionbits_period    = 10,
+        versionbits_threshold = 8,
+        deployments           = {dep},
+        pow_limit_bits        = consensus.networks.regtest.pow_limit_bits,
+        segwit_height         = 0,
+        taproot_height        = 0,
+        bip34_height          = 1,
+        pow_no_retarget       = true,
+        pow_allow_min_difficulty = true,
+      }
+
+      local blocks = {}
+      for h = 0, 5 do
+        blocks[h] = {timestamp = 100, mtp = 100, version = 0x20000000}
+      end
+
+      local mempool = make_mock_mempool({})
+      local template, _ = mining.create_block_template(
+        mempool, chain_state, test_net, payout_script, nil, make_block_info_fn(blocks))
+
+      -- DEFINED -> no signaling; version must equal TOP_BITS
+      assert.equal(consensus.VERSIONBITS_TOP_BITS, template.version)
+    end)
+  end)
+
 end)
