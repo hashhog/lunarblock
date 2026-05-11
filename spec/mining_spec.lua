@@ -147,13 +147,16 @@ describe("mining", function()
       assert.equal(2, coinbase.version)
       assert.equal(1, #coinbase.inputs)
       assert.equal(1, #coinbase.outputs)
-      assert.equal(0, coinbase.locktime)
+      -- BUG FIX: locktime = height-1 = 99 (Core miner.cpp:196)
+      assert.equal(99, coinbase.locktime)
 
       -- Check input is null coinbase
       local inp = coinbase.inputs[1]
       assert.equal(string.rep("\x00", 32), inp.prev_out.hash.bytes)
       assert.equal(0xFFFFFFFF, inp.prev_out.index)
-      assert.equal(0xFFFFFFFF, inp.sequence)
+      -- BUG FIX: sequence = MAX_SEQUENCE_NONFINAL (0xFFFFFFFE), not 0xFFFFFFFF
+      -- Core miner.cpp:171: CTxIn::MAX_SEQUENCE_NONFINAL
+      assert.equal(0xFFFFFFFE, inp.sequence)
 
       -- Check BIP34 height encoding in scriptSig
       local script_sig = inp.script_sig
@@ -680,18 +683,28 @@ describe("mining", function()
   end)
 
   describe("coinbase transaction", function()
-    it("has sequence 0xFFFFFFFF", function()
+    -- BUG FIX W87: sequence is MAX_SEQUENCE_NONFINAL (0xFFFFFFFE), not SEQUENCE_FINAL.
+    -- Core miner.cpp:171: "Make sure timelock is enforced."
+    it("has sequence MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)", function()
       local payout_script = make_payout_script()
       local coinbase = mining.create_coinbase_tx(100, 5000000000, nil, nil, payout_script)
 
-      assert.equal(0xFFFFFFFF, coinbase.inputs[1].sequence)
+      assert.equal(0xFFFFFFFE, coinbase.inputs[1].sequence)
     end)
 
-    it("has locktime 0", function()
+    -- BUG FIX W87: locktime = height-1 (anti-fee-sniping).
+    -- Core miner.cpp:196: coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1)
+    it("has locktime = height - 1", function()
       local payout_script = make_payout_script()
-      local coinbase = mining.create_coinbase_tx(100, 5000000000, nil, nil, payout_script)
+      local coinbase100 = mining.create_coinbase_tx(100, 5000000000, nil, nil, payout_script)
+      assert.equal(99, coinbase100.locktime)
 
-      assert.equal(0, coinbase.locktime)
+      local coinbase1 = mining.create_coinbase_tx(1, 5000000000, nil, nil, payout_script)
+      assert.equal(0, coinbase1.locktime)
+
+      -- height 0 edge case: no underflow
+      local coinbase0 = mining.create_coinbase_tx(0, 5000000000, nil, nil, payout_script)
+      assert.equal(0, coinbase0.locktime)
     end)
   end)
 
@@ -790,6 +803,158 @@ describe("mining", function()
       assert.equal(0xFFFFFFFE, tx.inputs[1].sequence)  -- Changed from FINAL
       assert.equal(0xFFFFFFFE, tx.inputs[2].sequence)  -- Already non-final
       assert.equal(0xFFFFFFFE, tx.inputs[3].sequence)  -- Changed from FINAL
+    end)
+  end)
+
+  -- -------------------------------------------------------------------------
+  -- W87 new tests: clamp_options, reserved weight, >= gates, mintime
+  -- -------------------------------------------------------------------------
+
+  describe("clamp_options (W87)", function()
+    it("defaults block_reserved_weight to 8000", function()
+      local out = mining.clamp_options({})
+      assert.equal(8000, out.block_reserved_weight)
+    end)
+
+    it("clamps block_reserved_weight below MINIMUM up to 2000", function()
+      local out = mining.clamp_options({block_reserved_weight = 100})
+      assert.equal(2000, out.block_reserved_weight)
+    end)
+
+    it("clamps block_reserved_weight above MAX_BLOCK_WEIGHT", function()
+      local out = mining.clamp_options({block_reserved_weight = 5000000})
+      assert.equal(consensus.MAX_BLOCK_WEIGHT, out.block_reserved_weight)
+    end)
+
+    it("defaults max_weight to MAX_BLOCK_WEIGHT", function()
+      local out = mining.clamp_options({})
+      assert.equal(consensus.MAX_BLOCK_WEIGHT, out.max_weight)
+    end)
+
+    it("does not allow max_weight below block_reserved_weight", function()
+      -- block_reserved_weight clamped to 2000, max_weight also clamped up to 2000
+      local out = mining.clamp_options({block_reserved_weight = 100, max_weight = 1000})
+      assert.equal(2000, out.block_reserved_weight)
+      assert.equal(2000, out.max_weight)
+    end)
+
+    it("does not allow max_weight above MAX_BLOCK_WEIGHT", function()
+      local out = mining.clamp_options({max_weight = 9000000})
+      assert.equal(consensus.MAX_BLOCK_WEIGHT, out.max_weight)
+    end)
+
+    it("preserves valid in-range values unchanged", function()
+      local out = mining.clamp_options({block_reserved_weight = 5000, max_weight = 3000000})
+      assert.equal(5000, out.block_reserved_weight)
+      assert.equal(3000000, out.max_weight)
+    end)
+  end)
+
+  describe("block_reserved_weight gate (W87 — Bug 3)", function()
+    -- The block starts at block_reserved_weight=8000, not 1000.
+    -- A transaction of weight 3992001 must be excluded from a default-weight block
+    -- because 8000 + 3992001 = 4000001 >= 4000000.
+    it("reserves 8000 weight units for header+coinbase by default", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      local network = consensus.networks.regtest
+
+      -- Build a tx whose weight exactly fills the remaining space minus 1
+      -- available = 4000000 - 8000 = 3992000; weight 3992001 must NOT fit.
+      local big_output = make_output(9000, string.rep("\x51", 3992001 / 4))  -- approx
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0)},
+                         {make_output(9000)})
+      -- Force a weight manually by patching the entry weight
+      local entry = make_mempool_entry(tx, 1000)
+      entry.weight = 3992001
+
+      local mempool = make_mock_mempool({entry})
+      local _, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+      -- 8000 + 3992001 = 4000001 >= 4000000, so tx must be excluded
+      assert.equal(1, #block.transactions)  -- only coinbase
+    end)
+
+    it("accepts a tx that exactly fits within the reserved space", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      local network = consensus.networks.regtest
+
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0)},
+                         {make_output(9000)})
+      local entry = make_mempool_entry(tx, 1000)
+      entry.weight = 3991999  -- 8000 + 3991999 = 3999999 < 4000000: fits
+
+      local mempool = make_mock_mempool({entry})
+      local _, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+      assert.equal(2, #block.transactions)  -- coinbase + tx
+    end)
+  end)
+
+  describe("weight gate off-by-one (W87 — Bug 4)", function()
+    -- Gate is < (i.e. total+weight < max), which mirrors Core's >=.
+    -- A tx with weight == remaining exactly must NOT fit.
+    it("rejects a tx whose weight exactly reaches max_weight", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      local network = consensus.networks.regtest
+
+      local tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0)},
+                         {make_output(9000)})
+      local entry = make_mempool_entry(tx, 1000)
+      -- With reserved=8000, set weight so 8000 + w == max_weight exactly
+      entry.weight = consensus.MAX_BLOCK_WEIGHT - 8000  -- equals limit exactly
+
+      local mempool = make_mock_mempool({entry})
+      local _, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+      -- 8000 + (4000000-8000) = 4000000, which is NOT < 4000000 => excluded
+      assert.equal(1, #block.transactions)
+    end)
+  end)
+
+  describe("MAX_CONSECUTIVE_FAILURES early exit (W87 — Bug 5)", function()
+    it("stops adding txs after 1000 consecutive failures when block is near full", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      local network = consensus.networks.regtest
+
+      -- Fill the block close to full with one big tx
+      local big_tx = make_tx(1, {make_input(types.hash256(string.rep("\x01", 32)), 0)},
+                              {make_output(9000)})
+      local big_entry = make_mempool_entry(big_tx, 10000)
+      -- 8000 + 3991000 = 3999000: close to full (within BLOCK_FULL_ENOUGH_WEIGHT_DELTA=4000)
+      big_entry.weight = 3991000
+
+      -- Add 1001 tiny txs that each exceed the remaining space
+      local entries = {big_entry}
+      for i = 1, 1001 do
+        local small_tx = make_tx(1,
+          {make_input(types.hash256(string.rep(string.char(i % 256), 32)), 0)},
+          {make_output(100)})
+        local small_entry = make_mempool_entry(small_tx, 1)
+        small_entry.weight = 5000  -- 3999000 + 5000 = 4004000 > 4000000, so fails
+        entries[#entries + 1] = small_entry
+      end
+
+      local mempool = make_mock_mempool(entries)
+      -- Should complete without hanging (the early-exit fires after 1000 failures)
+      local _, block = mining.create_block_template(mempool, chain_state, network, payout_script)
+      -- Big tx is included; small ones excluded because they exceed the limit
+      assert.equal(2, #block.transactions)
+    end)
+  end)
+
+  describe("mintime = MTP+1 (W87 — Bug 6)", function()
+    it("template mintime equals mtp+1", function()
+      local payout_script = make_payout_script()
+      local chain_state = make_mock_chain_state(100)
+      local mtp_val = 1700000000
+      chain_state.mtp = mtp_val
+      local network = consensus.networks.regtest
+
+      local mempool = make_mock_mempool({})
+      local template, _ = mining.create_block_template(mempool, chain_state, network, payout_script)
+
+      assert.equal(mtp_val + 1, template.mintime)
     end)
   end)
 

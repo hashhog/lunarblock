@@ -8,7 +8,24 @@ local M = {}
 
 -- Constants
 local LOCKTIME_THRESHOLD = consensus.LOCKTIME_THRESHOLD  -- 500,000,000
-local SEQUENCE_FINAL = 0xFFFFFFFF
+local SEQUENCE_FINAL     = 0xFFFFFFFF
+-- CTxIn::MAX_SEQUENCE_NONFINAL: used for coinbase inputs so that nLockTime is
+-- enforced at validation time.  Core miner.cpp:171.
+local MAX_SEQUENCE_NONFINAL = 0xFFFFFFFE
+
+-- Block-assembly limits (Bitcoin Core policy/policy.h + node/miner.cpp)
+-- DEFAULT_BLOCK_RESERVED_WEIGHT: weight reserved for block header + coinbase.
+-- Core policy/policy.h:27.
+local DEFAULT_BLOCK_RESERVED_WEIGHT  = 8000
+-- MINIMUM_BLOCK_RESERVED_WEIGHT: lower bound for ClampOptions.
+-- Core policy/policy.h:34.
+local MINIMUM_BLOCK_RESERVED_WEIGHT  = 2000
+-- MAX_CONSECUTIVE_FAILURES: give up when this many consecutive chunks failed
+-- and the block is already close to full.  Core miner.cpp:284.
+local MAX_CONSECUTIVE_FAILURES       = 1000
+-- BLOCK_FULL_ENOUGH_WEIGHT_DELTA: "close to full" threshold.
+-- Core miner.cpp:285.
+local BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000
 
 --------------------------------------------------------------------------------
 -- Transaction Finality (Locktime Check)
@@ -109,6 +126,12 @@ end
 -- @param witness_commitment string: 32-byte witness commitment hash (optional)
 -- @param payout_script string: Script pubkey for block reward payout
 -- @return transaction: The coinbase transaction
+--
+-- Key Core semantics reproduced here:
+--   • coinbase input sequence = MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) so that
+--     nLockTime is enforced.  Core miner.cpp:171.
+--   • coinbase nLockTime = height - 1 (anti-fee-sniping for regtest / miners).
+--     Core miner.cpp:196.  For height == 0 we use 0 to avoid underflow.
 function M.create_coinbase_tx(height, value, coinbase_script_extra, witness_commitment, payout_script)
   -- Build the coinbase scriptSig: height (BIP34) + extra data
   local w = serialize.buffer_writer()
@@ -136,11 +159,14 @@ function M.create_coinbase_tx(height, value, coinbase_script_extra, witness_comm
   local coinbase_script_sig = w.result()
 
   -- Build the transaction
+  -- BUG FIX: sequence must be MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) so that the
+  -- coinbase locktime is enforced during block validation.
+  -- Core miner.cpp:171: coinbaseTx.vin[0].nSequence = CTxIn::MAX_SEQUENCE_NONFINAL
   local inputs = {
     types.txin(
       types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
       coinbase_script_sig,
-      0xFFFFFFFF
+      MAX_SEQUENCE_NONFINAL   -- 0xFFFFFFFE, not 0xFFFFFFFF
     )
   }
 
@@ -154,7 +180,11 @@ function M.create_coinbase_tx(height, value, coinbase_script_extra, witness_comm
     outputs[#outputs + 1] = types.txout(0, commitment_script)
   end
 
-  local tx = types.transaction(2, inputs, outputs, 0)
+  -- BUG FIX: nLockTime = height - 1 (Core miner.cpp:196).
+  -- This implements anti-fee-sniping and is enforced by validation.
+  -- For height == 0 we use 0 to avoid underflow.
+  local coinbase_locktime = (height > 0) and (height - 1) or 0
+  local tx = types.transaction(2, inputs, outputs, coinbase_locktime)
 
   -- Add witness nonce for segwit
   if witness_commitment then
@@ -169,17 +199,55 @@ end
 -- Block Template Construction
 --------------------------------------------------------------------------------
 
+--- Apply ClampOptions semantics to a config table.
+-- Mirrors Core's ClampOptions() in miner.cpp:79.
+-- • block_reserved_weight is clamped to [MINIMUM_BLOCK_RESERVED_WEIGHT,
+--   MAX_BLOCK_WEIGHT] (defaults to DEFAULT_BLOCK_RESERVED_WEIGHT when absent).
+-- • nBlockMaxWeight is clamped to [block_reserved_weight, MAX_BLOCK_WEIGHT].
+-- @param config table: caller-supplied config
+-- @return table: clamped config (never mutates the input table)
+function M.clamp_options(config)
+  config = config or {}
+  local out = {}
+  for k, v in pairs(config) do out[k] = v end
+
+  -- Resolve block_reserved_weight
+  local reserved = out.block_reserved_weight or DEFAULT_BLOCK_RESERVED_WEIGHT
+  if reserved < MINIMUM_BLOCK_RESERVED_WEIGHT then
+    reserved = MINIMUM_BLOCK_RESERVED_WEIGHT
+  end
+  if reserved > consensus.MAX_BLOCK_WEIGHT then
+    reserved = consensus.MAX_BLOCK_WEIGHT
+  end
+  out.block_reserved_weight = reserved
+
+  -- Resolve nBlockMaxWeight
+  local max_w = out.max_weight or consensus.MAX_BLOCK_WEIGHT
+  if max_w < reserved then max_w = reserved end
+  if max_w > consensus.MAX_BLOCK_WEIGHT then max_w = consensus.MAX_BLOCK_WEIGHT end
+  out.max_weight = max_w
+
+  return out
+end
+
 --- Create a block template for mining.
 -- @param mempool table: The mempool object
 -- @param chain_state table: Chain state with tip_height, tip_hash, storage
 -- @param network table: Network configuration (mainnet, testnet, regtest)
 -- @param payout_script string: Script pubkey for block reward
--- @param config table: Optional configuration (max_weight, max_sigops)
+-- @param config table: Optional configuration (max_weight, block_reserved_weight,
+--                      max_sigops, block_min_fee_rate)
 -- @return table, block: BIP22 template and block object
 function M.create_block_template(mempool, chain_state, network, payout_script, config)
-  config = config or {}
-  local max_weight = config.max_weight or consensus.MAX_BLOCK_WEIGHT
+  -- BUG FIX: apply ClampOptions so callers cannot supply out-of-range values.
+  -- Core miner.cpp:79 ClampOptions().
+  config = M.clamp_options(config)
+
+  local max_weight = config.max_weight   -- already clamped
   local max_sigops = config.max_sigops or consensus.MAX_BLOCK_SIGOPS_COST
+  -- BUG FIX: reserve DEFAULT_BLOCK_RESERVED_WEIGHT (8000) for header + coinbase,
+  -- not the old hard-coded 1000.  Core miner.cpp:114 resetBlock().
+  local block_reserved_weight = config.block_reserved_weight  -- already clamped
 
   local height = chain_state.tip_height + 1
   local prev_hash = chain_state.tip_hash
@@ -196,9 +264,15 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   local total_fees = 0
   local total_sigops = 0
 
-  -- Reserve space for coinbase (estimated ~1000 weight units)
-  local coinbase_weight_estimate = 1000
-  local total_weight = coinbase_weight_estimate
+  -- BUG FIX: start weight at block_reserved_weight (8000), which reserves
+  -- space for the block header, tx count varint, and coinbase tx.
+  -- Core miner.cpp:114: nBlockWeight = *Assert(m_options.block_reserved_weight)
+  local total_weight = block_reserved_weight
+
+  -- BUG FIX: implement MAX_CONSECUTIVE_FAILURES early-exit.
+  -- Core miner.cpp:284-318: if nConsecutiveFailed > 1000 AND the block is
+  -- within BLOCK_FULL_ENOUGH_WEIGHT_DELTA (4000) of the weight cap, stop.
+  local consecutive_failed = 0
 
   for _, entry in ipairs(sorted_entries) do
     local txid_hex = types.hash256_hex(entry.txid)
@@ -209,10 +283,7 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
     -- Skip transactions that are not final (locktime not satisfied)
     if not M.is_final_tx(entry.tx, height, mtp) then goto continue end
 
-    -- Check weight limit
-    if total_weight + entry.weight > max_weight then goto continue end
-
-    -- Check sigops limit
+    -- Compute this entry's sigops cost
     local tx_sigops = 0
     for _, inp in ipairs(entry.tx.inputs) do
       tx_sigops = tx_sigops + validation.count_script_sigops(inp.script_sig, true) * consensus.WITNESS_SCALE_FACTOR
@@ -220,7 +291,13 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
     for _, out in ipairs(entry.tx.outputs) do
       tx_sigops = tx_sigops + validation.count_script_sigops(out.script_pubkey, true) * consensus.WITNESS_SCALE_FACTOR
     end
-    if total_sigops + tx_sigops > max_sigops then goto continue end
+
+    -- Check weight limit: >= mirrors Core's TestChunkBlockLimits (miner.cpp:241).
+    -- BUG FIX: was > (off-by-one allowed weight == max_weight through).
+    local weight_fits  = (total_weight + entry.weight < max_weight)
+    -- Check sigops limit: >= mirrors Core miner.cpp:244.
+    -- BUG FIX: was > (off-by-one allowed sigops == max_sigops through).
+    local sigops_fits  = (total_sigops + tx_sigops < max_sigops)
 
     -- Ensure all ancestors are already selected
     local ancestors_ok = true
@@ -231,7 +308,20 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
         break
       end
     end
-    if not ancestors_ok then goto continue end
+
+    if not weight_fits or not sigops_fits or not ancestors_ok then
+      -- BUG FIX: track consecutive failures and give up early when close to
+      -- full.  Core miner.cpp:313-318.
+      consecutive_failed = consecutive_failed + 1
+      if consecutive_failed > MAX_CONSECUTIVE_FAILURES and
+         total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > max_weight then
+        break
+      end
+      goto continue
+    end
+
+    -- Chunk accepted: reset consecutive-failure counter.
+    consecutive_failed = 0
 
     -- Add to block
     selected[#selected + 1] = entry
@@ -304,7 +394,10 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
       data = M.hex_encode(serialize.serialize_transaction(coinbase_tx, true)),
     },
     target = M.hex_encode(consensus.bits_to_target(bits)),
-    mintime = os.time(),
+    -- BUG FIX: mintime must be MTP+1 (GetMinimumTime), not os.time().
+    -- Core miner.cpp:36-47: GetMinimumTime returns MTP+1 (adjusted for
+    -- BIP94 timewarp on retarget boundaries).  BIP22 mintime field.
+    mintime = mtp + 1,
     mutable = {"time", "transactions", "prevblock"},
     noncerange = "00000000ffffffff",
     sigoplimit = consensus.MAX_BLOCK_SIGOPS_COST,
