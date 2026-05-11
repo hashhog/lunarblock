@@ -328,6 +328,178 @@ do
   assert_eq(mp.tx_count, 2, "Mempool has 2 transactions")
 end
 
+-- Test 7: Cluster count limit — constant and get_cluster_size function
+-- W75 fix: old code used MAX_CLUSTER_SIZE=101 as count limit (wrong).
+-- Correct limit is MAX_CLUSTER_COUNT=64 (DEFAULT_CLUSTER_LIMIT, policy/policy.h:72).
+-- Note: in practice, with ancestor_limit=25 and descendant_limit=25, a linear
+-- chain hits the ancestor limit (25) before the cluster count limit (64).
+-- The cluster limit is the binding constraint only in wide topologies where
+-- individual tx ancestor/descendant depths are shallow.  We test the constant
+-- value and the underlying counter function directly.
+print("\nTEST 7: Cluster count limit constant and per-cluster counting (W75 fix)")
+do
+  -- Verify the constant is correct before touching the mempool
+  assert_eq(mempool.MAX_CLUSTER_COUNT, 64, "MAX_CLUSTER_COUNT constant == 64")
+
+  -- A chain of 25 txs (ancestor limit) forms a single cluster of 25.
+  -- get_cluster_size via M.get_cluster_size should report 25 for the root's root.
+  local chain_state = make_mock_chain_state()
+  local base_txid = types.hash256(string.rep("\x07", 32))
+  local base_txid_hex = types.hash256_hex(base_txid)
+  add_utxo(chain_state, base_txid_hex, 0, 700000000)
+
+  local mp = mempool.new(chain_state)
+  local current_txid = base_txid
+  local first_hex = nil
+
+  for i = 1, 25 do
+    local tx = make_tx(1, {}, {}, 0)
+    tx.inputs[1] = make_input(current_txid, 0)
+    tx.outputs[1] = make_output(700000000 - i * 1000000)
+    local ok, txid_hex_or_err = mp:accept_transaction(tx)
+    assert_true(ok, "Chain tx " .. i .. " accepted")
+    if i == 1 then first_hex = txid_hex_or_err end
+    current_txid = validation.compute_txid(tx)
+  end
+  assert_eq(mp.tx_count, 25, "Mempool contains 25 transactions")
+
+  -- The cluster that contains the first tx should have 25 members
+  local root = mempool.uf_find(first_hex)
+  local cluster_n = mempool.get_cluster_size(root)
+  assert_eq(cluster_n, 25, "Cluster of 25-chain has 25 members (not 101)")
+
+  -- 26th tx is rejected by ancestor limit (not cluster limit — that's expected:
+  -- cluster count = 25 < 64, ancestor count = 26 > 25)
+  local tx26 = make_tx(1, {}, {}, 0)
+  tx26.inputs[1] = make_input(current_txid, 0)
+  tx26.outputs[1] = make_output(700000000 - 26 * 1000000)
+  local ok26, err26 = mp:accept_transaction(tx26)
+  assert_true(not ok26, "26th chain tx rejected (ancestor limit)")
+  assert_match(err26, "ancestor", "26th chain tx rejected by ancestor limit (not cluster)")
+end
+
+-- Test 8: Cluster vsize function (W75 fix: vsize check was not implemented).
+-- We verify get_cluster_vsize sums correctly and that the limit is exported.
+-- Also verify the limit value: 101000 vbytes (101 kvB, policy/policy.h:74).
+print("\nTEST 8: Cluster vsize limit — get_cluster_vsize correctness and constant (W75 fix)")
+do
+  assert_eq(mempool.MAX_CLUSTER_VSIZE, 101000, "MAX_CLUSTER_VSIZE == 101000 vbytes")
+
+  local chain_state = make_mock_chain_state()
+  local base_txid = types.hash256(string.rep("\x08", 32))
+  local base_txid_hex = types.hash256_hex(base_txid)
+  add_utxo(chain_state, base_txid_hex, 0, 500000000)
+
+  local mp = mempool.new(chain_state)
+
+  -- Accept a chain of 3 transactions
+  local current_txid = base_txid
+  local hex1, hex2, hex3
+  local vsize_sum = 0
+
+  local tx1 = make_tx(1, {}, {}, 0)
+  tx1.inputs[1] = make_input(current_txid, 0)
+  tx1.outputs[1] = make_output(499000000)
+  local ok1, h1 = mp:accept_transaction(tx1)
+  assert_true(ok1, "tx1 accepted")
+  hex1 = h1
+  vsize_sum = vsize_sum + mp.entries[hex1].vsize
+  current_txid = validation.compute_txid(tx1)
+
+  local tx2 = make_tx(1, {}, {}, 0)
+  tx2.inputs[1] = make_input(current_txid, 0)
+  tx2.outputs[1] = make_output(498000000)
+  local ok2, h2 = mp:accept_transaction(tx2)
+  assert_true(ok2, "tx2 accepted")
+  hex2 = h2
+  vsize_sum = vsize_sum + mp.entries[hex2].vsize
+  current_txid = validation.compute_txid(tx2)
+
+  local tx3 = make_tx(1, {}, {}, 0)
+  tx3.inputs[1] = make_input(current_txid, 0)
+  tx3.outputs[1] = make_output(497000000)
+  local ok3, h3 = mp:accept_transaction(tx3)
+  assert_true(ok3, "tx3 accepted")
+  hex3 = h3
+  vsize_sum = vsize_sum + mp.entries[hex3].vsize
+
+  -- get_cluster_vsize via exported function must equal sum of individual vsizes
+  local cluster_root = mempool.uf_find(hex1)
+  local computed_vsize = mempool.get_cluster_vsize(cluster_root, mp.entries)
+  assert_eq(computed_vsize, vsize_sum,
+    "get_cluster_vsize(" .. computed_vsize .. ") == sum of 3 vsizes (" .. vsize_sum .. ")")
+  assert_true(computed_vsize <= mempool.MAX_CLUSTER_VSIZE,
+    "3-tx cluster vsize " .. computed_vsize .. " is within 101000 limit")
+end
+
+-- Test 9: Star topology — descendant limit (25) is the binding constraint before
+-- cluster count limit (64) in simple fan topologies.  This test confirms correct
+-- ordering: one root with many leaves, root hits descendant limit at 25 leaves
+-- (not cluster count limit at 64).
+-- Root in-mempool tx has 30 outputs (30 × 30000 sat each = 900000 out of 1000000 in).
+print("\nTEST 9: Star topology — descendant limit (25) is binding before cluster limit (64)")
+do
+  local chain_state = make_mock_chain_state()
+  local root_txid = types.hash256(string.rep("\x09", 32))
+  local root_txid_hex = types.hash256_hex(root_txid)
+  -- One large confirmed UTXO for the root in-mempool tx
+  add_utxo(chain_state, root_txid_hex, 0, 1000000)
+
+  local mp = mempool.new(chain_state)
+
+  -- Root in-mempool tx: 1 input (1,000,000 sat), 30 outputs (30,000 each = 900,000 total)
+  -- Fee = 100,000 sat.
+  local root_tx = make_tx(1, {}, {}, 0)
+  root_tx.inputs[1] = make_input(root_txid, 0)
+  root_tx.outputs = {}
+  for i = 1, 30 do
+    root_tx.outputs[i] = make_output(30000)
+  end
+  local ok_r, root_hex = mp:accept_transaction(root_tx)
+  assert_true(ok_r, "Root tx accepted (1 in, 30 out, fee=100000)")
+  local root_txid2 = validation.compute_txid(root_tx)
+
+  -- Add children that each spend one of root_tx's outputs
+  -- Each child: 1 input (30,000), 1 output (29,000), fee=1000
+  local accepted_children = 0
+  for i = 0, 29 do
+    local child = make_tx(1, {}, {}, 0)
+    child.inputs[1] = make_input(root_txid2, i)
+    child.outputs[1] = make_output(29000)
+    local ok_c, err_c = mp:accept_transaction(child)
+    if not ok_c then
+      -- Root's descendant count exceeded MAX_DESCENDANTS=25
+      assert_match(err_c, "descendant", "Star limit is descendant count, not cluster count")
+      break
+    end
+    accepted_children = accepted_children + 1
+  end
+  -- Exactly 25 children accepted (root descendant_count = 25 at that point)
+  assert_eq(accepted_children, 25,
+    "Exactly 25 children accepted (descendant limit = 25, cluster limit = 64)")
+  -- Cluster has root + 25 children = 26, well under cluster limit of 64
+  local cluster_root = mempool.uf_find(root_hex)
+  local cluster_n = mempool.get_cluster_size(cluster_root)
+  assert_true(cluster_n <= mempool.MAX_CLUSTER_COUNT,
+    "Cluster of " .. cluster_n .. " is under MAX_CLUSTER_COUNT=" .. mempool.MAX_CLUSTER_COUNT)
+end
+
+-- Test 10: Cluster count constant value is 64 (not 101 — regression check)
+print("\nTEST 10: Constant values are correct (W75 regression guard)")
+do
+  assert_eq(mempool.MAX_CLUSTER_COUNT, 64,   "MAX_CLUSTER_COUNT == 64 (DEFAULT_CLUSTER_LIMIT)")
+  assert_eq(mempool.MAX_CLUSTER_VSIZE, 101000, "MAX_CLUSTER_VSIZE == 101000 (101 kvB)")
+  assert_eq(mempool.MAX_ANCESTORS,     25,   "MAX_ANCESTORS == 25 (DEFAULT_ANCESTOR_LIMIT)")
+  assert_eq(mempool.MAX_DESCENDANTS,   25,   "MAX_DESCENDANTS == 25 (DEFAULT_DESCENDANT_LIMIT)")
+  assert_eq(mempool.MAX_ANCESTOR_SIZE,   101000, "MAX_ANCESTOR_SIZE == 101000 vbytes")
+  assert_eq(mempool.MAX_DESCENDANT_SIZE, 101000, "MAX_DESCENDANT_SIZE == 101000 vbytes")
+  assert_eq(mempool.EXTRA_DESCENDANT_TX_SIZE_LIMIT, 10000,
+    "EXTRA_DESCENDANT_TX_SIZE_LIMIT == 10000 (policy/policy.h:90)")
+  -- Legacy alias still works and points to COUNT (not 101)
+  assert_eq(mempool.MAX_CLUSTER_SIZE, 64,
+    "MAX_CLUSTER_SIZE legacy alias == 64 (not stale 101)")
+end
+
 print("\n=== Results ===")
 print("Passed: " .. passed)
 print("Failed: " .. failed)
