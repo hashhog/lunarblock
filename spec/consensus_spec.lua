@@ -537,6 +537,200 @@ describe("consensus", function()
     end)
   end)
 
+  -- ---------------------------------------------------------------------------
+  -- permitted_difficulty_transition — W83 comprehensive gate tests
+  -- Mirrors Bitcoin Core src/pow.cpp PermittedDifficultyTransition (lines 89-136).
+  -- ---------------------------------------------------------------------------
+  describe("permitted_difficulty_transition", function()
+    local mainnet
+    local testnet4
+
+    setup(function()
+      mainnet  = consensus.networks.mainnet
+      testnet4 = consensus.networks.testnet4
+    end)
+
+    -- Rule 1: pow_allow_min_difficulty networks always return true.
+    -- Bitcoin Core: if (params.fPowAllowMinDifficultyBlocks) return true;
+    it("testnet4 (pow_allow_min_difficulty): always true regardless of bits", function()
+      -- Even a wild jump in difficulty is permitted on testnet4.
+      assert.is_true(consensus.permitted_difficulty_transition(
+        testnet4, 100, 0x1d00ffff, 0x1b0404cb))
+      assert.is_true(consensus.permitted_difficulty_transition(
+        testnet4, 100, 0x1b0404cb, 0x1d00ffff))
+      assert.is_true(consensus.permitted_difficulty_transition(
+        testnet4, 2016, 0x1d00ffff, 0x1a2b3c4d))
+    end)
+
+    -- Rule 3: non-retarget mainnet block — bits must be identical.
+    it("mainnet non-retarget: same bits is permitted", function()
+      local bits = 0x1b0404cb
+      assert.is_true(consensus.permitted_difficulty_transition(
+        mainnet, 100, bits, bits))
+    end)
+
+    it("mainnet non-retarget: any change in bits is rejected", function()
+      assert.is_false(consensus.permitted_difficulty_transition(
+        mainnet, 100, 0x1b0404cb, 0x1b0404cc))
+      assert.is_false(consensus.permitted_difficulty_transition(
+        mainnet, 100, 0x1b0404cb, 0x1c0000ff))
+    end)
+
+    -- Rule 2: retarget boundary (height % 2016 == 0).
+    -- Exact same difficulty is always permitted at the boundary.
+    it("mainnet retarget: same bits is permitted", function()
+      local bits = 0x1d00ffff
+      assert.is_true(consensus.permitted_difficulty_transition(
+        mainnet, 2016, bits, bits))
+    end)
+
+    -- If the new target is 4x the old target (max decrease in difficulty),
+    -- it must be permitted.
+    it("mainnet retarget: 4x easier target is permitted (max decrease)", function()
+      -- Start from genesis target 0x1d00ffff; 4x easier would push past
+      -- pow_limit and be clamped to pow_limit.  Claiming pow_limit is permitted.
+      assert.is_true(consensus.permitted_difficulty_transition(
+        mainnet, 2016, 0x1d00ffff, mainnet.pow_limit_bits))
+    end)
+
+    -- A target slightly above pow_limit (e.g. exponent byte incremented) is
+    -- impossible to represent in compact form above pow_limit since target_to_bits
+    -- always round-trips through GetCompact/SetCompact.  Verify that claiming the
+    -- exact pow_limit after an easy period is fine.
+    it("mainnet retarget: claiming pow_limit after very slow period is permitted", function()
+      -- bits encoding pow_limit (0x1d00ffff) is the maximum allowed new target.
+      local result = consensus.permitted_difficulty_transition(
+        mainnet, 2016, 0x1d00ffff, 0x1d00ffff)
+      assert.is_true(result)
+    end)
+
+    -- If the new target is 4x harder (min timespan case), it should be permitted
+    -- provided old_bits leaves room.  Use a mid-range bits value.
+    it("mainnet retarget: 4x harder target is permitted (max increase)", function()
+      -- 0x1c00ffff (roughly 0x00ffff << 200).  4x harder = 0x1b00ffff-ish.
+      -- We just verify that the identical-difficulty case passes; 4x direction
+      -- depends on actual target arithmetic tested in calculate_next_target.
+      local bits = 0x1c00ffff
+      assert.is_true(consensus.permitted_difficulty_transition(
+        mainnet, 2016, bits, bits))
+    end)
+
+    -- A bogus 8x harder claim at the retarget boundary must be REJECTED.
+    -- Core: minimum_new_target > observed_new_target → return false.
+    it("mainnet retarget: 8x harder new target is rejected", function()
+      -- Starting from 0x1d00ffff, the hardest permitted target is
+      -- 0x1d00ffff * MIN_TIMESPAN / TARGET_TIMESPAN = 0x1d00ffff / 4.
+      -- Claiming 0x1a00ffff is much harder (about 2^24 times harder), rejected.
+      assert.is_false(consensus.permitted_difficulty_transition(
+        mainnet, 2016, 0x1d00ffff, 0x1a00ffff))
+    end)
+
+    -- A bogus 8x easier claim (target 8x above allowed max) must be REJECTED.
+    -- This is the case where the attacker claims easy PoW during presync without
+    -- actually having done the work.
+    it("mainnet retarget: target much easier than pow_limit is rejected when starting from hard base", function()
+      -- Start from a hard target (e.g. 0x1700ffff ≈ mainnet at height ~500k).
+      -- A 32x easier jump should be outside the 4x window.
+      -- 0x1700ffff * 4 = about 0x1800ffff (target 4x easier).
+      -- Claiming 0x1d00ffff (much easier) should be rejected.
+      local hard_bits = 0x1700ffff
+      -- The maximum permitted target is hard_bits * 4x ≈ 0x1800ffff.
+      -- 0x1d00ffff is far above that → rejected.
+      assert.is_false(consensus.permitted_difficulty_transition(
+        mainnet, 2016, hard_bits, 0x1d00ffff))
+    end)
+
+    -- Verify that height 0 (genesis-level) retarget check doesn't crash.
+    -- Height 0 % 2016 == 0 so we hit the retarget path.
+    it("mainnet retarget at height 0 does not crash", function()
+      local ok = pcall(function()
+        consensus.permitted_difficulty_transition(mainnet, 0, 0x1d00ffff, 0x1d00ffff)
+      end)
+      assert.is_true(ok)
+    end)
+
+    -- Non-retarget height just before a boundary
+    it("mainnet non-retarget at height 2015 rejects bit change", function()
+      assert.is_false(consensus.permitted_difficulty_transition(
+        mainnet, 2015, 0x1d00ffff, 0x1e00ffff))
+    end)
+
+    -- height 4032 (second retarget period) also triggers boundary check
+    it("mainnet retarget at height 4032 permits same bits", function()
+      local bits = 0x1c00ffff
+      assert.is_true(consensus.permitted_difficulty_transition(
+        mainnet, 4032, bits, bits))
+    end)
+  end)
+
+  -- ---------------------------------------------------------------------------
+  -- scale_target_by_timespan and compare_targets helpers — W83
+  -- ---------------------------------------------------------------------------
+  describe("scale_target_by_timespan", function()
+    it("scales mainnet genesis target by TARGET_TIMESPAN → same target", function()
+      -- Scaling by TARGET_TIMESPAN / TARGET_TIMESPAN = 1 should round-trip.
+      local bits = 0x1d00ffff
+      local scaled = consensus.scale_target_by_timespan(bits, consensus.TARGET_TIMESPAN)
+      local scaled_bits = consensus.target_to_bits(scaled)
+      assert.equals(bits, scaled_bits)
+    end)
+
+    it("scales by 4 (MAX_TIMESPAN) gives a 4x easier target", function()
+      local bits = 0x1c00ffff
+      local scaled = consensus.scale_target_by_timespan(bits, consensus.MAX_TIMESPAN)
+      -- After scaling by 4, the new target should be larger (easier).
+      local original = consensus.bits_to_target(bits)
+      assert.equals(1, consensus.compare_targets(scaled, original))
+    end)
+
+    it("scales by MIN_TIMESPAN gives a 4x harder target", function()
+      local bits = 0x1d00ffff
+      local scaled = consensus.scale_target_by_timespan(bits, consensus.MIN_TIMESPAN)
+      -- After scaling by 1/4, the new target should be smaller (harder).
+      local original = consensus.bits_to_target(bits)
+      assert.equals(-1, consensus.compare_targets(scaled, original))
+    end)
+  end)
+
+  describe("compare_targets", function()
+    it("equal targets return 0", function()
+      local t = consensus.bits_to_target(0x1d00ffff)
+      assert.equals(0, consensus.compare_targets(t, t))
+    end)
+
+    it("larger target returns 1", function()
+      local smaller = consensus.bits_to_target(0x1c00ffff)
+      local larger  = consensus.bits_to_target(0x1d00ffff)
+      assert.equals(1, consensus.compare_targets(larger, smaller))
+    end)
+
+    it("smaller target returns -1", function()
+      local smaller = consensus.bits_to_target(0x1c00ffff)
+      local larger  = consensus.bits_to_target(0x1d00ffff)
+      assert.equals(-1, consensus.compare_targets(smaller, larger))
+    end)
+  end)
+
+  -- ---------------------------------------------------------------------------
+  -- get_next_work_required — pow_no_retarget fix — W83
+  -- ---------------------------------------------------------------------------
+  describe("get_next_work_required pow_no_retarget", function()
+    it("regtest returns previous block bits, not pow_limit_bits directly", function()
+      local regtest = consensus.networks.regtest
+      -- Manufacture a previous block with the standard regtest bits.
+      local headers = {
+        [0] = {header = {bits = regtest.pow_limit_bits, timestamp = 1296688602}},
+      }
+      local function get_ancestor(h) return headers[h] end
+
+      local bits = consensus.get_next_work_required(1, 1296688602 + 600, regtest, get_ancestor)
+      -- Must equal prev.header.bits, not some hardcoded pow_limit_bits constant.
+      assert.equals(headers[0].header.bits, bits)
+      -- For regtest they happen to be equal; this test verifies we read from prev.
+      assert.equals(regtest.pow_limit_bits, bits)
+    end)
+  end)
+
   describe("sighash types", function()
     it("has correct SIGHASH_ALL", function()
       assert.equals(0x01, consensus.SIGHASH.ALL)

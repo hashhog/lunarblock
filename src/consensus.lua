@@ -248,6 +248,138 @@ function M.calculate_next_target(last_target_bits, actual_timespan, first_block_
   return M.target_to_bits(new_target_str)
 end
 
+--- Check if a difficulty transition between two blocks is permitted.
+-- Mirrors Bitcoin Core src/pow.cpp PermittedDifficultyTransition (lines 89-136).
+-- Used by headers-first presync to detect spoofed/impossible difficulty claims
+-- without having to know the exact expected target (which requires knowing
+-- the first block of each period, unavailable during blind presync).
+--
+-- Rules:
+--   1. Networks with pow_allow_min_difficulty (testnet, regtest): always true.
+--   2. At a retarget boundary (height % 2016 == 0): new target must be within
+--      [old_target * MIN_TIMESPAN / TARGET_TIMESPAN,
+--       old_target * MAX_TIMESPAN / TARGET_TIMESPAN], clamped to pow_limit.
+--   3. Not at a retarget boundary: bits must be identical to previous block.
+--
+-- @param network table: network configuration (needs pow_allow_min_difficulty,
+--   pow_limit_bits, and difficulty adjustment constants)
+-- @param height number: height of the block whose bits we are checking
+-- @param old_bits number: compact bits from the immediately preceding block
+-- @param new_bits number: compact bits claimed by the block at `height`
+-- @return boolean: true if transition is permitted
+function M.permitted_difficulty_transition(network, height, old_bits, new_bits)
+  -- Rule 1: testnet/regtest with min-difficulty blocks — always permitted.
+  -- Bitcoin Core: if (params.fPowAllowMinDifficultyBlocks) return true;
+  if network.pow_allow_min_difficulty then
+    return true
+  end
+
+  if height % M.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
+    -- Rule 2: retarget boundary — verify the new target is within the 4× window.
+    -- Bitcoin Core computes largest and smallest permitted targets, rounds them
+    -- through GetCompact/SetCompact (the same rounding that CalculateNextWorkRequired
+    -- applies), then checks that observed_new_target ∈ [min_rounded, max_rounded].
+    local smallest_timespan = math.floor(M.TARGET_TIMESPAN / 4)  -- MIN_TIMESPAN
+    local largest_timespan  = M.TARGET_TIMESPAN * 4               -- MAX_TIMESPAN
+
+    local pow_limit = M.bits_to_target(network.pow_limit_bits)
+
+    -- Compute largest permitted difficulty target (easiest = slowest blocks).
+    -- largest_difficulty_target = SetCompact(old_bits) * largest_timespan / TARGET_TIMESPAN
+    local largest_target = M.scale_target_by_timespan(old_bits, largest_timespan)
+    -- Clamp to pow_limit
+    if M.compare_targets(largest_target, pow_limit) > 0 then
+      largest_target = pow_limit
+    end
+    -- Round through GetCompact/SetCompact (same rounding as CalculateNextWorkRequired)
+    local maximum_new_bits   = M.target_to_bits(largest_target)
+    local maximum_new_target = M.bits_to_target(maximum_new_bits)
+
+    -- Compute smallest permitted difficulty target (hardest = fastest blocks).
+    local smallest_target = M.scale_target_by_timespan(old_bits, smallest_timespan)
+    if M.compare_targets(smallest_target, pow_limit) > 0 then
+      smallest_target = pow_limit
+    end
+    local minimum_new_bits   = M.target_to_bits(smallest_target)
+    local minimum_new_target = M.bits_to_target(minimum_new_bits)
+
+    local observed_target = M.bits_to_target(new_bits)
+
+    -- maximum_new_target < observed_target → too easy, not permitted
+    if M.compare_targets(maximum_new_target, observed_target) < 0 then
+      return false
+    end
+    -- minimum_new_target > observed_target → too hard, not permitted
+    if M.compare_targets(minimum_new_target, observed_target) > 0 then
+      return false
+    end
+    return true
+  else
+    -- Rule 3: non-retarget block — bits must be unchanged.
+    return old_bits == new_bits
+  end
+end
+
+--- Scale a compact-bits target by a timespan scalar and return the 32-byte target.
+-- Implements the multiply-then-divide arithmetic used by PermittedDifficultyTransition
+-- and CalculateNextWorkRequired: result = SetCompact(bits) * timespan / TARGET_TIMESPAN.
+-- Returns a 32-byte big-endian target string.
+-- @param bits number: compact bits
+-- @param timespan number: timespan multiplier (already clamped by caller)
+-- @return string: 32-byte big-endian target
+function M.scale_target_by_timespan(bits, timespan)
+  local old_target = M.bits_to_target(bits)
+
+  -- Multiply in little-endian using the same big-num arithmetic as
+  -- calculate_next_target (see above).
+  local old_le = {}
+  for i = 1, 32 do old_le[i] = old_target:byte(33 - i) end
+
+  local product = {}
+  for i = 1, 36 do product[i] = 0 end
+
+  local carry = 0
+  for i = 1, 32 do
+    local val = old_le[i] * timespan + carry
+    product[i] = bit.band(val, 0xFF)
+    carry = math.floor(val / 256)
+  end
+  local idx = 33
+  while carry > 0 and idx <= 36 do
+    product[idx] = bit.band(carry, 0xFF)
+    carry = math.floor(carry / 256)
+    idx = idx + 1
+  end
+
+  -- Divide by TARGET_TIMESPAN
+  local divisor = M.TARGET_TIMESPAN
+  local remainder = 0
+  for i = 36, 1, -1 do
+    local dividend = remainder * 256 + product[i]
+    product[i] = math.floor(dividend / divisor)
+    remainder = dividend % divisor
+  end
+
+  -- Convert back to big-endian 32 bytes
+  local result = {}
+  for i = 1, 32 do result[i] = string.char(product[33 - i]) end
+  return table.concat(result)
+end
+
+--- Compare two 32-byte big-endian targets numerically.
+-- @param a string: 32-byte target
+-- @param b string: 32-byte target
+-- @return number: -1 if a < b, 0 if a == b, 1 if a > b
+function M.compare_targets(a, b)
+  for i = 1, 32 do
+    local av = a:byte(i)
+    local bv = b:byte(i)
+    if av < bv then return -1 end
+    if av > bv then return  1 end
+  end
+  return 0
+end
+
 --- Get the next required work for a block.
 -- Implements full Bitcoin Core logic including testnet special rules and BIP94.
 -- @param height number: height of the block being validated
@@ -256,14 +388,19 @@ end
 -- @param get_ancestor function: fn(height) -> {header={bits, timestamp}} for ancestor lookup
 -- @return number: expected compact bits value
 function M.get_next_work_required(height, timestamp, network, get_ancestor)
-  -- Regtest: always return pow_limit (no retargeting)
-  if network.pow_no_retarget then
-    return network.pow_limit_bits
-  end
-
   local prev = get_ancestor(height - 1)
   if not prev then
     return network.pow_limit_bits
+  end
+
+  -- No retargeting (regtest): always return the previous block's bits.
+  -- Bitcoin Core CalculateNextWorkRequired: if (fPowNoRetargeting) return pindexLast->nBits;
+  -- Note: return prev.header.bits, NOT pow_limit_bits.  They are typically the same
+  -- for regtest (genesis uses pow_limit_bits), but using prev.header.bits is the
+  -- canonical behaviour and avoids divergence if a test ever mines a header at a
+  -- different declared difficulty.
+  if network.pow_no_retarget then
+    return prev.header.bits
   end
 
   -- Check if this is a difficulty adjustment block
