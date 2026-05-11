@@ -1120,6 +1120,18 @@ end
 -- @param vout number: output index
 -- @param entry table: UTXO entry (value, script_pubkey, height, is_coinbase)
 function CoinView:add(txid, vout, entry)
+  -- W93 Gate 16 (Core: coins.cpp:91 CCoinsViewCache::AddCoin):
+  -- `if (coin.out.scriptPubKey.IsUnspendable()) return;`.
+  -- Defence-in-depth: connect_block's per-tx loop already filters provably
+  -- unspendable outputs (OP_RETURN, over-size) before calling :add, but
+  -- snapshot loaders, reorg apply_tx_in_undo paths, and future call sites
+  -- must NOT be able to plant an unspendable coin into the UTXO set.  Core
+  -- has the guard at the lowest-level AddCoin primitive for exactly this
+  -- reason.  Mirrors W92 disconnect-side is_unspendable symmetry.
+  if entry and entry.script_pubkey and is_unspendable(entry.script_pubkey) then
+    return
+  end
+
   local key = M.outpoint_key(txid, vout)
   local existing = self.cache[key]
 
@@ -2100,6 +2112,45 @@ end
 function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get_block_mtp, skip_script_validation, use_parallel, nosync, caller_batch_fn, reorg_batch)
   local _cb_t0 = perf.now()
 
+  -- W93 Gate 1 (Core:2339-2343): genesis-hash short-circuit.
+  -- "Special case for the genesis block, skipping connection of its transactions
+  --  (its coinbase is unspendable)."  Lunarblock's normal entry point is
+  -- connect_genesis(), but if connect_block is ever called with the genesis
+  -- block (e.g. during replay-from-zero / a reorg test) we must NOT attempt to
+  -- look up the (non-existent) coinbase inputs.  We just record the tip and
+  -- return.  Reference: bitcoin-core/src/validation.cpp:2339-2343.
+  if self.network.genesis_hash then
+    local gen_hash = types.hash256_from_hex(self.network.genesis_hash)
+    if types.hash256_eq(block_hash, gen_hash) then
+      self.tip_hash = block_hash
+      self.tip_height = height
+      return true, 0
+    end
+  end
+
+  -- W93 Gate 2 (Core:2332-2333): verify that the view's current state
+  -- corresponds to the previous block.  Core's `assert(hashPrevBlock ==
+  -- view.GetBestBlock())` is a hard invariant — if a caller passed a block
+  -- whose parent is not our current tip, we have a programmer bug, not a
+  -- consensus failure.  We surface this as an error so callers can recover
+  -- rather than killing the node with an assert (Lua's assert is fatal).
+  -- Skipped for height == 0 (pre-tip), when reorg_batch is set (the
+  -- shared-batch reorg path manages its own tip pointer mid-rewind, so the
+  -- in-memory tip_hash temporarily lags behind the on-disk state), AND when
+  -- block.header.prev_hash is the zero sentinel (legacy test fixtures use
+  -- hash256_zero() as a "don't-care" parent — those callers explicitly opt
+  -- out of the tip-link check).
+  if height > 0 and not reorg_batch and self.tip_hash and block.header
+      and block.header.prev_hash
+      and not types.hash256_eq(block.header.prev_hash, types.hash256_zero()) then
+    if not types.hash256_eq(self.tip_hash, block.header.prev_hash) then
+      return nil, string.format(
+        "connect_block: prev_hash mismatch — view tip is %s but block parent is %s",
+        types.hash256_hex(self.tip_hash),
+        types.hash256_hex(block.header.prev_hash))
+    end
+  end
+
   -- Build undo data as we go - one TxUndo per non-coinbase transaction
   local block_undo = M.block_undo({})
   local total_fees = 0
@@ -2238,6 +2289,11 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       -- Coinbase only has legacy sigops (no UTXOs to look up)
       local coinbase_sigops = validation.get_legacy_sigop_count(tx) * consensus.WITNESS_SCALE_FACTOR
       total_sigop_cost = total_sigop_cost + coinbase_sigops
+      -- W93 Gate 14 (Core:2569-2572): bad-blk-sigops also applies after the
+      -- coinbase's sigops are counted.  Mirrors Core's per-iteration check.
+      if total_sigop_cost > consensus.MAX_BLOCK_SIGOPS_COST then
+        return nil, "bad-blk-sigops: too many sigops"
+      end
     else
       -- First pass: collect UTXOs and check BIP68 sequence locks
       -- We need to look up all UTXOs before we can check sequence locks
@@ -2265,6 +2321,15 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       end
       local tx_sigop_cost = validation.get_transaction_sigop_cost(tx, get_prev_output, sigop_flags)
       total_sigop_cost = total_sigop_cost + tx_sigop_cost
+
+      -- W93 Gate 14 (Core:2569-2572): bad-blk-sigops INSIDE the tx loop so we
+      -- bail at the first overflow instead of completing every script
+      -- verification in the block.  Core's check runs after every tx; we mirror
+      -- that here.  Error string matches Core's BLOCK_CONSENSUS reject reason
+      -- ("bad-blk-sigops") so diff-test corpora produce identical rejections.
+      if total_sigop_cost > consensus.MAX_BLOCK_SIGOPS_COST then
+        return nil, "bad-blk-sigops: too many sigops"
+      end
 
       -- BIP68: Check relative lock-times (sequence locks)
       -- Only enforce if BIP68 is active and we have the required MTP information
@@ -2687,20 +2752,27 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   end
   local _cb_t_parallel = perf.now()
 
-  -- Check total sigop cost does not exceed limit
-  assert(total_sigop_cost <= consensus.MAX_BLOCK_SIGOPS_COST,
-    string.format("Block sigop cost %d exceeds maximum %d",
-      total_sigop_cost, consensus.MAX_BLOCK_SIGOPS_COST))
+  -- W93 Gate 14 (Core:2569-2572): defence-in-depth, the loop above also bails
+  -- inside the per-tx iteration but we keep a final assertion in case a future
+  -- code edit moves the per-iter check.  Error string mirrors Core.
+  if total_sigop_cost > consensus.MAX_BLOCK_SIGOPS_COST then
+    return nil, "bad-blk-sigops: too many sigops"
+  end
 
-  -- Verify coinbase value
+  -- W93 Gate 17 (Core:2610-2614): bad-cb-amount — the coinbase tx may not pay
+  -- itself more than subsidy + fees.  Error string matches Core's
+  -- BLOCK_CONSENSUS reject reason ("bad-cb-amount") for diff-test parity.
+  -- Per-output MoneyRange checks happen earlier in check_block.
   local subsidy = consensus.get_block_subsidy(height)
   local coinbase_value = 0
   for _, out in ipairs(block.transactions[1].outputs) do
     coinbase_value = coinbase_value + out.value
   end
-  assert(coinbase_value <= subsidy + total_fees,
-    string.format("Coinbase value too high: %d > %d + %d",
-      coinbase_value, subsidy, total_fees))
+  if coinbase_value > subsidy + total_fees then
+    return nil, string.format(
+      "bad-cb-amount: coinbase pays too much (actual=%d vs limit=%d)",
+      coinbase_value, subsidy + total_fees)
+  end
 
   -- Serialize undo data (only if there are non-coinbase transactions). The
   -- actual write goes into the atomic batch below — pre-2026-04-30 this was
