@@ -18,8 +18,14 @@ M.MAX_SCRIPT_ELEMENT_SIZE = 520
 M.MAX_OPS_PER_SCRIPT = 201
 M.MAX_PUBKEYS_PER_MULTISIG = 20
 M.MAX_STACK_SIZE = 1000
-M.MAX_TX_SIZE = 100000
-M.MIN_TX_SIZE = 60  -- Consensus minimum (Bitcoin Core: MIN_TRANSACTION_WEIGHT/4)
+-- MIN_TRANSACTION_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT
+-- Bitcoin Core consensus/consensus.h:23-24.
+-- These are NOT validation gates in CheckTransaction; they serve as upper-bound
+-- estimates for the number of transactions that can fit in a block (used in
+-- merkle block and compact block DoS guards, e.g. merkleblock.cpp:159).
+-- Reference: bitcoin-core/src/consensus/consensus.h lines 23-24.
+M.MIN_TRANSACTION_WEIGHT = 240         -- WITNESS_SCALE_FACTOR * 60
+M.MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 40  -- WITNESS_SCALE_FACTOR * 10
 M.MAX_TX_IN_SEQUENCE_NO = 0xFFFFFFFF
 M.LOCKTIME_THRESHOLD = 500000000     -- Block height vs unix time threshold
 
