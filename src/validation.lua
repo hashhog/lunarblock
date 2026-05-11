@@ -1046,63 +1046,119 @@ function M.check_merkle_root(block)
 end
 
 --------------------------------------------------------------------------------
--- Witness Commitment
+-- Witness Commitment (BIP-141)
 --------------------------------------------------------------------------------
 
 -- Witness commitment prefix: OP_RETURN (0x6a) + push 36 bytes (0x24) + marker (aa21a9ed)
+-- MINIMUM_WITNESS_COMMITMENT = 38 bytes (Core consensus/validation.h:18)
+-- NO_WITNESS_COMMITMENT = -1  (Core consensus/validation.h:15)
 local WITNESS_COMMITMENT_PREFIX = "\x6a\x24\xaa\x21\xa9\xed"
+local MINIMUM_WITNESS_COMMITMENT = 38
 
---- Check witness commitment in coinbase.
--- @param block block: The full block
+--- Find the index of the last coinbase output that carries a witness commitment.
+-- Mirrors Core GetWitnessCommitmentIndex (consensus/validation.h:147-165):
+-- scans ALL coinbase outputs forward, keeps the last matching index.
+-- Returns nil when not found (Core returns NO_WITNESS_COMMITMENT = -1).
+-- @param coinbase table: The coinbase transaction
+-- @return number|nil: 1-based output index, or nil
+local function get_witness_commitment_index(coinbase)
+  local commitpos = nil
+  for i, out in ipairs(coinbase.outputs) do
+    local spk = out.script_pubkey
+    if #spk >= MINIMUM_WITNESS_COMMITMENT and spk:sub(1, 6) == WITNESS_COMMITMENT_PREFIX then
+      commitpos = i
+    end
+  end
+  return commitpos
+end
+
+--- Check witness malleation for a block.
+-- Mirrors Core CheckWitnessMalleation (validation.cpp:3864-3916).
+--
+-- BUG-W77 fixes (4 bugs):
+--   Bug 1: segwit-activation gating missing — callers must pass expect_witness_commitment
+--   Bug 2: witness stack size check was >= 1; Core requires == 1 (BLOCK_MUTATED)
+--   Bug 3: missing nonce silently defaulted to zeros; Core rejects (bad-witness-nonce-size)
+--   Bug 4: unexpected-witness loop excluded coinbase; Core checks ALL txs
+--
+-- @param block table: The full block
+-- @param expect_witness_commitment boolean: true when segwit deployment is active
+--        (mirrors Core's DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT))
+-- @return boolean, string|nil: true on success; false + error string on failure
+function M.check_witness_malleation(block, expect_witness_commitment)
+  if expect_witness_commitment then
+    -- Segwit is active: look for witness commitment in coinbase.
+    -- Core asserts block is non-empty + coinbase has at least one input here;
+    -- those invariants are already enforced by check_block's earlier gates.
+    local coinbase = block.transactions[1]
+    local commitpos = get_witness_commitment_index(coinbase)
+
+    if commitpos ~= nil then
+      -- Gate 7: coinbase must have at least one input (asserted by Core).
+      -- check_block / check_transaction already ensures this; guard defensively.
+      if not coinbase.inputs[1] then
+        return false, "bad-witness-nonce-size: coinbase has no inputs"
+      end
+
+      -- Gate 8+9: coinbase witness stack must be EXACTLY one 32-byte item.
+      -- Core validation.cpp:3880:
+      --   if (witness_stack.size() != 1 || witness_stack[0].size() != 32)
+      --     → bad-witness-nonce-size (BLOCK_MUTATED)
+      -- Bug 2 fix: was checked as >= 1 (allowed multi-item stacks).
+      -- Bug 3 fix: was silently defaulting to zeros when witness absent.
+      local wit = coinbase.inputs[1].witness
+      if not wit or #wit ~= 1 or #wit[1] ~= 32 then
+        return false, "bad-witness-nonce-size"
+      end
+      local witness_nonce = wit[1]
+
+      -- Gate 10: BlockWitnessMerkleRoot — coinbase wtxid = 32 zero bytes,
+      -- all other txs use their real wtxid (including witness data).
+      local witness_hashes = {}
+      witness_hashes[1] = types.hash256_zero()  -- coinbase wtxid = 0x000...0
+      for i = 2, #block.transactions do
+        witness_hashes[i] = M.compute_wtxid(block.transactions[i])
+      end
+      local witness_root = crypto.compute_merkle_root(witness_hashes)
+
+      -- Gate 11: SHA256d(witness_root || witness_nonce) must equal the
+      -- 32-byte commitment embedded at commitpos scriptPubKey[6..38].
+      -- Core validation.cpp:3892-3898.
+      local commitment_hash = coinbase.outputs[commitpos].script_pubkey:sub(7, 38)
+      local computed = crypto.hash256(witness_root.bytes .. witness_nonce)
+      if computed ~= commitment_hash then
+        return false, "bad-witness-merkle-match"
+      end
+
+      return true
+    end
+    -- Fall through: commitment not found → check for unexpected witness data
+    -- (same path as when segwit is NOT active).
+  end
+
+  -- Gate 12: No witness commitment present (either segwit not active, or
+  -- active but no commitment output found).  Any transaction in the block
+  -- that carries witness data is an error ("unexpected-witness").
+  -- Core validation.cpp:3906-3913: iterates ALL vtx (including coinbase).
+  -- Bug 4 fix: previous loop started at i=2, skipping the coinbase.
+  for _, tx in ipairs(block.transactions) do
+    if tx.segwit then
+      return false, "unexpected-witness"
+    end
+  end
+
+  return true
+end
+
+--- check_witness_commitment: thin wrapper kept for backward-compatibility.
+-- Callers that don't have a segwit-active flag always treat commitment as
+-- expected (segwit-active=true).  New call-sites must use
+-- check_witness_malleation directly to pass the activation flag.
+-- @param block table: The full block
 -- @return boolean: true if valid or no commitment needed
 function M.check_witness_commitment(block)
-  if #block.transactions == 0 then
-    return true
-  end
-
-  local coinbase = block.transactions[1]
-
-  -- Find witness commitment in coinbase outputs (search from last to first)
-  local commitment_hash = nil
-  for i = #coinbase.outputs, 1, -1 do
-    local script_pubkey = coinbase.outputs[i].script_pubkey
-    if #script_pubkey >= 38 and script_pubkey:sub(1, 6) == WITNESS_COMMITMENT_PREFIX then
-      commitment_hash = script_pubkey:sub(7, 38)
-      break
-    end
-  end
-
-  -- No commitment found - check if any transaction has witness data
-  if not commitment_hash then
-    for i = 2, #block.transactions do
-      if block.transactions[i].segwit then
-        return false  -- Has witness data but no commitment
-      end
-    end
-    return true  -- No witness data, no commitment needed
-  end
-
-  -- Compute witness merkle root
-  -- Coinbase wtxid is all zeros
-  local witness_hashes = {}
-  witness_hashes[1] = types.hash256_zero()
-  for i = 2, #block.transactions do
-    witness_hashes[i] = M.compute_wtxid(block.transactions[i])
-  end
-  local witness_root = crypto.compute_merkle_root(witness_hashes)
-
-  -- Get witness nonce from coinbase (first witness item, or 32 zero bytes)
-  local witness_nonce = string.rep("\0", 32)
-  if coinbase.inputs[1].witness and #coinbase.inputs[1].witness >= 1 then
-    witness_nonce = coinbase.inputs[1].witness[1]
-    if #witness_nonce ~= 32 then
-      return false  -- Invalid nonce length
-    end
-  end
-
-  -- Verify: SHA256d(witness_root || witness_nonce) == commitment_hash
-  local computed = crypto.hash256(witness_root.bytes .. witness_nonce)
-  return computed == commitment_hash
+  local ok, _err = M.check_witness_malleation(block, true)
+  return ok
 end
 
 --------------------------------------------------------------------------------
@@ -1229,8 +1285,17 @@ function M.check_block(block, network, height)
   -- Verify merkle root
   assert(M.check_merkle_root(block), "merkle root mismatch")
 
-  -- Verify witness commitment
-  assert(M.check_witness_commitment(block), "witness commitment mismatch")
+  -- Verify witness commitment / malleation (BIP-141, ContextualCheckBlock).
+  -- Segwit is active when height >= network.segwit_height.
+  -- Bug 1 fix: was always called with implicit segwit_active=true; now
+  -- respects the deployment activation height so pre-segwit blocks are
+  -- not incorrectly rejected for lacking a witness commitment.
+  -- Core: ContextualCheckBlock calls CheckWitnessMalleation with
+  --   DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT).
+  local segwit_active = height ~= nil and network.segwit_height ~= nil and
+                        height >= network.segwit_height
+  local wit_ok, wit_err = M.check_witness_malleation(block, segwit_active)
+  assert(wit_ok, wit_err or "witness commitment mismatch")
 
   -- BIP34: coinbase scriptSig must start with the byte-exact canonical
   -- encoding of the block height.
