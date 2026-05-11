@@ -650,6 +650,100 @@ describe("validation", function()
     end)
   end)
 
+  -- W76: BIP-141 weight/vsize gate tests
+  -- Reference: bitcoin-core/src/policy/policy.cpp:390-408
+  --            bitcoin-core/src/consensus/consensus.h:15-24
+  describe("get_sigops_adjusted_weight", function()
+    it("returns weight when weight >= sigop_cost * bytes_per_sigop", function()
+      -- weight=800, sigop_cost=1, bytes_per_sigop=20 → adj=20 < 800 → 800
+      assert.equals(800, validation.get_sigops_adjusted_weight(800, 1, 20))
+    end)
+
+    it("returns sigop_cost*bytes_per_sigop when that exceeds weight", function()
+      -- weight=40, sigop_cost=10, bytes_per_sigop=20 → adj=200 > 40 → 200
+      assert.equals(200, validation.get_sigops_adjusted_weight(40, 10, 20))
+    end)
+
+    it("handles zero sigop_cost (no adjustment)", function()
+      -- zero sigop_cost → adj=0, weight=400 wins
+      assert.equals(400, validation.get_sigops_adjusted_weight(400, 0, 20))
+    end)
+
+    it("handles sigop_cost exactly at boundary", function()
+      -- weight=100, sigop_cost=5, bytes_per_sigop=20 → adj=100 == weight → 100
+      assert.equals(100, validation.get_sigops_adjusted_weight(100, 5, 20))
+    end)
+
+    it("uses default bytes_per_sigop=20 when omitted", function()
+      -- sigop_cost=3, bytes_per_sigop defaults to 20 → adj=60
+      -- weight=50 < 60 → returns 60
+      assert.equals(60, validation.get_sigops_adjusted_weight(50, 3))
+    end)
+  end)
+
+  describe("get_virtual_tx_size", function()
+    -- Reference: bitcoin-core/src/policy/policy.cpp:395-398
+    -- GetVirtualTransactionSize: ceil(max(weight, sigop_cost*bps) / 4)
+
+    it("no-sigop case: ceil(weight/4) for weight divisible by 4", function()
+      -- weight=400, no sigop adj → vsize=100
+      assert.equals(100, validation.get_virtual_tx_size(400, 0, 0))
+    end)
+
+    it("no-sigop case: ceiling applied for weight not divisible by 4", function()
+      -- weight=401 → ceil(401/4)=101
+      assert.equals(101, validation.get_virtual_tx_size(401, 0, 0))
+    end)
+
+    it("matches Core GetVirtualTransactionSize for weight=4000000", function()
+      -- MAX_BLOCK_WEIGHT=4000000 → vsize=1000000
+      assert.equals(1000000, validation.get_virtual_tx_size(4000000, 0, 0))
+    end)
+
+    it("sigop adjustment raises vsize when sigops are high", function()
+      -- weight=160 (40-byte stripped legacy tx → 160 WU)
+      -- sigop_cost=40, bytes_per_sigop=20 → adj=800 > 160 → vsize=ceil(800/4)=200
+      assert.equals(200, validation.get_virtual_tx_size(160, 40, 20))
+    end)
+
+    it("sigop adjustment has no effect when weight dominates", function()
+      -- weight=1000, sigop_cost=1, bytes_per_sigop=20 → adj=20 < 1000
+      -- vsize=ceil(1000/4)=250
+      assert.equals(250, validation.get_virtual_tx_size(1000, 1, 20))
+    end)
+
+    it("uses default sigop_cost=0 and bytes_per_sigop=0 when omitted", function()
+      -- weight=600 → ceil(600/4)=150
+      assert.equals(150, validation.get_virtual_tx_size(600))
+    end)
+
+    it("MIN_TRANSACTION_WEIGHT=240 fits in 60 vbytes", function()
+      -- consensus.h: MIN_TRANSACTION_WEIGHT = 4 * 60 = 240
+      -- ceil(240/4) = 60 vbytes; Core comment: "60 is lower bound for valid tx"
+      assert.equals(60, validation.get_virtual_tx_size(240, 0, 0))
+    end)
+
+    it("MAX_STANDARD_TX_WEIGHT=400000 gives vsize=100000", function()
+      -- policy.h:38: MAX_STANDARD_TX_WEIGHT=400000
+      -- vsize=ceil(400000/4)=100000
+      assert.equals(100000, validation.get_virtual_tx_size(400000, 0, 0))
+    end)
+  end)
+
+  describe("check_transaction upper size gate", function()
+    -- Bitcoin Core tx_check.cpp:19:
+    --   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    -- means stripped_size > 1_000_000 → reject with "bad-txns-oversize"
+
+    it("accepts a normal transaction well under the size limit", function()
+      local tx = types.transaction(1, {}, {}, 0)
+      local prev_hash = types.hash256(string.rep("\x01", 32))
+      tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), "\x00", 0xFFFFFFFF)
+      tx.outputs[1] = types.txout(50000, string.rep("\x00", 25))
+      assert.has_no_error(function() validation.check_transaction(tx) end)
+    end)
+  end)
+
   describe("make_sig_checker", function()
     describe("check_locktime", function()
       it("passes when script locktime <= tx locktime (block heights)", function()
