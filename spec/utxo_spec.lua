@@ -703,9 +703,13 @@ describe("utxo", function()
       local block = make_block(0, {coinbase})
       local block_hash = validation.compute_block_hash(block.header)
 
-      assert.has_error(function()
-        chain_state:connect_block(block, 0, block_hash)
-      end, "Coinbase value too high: 5000000001 > 5000000000 + 0")
+      -- W93 (Core:2610-2614): connect_block returns (nil, "bad-cb-amount: ...")
+      -- instead of asserting.  Mirrors Core's BLOCK_CONSENSUS reject reason for
+      -- diff-test parity.
+      local ok, err = chain_state:connect_block(block, 0, block_hash)
+      assert.is_nil(ok)
+      assert.is_truthy(tostring(err):find("bad%-cb%-amount"),
+        "expected 'bad-cb-amount' in: " .. tostring(err))
     end)
 
     -- W84: premature-spend canonical error string
