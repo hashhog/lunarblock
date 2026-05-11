@@ -63,6 +63,119 @@ local function is_bip30_exempt(network_name, height, block_hash)
 end
 M.is_bip30_exempt = is_bip30_exempt
 
+-- IsBIP30Unspendable: the two predecessor blocks at h=91722 and h=91812
+-- whose coinbase outputs were later duplicated by h=91842 and h=91880.
+-- During DISCONNECT of h=91722 or h=91812, the UTXO for the original
+-- coinbase no longer exists (it was overwritten by the duplicate-coinbase
+-- connect) so the output-mismatch check must be suppressed.
+-- Reference: Bitcoin Core validation.cpp:2201-2202.
+local BIP30_UNSPENDABLE_MAINNET = {
+  -- height -> big-endian display hash (IsBIP30Unspendable blocks)
+  [91722] = "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+  [91812] = "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+}
+
+-- Returns true iff (network, height, block_hash) is one of the two
+-- IsBIP30Unspendable blocks — the disconnect-time BIP-30 exception.
+-- Different set from is_bip30_exempt (which is for CONNECT time).
+local function is_bip30_unspendable(network_name, height, block_hash)
+  if network_name ~= "mainnet" then return false end
+  local hex = BIP30_UNSPENDABLE_MAINNET[height]
+  if not hex then return false end
+  local expect = types.hash256_from_hex(hex)
+  return block_hash and types.hash256_eq(block_hash, expect)
+end
+M.is_bip30_unspendable = is_bip30_unspendable
+
+-- IsUnspendable: mirrors CScript::IsUnspendable() in script.h:563-566.
+-- A script is provably unspendable iff:
+--   (a) it starts with OP_RETURN (0x6a), OR
+--   (b) it is longer than MAX_SCRIPT_SIZE (10000 bytes).
+-- Used by disconnect_block to skip outputs that were never added to the
+-- UTXO set during connect_block.
+-- Reference: bitcoin-core/src/script/script.h:563-566.
+local function is_unspendable(script_pubkey)
+  local len = #script_pubkey
+  if len == 0 then return false end
+  if script_pubkey:byte(1) == 0x6a then return true end  -- OP_RETURN
+  if len > M.MAX_SCRIPT_SIZE then return true end
+  return false
+end
+M.is_unspendable = is_unspendable
+
+-- AccessByTxid: scan outputs 0..MAX_OUTPUTS_PER_BLOCK-1 for a non-spent
+-- coin belonging to `txid`.  Used by apply_tx_in_undo when undo.nHeight==0
+-- (older undo records omitted height/coinbase data for non-last spends).
+-- Reference: bitcoin-core/src/coins.cpp:386-395.
+local MAX_OUTPUTS_PER_BLOCK = 125000  -- 4000000 / (4 * ~8 bytes) rounded up
+local function access_by_txid(coin_view, txid)
+  for n = 0, MAX_OUTPUTS_PER_BLOCK - 1 do
+    local coin = coin_view:get(txid, n)
+    if coin then return coin end
+  end
+  return nil
+end
+M.access_by_txid = access_by_txid
+
+-- DisconnectBlock / ApplyTxInUndo tri-state result codes.
+-- Mirrors Bitcoin Core validation.h:451-455.
+-- DISCONNECT_OK      : all good
+-- DISCONNECT_UNCLEAN : rolled back, but UTXO set was inconsistent with block
+--                      (mismatched vouts, overwriting an unspent coin, etc.)
+-- DISCONNECT_FAILED  : something else went wrong — caller MUST abort the reorg
+M.DISCONNECT_OK      = "ok"
+M.DISCONNECT_UNCLEAN = "unclean"
+M.DISCONNECT_FAILED  = "failed"
+
+-- ApplyTxInUndo: standalone helper mirroring Core validation.cpp:2149-2175.
+-- Restores a single Coin to the UTXO view using one undo record.
+--
+-- Gate breakdown:
+--   1. view.HaveCoin(out) → fClean=false  (overwriting unspent coin)
+--   2. if undo.height == 0 → AccessByTxid sibling recovery; FAILED if none
+--   3. AddCoin(out, undo, !fClean)         (Core: possible_overwrite = !fClean)
+--   4. return DISCONNECT_OK / UNCLEAN / FAILED
+--
+-- @param coin_view CoinView
+-- @param undo table: utxo_entry to restore (mutated in place when height==0)
+-- @param prev_out_hash hash256: txid of the outpoint being restored
+-- @param prev_out_index number: vout index
+-- @return string: M.DISCONNECT_OK / M.DISCONNECT_UNCLEAN / M.DISCONNECT_FAILED
+function M.apply_tx_in_undo(coin_view, undo, prev_out_hash, prev_out_index)
+  local fClean = true
+
+  -- Gate 1: HaveCoin → overwriting unspent coin (Core:2153).
+  if coin_view:have(prev_out_hash, prev_out_index) then
+    fClean = false
+  end
+
+  -- Gate 2: missing-metadata sibling recovery (Core:2155-2165).
+  if undo.height == 0 then
+    local alternate = access_by_txid(coin_view, prev_out_hash)
+    if alternate then
+      undo.height = alternate.height
+      undo.is_coinbase = alternate.is_coinbase
+    else
+      return M.DISCONNECT_FAILED
+    end
+  end
+
+  -- Gate 3: AddCoin (Core:2172).
+  -- Lunarblock's CoinView:add does not yet take a possible_overwrite flag;
+  -- the existing logic computes mark_fresh from cache state, which under
+  -- the "unspent coin already in parent view" case yields the same effective
+  -- behavior provided the parent coin was previously read into cache.  We
+  -- pre-fetch via :get to guarantee that condition before the :add call so
+  -- the FRESH suppression matches Core's possible_overwrite=true semantics.
+  if not fClean then
+    coin_view:get(prev_out_hash, prev_out_index)  -- materialize into cache
+  end
+  coin_view:add(prev_out_hash, prev_out_index, undo)
+
+  if fClean then return M.DISCONNECT_OK end
+  return M.DISCONNECT_UNCLEAN
+end
+
 -- Returns true if BIP-30 enforcement can be skipped because BIP-34 activated
 -- at the canonical height/hash for this network (making coinbase txids unique).
 -- Mirrors Core validation.cpp:2460-2462:
@@ -2555,8 +2668,9 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
     -- Add outputs to UTXO set
     for vout_idx, out in ipairs(tx.outputs) do
-      -- Don't add provably unspendable outputs (OP_RETURN)
-      if #out.script_pubkey == 0 or out.script_pubkey:byte(1) ~= 0x6a then
+      -- Don't add provably unspendable outputs (OP_RETURN or over-size).
+      -- Reference: CScript::IsUnspendable() bitcoin-core/src/script/script.h:563.
+      if not is_unspendable(out.script_pubkey) then
         self.coin_view:add(txid, vout_idx - 1, M.utxo_entry(
           out.value, out.script_pubkey, height, is_coinbase
         ))
@@ -3286,6 +3400,31 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     end
   end
 
+  -- Gate 1 (Core:2190): vtxundo count consistency check.
+  -- blockUndo.vtxundo.size() + 1 must equal block.vtx.size().
+  -- The +1 accounts for coinbase (no undo entry).
+  -- Reference: bitcoin-core/src/validation.cpp:2190-2193.
+  if block_undo and (#block_undo.tx_undo + 1 ~= #block.transactions) then
+    return nil, string.format(
+      "DisconnectBlock: undo data tx count %d + 1 != block tx count %d",
+      #block_undo.tx_undo, #block.transactions)
+  end
+
+  -- Gate 2 (Core:2201-2202): BIP-30 disconnect-time exception.
+  -- The two predecessor blocks at h=91722 and h=91812 have outputs that
+  -- were later overwritten by duplicate coinbases at h=91842/h=91880.
+  -- When disconnecting these predecessors, the coinbase outputs no longer
+  -- exist in the UTXO set (they were overwritten), so we must suppress the
+  -- output-mismatch detection for coinbase txs in these blocks.
+  -- Reference: bitcoin-core/src/validation.cpp:2201-2209.
+  local fEnforceBIP30 = not is_bip30_unspendable(self.network.name, height, block_hash)
+
+  -- fClean tracks whether disconnection was clean (no mismatches).
+  -- DISCONNECT_UNCLEAN mismatches are logged but non-fatal (they indicate
+  -- historical duplicate-coinbase situations). DISCONNECT_FAILED is fatal.
+  -- Reference: bitcoin-core/src/validation.cpp:2182 + 2218-2221.
+  local fClean = true
+
   -- Pattern C0: collect txids from this block so we can delete their
   -- CF.TX_INDEX entries inside the disconnect atomic batch.  Symmetrical
   -- with the connect path.  Ref: bitcoin-core BaseIndex::BlockDisconnected
@@ -3344,37 +3483,98 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     end
   end
 
-  -- Process transactions in reverse order
+  -- Process transactions in reverse order.
+  -- Reference: bitcoin-core/src/validation.cpp:2204-2241.
   -- Note: block_undo.tx_undo[i] corresponds to block.transactions[i+1]
-  -- because coinbase (tx index 1) has no undo data
+  -- because coinbase (tx index 1) has no undo data.
   for tx_idx = #block.transactions, 1, -1 do
     local tx = block.transactions[tx_idx]
     local txid = validation.compute_txid(tx)
     local is_coinbase = (tx_idx == 1)
+    -- Gate 2b: is_bip30_exception applies only to the coinbase tx in the
+    -- two IsBIP30Unspendable blocks.  Reference: Core:2209.
+    local is_bip30_exception = (is_coinbase and not fEnforceBIP30)
 
     if block_txid_bytes then
       block_txid_bytes[#block_txid_bytes + 1] = txid.bytes
     end
 
-    -- Remove outputs from UTXO set (they were added during connect)
+    -- Gate 3 (Core:2213-2223): check that all spendable outputs exist and
+    -- match the block data exactly.  SpendCoin returns the coin; compare
+    -- value, script, height, and coinbase flag.  Mismatches set fClean=false
+    -- (DISCONNECT_UNCLEAN) unless this is a bip30_exception.
+    -- Reference: bitcoin-core/src/validation.cpp:2213-2223.
     for vout_idx = 1, #tx.outputs do
       local out = tx.outputs[vout_idx]
-      -- Only remove if we added it (not OP_RETURN)
-      if #out.script_pubkey == 0 or out.script_pubkey:byte(1) ~= 0x6a then
-        self.coin_view:spend(txid, vout_idx - 1)
+      if not is_unspendable(out.script_pubkey) then
+        local coin, spend_err = self.coin_view:spend(txid, vout_idx - 1)
+        if not coin then
+          -- Output missing from UTXO set during disconnect.
+          if not is_bip30_exception then
+            fClean = false
+          end
+        else
+          -- Gate 3b: verify coin matches block output (value + script + height + coinbase).
+          -- Reference: Core:2218 `tx.vout[o] != coin.out || pindex->nHeight != coin.nHeight ...`
+          if coin.value ~= out.value
+              or coin.script_pubkey ~= out.script_pubkey
+              or coin.height ~= height
+              or (not not coin.is_coinbase) ~= is_coinbase then
+            if not is_bip30_exception then
+              fClean = false
+            end
+          end
+        end
       end
     end
 
-    -- Restore spent inputs using undo data
+    -- Gate 4 (Core:2227-2240): restore spent inputs using undo data (all txs
+    -- except coinbase).  Inputs are restored in REVERSE order to match Core's
+    -- iteration (for j = tx.vin.size(); j > 0; --j).
+    -- Reference: bitcoin-core/src/validation.cpp:2227-2241.
     if not is_coinbase and block_undo then
-      -- tx_idx 2 -> block_undo.tx_undo[1], tx_idx 3 -> block_undo.tx_undo[2], etc.
       local undo_idx = tx_idx - 1
       local tx_undo = block_undo.tx_undo[undo_idx]
       if tx_undo then
-        for inp_idx, inp in ipairs(tx.inputs) do
-          local spent_utxo = tx_undo.prev_outputs[inp_idx]
-          if spent_utxo then
-            self.coin_view:add(inp.prev_out.hash, inp.prev_out.index, spent_utxo)
+        -- Gate 5 (Core:2229): per-tx undo input count must match tx vin count.
+        -- Reference: bitcoin-core/src/validation.cpp:2229-2232.
+        if #tx_undo.prev_outputs ~= #tx.inputs then
+          return nil, string.format(
+            "DisconnectBlock: tx %s undo input count %d != vin count %d",
+            types.hash256_hex(txid), #tx_undo.prev_outputs, #tx.inputs)
+        end
+        -- Gate 6: apply undo in reverse input order (matches Core).
+        -- Reference: bitcoin-core/src/validation.cpp:2233-2238.
+        for j = #tx.inputs, 1, -1 do
+          local inp = tx.inputs[j]
+          local undo_entry = tx_undo.prev_outputs[j]
+          if undo_entry then
+            -- Gate 7 (Core:2155-2165 ApplyTxInUndo): if undo entry has
+            -- height == 0, the record pre-dates height storage in undo data.
+            -- Fall back to AccessByTxid to recover height and coinbase flag
+            -- from another unspent output of the same tx.
+            -- Reference: bitcoin-core/src/validation.cpp:2155-2166.
+            if undo_entry.height == 0 then
+              local alt = access_by_txid(self.coin_view, inp.prev_out.hash)
+              if alt then
+                undo_entry = M.utxo_entry(
+                  undo_entry.value, undo_entry.script_pubkey,
+                  alt.height, alt.is_coinbase)
+              else
+                -- No alternate found: cannot safely restore; DISCONNECT_FAILED.
+                return nil, string.format(
+                  "DisconnectBlock: undo height==0 and AccessByTxid failed for tx %s input %d",
+                  types.hash256_hex(txid), j)
+              end
+            end
+            -- Gate 8 (Core:2172 + HaveCoin overwrite detection):
+            -- If the coin already exists as unspent, it's an overwrite
+            -- situation (sets fClean = false = DISCONNECT_UNCLEAN).
+            -- Reference: bitcoin-core/src/validation.cpp:2153 + 2172.
+            if self.coin_view:have(inp.prev_out.hash, inp.prev_out.index) then
+              fClean = false
+            end
+            self.coin_view:add(inp.prev_out.hash, inp.prev_out.index, undo_entry)
           end
         end
       end
@@ -3453,7 +3653,10 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     self.callbacks.on_block_disconnected(block_hash)
   end
 
-  return true
+  -- Return true + "ok"/"unclean" to mirror Core's DISCONNECT_OK / DISCONNECT_UNCLEAN.
+  -- All callers treat non-nil first return as success; "unclean" is informational.
+  -- Reference: bitcoin-core/src/validation.cpp:2247.
+  return true, fClean and "ok" or "unclean"
 end
 
 --------------------------------------------------------------------------------
