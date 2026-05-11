@@ -690,6 +690,12 @@ M.networks.mainnet = {
 
   -- Soft fork heights
   bip34_height = 227931,
+  -- BIP34 activation hash: the hash of block 227931, needed for the BIP30
+  -- short-circuit: once BIP34 is active at the canonical hash we can skip
+  -- BIP30 UTXO-collision checks for blocks 0..1,983,701 (BIP34 makes coinbase
+  -- txids unique by embedding height, so duplicate coinbases become impossible).
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp:89-90.
+  bip34_hash = "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
   bip65_height = 388381,
   bip66_height = 363725,
   csv_height = 419328,
@@ -805,6 +811,9 @@ M.networks.testnet = {
 
   -- Soft fork heights
   bip34_height = 21111,
+  -- BIP34 activation hash for testnet3.
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp:212-213.
+  bip34_hash = "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
   bip65_height = 581885,
   bip66_height = 330776,
   csv_height = 770112,
@@ -869,6 +878,10 @@ M.networks.testnet4 = {
 
   -- All soft forks active from height 1 (BIP94)
   bip34_height = 1,
+  -- BIP34 activation hash: testnet4 has BIP34 active from genesis (height 1),
+  -- so bip34_hash is the empty hash (Core uses uint256{} for regtest/testnet4).
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp:455-456.
+  bip34_hash = nil,  -- empty / undefined; BIP34 active from height 1 with no bypass
   bip65_height = 1,
   bip66_height = 1,
   csv_height = 1,
@@ -930,6 +943,9 @@ M.networks.regtest = {
   -- All soft forks active from height 0 except BIP-34 which activates at 1
   -- (Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1 for regtest)
   bip34_height = 1,
+  -- BIP34 activation hash: regtest uses empty hash (uint256{}).
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp:536-537.
+  bip34_hash = nil,  -- empty / undefined; no BIP30 bypass optimization applies
   bip65_height = 0,
   bip66_height = 0,
   csv_height = 0,

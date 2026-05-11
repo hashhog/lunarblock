@@ -26,22 +26,34 @@ local M = {}
 -- to internal little-endian on lookup. types.hash256_from_hex does
 -- exactly that, so we can just call it.
 --
--- For all OTHER blocks, BIP-30 is enforced unconditionally: no
--- transaction (coinbase or otherwise) in the new block may have a txid
--- that matches an existing UTXO in the chainstate (Core
--- validation.cpp:2467-2476). Post-BIP-34 this is essentially academic
--- (BIP-34's height-in-coinbase makes coinbase txids unique), but the
--- check is consensus-critical for from-genesis IBD and for any future
--- soft-fork that breaks BIP-34 uniqueness.
+-- For all OTHER blocks, BIP-30 enforcement depends on height:
+--   1. If the block is one of the two BIP-30 repeat blocks (91842, 91880) →
+--      exempt (IsBIP30Repeat).
+--   2. If BIP-34 is active at the canonical height/hash for this chain,
+--      AND the block height is < BIP34_IMPLIES_BIP30_LIMIT (1,983,702) →
+--      skip BIP-30 (BIP-34's height-in-coinbase makes txids unique so
+--      duplicate coinbases are impossible).
+--   3. Otherwise (pre-BIP34 or height >= 1,983,702) → enforce BIP-30.
+--
+-- Reference: Bitcoin Core validation.cpp:2402-2476.
+-- W79: added BIP34-bypass optimization and BIP34_IMPLIES_BIP30_LIMIT constant.
 local BIP30_EXEMPT_MAINNET = {
   -- height -> big-endian display hash (uint256.ToString format)
+  -- These are the IsBIP30Repeat blocks: h=91842 and h=91880 which duplicate
+  -- their predecessors at h=91722 and h=91812 (IsBIP30Unspendable).
   [91842] = "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
   [91880] = "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
 }
 
+-- Above this height, BIP-34's coinbase-uniqueness guarantee breaks down
+-- because pre-BIP-34 coinbases with indicated heights at this level can
+-- collide. BIP-30 must always be enforced at or above this height, even
+-- post-BIP-34. Per Core validation.cpp:2430.
+local BIP34_IMPLIES_BIP30_LIMIT = 1983702
+
 -- Returns true iff the (network, height, block_hash) triple matches one
--- of the historical BIP-30 exemption blocks. Network-aware so testnet /
--- regtest don't accidentally inherit the mainnet exemption.
+-- of the historical BIP-30 exemption blocks (IsBIP30Repeat).
+-- Network-aware so testnet/regtest don't inherit the mainnet exemption.
 local function is_bip30_exempt(network_name, height, block_hash)
   if network_name ~= "mainnet" then return false end
   local exempt_hex = BIP30_EXEMPT_MAINNET[height]
@@ -50,6 +62,47 @@ local function is_bip30_exempt(network_name, height, block_hash)
   return block_hash and types.hash256_eq(block_hash, expect)
 end
 M.is_bip30_exempt = is_bip30_exempt
+
+-- Returns true if BIP-30 enforcement can be skipped because BIP-34 activated
+-- at the canonical height/hash for this network (making coinbase txids unique).
+-- Mirrors Core validation.cpp:2460-2462:
+--   fEnforceBIP30 = fEnforceBIP30 && (!pindexBIP34height ||
+--     !(pindexBIP34height->GetBlockHash() == params.GetConsensus().BIP34Hash))
+-- We need the BIP34 activation block's hash to confirm we're on the canonical
+-- chain. bip34_hash is nil for networks with no meaningful BIP30 history
+-- (testnet4, regtest) — those always enforce BIP30 (harmless for their heights).
+-- @param network table: network params (must have bip34_height, bip34_hash)
+-- @param height number: block height being connected
+-- @param get_ancestor_hash function(height) -> hash256|nil: look up a block hash
+-- @return boolean: true if BIP30 enforcement should be skipped
+local function bip34_bypasses_bip30(network, height, get_ancestor_hash)
+  -- Only applicable if BIP34 has activated at this height.
+  if not network.bip34_height or height < network.bip34_height then
+    return false
+  end
+  -- If the network has no canonical BIP34 hash, can't confirm the bypass.
+  if not network.bip34_hash then
+    return false
+  end
+  -- Heights >= BIP34_IMPLIES_BIP30_LIMIT must always enforce BIP30, even
+  -- post-BIP34 (pre-BIP34 coinbases can collide at these heights).
+  -- Reference: validation.cpp:2430, 2467.
+  if height >= BIP34_IMPLIES_BIP30_LIMIT then
+    return false
+  end
+  -- Look up the block at the BIP34 activation height and compare its hash
+  -- against the canonical BIP34 activation hash for this chain.
+  if not get_ancestor_hash then
+    return false
+  end
+  local ancestor = get_ancestor_hash(network.bip34_height)
+  if not ancestor then
+    return false
+  end
+  local canonical = types.hash256_from_hex(network.bip34_hash)
+  return types.hash256_eq(ancestor, canonical)
+end
+M.bip34_bypasses_bip30 = bip34_bypasses_bip30
 
 --------------------------------------------------------------------------------
 -- Fast UTXO Serialization (FFI-based, avoids buffer_writer/reader overhead)
@@ -1962,19 +2015,33 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- ConnectBlock enforces "no transaction in this block may have a txid
   -- whose outputs already exist as UTXOs", with two known mainnet
   -- exemption blocks (h=91842, h=91880) that intentionally duplicate
-  -- earlier coinbases. Core also short-circuits the check post-BIP34
-  -- (since BIP-34 makes coinbase txids unique by embedding height) but
-  -- explicitly preserves enforcement above height 1,983,702 because
-  -- pre-BIP-34 coinbases with indicated heights at that level can still
-  -- collide. Simplest correct policy: enforce always, except the two
-  -- exempt blocks. Cost is one HaveCoin lookup per tx output per block —
-  -- negligible vs script verification.
+  -- earlier coinbases (IsBIP30Repeat).
   --
-  -- Pre-fix lunarblock had no enforcement, so a malicious miner could
-  -- mine a block whose coinbase txid duplicated an existing UTXO and
-  -- silently overwrite it (CVE-2012-1909 family). Practically blocked
-  -- by BIP-34 on current mainnet, but the check is a spec requirement.
+  -- Core also short-circuits the check post-BIP34 (since BIP-34 makes
+  -- coinbase txids unique by embedding height) but explicitly preserves
+  -- enforcement at height >= 1,983,702 because some pre-BIP-34 coinbases
+  -- had indicated heights at that level and could collide (BIP34_IMPLIES_
+  -- BIP30_LIMIT). W79: wired in bip34_bypasses_bip30() to implement the
+  -- proper BIP34-hash-confirmed skip, matching Core's logic exactly.
+  --
+  -- Pre-fix lunarblock enforced BIP-30 always (correct but over-broad).
+  -- The only observable difference is performance: post-BIP34 mainnet IBD
+  -- was doing an extra HaveCoin scan per tx per block needlessly. With the
+  -- fix, those 700k+ blocks skip the scan. Consensus outcome is identical.
   local enforce_bip30 = not is_bip30_exempt(self.network.name, height, block_hash)
+  if enforce_bip30 then
+    -- BIP34 bypass: if BIP34 is confirmed active at the canonical hash for
+    -- this chain, skip BIP30 for blocks below BIP34_IMPLIES_BIP30_LIMIT.
+    -- Provide a get_ancestor_hash closure that looks up the block hash at
+    -- a given height from the height index.
+    local storage_ref = self.storage
+    local function get_ancestor_hash(h)
+      return storage_ref.get_hash_by_height(h)
+    end
+    if bip34_bypasses_bip30(self.network, height, get_ancestor_hash) then
+      enforce_bip30 = false
+    end
+  end
   if enforce_bip30 then
     for _, tx in ipairs(block.transactions) do
       local check_txid = validation.compute_txid(tx)
