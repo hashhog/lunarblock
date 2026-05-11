@@ -869,6 +869,15 @@ M.networks.mainnet = {
   pow_allow_min_difficulty = false,
   enforce_bip94 = false,
 
+  -- Headers sync anti-DoS parameters (Bitcoin Core kernel/chainparams.cpp:193-195).
+  -- commitment_period: store 1 commitment bit every N headers during PRESYNC.
+  -- redownload_buffer_size: keep this many headers buffered during REDOWNLOAD
+  --   before releasing to the block index, ensuring ~23.7 commitments verified.
+  headerssync_params = {
+    commitment_period = 641,
+    redownload_buffer_size = 15218,  -- 15218/641 = ~23.7 commitments
+  },
+
   -- Minimum chain work required to accept a chain (anti-DoS)
   -- This is a hex string representation of the 256-bit value
   -- Updated periodically; this value corresponds to Bitcoin Core v27
@@ -982,6 +991,12 @@ M.networks.testnet = {
   pow_allow_min_difficulty = true,
   enforce_bip94 = false,
 
+  -- Headers sync anti-DoS parameters (Bitcoin Core kernel/chainparams.cpp:294-296).
+  headerssync_params = {
+    commitment_period = 673,
+    redownload_buffer_size = 14460,  -- 14460/673 = ~21.5 commitments
+  },
+
   -- Minimum chain work (low for testnet)
   min_chain_work = "0000000000000000000000000000000000000000000000000000000100010001",
 
@@ -1048,6 +1063,12 @@ M.networks.testnet4 = {
   pow_allow_min_difficulty = true,
   enforce_bip94 = true,
 
+  -- Headers sync anti-DoS parameters (Bitcoin Core kernel/chainparams.cpp:400-401).
+  headerssync_params = {
+    commitment_period = 606,
+    redownload_buffer_size = 16092,  -- 16092/606 = ~26.6 commitments
+  },
+
   -- Minimum chain work (testnet4)
   min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
 
@@ -1111,6 +1132,13 @@ M.networks.regtest = {
 
   -- Minimum chain work (0 for regtest - disable anti-DoS)
   min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
+
+  -- Headers sync anti-DoS parameters for regtest (Bitcoin Core kernel/chainparams.cpp:559-562).
+  -- regtest uses a small commitment_period (275) for faster testing.
+  headerssync_params = {
+    commitment_period = 275,
+    redownload_buffer_size = 7017,  -- 7017/275 = ~25.5 commitments
+  },
 
   -- Assumevalid (disabled for regtest, always verify)
   assumevalid = nil,
