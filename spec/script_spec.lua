@@ -2307,4 +2307,521 @@ describe("script", function()
       assert.equals(3, script.script_num_decode(stack[1]))
     end)
   end)
+
+  -- ---------------------------------------------------------------------------
+  -- BIP-66 / signature encoding comprehensive tests (W82)
+  -- Reference: bitcoin-core/src/script/interpreter.cpp:64-227
+  --
+  -- All gates are exercised via execute_script with OP_CHECKSIG (0xAC) and
+  -- a mock checker so real ECDSA verification is bypassed.  The stack is
+  -- pre-loaded [sig, pubkey] (pubkey on top) and the script is just the
+  -- single opcode byte.
+  --
+  -- A minimal valid DER sig (9 bytes, hashtype 0x01):
+  --   30 06 02 01 01 02 01 01 01
+  -- ---------------------------------------------------------------------------
+  describe("BIP-66 IsValidSignatureEncoding gates (verify_dersig)", function()
+    -- OP_CHECKSIG opcode byte
+    local OP_CHECKSIG = "\xac"
+    -- A 33-byte compressed pubkey (02 + 32 bytes).  The checker stub ignores it.
+    local PUBKEY = "\x02" .. string.rep("\x01", 32)
+    -- Mock checker: always returns true so NULLFAIL is never triggered
+    local checker_ok = { check_sig = function() return true end }
+    -- Mock checker: always returns false (triggers NULLFAIL for non-empty sigs)
+    local checker_fail = { check_sig = function() return false end }
+
+    -- Helper: run OP_CHECKSIG with the given sig on the stack, dersig flag set.
+    -- Returns result, err from execute_script.
+    local function run_checksig_dersig(sig, pubkey_arg)
+      local pk = pubkey_arg or PUBKEY
+      return script.execute_script(OP_CHECKSIG, {sig, pk},
+        {verify_dersig = true}, checker_ok)
+    end
+
+    -- The minimal valid sig used as a baseline throughout this block
+    local VALID_SIG = "\x30\x06\x02\x01\x01\x02\x01\x01\x01"
+
+    it("accepts a minimal valid DER sig (9 bytes)", function()
+      local result, err = run_checksig_dersig(VALID_SIG)
+      assert.is_nil(err)
+      assert.is_table(result)
+    end)
+
+    it("accepts empty signature (always allowed per spec)", function()
+      -- Empty sig bypasses all encoding checks; the checker returns true.
+      local result, err = run_checksig_dersig("")
+      assert.is_nil(err)
+      assert.is_table(result)
+    end)
+
+    -- Gate 1: minimum size < 9
+    it("rejects sig shorter than 9 bytes (SIG_DER)", function()
+      -- 8-byte sig: 30 05 02 01 01 02 01 01 (missing hashtype)
+      local short_sig = "\x30\x05\x02\x01\x01\x02\x01\x01"
+      local result, err = run_checksig_dersig(short_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 2: maximum size > 73
+    it("rejects sig longer than 73 bytes (SIG_DER)", function()
+      -- 74-byte sig: compound byte + filler
+      local long_sig = "\x30" .. string.rep("\x00", 73)
+      local result, err = run_checksig_dersig(long_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 3: first byte must be 0x30 (compound)
+    it("rejects sig not starting with 0x30 (SIG_DER)", function()
+      -- Replace 0x30 with 0x31
+      local bad_sig = "\x31\x06\x02\x01\x01\x02\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 4: byte[1] must equal len - 3
+    it("rejects sig where total-length field is wrong (SIG_DER)", function()
+      -- VALID_SIG has byte[1]=0x06 = 9-3 = 6; change to 0x07
+      local bad_sig = "\x30\x07\x02\x01\x01\x02\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 5: 5 + lenR must be < len (lenR too large)
+    it("rejects sig where lenR would exceed buffer (SIG_DER)", function()
+      -- lenR = 0x20 (32) but total sig is only 9 bytes
+      local bad_sig = "\x30\x06\x02\x20\x01\x02\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 6: lenR + lenS + 7 must equal len
+    it("rejects sig where length sum is inconsistent (SIG_DER)", function()
+      -- R-len=1, S-len=2 but actual total is 9 (should be 10)
+      -- 30 06 02 01 01 02 02 01 01 → lenR+lenS+7 = 1+2+7=10 ≠ 9
+      local bad_sig = "\x30\x06\x02\x01\x01\x02\x02\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 7: byte[2] must be 0x02 (R integer marker)
+    it("rejects sig where R marker is not 0x02 (SIG_DER)", function()
+      -- Replace R marker 0x02 with 0x03
+      local bad_sig = "\x30\x06\x03\x01\x01\x02\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 8: lenR must not be zero
+    it("rejects sig with zero-length R (SIG_DER)", function()
+      -- 30 06 02 00 00 02 01 01 01  (lenR=0; but total-length stays 6 so
+      -- lenR+lenS+7=0+?+7 check will also fail; craft carefully)
+      -- Use: 30 04 02 00 02 01 01 01 (total 8 bytes — gate 1 fires first)
+      -- Better: 30 05 02 00 02 01 01 01 01 (9 bytes, lenR=0)
+      -- byte[1]=5, lenR=0, lenS must satisfy 0+lenS+7=8 so lenS=1
+      -- 30 05 02 00 02 01 01 01 → 8 bytes < 9 (gate 1 fires)
+      -- Need 9 bytes: 30 06 02 00 02 01 01 01 01 (lenR=0, lenS=1, len=9, byte[1]=6=9-3)
+      -- lenR+lenS+7 = 0+1+7=8 ≠ 9 → gate 6 fires first
+      -- The only way to hit gate 8 independently is to have lenR=0 and
+      -- everything else consistent.  That requires: total=0+lenS+7+3 bytes.
+      -- With lenS=1: total=11... but then we also need byte[1]=total-3=8.
+      -- 30 08 02 00 02 01 01 01 01 XX XX (11 bytes) — but gate 5 would fire
+      -- since 5+0=5 < 9 (ok), so proceed to gate 6: 0+1+7=8 ≠ 11 → gate 6.
+      -- It's impossible to isolate gate 8 from gate 6 in a pure byte sequence
+      -- without crafting a 10-byte sig.  Use 10 bytes:
+      -- len=10, byte[1]=7, lenR=0, lenS=lenS, total: 0+lenS+7=10 → lenS=3
+      -- 5+0=5 < 10 (ok gate 5), byte[2]=0x02 (ok), lenR=0 → gate 8 fires
+      -- 30 07 02 00 02 03 XX XX XX 01  (10 bytes)
+      local bad_sig = "\x30\x07\x02\x00\x02\x03\x01\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 9: R must not be negative (high bit of first R byte must be 0)
+    it("rejects sig where R is negative (high bit set) (SIG_DER)", function()
+      -- Replace R data byte 0x01 with 0x81 (high bit set)
+      local bad_sig = "\x30\x06\x02\x01\x81\x02\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 10: R must not be excessively padded (0x00 followed by byte without high bit)
+    it("rejects sig where R has unnecessary zero padding (SIG_DER)", function()
+      -- R = 0x00 0x01 (lenR=2, first byte 0x00, second byte 0x01 — high bit clear)
+      -- total = 2+1+7 = 10, byte[1] = 10-3 = 7
+      -- 30 07 02 02 00 01 02 01 01 01  (10 bytes)
+      local bad_sig = "\x30\x07\x02\x02\x00\x01\x02\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 11: byte at S-marker position must be 0x02
+    it("rejects sig where S marker is not 0x02 (SIG_DER)", function()
+      -- S marker (byte at lenR+4 = 5 in C++, i.e. sig:byte(lenR+5)=6th byte) = 0x03
+      -- VALID_SIG = 30 06 02 01 01 [02] 01 01 01; replace S marker with 0x03
+      local bad_sig = "\x30\x06\x02\x01\x01\x03\x01\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 12: lenS must not be zero
+    it("rejects sig with zero-length S (SIG_DER)", function()
+      -- S-len=0: 30 05 02 01 01 02 00 01  (8 bytes < 9 → gate 1 first)
+      -- Need to craft so gate 12 fires: lenR=1, lenS=0 → total=1+0+7=8 < 9 (gate 1)
+      -- lenR=2, lenS=0 → total=2+0+7=9 ✓
+      -- byte[1]=9-3=6, byte[3]=lenR=2, byte[6]=lenS=0
+      -- byte[4..5]=R data, byte[7..]=S marker check won't get there...
+      -- Actually gate 5: 5+2=7 < 9 ✓; gate 6: 2+0+7=9 ✓
+      -- byte[2]=0x02 (R marker), lenR=2, R data bytes, then S marker at byte[7]
+      -- 30 06 02 02 01 01 02 00 01 (9 bytes, byte[1]=6, lenR=2, R=01 01,
+      -- S marker at byte[lenR+5]=byte[7]=0x02, lenS=byte[lenR+6]=byte[8]=0)
+      -- lenR+lenS+7 = 2+0+7 = 9 ✓ -- gate 6 OK, gate 12 fires
+      local bad_sig = "\x30\x06\x02\x02\x01\x01\x02\x00\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 13: S must not be negative (high bit of first S byte must be 0)
+    it("rejects sig where S is negative (high bit set) (SIG_DER)", function()
+      -- S data byte 0x01 → 0x81
+      local bad_sig = "\x30\x06\x02\x01\x01\x02\x01\x81\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Gate 14: S must not be excessively padded
+    it("rejects sig where S has unnecessary zero padding (SIG_DER)", function()
+      -- S = 0x00 0x01 (lenS=2, first byte 0x00, second byte 0x01 without high bit)
+      -- total = 1+2+7 = 10, byte[1] = 7
+      -- 30 07 02 01 01 02 02 00 01 01  (10 bytes)
+      local bad_sig = "\x30\x07\x02\x01\x01\x02\x02\x00\x01\x01"
+      local result, err = run_checksig_dersig(bad_sig)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    -- Boundary: sig with S having leading 0x00 for sign-bit is valid
+    it("accepts sig where S has necessary 0x00 padding (high bit set on next byte)", function()
+      -- S = 0x00 0x81 (lenS=2, 0x00 padding because 0x81 has high bit set)
+      -- total = 1+2+7 = 10, byte[1] = 7
+      -- R=1 byte, S=2 bytes: 30 07 02 01 01 02 02 00 81 01  (10 bytes)
+      local good_sig = "\x30\x07\x02\x01\x01\x02\x02\x00\x81\x01"
+      local result, err = run_checksig_dersig(good_sig)
+      assert.is_nil(err)
+      assert.is_table(result)
+    end)
+  end)
+
+  describe("BIP-66 IsDefinedHashtypeSignature (verify_strictenc)", function()
+    local OP_CHECKSIG = "\xac"
+    local PUBKEY = "\x02" .. string.rep("\x01", 32)
+    local checker_ok = { check_sig = function() return true end }
+    -- Base valid DER sig bytes (without hashtype appended):
+    -- 30 06 02 01 01 02 01 01 [hashtype]
+    local SIG_BASE = "\x30\x06\x02\x01\x01\x02\x01\x01"
+
+    local function run_checksig_strictenc(sig)
+      return script.execute_script(OP_CHECKSIG, {sig, PUBKEY},
+        {verify_strictenc = true}, checker_ok)
+    end
+
+    -- Valid hashtypes: 0x01 (ALL), 0x02 (NONE), 0x03 (SINGLE)
+    -- and their ANYONECANPAY variants (0x81, 0x82, 0x83)
+    for _, ht in ipairs({0x01, 0x02, 0x03, 0x81, 0x82, 0x83}) do
+      local ht_byte = ht
+      it(string.format("accepts hashtype 0x%02x", ht_byte), function()
+        local sig = SIG_BASE .. string.char(ht_byte)
+        local result, err = run_checksig_strictenc(sig)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end)
+    end
+
+    -- Invalid hashtypes
+    for _, ht in ipairs({0x00, 0x04, 0x05, 0x7f, 0x80, 0x84, 0xff}) do
+      local ht_byte = ht
+      it(string.format("rejects hashtype 0x%02x (SIG_HASHTYPE)", ht_byte), function()
+        local sig = SIG_BASE .. string.char(ht_byte)
+        local result, err = run_checksig_strictenc(sig)
+        assert.is_nil(result)
+        assert.equals("SIG_HASHTYPE", err)
+      end)
+    end
+
+    it("empty sig is exempt from hashtype check", function()
+      -- Empty sigs bypass all encoding checks
+      local result, err = run_checksig_strictenc("")
+      assert.is_nil(err)
+      assert.is_table(result)
+    end)
+  end)
+
+  describe("BIP-66 IsLowDERSignature (verify_low_s)", function()
+    local OP_CHECKSIG = "\xac"
+    local PUBKEY = "\x02" .. string.rep("\x01", 32)
+    local checker_ok = { check_sig = function() return true end }
+
+    local function run_checksig_low_s(sig)
+      return script.execute_script(OP_CHECKSIG, {sig, PUBKEY},
+        {verify_low_s = true}, checker_ok)
+    end
+
+    it("accepts sig with S = 0x01 (clearly low)", function()
+      -- 30 06 02 01 01 02 01 01 01  (S=0x01)
+      local sig = "\x30\x06\x02\x01\x01\x02\x01\x01\x01"
+      local result, err = run_checksig_low_s(sig)
+      assert.is_nil(err)
+      assert.is_table(result)
+    end)
+
+    it("accepts sig with S exactly equal to half-order (boundary)", function()
+      -- half_order = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+      -- S as 32 bytes (no sign-extension needed, high bit clear)
+      -- lenS = 32, lenR = 1, total = 1+32+7 = 40, byte[1] = 37
+      local half_s = "\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" ..
+                     "\x5d\x57\x6e\x73\x57\xa4\x50\x1d\xdf\xe9\x2f\x46\x68\x1b\x20\xa0"
+      -- Sig: 30 25 02 01 01 02 20 [half_s] 01
+      -- header(1)+total_len(1)+R_marker(1)+lenR(1)+R(1)+S_marker(1)+lenS(1)+S(32)+hashtype(1) = 40
+      local sig = "\x30\x25\x02\x01\x01\x02\x20" .. half_s .. "\x01"
+      assert.equals(40, #sig)
+      local result, err = run_checksig_low_s(sig)
+      assert.is_nil(err)
+      assert.is_table(result)
+    end)
+
+    it("rejects sig with S above half-order (SIG_HIGH_S)", function()
+      -- S = half_order + 1:
+      -- 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A1
+      -- High bit is clear (0x7F...) so no sign-extension needed.
+      local high_s = "\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" ..
+                     "\x5d\x57\x6e\x73\x57\xa4\x50\x1d\xdf\xe9\x2f\x46\x68\x1b\x20\xa1"
+      local sig = "\x30\x25\x02\x01\x01\x02\x20" .. high_s .. "\x01"
+      assert.equals(40, #sig)
+      local result, err = run_checksig_low_s(sig)
+      assert.is_nil(result)
+      assert.equals("SIG_HIGH_S", err)
+    end)
+
+    it("rejects sig with S = curve order - 1 (clearly high)", function()
+      -- n-1 = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140
+      -- High bit set (0xFF) so needs 0x00 prefix; lenS=33
+      -- lenR=1, lenS=33, total=1+33+7=41, byte[1]=38=0x26
+      local high_s_33 = "\x00" ..
+                        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe" ..
+                        "\xba\xae\xdc\xe6\xaf\x48\xa0\x3b\xbf\xd2\x5e\x8c\xd0\x36\x41\x40"
+      -- Sig: 30 26 02 01 01 02 21 [high_s_33] 01
+      -- header(1) + total_len(1) + R_marker(1) + lenR(1) + R(1) + S_marker(1) + lenS(1) + S(33) + hashtype(1) = 41
+      local sig = "\x30\x26\x02\x01\x01\x02\x21" .. high_s_33 .. "\x01"
+      assert.equals(41, #sig)
+      local result, err = run_checksig_low_s(sig)
+      assert.is_nil(result)
+      assert.equals("SIG_HIGH_S", err)
+    end)
+
+    it("rejects sig with S equal to curve order (SIG_HIGH_S)", function()
+      -- n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+      -- With 0x00 prefix: lenS=33
+      local order_s = "\x00" ..
+                      "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe" ..
+                      "\xba\xae\xdc\xe6\xaf\x48\xa0\x3b\xbf\xd2\x5e\x8c\xd0\x36\x41\x41"
+      local sig = "\x30\x26\x02\x01\x01\x02\x21" .. order_s .. "\x01"
+      assert.equals(41, #sig)
+      local result, err = run_checksig_low_s(sig)
+      assert.is_nil(result)
+      assert.equals("SIG_HIGH_S", err)
+    end)
+
+    it("empty sig is exempt from low-S check", function()
+      local result, err = run_checksig_low_s("")
+      assert.is_nil(err)
+      assert.is_table(result)
+    end)
+  end)
+
+  describe("BIP-66 pubkey encoding gates", function()
+    local OP_CHECKSIG = "\xac"
+    -- Valid minimal DER sig with hashtype 0x01
+    local VALID_SIG = "\x30\x06\x02\x01\x01\x02\x01\x01\x01"
+    local checker_ok = { check_sig = function() return true end }
+
+    describe("IsCompressedOrUncompressedPubKey (verify_strictenc)", function()
+      local function run_checksig_strictenc_pubkey(pubkey)
+        return script.execute_script(OP_CHECKSIG, {VALID_SIG, pubkey},
+          {verify_strictenc = true}, checker_ok)
+      end
+
+      it("accepts compressed pubkey 02 prefix (33 bytes)", function()
+        local pk = "\x02" .. string.rep("\x01", 32)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end)
+
+      it("accepts compressed pubkey 03 prefix (33 bytes)", function()
+        local pk = "\x03" .. string.rep("\x01", 32)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end)
+
+      it("accepts uncompressed pubkey 04 prefix (65 bytes)", function()
+        local pk = "\x04" .. string.rep("\x01", 64)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end)
+
+      it("rejects 02-prefix key with wrong length (PUBKEYTYPE)", function()
+        -- 02 with 32 bytes (34 total instead of 33)
+        local pk = "\x02" .. string.rep("\x01", 33)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(result)
+        assert.equals("PUBKEYTYPE", err)
+      end)
+
+      it("rejects 04-prefix key with wrong length (PUBKEYTYPE)", function()
+        -- 04 with 63 bytes (64 total instead of 65)
+        local pk = "\x04" .. string.rep("\x01", 63)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(result)
+        assert.equals("PUBKEYTYPE", err)
+      end)
+
+      it("rejects 05-prefix key (PUBKEYTYPE)", function()
+        local pk = "\x05" .. string.rep("\x01", 32)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(result)
+        assert.equals("PUBKEYTYPE", err)
+      end)
+
+      it("rejects hybrid 06-prefix key (PUBKEYTYPE)", function()
+        -- Hybrid form 0x06/0x07 (65 bytes) was accepted in early Bitcoin,
+        -- but IsCompressedOrUncompressedPubKey explicitly rejects them.
+        local pk = "\x06" .. string.rep("\x01", 64)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(result)
+        assert.equals("PUBKEYTYPE", err)
+      end)
+
+      it("rejects hybrid 07-prefix key (PUBKEYTYPE)", function()
+        local pk = "\x07" .. string.rep("\x01", 64)
+        local result, err = run_checksig_strictenc_pubkey(pk)
+        assert.is_nil(result)
+        assert.equals("PUBKEYTYPE", err)
+      end)
+    end)
+
+    describe("IsCompressedPubKey (verify_witness_pubkeytype, witness-v0)", function()
+      local function run_checksig_witness_pubkeytype(pubkey)
+        -- verify_witness_pubkeytype + is_witness_v0 mirrors SigVersion::WITNESS_V0
+        return script.execute_script(OP_CHECKSIG, {VALID_SIG, pubkey},
+          {verify_witness_pubkeytype = true, is_witness_v0 = true}, checker_ok)
+      end
+
+      it("accepts 02-prefix compressed key (33 bytes)", function()
+        local pk = "\x02" .. string.rep("\x01", 32)
+        local result, err = run_checksig_witness_pubkeytype(pk)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end)
+
+      it("accepts 03-prefix compressed key (33 bytes)", function()
+        local pk = "\x03" .. string.rep("\x01", 32)
+        local result, err = run_checksig_witness_pubkeytype(pk)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end)
+
+      it("rejects uncompressed 04-prefix key in witness-v0 (WITNESS_PUBKEYTYPE)", function()
+        local pk = "\x04" .. string.rep("\x01", 64)
+        local result, err = run_checksig_witness_pubkeytype(pk)
+        assert.is_nil(result)
+        assert.equals("WITNESS_PUBKEYTYPE", err)
+      end)
+
+      it("rejects 33-byte key with wrong prefix in witness-v0 (WITNESS_PUBKEYTYPE)", function()
+        local pk = "\x05" .. string.rep("\x01", 32)
+        local result, err = run_checksig_witness_pubkeytype(pk)
+        assert.is_nil(result)
+        assert.equals("WITNESS_PUBKEYTYPE", err)
+      end)
+
+      it("WITNESS_PUBKEYTYPE not enforced when is_witness_v0 is false", function()
+        -- When is_witness_v0 is absent, the witness-pubkeytype gate does not fire.
+        local pk = "\x04" .. string.rep("\x01", 64)
+        local result, err = script.execute_script(OP_CHECKSIG, {VALID_SIG, pk},
+          {verify_witness_pubkeytype = true}, checker_ok)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end)
+    end)
+  end)
+
+  describe("BIP-66 gate interaction: verify_dersig vs verify_strictenc vs verify_low_s", function()
+    local OP_CHECKSIG = "\xac"
+    local PUBKEY = "\x02" .. string.rep("\x01", 32)
+    local checker_ok = { check_sig = function() return true end }
+    -- A structurally valid DER sig with a defined hashtype 0x01
+    local VALID_SIG = "\x30\x06\x02\x01\x01\x02\x01\x01\x01"
+    -- An encoding-invalid sig (total-length wrong)
+    local BAD_DER = "\x30\x07\x02\x01\x01\x02\x01\x01\x01"
+    -- A valid DER sig but with hashtype 0x04 (undefined)
+    local BAD_HASHTYPE = "\x30\x06\x02\x01\x01\x02\x01\x01\x04"
+
+    it("verify_dersig alone rejects bad DER", function()
+      local result, err = script.execute_script(OP_CHECKSIG, {BAD_DER, PUBKEY},
+        {verify_dersig = true}, checker_ok)
+      assert.is_nil(result)
+      assert.equals("SIG_DER", err)
+    end)
+
+    it("no flags: bad DER and bad hashtype are silently accepted", function()
+      -- Without any encoding flags, everything passes the encoding checks
+      local result1, err1 = script.execute_script(OP_CHECKSIG, {BAD_DER, PUBKEY}, {}, checker_ok)
+      assert.is_nil(err1)
+      assert.is_table(result1)
+      local result2, err2 = script.execute_script(OP_CHECKSIG, {BAD_HASHTYPE, PUBKEY}, {}, checker_ok)
+      assert.is_nil(err2)
+      assert.is_table(result2)
+    end)
+
+    it("verify_strictenc alone rejects bad hashtype but not bad DER structure", function()
+      -- With STRICTENC, bad hashtype fails
+      local result1, err1 = script.execute_script(OP_CHECKSIG, {BAD_HASHTYPE, PUBKEY},
+        {verify_strictenc = true}, checker_ok)
+      assert.is_nil(result1)
+      assert.equals("SIG_HASHTYPE", err1)
+      -- But also validates DER encoding (STRICTENC implies DER check)
+      local result2, err2 = script.execute_script(OP_CHECKSIG, {BAD_DER, PUBKEY},
+        {verify_strictenc = true}, checker_ok)
+      assert.is_nil(result2)
+      assert.equals("SIG_DER", err2)
+    end)
+
+    it("empty sig always bypasses all encoding flags", function()
+      local flags_list = {
+        {verify_dersig = true},
+        {verify_low_s = true},
+        {verify_strictenc = true},
+        {verify_dersig = true, verify_low_s = true, verify_strictenc = true},
+      }
+      for _, flags in ipairs(flags_list) do
+        local result, err = script.execute_script(OP_CHECKSIG, {"", PUBKEY}, flags, checker_ok)
+        assert.is_nil(err)
+        assert.is_table(result)
+      end
+    end)
+  end)
 end)
