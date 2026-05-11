@@ -849,12 +849,34 @@ function HeaderChain:accept_header(header)
     return false, "insufficient proof of work"
   end
 
-  -- 5. Check timestamp (must be > median time past of previous 11 blocks)
+  -- 5a. Check timestamp: must be > median time past of previous 11 blocks
+  --     (time-too-old gate).
+  --     Bitcoin Core validation.cpp:4092-4093.
   local height = parent.height + 1
   local mtp_timestamps = self:get_past_timestamps(prev_hex, consensus.MEDIAN_TIME_PAST_BLOCKS)
   local mtp = consensus.get_median_time_past(mtp_timestamps)
   if header.timestamp <= mtp then
-    return false, "timestamp not greater than median time past"
+    return false, "time-too-old"
+  end
+
+  -- 5b. Check timestamp: must not exceed wall-clock by MAX_FUTURE_BLOCK_TIME
+  --     (time-too-new gate).
+  --     Bitcoin Core validation.cpp:4108-4110 (chain.h:29).
+  local now = os.time()
+  if header.timestamp > now + consensus.MAX_FUTURE_BLOCK_TIME then
+    return false, "time-too-new"
+  end
+
+  -- 5c. BIP94 (testnet4 only): first block of each difficulty adjustment
+  --     period must not be more than MAX_TIMEWARP (600s) earlier than the
+  --     last block of the preceding period.  Prevents timewarp attacks.
+  --     Bitcoin Core validation.cpp:4097-4105 (consensus/consensus.h:35).
+  if self.network.enforce_bip94 then
+    if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
+      if header.timestamp < parent.header.timestamp - consensus.MAX_TIMEWARP then
+        return false, "time-timewarp-attack"
+      end
+    end
   end
 
   -- 6. Check difficulty target using consensus.get_next_work_required
@@ -871,8 +893,38 @@ function HeaderChain:accept_header(header)
     end
   )
   if header.bits ~= expected_bits then
-    return false, string.format("wrong difficulty: expected 0x%08x got 0x%08x",
+    return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
       expected_bits, header.bits)
+  end
+
+  -- 6b. Reject outdated block versions once the corresponding soft fork has
+  --     activated (bad-version gate).
+  --     Bitcoin Core validation.cpp:4113-4118.
+  --
+  --     height-1 is pindexPrev; the network table stores the activation heights
+  --     matching DeploymentActiveAfter(pindexPrev, ...).  "ActiveAfter(prev)"
+  --     means the rule is active starting at the block AFTER prev, i.e. when
+  --     the new block's height > activation_height.  Use (height - 1) >=
+  --     activation_height to mirror Core's DeploymentActiveAfter semantics.
+  --
+  --     nVersion < 2  after HEIGHTINCB (BIP34) activation
+  --     nVersion < 3  after DERSIG     (BIP66) activation
+  --     nVersion < 4  after CLTV       (BIP65) activation
+  local net = self.network
+  if header.version < 2
+    and net.bip34_height
+    and (height - 1) >= net.bip34_height then
+    return false, string.format("bad-version(0x%08x)", header.version)
+  end
+  if header.version < 3
+    and net.bip66_height
+    and (height - 1) >= net.bip66_height then
+    return false, string.format("bad-version(0x%08x)", header.version)
+  end
+  if header.version < 4
+    and net.bip65_height
+    and (height - 1) >= net.bip65_height then
+    return false, string.format("bad-version(0x%08x)", header.version)
   end
 
   -- 7. Check against checkpoints

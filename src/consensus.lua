@@ -29,6 +29,17 @@ M.MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 40  -- WITNESS_SCALE_FACTOR * 10
 M.MAX_TX_IN_SEQUENCE_NO = 0xFFFFFFFF
 M.LOCKTIME_THRESHOLD = 500000000     -- Block height vs unix time threshold
 
+-- Maximum amount of time a block timestamp may exceed the current wall-clock
+-- time before the block is rejected.  Also used as TIMESTAMP_WINDOW.
+-- Bitcoin Core chain.h:29.
+M.MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60   -- 7200 seconds
+
+-- Maximum amount of time that the first block of a difficulty adjustment
+-- period is allowed to be *earlier* than the last block of the preceding
+-- period (BIP94 / testnet4 only).
+-- Bitcoin Core consensus/consensus.h:35.
+M.MAX_TIMEWARP = 600   -- 600 seconds
+
 --------------------------------------------------------------------------------
 -- Block Reward Schedule
 --------------------------------------------------------------------------------

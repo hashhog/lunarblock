@@ -114,12 +114,13 @@ describe("sync", function()
     return storage
   end
 
-  -- Create a valid header extending from a parent
+  -- Create a valid header extending from a parent.
+  -- W85: version 4 required on regtest (BIP65+BIP66 activate from height 0).
   local function create_valid_header(parent_hash, timestamp, bits)
     bits = bits or 0x207fffff  -- regtest difficulty
     timestamp = timestamp or os.time()
     return types.block_header(
-      1,               -- version
+      4,               -- version >= 4; regtest has BIP65/66 active from h=0
       parent_hash,     -- prev_hash
       types.hash256_zero(),  -- merkle_root
       timestamp,
@@ -240,7 +241,7 @@ describe("sync", function()
 
       local ok, err = chain:accept_header(header)
       assert.is_false(ok)
-      assert.equals("timestamp not greater than median time past", err)
+      assert.equals("time-too-old", err)
     end)
 
     it("skips already known headers", function()

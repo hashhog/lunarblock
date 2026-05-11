@@ -159,12 +159,26 @@ local function bip22_result(err)
   end
 
   -- Timestamp / time
-  if s:find("too far in the future") or s:find("time%-too%-new") then
+  if s:find("time%-too%-new") then
     return "time-too-new"
   end
-  if s:find("before median") or s:find("time%-too%-old") or
-     s:find("timestamp") and s:find("median") then
+  if s:find("time%-too%-old") then
     return "time-too-old"
+  end
+  if s:find("time%-timewarp%-attack") then
+    return "time-timewarp-attack"
+  end
+
+  -- Outdated block version (bad-version gate, BIP34/66/65 activation).
+  -- Bitcoin Core validation.cpp:4116-4117.
+  if s:find("bad%-version") then
+    return s:match("bad%-version%([^)]+%)")  -- preserve full "bad-version(0x...)" code
+  end
+
+  -- Incorrect PoW target (bad-diffbits).
+  -- Bitcoin Core validation.cpp:4088-4089.
+  if s:find("bad%-diffbits") then
+    return "bad-diffbits"
   end
 
   -- Previous block not found → inconclusive (orphan block)

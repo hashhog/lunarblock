@@ -1191,11 +1191,11 @@ end
 function M.check_block_header(header, network)
   network = network or consensus.networks.mainnet
 
-  -- Check timestamp not more than 2 hours in future
+  -- Check timestamp not more than 2 hours in future (time-too-new).
+  -- Bitcoin Core chain.h:29, validation.cpp:4108-4110.
   local current_time = os.time()
-  local max_future = 2 * 60 * 60  -- 2 hours
-  assert(header.timestamp <= current_time + max_future,
-         "block timestamp too far in future")
+  assert(header.timestamp <= current_time + consensus.MAX_FUTURE_BLOCK_TIME,
+         "time-too-new")
 
   -- Check proof of work
   assert(M.check_proof_of_work(header, network), "proof of work failed")
