@@ -1016,6 +1016,15 @@ end
 --------------------------------------------------------------------------------
 
 --- Check if block header meets proof of work requirements.
+-- Mirrors Bitcoin Core CheckProofOfWorkImpl / DeriveTarget (src/pow.cpp:146-171).
+-- Three conditions must all hold:
+--   1. bits must not encode a negative target (fNegative flag from SetCompact).
+--   2. bits must not be zero or overflow (fOverflow flag from SetCompact).
+--   3. target must not exceed pow_limit (would allow easier-than-minimum work).
+--   4. block hash must be <= target.
+-- Conditions 1-3 are gated via bits_to_target returning a zero 32-byte string
+-- for negative/overflow/zero inputs; condition 3 is the explicit pow_limit check
+-- added here (Core: if bnTarget > UintToArith256(pow_limit) return false).
 -- @param header block_header: The block header
 -- @param network table: Network configuration (optional, defaults to mainnet)
 -- @return boolean: true if valid
@@ -1024,6 +1033,13 @@ function M.check_proof_of_work(header, network)
 
   local block_hash = M.compute_block_hash(header)
   local target = consensus.bits_to_target(header.bits)
+
+  -- Reject if target exceeds network's proof-of-work limit.
+  -- Bitcoin Core DeriveTarget: if (bnTarget > UintToArith256(pow_limit)) return {};
+  local pow_limit = consensus.bits_to_target(network.pow_limit_bits)
+  if consensus.compare_targets(target, pow_limit) > 0 then
+    return false
+  end
 
   return consensus.hash_meets_target(block_hash.bytes, target)
 end
