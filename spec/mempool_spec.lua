@@ -2380,4 +2380,318 @@ describe("mempool", function()
     end)
   end)
 
+  --------------------------------------------------------------------------
+  -- BIP-431 TRUC (v3) policy — single_truc_checks + accept_transaction
+  -- Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261
+  --------------------------------------------------------------------------
+  describe("BIP-431 TRUC v3 policy", function()
+
+    -- Helper: accept a confirmed-UTXO-backed tx of version `ver` with `fee`
+    -- sats fee and return (ok, txid_hex_or_err, mp, txid_hash256).
+    local function accept_root(ver, fee)
+      fee = fee or 10000
+      local cs = make_mock_chain_state()
+      local root_txid = types.hash256(string.rep("\xcc", 32))
+      add_utxo(cs, types.hash256_hex(root_txid), 0, 1000000)
+      local mp = mempool.new(cs)
+      local tx = make_tx(ver, {}, {}, 0)
+      tx.inputs[1] = make_input(root_txid, 0)
+      tx.outputs[1] = make_output(1000000 - fee)
+      local ok, hex = mp:accept_transaction(tx)
+      local txid = validation.compute_txid(tx)
+      return ok, hex, mp, txid, cs
+    end
+
+    -- Gate 1: non-TRUC tx cannot spend a TRUC (v=3) unconfirmed parent.
+    -- Core truc_policy.cpp:180-184.
+    it("Gate 1: rejects non-TRUC child spending TRUC parent", function()
+      local ok_p, parent_hex, mp, parent_txid, cs = accept_root(3, 10000)
+      assert.is_true(ok_p, "TRUC parent should be accepted")
+
+      -- Now try to add a non-TRUC (v=1) child spending the v=3 parent.
+      local child = make_tx(1, {}, {}, 0)
+      child.inputs[1] = make_input(parent_txid, 0)
+      child.outputs[1] = make_output(970000)
+
+      local ok, err = mp:accept_transaction(child)
+      assert.is_false(ok)
+      assert.truthy(err:match("non%-version=3 tx cannot spend from version=3 tx"),
+        "expected inheritance error, got: " .. tostring(err))
+    end)
+
+    -- Gate 2: TRUC tx cannot spend a non-TRUC unconfirmed parent.
+    -- Core truc_policy.cpp:185-190.
+    it("Gate 2: rejects TRUC child spending non-TRUC parent", function()
+      local ok_p, parent_hex, mp, parent_txid, cs = accept_root(1, 10000)
+      assert.is_true(ok_p, "non-TRUC parent should be accepted")
+
+      -- Now try a v=3 child spending the v=1 parent.
+      local child = make_tx(3, {}, {}, 0)
+      child.inputs[1] = make_input(parent_txid, 0)
+      child.outputs[1] = make_output(970000)
+
+      local ok, err = mp:accept_transaction(child)
+      assert.is_false(ok)
+      assert.truthy(err:match("version=3 tx cannot spend from non%-version=3 tx"),
+        "expected inheritance error, got: " .. tostring(err))
+    end)
+
+    -- Gate 3: TRUC tx must be ≤ TRUC_MAX_VSIZE (10000 vbytes).
+    -- We test the constant is present (the full >10000 vbyte tx is impractical
+    -- to construct in unit tests — the constant gate is tested via single_truc_checks).
+    -- Core truc_policy.cpp:200-204.
+    it("Gate 3: single_truc_checks rejects TRUC tx above TRUC_MAX_VSIZE", function()
+      local tx = make_tx(3, {}, {}, 0)
+      tx.inputs[1] = make_input(types.hash256(string.rep("\x01", 32)), 0)
+      tx.outputs[1] = make_output(50000)
+
+      local ok, err, sibling = mempool.single_truc_checks({}, tx, {}, 10001, {})
+      assert.is_false(ok)
+      assert.truthy(err:match("too big"), "expected too-big error, got: " .. tostring(err))
+      assert.is_nil(sibling)
+    end)
+
+    -- Gate 3 negative: TRUC tx exactly at TRUC_MAX_VSIZE should pass size gate.
+    it("Gate 3: single_truc_checks allows TRUC tx at exactly TRUC_MAX_VSIZE", function()
+      local tx = make_tx(3, {}, {}, 0)
+      local ok, err, _ = mempool.single_truc_checks({}, tx, {}, 10000, {})
+      -- No parents → only gates 3+4 run; both should pass.
+      assert.is_true(ok, "expected pass, got: " .. tostring(err))
+    end)
+
+    -- Gate 4: TRUC tx ancestor count (incl. self) must be ≤ 2.
+    -- With TRUC limits, >1 unconfirmed parent is rejected.
+    -- Core truc_policy.cpp:207-211.
+    it("Gate 4: rejects TRUC tx with 2 unconfirmed parents", function()
+      local cs = make_mock_chain_state()
+      local root1 = types.hash256(string.rep("\x10", 32))
+      local root2 = types.hash256(string.rep("\x11", 32))
+      add_utxo(cs, types.hash256_hex(root1), 0, 1000000)
+      add_utxo(cs, types.hash256_hex(root2), 0, 1000000)
+      local mp = mempool.new(cs)
+
+      -- Accept two separate TRUC parents.
+      local p1 = make_tx(3, {}, {}, 0)
+      p1.inputs[1] = make_input(root1, 0)
+      p1.outputs[1] = make_output(990000)
+      local ok1, _ = mp:accept_transaction(p1)
+      assert.is_true(ok1)
+
+      local p2 = make_tx(3, {}, {}, 0)
+      p2.inputs[1] = make_input(root2, 0)
+      p2.outputs[1] = make_output(990000)
+      local ok2, _ = mp:accept_transaction(p2)
+      assert.is_true(ok2)
+
+      -- Child spending both TRUC parents → ancestor_count = 3 > 2.
+      local child = make_tx(3, {}, {}, 0)
+      child.inputs[1] = make_input(validation.compute_txid(p1), 0)
+      child.inputs[2] = make_input(validation.compute_txid(p2), 0)
+      child.outputs[1] = make_output(970000)
+
+      local ok, err = mp:accept_transaction(child)
+      assert.is_false(ok)
+      assert.truthy(err:match("too many ancestors"),
+        "expected too-many-ancestors, got: " .. tostring(err))
+    end)
+
+    -- Gate 4 (depth): TRUC grandchild is rejected because parent already has 1 ancestor.
+    -- Core truc_policy.cpp:214-220: GetAncestorCount(parent)+1 > TRUC_ANCESTOR_LIMIT.
+    it("Gate 4 depth: rejects TRUC grandchild (depth=3 chain)", function()
+      local cs = make_mock_chain_state()
+      local root = types.hash256(string.rep("\x20", 32))
+      add_utxo(cs, types.hash256_hex(root), 0, 3000000)
+      local mp = mempool.new(cs)
+
+      -- Grandparent (v=3, no unconfirmed parents)
+      local gp = make_tx(3, {}, {}, 0)
+      gp.inputs[1] = make_input(root, 0)
+      gp.outputs[1] = make_output(2990000)
+      local ok_gp, _ = mp:accept_transaction(gp)
+      assert.is_true(ok_gp)
+
+      -- Parent (v=3, 1 unconfirmed parent = grandparent) — should succeed
+      local parent = make_tx(3, {}, {}, 0)
+      parent.inputs[1] = make_input(validation.compute_txid(gp), 0)
+      parent.outputs[1] = make_output(2980000)
+      local ok_p, _ = mp:accept_transaction(parent)
+      assert.is_true(ok_p)
+
+      -- Grandchild (v=3, parent has 1 ancestor → depth 3 > TRUC_ANCESTOR_LIMIT)
+      local gc = make_tx(3, {}, {}, 0)
+      gc.inputs[1] = make_input(validation.compute_txid(parent), 0)
+      gc.outputs[1] = make_output(2970000)
+      local ok_gc, err_gc = mp:accept_transaction(gc)
+      assert.is_false(ok_gc)
+      assert.truthy(err_gc:match("too many ancestors"),
+        "expected too-many-ancestors, got: " .. tostring(err_gc))
+    end)
+
+    -- Gate 5: TRUC child with unconfirmed parent must be ≤ TRUC_CHILD_MAX_VSIZE (1000).
+    -- Core truc_policy.cpp:223-227.
+    it("Gate 5: single_truc_checks rejects oversized TRUC child", function()
+      -- Build a mock parent entry (ancestor_count=0 → depth 1).
+      local parent_txid_hex = string.rep("ab", 32)
+      local fake_parent_entry = {
+        tx = make_tx(3, {}, {}, 0),
+        ancestor_count = 0,
+        descendant_count = 0,
+        descendants = {},
+      }
+      local entries = { [parent_txid_hex] = fake_parent_entry }
+      local direct_parents = { [parent_txid_hex] = fake_parent_entry }
+
+      local tx = make_tx(3, {}, {}, 0)
+      local ok, err, sibling = mempool.single_truc_checks(entries, tx, direct_parents, 1001, {})
+      assert.is_false(ok)
+      assert.truthy(err:match("too big"), "expected child-too-big error, got: " .. tostring(err))
+      assert.is_nil(sibling)
+    end)
+
+    -- Gate 5 negative: TRUC child exactly at TRUC_CHILD_MAX_VSIZE should pass.
+    it("Gate 5: single_truc_checks allows TRUC child at exactly TRUC_CHILD_MAX_VSIZE", function()
+      local parent_txid_hex = string.rep("cd", 32)
+      local fake_parent_entry = {
+        tx = make_tx(3, {}, {}, 0),
+        ancestor_count = 0,
+        descendant_count = 0,
+        descendants = {},
+      }
+      local entries = { [parent_txid_hex] = fake_parent_entry }
+      local direct_parents = { [parent_txid_hex] = fake_parent_entry }
+
+      local tx = make_tx(3, {}, {}, 0)
+      local ok, err, _ = mempool.single_truc_checks(entries, tx, direct_parents, 1000, {})
+      assert.is_true(ok, "expected pass, got: " .. tostring(err))
+    end)
+
+    -- Gate 6: single_truc_checks hard-rejects when parent already has 2 descendants.
+    -- This models a post-reorg state where TRUC_DESCENDANT_LIMIT is already exceeded.
+    -- Core truc_policy.cpp:243. Sibling eviction not eligible (>1 existing descendant).
+    it("Gate 6: single_truc_checks hard-rejects when parent has 2 existing descendants", function()
+      local parent_txid_hex = string.rep("e0", 32)
+      local child1_hex = string.rep("e1", 32)
+      local child2_hex = string.rep("e2", 32)
+
+      -- Fake parent entry with 2 descendants (post-reorg scenario).
+      local fake_parent = {
+        tx = make_tx(3, {}, {}, 0),
+        ancestor_count = 0,
+        descendant_count = 2,  -- already 2 children
+        descendants = { [child1_hex] = true, [child2_hex] = true },
+      }
+      -- Two existing children (each has ancestor_count=1).
+      local fake_child1 = {
+        tx = make_tx(3, {}, {}, 0),
+        ancestor_count = 1,
+        descendant_count = 0,
+        descendants = {},
+      }
+      local fake_child2 = {
+        tx = make_tx(3, {}, {}, 0),
+        ancestor_count = 1,
+        descendant_count = 0,
+        descendants = {},
+      }
+      local entries = {
+        [parent_txid_hex] = fake_parent,
+        [child1_hex] = fake_child1,
+        [child2_hex] = fake_child2,
+      }
+      local direct_parents = { [parent_txid_hex] = fake_parent }
+
+      local tx = make_tx(3, {}, {}, 0)
+      local ok, err, sibling = mempool.single_truc_checks(entries, tx, direct_parents, 200, {})
+      assert.is_false(ok)
+      assert.truthy(err:match("exceed"),
+        "expected descendant-count-limit error, got: " .. tostring(err))
+      -- Sibling eviction not eligible because parent has 2 existing descendants (not 1).
+      assert.is_nil(sibling, "sibling eviction must not be offered when parent has >1 descendants")
+    end)
+
+    -- Gate 6 sibling eviction: when the existing child is replaced (direct RBF conflict),
+    -- the second child should be allowed after the sibling is evicted.
+    -- Core truc_policy.cpp:240-257.
+    it("Gate 6 sibling eviction: new TRUC child evicts existing sibling", function()
+      local cs = make_mock_chain_state()
+      local root = types.hash256(string.rep("\x40", 32))
+      add_utxo(cs, types.hash256_hex(root), 0, 3000000)
+      local mp = mempool.new(cs)
+
+      -- TRUC parent with 2 outputs.
+      local parent = make_tx(3, {}, {}, 0)
+      parent.inputs[1] = make_input(root, 0)
+      parent.outputs[1] = make_output(1490000)
+      parent.outputs[2] = make_output(1490000)
+      local ok_p, _ = mp:accept_transaction(parent)
+      assert.is_true(ok_p)
+      local parent_txid = validation.compute_txid(parent)
+
+      -- First TRUC child (sibling to-be-evicted).
+      local child1 = make_tx(3, {}, {}, 0)
+      child1.inputs[1] = make_input(parent_txid, 0)
+      child1.outputs[1] = make_output(1480000)
+      local ok_c1, c1_hex = mp:accept_transaction(child1)
+      assert.is_true(ok_c1)
+
+      -- Second TRUC child spending the OTHER output of the same parent.
+      -- This triggers sibling eviction: child1 is evicted, child2 takes its place.
+      local child2 = make_tx(3, {}, {}, 0)
+      child2.inputs[1] = make_input(parent_txid, 1)
+      child2.outputs[1] = make_output(1480000)
+      local ok_c2, c2_hex = mp:accept_transaction(child2)
+      assert.is_true(ok_c2, "sibling eviction should allow second TRUC child, got: " .. tostring(c2_hex))
+
+      -- Verify sibling was evicted.
+      assert.is_nil(mp:get_entry(c1_hex), "evicted sibling should not be in mempool")
+      assert.is_not_nil(mp:get_entry(c2_hex), "new child should be in mempool")
+    end)
+
+    -- Happy path: TRUC parent + 1 TRUC child accepted (the full valid cluster).
+    it("happy path: TRUC parent + single TRUC child accepted", function()
+      local cs = make_mock_chain_state()
+      local root = types.hash256(string.rep("\x50", 32))
+      add_utxo(cs, types.hash256_hex(root), 0, 2000000)
+      local mp = mempool.new(cs)
+
+      local parent = make_tx(3, {}, {}, 0)
+      parent.inputs[1] = make_input(root, 0)
+      parent.outputs[1] = make_output(1990000)
+      local ok_p, parent_hex = mp:accept_transaction(parent)
+      assert.is_true(ok_p, "TRUC parent should be accepted")
+
+      local child = make_tx(3, {}, {}, 0)
+      child.inputs[1] = make_input(validation.compute_txid(parent), 0)
+      child.outputs[1] = make_output(1980000)
+      local ok_c, child_hex = mp:accept_transaction(child)
+      assert.is_true(ok_c, "TRUC child should be accepted, got: " .. tostring(child_hex))
+
+      assert.is_not_nil(mp:get_entry(parent_hex))
+      assert.is_not_nil(mp:get_entry(child_hex))
+    end)
+
+    -- Standalone TRUC tx with no unconfirmed parent: accepted normally.
+    it("standalone TRUC tx (no unconfirmed parent) is accepted", function()
+      local cs = make_mock_chain_state()
+      local root = types.hash256(string.rep("\x60", 32))
+      add_utxo(cs, types.hash256_hex(root), 0, 1000000)
+      local mp = mempool.new(cs)
+
+      local tx = make_tx(3, {}, {}, 0)
+      tx.inputs[1] = make_input(root, 0)
+      tx.outputs[1] = make_output(990000)
+      local ok, hex = mp:accept_transaction(tx)
+      assert.is_true(ok, "standalone TRUC tx should be accepted, got: " .. tostring(hex))
+    end)
+
+    -- TRUC constant values match Core spec.
+    it("TRUC constants match Bitcoin Core truc_policy.h", function()
+      assert.equal(3,     mempool.TRUC_VERSION)
+      assert.equal(2,     mempool.TRUC_ANCESTOR_LIMIT)
+      assert.equal(2,     mempool.TRUC_DESCENDANT_LIMIT)
+      assert.equal(10000, mempool.TRUC_MAX_VSIZE)
+      assert.equal(1000,  mempool.TRUC_CHILD_MAX_VSIZE)
+    end)
+  end)
+
 end)
