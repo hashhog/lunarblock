@@ -65,7 +65,13 @@ local function uf_union(a, b)
   if (uf_rank[a] or 0) == (uf_rank[b] or 0) then uf_rank[a] = (uf_rank[a] or 0) + 1 end
 end
 
-local MAX_CLUSTER_SIZE = 101
+-- Cluster count limit: max transactions in a single cluster.
+-- Bitcoin Core policy/policy.h:72 DEFAULT_CLUSTER_LIMIT = 64.
+local MAX_CLUSTER_COUNT = 64
+-- Cluster vsize limit: max total virtual bytes in a single cluster.
+-- Bitcoin Core policy/policy.h:74 DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101
+-- → 101 * 1000 = 101,000 vbytes.  Core enforces in vbytes (weight/4).
+local MAX_CLUSTER_VSIZE = 101000
 
 local function get_cluster_size(root)
   local count = 0
@@ -73,6 +79,23 @@ local function get_cluster_size(root)
     if uf_find(txid) == root then count = count + 1 end
   end
   return count
+end
+
+-- Sum the vsize of all in-mempool transactions in the cluster rooted at `root`.
+-- `entries` must be the mempool's current entries table so that removed
+-- transactions are not counted (union-find nodes linger until explicitly nil'd,
+-- but entries are removed immediately).
+local function get_cluster_vsize(root, entries)
+  local vsize_total = 0
+  for txid, _ in pairs(uf_parent) do
+    if uf_find(txid) == root then
+      local e = entries and entries[txid]
+      if e then
+        vsize_total = vsize_total + (e.vsize or 0)
+      end
+    end
+  end
+  return vsize_total
 end
 
 local function get_cluster_txids(root)
@@ -156,8 +179,14 @@ M.uf_parent = uf_parent
 M.uf_rank = uf_rank
 M.uf_find = uf_find
 M.uf_union = uf_union
-M.MAX_CLUSTER_SIZE = MAX_CLUSTER_SIZE
+-- Cluster limits (policy/policy.h:72-74, kernel/mempool_limits.h:20-22)
+M.MAX_CLUSTER_COUNT = MAX_CLUSTER_COUNT
+M.MAX_CLUSTER_VSIZE = MAX_CLUSTER_VSIZE
+-- Keep legacy alias so external callers that read MAX_CLUSTER_SIZE still get
+-- the transaction-COUNT limit (not 101 kvB).
+M.MAX_CLUSTER_SIZE = MAX_CLUSTER_COUNT
 M.get_cluster_size = get_cluster_size
+M.get_cluster_vsize = get_cluster_vsize
 M.get_cluster_txids = get_cluster_txids
 M.linearize_cluster = linearize_cluster
 M.build_feerate_diagram = build_feerate_diagram
@@ -171,10 +200,17 @@ M.interpolate_fee = interpolate_fee
 M.DEFAULT_MAX_MEMPOOL_SIZE = 300 * 1024 * 1024  -- 300 MB
 M.DEFAULT_MIN_RELAY_FEE = 1000    -- 1 sat/vB in sat/KB
 M.DEFAULT_MAX_TX_FEE = 1000000    -- 0.01 BTC max fee (policy, not consensus)
-M.MAX_ANCESTORS = 25              -- Max unconfirmed ancestor chain
-M.MAX_DESCENDANTS = 25            -- Max unconfirmed descendant chain
-M.MAX_ANCESTOR_SIZE = 101000      -- Max total vsize of ancestor chain
-M.MAX_DESCENDANT_SIZE = 101000    -- Max total vsize of descendant chain
+-- Ancestor/descendant limits (policy/policy.h:76-78, kernel/mempool_limits.h:24-26).
+-- In Bitcoin Core 28+ (cluster mempool) these are deprecated for policy
+-- enforcement and replaced by cluster limits, but are retained here for
+-- belt-and-suspenders relay protection and wallet coin-selection.
+M.MAX_ANCESTORS = 25              -- DEFAULT_ANCESTOR_LIMIT (policy/policy.h:76)
+M.MAX_DESCENDANTS = 25            -- DEFAULT_DESCENDANT_LIMIT (policy/policy.h:78)
+M.MAX_ANCESTOR_SIZE = 101000      -- 101 kvB in vbytes (kernel/mempool_limits.h:22)
+M.MAX_DESCENDANT_SIZE = 101000    -- 101 kvB in vbytes (kernel/mempool_limits.h:22)
+-- Extra descendant exception: one single-ancestor child tx ≤ this size may
+-- exceed the descendant count limit by 1 (policy/policy.h:90).
+M.EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10000  -- EXTRA_DESCENDANT_TX_SIZE_LIMIT
 M.REPLACEMENT_MIN_FEE_BUMP = 1000 -- Minimum fee increase for RBF (sat/KB)
 
 -- IsStandardTx weight cap (Bitcoin Core policy/policy.h:38).
@@ -1052,11 +1088,23 @@ function Mempool:accept_transaction(tx, allow_rbf)
   for parent_hex in pairs(direct_parents) do
     uf_union(txid_hex, parent_hex)
   end
-  -- Check cluster size limit
-  if get_cluster_size(uf_find(txid_hex)) > MAX_CLUSTER_SIZE then
+  -- Check cluster limits (Bitcoin Core policy/policy.h:72-74,
+  -- kernel/mempool_limits.h:20-22, txmempool.cpp:1072-1079).
+  -- Two independent gates mirror Core's TxGraph::IsOversized() check:
+  --   (a) cluster transaction COUNT must not exceed DEFAULT_CLUSTER_LIMIT (64)
+  --   (b) cluster total vsize must not exceed DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000 (101000)
+  local cluster_root = uf_find(txid_hex)
+  local cluster_count = get_cluster_size(cluster_root)
+  if cluster_count > MAX_CLUSTER_COUNT then
     -- Undo: remove the entry we just added
     self:remove_transaction(txid_hex, "cluster-limit")
-    return false, "cluster size exceeds limit of " .. MAX_CLUSTER_SIZE
+    return false, "cluster size exceeds count limit of " .. MAX_CLUSTER_COUNT
+  end
+  local cluster_vsize = get_cluster_vsize(cluster_root, self.entries)
+  if cluster_vsize > MAX_CLUSTER_VSIZE then
+    -- Undo: remove the entry we just added
+    self:remove_transaction(txid_hex, "cluster-limit")
+    return false, "cluster vsize " .. cluster_vsize .. " exceeds limit of " .. MAX_CLUSTER_VSIZE
   end
 
   -- 9. Evict low-fee transactions if mempool exceeds max size
