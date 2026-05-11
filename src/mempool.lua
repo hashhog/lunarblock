@@ -197,7 +197,9 @@ M.interpolate_fee = interpolate_fee
 -- Mempool Policy Constants
 --------------------------------------------------------------------------------
 
-M.DEFAULT_MAX_MEMPOOL_SIZE = 300 * 1024 * 1024  -- 300 MB
+-- DEFAULT_MAX_MEMPOOL_SIZE_MB = 300, but Core uses metric MB (1,000,000 bytes),
+-- not binary MiB (1,048,576 bytes).  Reference: kernel/mempool_options.h:19.
+M.DEFAULT_MAX_MEMPOOL_SIZE = 300 * 1000 * 1000  -- 300 MB (metric, not MiB)
 M.DEFAULT_MIN_RELAY_FEE = 1000    -- 1 sat/vB in sat/KB
 M.DEFAULT_MAX_TX_FEE = 1000000    -- 0.01 BTC max fee (policy, not consensus)
 -- DEFAULT_BYTES_PER_SIGOP: each sigop "costs" this many virtual bytes.
@@ -257,7 +259,21 @@ M.MAX_OP_RETURN_RELAY = 100000
 -- BIP125 RBF Constants
 M.MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD  -- Sequence number signaling RBF
 M.MAX_REPLACEMENT_CANDIDATES = 100       -- Max transactions that can be evicted by RBF
-M.INCREMENTAL_RELAY_FEE = 1000           -- 1 sat/vB incremental relay fee (sat/KB)
+-- DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (policy/policy.h:48).
+-- Used in RBF Rule #4 and as the TrimToSize bump increment.
+-- Previously wrong: 1000 (10× too high).  Core is 100 sat/kvB.
+M.INCREMENTAL_RELAY_FEE = 100            -- 100 sat/kvB (policy/policy.h:48)
+
+-- Rolling minimum fee half-life in seconds (txmempool.h:212).
+-- The rolling minimum fee decays by half every ROLLING_FEE_HALFLIFE seconds.
+-- When the pool is < 1/4 full, halflife is divided by 4 (faster decay).
+-- When the pool is < 1/2 full, halflife is divided by 2.
+-- Reference: Bitcoin Core txmempool.h:212 ROLLING_FEE_HALFLIFE = 60*60*12.
+M.ROLLING_FEE_HALFLIFE = 43200           -- 12 hours in seconds (txmempool.h:212)
+
+-- Mempool expiry: transactions older than this many seconds are removed.
+-- Reference: kernel/mempool_options.h:23 DEFAULT_MEMPOOL_EXPIRY_HOURS = 336.
+M.DEFAULT_MEMPOOL_EXPIRY = 336 * 3600    -- 336 hours = 14 days in seconds
 
 -- Package Relay Constants (BIP 331)
 M.MAX_PACKAGE_COUNT = 25                 -- Max transactions in a package
@@ -744,10 +760,20 @@ function M.new(chain_state, config)
   self.chain_state = chain_state
   self.max_size = (config and config.max_mempool_size) or M.DEFAULT_MAX_MEMPOOL_SIZE
   self.min_relay_fee = (config and config.min_relay_fee) or M.DEFAULT_MIN_RELAY_FEE
+  self.expiry = (config and config.expiry) or M.DEFAULT_MEMPOOL_EXPIRY
   self.entries = {}            -- txid_hex -> MempoolEntry
   self.outpoint_to_tx = {}    -- outpoint_key -> txid_hex (tracks which tx spends each output)
   self.total_size = 0          -- Current memory usage estimate
   self.tx_count = 0
+  -- Rolling minimum fee state (txmempool.h:195-197, txmempool.cpp:829-859).
+  -- Tracks the minimum feerate that can enter the mempool after evictions.
+  -- Decays exponentially over time (ROLLING_FEE_HALFLIFE = 43200s).
+  -- Bumped by TrimToSize (track_package_removed) when txs are evicted.
+  -- Decay is enabled only after a block has been connected
+  -- (block_since_last_rolling_fee_bump, txmempool.cpp:427).
+  self.rolling_minimum_fee_rate = 0.0   -- sat/kvB, double precision
+  self.last_rolling_fee_update = os.time()
+  self.block_since_last_rolling_fee_bump = false
   -- Optional notification callbacks (for ZMQ, etc.)
   self.callbacks = {
     on_tx_removed = nil,  -- function(txid, reason)
@@ -1053,6 +1079,25 @@ function Mempool:accept_transaction(tx, allow_rbf)
       fee_rate_per_kb, self.min_relay_fee)
   end
 
+  -- 6b. Rolling minimum fee gate (Bitcoin Core validation.cpp:703-705).
+  -- After TrimToSize evicts transactions, a rolling minimum fee is bumped so
+  -- those evicted transactions cannot immediately re-enter the mempool.
+  -- GetMinFee() decays over time (half-life = ROLLING_FEE_HALFLIFE) after
+  -- each block is connected, approaching zero when the pool is well below max.
+  -- Reference: CTxMemPool::GetMinFee (txmempool.cpp:829-851);
+  --             validation.cpp:703-705 (CheckFeeRate).
+  do
+    local min_fee_rate_kvb = self:get_min_fee()  -- sat/kvB
+    if min_fee_rate_kvb > 0 then
+      -- fee_rate_per_kb is in sat/kvB (fee*1000/vsize = sat*1000/(virtual-bytes) = sat/kvB)
+      if fee_rate_per_kb < min_fee_rate_kvb then
+        return false, string.format(
+          "mempool min fee not met: %.2f < %.2f sat/kvB",
+          fee_rate_per_kb, min_fee_rate_kvb)
+      end
+    end
+  end
+
   -- 7. Handle RBF conflicts (BIP125)
   local all_conflicts = {}  -- All txs to be evicted (conflicts + descendants)
   if next(conflicts) then
@@ -1323,7 +1368,11 @@ function Mempool:accept_transaction(tx, allow_rbf)
     return false, "cluster vsize " .. cluster_vsize .. " exceeds limit of " .. MAX_CLUSTER_VSIZE
   end
 
-  -- 9. Evict low-fee transactions if mempool exceeds max size
+  -- 9. Evict low-fee and expired transactions if mempool exceeds limits.
+  -- Core's LimitMempoolSize (validation.cpp:271-276) calls Expire() then
+  -- TrimToSize().  We mirror that order: first expire old txs, then trim
+  -- by size so that the freshest high-feerate txs survive.
+  self:expire()
   self:trim()
 
   return true, txid_hex, fee
@@ -1433,6 +1482,10 @@ end
 --------------------------------------------------------------------------------
 
 --- Handle block connection (remove confirmed transactions).
+-- Also resets the rolling fee decay clock: after a block is connected,
+-- the rolling minimum fee is eligible to decay toward zero (Bitcoin Core
+-- txmempool.cpp:426-427: lastRollingFeeUpdate=GetTime(),
+-- blockSinceLastRollingFeeBump=true).
 -- @param block block: The connected block
 function Mempool:on_block_connected(block)
   for _, tx in ipairs(block.transactions) do
@@ -1450,6 +1503,11 @@ function Mempool:on_block_connected(block)
       end
     end
   end
+  -- Reset rolling fee decay clock (txmempool.cpp:426-427).
+  -- block_since_last_rolling_fee_bump=true enables get_min_fee() to
+  -- decay the rolling minimum fee toward zero over time.
+  self.last_rolling_fee_update = os.time()
+  self.block_since_last_rolling_fee_bump = true
 end
 
 --------------------------------------------------------------------------------
@@ -1495,7 +1553,135 @@ end
 -- Mempool Trimming
 --------------------------------------------------------------------------------
 
+--- Track the feerate of a removed package for the rolling minimum fee.
+-- Called from trim_to_size() after evicting a transaction or cluster.
+-- Bumps rolling_minimum_fee_rate if the evicted rate is higher.
+-- Also clears block_since_last_rolling_fee_bump so the decay clock restarts.
+-- Reference: Bitcoin Core CTxMemPool::trackPackageRemoved (txmempool.cpp:853-859).
+-- @param rate_sat_kvb number: feerate in sat/kvB of the removed package
+function Mempool:track_package_removed(rate_sat_kvb)
+  if rate_sat_kvb > self.rolling_minimum_fee_rate then
+    self.rolling_minimum_fee_rate = rate_sat_kvb
+    self.block_since_last_rolling_fee_bump = false
+  end
+end
+
+--- Get the current minimum fee rate required to enter the mempool.
+-- Implements the exponential rolling decay from Bitcoin Core's GetMinFee().
+-- The decay is only active after a block has been connected
+-- (block_since_last_rolling_fee_bump == true).  While the pool is shrinking,
+-- the minimum decays toward zero (floor: INCREMENTAL_RELAY_FEE / 2).
+--
+-- Halflife adjustments (txmempool.cpp:836-841):
+--   - pool < 1/4 full → halflife / 4  (fast decay)
+--   - pool < 1/2 full → halflife / 2
+--   - otherwise       → full ROLLING_FEE_HALFLIFE
+--
+-- Returns the rolling minimum fee rate in sat/kvB; at least
+-- INCREMENTAL_RELAY_FEE sat/kvB when non-zero, else 0.
+--
+-- Reference: Bitcoin Core CTxMemPool::GetMinFee (txmempool.cpp:829-851).
+-- @return number: minimum feerate in sat/kvB
+function Mempool:get_min_fee()
+  -- If no block has been connected since the last bump, do not decay.
+  -- Core: if (!blockSinceLastRollingFeeBump || rollingMinimumFeeRate == 0)
+  --        return CFeeRate(llround(rollingMinimumFeeRate));
+  if not self.block_since_last_rolling_fee_bump or self.rolling_minimum_fee_rate == 0 then
+    return self.rolling_minimum_fee_rate
+  end
+
+  local now = os.time()
+  if now > self.last_rolling_fee_update + 10 then
+    local halflife = M.ROLLING_FEE_HALFLIFE
+    -- Adjust halflife based on current pool occupancy (txmempool.cpp:837-841).
+    if self.total_size < self.max_size / 4 then
+      halflife = halflife / 4
+    elseif self.total_size < self.max_size / 2 then
+      halflife = halflife / 2
+    end
+
+    local dt = now - self.last_rolling_fee_update
+    self.rolling_minimum_fee_rate =
+      self.rolling_minimum_fee_rate / math.pow(2.0, dt / halflife)
+    self.last_rolling_fee_update = now
+
+    -- Floor: once below INCREMENTAL_RELAY_FEE/2, zero it out.
+    -- Core: if (rollingMinimumFeeRate < incremental_relay_feerate.GetFeePerK() / 2) → 0
+    if self.rolling_minimum_fee_rate < M.INCREMENTAL_RELAY_FEE / 2 then
+      self.rolling_minimum_fee_rate = 0
+      return 0
+    end
+  end
+
+  -- Return max(rolling_minimum_fee_rate, INCREMENTAL_RELAY_FEE).
+  -- Core: return std::max(CFeeRate(llround(rollingMinimumFeeRate)), incremental_relay_feerate)
+  return math.max(self.rolling_minimum_fee_rate, M.INCREMENTAL_RELAY_FEE)
+end
+
+--- Expire transactions older than the configured expiry time.
+-- Removes all mempool entries whose time < (now - expiry), plus all their
+-- descendants.  Returns the count of transactions removed.
+-- Reference: Bitcoin Core CTxMemPool::Expire (txmempool.cpp:811-827).
+-- @param cutoff_time number: optional Unix timestamp; defaults to now - self.expiry
+-- @return number: count of txs removed (including descendants)
+function Mempool:expire(cutoff_time)
+  cutoff_time = cutoff_time or (os.time() - self.expiry)
+  -- Collect all entries that are directly expired.
+  local expired = {}
+  for txid_hex, entry in pairs(self.entries) do
+    if entry.time < cutoff_time then
+      expired[txid_hex] = true
+    end
+  end
+  if not next(expired) then return 0 end
+
+  -- Expand to include all descendants (CalculateDescendants equivalent).
+  -- We do a worklist expansion: for each expired tx, add its descendants.
+  local to_remove = {}
+  local worklist = {}
+  for txid_hex in pairs(expired) do
+    worklist[#worklist + 1] = txid_hex
+  end
+  local visited = {}
+  while #worklist > 0 do
+    local hex = table.remove(worklist)
+    if not visited[hex] then
+      visited[hex] = true
+      to_remove[#to_remove + 1] = hex
+      local entry = self.entries[hex]
+      if entry then
+        for desc_hex in pairs(entry.descendants) do
+          if not visited[desc_hex] then
+            worklist[#worklist + 1] = desc_hex
+          end
+        end
+      end
+    end
+  end
+
+  -- Remove in order (remove_transaction handles cascading removal, but
+  -- some txs in to_remove may already be gone; nil-check is cheap).
+  local n = 0
+  for _, txid_hex in ipairs(to_remove) do
+    if self.entries[txid_hex] then
+      self:remove_transaction(txid_hex, "expiry")
+      n = n + 1
+    end
+  end
+  return n
+end
+
 --- Evict low-fee transactions when mempool exceeds max size.
+-- Implements Bitcoin Core CTxMemPool::TrimToSize (txmempool.cpp:861-911).
+--
+-- Three gates compared to the old trim():
+--   Gate 1: loop condition — DynamicMemoryUsage() > sizelimit (Core:868).
+--   Gate 2: after each eviction, call track_package_removed(evicted_feerate +
+--            INCREMENTAL_RELAY_FEE) to bump the rolling minimum fee so newly
+--            evicted txs cannot immediately re-enter (Core:877-878).
+--   Gate 3: select the worst (lowest feerate) entry as eviction candidate,
+--            using (fee+desc_fees)/(vsize+desc_size) as the descendant feerate
+--            proxy (closest analog to Core's GetWorstMainChunk cluster sort).
 function Mempool:trim()
   while self.total_size > self.max_size do
     -- Find the entry with the lowest descendant fee rate
@@ -1503,14 +1689,26 @@ function Mempool:trim()
     local worst_hex = nil
     local worst_rate = math.huge
     for hex, entry in pairs(self.entries) do
-      local rate = (entry.fee + entry.descendant_fees) /
-                   (entry.vsize + entry.descendant_size)
-      if rate < worst_rate then
-        worst_rate = rate
-        worst_hex = hex
+      -- Guard against zero-size (should not happen but prevents /0)
+      local total_vsize = entry.vsize + entry.descendant_size
+      if total_vsize > 0 then
+        local rate = (entry.fee + entry.descendant_fees) / total_vsize
+        if rate < worst_rate then
+          worst_rate = rate
+          worst_hex = hex
+        end
       end
     end
     if not worst_hex then break end
+
+    -- Gate 2: bump rolling minimum fee before removing.
+    -- evicted_rate is in sat/vB; convert to sat/kvB for the rolling tracker.
+    -- Add INCREMENTAL_RELAY_FEE so evicted txs cannot immediately re-enter.
+    -- Reference: txmempool.cpp:877-878 (removed += incremental_relay_feerate;
+    --             trackPackageRemoved(removed)).
+    local evicted_rate_kvb = math.floor(worst_rate * 1000)  -- sat/vB -> sat/kvB
+    self:track_package_removed(evicted_rate_kvb + M.INCREMENTAL_RELAY_FEE)
+
     self:remove_transaction(worst_hex, "evicted")
   end
 end
@@ -1536,14 +1734,19 @@ function Mempool:get_sorted_entries()
 end
 
 --- Get mempool statistics.
+-- mempoolminfee returns the effective minimum feerate in sat/kvB:
+-- max(min_relay_fee, get_min_fee()) — the rolling minimum includes the
+-- post-trim bump and decays over time (Bitcoin Core getmempoolinfo field).
 -- @return table: Mempool info
 function Mempool:get_info()
+  local rolling_min = self:get_min_fee()  -- sat/kvB, may be 0
+  local effective_min = math.max(self.min_relay_fee, rolling_min)
   return {
     size = self.tx_count,
     bytes = self.total_size,
     usage = self.total_size,
     maxmempool = self.max_size,
-    mempoolminfee = self.min_relay_fee,
+    mempoolminfee = effective_min,
   }
 end
 
