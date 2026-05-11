@@ -267,6 +267,19 @@ M.MAX_PACKAGE_VSIZE = 101000             -- Max total vsize (weight / 4)
 -- Pay-to-Anchor (P2A) Constants
 M.ANCHOR_AMOUNT = 0                      -- P2A outputs must have zero value
 
+-- BIP-431 TRUC (Topologically Restricted Until Confirmation) v3 Policy
+-- Reference: bitcoin-core/src/policy/truc_policy.h
+-- A transaction with version=3 is treated as TRUC.
+M.TRUC_VERSION = 3
+-- TRUC allows at most 1 unconfirmed parent: ancestor set size ≤ 2.
+M.TRUC_ANCESTOR_LIMIT = 2      -- Core truc_policy.h:27
+-- TRUC allows at most 1 child: descendant set size ≤ 2.
+M.TRUC_DESCENDANT_LIMIT = 2    -- Core truc_policy.h:25
+-- Maximum sigop-adjusted vsize for any TRUC transaction.
+M.TRUC_MAX_VSIZE = 10000       -- Core truc_policy.h:30
+-- Maximum sigop-adjusted vsize for a TRUC child (has unconfirmed parent).
+M.TRUC_CHILD_MAX_VSIZE = 1000  -- Core truc_policy.h:33
+
 -- IsWitnessStandard limits (Bitcoin Core policy/policy.h).
 -- P2WSH redeem script size limit (Core policy/policy.h:56).
 M.MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600
@@ -282,6 +295,165 @@ M.ANNEX_TAG = 0x50
 M.TAPROOT_LEAF_MASK = 0xfe
 -- Tapscript leaf version (BIP 342).
 M.TAPROOT_LEAF_TAPSCRIPT = 0xc0
+
+--------------------------------------------------------------------------------
+-- BIP-431 TRUC (v3) Policy — SingleTRUCChecks
+-- Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261
+--------------------------------------------------------------------------------
+
+--- Check BIP-431 TRUC policy for a single transaction entering the mempool.
+--
+-- Must be called for every transaction (TRUC and non-TRUC alike).
+-- Enforces the following 6 gates:
+--   Gate 1: Non-TRUC tx must not spend a TRUC (v=3) unconfirmed parent.
+--            Core truc_policy.cpp:180-184.
+--   Gate 2: TRUC tx must not spend a non-TRUC unconfirmed parent.
+--            Core truc_policy.cpp:185-190.
+--   Gate 3: TRUC tx sigop-adjusted vsize must be ≤ TRUC_MAX_VSIZE (10000).
+--            Core truc_policy.cpp:200-204.
+--   Gate 4: TRUC tx ancestor count (incl. self) must be ≤ TRUC_ANCESTOR_LIMIT (2).
+--            Core truc_policy.cpp:207-211.
+--   Gate 5: If TRUC tx has an unconfirmed parent, its vsize must be
+--            ≤ TRUC_CHILD_MAX_VSIZE (1000).
+--            Core truc_policy.cpp:223-227.
+--   Gate 6: TRUC parent's descendant count (incl. new child) must be
+--            ≤ TRUC_DESCENDANT_LIMIT (2). Returns sibling txid_hex when
+--            sibling eviction is applicable (parent has exactly 1 existing
+--            child with ancestor_count=1), otherwise nil.
+--            Core truc_policy.cpp:229-258.
+--
+-- @param entries    table: mempool entries (txid_hex -> entry)
+-- @param tx         table: the transaction being accepted
+-- @param direct_parents table: txid_hex -> entry of in-mempool direct parents
+-- @param vsize      number: sigop-adjusted virtual size of tx
+-- @param conflicts  table: txid_hex -> true, set of direct RBF conflicts
+--
+-- @return ok, err_string, sibling_txid_hex
+--   ok=true means all checks passed (sibling_txid_hex is nil).
+--   ok=false, err set, sibling_txid_hex set → sibling eviction may be tried.
+--   ok=false, err set, sibling_txid_hex nil → hard reject.
+function M.single_truc_checks(entries, tx, direct_parents, vsize, conflicts)
+  conflicts = conflicts or {}
+
+  -- Gates 1+2: TRUC/non-TRUC inheritance check (applies to all txs).
+  -- Core truc_policy.cpp:178-191.
+  for parent_hex, parent_entry in pairs(direct_parents) do
+    local parent_ver = parent_entry.tx.version
+    if tx.version ~= M.TRUC_VERSION and parent_ver == M.TRUC_VERSION then
+      -- Gate 1: non-TRUC spending TRUC parent.
+      return false,
+        string.format("non-version=3 tx cannot spend from version=3 tx %s",
+          parent_hex:sub(1, 16)),
+        nil
+    elseif tx.version == M.TRUC_VERSION and parent_ver ~= M.TRUC_VERSION then
+      -- Gate 2: TRUC spending non-TRUC parent.
+      return false,
+        string.format("version=3 tx cannot spend from non-version=3 tx %s",
+          parent_hex:sub(1, 16)),
+        nil
+    end
+  end
+
+  -- Remaining gates only apply to TRUC transactions.
+  -- Core truc_policy.cpp:198.
+  if tx.version ~= M.TRUC_VERSION then
+    return true, nil, nil
+  end
+
+  -- Gate 3: TRUC tx vsize limit.
+  -- Core truc_policy.cpp:200-204.
+  if vsize > M.TRUC_MAX_VSIZE then
+    return false,
+      string.format("version=3 tx is too big: %d > %d virtual bytes",
+        vsize, M.TRUC_MAX_VSIZE),
+      nil
+  end
+
+  -- Count direct parents (= unconfirmed ancestors at depth 1).
+  local parent_count = 0
+  local first_parent_hex = nil
+  local first_parent_entry = nil
+  for parent_hex, parent_entry in pairs(direct_parents) do
+    parent_count = parent_count + 1
+    first_parent_hex = parent_hex
+    first_parent_entry = parent_entry
+  end
+
+  -- Gate 4: TRUC ancestor count (self + all in-mempool ancestors) ≤ 2.
+  -- With TRUC_ANCESTOR_LIMIT=2, at most 1 unconfirmed parent is allowed.
+  -- Core truc_policy.cpp:207-211 (mempool_parents.size() + 1 > TRUC_ANCESTOR_LIMIT).
+  if parent_count + 1 > M.TRUC_ANCESTOR_LIMIT then
+    return false,
+      "tx would have too many ancestors (version=3 allows at most 1 unconfirmed parent)",
+      nil
+  end
+
+  -- Additionally, if the parent itself has ancestors, the total chain exceeds 2.
+  -- Core truc_policy.cpp:214-220: GetAncestorCount(mempool_parents[0]) + 1 > limit.
+  if first_parent_entry then
+    -- ancestor_count on the entry excludes self (set in accept_transaction step 8).
+    -- ancestor_count + 1 (the parent itself) + 1 (ptx) > TRUC_ANCESTOR_LIMIT.
+    local parent_anc_depth = first_parent_entry.ancestor_count + 1  -- parent incl. itself
+    if parent_anc_depth + 1 > M.TRUC_ANCESTOR_LIMIT then
+      return false,
+        "tx would have too many ancestors (version=3 parent is not a top-level tx)",
+        nil
+    end
+  end
+
+  -- Remaining gates only apply when the tx has an unconfirmed parent.
+  if parent_count == 0 then
+    return true, nil, nil
+  end
+
+  -- Gate 5: TRUC child vsize limit (tx has unconfirmed TRUC parent).
+  -- Core truc_policy.cpp:223-227.
+  if vsize > M.TRUC_CHILD_MAX_VSIZE then
+    return false,
+      string.format("version=3 child tx is too big: %d > %d virtual bytes",
+        vsize, M.TRUC_CHILD_MAX_VSIZE),
+      nil
+  end
+
+  -- Gate 6: TRUC parent's descendant count must not exceed TRUC_DESCENDANT_LIMIT.
+  -- The parent currently has `descendant_count` descendants (excluding self).
+  -- Adding ptx would make it descendant_count+1 descendants (excl. self), or
+  -- descendant_count+2 including self → compare parent.descendant_count+1+1 > limit.
+  -- Core truc_policy.cpp:243: pool.GetDescendantCount(parent_entry) + 1 > TRUC_DESCENDANT_LIMIT.
+  -- GetDescendantCount includes the entry itself, so it equals descendant_count+1.
+  -- Core truc_policy.cpp:243: (descendant_count+1) + 1 > 2  → descendant_count > 0.
+  local parent_desc_count_with_self = first_parent_entry.descendant_count + 1
+  if parent_desc_count_with_self + 1 > M.TRUC_DESCENDANT_LIMIT then
+    -- Sibling eviction: applicable when parent has exactly 1 existing child
+    -- (GetDescendantCount == 2, i.e. descendant_count_with_self == 2) AND that
+    -- child itself has no children (GetAncestorCount(**begin) == 2, meaning the
+    -- child has exactly 1 ancestor = the parent).
+    -- Core truc_policy.cpp:249-257.
+    local sibling_txid_hex = nil
+    if parent_desc_count_with_self == 2 then
+      -- Exactly one existing child. Find it.
+      for desc_hex in pairs(first_parent_entry.descendants) do
+        local desc_entry = entries[desc_hex]
+        if desc_entry then
+          -- Check the sibling is not itself being replaced (direct conflict).
+          local will_be_replaced = conflicts[desc_hex]
+          -- Core checks GetAncestorCount == 2 (parent+self, no further ancestors).
+          -- Our ancestor_count excludes self, so ancestor_count+1 == 2 → ancestor_count == 1.
+          if not will_be_replaced and desc_entry.ancestor_count == 1 then
+            sibling_txid_hex = desc_hex
+          end
+        end
+      end
+    end
+
+    local err = string.format(
+      "version=3 tx %s would exceed descendant count limit",
+      first_parent_hex:sub(1, 16))
+    return false, err, sibling_txid_hex
+  end
+
+  return true, nil, nil
+end
 
 --------------------------------------------------------------------------------
 -- IsWitnessStandard (Bitcoin Core policy/policy.cpp:265-352)
@@ -1057,6 +1229,38 @@ function Mempool:accept_transaction(tx, allow_rbf)
       end
       if new_desc_size > M.MAX_DESCENDANT_SIZE then
         return false, "descendant size too large for ancestor " .. anc_hex:sub(1, 16)
+      end
+    end
+  end
+
+  -- 8c. BIP-431 TRUC (v3) policy checks.
+  -- Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261 (SingleTRUCChecks).
+  -- Must be called for every tx (TRUC and non-TRUC) to enforce inheritance gates.
+  -- The `conflicts` set (direct RBF conflicts) is forwarded so Gate 6 can detect
+  -- sibling-eviction eligibility (the existing child is about to be replaced).
+  do
+    local truc_conflicts = {}
+    for conflict_hex in pairs(conflicts) do
+      truc_conflicts[conflict_hex] = true
+    end
+    local truc_ok, truc_err, sibling_hex =
+      M.single_truc_checks(self.entries, tx, direct_parents, vsize, truc_conflicts)
+    if not truc_ok then
+      if sibling_hex then
+        -- Sibling eviction: attempt to evict the existing TRUC child and retry.
+        -- This mirrors Core's behaviour: the caller removes the sibling under RBF
+        -- rules and re-attempts acceptance.  Here we evict the sibling and
+        -- re-run the gate, then continue if it now passes.
+        -- Reference: Core validation.cpp AcceptSingleTransaction sibling-eviction path.
+        self:remove_transaction(sibling_hex, "truc-sibling-eviction")
+        local retry_ok, retry_err, _ =
+          M.single_truc_checks(self.entries, tx, direct_parents, vsize, truc_conflicts)
+        if not retry_ok then
+          return false, retry_err or truc_err
+        end
+        -- Sibling evicted and gate now passes; fall through.
+      else
+        return false, truc_err
       end
     end
   end
