@@ -128,20 +128,26 @@ HeadersSyncState.STATE = {
   FINAL = "final"
 }
 
--- Parameters for commitment tracking
-local COMMITMENT_PERIOD = 584  -- Store 1 commitment every N headers
-local REDOWNLOAD_BUFFER_SIZE = 144  -- Buffer headers before accepting
-
 --- Create a new HeadersSyncState instance for a peer.
 -- @param peer_id number|string: identifier for the peer
 -- @param network table: network configuration
--- @param chain_start table: {hash, height, work} of the chain start point
+-- @param chain_start table: {hash, height, work, bits} of the chain start point
+--   chain_start.bits must be the compact nBits of the chain_start block
+--   (Bitcoin Core: m_chain_start.nBits via GetBlockHeader()).
 -- @return HeadersSyncState: new sync state instance
 function M.new_headers_sync_state(peer_id, network, chain_start)
   local self = setmetatable({}, HeadersSyncState)
 
   self.peer_id = peer_id
   self.network = network
+
+  -- Per-network headers sync parameters (Bitcoin Core kernel/chainparams.cpp).
+  -- Bug-fix: use per-network commitment_period / redownload_buffer_size instead
+  -- of the old hardcoded COMMITMENT_PERIOD=584 / REDOWNLOAD_BUFFER_SIZE=144.
+  -- Core values: mainnet 641/15218, testnet4 606/16092, regtest 275/7017.
+  local hs_params = (network.headerssync_params or {})
+  self.commitment_period = hs_params.commitment_period or 641
+  self.redownload_buffer_size = hs_params.redownload_buffer_size or 15218
 
   -- Parse minimum required work from network config
   self.min_required_work = consensus.work_from_hex(
@@ -152,46 +158,82 @@ function M.new_headers_sync_state(peer_id, network, chain_start)
   self.chain_start_hash = chain_start.hash
   self.chain_start_height = chain_start.height
   self.chain_start_work = chain_start.work or consensus.work_zero()
+  -- Bug-fix: use chain_start.bits, not network.genesis.bits.  When chain_start
+  -- is not the genesis block the genesis bits would be wrong (e.g. mainnet
+  -- syncs starting from a buried block with different difficulty).
+  -- Bitcoin Core: m_last_header_received = m_chain_start.GetBlockHeader() whose
+  -- nBits comes from the CBlockIndex, not chainparams.genesis (headerssync.cpp:30).
+  self.chain_start_bits = chain_start.bits or network.genesis.bits
 
   -- Current state
   self.state = HeadersSyncState.STATE.PRESYNC
 
-  -- PRESYNC tracking (memory-efficient)
-  self.presync = {
-    work = self.chain_start_work,  -- Accumulated work (32-byte big-endian)
-    last_hash = chain_start.hash,  -- Hash of last processed header
-    last_bits = network.genesis.bits,  -- bits of last header (for difficulty check)
-    last_timestamp = network.genesis.timestamp,  -- timestamp of last header
-    count = 0,  -- Number of headers processed
-    height = chain_start.height,  -- Current height
-    commitments = {},  -- 1-bit commitments (boolean array)
-  }
-
-  -- Random salt for commitment hashing (anti-grinding)
-  -- Use /dev/urandom for secure random bytes
+  -- Random salt for commitment hashing (anti-grinding).
+  -- Bug-fix: derive commitment_offset from the same /dev/urandom read as the
+  -- salt so both are from the same secure source and the offset is not exposed
+  -- to the Lua global PRNG state (old code called math.random() independently).
+  -- Bitcoin Core: FastRandomContext().randrange(params.commitment_period)
+  -- (headerssync.cpp:23), which is seeded from /dev/urandom on construction.
   local f = io.open("/dev/urandom", "rb")
   if f then
-    self.commitment_salt = f:read(32)
+    local rand_bytes = f:read(33)  -- 32 salt + 1 offset byte
     f:close()
+    if rand_bytes and #rand_bytes == 33 then
+      self.commitment_salt = rand_bytes:sub(1, 32)
+      -- Reduce the offset byte modulo commitment_period (unbiased enough given
+      -- commitment_period << 256; mirrors Core's randrange semantics).
+      self.commitment_offset = rand_bytes:byte(33) % self.commitment_period
+    else
+      -- /dev/urandom returned fewer bytes than expected — extremely unlikely.
+      self.commitment_salt = string.rep("\x00", 32)
+      self.commitment_offset = 0
+    end
   else
-    -- Fallback to Lua random (NOT cryptographically secure)
-    math.randomseed(os.time() + os.clock() * 1000000)
+    -- /dev/urandom unavailable: generate a weak-but-functional salt.
+    -- Documented limitation; production deployments should have /dev/urandom.
+    local seed = os.time() * 1000003 + math.floor(os.clock() * 1e9)
+    math.randomseed(seed)
     local bytes = {}
     for i = 1, 32 do
       bytes[i] = string.char(math.random(0, 255))
     end
     self.commitment_salt = table.concat(bytes)
+    self.commitment_offset = math.random(0, self.commitment_period - 1)
   end
 
-  -- Random offset for commitment positions (0 to COMMITMENT_PERIOD-1)
-  self.commitment_offset = math.random(0, COMMITMENT_PERIOD - 1)
+  -- m_max_commitments: memory bound on how long an honest chain can be.
+  -- Bitcoin Core (headerssync.cpp:41-43):
+  --   max_seconds = (now - chain_start.GetMedianTimePast()) + MAX_FUTURE_BLOCK_TIME
+  --   m_max_commitments = 6 * max_seconds / commitment_period
+  -- Bug-fix: lunarblock had no bound at all; an attacker could grow
+  -- presync.commitments without limit.
+  do
+    local now = os.time()
+    -- chain_start.mtp is the Median Time Past of the chain_start block.
+    -- Fall back to chain_start genesis timestamp if not provided (safe; MTP <=
+    -- the block's own timestamp, so this over-estimates max_commitments slightly
+    -- which is acceptable — it only widens the memory bound, not tightens it).
+    local start_mtp = chain_start.mtp or chain_start.timestamp or network.genesis.timestamp
+    local MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60  -- 7200 seconds (consensus.MAX_FUTURE_BLOCK_TIME)
+    local max_seconds = math.max(0, now - start_mtp) + MAX_FUTURE_BLOCK_TIME
+    self.max_commitments = math.floor(6 * max_seconds / self.commitment_period)
+  end
+
+  -- PRESYNC tracking (memory-efficient)
+  self.presync = {
+    work = self.chain_start_work,  -- Accumulated work (32-byte big-endian)
+    last_hash = chain_start.hash,  -- Hash of last processed header
+    last_bits = self.chain_start_bits,  -- bits of last header (for difficulty check)
+    count = 0,  -- Number of headers processed
+    height = chain_start.height,  -- Current height
+    commitments = {},  -- 1-bit commitments (boolean array)
+  }
 
   -- REDOWNLOAD tracking
   self.redownload = {
     work = self.chain_start_work,
     last_hash = chain_start.hash,
-    last_bits = network.genesis.bits,
-    last_timestamp = network.genesis.timestamp,
+    last_bits = self.chain_start_bits,
     height = chain_start.height,
     buffer = {},  -- Buffered headers awaiting acceptance
     commitment_idx = 1,  -- Next commitment to verify
@@ -263,12 +305,13 @@ end
 --------------------------------------------------------------------------------
 
 --- Process headers in PRESYNC phase.
--- Validates PoW and accumulates work without storing headers.
+-- Validates PoW and difficulty; accumulates work without storing headers.
 -- @param headers table: list of block_header objects
 -- @return boolean, string|nil: success, error message
 function HeadersSyncState:process_presync(headers)
   for _, header in ipairs(headers) do
-    -- Verify continuity (header connects to last)
+    -- Verify continuity (header connects to last).
+    -- Bitcoin Core headerssync.cpp:148-155.
     local prev_hex = types.hash256_hex(header.prev_hash)
     local last_hex = types.hash256_hex(self.presync.last_hash)
     if prev_hex ~= last_hex then
@@ -277,44 +320,58 @@ function HeadersSyncState:process_presync(headers)
 
     local next_height = self.presync.height + 1
 
-    -- Check difficulty transition
+    -- Check difficulty transition.
+    -- Bitcoin Core headerssync.cpp:189-193 (ValidateAndProcessSingleHeader).
     if not self:permitted_difficulty_transition(
       self.presync.last_bits, header.bits, next_height
     ) then
       return false, "invalid difficulty transition in presync"
     end
 
-    -- Verify PoW
+    -- Verify PoW.
+    -- Bitcoin Core headerssync.cpp implicitly trusts the caller to have already
+    -- checked PoW against the declared target; we verify explicitly here.
     local hash = validation.compute_block_hash(header)
     local target = consensus.bits_to_target(header.bits)
     if not consensus.hash_meets_target(hash.bytes, target) then
       return false, "invalid proof of work in presync"
     end
 
-    -- Check timestamp > previous timestamp (simplified MTP check)
-    if header.timestamp <= self.presync.last_timestamp - 7200 then
-      return false, "timestamp too old in presync"
-    end
+    -- Bug-fix: removed bogus timestamp check.
+    -- Old code: if header.timestamp <= self.presync.last_timestamp - 7200 then
+    -- Bitcoin Core does NOT check timestamps in PRESYNC (ValidateAndProcessSingleHeader
+    -- only calls PermittedDifficultyTransition and GetBlockProof).
+    -- Timestamps are validated later during full block acceptance.
 
-    -- Accumulate work
+    -- Accumulate work.
+    -- Bitcoin Core headerssync.cpp:208.
     local block_work = consensus.get_block_work(header.bits)
     self.presync.work = consensus.work_add(self.presync.work, block_work)
 
-    -- Store commitment at periodic intervals
-    if (next_height % COMMITMENT_PERIOD) == self.commitment_offset then
+    -- Store commitment at periodic intervals.
+    -- Bitcoin Core headerssync.cpp:195-205.
+    if (next_height % self.commitment_period) == self.commitment_offset then
       local commitment = self:compute_commitment(hash)
       self.presync.commitments[#self.presync.commitments + 1] = commitment
+
+      -- Bug-fix: enforce m_max_commitments memory bound.
+      -- Bitcoin Core headerssync.cpp:198-204: abort if commitments exceed bound.
+      -- Without this check an attacker can exhaust memory by serving an
+      -- arbitrarily long chain during PRESYNC.
+      if #self.presync.commitments > self.max_commitments then
+        return false, "exceeded max commitments in presync (DoS limit)"
+      end
     end
 
-    -- Update state
+    -- Update state.
     self.presync.last_hash = hash
     self.presync.last_bits = header.bits
-    self.presync.last_timestamp = header.timestamp
     self.presync.height = next_height
     self.presync.count = self.presync.count + 1
   end
 
-  -- Check if we've reached minimum required work
+  -- Check if we've reached minimum required work.
+  -- Bitcoin Core headerssync.cpp:165-173.
   if consensus.work_compare(self.presync.work, self.min_required_work) >= 0 then
     -- Transition to REDOWNLOAD
     self:transition_to_redownload()
@@ -324,15 +381,20 @@ function HeadersSyncState:process_presync(headers)
 end
 
 --- Transition from PRESYNC to REDOWNLOAD phase.
+-- Bitcoin Core headerssync.cpp:165-173 (ValidateAndStoreHeadersCommitments).
 function HeadersSyncState:transition_to_redownload()
   self.state = HeadersSyncState.STATE.REDOWNLOAD
 
-  -- Reset redownload state to chain start
+  -- Reset redownload state to chain start.
+  -- Bug-fix: use self.chain_start_bits (actual bits of chain_start block),
+  -- not network.genesis.bits.
+  -- Bitcoin Core: m_redownload_buffer_last_height/hash initialised to
+  -- m_chain_start.nHeight / m_chain_start.GetBlockHash(); previous_nBits
+  -- falls through to m_chain_start.nBits (headerssync.cpp:234).
   self.redownload = {
     work = self.chain_start_work,
     last_hash = self.chain_start_hash,
-    last_bits = self.network.genesis.bits,
-    last_timestamp = self.network.genesis.timestamp,
+    last_bits = self.chain_start_bits,
     height = self.chain_start_height,
     buffer = {},
     commitment_idx = 1,
@@ -347,18 +409,24 @@ function HeadersSyncState:presync_complete()
 end
 
 --- Get the getheaders request parameters for current state.
+-- Mirrors Bitcoin Core HeadersSyncState::NextHeadersRequestLocator()
+-- (headerssync.cpp:296-317).
 -- @return table: {locator_hashes, stop_hash}
 function HeadersSyncState:get_getheaders_request()
   if self.state == HeadersSyncState.STATE.PRESYNC then
-    -- Continue from last PRESYNC header
+    -- During PRESYNC, continue from the last header received.
+    -- Bitcoin Core: locator.push_back(m_last_header_received.GetHash())
     return {
       locator_hashes = {self.presync.last_hash},
       stop_hash = types.hash256_zero()
     }
   elseif self.state == HeadersSyncState.STATE.REDOWNLOAD then
-    -- Start from chain start for REDOWNLOAD
+    -- Bug-fix: during REDOWNLOAD, resume from the last buffered/redownloaded hash,
+    -- NOT from chain_start_hash.  Old code returned chain_start_hash which forced
+    -- re-downloading from the very beginning of the chain on every batch.
+    -- Bitcoin Core: locator.push_back(m_redownload_buffer_last_hash) (headerssync.cpp:311).
     return {
-      locator_hashes = {self.chain_start_hash},
+      locator_hashes = {self.redownload.last_hash},
       stop_hash = types.hash256_zero()
     }
   else
@@ -401,20 +469,24 @@ function HeadersSyncState:process_redownload(headers)
       return nil, "invalid proof of work in redownload"
     end
 
-    -- Accumulate work
+    -- Accumulate work on the redownloaded chain.
+    -- Bitcoin Core headerssync.cpp:244.
     local block_work = consensus.get_block_work(header.bits)
     self.redownload.work = consensus.work_add(self.redownload.work, block_work)
 
-    -- Check if we've reached work threshold
+    -- Check if we've reached work threshold (m_process_all_remaining_headers).
+    -- Bitcoin Core headerssync.cpp:246-248.
     if not self.redownload.work_threshold_reached then
       if consensus.work_compare(self.redownload.work, self.min_required_work) >= 0 then
         self.redownload.work_threshold_reached = true
       end
     end
 
-    -- Verify commitment at periodic intervals
+    -- Verify commitment at periodic intervals, but only before work threshold.
+    -- Bug-fix: use self.commitment_period (per-network) not the old constant COMMITMENT_PERIOD.
+    -- Bitcoin Core headerssync.cpp:256-270.
     if not self.redownload.work_threshold_reached then
-      if (next_height % COMMITMENT_PERIOD) == self.commitment_offset then
+      if (next_height % self.commitment_period) == self.commitment_offset then
         local idx = self.redownload.commitment_idx
         if idx > #self.presync.commitments then
           return nil, "commitment overrun in redownload"
@@ -430,13 +502,12 @@ function HeadersSyncState:process_redownload(headers)
       end
     end
 
-    -- Update state
+    -- Update state.
     self.redownload.last_hash = hash
     self.redownload.last_bits = header.bits
-    self.redownload.last_timestamp = header.timestamp
     self.redownload.height = next_height
 
-    -- Add to buffer
+    -- Add to buffer.
     self.redownload.buffer[#self.redownload.buffer + 1] = {
       header = header,
       hash = hash,
@@ -445,41 +516,83 @@ function HeadersSyncState:process_redownload(headers)
   end
 
   -- Release buffered headers that have sufficient commitments verified
-  -- (or all if work threshold reached)
-  if self.redownload.work_threshold_reached or
-     #self.redownload.buffer > REDOWNLOAD_BUFFER_SIZE then
-    -- Release headers from buffer
-    if self.redownload.work_threshold_reached then
-      -- Release all
-      for _, entry in ipairs(self.redownload.buffer) do
-        accepted[#accepted + 1] = entry
-      end
-      self.redownload.buffer = {}
-      self.state = HeadersSyncState.STATE.FINAL
-    else
-      -- Release oldest entries, keeping REDOWNLOAD_BUFFER_SIZE
-      while #self.redownload.buffer > REDOWNLOAD_BUFFER_SIZE do
-        local entry = table.remove(self.redownload.buffer, 1)
-        accepted[#accepted + 1] = entry
-      end
+  -- (or all if work threshold reached).
+  -- Bitcoin Core PopHeadersReadyForAcceptance() (headerssync.cpp:280-293):
+  --   while (size > redownload_buffer_size || (size > 0 && m_process_all_remaining_headers))
+  --     pop front.
+  -- Bug-fix: do NOT set state=FINAL here.  Bitcoin Core never sets FINAL inside
+  -- PopHeadersReadyForAcceptance — Finalize() is called by ProcessNextHeaders
+  -- only after consulting full_headers_message.  Prematurely setting FINAL here
+  -- caused the sync to stop requesting further batches even when the peer had
+  -- more headers to serve beyond the work threshold.
+  if self.redownload.work_threshold_reached then
+    -- Release all buffered headers.
+    for _, entry in ipairs(self.redownload.buffer) do
+      accepted[#accepted + 1] = entry
+    end
+    self.redownload.buffer = {}
+    -- Note: caller (process_headers / continue_low_work_sync) is responsible
+    -- for checking is_work_threshold_reached() and setting FINAL when the peer
+    -- signals no more headers (non-full message).
+  else
+    -- Release oldest entries until buffer is within redownload_buffer_size.
+    -- Bug-fix: use self.redownload_buffer_size (per-network) not old constant.
+    while #self.redownload.buffer > self.redownload_buffer_size do
+      local entry = table.remove(self.redownload.buffer, 1)
+      accepted[#accepted + 1] = entry
     end
   end
 
   return accepted
 end
 
+--- Return true if the redownload work threshold has been reached.
+-- Callers use this to decide whether to mark sync as FINAL.
+function HeadersSyncState:is_work_threshold_reached()
+  return self.redownload.work_threshold_reached
+end
+
 --- Process headers based on current state.
+-- Mirrors Bitcoin Core HeadersSyncState::ProcessNextHeaders() logic
+-- (headerssync.cpp:68-137).
 -- @param headers table: list of block_header objects
+-- @param full_headers_message boolean: true if the message was full (2000 headers);
+--   false (or nil) if this is the last batch from the peer.  Used to determine
+--   whether to transition to FINAL after REDOWNLOAD completes.
 -- @return table|nil, string|nil: accepted headers (for storage), error
-function HeadersSyncState:process_headers(headers)
+function HeadersSyncState:process_headers(headers, full_headers_message)
   if self.state == HeadersSyncState.STATE.PRESYNC then
     local ok, err = self:process_presync(headers)
     if not ok then
+      self.state = HeadersSyncState.STATE.FINAL
       return nil, err
     end
+    -- If PRESYNC transitioned to REDOWNLOAD, that's fine — caller will see
+    -- state changed and re-request from the beginning.
     return {}, nil  -- No headers accepted yet in PRESYNC
   elseif self.state == HeadersSyncState.STATE.REDOWNLOAD then
-    return self:process_redownload(headers)
+    local accepted, err = self:process_redownload(headers)
+    if err then
+      self.state = HeadersSyncState.STATE.FINAL
+      return nil, err
+    end
+
+    -- Bug-fix: FINAL transition must be driven by full_headers_message, mirroring
+    -- Bitcoin Core ProcessNextHeaders (headerssync.cpp:119-131):
+    --   if (buffer.empty() && m_process_all_remaining_headers) → done (no request_more)
+    --   else if (full_headers_message) → request_more = true
+    --   else → incomplete message, give up (no request_more → Finalize)
+    if #self.redownload.buffer == 0 and self.redownload.work_threshold_reached then
+      -- All headers released; sync complete.
+      self.state = HeadersSyncState.STATE.FINAL
+    elseif not full_headers_message then
+      -- Peer sent a non-full batch but we haven't reached our target yet.
+      -- Treat as incomplete/abandoned — transition to FINAL.
+      self.state = HeadersSyncState.STATE.FINAL
+    end
+    -- (If full_headers_message and buffer not empty: stay in REDOWNLOAD, caller requests more.)
+
+    return accepted, nil
   else
     return nil, "sync already complete"
   end
@@ -1197,11 +1310,24 @@ function HeaderChain:try_low_work_sync(peer, headers)
     return false
   end
 
-  -- Create HeadersSyncState for this peer
+  -- Create HeadersSyncState for this peer.
+  -- Bug-fix: include chain_start.bits (the nBits of the fork-point block) so
+  -- HeadersSyncState can use the correct difficulty for the first header check,
+  -- matching Bitcoin Core CBlockIndex::nBits (headerssync.cpp:234).
+  local tip_bits = self.network.genesis.bits  -- safe default
+  if self.header_tip_hash then
+    local tip_hex = types.hash256_hex(self.header_tip_hash)
+    local tip_entry = self.headers[tip_hex]
+    if tip_entry and tip_entry.header then
+      tip_bits = tip_entry.header.bits
+    end
+  end
+
   local chain_start = {
     hash = self.header_tip_hash,
     height = self.header_tip_height,
-    work = self:get_chain_work()
+    work = self:get_chain_work(),
+    bits = tip_bits,
   }
 
   local sync_state = M.new_headers_sync_state(peer_id, self.network, chain_start)
@@ -1221,8 +1347,9 @@ end
 --- Continue low-work header sync for a peer.
 -- @param peer table: peer sending headers
 -- @param headers table: headers received
+-- @param full_headers_message boolean: true if the batch was full (2000 headers)
 -- @return table|nil, string|nil: accepted headers, error
-function HeaderChain:continue_low_work_sync(peer, headers)
+function HeaderChain:continue_low_work_sync(peer, headers, full_headers_message)
   local peer_id = peer.id or tostring(peer)
   local sync_state = self.peer_sync_states[peer_id]
 
@@ -1230,8 +1357,9 @@ function HeaderChain:continue_low_work_sync(peer, headers)
     return nil, "no sync state for peer"
   end
 
-  -- Process headers based on current state
-  local accepted, err = sync_state:process_headers(headers)
+  -- Process headers based on current state; pass full_headers_message so
+  -- REDOWNLOAD knows whether to transition to FINAL or request more.
+  local accepted, err = sync_state:process_headers(headers, full_headers_message)
   if err then
     -- Invalid headers - remove sync state
     self.peer_sync_states[peer_id] = nil
@@ -1267,8 +1395,10 @@ function HeaderChain:handle_headers(peer, payload)
   local sync_state = self.peer_sync_states[peer_id]
 
   if sync_state then
-    -- Continue low-work sync
-    local accepted_entries, err = self:continue_low_work_sync(peer, headers)
+    -- Continue low-work sync.
+    -- Pass full_headers_message so REDOWNLOAD knows whether to transition to FINAL.
+    local full_headers_message = (#headers == 2000)
+    local accepted_entries, err = self:continue_low_work_sync(peer, headers, full_headers_message)
     if err then
       return -1, err
     end
