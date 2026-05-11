@@ -186,10 +186,14 @@ function M.check_transaction(tx)
   assert(#tx.inputs > 0, "transaction has no inputs")
   assert(#tx.outputs > 0, "transaction has no outputs")
 
-  -- Check serialized size (use cached data if available from check_block)
+  -- Check serialized size.
+  -- Upper bound (consensus): Bitcoin Core CheckTransaction checks
+  --   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+  -- i.e. stripped_size * 4 > 4_000_000, which means stripped_size > 1_000_000.
+  -- Reference: bitcoin-core/src/consensus/tx_check.cpp:19.
   local tx_data = tx._cached_base_data or serialize.serialize_transaction(tx, false)
-  assert(#tx_data >= consensus.MIN_TX_SIZE,
-         "transaction size " .. #tx_data .. " below minimum " .. consensus.MIN_TX_SIZE)
+  assert(#tx_data * consensus.WITNESS_SCALE_FACTOR <= consensus.MAX_BLOCK_WEIGHT,
+         "transaction stripped size " .. #tx_data .. " * 4 exceeds MAX_BLOCK_WEIGHT")
 
   -- Check for duplicate inputs (avoid buffer_writer allocation per input)
   local seen_outpoints = {}
@@ -280,12 +284,49 @@ end
 -- Weight = base_size * 3 + total_size
 -- where base_size is non-witness serialization length
 -- and total_size is witness serialization length.
+-- Equivalent to: stripped_size * (WITNESS_SCALE_FACTOR - 1) + total_size
+-- Reference: bitcoin-core/src/consensus/validation.h:132-135.
 -- @param tx transaction: The transaction
 -- @return number: The weight in weight units
 function M.get_tx_weight(tx)
   local base_size = #serialize.serialize_transaction(tx, false)
   local total_size = #serialize.serialize_transaction(tx, true)
   return base_size * 3 + total_size
+end
+
+--- Get the sigop-adjusted weight.
+-- When a transaction has many sigops, its effective weight is raised to
+-- sigop_cost * bytes_per_sigop so that miners are correctly compensated.
+-- Reference: bitcoin-core/src/policy/policy.cpp:390-393 GetSigOpsAdjustedWeight.
+--   return std::max(weight, sigop_cost * bytes_per_sigop);
+-- @param weight number: raw transaction weight
+-- @param sigop_cost number: total sigop cost (from get_transaction_sigop_cost)
+-- @param bytes_per_sigop number: bytes per sigop policy setting (default 20)
+-- @return number: adjusted weight
+function M.get_sigops_adjusted_weight(weight, sigop_cost, bytes_per_sigop)
+  bytes_per_sigop = bytes_per_sigop or 20
+  local adjusted = sigop_cost * bytes_per_sigop
+  if adjusted > weight then return adjusted end
+  return weight
+end
+
+--- Get virtual transaction size (vsize).
+-- vsize = ceil(sigop_adjusted_weight / WITNESS_SCALE_FACTOR)
+-- Reference: bitcoin-core/src/policy/policy.cpp:395-398 GetVirtualTransactionSize:
+--   return (GetSigOpsAdjustedWeight(nWeight, nSigOpCost, bytes_per_sigop)
+--           + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
+-- When sigop_cost=0 and bytes_per_sigop=0 this reduces to ceil(weight/4),
+-- matching the no-sigop-adjustment form (policy.h:186-188).
+-- @param weight number: raw transaction weight
+-- @param sigop_cost number: total sigop cost (0 to disable adjustment)
+-- @param bytes_per_sigop number: bytes per sigop (0 to disable adjustment)
+-- @return number: virtual size in vbytes (integer, ceiling division)
+function M.get_virtual_tx_size(weight, sigop_cost, bytes_per_sigop)
+  sigop_cost = sigop_cost or 0
+  bytes_per_sigop = bytes_per_sigop or 0
+  local adj = M.get_sigops_adjusted_weight(weight, sigop_cost, bytes_per_sigop)
+  -- Ceiling division: (adj + WSF - 1) / WSF
+  return math.floor((adj + consensus.WITNESS_SCALE_FACTOR - 1) / consensus.WITNESS_SCALE_FACTOR)
 end
 
 --------------------------------------------------------------------------------

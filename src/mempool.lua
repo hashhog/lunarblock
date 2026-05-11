@@ -200,6 +200,12 @@ M.interpolate_fee = interpolate_fee
 M.DEFAULT_MAX_MEMPOOL_SIZE = 300 * 1024 * 1024  -- 300 MB
 M.DEFAULT_MIN_RELAY_FEE = 1000    -- 1 sat/vB in sat/KB
 M.DEFAULT_MAX_TX_FEE = 1000000    -- 0.01 BTC max fee (policy, not consensus)
+-- DEFAULT_BYTES_PER_SIGOP: each sigop "costs" this many virtual bytes.
+-- When a tx has many sigops, its effective vsize is raised to
+--   ceil(max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP) / 4)
+-- so that sigop-heavy txs cannot pay a too-low fee rate.
+-- Reference: bitcoin-core/src/policy/policy.h:50, policy.cpp:390-398.
+M.DEFAULT_BYTES_PER_SIGOP = 20
 -- Ancestor/descendant limits (policy/policy.h:76-78, kernel/mempool_limits.h:24-26).
 -- In Bitcoin Core 28+ (cluster mempool) these are deprecated for policy
 -- enforcement and replaced by cluster limits, but are retained here for
@@ -799,7 +805,9 @@ function Mempool:accept_transaction(tx, allow_rbf)
   -- GetTransactionSigOpCost with STANDARD_SCRIPT_VERIFY_FLAGS (P2SH+witness).
   -- Transactions whose total sigop cost exceeds MAX_STANDARD_TX_SIGOPS_COST
   -- (16000 = MAX_BLOCK_SIGOPS_COST/5) are rejected with "bad-txns-too-many-sigops".
+  -- We also save tx_sigop_cost for vsize adjustment in step 6.
   -- Reference: bitcoin-core/src/validation.cpp:908+941-943.
+  local tx_sigop_cost
   do
     local inp_to_resolved = {}
     for i, inp in ipairs(tx.inputs) do
@@ -809,7 +817,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
       return inp_to_resolved[inp]
     end
     local sigop_flags = { verify_p2sh = true, verify_witness = true }
-    local tx_sigop_cost = validation.get_transaction_sigop_cost(tx, get_prev_for_sigops, sigop_flags)
+    tx_sigop_cost = validation.get_transaction_sigop_cost(tx, get_prev_for_sigops, sigop_flags)
     if tx_sigop_cost > M.MAX_STANDARD_TX_SIGOPS_COST then
       return false, string.format("bad-txns-too-many-sigops: sigop cost %d > %d",
         tx_sigop_cost, M.MAX_STANDARD_TX_SIGOPS_COST)
@@ -860,9 +868,13 @@ function Mempool:accept_transaction(tx, allow_rbf)
     end
   end
 
-  -- 6. Check fee rate
+  -- 6. Check fee rate using sigop-adjusted vsize.
+  -- Bitcoin Core computes vsize = GetVirtualTransactionSize(tx, sigop_cost, bytes_per_sigop)
+  -- = ceil(max(weight, sigop_cost * bytes_per_sigop) / WITNESS_SCALE_FACTOR).
+  -- This ensures sigop-heavy transactions pay proportionally higher fees.
+  -- Reference: bitcoin-core/src/policy/policy.cpp:395-403 + policy.h:182-188.
   local weight = validation.get_tx_weight(tx)
-  local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+  local vsize = validation.get_virtual_tx_size(weight, tx_sigop_cost, M.DEFAULT_BYTES_PER_SIGOP)
   local fee_rate_per_kb = fee * 1000 / vsize
   if fee_rate_per_kb < self.min_relay_fee then
     return false, string.format("fee rate too low: %.2f < %d sat/KB",
