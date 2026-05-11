@@ -60,6 +60,20 @@ local function bip22_result(err)
     return "bad-witness-merkle-match"
   end
 
+  -- BIP34 coinbase height — MUST come before the generic "script" catcher below.
+  -- Bug fix (W79): original pattern s:find("bip34") (lowercase) missed the actual
+  -- error strings emitted by validation.check_block which used uppercase "BIP34:".
+  -- The first assert message contained "scriptSig" which caused s:find("script")
+  -- to fire first, returning the wrong code "block-script-verify-flag-failed".
+  -- The second assert message hit the default "rejected" fallback.
+  -- Fix: match "bad-cb-height" (now embedded literally in error messages by
+  -- validation.lua W79 fix) AND keep the legacy uppercase/lowercase patterns for
+  -- belt-and-suspenders.  Core: state.Invalid(BLOCK_CONSENSUS, "bad-cb-height").
+  -- Reference: validation.cpp:4157.
+  if s:find("bad%-cb%-height") or s:find("[Bb][Ii][Pp]34") or s:find("coinbase height") then
+    return "bad-cb-height"
+  end
+
   -- Coinbase scriptSig length (consensus/tx_check.cpp "bad-cb-length"; 2..100 bytes)
   -- Must precede the generic "script" catch below.
   if s:find("coinbase scriptsig") and (s:find("too long") or s:find("too short") or s:find("out of range")) then
@@ -79,11 +93,6 @@ local function bip22_result(err)
   -- Block weight / size
   if s:find("weight") and s:find("exceed") then
     return "bad-blk-length"
-  end
-
-  -- BIP34 coinbase height
-  if s:find("bip34") or s:find("coinbase height") or s:find("bad%-cb%-height") then
-    return "bad-cb-height"
   end
 
   -- Non-final transactions / sequence lock
@@ -153,6 +162,12 @@ local function bip22_result(err)
 
   return "rejected"
 end
+
+-- Exported alias for testability.
+-- W79: exposed so the BIP-34 error-code mapping can be unit-tested directly
+-- without going through submitblock.  The internal function is the
+-- single-source-of-truth for all submitblock rejection codes.
+M.classify_block_rejection = bip22_result
 
 --------------------------------------------------------------------------------
 -- RPC Error Codes

@@ -64,7 +64,12 @@ function M.classify_callback_error(err)
     "transaction has no inputs",
     "transaction has no outputs",
     "missing utxo",  -- secondary effect of script failure (see comment above)
-    "bip34 requires height",
+    -- BIP34 coinbase height: old pattern "bip34 requires height" was lowercase
+    -- and never matched the actual error messages ("BIP34: coinbase scriptSig..."
+    -- or "bad-cb-height: ...").  Add both the canonical error code and a
+    -- case-insensitive BIP34 prefix match.  W79 fix.
+    "bad%-cb%-height",
+    "[Bb][Ii][Pp]34",
     "bad%-txns",
     "bad%-blk",
     "non%-final",

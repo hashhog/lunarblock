@@ -1302,16 +1302,29 @@ function M.check_block(block, network, height)
   -- Bitcoin Core validation.cpp:4151-4159:
   --   CScript expect = CScript() << nHeight;
   --   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+  -- Error code: "bad-cb-height" (Core BlockValidationResult::BLOCK_CONSENSUS).
+  -- Bug fix (W79): previous assert messages used "BIP34:" / "BIP34 height mismatch"
+  -- (uppercase prefix), which were NOT matched by rpc.lua's lowercase "bip34"
+  -- pattern — BIP34 violations were silently mapped to "block-script-verify-flag-
+  -- failed" (first assert, caught by s:find("script")) or "rejected" (second
+  -- assert).  Now both asserts embed "bad-cb-height" so the canonical-set check
+  -- in classify_block_rejection() catches them immediately, matching Core's
+  -- state.Invalid(BLOCK_CONSENSUS, "bad-cb-height", ...) wire code.
   if height and height >= network.bip34_height then
     local coinbase_sig = block.transactions[1].inputs[1].script_sig
     local expect = M.encode_bip34_height(height)
     local n = #expect
-    assert(#coinbase_sig >= n, "BIP34: coinbase scriptSig too short for height " .. height)
+    if #coinbase_sig < n then
+      error("bad-cb-height: coinbase scriptSig too short for height " .. height ..
+            " (need " .. n .. " bytes, got " .. #coinbase_sig .. ")")
+    end
     for i = 1, n do
-      assert(coinbase_sig:byte(i) == expect:byte(i),
-             "BIP34 height mismatch at byte " .. i ..
-             ": expected " .. string.format("0x%02x", expect:byte(i)) ..
-             " got " .. string.format("0x%02x", coinbase_sig:byte(i)))
+      if coinbase_sig:byte(i) ~= expect:byte(i) then
+        error("bad-cb-height: height mismatch at byte " .. i ..
+              " (expected " .. string.format("0x%02x", expect:byte(i)) ..
+              " got " .. string.format("0x%02x", coinbase_sig:byte(i)) ..
+              ") at block height " .. height)
+      end
     end
   end
 
