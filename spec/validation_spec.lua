@@ -92,9 +92,11 @@ describe("validation", function()
       tx.inputs[2] = types.txin(types.outpoint(prev_hash, 0), "\x00", 0xFFFFFFFF)
       tx.outputs[1] = types.txout(50000, string.rep("\x00", 25))
 
+      -- CVE-2018-17144: error must be Core's canonical "bad-txns-inputs-duplicate"
+      -- so bip22_result() classifies it correctly (not as "rejected").
       assert.has_error(function()
         validation.check_transaction(tx)
-      end, "duplicate input")
+      end, "bad-txns-inputs-duplicate")
     end)
 
     it("rejects negative output value", function()

@@ -206,7 +206,10 @@ function M.check_transaction(tx)
       bit.band(bit.rshift(idx, 24), 0xFF)
     )
     if seen_outpoints[key] then
-      error("duplicate input")
+      -- CVE-2018-17144: duplicate inputs allow inflation in naive UTXO implementations.
+      -- Core: state.Invalid(TX_CONSENSUS, "bad-txns-inputs-duplicate")
+      -- tx_check.cpp:44.
+      error("bad-txns-inputs-duplicate")
     end
     seen_outpoints[key] = true
   end

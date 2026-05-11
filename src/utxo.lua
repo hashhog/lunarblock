@@ -2184,11 +2184,23 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           utxo.value, utxo.script_pubkey, utxo.height, utxo.is_coinbase
         )
 
-        -- Coinbase maturity check
+        -- Coinbase maturity check.
+        -- Core: tx_verify.cpp:179-182 "bad-txns-premature-spend-of-coinbase".
         if utxo.is_coinbase then
           assert(height - utxo.height >= consensus.COINBASE_MATURITY,
-            "Coinbase output not mature")
+            string.format("bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth %d",
+              height - utxo.height))
         end
+
+        -- Per-input amount MoneyRange check (CVE-2010-5139 defense on inputs).
+        -- Core: tx_verify.cpp:186 "bad-txns-inputvalues-outofrange":
+        --   nValueIn += coin.out.nValue;
+        --   if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn))
+        -- Check individual input value first, then the running sum.
+        assert(consensus.is_valid_amount(utxo.value),
+          "bad-txns-inputvalues-outofrange: input value out of range")
+        assert(consensus.is_valid_amount(input_total + utxo.value),
+          "bad-txns-inputvalues-outofrange: accumulated input value out of range")
 
         -- Script verification (skip if assumevalid optimization is active)
         if not skip_script_validation then
@@ -2529,9 +2541,16 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       for _, out in ipairs(tx.outputs) do
         output_total = output_total + out.value
       end
+      -- Core: tx_verify.cpp:196-199 "bad-txns-in-belowout".
       assert(input_total >= output_total,
-        "Transaction outputs exceed inputs")
-      total_fees = total_fees + (input_total - output_total)
+        string.format("bad-txns-in-belowout: value in (%d) < value out (%d)",
+          input_total, output_total))
+      -- Accumulated fees MoneyRange check.
+      -- Core: validation.cpp:2543-2546 "bad-txns-accumulated-fee-outofrange".
+      local tx_fee = input_total - output_total
+      assert(consensus.is_valid_amount(total_fees + tx_fee),
+        "bad-txns-accumulated-fee-outofrange: accumulated fee in block out of range")
+      total_fees = total_fees + tx_fee
     end
 
     -- Add outputs to UTXO set

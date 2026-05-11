@@ -33,17 +33,29 @@ local function bip22_result(err)
   if err == nil then return nil end  -- success
   local s = tostring(err):lower()
 
-  -- Already-canonical strings pass through unchanged
-  local canonical = {
-    ["duplicate"] = true, ["inconclusive"] = true, ["duplicate-invalid"] = true,
-    ["high-hash"] = true, ["bad-txnmrklroot"] = true,
-    ["bad-witness-merkle-match"] = true, ["bad-cb-amount"] = true,
-    ["bad-blk-sigops"] = true, ["bad-cb-height"] = true,
-    ["bad-txns-nonfinal"] = true, ["bad-txns-duplicate"] = true,
-    ["rejected"] = true, ["block-script-verify-flag-failed"] = true,
-    ["bad-txns-inputs-missingorspent"] = true,
+  -- Already-canonical strings pass through unchanged (exact match or prefix match).
+  -- Error messages may carry a detail suffix after ": " — e.g.
+  --   "bad-txns-in-belowout: value in (X) < value out (Y)"
+  -- Exact-match first for the short form; prefix-match handles the long form.
+  local canonical_keys = {
+    "duplicate", "inconclusive", "duplicate-invalid",
+    "high-hash", "bad-txnmrklroot",
+    "bad-witness-merkle-match", "bad-cb-amount",
+    "bad-blk-sigops", "bad-cb-height",
+    "bad-txns-nonfinal", "bad-txns-duplicate",
+    "rejected", "block-script-verify-flag-failed",
+    "bad-txns-inputs-missingorspent",
+    "bad-txns-inputs-duplicate",
+    "bad-txns-inputvalues-outofrange",
+    "bad-txns-accumulated-fee-outofrange",
+    "bad-txns-in-belowout",
+    "bad-txns-premature-spend-of-coinbase",
   }
-  if canonical[s] then return s end
+  for _, key in ipairs(canonical_keys) do
+    if s == key or s:sub(1, #key + 1) == key .. ":" then
+      return key
+    end
+  end
 
   -- PoW / difficulty
   if s:find("proof of work") or s:find("invalid pow") or s:find("does not meet target") then

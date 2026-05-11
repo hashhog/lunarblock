@@ -708,6 +708,133 @@ describe("utxo", function()
       end, "Coinbase value too high: 5000000001 > 5000000000 + 0")
     end)
 
+    -- W84: premature-spend canonical error string
+    -- Core: tx_verify.cpp:179-182 "bad-txns-premature-spend-of-coinbase"
+    it("premature-spend error carries canonical Core reject reason", function()
+      local pubkey_hash = string.rep("\xaa", 20)
+      local script_pubkey = script.make_p2pkh_script(pubkey_hash)
+
+      -- Connect coinbase at height 0
+      local coinbase0 = make_coinbase_tx(0, 5000000000, script_pubkey)
+      local block0 = make_block(0, {coinbase0})
+      local hash0 = validation.compute_block_hash(block0.header)
+      chain_state:connect_block(block0, 0, hash0)
+
+      -- Advance 98 blocks so coinbase depth at block 99 = 99 - 0 = 99 < 100 (immature)
+      for h = 1, 98 do
+        local cb = make_coinbase_tx(h, 5000000000, script_pubkey)
+        local blk = make_block(h, {cb})
+        local hash = validation.compute_block_hash(blk.header)
+        chain_state:connect_block(blk, h, hash)
+      end
+
+      -- Try to spend coinbase at height 99 (depth = 99 - 0 = 99 < COINBASE_MATURITY=100)
+      local cb0_txid = validation.compute_txid(coinbase0)
+      local spend_inp = types.txin(types.outpoint(cb0_txid, 0), "\x00", 0xFFFFFFFF)
+      local out_script = script.make_p2pkh_script(string.rep("\xbb", 20))
+      local spend_tx = types.transaction(1, {spend_inp}, {types.txout(4999000000, out_script)}, 0)
+      local cb_spend = make_coinbase_tx(99, 5000000000, script_pubkey)
+      local blk99 = make_block(99, {cb_spend, spend_tx})
+      local hash100 = validation.compute_block_hash(blk99.header)
+
+      -- connect_block asserts on failure; capture the error via pcall
+      local ok, err = pcall(function()
+        chain_state:connect_block(blk99, 99, hash100,
+          nil, nil, true)  -- skip_script_validation=true to isolate maturity check
+      end)
+      assert.is_false(ok)
+      -- Must contain Core's canonical reject code so bip22_result() maps correctly
+      assert.is_truthy(tostring(err):find("bad%-txns%-premature%-spend%-of%-coinbase"),
+        "expected 'bad-txns-premature-spend-of-coinbase' in: " .. tostring(err))
+    end)
+
+    -- W84: per-input MoneyRange check (CVE-2010-5139 defense on inputs)
+    -- Core: tx_verify.cpp:186 "bad-txns-inputvalues-outofrange"
+    it("rejects block with input value out of range (MoneyRange gate)", function()
+      local pubkey_hash = string.rep("\xcc", 20)
+      local script_pubkey = script.make_p2pkh_script(pubkey_hash)
+
+      -- Connect coinbase at height 0 and mature it
+      local coinbase0 = make_coinbase_tx(0, 5000000000, script_pubkey)
+      local block0 = make_block(0, {coinbase0})
+      local hash0 = validation.compute_block_hash(block0.header)
+      chain_state:connect_block(block0, 0, hash0)
+
+      for h = 1, 100 do
+        local cb = make_coinbase_tx(h, 5000000000, script_pubkey)
+        local blk = make_block(h, {cb})
+        local hsh = validation.compute_block_hash(blk.header)
+        chain_state:connect_block(blk, h, hsh)
+      end
+
+      -- Manually inject a UTXO with a negative value to simulate DB corruption.
+      -- Core rejects this via MoneyRange(coin.out.nValue) check.
+      local cb0_txid = validation.compute_txid(coinbase0)
+      local corrupt_entry = utxo.utxo_entry(-1, script_pubkey, 0, false)
+      chain_state.coin_view:add(cb0_txid, 0, corrupt_entry)
+
+      -- Build a tx spending that corrupted UTXO
+      local spend_inp = types.txin(types.outpoint(cb0_txid, 0), "\x00", 0xFFFFFFFF)
+      local out_script = script.make_p2pkh_script(string.rep("\xdd", 20))
+      local spend_tx = types.transaction(1, {spend_inp}, {types.txout(0, out_script)}, 0)
+      local cb101 = make_coinbase_tx(101, 5000000000, script_pubkey)
+      local blk101 = make_block(101, {cb101, spend_tx})
+      local hash101 = validation.compute_block_hash(blk101.header)
+
+      local ok, err = pcall(function()
+        chain_state:connect_block(blk101, 101, hash101, nil, nil, true)
+      end)
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find("bad%-txns%-inputvalues%-outofrange"),
+        "expected 'bad-txns-inputvalues-outofrange' in: " .. tostring(err))
+    end)
+
+    -- W84: accumulated fees MoneyRange check
+    -- Core: validation.cpp:2543-2546 "bad-txns-accumulated-fee-outofrange"
+    it("rejects block where accumulated fees exceed MAX_MONEY", function()
+      local pubkey_hash = string.rep("\xee", 20)
+      local script_pubkey = script.make_p2pkh_script(pubkey_hash)
+
+      -- Connect genesis coinbase and mature it
+      local coinbase0 = make_coinbase_tx(0, 5000000000, script_pubkey)
+      local block0 = make_block(0, {coinbase0})
+      local hash0 = validation.compute_block_hash(block0.header)
+      chain_state:connect_block(block0, 0, hash0)
+
+      for h = 1, 100 do
+        local cb = make_coinbase_tx(h, 5000000000, script_pubkey)
+        local blk = make_block(h, {cb})
+        local hsh = validation.compute_block_hash(blk.header)
+        chain_state:connect_block(blk, h, hsh)
+      end
+
+      -- Inject two UTXOs each with value MAX_MONEY.  One tx spending
+      -- MAX_MONEY → 0 yields fee=MAX_MONEY (valid alone); two such txs
+      -- in the same block → total_fees = 2×MAX_MONEY, which fails MoneyRange.
+      local fake_txid  = types.hash256(string.rep("\xab", 32))
+      local fake_txid2 = types.hash256(string.rep("\xac", 32))
+      local fat_entry  = utxo.utxo_entry(consensus.MAX_MONEY, script_pubkey, 100, false)
+      chain_state.coin_view:add(fake_txid,  0, fat_entry)
+      chain_state.coin_view:add(fake_txid2, 0, fat_entry)
+
+      local spend_inp  = types.txin(types.outpoint(fake_txid,  0), "\x00", 0xFFFFFFFF)
+      local spend_inp2 = types.txin(types.outpoint(fake_txid2, 0), "\x00", 0xFFFFFFFF)
+      -- OP_RETURN outputs carry 0 value; fee = input value − 0 = MAX_MONEY each
+      local spend_tx  = types.transaction(1, {spend_inp},  {types.txout(0, "\x6a")}, 0)
+      local spend_tx2 = types.transaction(1, {spend_inp2}, {types.txout(0, "\x6a")}, 0)
+
+      local cb101 = make_coinbase_tx(101, 5000000000, script_pubkey)
+      local blk101 = make_block(101, {cb101, spend_tx, spend_tx2})
+      local hash101 = validation.compute_block_hash(blk101.header)
+
+      local ok, err = pcall(function()
+        chain_state:connect_block(blk101, 101, hash101, nil, nil, true)
+      end)
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find("bad%-txns%-accumulated%-fee%-outofrange"),
+        "expected 'bad-txns-accumulated-fee-outofrange' in: " .. tostring(err))
+    end)
+
     it("correctly calculates block subsidy at different heights", function()
       -- Height 0: 50 BTC
       assert.equal(5000000000, consensus.get_block_subsidy(0))
