@@ -1205,6 +1205,256 @@ describe("consensus", function()
     end)
   end)
 
+  -- ---------------------------------------------------------------------------
+  -- W91: BIP-9 versionbits bug-fix tests
+  -- ---------------------------------------------------------------------------
+
+  -- Bug 1 (fixed): STARTED→LOCKED_IN/FAILED priority.
+  -- Bitcoin Core versionbits.cpp:86-98: threshold check precedes timeout check.
+  -- When both count >= threshold AND mtp >= timeout in the same period, the
+  -- deployment must become LOCKED_IN, not FAILED.
+  describe("get_deployment_state STARTED priority: threshold beats timeout", function()
+    local period = 10
+    local threshold = 8
+
+    local function make_block_info(blocks)
+      return function(h) return blocks[h] end
+    end
+
+    it("transitions to LOCKED_IN not FAILED when both count and timeout hit in same period", function()
+      -- deployment starts at mtp=1000 and times out at mtp=2000
+      local dep = {
+        bit = 1,
+        start_time = 1000,
+        timeout = 2000,
+        min_activation_height = 0,
+      }
+
+      local blocks = {}
+      -- Period 0 (h=0..9): MTP >= start_time -> STARTED
+      for h = 0, 9 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      -- Period 1 (h=10..19): 8 signaling blocks AND mtp >= timeout in same period.
+      -- Core: LOCKED_IN takes priority because threshold checked first.
+      for h = 10, 17 do
+        blocks[h] = {timestamp = 2000, mtp = 2000, version = 0x20000002}  -- signaling
+      end
+      for h = 18, 19 do
+        blocks[h] = {timestamp = 2000, mtp = 2000, version = 0x20000000}  -- not signaling
+      end
+
+      local state = consensus.get_deployment_state(dep, period, threshold, 19, make_block_info(blocks))
+      -- Must be LOCKED_IN (not FAILED).  The old code checked timeout first
+      -- and returned FAILED, which is wrong per Core versionbits.cpp:93-97.
+      assert.equals(consensus.DEPLOYMENT_STATE.LOCKED_IN, state)
+    end)
+
+    it("transitions to FAILED when timeout hit and threshold NOT met", function()
+      local dep = {
+        bit = 1,
+        start_time = 1000,
+        timeout = 2000,
+        min_activation_height = 0,
+      }
+
+      local blocks = {}
+      -- Period 0: STARTED
+      for h = 0, 9 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      -- Period 1: only 5 signaling, mtp >= timeout -> FAILED
+      for h = 10, 14 do
+        blocks[h] = {timestamp = 2000, mtp = 2000, version = 0x20000002}  -- 5 signaling
+      end
+      for h = 15, 19 do
+        blocks[h] = {timestamp = 2000, mtp = 2000, version = 0x20000000}
+      end
+
+      local state = consensus.get_deployment_state(dep, period, threshold, 19, make_block_info(blocks))
+      assert.equals(consensus.DEPLOYMENT_STATE.FAILED, state)
+    end)
+
+    it("stays STARTED when neither threshold nor timeout met", function()
+      local dep = {
+        bit = 1,
+        start_time = 1000,
+        timeout = 9999,
+        min_activation_height = 0,
+      }
+
+      local blocks = {}
+      for h = 0, 9 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      -- Period 1: only 3 signaling, mtp well below timeout
+      for h = 10, 12 do
+        blocks[h] = {timestamp = 1500, mtp = 1500, version = 0x20000002}
+      end
+      for h = 13, 19 do
+        blocks[h] = {timestamp = 1500, mtp = 1500, version = 0x20000000}
+      end
+
+      local state = consensus.get_deployment_state(dep, period, threshold, 19, make_block_info(blocks))
+      assert.equals(consensus.DEPLOYMENT_STATE.STARTED, state)
+    end)
+  end)
+
+  -- Bug 2 (fixed): compute_block_version missing.
+  -- Bitcoin Core versionbits.cpp:265-279: starts from VERSIONBITS_TOP_BITS,
+  -- ORs in Mask() for each STARTED or LOCKED_IN deployment.
+  describe("compute_block_version", function()
+    local STATE = consensus.DEPLOYMENT_STATE
+
+    -- Helper: make a minimal network with a single deployment.
+    local function make_net(deployments)
+      return {
+        versionbits_period = 10,
+        versionbits_threshold = 8,
+        deployments = deployments,
+      }
+    end
+
+    local function make_block_info(blocks)
+      return function(h) return blocks[h] end
+    end
+
+    it("returns VERSIONBITS_TOP_BITS when no deployments", function()
+      local net = make_net(nil)  -- no deployments key
+      -- height=0 or any height; get_block_info won't be called
+      local v = consensus.compute_block_version(net, 100, function() return nil end)
+      assert.equals(consensus.VERSIONBITS_TOP_BITS, v)
+    end)
+
+    it("returns VERSIONBITS_TOP_BITS for empty deployments list", function()
+      local net = make_net({})
+      local v = consensus.compute_block_version(net, 100, function() return nil end)
+      assert.equals(consensus.VERSIONBITS_TOP_BITS, v)
+    end)
+
+    it("returns VERSIONBITS_TOP_BITS for DEFINED deployment", function()
+      -- Deployment that has not started yet (mtp < start_time)
+      local dep = {bit = 0, start_time = 9999, timeout = 99999, min_activation_height = 0}
+      local net = make_net({dep})
+
+      local blocks = {}
+      for h = 0, 19 do
+        blocks[h] = {timestamp = 100, mtp = 100, version = 0x20000000}
+      end
+
+      -- Block 10: deployment is DEFINED, should NOT signal
+      local v = consensus.compute_block_version(net, 10, make_block_info(blocks))
+      assert.equals(consensus.VERSIONBITS_TOP_BITS, v)
+    end)
+
+    it("signals bit for STARTED deployment", function()
+      -- Deployment on bit 1 that entered STARTED state in previous period
+      local dep = {bit = 1, start_time = 1000, timeout = 9999, min_activation_height = 0}
+      local net = make_net({dep})
+
+      local blocks = {}
+      -- Period 0 (h=0..9): MTP >= start_time -> STARTED at end of period 0
+      for h = 0, 9 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      -- Block 10 is in period 1; state from prev period = STARTED -> must signal
+      blocks[10] = {timestamp = 1100, mtp = 1100, version = 0x20000000}
+
+      -- Height=11 means the block being built is at h=11; prev=h=10
+      -- get_deployment_state_for_block for h=11: prev_period_end = 9 -> STARTED
+      local v = consensus.compute_block_version(net, 11, make_block_info(blocks))
+      local expected = bit.bor(consensus.VERSIONBITS_TOP_BITS, bit.lshift(1, 1))
+      assert.equals(expected, v)
+    end)
+
+    it("signals bit for LOCKED_IN deployment", function()
+      -- Deployment on bit 2 that entered LOCKED_IN
+      local dep = {bit = 2, start_time = 1000, timeout = 9999, min_activation_height = 0}
+      local net = make_net({dep})
+
+      local blocks = {}
+      -- Period 0: STARTED
+      for h = 0, 9 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      -- Period 1: 8 signaling blocks -> LOCKED_IN at end of period 1
+      for h = 10, 17 do
+        blocks[h] = {timestamp = 1500, mtp = 1500, version = 0x20000004}  -- bit 2
+      end
+      for h = 18, 19 do
+        blocks[h] = {timestamp = 1500, mtp = 1500, version = 0x20000000}
+      end
+      -- Block 20 is in period 2; state from prev period = LOCKED_IN -> must signal
+      blocks[20] = {timestamp = 1600, mtp = 1600, version = 0x20000000}
+
+      local v = consensus.compute_block_version(net, 21, make_block_info(blocks))
+      local expected = bit.bor(consensus.VERSIONBITS_TOP_BITS, bit.lshift(1, 2))
+      assert.equals(expected, v)
+    end)
+
+    it("does NOT signal bit for ACTIVE deployment (terminal state)", function()
+      -- After LOCKED_IN, next period is ACTIVE.  Miners do not need to signal.
+      local dep = {bit = 1, start_time = 1000, timeout = 9999, min_activation_height = 0}
+      local net = make_net({dep})
+
+      local blocks = {}
+      -- Period 0: STARTED
+      for h = 0, 9 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      -- Period 1: LOCKED_IN
+      for h = 10, 17 do
+        blocks[h] = {timestamp = 1500, mtp = 1500, version = 0x20000002}
+      end
+      for h = 18, 19 do
+        blocks[h] = {timestamp = 1500, mtp = 1500, version = 0x20000000}
+      end
+      -- Period 2: ACTIVE (block 21 in period 2, prev_period_end = 19 -> LOCKED_IN,
+      -- get_deployment_state_for_block for h=21 returns ACTIVE)
+      -- Actually need period 2 to have ended for ACTIVE to show at period 3.
+      -- Let's compute for h=31 (period 3 start) to see ACTIVE.
+      for h = 20, 29 do
+        blocks[h] = {timestamp = 2000, mtp = 2000, version = 0x20000000}
+      end
+      blocks[30] = {timestamp = 2000, mtp = 2000, version = 0x20000000}
+
+      local v = consensus.compute_block_version(net, 31, make_block_info(blocks))
+      -- ACTIVE -> no signaling bit set; must return VERSIONBITS_TOP_BITS
+      assert.equals(consensus.VERSIONBITS_TOP_BITS, v)
+    end)
+
+    it("signals multiple bits for concurrent deployments", function()
+      -- Two deployments both in STARTED state simultaneously
+      local dep1 = {bit = 1, start_time = 1000, timeout = 9999, min_activation_height = 0}
+      local dep2 = {bit = 3, start_time = 1000, timeout = 9999, min_activation_height = 0}
+      local net = make_net({dep1, dep2})
+
+      local blocks = {}
+      for h = 0, 9 do
+        blocks[h] = {timestamp = 1000, mtp = 1000, version = 0x20000000}
+      end
+      blocks[10] = {timestamp = 1100, mtp = 1100, version = 0x20000000}
+
+      local v = consensus.compute_block_version(net, 11, make_block_info(blocks))
+      -- Must signal bits 1 and 3
+      local expected = bit.bor(
+        consensus.VERSIONBITS_TOP_BITS,
+        bit.lshift(1, 1),
+        bit.lshift(1, 3))
+      assert.equals(expected, v)
+    end)
+
+    it("network without deployments key returns base version (all-buried network)", function()
+      -- Mainnet: all deployments are buried, no .deployments list on network
+      local mainnet = consensus.networks.mainnet
+      -- Must not error and must return a version with TOP_BITS set
+      local v = consensus.compute_block_version(mainnet, 100, function() return nil end)
+      -- Top 3 bits must equal VERSIONBITS_TOP_BITS
+      local top_mask = consensus.VERSIONBITS_TOP_MASK
+      assert.equals(consensus.VERSIONBITS_TOP_BITS, bit.band(v, top_mask))
+    end)
+  end)
+
   describe("checkpoint enforcement", function()
     local test_network
 
