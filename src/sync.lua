@@ -938,8 +938,16 @@ end
 
 --- Validate and accept a single header.
 -- @param header block_header: header to validate
+-- @param opts table|nil: options
+--   opts.min_pow_checked boolean: when true, the caller has already verified
+--     that the candidate chain has sufficient cumulative work (MinimumChainWork)
+--     via the PRESYNC/REDOWNLOAD pipeline.  When false (default), accept_header
+--     performs the check itself and rejects with "too-little-chainwork" when the
+--     candidate total_work would be below network.min_chain_work.
+--     Bitcoin Core: validation.cpp:4229 — "if (!min_pow_checked) return
+--     state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork")"
 -- @return boolean, string|nil: success flag, error message
-function HeaderChain:accept_header(header)
+function HeaderChain:accept_header(header, opts)
   -- 1. Compute the hash
   local hash = validation.compute_block_hash(header)
   local hash_hex = types.hash256_hex(hash)
@@ -1065,8 +1073,38 @@ function HeaderChain:accept_header(header)
     return false, fork_err
   end
 
-  -- 8. Accept the header
-  local work = parent.total_work + self:work_for_bits(header.bits)
+  -- 8. min_pow_checked gate (Bitcoin Core: validation.cpp:4229).
+  --    If the caller did not assert that the candidate chain has sufficient
+  --    cumulative work (i.e. PRESYNC/REDOWNLOAD has not already vetted it),
+  --    reject the header when its total_work would be below MinimumChainWork.
+  --    This is the anti-DoS guard that prevents a peer from spamming
+  --    low-difficulty headers that connect on top of our current tip but
+  --    represent a chain with less work than the mainnet minimum.
+  local candidate_work = parent.total_work + self:work_for_bits(header.bits)
+  local _opts = opts or {}
+  if not _opts.min_pow_checked then
+    local min_work_hex = self.network.min_chain_work or string.rep("00", 64)
+    local min_work = consensus.work_from_hex(min_work_hex)
+    -- Reuse get_chain_work() conversion: build a 32-byte big-endian
+    -- representation of candidate_work (float) for comparison.
+    local cw_bytes = {}
+    for i = 1, 32 do cw_bytes[i] = 0 end
+    local remaining = candidate_work
+    for i = 32, 1, -1 do
+      if remaining <= 0 then break end
+      cw_bytes[i] = math.floor(remaining % 256)
+      remaining = math.floor(remaining / 256)
+    end
+    local cw_str_parts = {}
+    for i = 1, 32 do cw_str_parts[i] = string.char(cw_bytes[i]) end
+    local candidate_work_bytes = table.concat(cw_str_parts)
+    if consensus.work_compare(candidate_work_bytes, min_work) < 0 then
+      return false, "too-little-chainwork"
+    end
+  end
+
+  -- 9. Accept the header
+  local work = candidate_work
   self.headers[hash_hex] = {
     header = header,
     height = height,
@@ -1403,11 +1441,13 @@ function HeaderChain:handle_headers(peer, payload)
       return -1, err
     end
 
-    -- Add accepted headers from REDOWNLOAD to our chain
+    -- Add accepted headers from REDOWNLOAD to our chain.
+    -- Pass min_pow_checked=true: PRESYNC/REDOWNLOAD has already verified that
+    -- this batch represents a chain with sufficient cumulative work.
     local accepted_count = 0
     if accepted_entries then
       for _, entry in ipairs(accepted_entries) do
-        local ok, accept_err = self:accept_header(entry.header)
+        local ok, accept_err = self:accept_header(entry.header, { min_pow_checked = true })
         if not ok then
           return accepted_count, accept_err
         end

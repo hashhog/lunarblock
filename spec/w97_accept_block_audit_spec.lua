@@ -328,33 +328,66 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
   -- to the block index.  Set by callers that are about to commit the
   -- header to memory (ProcessNewBlockHeaders, ProcessHeadersMessage).
   --
-  -- lunarblock BUG: src/sync.lua:1068-1080 stores the header in
-  -- self.headers + storage UNCONDITIONALLY after the timestamp and
-  -- difficulty gates pass.  There is no min_pow_checked argument, no
-  -- chainwork-threshold gate at accept_header, and no "too-little-chainwork"
-  -- error path.  The PRESYNC/REDOWNLOAD machinery (sync.lua HeadersSyncState
-  -- 121-) prevents low-work spam at the *batch* level by routing through
-  -- try_low_work_sync (sync.lua:1447), but a peer that connects on top of
-  -- our current tip with a small number of low-difficulty headers
-  -- bypasses HeadersSyncState entirely.
-  --
-  -- SEVERITY: DOS — single header at tip with sub-MinChainWork PoW is
-  -- accepted into the header index.  Real-world impact is bounded by the
-  -- regtest pow_limit_bits clamp; on mainnet the only path is short-fork
-  -- attacks.
+  -- Fixed (W97 G8): accept_header now accepts an opts.min_pow_checked
+  -- boolean.  When false (default), it checks candidate total_work against
+  -- network.min_chain_work and rejects with "too-little-chainwork" when
+  -- the chain falls below the threshold.  The REDOWNLOAD path in
+  -- handle_headers passes min_pow_checked=true because the PRESYNC batch
+  -- already verified sufficient work.  Raw P2P headers (process_headers)
+  -- use the default (false), so they are subject to the gate.
   ----------------------------------------------------------------
-  it("G8 BUG: accept_header has no min_pow_checked / 'too-little-chainwork' gate (DOS)", function()
-    -- Spec-encoding via source-grep: the canonical token "too-little-chainwork"
-    -- and the argument "min_pow_checked" must appear in any post-fix
-    -- implementation.  Today they do not.
-    local f = io.open("src/sync.lua", "r")
-    if f then
-      local src = f:read("*a"); f:close()
-      assert.is_nil(src:match("too%-little%-chainwork"),
-        "post-fix this must be is_not_nil")
-      assert.is_nil(src:match("min_pow_checked"),
-        "post-fix this must be is_not_nil")
+  describe("G8 min_pow_checked / too-little-chainwork gate (W97 G8 active)", function()
+    -- Build a network that looks like mainnet's high min_chain_work so a
+    -- fresh regtest header is always below the threshold.  We override
+    -- min_chain_work to the all-FF sentinel (maximum possible 256-bit value
+    -- expressed as a 64-hex-character string, i.e. 32 FF bytes = 64 chars).
+    local function new_high_min_work_chain()
+      local storage = helpers.mock_storage()
+      -- Clone regtest params and override min_chain_work to max.
+      local net = {}
+      for k, v in pairs(consensus.networks.regtest) do net[k] = v end
+      net.min_chain_work = string.rep("ff", 32)  -- 64-char hex = 2^256-1: nothing can pass
+      local chain = sync.new_header_chain(net, storage)
+      chain:init()
+      return chain
     end
+
+    it("rejects header when opts.min_pow_checked is nil (default) and chain work < min_chain_work", function()
+      local chain = new_high_min_work_chain()
+      local h = mine_header(chain:get_tip_hash())
+      -- No opts → min_pow_checked defaults to false → gate fires.
+      local ok, err = chain:accept_header(h)
+      assert.is_false(ok, "header should be rejected: chain work below min_chain_work")
+      assert.is_string(err)
+      assert.matches("too%-little%-chainwork", err)
+    end)
+
+    it("rejects header when opts.min_pow_checked = false and chain work < min_chain_work", function()
+      local chain = new_high_min_work_chain()
+      local h = mine_header(chain:get_tip_hash())
+      local ok, err = chain:accept_header(h, { min_pow_checked = false })
+      assert.is_false(ok)
+      assert.matches("too%-little%-chainwork", err)
+    end)
+
+    it("accepts header when opts.min_pow_checked = true (PRESYNC/REDOWNLOAD caller bypasses gate)", function()
+      local chain = new_high_min_work_chain()
+      local h = mine_header(chain:get_tip_hash())
+      -- Caller asserts it has already verified sufficient chainwork.
+      local ok, err = chain:accept_header(h, { min_pow_checked = true })
+      assert.is_true(ok, "min_pow_checked=true must bypass the too-little-chainwork gate: " .. tostring(err))
+      assert.is_nil(err)
+    end)
+
+    it("structural: 'too-little-chainwork' and 'min_pow_checked' appear in sync.lua (post-fix)", function()
+      local f = io.open("src/sync.lua", "r")
+      assert.is_not_nil(f, "src/sync.lua not found")
+      local src = f:read("*a"); f:close()
+      assert.is_not_nil(src:match("too%-little%-chainwork"),
+        "too-little-chainwork must be present post-fix")
+      assert.is_not_nil(src:match("min_pow_checked"),
+        "min_pow_checked must be present post-fix")
+    end)
   end)
 
   ----------------------------------------------------------------
@@ -1053,8 +1086,9 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
   ----------------------------------------------------------------
   -- Bonus sentinel: confirm the accept_header file-level structure.
   ----------------------------------------------------------------
-  it("structural sentinel: accept_header is defined in sync.lua:942", function()
+  it("structural sentinel: accept_header is defined in sync.lua (with opts parameter post-G8-fix)", function()
     local f = io.open("src/sync.lua", "r"):read("*a")
-    assert.is_not_nil(f:match("function HeaderChain:accept_header%(header%)"))
+    -- Signature updated to accept_header(header, opts) for the G8 min_pow_checked fix.
+    assert.is_not_nil(f:match("function HeaderChain:accept_header%(header, opts%)"))
   end)
 end)
