@@ -1554,6 +1554,10 @@ function M.new_chain_state(storage, network)
   -- today, only exercised by spec/txindex_spec.lua).  Inline wiring is
   -- the smallest correct fix per the 2026-05-05 audit.
   self.txindex_enabled = false
+  -- BUG-3 fix: track whether a snapshot has already been activated.
+  -- Core validation.cpp:5600-5601 stores m_from_snapshot_blockhash and
+  -- refuses a second ActivateSnapshot call.
+  self.from_snapshot_blockhash = nil
   -- BIP-157 Phase 2 (2026-05-07): inline block-filter index maintenance.
   -- Pattern C0 sibling for blockfilterindex.  When enabled, connect_block
   -- builds the BIP-158 basic GCS filter for the block (using the spent
@@ -4491,8 +4495,50 @@ end
 --                                  in HashWriter natural-LE order. When
 --                                  supplied, mirrors Core's loadtxoutset
 --                                  strict gate (validation.cpp:5904-5915).
+-- @param base_height number|nil: height of the snapshot base block; used for
+--                                the per-coin height guard (BUG-6 / Core:5814).
+--                                When nil, self.tip_height is used as a proxy.
+-- @param active_tip_height number|nil: tip height of the active (IBD) chainstate
+--                                      prior to snapshot load; used for the
+--                                      work-exceeds-active check (BUG-4 /
+--                                      Core:5706-5708).  When nil the check is
+--                                      skipped (safe for tests that call
+--                                      load_snapshot directly).
+-- @param mempool table|nil: mempool object with a size() method; when present
+--                           and non-empty the load is refused (BUG-5 /
+--                           Core:5627-5629).
 -- @return boolean, string|nil: success flag, error message
-function ChainState:load_snapshot(file_path, expected_hash)
+function ChainState:load_snapshot(file_path, expected_hash, base_height, active_tip_height, mempool)
+  -- BUG-3 fix: duplicate-activation guard.
+  -- Core validation.cpp:5600-5601: if m_from_snapshot_blockhash is already
+  -- set, refuse with "Can't activate a snapshot-based chainstate more than
+  -- once".
+  if self.from_snapshot_blockhash then
+    return false, "Can't activate a snapshot-based chainstate more than once"
+  end
+
+  -- BUG-4 fix: snapshot work must exceed active chainstate.
+  -- Core validation.cpp:5706-5708: refuse if the snapshot tip does not
+  -- represent more work than the current active chain tip.
+  -- lunarblock does not carry per-block chainwork; we use tip height as a
+  -- monotone proxy (same network, same difficulty — higher height ≡ more work).
+  -- Only apply when the active chain has progressed beyond genesis (height > 0);
+  -- loading a snapshot into a fresh node (active_tip_height <= 0) is the normal
+  -- AssumeUTXO fast-sync path and must not be rejected.
+  if active_tip_height ~= nil and active_tip_height > 0 then
+    local snap_height = base_height or (self.tip_height or -1)
+    if snap_height <= active_tip_height then
+      return false, "work does not exceed active chainstate"
+    end
+  end
+
+  -- BUG-5 fix: mempool must be empty before activating snapshot.
+  -- Core validation.cpp:5627-5629: "Can't activate a snapshot when mempool
+  -- not empty".
+  if mempool and type(mempool.size) == "function" and mempool:size() > 0 then
+    return false, "Can't activate a snapshot when mempool not empty"
+  end
+
   local file, err = io.open(file_path, "rb")
   if not file then
     return false, "failed to open snapshot: " .. (err or "unknown error")
@@ -4516,6 +4562,12 @@ function ChainState:load_snapshot(file_path, expected_hash)
     return false, "snapshot network magic mismatch"
   end
 
+  -- Resolve the effective base_height for per-coin validation.
+  -- Callers that know the exact snapshot height pass it; others fall back
+  -- to the chainstate's current tip height (the height the snapshot was
+  -- taken at, as set by the RPC layer before calling us).
+  local effective_base_height = base_height or (self.tip_height or 0)
+
   -- Clear in-memory cache; the underlying CF is left untouched and the
   -- caller is expected to feed a fresh chainstate (Core does the same).
   self.coin_view:clear_cache()
@@ -4529,17 +4581,45 @@ function ChainState:load_snapshot(file_path, expected_hash)
   local r = _file_reader(file)
 
   local ok_outer, parse_err = pcall(function()
-    while coins_loaded < coins_total do
+    local coins_left = coins_total
+
+    while coins_left > 0 do
       -- Per-txid header: raw 32-byte txid + CompactSize(coins_per_txid).
       local txid_bytes = r.read_bytes(32)
       local txid = types.hash256(txid_bytes)
-      local num_outputs = r.read_varint()  -- CompactSize, see WriteUTXOSnapshot
+      local coins_per_txid = r.read_varint()  -- CompactSize, see WriteUTXOSnapshot
 
-      for _ = 1, num_outputs do
+      -- BUG-8 fix: coins_per_txid > coins_left overflow guard.
+      -- Core validation.cpp:5804-5806: "Mismatch in coins count in snapshot
+      -- metadata and actual snapshot data".
+      if coins_per_txid > coins_left then
+        error("Mismatch in coins count in snapshot metadata and actual snapshot data")
+      end
+
+      for _ = 1, coins_per_txid do
         local vout = r.read_varint()  -- CompactSize for vout
         local entry = M.deserialize_snapshot_coin(r)
+
+        -- BUG-6 fix: per-coin height > base_height guard.
+        -- Core validation.cpp:5814-5819: "Bad snapshot data after deserializing
+        -- N coins" when coin.nHeight > base_height.
+        if entry.height > effective_base_height then
+          error(string.format(
+            "Bad snapshot data after deserializing %d coins", coins_loaded))
+        end
+
+        -- BUG-7 fix: per-coin MoneyRange validation.
+        -- Core validation.cpp:5820-5823: "Bad snapshot data after deserializing
+        -- N coins - bad tx out value".
+        if entry.value < 0 or entry.value > consensus.MAX_MONEY then
+          error(string.format(
+            "Bad snapshot data after deserializing %d coins - bad tx out value",
+            coins_loaded))
+        end
+
         self.coin_view:add(txid, vout, entry)
         coins_loaded = coins_loaded + 1
+        coins_left = coins_left - 1
 
         -- Periodic flush to keep the cache from running away on a 100M+
         -- UTXO load.
@@ -4548,6 +4628,20 @@ function ChainState:load_snapshot(file_path, expected_hash)
         end
       end
     end
+
+    -- BUG-9 fix: trailing-bytes EOF check.
+    -- Core validation.cpp:5872-5883: after reading all expected coins,
+    -- attempt to read one more byte; if it succeeds (no exception) then
+    -- there is leftover data → snapshot is corrupt.  _file_reader.read_bytes
+    -- throws on EOF (mirrors std::ios_base::failure), so a successful read
+    -- means extra data is present.
+    local trailing_ok, _ = pcall(r.read_bytes, 1)
+    if trailing_ok then
+      error(string.format(
+        "Bad snapshot - coins left over after deserializing %d coins",
+        coins_loaded))
+    end
+    -- EOF-throw is the expected success path; swallow it.
   end)
 
   file:close()
@@ -4584,6 +4678,10 @@ function ChainState:load_snapshot(file_path, expected_hash)
   -- Snapshot base block becomes the chainstate tip.  Height is filled in
   -- by the caller via assumeutxo lookup.
   self.tip_hash = metadata.base_blockhash
+
+  -- BUG-3 fix: record activation so a second call is refused.
+  -- Mirrors Core's m_from_snapshot_blockhash (validation.cpp:1872).
+  self.from_snapshot_blockhash = metadata.base_blockhash
 
   return true
 end

@@ -7354,7 +7354,12 @@ function RPCServer:register_methods()
           .. height_str .. ") - refusing to load snapshot"})
     end
 
-    local ok, lerr = rpc.chain_state:load_snapshot(path)
+    -- Pass au_height as base_height (BUG-6), the current IBD tip as
+    -- active_tip_height (BUG-4), and the mempool handle (BUG-5) so that
+    -- load_snapshot can enforce all Core precondition gates.
+    local active_tip = rpc.chain_state and rpc.chain_state.tip_height
+    local ok, lerr = rpc.chain_state:load_snapshot(
+      path, nil, au_height, active_tip, rpc.mempool)
     if not ok then
       error({code = M.ERROR.MISC_ERROR,
         message = lerr or "load failed"})
