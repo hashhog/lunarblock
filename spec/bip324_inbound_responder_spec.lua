@@ -90,33 +90,40 @@ describe("BIP-324 v2 inbound responder", function()
   end
 
   describe("bip324.looks_like_v1 classifier", function()
+    local mainnet_magic = "\xf9\xbe\xb4\xd9"
+
     it("recognizes a v1 mainnet version-message prefix", function()
-      local prefix = "\xf9\xbe\xb4\xd9" .. "version\0\0\0\0\0"
-      assert.is_true(bip324.looks_like_v1(prefix))
+      local prefix = mainnet_magic .. "version\0\0\0\0\0"
+      assert.is_true(bip324.looks_like_v1(prefix, mainnet_magic))
     end)
 
-    it("recognizes a v1 testnet/regtest version-message prefix", function()
-      -- Magic doesn't matter; only the command field is checked.
-      local prefix = "\xfa\xbf\xb5\xda" .. "version\0\0\0\0\0"
-      assert.is_true(bip324.looks_like_v1(prefix))
+    it("G13 FIXED: rejects wrong-magic + correct command field (cross-network peer)", function()
+      -- Before W98 G13 fix, magic was not checked; only the command field was
+      -- compared (bytes 5-16).  A peer on a different network sending
+      -- "version\0\0\0\0\0" would be misclassified as v1 on our network.
+      -- After the fix, all 16 bytes are compared — wrong magic → false.
+      local wrong_magic = "\xfa\xbf\xb5\xda"
+      local prefix = wrong_magic .. "version\0\0\0\0\0"
+      assert.is_false(bip324.looks_like_v1(prefix, mainnet_magic),
+        "G13 FIXED: cross-network peer with wrong magic must not be classified as v1")
     end)
 
     it("rejects a 64-byte ellswift pubkey (random non-version bytes)", function()
       -- Repeat: 8 bytes A8 + 8 bytes 5C ... — definitely not "version\0\0\0\0\0".
       local prefix = string.rep("\xa8", 8) .. string.rep("\x5c", 8)
-      assert.is_false(bip324.looks_like_v1(prefix))
+      assert.is_false(bip324.looks_like_v1(prefix, mainnet_magic))
     end)
 
     it("rejects a v1 prefix with the wrong command field", function()
       -- "verackXX..." is not "version\0\0\0\0\0".
-      local prefix = "\xf9\xbe\xb4\xd9" .. "verack\0\0\0\0\0\0"
-      assert.is_false(bip324.looks_like_v1(prefix))
+      local prefix = mainnet_magic .. "verack\0\0\0\0\0\0"
+      assert.is_false(bip324.looks_like_v1(prefix, mainnet_magic))
     end)
 
     it("returns false on too-short input", function()
-      assert.is_false(bip324.looks_like_v1(""))
-      assert.is_false(bip324.looks_like_v1("short"))
-      assert.is_false(bip324.looks_like_v1("0123456789abcde"))  -- 15 bytes
+      assert.is_false(bip324.looks_like_v1("", mainnet_magic))
+      assert.is_false(bip324.looks_like_v1("short", mainnet_magic))
+      assert.is_false(bip324.looks_like_v1("0123456789abcde", mainnet_magic))  -- 15 bytes
     end)
   end)
 
