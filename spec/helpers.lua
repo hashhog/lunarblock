@@ -216,6 +216,37 @@ function M.mock_storage()
     return serialize.deserialize_block(block_data)
   end
 
+  -- Mock write batch: no-op in-memory accumulator.
+  -- Required by new_chain_state → new_coin_view (coin_view._persistent_batch).
+  function storage.batch()
+    local pending = {}
+    local batch = {}
+    function batch.put(cf, key, value)
+      table.insert(pending, { op = "put", cf = cf, key = key, value = value })
+    end
+    function batch.delete(cf, key)
+      table.insert(pending, { op = "del", cf = cf, key = key })
+    end
+    function batch.write(sync)
+      -- Replay pending ops into the mock data store.
+      for _, op in ipairs(pending) do
+        if op.op == "put" then
+          storage.put(op.cf, op.key, op.value)
+        elseif op.op == "del" then
+          if data[op.cf] then data[op.cf][op.key] = nil end
+        end
+      end
+      pending = {}
+    end
+    function batch.clear()
+      pending = {}
+    end
+    function batch.destroy()
+      pending = {}
+    end
+    return batch
+  end
+
   return storage
 end
 
