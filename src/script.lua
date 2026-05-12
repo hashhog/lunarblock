@@ -771,6 +771,59 @@ function M.classify_script(script)
     end
   end
 
+  -- W96: Bare multisig detection (Core Solver TxoutType::MULTISIG in
+  -- script/solver.cpp:97-115).  A bare multisig is:
+  --   OP_m <pubkey>...<pubkey> OP_n OP_CHECKMULTISIG
+  -- where m is OP_1..OP_16, n is OP_1..OP_16, exactly n pubkeys (33 or 65
+  -- bytes each, push-only), 1 <= m <= n <= 3 for Core's IsStandard, but the
+  -- *classification* itself only requires 1 <= m <= n <= 16 — the n <= 3
+  -- check happens in IsStandard().  We follow the same split: classify any
+  -- syntactically-valid bare multisig as "multisig" and let the caller
+  -- enforce the IsStandard limit (n <= 3) and bare-multisig policy.
+  -- Returns ("multisig", "m_n") so callers know the m-of-n shape.
+  if len >= 4 then
+    local first = script:byte(1)
+    local last = script:byte(len)
+    if last == 0xae and first >= 0x51 and first <= 0x60 then
+      local m = first - 0x50
+      -- second-to-last byte must be OP_n
+      local n_op = script:byte(len - 1)
+      if n_op and n_op >= 0x51 and n_op <= 0x60 then
+        local n = n_op - 0x50
+        if m >= 1 and m <= n and n <= 16 then
+          -- Walk the n pubkey pushes from index 2 to len-2.
+          local j = 2
+          local pk_count = 0
+          local ok_parse = true
+          while j <= len - 2 do
+            local op = script:byte(j)
+            if op >= 0x01 and op <= 0x4b then
+              -- push of `op` bytes — must be a 33 or 65-byte pubkey
+              if op ~= 33 and op ~= 65 then ok_parse = false; break end
+              if j + op > len - 2 then ok_parse = false; break end
+              j = j + 1 + op
+              pk_count = pk_count + 1
+            elseif op == 0x4c then  -- OP_PUSHDATA1
+              if j + 1 > len - 2 then ok_parse = false; break end
+              local plen = script:byte(j + 1)
+              if plen ~= 33 and plen ~= 65 then ok_parse = false; break end
+              if j + 1 + plen > len - 2 then ok_parse = false; break end
+              j = j + 2 + plen
+              pk_count = pk_count + 1
+            else
+              ok_parse = false; break
+            end
+          end
+          if ok_parse and j == len - 1 and pk_count == n then
+            -- Pass m,n via the second return as a string "m_n" so callers can
+            -- check the n<=3 IsStandard gate without re-parsing.
+            return "multisig", string.format("%d_%d", m, n)
+          end
+        end
+      end
+    end
+  end
+
   return "nonstandard", nil
 end
 

@@ -1995,7 +1995,16 @@ function RPCServer:register_methods()
     assert(rpc.mempool, "Mempool not available")
     local ok, txid_hex = rpc.mempool:accept_transaction(tx)
     if not ok then
-      error({code = M.ERROR.VERIFY_REJECTED, message = txid_hex})
+      -- W96: route mempool reject reasons to canonical Core RPC error codes.
+      -- "txn-already-in-mempool" / "txn-same-nonwitness-data-in-mempool" →
+      -- VERIFY_ALREADY_IN_CHAIN (-27) per Bitcoin Core rpc/rawtransaction.cpp.
+      -- Other rejects remain VERIFY_REJECTED (-26).
+      local err_str = tostring(txid_hex or "")
+      if err_str:find("already", 1, true)
+         or err_str:find("same-nonwitness-data", 1, true) then
+        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN, message = err_str})
+      end
+      error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
     end
     -- Broadcast to peers
     if rpc.peer_manager then

@@ -248,6 +248,24 @@ M.TX_MAX_STANDARD_VERSION = 3
 -- Maximum scriptSig size for a standard input (Bitcoin Core policy/policy.h:62).
 M.MAX_STANDARD_SCRIPTSIG_SIZE = 1650
 
+-- W96: permit_bare_multisig policy flag (Core policy/policy.cpp:152-154
+-- + kernel/mempool_options.h DEFAULT_PERMIT_BAREMULTISIG).
+-- Core flipped this default from true → false in v28 (commit 8ee7773d).
+-- When false, IsStandardTx rejects bare-multisig outputs with reason
+-- "bare-multisig" even if 1 <= m <= n <= 3.
+M.PERMIT_BARE_MULTISIG = false
+
+-- W96: legacy (non-witness) sigops cap per transaction (BIP-54 +
+-- Core policy.h MAX_TX_LEGACY_SIGOPS).  Enforced by ValidateInputsStandardness
+-- via CheckSigopsBIP54 at relay time.  Reference:
+-- bitcoin-core/src/policy/policy.cpp:170-194 + policy.h MAX_TX_LEGACY_SIGOPS=2500.
+M.MAX_TX_LEGACY_SIGOPS = 2500
+
+-- W96: P2SH redeemScript sigops cap (Core policy.h MAX_P2SH_SIGOPS = 15).
+-- Enforced by ValidateInputsStandardness on TxoutType::SCRIPTHASH inputs
+-- at relay time.  policy.cpp:255-257.
+M.MAX_P2SH_SIGOPS = 15
+
 -- Dust relay fee rate used for GetDustThreshold (Core policy/policy.h:68).
 -- Units: satoshis per kilobyte.  Default: 3000 sat/kvB.
 M.DUST_RELAY_FEE_RATE = 3000
@@ -494,6 +512,93 @@ end
 --                when inputs are missing (we skip nil entries for safety).
 -- @return boolean, string: true if standard; false + reason string if not.
 -- Reference: Bitcoin Core policy/policy.cpp:265-352.
+
+--- W96: ValidateInputsStandardness — relay-time input-standardness gate.
+--
+-- Mirrors Bitcoin Core's `ValidateInputsStandardness` (policy/policy.cpp:214-263).
+-- For each non-witness input, classifies the prev scriptPubKey and rejects:
+--   • Unknown / non-standard scriptPubKey ("bad-txns-nonstandard-inputs").
+--   • Unknown segwit version (WITNESS_UNKNOWN) — relay-time gate to keep
+--     forward-compat segwit versions reserved.
+--   • P2SH redeem-script sigop count > MAX_P2SH_SIGOPS (15).
+--
+-- Also runs CheckSigopsBIP54 (policy.cpp:170-194) to cap total non-witness
+-- sigops at MAX_TX_LEGACY_SIGOPS (2500) — this is BIP-54 standardness, not
+-- consensus.
+--
+-- Coinbase is exempt — caller must not call this for coinbase.
+--
+-- @param tx     transaction: the transaction
+-- @param utxos  table[i] = resolved {script_pubkey, ...} for each input 1..N
+-- @return ok, reason
+function M.validate_inputs_standardness(tx, utxos)
+  -- Gate A (BIP-54): cap legacy non-witness sigops per tx.
+  -- Core CheckSigopsBIP54 (policy.cpp:170-194).  Counts scriptSig sigops
+  -- (fAccurate=true) + prev scriptPubKey sigops (which counts both bare
+  -- and P2SH-redeem sigops via GetSigOpCount(scriptSig)).
+  do
+    local sigops = 0
+    for i, inp in ipairs(tx.inputs) do
+      local utxo = utxos[i]
+      if utxo then
+        local ss = inp.script_sig or ""
+        local prev = utxo.script_pubkey or ""
+        -- scriptSig accurate sigop count (fAccurate=true).
+        sigops = sigops + (validation.count_script_sigops(ss, true) or 0)
+        -- prev scriptPubKey: bare CHECKSIG sigops + P2SH-redeem sigops.
+        sigops = sigops + (validation.count_script_sigops(prev, false) or 0)
+        if script_mod.classify_script(prev) == "p2sh" then
+          local redeem = validation.extract_p2sh_redeem_script(ss)
+          if redeem then
+            sigops = sigops + (validation.count_script_sigops(redeem, true) or 0)
+          end
+        end
+        if sigops > M.MAX_TX_LEGACY_SIGOPS then
+          return false,
+            "bad-txns-nonstandard-inputs: non-witness sigops exceed bip54 limit"
+        end
+      end
+    end
+  end
+
+  -- Gate B: per-input prev scriptPubKey type + P2SH redeem-sigops cap.
+  for i, inp in ipairs(tx.inputs) do
+    local utxo = utxos[i]
+    if utxo then
+      local prev = utxo.script_pubkey or ""
+      local script_type = script_mod.classify_script(prev)
+      if script_type == "nonstandard" then
+        return false,
+          string.format("bad-txns-nonstandard-inputs: input %d script unknown", i - 1)
+      elseif script_type == "witness_unknown" then
+        return false,
+          string.format("bad-txns-nonstandard-inputs: input %d witness program is undefined", i - 1)
+      elseif script_type == "p2sh" then
+        local ss = inp.script_sig or ""
+        local redeem = validation.extract_p2sh_redeem_script(ss)
+        if not redeem or #redeem == 0 then
+          -- empty scriptSig → either malformed or missing redeem; mirror Core
+          -- distinction by checking whether scriptSig is push-only.
+          if #ss == 0 or not script_mod.is_push_only(ss) then
+            return false, string.format(
+              "bad-txns-nonstandard-inputs: p2sh scriptsig malformed (input %d)", i - 1)
+          end
+          return false, string.format(
+            "bad-txns-nonstandard-inputs: input %d P2SH redeemscript missing", i - 1)
+        end
+        local sigop_count = validation.count_script_sigops(redeem, true) or 0
+        if sigop_count > M.MAX_P2SH_SIGOPS then
+          return false, string.format(
+            "bad-txns-nonstandard-inputs: p2sh redeemscript sigops exceed limit (input %d: %d > %d)",
+            i - 1, sigop_count, M.MAX_P2SH_SIGOPS)
+        end
+      end
+    end
+  end
+
+  return true, nil
+end
+
 function M.is_witness_standard(tx, utxos)
   for i, inp in ipairs(tx.inputs) do
     -- Skip inputs with no witness data (Core: "We don't care if witness for
@@ -765,6 +870,19 @@ function M.new(chain_state, config)
   self.outpoint_to_tx = {}    -- outpoint_key -> txid_hex (tracks which tx spends each output)
   self.total_size = 0          -- Current memory usage estimate
   self.tx_count = 0
+  -- W96: PolicyScriptChecks/ConsensusScriptChecks gate.
+  -- When true, accept_transaction runs script-verify for each input prev script
+  -- before adding the tx to the mempool (Core validation.cpp:1135-1157 +
+  -- 1158-1190).  Default OFF to preserve backward compatibility with existing
+  -- test fixtures that use mock scripts.  Production callers (peer_manager,
+  -- sendrawtransaction handler) should pass {verify_input_scripts=true} to
+  -- match Core's relay behaviour.
+  self.verify_input_scripts = (config and config.verify_input_scripts) == true
+  -- Optional caller-supplied max feerate cap (Core ATMPArgs::m_client_maxfeerate,
+  -- validation.cpp:1368-1371).  When set, the modified-feerate must not exceed
+  -- this value; otherwise the tx is rejected with "max-fee-exceeded".  Units:
+  -- satoshis per virtual kilobyte (sat/kvB).
+  self.client_max_feerate_kvb = (config and config.client_max_feerate_kvb) or nil
   -- Rolling minimum fee state (txmempool.h:195-197, txmempool.cpp:829-859).
   -- Tracks the minimum feerate that can enter the mempool after evictions.
   -- Decays exponentially over time (ROLLING_FEE_HALFLIFE = 43200s).
@@ -794,9 +912,21 @@ function Mempool:accept_transaction(tx, allow_rbf)
   local txid = validation.compute_txid(tx)
   local txid_hex = types.hash256_hex(txid)
 
-  -- 1. Check if we already have this transaction
-  if self.entries[txid_hex] then
-    return false, "tx already in mempool"
+  -- 1. Check if we already have this transaction.
+  -- Core distinguishes two cases (validation.cpp:823-830):
+  --   (a) exact wtxid match → "txn-already-in-mempool"
+  --   (b) same txid, different witness → "txn-same-nonwitness-data-in-mempool"
+  -- We mirror that distinction so callers (RPC, P2P) can route accordingly.
+  local existing = self.entries[txid_hex]
+  if existing then
+    local incoming_wtxid = validation.compute_wtxid(tx)
+    local existing_wtxid_hex = existing.wtxid and types.hash256_hex(existing.wtxid) or nil
+    local incoming_wtxid_hex = types.hash256_hex(incoming_wtxid)
+    if existing_wtxid_hex == incoming_wtxid_hex then
+      return false, "txn-already-in-mempool"
+    else
+      return false, "txn-same-nonwitness-data-in-mempool"
+    end
   end
 
   -- 2. Basic structure validation
@@ -864,7 +994,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
   -- Reference: Bitcoin Core IsStandard() + IsStandardTx() loop, policy.cpp:80-155.
   local datacarrier_bytes_left = M.MAX_OP_RETURN_RELAY
   for _, out in ipairs(tx.outputs) do
-    local script_type = script_mod.classify_script(out.script_pubkey)
+    local script_type, type_meta = script_mod.classify_script(out.script_pubkey)
     if script_type == "nonstandard" then
       return false, "scriptpubkey"
     end
@@ -874,6 +1004,27 @@ function Mempool:accept_transaction(tx, allow_rbf)
         return false, "datacarrier"
       end
       datacarrier_bytes_left = datacarrier_bytes_left - script_size
+    elseif script_type == "multisig" then
+      -- W96: IsStandard rejects bare multisig with n > 3 (Core script/solver
+      -- IsStandard, policy.cpp:140-141 via Solver TxoutType::MULTISIG).
+      -- Reason string "scriptpubkey" matches Core (it falls through the same
+      -- IsStandard() == false path).
+      -- Additionally, if permit_bare_multisig is false, reject any bare
+      -- multisig with reason "bare-multisig" (Core policy.cpp:152-154).
+      -- We expose the policy flag via M.PERMIT_BARE_MULTISIG (default false
+      -- to match Core's `-permitbaremultisig=0` since v28).
+      local m, n = 0, 0
+      if type(type_meta) == "string" then
+        local m_s, n_s = type_meta:match("^(%d+)_(%d+)$")
+        m = tonumber(m_s or "") or 0
+        n = tonumber(n_s or "") or 0
+      end
+      if n < 1 or n > 3 or m < 1 or m > n then
+        return false, "scriptpubkey"
+      end
+      if not M.PERMIT_BARE_MULTISIG then
+        return false, "bare-multisig"
+      end
     end
   end
 
@@ -897,12 +1048,21 @@ function Mempool:accept_transaction(tx, allow_rbf)
                           or script_type == "p2tr" or script_type == "p2a")
       if is_witness then
         -- 32(prev_hash) + 4(prev_index) + 1(script_sig_len) + (107/4)(witness) + 4(sequence)
-        nSize = nSize + 32 + 4 + 1 + 27 + 4  -- = 68 (Core uses 98 for P2WPKH total)
+        -- W96 fix: 107/4 = 26 (integer division), not 27.  Bitcoin Core
+        -- policy.cpp:58 uses `(107 / WITNESS_SCALE_FACTOR)` which is C++ int
+        -- division → 26.  Previously lunarblock added 27, computing dust
+        -- thresholds 1 byte too large (~0.3% over-strict relay).
+        nSize = nSize + 32 + 4 + 1 + 26 + 4  -- = 67 (Core uses 98 for P2WPKH total)
       else
         -- 32(prev_hash) + 4(prev_index) + 1(script_sig_len) + 107(script_sig) + 4(sequence)
         nSize = nSize + 32 + 4 + 1 + 107 + 4  -- = 148 (Core uses 182 for P2PKH total)
       end
-      local dust_threshold = math.floor(M.DUST_RELAY_FEE_RATE * nSize / 1000)
+      -- W96 fix: Core CFeeRate::GetFee uses EvaluateFeeUp (CEIL division), not
+      -- floor.  For the default 3000 sat/kvB this happens to be a no-op
+      -- (3000*nSize % 1000 == 0), but for any other configured dust rate the
+      -- two diverge.  Use ceil for parity.  policy/feerate.cpp:20-26 +
+      -- util/feefrac.h:202-218 (EvaluateFee<false> = round-up).
+      local dust_threshold = math.ceil(M.DUST_RELAY_FEE_RATE * nSize / 1000)
       if out.value < dust_threshold then
         dust_count = dust_count + 1
       end
@@ -986,7 +1146,22 @@ function Mempool:accept_transaction(tx, allow_rbf)
   end
 
   if missing_inputs then
-    return false, "missing inputs"
+    -- W96: Core distinguishes two missing-inputs cases (validation.cpp:858-867):
+    --   (a) any output of THIS tx is already in the coins cache → "txn-already-known"
+    --       (we likely already accepted this tx into a block)
+    --   (b) otherwise → "bad-txns-inputs-missingorspent" (real orphan)
+    -- We approximate (a) by probing the coin_view for THIS tx's outputs.
+    -- Reference: bitcoin-core/src/validation.cpp:858-867.
+    local txid_bytes_hash = txid  -- hash256 type
+    if self.chain_state.coin_view and self.chain_state.coin_view.get then
+      for out_idx = 0, #tx.outputs - 1 do
+        local own = self.chain_state.coin_view:get(txid_bytes_hash, out_idx)
+        if own then
+          return false, "txn-already-known"
+        end
+      end
+    end
+    return false, "bad-txns-inputs-missingorspent"
   end
 
   -- 3c. IsWitnessStandard (Bitcoin Core policy/policy.cpp:265-352).
@@ -997,6 +1172,20 @@ function Mempool:accept_transaction(tx, allow_rbf)
   local wit_ok, wit_err = M.is_witness_standard(tx, resolved_utxos)
   if not wit_ok then
     return false, wit_err
+  end
+
+  -- 3c2. W96: ValidateInputsStandardness (Core policy/policy.cpp:214-263).
+  -- For each non-witness input, classify the prev scriptPubKey and reject:
+  --   • NONSTANDARD prev scriptPubKey (with input index).
+  --   • WITNESS_UNKNOWN (forward-compat segwit version with no relay support).
+  --   • P2SH redeem-script with > MAX_P2SH_SIGOPS (15) sigops.
+  -- Also runs CheckSigopsBIP54 to cap total non-witness sigops at
+  -- MAX_TX_LEGACY_SIGOPS (2500) — a separate BIP-54 standardness gate.
+  do
+    local inp_std_ok, inp_std_err = M.validate_inputs_standardness(tx, resolved_utxos)
+    if not inp_std_ok then
+      return false, inp_std_err
+    end
   end
 
   -- 3d. Sigop cost gate (Bitcoin Core validation.cpp:908,941-943).
@@ -1310,6 +1499,97 @@ function Mempool:accept_transaction(tx, allow_rbf)
     end
   end
 
+  -- 8d. W96: client_max_feerate gate (Core validation.cpp:1368-1371).
+  -- When the caller (e.g. RPC sendrawtransaction with `maxfeerate`) supplied
+  -- a maximum feerate, abort if this tx's modified feerate exceeds it.  Units
+  -- match the gate above (sat/kvB).  This is per-Mempool config, evaluated
+  -- against the freshly-computed fee_rate_per_kb.
+  if self.client_max_feerate_kvb
+     and fee_rate_per_kb > self.client_max_feerate_kvb then
+    return false, string.format(
+      "max-fee-exceeded: feerate %.2f > %.2f sat/kvB",
+      fee_rate_per_kb, self.client_max_feerate_kvb)
+  end
+
+  -- 8e. W96: PolicyScriptChecks (Core validation.cpp:1135-1157).
+  -- Run input-script verification against STANDARD_SCRIPT_VERIFY_FLAGS so that
+  -- bad signatures, malformed scripts, and policy violations are caught at
+  -- relay time and not just at block-connect time.  This is the equivalent of
+  -- Core's CheckInputScripts call with cacheSigStore=true, cacheFullScriptStore=
+  -- false — the policy pass.  Gated by self.verify_input_scripts so existing
+  -- test fixtures (which use mock scripts) keep passing.
+  --
+  -- Coverage:
+  --   • Legacy + P2SH: full verify_script with verify_p2sh + verify_dersig +
+  --     verify_nulldummy + verify_checklocktimeverify + verify_checksequenceverify
+  --     + verify_low_s + verify_strictenc + verify_minimaldata.
+  --   • Witness paths (P2WPKH/P2WSH/P2TR): require the full segwit/taproot
+  --     verifier stack used by ConnectBlock.  Building that here is non-trivial
+  --     and would duplicate ~400 lines from utxo.lua; we leave witness
+  --     verification to block-connect for now and only verify the non-witness
+  --     side at relay.  This is policy-only (consensus rules are still
+  --     enforced at block-connect), but does mean signature-bad witness txs
+  --     can sit in the mempool until they get mined and rejected.  TODO:
+  --     factor utxo.lua's per-input verifier into a reusable helper and call
+  --     it here.
+  if self.verify_input_scripts then
+    local script_flags = {
+      verify_p2sh = true,
+      verify_dersig = true,
+      verify_strictenc = true,
+      verify_low_s = true,
+      verify_nulldummy = true,
+      verify_sigpushonly = true,
+      verify_minimaldata = true,
+      verify_discourage_upgradable_nops = true,
+      verify_cleanstack = true,
+      verify_checklocktimeverify = true,
+      verify_checksequenceverify = true,
+      verify_witness = true,
+      verify_nullfail = true,
+      verify_witness_pubkeytype = true,
+      verify_const_scriptcode = true,
+    }
+    for i, inp in ipairs(tx.inputs) do
+      local utxo = resolved_utxos[i]
+      if utxo and validation.make_sig_checker then
+        local script_type = script_mod.classify_script(utxo.script_pubkey)
+        -- Only verify non-witness paths here.  Witness paths require the
+        -- per-witness execution machinery in utxo.lua (~400 lines); they are
+        -- still validated at block-connect.  This is policy-only — consensus
+        -- rules continue to be enforced at block validation.
+        local is_witness_path = (script_type == "p2wpkh"
+                                  or script_type == "p2wsh"
+                                  or script_type == "p2tr"
+                                  or script_type == "p2a")
+        if not is_witness_path then
+          local ok_c, checker = pcall(validation.make_sig_checker,
+            tx, i - 1, utxo.value, utxo.script_pubkey, script_flags, nil)
+          if ok_c then
+            -- verify_script returns:
+            --   (true)            on success
+            --   (false)           on script eval returning empty/false stack
+            --   (nil, err_string) on hard script error
+            -- We need to handle all three.  pcall adds a leading bool for the
+            -- pcall outcome itself, so successful pcall + true = pass.
+            local ok_p, r1, r2 = pcall(script_mod.verify_script,
+              inp.script_sig or "", utxo.script_pubkey, script_flags, checker)
+            if not ok_p then
+              return false, string.format(
+                "mandatory-script-verify-flag-failed (input %d: %s)",
+                i - 1, tostring(r1))
+            end
+            if r1 == nil or r1 == false then
+              return false, string.format(
+                "mandatory-script-verify-flag-failed (input %d: %s)",
+                i - 1, tostring(r2 or "script eval"))
+            end
+          end
+        end
+      end
+    end
+  end
+
   -- 9. Add to mempool
   local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time())
   entry.ancestor_count = ancestor_count - 1  -- exclude self
@@ -1380,26 +1660,62 @@ end
 
 --- AcceptToMemoryPool — main entry point matching Bitcoin Core's AcceptToMemoryPool.
 -- Validates and adds a transaction to the mempool with full RBF support.
+--
+-- When `test_accept` is true (Core's `m_test_accept`, validation.cpp:1388),
+-- we run the FULL acceptance pipeline (PreChecks + Policy/ConsensusScriptChecks)
+-- but roll back any state changes so the mempool is unchanged.  The previous
+-- shim short-circuited and returned `accepted=true` for any non-duplicate tx,
+-- which silently accepted invalid txs (missing inputs, oversize, dust, etc.).
+-- Reference: bitcoin-core/src/validation.cpp:1386-1391.
+--
 -- @param tx transaction: The transaction to validate and add
 -- @param test_accept boolean: When true, validate only without adding (default false)
 -- @return table: Result with fields: accepted, txid, fee, vsize, reject_reason
 function Mempool:accept_to_memory_pool(tx, test_accept)
   if test_accept then
-    -- Dry-run: check basic structure and standardness without modifying state
-    local txid = validation.compute_txid(tx)
-    local txid_hex = types.hash256_hex(txid)
-    if self.entries[txid_hex] then
+    -- W96 fix: run full validation, then roll back if accepted.  This mirrors
+    -- Core's behaviour where m_test_accept causes early-return after
+    -- PolicyScriptChecks/ConsensusScriptChecks pass but before FinalizeSubpackage.
+    -- We can't easily reproduce Core's changeset model in pure Lua, so we
+    -- accept via accept_transaction (which adds the entry) and then immediately
+    -- remove it.  Any side-effect on the rolling-fee state would be incorrect
+    -- but the test_accept path is not supposed to affect mempool state, so we
+    -- also snapshot/restore the rolling-fee fields.
+    local saved_rolling = self.rolling_minimum_fee_rate
+    local saved_last_update = self.last_rolling_fee_update
+    local saved_since_bump = self.block_since_last_rolling_fee_bump
+
+    local ok, txid_hex_or_err, fee = self:accept_transaction(tx)
+    if ok then
+      -- Snapshot vsize before we wipe the entry.
+      local entry = self.entries[txid_hex_or_err]
+      local vsize = (entry and entry.vsize) or 0
+      -- Roll back: drop the entry without bumping rolling-fee state.
+      self:remove_transaction(txid_hex_or_err, "test-accept")
+      -- Restore rolling-fee state so test_accept is side-effect-free.
+      self.rolling_minimum_fee_rate = saved_rolling
+      self.last_rolling_fee_update = saved_last_update
+      self.block_since_last_rolling_fee_bump = saved_since_bump
       return {
-        accepted = false, txid = txid_hex, fee = 0, vsize = 0,
-        reject_reason = "txn-already-in-mempool",
+        accepted = true,
+        txid = txid_hex_or_err,
+        fee = fee or 0,
+        vsize = vsize,
+        reject_reason = nil,
+      }
+    else
+      -- Restore rolling-fee state in case any rejection path mutated it.
+      self.rolling_minimum_fee_rate = saved_rolling
+      self.last_rolling_fee_update = saved_last_update
+      self.block_since_last_rolling_fee_bump = saved_since_bump
+      return {
+        accepted = false,
+        txid = nil,
+        fee = 0,
+        vsize = 0,
+        reject_reason = txid_hex_or_err,
       }
     end
-    -- For test_accept, we attempt a full accept_transaction check
-    -- Since we can't easily roll back, just do basic checks
-    return {
-      accepted = true, txid = txid_hex, fee = 0, vsize = 0,
-      reject_reason = nil,
-    }
   end
 
   local ok, txid_hex_or_err, fee = self:accept_transaction(tx)

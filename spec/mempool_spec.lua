@@ -51,12 +51,19 @@ describe("mempool", function()
     }
   end
 
-  -- Helper to add UTXO to mock chain state
+  -- Helper to add UTXO to mock chain state.
+  -- W96: the default script_pubkey was `string.rep("\x00", 25)` which is
+  -- classified as "nonstandard" — that was historically OK because lunarblock
+  -- never ran ValidateInputsStandardness at relay time, so the type of the
+  -- prev scriptPubKey was ignored.  After W96 the relay path now checks input
+  -- standardness (matching Core policy.cpp:214-263), so we default to a valid
+  -- P2PKH prev scriptPubKey here to keep mock UTXOs accept-eligible.
   local function add_utxo(chain_state, txid_hex, vout, value, script_pubkey, height, is_coinbase)
     local key = txid_hex .. ":" .. vout
+    local default_p2pkh = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
     chain_state.coin_view.utxos[key] = {
       value = value,
-      script_pubkey = script_pubkey or string.rep("\x00", 25),
+      script_pubkey = script_pubkey or default_p2pkh,
       height = height or 500000,
       is_coinbase = is_coinbase or false
     }
@@ -163,7 +170,11 @@ describe("mempool", function()
       local ok, err = mp:accept_transaction(tx)
 
       assert.is_false(ok)
-      assert.equal("tx already in mempool", err)
+      -- W96: error message now matches Core's "txn-already-in-mempool" (exact
+      -- wtxid match) instead of the lunarblock-specific "tx already in mempool".
+      -- validation.cpp:823-830 distinguishes this from "txn-same-nonwitness-
+      -- data-in-mempool" (same txid, different wtxid).
+      assert.equal("txn-already-in-mempool", err)
     end)
 
     it("rejects coinbase transaction", function()
@@ -195,7 +206,10 @@ describe("mempool", function()
 
       local ok, err = mp:accept_transaction(tx)
       assert.is_false(ok)
-      assert.equal("missing inputs", err)
+      -- W96: error reason now matches Core's canonical
+      -- "bad-txns-inputs-missingorspent" (validation.cpp:866) instead of
+      -- the lunarblock-specific "missing inputs".
+      assert.equal("bad-txns-inputs-missingorspent", err)
     end)
 
     it("rejects transaction with fee rate below minimum", function()
@@ -2691,6 +2705,335 @@ describe("mempool", function()
       assert.equal(2,     mempool.TRUC_DESCENDANT_LIMIT)
       assert.equal(10000, mempool.TRUC_MAX_VSIZE)
       assert.equal(1000,  mempool.TRUC_CHILD_MAX_VSIZE)
+    end)
+  end)
+
+  --------------------------------------------------------------------------
+  -- W96: AcceptToMemoryPool end-to-end gate tests
+  -- Reference: bitcoin-core/src/validation.cpp PreChecks (:782-983),
+  --            ReplacementChecks (:984-1036), PolicyScriptChecks (:1135-1157),
+  --            ConsensusScriptChecks (:1158-1190),
+  --            AcceptSingleTransactionInternal (:1317-1431).
+  --------------------------------------------------------------------------
+  describe("W96 AcceptToMemoryPool gates", function()
+
+    -- W96 Bug 1: test_accept dry-run was a no-op that returned accepted=true
+    -- for any non-duplicate tx (including invalid ones like missing inputs,
+    -- coinbase, oversize, etc).  Now it runs the full pipeline and rolls back.
+    describe("test_accept dry-run", function()
+      it("rejects coinbase via accept_to_memory_pool(test_accept=true)", function()
+        local chain_state = make_mock_chain_state()
+        local mp = mempool.new(chain_state)
+        local coinbase = make_tx(1, {}, {}, 0)
+        coinbase.inputs[1] = types.txin(
+          types.outpoint(types.hash256_zero(), 0xFFFFFFFF),
+          "\x03\x01\x02\x03",
+          0xFFFFFFFF
+        )
+        coinbase.outputs[1] = make_output(5000000000)
+
+        local res = mp:accept_to_memory_pool(coinbase, true)
+        assert.is_false(res.accepted)
+        assert.is_string(res.reject_reason)
+      end)
+
+      it("rejects missing inputs via test_accept", function()
+        local chain_state = make_mock_chain_state()
+        local mp = mempool.new(chain_state)
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(types.hash256(string.rep("\x99", 32)), 0)
+        tx.outputs[1] = make_output(50000)
+
+        local res = mp:accept_to_memory_pool(tx, true)
+        assert.is_false(res.accepted)
+        -- Should now match Core's canonical reason.
+        assert.equal("bad-txns-inputs-missingorspent", res.reject_reason)
+      end)
+
+      it("does not mutate mempool state on dry-run accept", function()
+        local prev_txid = types.hash256(string.rep("\xa1", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state)
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = make_output(90000)
+
+        local res = mp:accept_to_memory_pool(tx, true)
+        assert.is_true(res.accepted)
+        -- Mempool state must be unchanged.
+        assert.equal(0, mp.tx_count)
+        assert.equal(0, mp.total_size)
+      end)
+    end)
+
+    -- W96 Bug 2: duplicate detection now distinguishes wtxid match vs
+    -- txid-only match (Core validation.cpp:823-830).
+    describe("duplicate detection (wtxid vs txid)", function()
+      it("returns txn-already-in-mempool on exact wtxid duplicate", function()
+        local prev_txid = types.hash256(string.rep("\xb1", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state)
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = make_output(90000)
+
+        mp:accept_transaction(tx)
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.equal("txn-already-in-mempool", err)
+      end)
+    end)
+
+    -- W96 Bug 6: ValidateInputsStandardness (Core policy.cpp:214-263).
+    -- Per-input prev scriptPubKey must be a known TxoutType and a P2SH redeem
+    -- script must have at most MAX_P2SH_SIGOPS sigops.
+    describe("ValidateInputsStandardness", function()
+      it("rejects input spending non-standard prev script", function()
+        local prev_txid = types.hash256(string.rep("\xc1", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        -- 25 bytes of OP_DROP — NONSTANDARD
+        local nonstd = string.rep("\x75", 25)
+        add_utxo(chain_state, prev_txid_hex, 0, 100000, nonstd)
+        local mp = mempool.new(chain_state)
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = make_output(90000)
+
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.truthy(err:match("bad%-txns%-nonstandard%-inputs"))
+      end)
+    end)
+
+    -- W96 Bug 7: dust witness path off-by-one (107/4 = 26, not 27).
+    -- Default dust rate 3000 sat/kvB makes this a no-op (3000%1000==0), so we
+    -- exercise the helper directly via classify_script + the witness branch
+    -- by checking the boundary explicitly.  The test pins the formula so a
+    -- future regression bumping `26` back to `27` breaks here.
+    describe("dust threshold witness path", function()
+      it("uses (107/4)=26 not 27 bytes for the witness-input estimate", function()
+        -- Compute the threshold for a 22-byte P2WPKH scriptPubKey at the
+        -- default dust rate (3000 sat/kvB).
+        -- Core: nSize = 31 (8+1+22) + 32 + 4 + 1 + 26 + 4 = 98 → 294 sat.
+        -- Pre-W96: nSize = 31 + 32 + 4 + 1 + 27 + 4 = 99 → 297 sat (over-strict).
+        local p2wpkh = "\x00\x14" .. string.rep("\x00", 20)
+        -- Build a tx whose ONLY output is a 294-sat P2WPKH (Core-exact dust
+        -- threshold).  Pre-fix this would be rejected as dust (297 > 294);
+        -- post-fix it's exactly the threshold and accepted.
+        local prev_txid = types.hash256(string.rep("\xd1", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state)
+
+        local tx = make_tx(2, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = types.txout(294, p2wpkh)  -- exact threshold
+        -- second non-dust output absorbs the rest so the tx isn't all-dust.
+        tx.outputs[2] = make_output(89706)  -- 100000 - 294 = 99706, fee=10000
+
+        local ok, err = mp:accept_transaction(tx)
+        -- The output at 294 sat must satisfy the Core dust threshold (not be
+        -- rejected as dust at 297).  Either accept or fail for some other
+        -- reason — but NOT "dust".
+        if not ok then
+          assert.is_nil(err:find("dust"))
+        end
+      end)
+    end)
+
+    -- W96 Bug 8: bare-multisig detection + permit_bare_multisig=false default.
+    describe("bare multisig detection", function()
+      it("classify_script recognises a 1-of-1 bare multisig", function()
+        -- OP_1 <33-byte pubkey> OP_1 OP_CHECKMULTISIG
+        local pk = string.rep("\x02", 33)
+        local ms = "\x51\x21" .. pk .. "\x51\xae"
+        local t, meta = script.classify_script(ms)
+        assert.equal("multisig", t)
+        assert.equal("1_1", meta)
+      end)
+
+      it("rejects bare multisig output when permit_bare_multisig=false", function()
+        local prev_txid = types.hash256(string.rep("\xe1", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state)
+
+        local pk = string.rep("\x02", 33)
+        local ms = "\x51\x21" .. pk .. "\x51\xae"  -- 1-of-1
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = types.txout(89000, ms)
+
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.equal("bare-multisig", err)
+      end)
+
+      it("rejects bare multisig output with n > 3 as scriptpubkey", function()
+        -- 1-of-4 bare multisig — Core IsStandard rejects with TxoutType cap n<=3.
+        local prev_txid = types.hash256(string.rep("\xe2", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state)
+
+        local pk = string.rep("\x02", 33)
+        -- OP_1 <pk><pk><pk><pk> OP_4 OP_CHECKMULTISIG
+        local ms = "\x51" .. ("\x21" .. pk):rep(4) .. "\x54\xae"
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = types.txout(89000, ms)
+
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.equal("scriptpubkey", err)
+      end)
+    end)
+
+    -- W96 Bug 10: client_max_feerate gate (Core validation.cpp:1368-1371).
+    describe("client_max_feerate", function()
+      it("rejects when fee rate exceeds caller's cap", function()
+        local prev_txid = types.hash256(string.rep("\xf1", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        -- 1000 sat/kvB cap.
+        local mp = mempool.new(chain_state, {client_max_feerate_kvb = 1000})
+
+        -- 50,000 sat fee on ~100-vbyte tx → ~500,000 sat/kvB.  Way over cap.
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = make_output(50000)  -- 50000 sat fee
+
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.truthy(err:match("max%-fee%-exceeded"))
+      end)
+    end)
+
+    -- W96 Bug 12: missing inputs reason matches Core canonical.
+    describe("missing inputs reason canonicalisation", function()
+      it("returns bad-txns-inputs-missingorspent", function()
+        local chain_state = make_mock_chain_state()
+        local mp = mempool.new(chain_state)
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(types.hash256(string.rep("\x99", 32)), 0)
+        tx.outputs[1] = make_output(50000)
+
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.equal("bad-txns-inputs-missingorspent", err)
+      end)
+    end)
+
+    -- W96 Bug 2: PolicyScriptChecks runs verify_script when enabled.  The gate
+    -- is off by default, so we exercise it explicitly here.
+    describe("PolicyScriptChecks (verify_input_scripts=true)", function()
+      it("rejects tx with invalid scriptSig when verification enabled", function()
+        local prev_txid = types.hash256(string.rep("\x11", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state, {verify_input_scripts = true})
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        -- scriptSig is empty — verify_script will see empty stack after
+        -- exec, return false, and trigger the script-verify-flag-failed reject.
+        tx.outputs[1] = make_output(90000)
+
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.truthy(err:match("mandatory%-script%-verify%-flag%-failed"))
+      end)
+
+      it("does not run verify_script when gate is off (default)", function()
+        local prev_txid = types.hash256(string.rep("\x12", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state)  -- default: gate off
+
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(prev_txid, 0)
+        tx.outputs[1] = make_output(90000)
+
+        -- With the gate off, an empty scriptSig is accepted (matches the
+        -- backward-compat behaviour all the other tests depend on).
+        local ok = mp:accept_transaction(tx)
+        assert.is_true(ok)
+      end)
+    end)
+
+    -- W96 Bug 9 (multisig classifier): make sure non-multisig scripts that
+    -- coincidentally end with 0xae do NOT get reclassified as multisig.
+    describe("multisig classifier robustness", function()
+      it("does not misclassify a long OP_RETURN containing 0xae", function()
+        local data = string.rep("\xae", 30)
+        local op_return = "\x6a\x1e" .. data
+        local t = script.classify_script(op_return)
+        assert.equal("nulldata", t)
+      end)
+
+      it("rejects malformed multisig (push count mismatch)", function()
+        -- OP_2 <pk> OP_2 OP_CHECKMULTISIG — claims 2 pubkeys but only 1 pushed.
+        local pk = string.rep("\x02", 33)
+        local bad_ms = "\x52\x21" .. pk .. "\x52\xae"
+        local t = script.classify_script(bad_ms)
+        assert.equal("nonstandard", t)
+      end)
+    end)
+
+    -- W96: ValidateInputsStandardness exported helper directly testable.
+    describe("validate_inputs_standardness helper", function()
+      it("returns true for P2PKH input", function()
+        local p2pkh = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(types.hash256(string.rep("\x01", 32)), 0)
+        tx.outputs[1] = make_output(90000)
+        local ok = mempool.validate_inputs_standardness(tx, {
+          [1] = {script_pubkey = p2pkh, value = 100000}
+        })
+        assert.is_true(ok)
+      end)
+
+      it("returns false for nonstandard input prev script", function()
+        local nonstd = string.rep("\x75", 25)  -- 25 OP_DROPs
+        local tx = make_tx(1, {}, {}, 0)
+        tx.inputs[1] = make_input(types.hash256(string.rep("\x01", 32)), 0)
+        tx.outputs[1] = make_output(90000)
+        local ok, err = mempool.validate_inputs_standardness(tx, {
+          [1] = {script_pubkey = nonstd, value = 100000}
+        })
+        assert.is_false(ok)
+        assert.truthy(err:match("bad%-txns%-nonstandard%-inputs"))
+      end)
+    end)
+
+    -- Policy constants pinned to Core values.
+    describe("W96 policy constants", function()
+      it("MAX_TX_LEGACY_SIGOPS = 2500", function()
+        assert.equal(2500, mempool.MAX_TX_LEGACY_SIGOPS)
+      end)
+      it("MAX_P2SH_SIGOPS = 15", function()
+        assert.equal(15, mempool.MAX_P2SH_SIGOPS)
+      end)
+      it("PERMIT_BARE_MULTISIG defaults to false (Core v28+)", function()
+        assert.is_false(mempool.PERMIT_BARE_MULTISIG)
+      end)
     end)
   end)
 
