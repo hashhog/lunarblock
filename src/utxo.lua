@@ -10,8 +10,13 @@ local perf = require("lunarblock.perf")
 local sig_cache = require("lunarblock.sig_cache")
 local mining = require("lunarblock.mining")
 local blockfilter = require("lunarblock.blockfilter")
+local prune_mod = require("lunarblock.prune")
 local bit = require("bit")
 local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
+-- MIN_BLOCKS_TO_KEEP: reused from prune_mod (= 288).  Blocks this far ahead
+-- of the active tip are not stored when the block was not explicitly requested
+-- (fTooFarAhead gate, Core validation.cpp:4325).
+local MIN_BLOCKS_TO_KEEP = prune_mod.MIN_BLOCKS_TO_KEEP
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -3066,6 +3071,20 @@ end
 
 function ChainState:accept_block(block, height, block_hash, opts)
   opts = opts or {}
+
+  -- G19c (W97): fTooFarAhead gate (Core validation.cpp:4325 + 4339).
+  -- An unrequested block more than MIN_BLOCKS_TO_KEEP (288) blocks ahead
+  -- of the active tip is dropped without storing.  This prevents an
+  -- attacker from pinning block bodies far above the tip to defeat pruning.
+  -- opts.requested = true exempts explicitly-requested blocks (e.g. from the
+  -- block-download pipeline where inflight tracking constitutes a request).
+  if not opts.requested then
+    local active_height = self.tip_height or -1
+    local f_too_far_ahead = height > active_height + MIN_BLOCKS_TO_KEEP
+    if f_too_far_ahead then
+      return nil, "too-far-ahead"
+    end
+  end
 
   -- Stage 1: context-free validation (check_block).
   -- Covers: header PoW, future-time gate, >=1 tx, first-coinbase,
