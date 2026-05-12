@@ -3274,16 +3274,14 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     entry.height = common_height + (side_len - i + 1)
   end
 
-  -- ── Stage 3: store the new block + header as a side-branch BEFORE the
-  -- work comparison.  Storing is idempotent (overwrite OK) and keeps
-  -- side-branch persistence consistent regardless of whether the reorg
-  -- fires.  Earlier side-branch blocks (e.g. B1, B2 when B3 arrives)
-  -- were stored on their own submitblock calls.
-  --
-  -- We do NOT touch the height-index here — that index represents the
-  -- ACTIVE chain.  height-index is rewritten only when the reorg fires.
-  self.storage.put_block(block_hash, block)
-  self.storage.put_header(block_hash, block.header)
+  -- ── Stage 3: guard — reject side branches that descend from an
+  -- invalidated block.  Core's FindMostWorkChain (validation.cpp:3139-3164)
+  -- skips any candidate whose ancestor chain contains BLOCK_FAILED_VALID.
+  -- B2 fix: check BEFORE storing so we never write an invalid-ancestor block
+  -- to RocksDB (B9 fix: store only after this check and work comparison pass).
+  if self:has_invalid_ancestor(block_hash) then
+    return nil, "invalid-ancestor"
+  end
 
   -- ── Stage 4: compute side-branch work and active-chain work above the
   -- common ancestor.  256-bit work add/compare via consensus helpers.
@@ -3309,11 +3307,28 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     end
   end
 
+  -- B9 fix: perform work_compare BEFORE put_block so that an
+  -- invalid-ancestor block (already rejected above by B2 guard) or a
+  -- lighter side branch does not unconditionally consume disk on every call.
+  -- Storing is idempotent (overwrite OK).  Earlier side-branch blocks
+  -- (e.g. B1, B2 when B3 arrives) were stored on their own submitblock calls.
   if consensus.work_compare(side_work, active_work) <= 0 then
-    -- Side branch is not strictly heavier; leave active chain alone.
-    -- Block is persisted as a side-branch above; tip stays at A2.
+    -- Side branch is not strictly heavier; store it as a side-branch and
+    -- leave the active chain alone.  We DO still store it so that when a
+    -- follow-up block arrives and makes this branch heavier we have the
+    -- block body available for the reorg connect loop.
+    -- We do NOT touch the height-index — it represents the ACTIVE chain.
+    self.storage.put_block(block_hash, block)
+    self.storage.put_header(block_hash, block.header)
     return "stored"
   end
+
+  -- ── Stage 5 (formerly Stage 3): store the new block + header as a
+  -- side-branch.  We are about to reorg, so the block must be in storage
+  -- before the connect loop re-loads it.  height-index is NOT written here;
+  -- it is rewritten atomically under each connect_block call below.
+  self.storage.put_block(block_hash, block)
+  self.storage.put_header(block_hash, block.header)
 
   -- ── Stage 5: REORG.  Disconnect from tip down to common_height (using
   -- the existing rollback_chain_to which restores UTXOs from undo data),
@@ -3881,6 +3896,48 @@ end
 -- Block Invalidation (invalidateblock / reconsiderblock RPC support)
 --------------------------------------------------------------------------------
 
+--- Mark all stored descendants of block_hash as invalid.
+-- B4 fix: mirrors Core's InvalidateBlock (validation.cpp:3604-3638) which
+-- walks all block index entries and sets BLOCK_FAILED_VALID on every
+-- descendant (including out-of-chain ones) so they cannot be promoted later.
+-- @param block_hash hash256: The ancestor block whose descendants to mark
+function ChainState:mark_descendant_invalid(block_hash)
+  -- Iterate over ALL stored headers to find blocks that have block_hash as
+  -- an ancestor.  The walk is O(n * depth) but invalidateblock is a rare
+  -- operator action, not a hot path.
+  local iter = self.storage.iterator(storage_mod.CF.HEADERS)
+  iter.seek_to_first()
+  while iter.valid() do
+    local candidate_bytes = iter.key()
+    -- Skip the block itself (already marked) and already-invalid blocks.
+    if candidate_bytes ~= block_hash.bytes and not self.invalid_blocks[candidate_bytes] then
+      local candidate_hash = types.hash256(candidate_bytes)
+      -- Walk the candidate's ancestor chain looking for block_hash.
+      local cur = candidate_hash
+      local found = false
+      local limit = 10000  -- prevent infinite loop on malformed storage
+      while cur and limit > 0 do
+        limit = limit - 1
+        local h = self.storage.get_header(cur)
+        if not h then break end
+        if types.hash256_eq(h.prev_hash, block_hash) then
+          found = true
+          break
+        end
+        if h.prev_hash.bytes == string.rep("\0", 32) then
+          break
+        end
+        cur = h.prev_hash
+      end
+      if found then
+        self.invalid_blocks[candidate_bytes] = true
+      end
+    end
+    iter.next()
+  end
+  iter.destroy()
+end
+
 --- Invalidate a block and all its descendants, triggering a reorg if needed.
 -- This marks the block as invalid and disconnects it from the active chain.
 -- @param block_hash hash256: The hash of the block to invalidate
@@ -3899,6 +3956,14 @@ function ChainState:invalidate_block(block_hash)
 
   -- Mark this block as invalid
   self.invalid_blocks[block_hash.bytes] = true
+
+  -- B4 fix: mark all out-of-chain descendants as invalid too.
+  -- Core's InvalidateBlock (validation.cpp:3604-3638) walks all block index
+  -- entries and sets BLOCK_FAILED_VALID on every descendant so that
+  -- FindMostWorkChain cannot later promote them.  Without this, a side branch
+  -- descending from the invalidated block could be promoted after a call to
+  -- accept_side_branch_block (which now checks has_invalid_ancestor).
+  self:mark_descendant_invalid(block_hash)
 
   -- Check if the block is in the active chain
   local block_in_chain = false
