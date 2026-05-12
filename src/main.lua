@@ -1141,6 +1141,16 @@ local function main()
             hash = item.hash,
           }
         end
+      elseif item.type == p2p.INV_TYPE.MSG_WTX then
+        -- BIP-339: wtxid-relay peers announce via MSG_WTX (=5); hash is wtxid.
+        -- Look up by wtxid hex; if not in mempool, request via MSG_WTX getdata.
+        local wtxid_hex = types.hash256_hex(item.hash)
+        if not mempool:has_wtxid(wtxid_hex) then
+          to_request[#to_request + 1] = {
+            type = p2p.INV_TYPE.MSG_WTX,
+            hash = item.hash,
+          }
+        end
       elseif item.type == p2p.INV_TYPE.MSG_BLOCK or item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
         -- Request new block headers
         header_chain:start_sync(peer)
@@ -1160,12 +1170,13 @@ local function main()
       local tx = serialize.deserialize_transaction(payload)
       local accepted, reason = mempool:accept_transaction(tx)
       if accepted then
-        -- Relay to other peers
-        local txid = validation.compute_txid(tx)
-        local inv = p2p.serialize_inv({
-          {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
-        })
-        peer_manager:broadcast("inv", inv, function(p) return p ~= peer end)
+        -- Relay to other peers via the trickle queue (Poisson delay, BIP-339
+        -- correct inv type: MSG_WTX for wtxid_relay peers, MSG_TX otherwise).
+        -- Do NOT call peer_manager:broadcast() here — that sends immediately to
+        -- all peers with MSG_WITNESS_TX (legacy) and leaks timing/origin info.
+        local txid  = validation.compute_txid(tx)
+        local wtxid = validation.compute_wtxid(tx)
+        peer_manager:queue_tx_announcement(txid, wtxid)
         -- Track for fee estimation
         local txid_hex = types.hash256_hex(txid)
         local entry = mempool:get_entry(txid_hex)
