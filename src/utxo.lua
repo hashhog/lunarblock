@@ -2608,6 +2608,14 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
                 sig_bytes = string.sub(sig, 1, 64)
                 -- BIP341: 0x00 hash_type must not use 65-byte sig
                 assert(hash_type ~= 0x00, "taproot invalid hash type with 65-byte sig")
+                -- BIP-341 hash_type range gate (Core interpreter.cpp:1516):
+                -- only {0x01, 0x02, 0x03, 0x81, 0x82, 0x83} are accepted in
+                -- the explicit-sigbyte form. Pre-W94 lunarblock would compute
+                -- a sighash for any byte and Schnorr-verify against it —
+                -- exposing the same accept-vs-reject split as the make_*_checker
+                -- key-path sites below.
+                assert(validation.is_valid_taproot_hash_type(hash_type),
+                  "taproot invalid hash type")
               end
 
               -- Compute taproot sighash for key-path (ext_flag = 0)
@@ -2622,7 +2630,13 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               local control_block = witness[#witness]
               local tapscript = witness[#witness - 1]
 
+              -- BIP-341 / Core interpreter.cpp:1970: control block must
+              -- be 33 + 32*m bytes for m in [0, 128]. Upper bound was
+              -- missing pre-W94; an oversized control block (>4129 bytes)
+              -- with a still-32-aligned shape would have been accepted by
+              -- lunarblock and rejected by Core (TAPROOT_WRONG_CONTROL_SIZE).
               assert(#control_block >= 33, "taproot invalid control block size")
+              assert(#control_block <= 4129, "taproot invalid control block size")
               assert((#control_block - 33) % 32 == 0, "taproot invalid control block size")
 
               local leaf_version = bit.band(string.byte(control_block, 1), 0xFE)

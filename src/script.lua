@@ -1404,15 +1404,28 @@ function M.execute_script(script_bytes, stack, flags, checker)
         if #pubkey == 32 then
           if #sig > 0 and checker.check_sig then
             valid = checker.check_sig(sig, pubkey)
+            if not valid then
+              -- 32-byte pubkey + non-empty sig that fails Schnorr verify:
+              -- Core returns SCRIPT_ERR_SCHNORR_SIG. (For unknown-length
+              -- pubkeys Core does NOT verify and does NOT raise SIG_SCHNORR
+              -- — see else branch below.)
+              return nil, "SIG_SCHNORR"
+            end
           end
         else
-          -- Unknown pubkey type in tapscript: succeed if sig is non-empty
+          -- Unknown pubkey type in tapscript: forward soft-fork reservation.
+          -- Core (interpreter.cpp:373-382): with DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+          -- this becomes a policy reject; otherwise success is left as-is
+          -- (i.e. success = !sig.empty()). It is critical that this branch
+          -- NOT call check_sig — libsecp256k1's xonly_pubkey_parse will
+          -- reject any pubkey whose length is not 32 and we'd surface
+          -- SIG_SCHNORR for what Core treats as a forward-compatible accept.
+          if flags.verify_discourage_upgradable_pubkeytype then
+            return nil, "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"
+          end
           if #sig > 0 then
             valid = true
           end
-        end
-        if not valid and #sig > 0 then
-          return nil, "SIG_SCHNORR"
         end
         push_bool(valid)
       else
@@ -1458,17 +1471,24 @@ function M.execute_script(script_bytes, stack, flags, checker)
         if #pubkey == 32 then
           if #sig > 0 and checker.check_sig then
             valid = checker.check_sig(sig, pubkey)
+            if not valid then
+              return nil, "SIG_SCHNORR"
+            end
           end
         else
+          -- Forward soft-fork reservation (see OP_CHECKSIG comment above).
+          if flags.verify_discourage_upgradable_pubkeytype then
+            return nil, "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"
+          end
           if #sig > 0 then
             valid = true
           end
         end
-        if not valid and #sig > 0 then
-          return nil, "SIG_SCHNORR"
-        end
         if not valid then
-          error("OP_CHECKSIGVERIFY failed")
+          -- BIP342: OP_CHECKSIGVERIFY fails if `success == false`
+          -- (i.e. empty sig under any pubkey, or unknown pubkey with
+          -- empty sig). Mirrors Core's interpreter.cpp:1076-1079.
+          return nil, "CHECKSIGVERIFY"
         end
       else
         local sig_ok, sig_err = check_signature_encoding(sig, flags)
@@ -1666,34 +1686,58 @@ function M.execute_script(script_bytes, stack, flags, checker)
       local pubkey = pop()
       local n = pop_num()
       local sig = pop()
-      -- BIP-342 validation-weight budget: decrement by 50 BEFORE pubkey
-      -- inspection / Schnorr verify, gated on #sig > 0. Empty sigs do
-      -- NOT consume budget — Core only decrements when
-      -- `success = !sig.empty()` (interpreter.cpp:357-366).
-      -- Only consult the counter when the budget has been seeded
-      -- (verify_witness_program seeds it for the BIP-342 leaf entry).
-      -- Direct test entries that drive CHECKSIGADD without going through
-      -- the v1 entry don't seed the budget and are not consensus paths.
-      if #sig > 0 and flags.validation_weight_init then
+      -- BIP-342 OP_CHECKSIGADD must mirror Core's EvalChecksigTapscript
+      -- (interpreter.cpp:347-385) exactly. Pre-fix this site lacked the
+      -- empty-pubkey, unknown-pubkey-type, and discouraged-pubkey-type
+      -- gates — three latent consensus splits:
+      --   1. (sig empty, pubkey empty) Core rejects TAPSCRIPT_EMPTY_PUBKEY
+      --      unconditionally; lunarblock pushed `n` (accept) → SPLIT.
+      --   2. (sig non-empty, pubkey size NOT in {0, 32}) Core treats as
+      --      success=true for forward-softfork compatibility; lunarblock
+      --      called check_sig (libsecp256k1 rejects non-32-byte xonly)
+      --      then `error()`d → SPLIT.
+      --   3. (sig empty, pubkey size NOT in {0, 32}) Core treats as
+      --      success=false (no error); lunarblock matches by coincidence
+      --      (empty sig falls through to push_num(n)) but no longer relies
+      --      on it.
+      -- Step 1: success = !sig.empty().
+      local success = #sig > 0
+      -- Step 2: if success, decrement weight (gated on init).
+      if success and flags.validation_weight_init then
         flags.validation_weight_left =
           flags.validation_weight_left - VALIDATION_WEIGHT_PER_SIGOP_PASSED
         if flags.validation_weight_left < 0 then
           return nil, "TAPSCRIPT_VALIDATION_WEIGHT"
         end
       end
-      local valid = false
-      if checker.check_sig then
-        valid = checker.check_sig(sig, pubkey)
+      -- Step 3: empty pubkey is a hard reject regardless of success.
+      if #pubkey == 0 then
+        return nil, "TAPSCRIPT_EMPTY_PUBKEY"
       end
-      if valid then
+      -- Step 4: 32-byte pubkey → run Schnorr verify (only if success).
+      if #pubkey == 32 then
+        if success and checker.check_sig then
+          if not checker.check_sig(sig, pubkey) then
+            return nil, "SIG_SCHNORR"
+          end
+        end
+      else
+        -- Step 5: unknown pubkey size (forward soft-fork reservation).
+        -- Core: SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE makes this
+        -- a policy reject; absent the flag it succeeds (success unchanged).
+        if flags.verify_discourage_upgradable_pubkeytype then
+          return nil, "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"
+        end
+        -- Otherwise: success stays as-is. Per Core comment "the new code
+        -- should not do anything but failing the script execution. To
+        -- avoid consensus bugs, it should not modify any existing values
+        -- (including `success`)" (interpreter.cpp:375-378).
+      end
+      -- Step 6: push num + (success ? 1 : 0).
+      if success then
         push_num(n + 1)
       else
-        -- For empty sig, don't increment and don't fail
-        if #sig == 0 then
-          push_num(n)
-        else
-          error("OP_CHECKSIGADD failed with non-empty invalid sig")
-        end
+        push_num(n)
       end
 
     -- Unknown NOPs (0xb0, 0xb3-0xb9): treat as NOP for softfork compatibility
@@ -1793,6 +1837,30 @@ function M.execute_witness_script(script_bytes, stack, flags, checker)
       end
       -- non-push, non-OP_SUCCESS opcode: continue scanning
     end
+
+    -- TAPSCRIPT-only initial stack-size cap (Core interpreter.cpp:1855).
+    -- This runs AFTER OP_SUCCESS pre-scan (so OP_SUCCESS shortcut overrides
+    -- it) but BEFORE per-element PUSH_SIZE and EvalScript. Pre-fix the
+    -- runtime in-loop `(#stack + #altstack) > MAX_STACK_SIZE` check could
+    -- not catch an oversize initial witness stack that immediately pops:
+    -- e.g. 1500 stack items, first op is OP_DROP; lunarblock would let it
+    -- through, Core rejects STACK_SIZE on entry.
+    if #stack > MAX_STACK_SIZE then
+      return nil, "STACK_SIZE"
+    end
+  end
+
+  -- Per-element initial cap: every witness stack item is constrained to
+  -- MAX_SCRIPT_ELEMENT_SIZE (520 bytes), in BOTH WITNESS_V0 and TAPSCRIPT
+  -- (Core interpreter.cpp:1858-1861, outside the SigVersion::TAPSCRIPT
+  -- block, so it applies to every witness execution). Pre-fix lunarblock
+  -- only enforced this at runtime push() time; a witness stack item that
+  -- was never pushed-then-popped (e.g. a witness-only check that never
+  -- touched the value) bypassed the check.
+  for idx = 1, #stack do
+    if #stack[idx] > MAX_SCRIPT_ELEMENT_SIZE then
+      return nil, "PUSH_SIZE"
+    end
   end
 
   -- Execute the script
@@ -1821,9 +1889,16 @@ end
 -- @param witness_program string: Witness program data
 -- @param flags table: Verification flags
 -- @param checker table: Signature checker
+-- @param is_p2sh boolean|nil: true if this witness program was discovered
+--   inside a P2SH redeem script (P2SH-P2WPKH / P2SH-P2WSH). BIP-341 forbids
+--   P2SH-wrapped Taproot — Core (interpreter.cpp:1947) only activates the
+--   v1+32 Taproot branch when `!is_p2sh`. Pre-fix lunarblock omitted the
+--   guard and would activate Taproot rules on a P2SH redeem script of
+--   shape `OP_1 <32-byte-prog>`, which Core treats as the catch-all
+--   forward-soft-fork branch (anyone-can-spend / DISCOURAGE optional).
 -- @return boolean: true if valid
 -- @return string|nil: Error message on failure
-function M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
+function M.verify_witness_program(witness, witness_version, witness_program, flags, checker, is_p2sh)
   if witness_version == 0 then
     if #witness_program == 20 then
       -- P2WPKH: witness = [sig, pubkey]
@@ -1895,8 +1970,10 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
     else
       return nil, "WITNESS_PROGRAM_WRONG_LENGTH"
     end
-  elseif witness_version == 1 and #witness_program == 32 and flags.verify_taproot then
-    -- BIP341/342: Taproot (witness v1, 32-byte program)
+  elseif witness_version == 1 and #witness_program == 32 and flags.verify_taproot
+         and not is_p2sh then
+    -- BIP341/342: Taproot (witness v1, 32-byte program). Disabled for
+    -- P2SH-wrapped paths per Core interpreter.cpp:1947 (`!is_p2sh`).
     -- (Other v1 program lengths fall through to the catch-all per BIP141 forward
     -- soft-fork compatibility; P2A is matched explicitly below.)
 
@@ -1916,7 +1993,15 @@ function M.verify_witness_program(witness, witness_version, witness_program, fla
       local control_block = witness[stack_end]
       local tap_script = witness[stack_end - 1]
 
-      if #control_block < 33 or (#control_block - 33) % 32 ~= 0 then
+      -- BIP-341: control block must be 33 + 32*m bytes for m in [0, 128].
+      -- Core (interpreter.h:243-246, interpreter.cpp:1970): rejects any
+      -- size < TAPROOT_CONTROL_BASE_SIZE (33), > TAPROOT_CONTROL_MAX_SIZE
+      -- (33 + 32*128 = 4129), or not aligned to the 32-byte node stride.
+      -- Pre-fix the upper bound was missing; a 4129+ byte control block
+      -- with a valid (33 + 32*m % 32 == 0) shape would have been accepted
+      -- by lunarblock and rejected by Core.
+      if #control_block < 33 or #control_block > 4129
+         or (#control_block - 33) % 32 ~= 0 then
         return nil, "TAPROOT_WRONG_CONTROL_SIZE"
       end
 
@@ -2127,7 +2212,8 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
       -- Get witness data from checker
       local witness = (checker and checker.get_witness and checker.get_witness()) or {}
 
-      local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
+      -- Native witness: is_p2sh=false. Taproot (v1+32) IS permitted here.
+      local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker, false)
       if not ok then
         return nil, werr
       end
@@ -2158,7 +2244,11 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
           -- Get witness data from checker
           local witness = (checker and checker.get_witness and checker.get_witness()) or {}
 
-          local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker)
+          -- P2SH-wrapped witness: is_p2sh=true. Taproot is forbidden here
+          -- (BIP-341 / interpreter.cpp:1947) and falls through to the
+          -- forward-soft-fork catch-all (anyone-can-spend) inside
+          -- verify_witness_program.
+          local ok, werr = M.verify_witness_program(witness, witness_version, witness_program, flags, checker, true)
           if not ok then
             return nil, werr
           end
