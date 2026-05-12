@@ -2618,9 +2618,16 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
                   "taproot invalid hash type")
               end
 
-              -- Compute taproot sighash for key-path (ext_flag = 0)
-              local sighash = validation.signature_hash_taproot(
+              -- Compute taproot sighash for key-path (ext_flag = 0). nil
+              -- means SIGHASH_SINGLE-out-of-range (BIP-341 / Core
+              -- interpreter.cpp:1550) — Core fails the input with
+              -- SCRIPT_ERR_SCHNORR_SIG_HASHTYPE. Pre-W95 lunarblock would
+              -- silently feed sha256(... || zero32 || ...) to
+              -- schnorr_verify and accept any sig the attacker had
+              -- pre-computed against that placeholder — real split.
+              local sighash, sh_err = validation.signature_hash_taproot(
                 tx, inp_idx - 1, hash_type, prev_outputs, 0, annex)
+              assert(sighash, "taproot sighash failed: " .. tostring(sh_err))
 
               -- Verify Schnorr signature against the output key (witness_program)
               local ok = crypto.schnorr_verify(witness_program, sig_bytes, sighash)
