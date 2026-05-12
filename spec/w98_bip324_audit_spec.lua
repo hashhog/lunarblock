@@ -554,30 +554,63 @@ describe("W98 BIP-324 gate audit", function()
   end)
 
   -- -------------------------------------------------------------------------
-  -- G10: Secret zeroization (BUG-G10 documented)
+  -- G10: Secret zeroization (FFI-zero fix applied)
   -- -------------------------------------------------------------------------
   describe("G10 secret zeroization", function()
-    it("BUG-G10: privkey retained in cipher.privkey after initialization", function()
-      -- After initialize(), the private key should be erased (Core calls
-      -- memory_cleanse + m_key = CKey()). Lunarblock retains self.privkey
-      -- as a Lua string with no zeroize.
+    it("G10: privkey is nil in cipher before initialize() (set at construction)", function()
+      -- Before initialize() the privkey is still needed for ECDH; it lives in
+      -- cipher.privkey as a Lua string at construction time.
       local magic = "\xf9\xbe\xb4\xd9"
       local t = bip324.V2Transport(magic, true)
-      -- privkey lives in t.cipher.privkey — should be nil/cleared post-init
-      -- but currently it persists.
+      -- privkey must be present before initialize() (ECDH hasn't run yet).
       assert.is_not_nil(t.cipher.privkey,
-        "BUG-G10: privkey persists after cipher construction (not zeroized)")
+        "privkey must be present before initialize() — ECDH has not run yet")
     end)
 
-    it("BUG-G10: privkey still present after cipher:initialize()", function()
+    it("G10 FIXED: privkey is nil after cipher:initialize()", function()
+      -- After initialize(), the private key is zeroized via FFI and the Lua
+      -- reference is set to nil (mirrors bitcoin-core/src/bip324.cpp:67-70
+      -- memory_cleanse + m_key = CKey()).
+      -- IMPORTANT: capture both handshake byte strings BEFORE any recv_bytes
+      -- calls, because get_handshake_bytes() returns "" once send_state is READY.
       local magic = "\xf9\xbe\xb4\xd9"
       local i = bip324.V2Transport(magic, true)
       local r = bip324.V2Transport(magic, false)
-      r:recv_bytes(i:get_handshake_bytes())
-      i:recv_bytes(r:get_handshake_bytes())
-      -- After initialize(), privkey should be gone
-      assert.is_not_nil(i.cipher.privkey,
-        "BUG-G10: privkey survives cipher:initialize() — key material not erased")
+      local i_hs = i:get_handshake_bytes()
+      local r_hs = r:get_handshake_bytes()
+      r:recv_bytes(i_hs)
+      i:recv_bytes(r_hs)
+      -- After initialize(), privkey must be erased on both sides.
+      assert.is_nil(i.cipher.privkey,
+        "G10 FIXED: initiator privkey must be nil after cipher:initialize()")
+      assert.is_nil(r.cipher.privkey,
+        "G10 FIXED: responder privkey must be nil after cipher:initialize()")
+    end)
+
+    it("G10 FIXED: initialized cipher still encrypts/decrypts correctly", function()
+      -- Regression guard: zeroizing the privkey must not break the cipher
+      -- (the ciphers were already constructed from the derived OKMs).
+      local magic = "\xf9\xbe\xb4\xd9"
+      local i = bip324.V2Transport(magic, true)
+      local r = bip324.V2Transport(magic, false)
+      local function must(ok, err) assert.is_true(ok, tostring(err)) end
+      -- Capture both handshake byte strings BEFORE any recv_bytes calls.
+      local i_hs = i:get_handshake_bytes()
+      local r_hs = r:get_handshake_bytes()
+      must(r:recv_bytes(i_hs))
+      must(i:recv_bytes(r_hs))
+      must(r:recv_bytes(i:make_version_packet()))
+      must(i:recv_bytes(r:make_version_packet()))
+      -- Both sides must have nil privkeys after handshake.
+      assert.is_nil(i.cipher.privkey, "initiator privkey must be nil post-handshake")
+      assert.is_nil(r.cipher.privkey, "responder privkey must be nil post-handshake")
+      -- Round-trip a message to confirm cipher operation is unaffected.
+      local enc = i:encrypt_message("ping", "hello_w98_g10")
+      must(r:recv_bytes(enc))
+      assert.is_true(r:message_ready())
+      local cmd, payload = r:get_message()
+      assert.equals("ping", cmd)
+      assert.equals("hello_w98_g10", payload)
     end)
   end)
 
