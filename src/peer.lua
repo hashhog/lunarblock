@@ -152,6 +152,10 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
   self.latency_ms = 0
   self.ban_score = 0
   self.inbound = false
+  -- Connection-type protection flags (mirrors Core NetPermissionFlags::NoBan
+  -- and CNode::m_manually_added).  Set by PeerManager after construction.
+  self.noban = false      -- true for -whitelist peers: score accumulates but never banned
+  self.is_manual = false  -- true for -addnode peers: disconnect-only on threshold, never banned
   self.send_headers = false       -- Peer requested headers announcements
   self.send_compact = false       -- Peer supports compact blocks
   self.compact_version = 0        -- Compact block version (1 = txid, 2 = wtxid)
