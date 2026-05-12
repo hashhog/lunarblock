@@ -8,7 +8,7 @@ local M = {}
 --------------------------------------------------------------------------------
 
 M.HEADER_SIZE = 24
-M.MAX_MESSAGE_SIZE = 32 * 1024 * 1024  -- 32 MB max message
+M.MAX_MESSAGE_SIZE = 4 * 1000 * 1000  -- 4 MB max message (Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH, net.h:65)
 
 M.PROTOCOL_VERSION = 70016
 
