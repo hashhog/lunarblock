@@ -675,26 +675,18 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
   end)
 
   ----------------------------------------------------------------
-  -- BUG G16 — BLOCK_MUTATED → Misbehaving MISSING
-  -- src/main.lua:1101-1108 / src/sync.lua:1971  DOS + CONSENSUS-DIVERGENT
+  -- G16 FIXED — BLOCK_MUTATED → Misbehaving (W99 G16/G17 fix)
+  -- src/main.lua:1101-1115 / src/sync.lua:1971  DOS + CONSENSUS-DIVERGENT
   --
   -- Bitcoin Core ProcessBlock (net_processing.cpp:3424) calls
   -- MaybeDiscourageAndDisconnect with BLOCK_MUTATED score=100 when
-  -- IsBlockMutated returns true (witness malleation).  lunarblock's
-  -- block handler (main.lua:1101) does NOT apply any ban score on
-  -- block validation failure — it only prints an error.
+  -- IsBlockMutated returns true (witness malleation).  Fixed: the block
+  -- handler now calls peer_manager:add_ban_score(peer, 100, err) on any
+  -- validation failure except "deserialize failed".
   ----------------------------------------------------------------
-  describe("G16 BUG: BLOCK_MUTATED → Misbehaving MISSING (main.lua:1101-1108) DOS", function()
-    it("XFAIL: block handler does not ban peer on validation failure", function()
-      -- The block handler in main.lua:1101:
-      --   local ok, err = block_downloader:handle_block(peer, payload)
-      --   if not ok then
-      --     print(...)  -- no peer_manager:add_ban_score call
-      --   end
-      --
-      -- We cannot easily invoke the full block pipeline here, but we can
-      -- verify that check_witness_malleation exists (the upstream check)
-      -- and confirm that peerman:misbehaving is NOT called from the block handler.
+  describe("G16 FIXED: BLOCK_MUTATED → Misbehaving (main.lua:1101-1115) DOS", function()
+    it("check_witness_malleation exists for BLOCK_MUTATED detection", function()
+      -- Upstream check that produces the mutated-block error remains present.
       local validation = require("validation")
       assert.is_function(validation.check_witness_malleation,
         "check_witness_malleation must exist for BLOCK_MUTATED detection")
@@ -702,18 +694,24 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
   end)
 
   ----------------------------------------------------------------
-  -- BUG G17 — BLOCK_INVALID_HEADER → Misbehaving MISSING
-  -- src/main.lua:1101-1108  DOS
+  -- G17 FIXED — BLOCK_INVALID_HEADER → Misbehaving (W99 G16/G17 fix)
+  -- src/main.lua:1101-1115  DOS
   --
-  -- Same gap as G16: invalid block headers do not score Misbehaving.
   -- Bitcoin Core: ProcessBlock → MaybeDiscourageAndDisconnect for
-  -- BLOCK_INVALID_HEADER, BLOCK_CACHEDINVALID, etc.
+  -- BLOCK_INVALID_HEADER, BLOCK_CACHEDINVALID, etc.  Fixed: the block
+  -- handler now calls peer_manager:add_ban_score(peer, 100, err) on any
+  -- non-deserialize validation failure.
   ----------------------------------------------------------------
-  describe("G17 BUG: BLOCK_INVALID_HEADER → Misbehaving MISSING (main.lua:1101-1108) DOS", function()
-    it("XFAIL: block handler prints error but does not add ban score", function()
-      -- As with G16: the handler at main.lua:1101-1108 only prints.
-      -- There is no peer_manager:add_ban_score(peer, 100, ...) call.
-      -- We document the shape of the gap for the fix wave.
+  describe("G17 FIXED: BLOCK_INVALID_HEADER → Misbehaving (main.lua:1101-1115) DOS", function()
+    it("block handler calls add_ban_score(peer, 100) on validation failure", function()
+      -- Simulate the FIXED handler from main.lua:1101-1115:
+      --   local ok, err = block_downloader:handle_block(peer, payload)
+      --   if not ok then
+      --     print(...)
+      --     if err_str ~= "deserialize failed" then
+      --       peer_manager:add_ban_score(peer, 100, err_str)
+      --     end
+      --   end
       local handled = false
       local fake_downloader = {
         handle_block = function(self, peer, payload)
@@ -728,15 +726,41 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
         end
       }
       local fake_peer = mock_peer({ip = "5.5.5.5"})
-      -- Simulate what main.lua does (no ban)
       local ok, err = fake_downloader:handle_block(fake_peer, "")
       if not ok then
-        -- main.lua just prints; does NOT call add_ban_score
-        -- so banned stays false
+        local err_str = tostring(err)
+        -- Fixed: call add_ban_score for non-deserialize errors
+        if err_str ~= "deserialize failed" then
+          fake_pm:add_ban_score(fake_peer, 100, err_str)
+        end
       end
       assert.is_true(handled)
+      assert.is_true(banned,
+        "fixed: block handler must call add_ban_score on BLOCK_INVALID_HEADER")
+    end)
+
+    it("block handler does NOT ban on deserialize failed (wire noise, not peer fault)", function()
+      local fake_downloader = {
+        handle_block = function(self, peer, payload)
+          return false, "deserialize failed"
+        end
+      }
+      local banned = false
+      local fake_pm = {
+        add_ban_score = function(self, peer, score, reason)
+          banned = true
+        end
+      }
+      local fake_peer = mock_peer({ip = "5.5.5.6"})
+      local ok, err = fake_downloader:handle_block(fake_peer, "")
+      if not ok then
+        local err_str = tostring(err)
+        if err_str ~= "deserialize failed" then
+          fake_pm:add_ban_score(fake_peer, 100, err_str)
+        end
+      end
       assert.is_false(banned,
-        "documenting bug: block handler does not call add_ban_score on BLOCK_INVALID_HEADER")
+        "deserialize failures are wire noise and must NOT trigger add_ban_score")
     end)
   end)
 

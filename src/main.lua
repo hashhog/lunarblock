@@ -1103,7 +1103,15 @@ local function main()
     -- received via inv→getdata after IBD completes).
     local ok, err = block_downloader:handle_block(peer, payload)
     if not ok then
-      print(string.format("Block download error: %s", tostring(err)))
+      local err_str = tostring(err)
+      print(string.format("Block download error: %s", err_str))
+      -- Bitcoin Core net_processing.cpp:4788 / MaybePunishNodeForBlock:
+      -- BLOCK_MUTATED (witness malleation) and BLOCK_INVALID_HEADER both call
+      -- Misbehaving(peer, 100). Deserialize failures are network noise (not
+      -- necessarily the peer's fault), so we skip the ban score only for that.
+      if err_str ~= "deserialize failed" then
+        peer_manager:add_ban_score(peer, 100, err_str)
+      end
     end
   end)
 
