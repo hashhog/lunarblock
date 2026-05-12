@@ -317,29 +317,65 @@ function M.BIP324Cipher(privkey, our_ellswift)
   -- @param initiator boolean: true if we initiated the connection
   -- @param magic_bytes string: 4-byte network magic
   function self:initialize(their_ellswift, initiator, magic_bytes)
-    -- Compute ECDH shared secret using BIP324 hash function
+    -- Compute ECDH shared secret using BIP324 hash function.
+    -- Use an FFI byte buffer for privkey so we can explicitly zero it after use
+    -- (Lua strings are immutable and GC-managed; they cannot be zeroed in place).
+    -- Mirrors bitcoin-core/src/bip324.cpp:67-70 memory_cleanse() calls.
+    local privkey_str = self.privkey  -- hold the string reference
+    local privkey_buf = ffi.new("uint8_t[32]")
+    ffi.copy(privkey_buf, privkey_str, 32)
+
     local ecdh_secret = crypto.ellswift_ecdh(
-      self.privkey, self.our_ellswift, their_ellswift, initiator
+      ffi.string(privkey_buf, 32), self.our_ellswift, their_ellswift, initiator
     )
+
+    -- Zero and discard the private key immediately after ECDH — it is never
+    -- needed again.  nil out the Lua string reference as well so it becomes
+    -- eligible for GC.
+    ffi.fill(privkey_buf, 32, 0)
+    self.privkey = nil
+
     if not ecdh_secret then
       return false, "ECDH failed"
     end
 
+    -- Use an FFI buffer for the ECDH secret during HKDF derivation, then zero.
+    local ecdh_buf = ffi.new("uint8_t[32]")
+    ffi.copy(ecdh_buf, ecdh_secret, 32)
+    local ecdh_str = ffi.string(ecdh_buf, 32)
+
     -- HKDF salt: "bitcoin_v2_shared_secret" + network magic
     local salt = "bitcoin_v2_shared_secret" .. magic_bytes
 
-    -- Extract PRK from shared secret
-    local prk = hkdf_extract(salt, ecdh_secret)
+    -- Extract PRK from shared secret, then zero the ECDH buffer.
+    local prk = hkdf_extract(salt, ecdh_str)
+    ffi.fill(ecdh_buf, 32, 0)
+    ecdh_str = nil  -- drop Lua string reference; GC eligible
 
-    -- Derive keys
-    local initiator_l = hkdf_expand32(prk, "initiator_L")
-    local initiator_p = hkdf_expand32(prk, "initiator_P")
-    local responder_l = hkdf_expand32(prk, "responder_L")
-    local responder_p = hkdf_expand32(prk, "responder_P")
-    local garbage_terms = hkdf_expand32(prk, "garbage_terminators")
-    self.session_id = hkdf_expand32(prk, "session_id")
+    -- Derive keys using FFI buffers for each OKM, zero after passing to cipher.
+    local function derive_and_zero(label)
+      local okm_str = hkdf_expand32(prk, label)
+      local okm_buf = ffi.new("uint8_t[32]")
+      ffi.copy(okm_buf, okm_str, 32)
+      local result = ffi.string(okm_buf, 32)
+      ffi.fill(okm_buf, 32, 0)
+      return result
+    end
 
-    -- Assign keys based on role
+    local initiator_l = derive_and_zero("initiator_L")
+    local initiator_p = derive_and_zero("initiator_P")
+    local responder_l = derive_and_zero("responder_L")
+    local responder_p = derive_and_zero("responder_P")
+    local garbage_terms = derive_and_zero("garbage_terminators")
+    self.session_id   = derive_and_zero("session_id")
+
+    -- Zero PRK buffer after all OKMs are derived.
+    local prk_buf = ffi.new("uint8_t[32]")
+    ffi.copy(prk_buf, prk, 32)
+    ffi.fill(prk_buf, 32, 0)
+    prk = nil  -- drop Lua string reference
+
+    -- Assign keys based on role.
     if initiator then
       self.send_l_cipher = FSChaCha20(initiator_l, M.REKEY_INTERVAL)
       self.send_p_cipher = FSChaCha20Poly1305(initiator_p, M.REKEY_INTERVAL)
@@ -355,6 +391,18 @@ function M.BIP324Cipher(privkey, our_ellswift)
       self.send_garbage_terminator = garbage_terms:sub(17, 32)
       self.recv_garbage_terminator = garbage_terms:sub(1, 16)
     end
+
+    -- Zero the OKM Lua string references (already copied into cipher state).
+    initiator_l = nil
+    initiator_p = nil
+    responder_l = nil
+    responder_p = nil
+    garbage_terms = nil
+
+    -- Encourage GC to collect the sensitive Lua string objects.  This does not
+    -- guarantee the memory is overwritten (Lua's GC is not a secure allocator)
+    -- but it reduces the window during which they remain reachable.
+    collectgarbage("collect")
 
     self.initialized = true
     return true
