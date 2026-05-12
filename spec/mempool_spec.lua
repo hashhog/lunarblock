@@ -2331,17 +2331,24 @@ describe("mempool", function()
       local pool = mempool.new_orphan_pool()
       local parent = types.hash256(string.rep("\x11", 32))
       local parent_hex = types.hash256_hex(parent)
-      pool:add(make_small_tx(parent, 0), "child1", "p1", {[parent_hex] = true})
-      pool:add(make_small_tx(parent, 1), "child2", "p1", {[parent_hex] = true})
-      -- Unrelated orphan with a different missing parent
+      local tx1 = make_small_tx(parent, 0)
+      local tx2 = make_small_tx(parent, 1)
+      -- Use actual wtxid as the primary key (BIP-339 fix).
+      local wtxid1 = types.hash256_hex(validation.compute_wtxid(tx1))
+      local wtxid2 = types.hash256_hex(validation.compute_wtxid(tx2))
+      pool:add(tx1, wtxid1, "p1", {[parent_hex] = true})
+      pool:add(tx2, wtxid2, "p1", {[parent_hex] = true})
+      -- Unrelated orphan with a different missing parent.
       local other = types.hash256(string.rep("\x22", 32))
-      pool:add(make_small_tx(other, 0), "child3", "p2",
-        {[types.hash256_hex(other)] = true})
+      local tx3 = make_small_tx(other, 0)
+      local wtxid3 = types.hash256_hex(validation.compute_wtxid(tx3))
+      pool:add(tx3, wtxid3, "p2", {[types.hash256_hex(other)] = true})
 
       local kids = pool:children_of(parent_hex)
       assert.equal(2, #kids)
-      assert.equal("child1", kids[1].txid_hex)
-      assert.equal("child2", kids[2].txid_hex)
+      -- children_of now returns wtxid_hex (primary key) + txid_hex (secondary).
+      assert.equal(wtxid1, kids[1].wtxid_hex)
+      assert.equal(wtxid2, kids[2].wtxid_hex)
     end)
 
     it("removes orphans for a disconnected peer", function()

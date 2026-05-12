@@ -539,24 +539,125 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
   end)
 
   ----------------------------------------------------------------
-  -- BUG G14 — orphan pool is txid-keyed, NOT wtxid-keyed
-  -- src/mempool.lua:2655  CORRECTNESS
+  -- G14 FIXED — orphan pool now wtxid-keyed (BIP-339 / Core txorphanage)
+  -- src/mempool.lua  CORRECTNESS
   --
   -- Bitcoin Core txorphanage.cpp (v22+) keys orphans by WTxId for
   -- segwit/taproot transactions to prevent txid-malleation attacks on
-  -- the orphan index.  lunarblock OrphanPool stores entries keyed by
-  -- txid_hex (caller supplies txid, not wtxid).
+  -- the orphan index.  Fixed: OrphanPool.entries is now wtxid_hex-keyed
+  -- with a secondary txid_to_wtxid map for child resolution.
   ----------------------------------------------------------------
-  describe("G14 BUG: orphan pool txid-keyed not wtxid-keyed (mempool.lua:2655) CORRECTNESS", function()
-    it("XFAIL: entries map is txid-keyed (no separate wtxid index)", function()
+  describe("G14 FIXED: orphan pool wtxid-keyed with secondary txid index (mempool.lua) CORRECTNESS", function()
+    it("entries map is wtxid-keyed; txid_to_wtxid secondary index present", function()
       local pool = mempool_mod.new_orphan_pool()
-      -- The comment at line 2655 explicitly states txid-keyed.
-      -- There is no wtxid_entries or by_wtxid map.
-      assert.is_nil(pool.wtxid_entries)
-      assert.is_nil(pool.by_wtxid)
-      -- Document the gap: "Keeping it txid-keyed (rather than wtxid-keyed
-      -- like Core 31.99) keeps parent-resolution lookups O(1) without an
-      -- extra mapping." — mempool.lua:2656
+      -- The pool must have a secondary txid→wtxid index.
+      assert.is_table(pool.txid_to_wtxid,
+        "pool.txid_to_wtxid secondary index must exist (wtxid-keyed fix)")
+      -- Entries table starts empty.
+      assert.equal(0, pool:size())
+    end)
+
+    it("add() accepts wtxid as primary key; secondary index populated", function()
+      local types      = require("types")
+      local validation = require("validation")
+      local pool = mempool_mod.new_orphan_pool()
+      local parent = types.hash256(string.rep("\xaa", 32))
+      local parent_hex = types.hash256_hex(parent)
+      -- Build a minimal tx using proper types constructors.
+      -- Set witness data so wtxid ≠ txid (segwit tx).
+      local inp = types.txin(types.outpoint(parent, 0), "", 0xffffffff)
+      inp.witness = {"\x01"}  -- non-empty witness → wtxid ≠ txid
+      local tx = types.transaction(1, {inp}, {types.txout(50000, "")}, 0)
+      tx.segwit = true
+      local wtxid_obj = validation.compute_wtxid(tx)
+      local wtxid_hex = types.hash256_hex(wtxid_obj)
+      local ok, err = pool:add(tx, wtxid_hex, "peer1", {[parent_hex] = true})
+      assert.is_true(ok, "add() must succeed: " .. tostring(err))
+      -- Primary lookup by wtxid.
+      assert.is_true(pool:has(wtxid_hex), "has() must find by wtxid")
+      -- Secondary index must map txid → wtxid.
+      local txid_obj = validation.compute_txid(tx)
+      local txid_hex = types.hash256_hex(txid_obj)
+      assert.equal(wtxid_hex, pool.txid_to_wtxid[txid_hex],
+        "txid_to_wtxid must map txid→wtxid")
+    end)
+
+    it("dedup by wtxid: same wtxid is rejected as already-have-orphan", function()
+      local types      = require("types")
+      local validation = require("validation")
+      local pool = mempool_mod.new_orphan_pool()
+      local parent = types.hash256(string.rep("\xbb", 32))
+      local inp = types.txin(types.outpoint(parent, 0), "", 0xffffffff)
+      inp.witness = {"\x02"}
+      local tx = types.transaction(1, {inp}, {types.txout(1000, "")}, 0)
+      tx.segwit = true
+      local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
+      local ok1 = pool:add(tx, wtxid_hex, "p1", {})
+      assert.is_true(ok1)
+      local ok2, reason = pool:add(tx, wtxid_hex, "p1", {})
+      assert.is_false(ok2)
+      assert.equal("already-have-orphan", reason)
+    end)
+
+    it("dedup by txid: different witness variant of same txid is rejected", function()
+      -- Two txs with identical base serialization (same txid) but different
+      -- witnesses (different wtxid).  The second must be rejected.
+      local types      = require("types")
+      local validation = require("validation")
+      local pool = mempool_mod.new_orphan_pool()
+      local parent = types.hash256(string.rep("\xcc", 32))
+      local inp1 = types.txin(types.outpoint(parent, 0), "", 0xffffffff)
+      inp1.witness = {"\x01"}
+      local tx1 = types.transaction(1, {inp1}, {types.txout(2000, "")}, 0)
+      tx1.segwit = true
+      local inp2 = types.txin(types.outpoint(parent, 0), "", 0xffffffff)
+      inp2.witness = {"\x02"}
+      local tx2 = types.transaction(1, {inp2}, {types.txout(2000, "")}, 0)
+      tx2.segwit = true
+      -- tx1 and tx2 share the same txid (base serialization identical).
+      local txid1 = types.hash256_hex(validation.compute_txid(tx1))
+      local txid2 = types.hash256_hex(validation.compute_txid(tx2))
+      assert.equal(txid1, txid2, "test setup: txids must match")
+      -- wtxids differ.
+      local wtxid1 = types.hash256_hex(validation.compute_wtxid(tx1))
+      local wtxid2 = types.hash256_hex(validation.compute_wtxid(tx2))
+      assert.not_equal(wtxid1, wtxid2, "test setup: wtxids must differ")
+
+      local ok1 = pool:add(tx1, wtxid1, "p1", {})
+      assert.is_true(ok1, "first variant must be accepted")
+      local ok2, reason = pool:add(tx2, wtxid2, "p2", {})
+      assert.is_false(ok2, "second variant (same txid) must be rejected")
+      assert.equal("already-have-orphan", reason,
+        "reason must be already-have-orphan for txid-malleation bypass")
+    end)
+
+    it("children_of returns wtxid_hex + txid_hex; remove() uses wtxid", function()
+      local types      = require("types")
+      local validation = require("validation")
+      local pool = mempool_mod.new_orphan_pool()
+      local parent = types.hash256(string.rep("\xdd", 32))
+      local parent_hex = types.hash256_hex(parent)
+      local inp = types.txin(types.outpoint(parent, 0), "", 0xffffffff)
+      inp.witness = {"\x03"}
+      local tx = types.transaction(1, {inp}, {types.txout(3000, "")}, 0)
+      tx.segwit = true
+      local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
+      local txid_hex  = types.hash256_hex(validation.compute_txid(tx))
+      pool:add(tx, wtxid_hex, "p1", {[parent_hex] = true})
+
+      local kids = pool:children_of(parent_hex)
+      assert.equal(1, #kids)
+      assert.equal(wtxid_hex, kids[1].wtxid_hex,
+        "children_of must return wtxid_hex field")
+      assert.equal(txid_hex, kids[1].txid_hex,
+        "children_of must return txid_hex field for child resolution worklist")
+
+      -- remove() takes wtxid.
+      local removed = pool:remove(kids[1].wtxid_hex)
+      assert.is_true(removed)
+      assert.equal(0, pool:size())
+      assert.is_nil(pool.txid_to_wtxid[txid_hex],
+        "txid_to_wtxid must be cleaned up on remove")
     end)
   end)
 

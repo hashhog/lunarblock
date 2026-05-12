@@ -2652,32 +2652,46 @@ function M.new_orphan_pool(config)
   self.max_per_peer = (config and config.max_per_peer) or M.MAX_ORPHANS_PER_PEER
   self.max_tx_size  = (config and config.max_tx_size)  or M.MAX_ORPHAN_TX_SIZE
 
-  -- Storage. Keyed by txid_hex (string) since callers carry that already.
-  -- Keeping it txid-keyed (rather than wtxid-keyed like Core 31.99) keeps
-  -- parent-resolution lookups O(1) without an extra mapping.
-  self.entries = {}    -- txid_hex -> {tx, peer_id, time, size, missing_parents={txid_hex=true,...}}
+  -- Primary storage keyed by wtxid_hex (BIP-339 / Core txorphanage.cpp).
+  -- Secondary txid→wtxid index allows O(1) child lookup: missing_parents
+  -- carries txid_hex values (from input prevout hashes), so we need to
+  -- map those back to the wtxid primary key.
+  self.entries      = {}  -- wtxid_hex -> {tx, txid_hex, peer_id, time, size, missing_parents={txid_hex=true,...}}
+  self.txid_to_wtxid = {} -- txid_hex  -> wtxid_hex  (secondary index for dedup + child resolution)
   self.count   = 0
   -- Per-peer announcement counts (peer_id -> count).
   self.by_peer = {}
   -- Insertion order list for oldest-first eviction.  We accept the O(n)
   -- shift on eviction because n <= max_orphans (100 by default).
-  self.order   = {}    -- ordered list of txid_hex
+  self.order   = {}    -- ordered list of wtxid_hex
   return self
 end
 
 --- Try to add an orphan transaction.
 -- Caller must have already determined the tx has missing inputs and the
 -- missing-parent txid set.
+-- Primary key is wtxid_hex (BIP-339): two txids with the same txid but
+-- different witnesses are distinct orphans.  A secondary txid→wtxid map
+-- enables O(1) dedup by txid and child-resolution lookups.
 -- @param tx table: the orphan transaction
--- @param txid_hex string: hex-encoded txid of the orphan
+-- @param wtxid_hex string: hex-encoded wtxid of the orphan (primary key)
 -- @param peer_id any: peer-keyed identifier (e.g. "ip:port" or numeric id)
 -- @param missing_parents table|nil: set of {parent_txid_hex=true} (optional)
 -- @return boolean, string|nil: true on accept; false + reason on reject
-function OrphanPool:add(tx, txid_hex, peer_id, missing_parents)
-  if type(tx) ~= "table" or type(txid_hex) ~= "string" then
+function OrphanPool:add(tx, wtxid_hex, peer_id, missing_parents)
+  if type(tx) ~= "table" or type(wtxid_hex) ~= "string" then
     return false, "bad-orphan-args"
   end
-  if self.entries[txid_hex] then
+  if self.entries[wtxid_hex] then
+    return false, "already-have-orphan"
+  end
+  -- Compute txid for the secondary index (needed for child resolution via
+  -- missing_parents which carries txid_hex values from input prevouts).
+  local ok_txid, txid_raw = pcall(validation.compute_txid, tx)
+  local txid_hex = (ok_txid and txid_raw) and types.hash256_hex(txid_raw) or wtxid_hex
+  -- Reject if a different witness variant of the same txid is already present
+  -- (txid-malleation: same inputs/outputs, different witness).
+  if self.txid_to_wtxid[txid_hex] then
     return false, "already-have-orphan"
   end
 
@@ -2711,34 +2725,41 @@ function OrphanPool:add(tx, txid_hex, peer_id, missing_parents)
     return false, "orphan-cap-evict-failed"
   end
 
-  self.entries[txid_hex] = {
+  self.entries[wtxid_hex] = {
     tx              = tx,
+    txid_hex        = txid_hex,
     peer_id         = pid,
     time            = os.time(),
     size            = size,
     missing_parents = missing_parents or {},
   }
+  self.txid_to_wtxid[txid_hex] = wtxid_hex
   self.count = self.count + 1
   self.by_peer[pid] = (self.by_peer[pid] or 0) + 1
-  self.order[#self.order + 1] = txid_hex
+  self.order[#self.order + 1] = wtxid_hex
   return true
 end
 
 --- Evict the oldest orphan. Returns true if one was evicted.
 function OrphanPool:_evict_oldest()
-  local victim_txid = self.order[1]
-  if not victim_txid then return false end
+  local victim_wtxid = self.order[1]
+  if not victim_wtxid then return false end
   -- Shift order list (O(n) but n <= 100).
   table.remove(self.order, 1)
-  return self:_remove_internal(victim_txid) ~= nil
+  return self:_remove_internal(victim_wtxid) ~= nil
 end
 
 --- Internal removal (does not touch self.order — caller must).
+-- @param wtxid_hex string: primary key
 -- @return entry|nil
-function OrphanPool:_remove_internal(txid_hex)
-  local entry = self.entries[txid_hex]
+function OrphanPool:_remove_internal(wtxid_hex)
+  local entry = self.entries[wtxid_hex]
   if not entry then return nil end
-  self.entries[txid_hex] = nil
+  self.entries[wtxid_hex] = nil
+  -- Remove secondary txid→wtxid index entry.
+  if entry.txid_hex then
+    self.txid_to_wtxid[entry.txid_hex] = nil
+  end
   self.count = self.count - 1
   local pid = entry.peer_id
   if pid then
@@ -2752,22 +2773,27 @@ function OrphanPool:_remove_internal(txid_hex)
   return entry
 end
 
---- Public: remove an orphan by txid_hex.
-function OrphanPool:remove(txid_hex)
-  if not self.entries[txid_hex] then return false end
-  for i, t in ipairs(self.order) do
-    if t == txid_hex then
+--- Public: remove an orphan by wtxid_hex (primary key).
+function OrphanPool:remove(wtxid_hex)
+  if not self.entries[wtxid_hex] then return false end
+  for i, w in ipairs(self.order) do
+    if w == wtxid_hex then
       table.remove(self.order, i)
       break
     end
   end
-  self:_remove_internal(txid_hex)
+  self:_remove_internal(wtxid_hex)
   return true
 end
 
---- Test if the pool already has this orphan.
-function OrphanPool:has(txid_hex)
-  return self.entries[txid_hex] ~= nil
+--- Test if the pool already has this orphan (by wtxid_hex, primary key).
+function OrphanPool:has(wtxid_hex)
+  return self.entries[wtxid_hex] ~= nil
+end
+
+--- Test if the pool already has an orphan with this txid_hex (secondary index).
+function OrphanPool:has_by_txid(txid_hex)
+  return self.txid_to_wtxid[txid_hex] ~= nil
 end
 
 --- Number of orphans currently held.
@@ -2782,13 +2808,13 @@ function OrphanPool:remove_for_peer(peer_id)
   local removed = 0
   -- Walk entries; keep order list rebuild simple (n <= 100).
   local kept = {}
-  for _, txid_hex in ipairs(self.order) do
-    local e = self.entries[txid_hex]
+  for _, wtxid_hex in ipairs(self.order) do
+    local e = self.entries[wtxid_hex]
     if e and e.peer_id == peer_id then
-      self:_remove_internal(txid_hex)
+      self:_remove_internal(wtxid_hex)
       removed = removed + 1
     else
-      kept[#kept + 1] = txid_hex
+      kept[#kept + 1] = wtxid_hex
     end
   end
   self.order = kept
@@ -2799,20 +2825,21 @@ end
 -- mempool — find any orphans that listed it as a missing parent and
 -- return them in insertion order.  Caller is expected to re-feed them
 -- through `mempool:accept_transaction(...)` and remove them from the
--- pool with `pool:remove(txid_hex)` on either acceptance or persistent
+-- pool with `pool:remove(wtxid_hex)` on either acceptance or persistent
 -- rejection.
 --
--- @param parent_txid_hex string
--- @return list of {tx, txid_hex, peer_id} entries
+-- @param parent_txid_hex string: txid (not wtxid) of the newly-accepted parent
+-- @return list of {tx, wtxid_hex, txid_hex, peer_id} entries
 function OrphanPool:children_of(parent_txid_hex)
   local out = {}
-  for _, txid_hex in ipairs(self.order) do
-    local e = self.entries[txid_hex]
+  for _, wtxid_hex in ipairs(self.order) do
+    local e = self.entries[wtxid_hex]
     if e and e.missing_parents[parent_txid_hex] then
       out[#out + 1] = {
-        tx       = e.tx,
-        txid_hex = txid_hex,
-        peer_id  = e.peer_id,
+        tx        = e.tx,
+        wtxid_hex = wtxid_hex,
+        txid_hex  = e.txid_hex,
+        peer_id   = e.peer_id,
       }
     end
   end

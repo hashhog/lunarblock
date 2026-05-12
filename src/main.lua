@@ -1048,7 +1048,7 @@ local function main()
     if orphan_pool and block and block.transactions then
       local resolved = orphan_pool:on_block_connected(block)
       for _, c in ipairs(resolved) do
-        orphan_pool:remove(c.txid_hex)
+        orphan_pool:remove(c.wtxid_hex)
         pcall(function() mempool:accept_transaction(c.tx) end)
       end
     end
@@ -1175,12 +1175,14 @@ local function main()
       elseif reason == "missing inputs" then
         -- Buffer in orphan pool so that when the parent arrives we can
         -- re-evaluate.  Bounded; rejections are silent.
-        local txid = validation.compute_txid(tx)
-        local txid_hex = types.hash256_hex(txid)
+        -- Use wtxid as primary key (BIP-339 / W99 G14): two transactions
+        -- with the same txid but different witnesses are distinct orphans.
+        local wtxid = validation.compute_wtxid(tx)
+        local wtxid_hex = types.hash256_hex(wtxid)
         local missing = mempool:missing_parents_for(tx)
         local pid = (peer and peer.ip and peer.port)
                     and (peer.ip .. ":" .. peer.port) or "anonymous"
-        orphan_pool:add(tx, txid_hex, pid, missing)
+        orphan_pool:add(tx, wtxid_hex, pid, missing)
       else
         -- Log rejection if verbose
         local _ = reason
@@ -1206,7 +1208,9 @@ local function main()
         for _, c in ipairs(children) do
           -- Always remove first; on persistent reject we don't want to
           -- keep retrying the same tx every time the parent re-resolves.
-          orphan_pool:remove(c.txid_hex)
+          -- Remove by wtxid_hex (primary key); add txid_hex to worklist
+          -- so subsequent children_of() calls resolve grandchildren.
+          orphan_pool:remove(c.wtxid_hex)
           local accepted = mempool:accept_transaction(c.tx)
           if accepted then
             worklist[#worklist + 1] = c.txid_hex
