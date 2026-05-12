@@ -13,8 +13,9 @@
 --             first NUL are all zero — non-zero padding accepted silently.
 --   BUG-G25: math.random() (LCG, not CSRNG) used for garbage length; predictable.
 --   BUG-G30: m_sent_v1_header_worth (>= 24B) tracking absent.
---   BUG-G13: looks_like_v1 does not check network magic; cross-network peers
---            with matching command field misclassified as v1.
+--   BUG-G13: FIXED — looks_like_v1 now checks all 16 bytes (magic + command);
+--            cross-network peers with matching command field no longer
+--            misclassified as v1 (W98 G13 fix).
 
 describe("W98 BIP-324 gate audit", function()
   local bip324
@@ -123,28 +124,38 @@ describe("W98 BIP-324 gate audit", function()
       assert.equals(16, bip324.V1_PREFIX_LEN)
     end)
 
-    -- BUG-G13: looks_like_v1 only checks command bytes 5-16, not magic
-    it("BUG-G13: looks_like_v1 misclassifies wrong-magic + version command as v1", function()
+    -- G13 FIXED: looks_like_v1 now checks all 16 bytes (magic + command)
+    it("G13 FIXED: looks_like_v1 rejects wrong-magic + version command", function()
       -- A peer on a different network (wrong magic) sending "version\0\0\0\0\0"
-      -- should NOT be classified as a v1 peer on our network.
-      -- Core checks both magic AND command; lunarblock only checks command.
+      -- must NOT be classified as a v1 peer on our network.
+      -- Core checks both magic AND command (net.cpp:1091-1094); lunarblock
+      -- now does the same (W98 G13 fix).
+      local mainnet_magic = "\xf9\xbe\xb4\xd9"
       local wrong_magic_v1 = "\x00\x00\x00\x00" .. "version\0\0\0\0\0"
-      -- Under correct behaviour this should return false (not our network).
-      -- Under lunarblock it returns TRUE — documenting the bug.
-      local result = bip324.looks_like_v1(wrong_magic_v1)
-      -- Bug assertion: lunarblock incorrectly returns true for wrong magic
+      local result = bip324.looks_like_v1(wrong_magic_v1, mainnet_magic)
+      assert.is_false(result,
+        "G13 FIXED: wrong-magic peer must not be classified as v1 on our network")
+    end)
+
+    it("G13 FIXED: looks_like_v1 accepts correct magic + version command as v1", function()
+      local mainnet_magic = "\xf9\xbe\xb4\xd9"
+      local correct_v1 = mainnet_magic .. "version\0\0\0\0\0"
+      assert.equals(16, #correct_v1)
+      local result = bip324.looks_like_v1(correct_v1, mainnet_magic)
       assert.is_true(result,
-        "BUG-G13: lunarblock classifies wrong-magic peer as v1 (magic check absent)")
+        "G13 FIXED: correct magic + version command must be classified as v1")
     end)
 
     it("looks_like_v1 returns false for non-version command", function()
-      local prefix = "\xf9\xbe\xb4\xd9" .. "ping\0\0\0\0\0\0\0\0"
-      assert.is_false(bip324.looks_like_v1(prefix))
+      local mainnet_magic = "\xf9\xbe\xb4\xd9"
+      local prefix = mainnet_magic .. "ping\0\0\0\0\0\0\0\0"
+      assert.is_false(bip324.looks_like_v1(prefix, mainnet_magic))
     end)
 
     it("looks_like_v1 returns false for short input", function()
-      assert.is_false(bip324.looks_like_v1(""))
-      assert.is_false(bip324.looks_like_v1("short"))
+      local mainnet_magic = "\xf9\xbe\xb4\xd9"
+      assert.is_false(bip324.looks_like_v1("", mainnet_magic))
+      assert.is_false(bip324.looks_like_v1("short", mainnet_magic))
     end)
 
     -- BUG-G16: Forward linear scan vs tail scan
