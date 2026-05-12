@@ -71,51 +71,76 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
       disconnected = {},
       ban_calls = {},
     }
-    function pm:misbehaving(peer, score, reason)
-      peer.ban_score = (peer.ban_score or 0) + score
-      if peer.ban_score >= 100 then
-        self.banned[peer.ip] = true
-        self.disconnected[#self.disconnected + 1] = peer
-      end
-    end
-    function pm:add_ban_score(peer, score, reason)
-      self:misbehaving(peer, score, reason)
+    -- Single-event discourage per Core PR#25974: any misbehaving call on a
+    -- regular (non-noban, non-manual, non-local) peer immediately bans+disconnects.
+    function pm:disconnect_peer(peer, reason)
+      self.disconnected[#self.disconnected + 1] = peer
     end
     function pm:ban_peer(ip, duration)
       self.ban_calls[#self.ban_calls + 1] = {ip = ip, duration = duration}
       self.banned[ip] = true
     end
+    function pm:misbehaving(peer, score, reason)
+      -- mirrors peerman.lua PeerManager:misbehaving (G1 fix):
+      -- noban → no-op; manual/local → disconnect only; regular → ban+disconnect.
+      if peer.noban then return end
+      if peer.is_manual then
+        self:disconnect_peer(peer, "misbehaving (manual): " .. (reason or ""))
+        return
+      end
+      -- Simplified local check for the mock (peerman uses _is_local_addr)
+      if peer.ip == "127.0.0.1" or peer.ip == "::1" then
+        self:disconnect_peer(peer, "misbehaving (local): " .. (reason or ""))
+        return
+      end
+      self:ban_peer(peer.ip)
+      self:disconnect_peer(peer, "misbehaving: " .. (reason or ""))
+    end
+    function pm:add_ban_score(peer, score, reason)
+      self:misbehaving(peer, score, reason)
+    end
     return pm
   end
 
   ----------------------------------------------------------------
-  -- G1 — Misbehaving single-event discourage
-  -- src/peerman.lua:1176  CORRECTNESS
+  -- G1 — Misbehaving single-event discourage (FIXED W99 G1)
+  -- src/peerman.lua:misbehaving  CORRECTNESS
+  --
+  -- Bitcoin Core post-PR#25974 (2022): Misbehaving() sets m_should_discourage=true
+  -- immediately — any single event discourages+disconnects the peer.  No score
+  -- accumulation.  The old score-accumulate model required 100 points and allowed
+  -- a misbehaving peer to send 9 low-scoring violations before being banned.
   ----------------------------------------------------------------
-  describe("G1 misbehaving accumulates score correctly (peerman.lua:1176)", function()
-    it("single score increment below threshold does not ban", function()
+  describe("G1 single-event discourage per Core PR#25974 (peerman.lua:misbehaving) FIXED", function()
+    it("single misbehaving call on regular peer triggers ban+disconnect immediately", function()
       local pm = mock_peerman()
       local p = mock_peer({ip = "1.2.3.4"})
-      pm:misbehaving(p, 50, "test")
-      assert.equals(50, p.ban_score)
-      assert.is_nil(pm.banned["1.2.3.4"])
-      assert.equals(0, #pm.disconnected)
+      pm:misbehaving(p, 10, "single event")
+      -- Must be banned and disconnected on first call regardless of score value
+      assert.is_true(pm.banned["1.2.3.4"] ~= nil,
+        "regular peer must be banned on first misbehaving call")
+      assert.is_true(#pm.disconnected > 0,
+        "regular peer must be disconnected on first misbehaving call")
     end)
 
-    it("score reaching 100 triggers ban", function()
+    it("score value is irrelevant — small score (10) still triggers immediate discourage", function()
       local pm = mock_peerman()
       local p = mock_peer({ip = "1.2.3.5"})
-      pm:misbehaving(p, 100, "instant ban")
-      assert.is_true(pm.banned["1.2.3.5"] or p.ban_score >= 100)
+      pm:misbehaving(p, 10, "low score still discourages")
+      assert.is_true(pm.banned["1.2.3.5"] ~= nil,
+        "score=10 must still ban immediately (no threshold)")
+      assert.is_true(#pm.disconnected > 0,
+        "score=10 must still disconnect immediately")
     end)
 
-    it("cumulative score reaching threshold triggers ban", function()
+    it("score value is irrelevant — large score (100) triggers immediate discourage", function()
       local pm = mock_peerman()
       local p = mock_peer({ip = "1.2.3.6"})
-      pm:misbehaving(p, 40, "first")
-      pm:misbehaving(p, 40, "second")
-      pm:misbehaving(p, 40, "third")
-      assert.is_true(p.ban_score >= 100)
+      pm:misbehaving(p, 100, "instant ban")
+      assert.is_true(pm.banned["1.2.3.6"] ~= nil,
+        "score=100 must ban immediately")
+      assert.is_true(#pm.disconnected > 0,
+        "score=100 must disconnect immediately")
     end)
   end)
 
@@ -165,32 +190,28 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
       return pm
     end
 
-    it("noban peer: score accumulates but is never banned or disconnected", function()
+    it("noban peer: never banned or disconnected (single-event model)", function()
       local pm = minimal_pm()
       local p = mock_peer({ip = "2.2.2.2"})
       p.noban = true
       pm:misbehaving(p, 100, "noban peer misbehaved")
-      -- Score was accumulated for observability
-      assert.is_true(p.ban_score >= 100, "score must accumulate even for noban peers")
-      -- But no ban or disconnect
+      -- No ban or disconnect regardless of score
       assert.equals(0, #pm.ban_calls,
         "noban peer must NOT be added to ban list")
       assert.equals(0, #pm.disconnected_peers,
         "noban peer must NOT be disconnected")
     end)
 
-    it("manual peer: score accumulates but only disconnected on threshold (never banned)", function()
+    it("manual peer: disconnected immediately on misbehaving call (never banned)", function()
       local pm = minimal_pm()
       local p = mock_peer({ip = "2.2.2.3"})
       p.is_manual = true
       pm:misbehaving(p, 100, "manual peer misbehaved")
-      -- Score accumulates
-      assert.is_true(p.ban_score >= 100, "score must accumulate for manual peer")
-      -- Disconnected but NOT banned
+      -- Disconnected but NOT banned (single-event)
       assert.equals(0, #pm.ban_calls,
         "manual peer must NOT be added to ban list")
       assert.equals(1, #pm.disconnected_peers,
-        "manual peer must be disconnected on threshold")
+        "manual peer must be disconnected immediately on misbehaving call")
     end)
 
     it("local/loopback peer: disconnect-only on threshold, never banned", function()

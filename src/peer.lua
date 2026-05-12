@@ -471,17 +471,20 @@ function Peer:disconnect(reason)
   self.disconnect_reason = reason
 end
 
---- Increment misbehavior score and disconnect if threshold exceeded.
--- @param score number: points to add to ban score
+--- Disconnect peer immediately on any misbehavior (single-event, no score).
+-- Mirrors Bitcoin Core Misbehaving() (net_processing.cpp:1893, PR#25974):
+-- any single misbehaving event sets m_should_discourage=true and the peer
+-- is disconnected on the next MaybeDiscourageAndDisconnect pass.
+-- The `score` parameter is accepted for call-site compatibility but ignored.
+-- IP-level discouragement is handled by PeerManager:misbehaving(); this
+-- per-Peer method covers low-level protocol violations caught before the
+-- message reaches the PeerManager dispatcher.
+-- @param score number: ignored (kept for call-site compatibility)
 -- @param reason string: reason for misbehavior
 -- @return boolean: true if peer was disconnected
 function Peer:misbehaving(score, reason)
-  self.ban_score = self.ban_score + score
-  if self.ban_score >= 100 then
-    self:disconnect("misbehaving: " .. (reason or "score exceeded"))
-    return true
-  end
-  return false
+  self:disconnect("misbehaving: " .. (reason or "protocol violation"))
+  return true
 end
 
 --------------------------------------------------------------------------------
