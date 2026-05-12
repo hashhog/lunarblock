@@ -887,6 +887,21 @@ end
 -- BIP341 Taproot Signature Hash
 --------------------------------------------------------------------------------
 
+--- BIP-341 hash-type validity check.
+-- Per Core SignatureHashSchnorr (interpreter.cpp:1516) only the values
+--   {0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83}
+-- are accepted; everything else makes SignatureHashSchnorr return false
+-- and the surrounding Schnorr check fails. Pre-fix lunarblock omitted
+-- this range check in all three Taproot checker sites (key-path schnorr
+-- (×2) and tapscript checker.check_sig); a 65-byte sig whose last byte
+-- was e.g. 0x04 would still compute a sighash and the verify would
+-- succeed or fail depending on whether the resulting hash happened to
+-- match a forged sig — i.e. lunarblock could ACCEPT a witness Core
+-- REJECTS, splitting consensus on any block that lands such a sig.
+function M.is_valid_taproot_hash_type(hash_type)
+  return hash_type <= 0x03 or (hash_type >= 0x81 and hash_type <= 0x83)
+end
+
 --- Compute the BIP-341 sigmsg buffer (the bytes fed into TapSighash tagged
 -- hash). Exposed so the bip341-vector-runner shim can validate the
 -- pre-image against Bitcoin Core's BIP-341 wallet vectors before checking
@@ -1537,6 +1552,8 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
       sig_bytes = string.sub(sig, 1, 64)
       -- BIP-341: explicit SIGHASH_DEFAULT byte is invalid in 65-byte form
       if hash_type == 0x00 then return false end
+      -- BIP-341 hash_type range gate (Core interpreter.cpp:1516).
+      if not M.is_valid_taproot_hash_type(hash_type) then return false end
     end
 
     local sighash = M.signature_hash_taproot(
@@ -1641,6 +1658,10 @@ function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, a
       sig_bytes = sig:sub(1, 64)
       -- BIP341: hash_type 0x00 must not be used with 65-byte sig
       if hash_type == 0x00 then
+        return false
+      end
+      -- BIP-341 hash_type range gate (Core interpreter.cpp:1516).
+      if not M.is_valid_taproot_hash_type(hash_type) then
         return false
       end
     end
@@ -1825,6 +1846,8 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
       hash_type = string.byte(sig, 65)
       sig_bytes = string.sub(sig, 1, 64)
       if hash_type == 0x00 then return false end
+      -- BIP-341 hash_type range gate (Core interpreter.cpp:1516).
+      if not M.is_valid_taproot_hash_type(hash_type) then return false end
     end
 
     local sighash = M.signature_hash_taproot(
