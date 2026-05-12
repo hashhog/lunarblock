@@ -685,25 +685,86 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
   --
   -- Core: AcceptBlock 4325 + 4339.
   --
-  -- lunarblock has NO fTooFarAhead gate.  Headers can extend the chain
-  -- arbitrarily far; blocks above tip+288 can be downloaded and stored.
-  -- The download window (sync.lua download_window=1024) bounds in-flight,
-  -- not stored.
-  --
-  -- SEVERITY: DOS — pruning ceiling defense missing.  Under attack, an
-  -- alt chain millions of headers ahead can pin block bodies in the
-  -- newest 288 blocks, defeating pruning.
+  -- Fixed (W97 G19c): utxo.lua accept_block now carries the gate.
+  -- MIN_BLOCKS_TO_KEEP=288 is reused from prune_mod in utxo.lua.
+  -- opts.requested=true exempts explicitly-requested blocks.
   ----------------------------------------------------------------
-  it("G19c BUG: no fTooFarAhead / tip+288 gate (DOS, prune-defeat)", function()
-    local function search(path, needle)
-      local f = io.open(path, "r"); if not f then return false end
-      local s = f:read("*a"); f:close(); return s:find(needle) ~= nil
+  describe("G19c fTooFarAhead gate (utxo.lua accept_block, W97 G19c active)", function()
+    local utxo_mod
+
+    setup(function()
+      package.preload["lunarblock.prune"]       = function() return require("prune") end
+      package.preload["lunarblock.storage"]     = function() return require("storage") end
+      package.preload["lunarblock.mining"]      = function() return require("mining") end
+      package.preload["lunarblock.blockfilter"] = function() return require("blockfilter") end
+      package.preload["lunarblock.sig_cache"]   = function() return require("sig_cache") end
+      package.preload["lunarblock.perf"]        = function() return require("perf") end
+      utxo_mod = require("utxo")
+    end)
+
+    local function make_chain_state(tip_height)
+      -- Use the module's public constructor, then override tip_height.
+      local storage = helpers.mock_storage()
+      local cs = utxo_mod.new_chain_state(storage, consensus.networks.regtest)
+      cs.tip_height = tip_height
+      return cs
     end
-    -- MIN_BLOCKS_TO_KEEP=288 lives in prune.lua only.
-    assert.is_true(search("src/prune.lua", "MIN_BLOCKS_TO_KEEP"))
-    -- It is NOT referenced from sync.lua or utxo.lua accept paths.
-    assert.is_false(search("src/sync.lua", "MIN_BLOCKS_TO_KEEP"))
-    assert.is_false(search("src/utxo.lua", "MIN_BLOCKS_TO_KEEP"))
+
+    local function dummy_block()
+      -- Minimal block table; accept_block hits the fTooFarAhead gate before
+      -- check_block when skip_check_block=true.
+      return { header = {}, transactions = {} }
+    end
+
+    local function dummy_hash()
+      return types.hash256(string.rep("\xaa", 32))
+    end
+
+    it("unrequested block at tip+289 is rejected with too-far-ahead", function()
+      local cs = make_chain_state(1000)
+      -- height = 1000 + 289 = 1289 → strictly greater than tip+288; gate fires
+      local ok, err = cs:accept_block(dummy_block(), 1289, dummy_hash(), {
+        skip_check_block = true,
+      })
+      assert.is_nil(ok)
+      assert.matches("too%-far%-ahead", tostring(err))
+    end)
+
+    it("unrequested block at exactly tip+288 is NOT rejected by fTooFarAhead", function()
+      local cs = make_chain_state(1000)
+      -- height = 1000 + 288 = 1288 → at boundary (strictly >); gate must not fire.
+      -- Use pcall because deeper validation may raise a Lua error on the dummy block.
+      local pcall_ok, ok_or_err, err2 = pcall(cs.accept_block, cs, dummy_block(), 1288, dummy_hash(), {
+        skip_check_block = true,
+      })
+      -- Whether it returned (nil, err) or raised, the error must NOT be too-far-ahead.
+      local err_str = pcall_ok and tostring(err2) or tostring(ok_or_err)
+      assert.is_false(err_str:find("too%-far%-ahead") ~= nil,
+        "fTooFarAhead gate must NOT fire at tip+288 (strictly > 288)")
+    end)
+
+    it("requested block at tip+289 is NOT rejected by fTooFarAhead", function()
+      local cs = make_chain_state(1000)
+      -- opts.requested=true exempts the gate (block was in the inflight set).
+      -- Use pcall because deeper validation may raise a Lua error on the dummy block.
+      local pcall_ok, ok_or_err, err2 = pcall(cs.accept_block, cs, dummy_block(), 1289, dummy_hash(), {
+        skip_check_block = true,
+        requested        = true,
+      })
+      -- Whether it returned (nil, err) or raised, the error must NOT be too-far-ahead.
+      local err_str = pcall_ok and tostring(err2) or tostring(ok_or_err)
+      assert.is_false(err_str:find("too%-far%-ahead") ~= nil,
+        "fTooFarAhead gate must NOT fire when opts.requested=true")
+    end)
+
+    it("structural: MIN_BLOCKS_TO_KEEP referenced in utxo.lua (constant reused from prune)", function()
+      local function search(path, needle)
+        local f = io.open(path, "r"); if not f then return false end
+        local s = f:read("*a"); f:close(); return s:find(needle) ~= nil
+      end
+      assert.is_true(search("src/prune.lua", "MIN_BLOCKS_TO_KEEP"))
+      assert.is_true(search("src/utxo.lua",  "MIN_BLOCKS_TO_KEEP"))
+    end)
   end)
 
   ----------------------------------------------------------------
