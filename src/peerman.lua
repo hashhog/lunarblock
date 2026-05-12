@@ -1187,73 +1187,76 @@ function PeerManager:is_banned(ip)
   return self.banned[ip] and self.banned[ip] > os.time()
 end
 
---- Log misbehavior and add to ban score.
--- Reference: Bitcoin Core net_processing.cpp MaybeDiscourageAndDisconnect (5083)
+--- Discourage and disconnect a misbehaving peer (single-event, no score).
+-- Reference: Bitcoin Core net_processing.cpp Misbehaving (1893) +
+--            MaybeDiscourageAndDisconnect (5083) — PR #25974 (2022).
+--
+-- Core model (post-PR#25974): Misbehaving() sets m_should_discourage=true
+-- immediately; MaybeDiscourageAndDisconnect() acts on the flag in the same
+-- message-processing loop.  There is NO score accumulation — a single
+-- misbehaving event discourages+disconnects the peer.  The `score` parameter
+-- is accepted for API compatibility (callers may pass 100 or 10) but is
+-- ignored — every call triggers immediate action.
+--
+-- G2 guards (FIX-2, a574b7c) are preserved exactly:
 --   if (pnode.HasPermission(NetPermissionFlags::NoBan)) return false;
---   if (pnode.IsManualConn()) return false;         -- disconnect only, never ban
+--   if (pnode.IsManualConn()) return false;   -- disconnect only, never ban
 --   if (pnode.addr.IsLocal()) { disconnect only }
 --   else { Discourage(pnode.addr); }
 --   pnode.fDisconnect = true;
+--
 -- @param peer Peer: peer that misbehaved
--- @param score number: ban score to add
+-- @param score number: ignored (kept for call-site compatibility)
 -- @param reason string: reason for the misbehavior
 function PeerManager:misbehaving(peer, score, reason)
   reason = reason or "unspecified"
 
-  -- Guard: NoBan-whitelisted peers accumulate score for observability but
-  -- are NEVER banned or disconnected (mirrors NetPermissionFlags::NoBan).
+  -- Guard: NoBan-whitelisted peers are NEVER banned or disconnected
+  -- (mirrors NetPermissionFlags::NoBan). Log for observability only.
   if peer.noban then
-    peer.ban_score = (peer.ban_score or 0) + score
     local key = peer.ip .. ":" .. (peer.port or 0)
     print(string.format(
-      "[misbehaving] peer=%s (noban) score +%d, skipping ban/disconnect: %s",
-      key, score, reason
+      "[misbehaving] peer=%s (noban) skipping ban/disconnect: %s",
+      key, reason
     ))
     return
   end
 
-  local old_score = peer.ban_score
-  peer.ban_score = peer.ban_score + score
-
-  -- Log the misbehavior
-  local key = peer.ip .. ":" .. peer.port
+  local key = peer.ip .. ":" .. (peer.port or 0)
   print(string.format(
-    "[misbehaving] peer=%s score +%d (%d -> %d): %s",
-    key, score, old_score, peer.ban_score, reason
+    "[misbehaving] peer=%s single-event discourage: %s",
+    key, reason
   ))
 
-  -- Check if threshold exceeded
-  if peer.ban_score >= M.MISBEHAVIOR.BAN_THRESHOLD then
-    -- Guard: manual (addnode) peers are only DISCONNECTED, never banned
-    -- (mirrors CNode::m_manually_added — they have a human-trusted addnode entry).
-    if peer.is_manual then
-      print(string.format(
-        "[misbehaving] peer=%s (manual) threshold reached, disconnect-only (no ban): %s",
-        key, reason
-      ))
-      self:disconnect_peer(peer, "misbehaving (manual peer): " .. reason)
-      return
-    end
-
-    -- Guard: local/loopback peers get disconnect-only treatment (mirrors
-    -- Core's IsLocal() branch in MaybeDiscourageAndDisconnect).
-    if _is_local_addr(peer.ip) then
-      print(string.format(
-        "[misbehaving] peer=%s (local) threshold reached, disconnect-only (no ban): %s",
-        key, reason
-      ))
-      self:disconnect_peer(peer, "misbehaving (local peer): " .. reason)
-      return
-    end
-
-    -- Regular inbound/outbound peer: ban IP and disconnect.
+  -- Guard: manual (addnode) peers are only DISCONNECTED, never banned
+  -- (mirrors CNode::m_manually_added).
+  if peer.is_manual then
     print(string.format(
-      "[misbehaving] peer=%s ban threshold reached, banning",
-      key
+      "[misbehaving] peer=%s (manual) disconnect-only (no ban): %s",
+      key, reason
     ))
-    self:ban_peer(peer.ip)
-    self:disconnect_peer(peer, "ban score exceeded: " .. reason)
+    self:disconnect_peer(peer, "misbehaving (manual peer): " .. reason)
+    return
   end
+
+  -- Guard: local/loopback peers get disconnect-only treatment (mirrors
+  -- Core's IsLocal() branch in MaybeDiscourageAndDisconnect).
+  if _is_local_addr(peer.ip) then
+    print(string.format(
+      "[misbehaving] peer=%s (local) disconnect-only (no ban): %s",
+      key, reason
+    ))
+    self:disconnect_peer(peer, "misbehaving (local peer): " .. reason)
+    return
+  end
+
+  -- Regular inbound/outbound peer: discourage IP and disconnect immediately.
+  print(string.format(
+    "[misbehaving] peer=%s discouraging and disconnecting",
+    key
+  ))
+  self:ban_peer(peer.ip)
+  self:disconnect_peer(peer, "misbehaving: " .. reason)
 end
 
 --- Add to a peer's ban score and ban if threshold exceeded.
