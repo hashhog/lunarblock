@@ -749,22 +749,22 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
   end)
 
   ----------------------------------------------------------------
-  -- BUG G23 — payload cap is 32 MiB, NOT 4 MiB
+  -- G23 — payload cap is 4 MB (FIXED W99 G23)
   -- src/p2p.lua:11 + src/peer.lua:578  DOS
   --
-  -- Bitcoin Core net_processing.cpp ProcessMessage rejects messages
-  -- larger than MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1024 * 1024 (4 MiB).
-  -- lunarblock p2p.lua:11 defines MAX_MESSAGE_SIZE = 32 * 1024 * 1024.
-  -- A peer can send an 8× oversized payload before disconnection.
+  -- Bitcoin Core net.h:65 MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000.
+  -- Was: 32 * 1024 * 1024 (32 MiB, 8× too large).
+  -- Fixed: 4 * 1000 * 1000 = 4,000,000 bytes.
   ----------------------------------------------------------------
-  describe("G23 BUG: payload cap 32 MiB (should be 4 MiB) (p2p.lua:11) DOS", function()
-    it("XFAIL: MAX_MESSAGE_SIZE is 32 MB, not 4 MB", function()
-      local expected_core = 4 * 1024 * 1024  -- Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH
-      local actual = p2p.MAX_MESSAGE_SIZE
-      assert.equals(32 * 1024 * 1024, actual,
-        "MAX_MESSAGE_SIZE is 32 MB (documenting the bug)")
-      assert.is_true(actual > expected_core,
-        "lunarblock allows 8x larger messages than Bitcoin Core (DoS vector)")
+  describe("G23 payload cap is 4 MB per Core (p2p.lua:11) DOS FIXED", function()
+    it("MAX_MESSAGE_SIZE is 4,000,000 bytes (Core MAX_PROTOCOL_MESSAGE_LENGTH)", function()
+      assert.equals(4 * 1000 * 1000, p2p.MAX_MESSAGE_SIZE,
+        "MAX_MESSAGE_SIZE must equal Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH (4 * 1000 * 1000)")
+    end)
+
+    it("MAX_MESSAGE_SIZE is strictly less than 32 MiB (old buggy value)", function()
+      assert.is_true(p2p.MAX_MESSAGE_SIZE < 32 * 1024 * 1024,
+        "MAX_MESSAGE_SIZE must not exceed 32 MiB (fix must be live)")
     end)
   end)
 
