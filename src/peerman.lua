@@ -391,6 +391,22 @@ function PeerManager:get_local_addresses()
   return addresses
 end
 
+--- Check if an IP address is a local/loopback address.
+-- Mirrors Bitcoin Core CNetAddr::IsLocal().
+-- Local peers get disconnect-only on misbehavior (never banned).
+-- @param ip string: IPv4 or IPv6 address
+-- @return boolean
+local function _is_local_addr(ip)
+  if not ip then return false end
+  -- IPv4 loopback (127.0.0.0/8)
+  if ip:match("^127%.") then return true end
+  -- IPv6 loopback (::1)
+  if ip == "::1" then return true end
+  -- IPv4-mapped IPv6 loopback (::ffff:127.x.x.x)
+  if ip:match("^::ffff:127%.") then return true end
+  return false
+end
+
 --------------------------------------------------------------------------------
 -- Address Manager Initialization (Eclipse Attack Mitigation)
 --------------------------------------------------------------------------------
@@ -951,6 +967,9 @@ function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override, is_
     if self._peer_chain_sync[key] then
       self._peer_chain_sync[key].protect = true
     end
+    -- Also mark the peer object so misbehaving() can apply disconnect-only
+    -- semantics (never ban) — mirrors Core CNode::m_manually_added.
+    p.is_manual = true
   end
 
   p:start_handshake()
@@ -1169,12 +1188,30 @@ function PeerManager:is_banned(ip)
 end
 
 --- Log misbehavior and add to ban score.
--- Reference: Bitcoin Core net_processing.cpp Misbehaving()
+-- Reference: Bitcoin Core net_processing.cpp MaybeDiscourageAndDisconnect (5083)
+--   if (pnode.HasPermission(NetPermissionFlags::NoBan)) return false;
+--   if (pnode.IsManualConn()) return false;         -- disconnect only, never ban
+--   if (pnode.addr.IsLocal()) { disconnect only }
+--   else { Discourage(pnode.addr); }
+--   pnode.fDisconnect = true;
 -- @param peer Peer: peer that misbehaved
 -- @param score number: ban score to add
 -- @param reason string: reason for the misbehavior
 function PeerManager:misbehaving(peer, score, reason)
   reason = reason or "unspecified"
+
+  -- Guard: NoBan-whitelisted peers accumulate score for observability but
+  -- are NEVER banned or disconnected (mirrors NetPermissionFlags::NoBan).
+  if peer.noban then
+    peer.ban_score = (peer.ban_score or 0) + score
+    local key = peer.ip .. ":" .. (peer.port or 0)
+    print(string.format(
+      "[misbehaving] peer=%s (noban) score +%d, skipping ban/disconnect: %s",
+      key, score, reason
+    ))
+    return
+  end
+
   local old_score = peer.ban_score
   peer.ban_score = peer.ban_score + score
 
@@ -1187,6 +1224,29 @@ function PeerManager:misbehaving(peer, score, reason)
 
   -- Check if threshold exceeded
   if peer.ban_score >= M.MISBEHAVIOR.BAN_THRESHOLD then
+    -- Guard: manual (addnode) peers are only DISCONNECTED, never banned
+    -- (mirrors CNode::m_manually_added — they have a human-trusted addnode entry).
+    if peer.is_manual then
+      print(string.format(
+        "[misbehaving] peer=%s (manual) threshold reached, disconnect-only (no ban): %s",
+        key, reason
+      ))
+      self:disconnect_peer(peer, "misbehaving (manual peer): " .. reason)
+      return
+    end
+
+    -- Guard: local/loopback peers get disconnect-only treatment (mirrors
+    -- Core's IsLocal() branch in MaybeDiscourageAndDisconnect).
+    if _is_local_addr(peer.ip) then
+      print(string.format(
+        "[misbehaving] peer=%s (local) threshold reached, disconnect-only (no ban): %s",
+        key, reason
+      ))
+      self:disconnect_peer(peer, "misbehaving (local peer): " .. reason)
+      return
+    end
+
+    -- Regular inbound/outbound peer: ban IP and disconnect.
     print(string.format(
       "[misbehaving] peer=%s ban threshold reached, banning",
       key
@@ -2190,5 +2250,9 @@ function PeerManager:_load_bans()
   end
   f:close()
 end
+
+-- Expose PeerManager metatable so tests can borrow individual methods
+-- (e.g. misbehaving()) without constructing a full I/O-bound instance.
+M.PeerManager = PeerManager
 
 return M
