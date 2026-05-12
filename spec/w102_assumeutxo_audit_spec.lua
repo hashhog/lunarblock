@@ -229,8 +229,8 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
   -- Core validation.cpp:5600-5601: if CurrentChainstate().m_from_snapshot_blockhash
   -- is set, refuse a second loadtxoutset with "Can't activate a snapshot-based
   -- chainstate more than once".
-  describe("BUG-3: calling loadtxoutset twice succeeds (no duplicate guard)", function()
-    it("second loadtxoutset call is not rejected", function()
+  describe("BUG-3 FIXED: duplicate-activation guard", function()
+    it("second loadtxoutset call is rejected with duplicate-activation error", function()
       local db, cs = build_chain(1)
       local snap = "/tmp/lb_w102_bug3_" .. os.time() .. "_" .. math.random(1000000) .. ".dat"
       local tip_hex = types.hash256_hex(cs.tip_hash)
@@ -258,13 +258,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
       local req = '{"method":"loadtxoutset","params":["' .. snap .. '"],"id":1}'
 
-      -- First call
+      -- First call — must succeed
       local _r1raw = server:handle_request(req)
       local r1 = cjson.decode(_r1raw)
+      local r1_ok = (r1.error == nil or r1.error == cjson.null)
+      assert.is_true(r1_ok, "first loadtxoutset should succeed")
 
-      -- Second call — Core would reject with "Can't activate a snapshot-based
-      -- chainstate more than once".  lunarblock silently re-loads.
-      -- BUG: no error returned on second call.
+      -- Second call — must be rejected (BUG-3 fix: duplicate-activation guard).
       local snap2 = snap .. "2"
       os.rename(snap, snap2)  -- avoid "file exists" guard on dump
       cs:dump_snapshot(snap2)
@@ -272,12 +272,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       local _r2raw = server:handle_request(req)
       local r2 = cjson.decode(_r2raw)
 
-      -- Document the bug: both calls return success (no dedup guard).
-      -- JSON null comes back as cjson.null (userdata), not Lua nil.
-      local r1_ok = (r1.error == nil or r1.error == cjson.null)
-      local r2_ok = (r2.error == nil or r2.error == cjson.null)
-      assert.is_true(r1_ok, "first loadtxoutset should succeed")
-      assert.is_true(r2_ok, "BUG-3: second loadtxoutset should be rejected but isn't")
+      -- Fixed: second call must return an error (Core:5600-5601).
+      local r2_has_error = (r2.error ~= nil and r2.error ~= cjson.null)
+      assert.is_true(r2_has_error,
+        "second loadtxoutset must be rejected (Core validation.cpp:5600-5601)")
+      if type(r2.error) == "table" then
+        assert.matches("more than once", r2.error.message)
+      end
 
       db.close()
       os.remove(snap)
@@ -286,8 +287,8 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
   -- ── BUG-5: mempool-empty precondition absent ──────────────────────────────────
   -- Core validation.cpp:5627-5629 refuses loadtxoutset when mempool is non-empty.
-  describe("BUG-5: loadtxoutset succeeds even when mempool is non-empty", function()
-    it("non-empty mempool does not block loadtxoutset", function()
+  describe("BUG-5 FIXED: mempool-empty precondition", function()
+    it("non-empty mempool blocks loadtxoutset with an error", function()
       local db, cs = build_chain(1)
       local snap   = "/tmp/lb_w102_bug5_" .. os.time() .. "_" .. math.random(1000000) .. ".dat"
       local tip_hex = types.hash256_hex(cs.tip_hash)
@@ -317,11 +318,14 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       local _bug5raw = server:handle_request(req)
       local resp = cjson.decode(_bug5raw)
 
-      -- BUG: no rejection despite non-empty mempool
+      -- Fixed: non-empty mempool must be rejected (Core validation.cpp:5627-5629).
       -- JSON null -> cjson.null (userdata), not Lua nil.
-      local no_error = (resp.error == nil or resp.error == cjson.null)
-      assert.is_true(no_error,
-        "BUG-5: loadtxoutset should reject when mempool is non-empty (Core:5627)")
+      local has_error = (resp.error ~= nil and resp.error ~= cjson.null)
+      assert.is_true(has_error,
+        "loadtxoutset must be rejected when mempool is non-empty (Core:5627-5629)")
+      if type(resp.error) == "table" then
+        assert.matches("mempool", resp.error.message)
+      end
 
       db.close()
       os.remove(snap)
@@ -330,8 +334,8 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
   -- ── BUG-6: coin.nHeight > base_height validation absent ──────────────────────
   -- Core validation.cpp:5814: coin.nHeight > base_height → reject snapshot.
-  describe("BUG-6: coin height > base_height not validated during load", function()
-    it("snapshot coin with height > base_height is silently accepted", function()
+  describe("BUG-6 FIXED: coin height > base_height guard", function()
+    it("snapshot coin with height > base_height is rejected", function()
       local tmp  = "/tmp/lb_w102_bug6_" .. os.time() .. "_" .. math.random(1000000)
       local db   = storage_mod.open(tmp)
       local cs   = utxo.new_chain_state(db, consensus.networks.regtest)
@@ -356,11 +360,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       f:write(utxo.serialize_snapshot_coin(bad_coin))
       f:close()
 
-      -- BUG: load_snapshot does not validate coin.height against base_height
+      -- Fixed: load_snapshot must reject a coin whose height > base_height
+      -- (Core validation.cpp:5814-5819).
       local ok, err = cs:load_snapshot(snap)
-      assert.is_true(ok,
-        "BUG-6: coin with height > base_height should be rejected (Core:5814) but isn't")
-      assert.is_nil(err)
+      assert.is_false(ok,
+        "coin with height > base_height must be rejected (Core:5814-5819)")
+      assert.is_not_nil(err)
+      assert.matches("Bad snapshot data", err)
 
       db.close()
       os.remove(snap)
@@ -369,8 +375,8 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
   -- ── BUG-7: per-coin MoneyRange validation absent ──────────────────────────────
   -- Core validation.cpp:5820: !MoneyRange(coin.out.nValue) → reject snapshot.
-  describe("BUG-7: negative coin value not rejected during load", function()
-    it("snapshot coin with negative value is silently accepted", function()
+  describe("BUG-7 FIXED: per-coin MoneyRange guard", function()
+    it("snapshot coin with negative value is rejected", function()
       local tmp = "/tmp/lb_w102_bug7_" .. os.time() .. "_" .. math.random(1000000)
       local db  = storage_mod.open(tmp)
       local cs  = utxo.new_chain_state(db, consensus.networks.regtest)
@@ -393,10 +399,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       f:write(utxo.serialize_snapshot_coin(neg_coin))
       f:close()
 
-      -- BUG: no MoneyRange check → negative-value coin accepted
-      local ok = cs:load_snapshot(snap)
-      assert.is_true(ok,
-        "BUG-7: negative coin value should be rejected (Core:5820) but isn't")
+      -- Fixed: MoneyRange check must reject negative-value coin
+      -- (Core validation.cpp:5820-5823).
+      local ok, err = cs:load_snapshot(snap)
+      assert.is_false(ok,
+        "negative coin value must be rejected (Core:5820-5823)")
+      assert.is_not_nil(err)
+      assert.matches("bad tx out value", err)
 
       db.close()
       os.remove(snap)
@@ -405,8 +414,8 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
   -- ── BUG-8: coins_per_txid > coins_left guard absent ──────────────────────────
   -- Core validation.cpp:5804-5806: if (coins_per_txid > coins_left) → reject.
-  describe("BUG-8: coins_per_txid > coins_left not checked", function()
-    it("snapshot with coins_per_txid exceeding metadata coins_count loads without error", function()
+  describe("BUG-8 FIXED: coins_per_txid > coins_left overflow guard", function()
+    it("snapshot with coins_per_txid exceeding metadata coins_count is rejected", function()
       local tmp = "/tmp/lb_w102_bug8_" .. os.time() .. "_" .. math.random(1000000)
       local db  = storage_mod.open(tmp)
       local cs  = utxo.new_chain_state(db, consensus.networks.regtest)
@@ -432,13 +441,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       end
       f:close()
 
-      -- BUG: load_snapshot stops after coins_loaded==1 (loop condition:
-      -- while coins_loaded < coins_total), so vout 1 and 2 are never read.
-      -- Core rejects at the "coins_per_txid > coins_left" check.
-      local ok = cs:load_snapshot(snap)
-      -- Currently it succeeds; Core would reject.
-      assert.is_true(ok,
-        "BUG-8: coins_per_txid > coins_left should be rejected (Core:5804) but isn't")
+      -- Fixed: coins_per_txid > coins_left must be rejected
+      -- (Core validation.cpp:5804-5806).
+      local ok, err = cs:load_snapshot(snap)
+      assert.is_false(ok,
+        "coins_per_txid > coins_left must be rejected (Core:5804-5806)")
+      assert.is_not_nil(err)
+      assert.matches("Mismatch in coins count", err)
 
       db.close()
       os.remove(snap)
@@ -448,8 +457,8 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
   -- ── BUG-9: trailing-data after last coin not detected ────────────────────────
   -- Core validation.cpp:5872-5883: reads one extra byte after all coins;
   -- if it succeeds (no exception), the snapshot is corrupt.
-  describe("BUG-9: trailing garbage bytes after last coin not detected", function()
-    it("snapshot with trailing bytes after all coins is accepted", function()
+  describe("BUG-9 FIXED: trailing-bytes EOF check", function()
+    it("snapshot with trailing bytes after all coins is rejected", function()
       local tmp = "/tmp/lb_w102_bug9_" .. os.time() .. "_" .. math.random(1000000)
       local db  = storage_mod.open(tmp)
       local cs  = utxo.new_chain_state(db, consensus.networks.regtest)
@@ -474,10 +483,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       f:write(string.rep("\xff", 16))
       f:close()
 
-      -- BUG: load_snapshot does not check for leftover data
-      local ok = cs:load_snapshot(snap)
-      assert.is_true(ok,
-        "BUG-9: trailing data after last coin should be rejected (Core:5880) but isn't")
+      -- Fixed: trailing data after the last coin must be rejected
+      -- (Core validation.cpp:5872-5883).
+      local ok, err = cs:load_snapshot(snap)
+      assert.is_false(ok,
+        "trailing data after last coin must be rejected (Core:5872-5883)")
+      assert.is_not_nil(err)
+      assert.matches("coins left over", err)
 
       db.close()
       os.remove(snap)
