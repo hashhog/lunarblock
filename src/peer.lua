@@ -406,7 +406,7 @@ function Peer:drive_inbound_v2_handshake()
 
   -- Peek (do not consume) the first 16 bytes to classify.
   local prefix = self.recv_buffer:sub(1, bip324.V1_PREFIX_LEN)
-  if bip324.looks_like_v1(prefix) then
+  if bip324.looks_like_v1(prefix, self.network.magic_bytes) then
     -- Peer is v1-only.  Tear down v2 and let the v1 path in
     -- recv_messages() consume the bytes still in recv_buffer.
     io.stderr:write(string.format(

@@ -48,14 +48,23 @@ M.V1_PREFIX_LEN = 16
 --- classify before deciding whether to send v2 ellswift bytes (we MUST
 --- avoid sending v2 garbage to a v1-only peer; the 64 bytes will be
 --- mis-parsed as a v1 header and the peer will ban us).
--- @param data string: first 16 (or more) bytes received from peer
--- @return boolean: true if this looks like v1
-function M.looks_like_v1(data)
+--
+-- Canonical Core logic (net.cpp:1091-1094): build the full 16-byte
+-- v1_prefix = magic (4B) + "version\0\0\0\0\0" (12B) and compare ALL
+-- 16 bytes against the receive buffer.  Checking only the command field
+-- (bytes 5-16) is NOT sufficient — a peer on a different network whose
+-- magic happens to differ but who sends "version\0\0\0\0\0" would be
+-- mis-classified as a v1 peer on our network (W98 G13).
+--
+-- @param data       string: first 16 (or more) bytes received from peer
+-- @param magic_bytes string: 4-byte network magic for the current network
+-- @return boolean: true if this looks like a v1 peer on our network
+function M.looks_like_v1(data, magic_bytes)
   if not data or #data < 16 then return false end
-  -- Bytes 5-16 must match the v1 command field "version\0\0\0\0\0".
-  -- We do not check magic explicitly — the chance of a random ellswift
-  -- pubkey collision with these 12 specific bytes is ~2^-96.
-  return data:sub(5, 16) == "version\0\0\0\0\0"
+  if not magic_bytes or #magic_bytes ~= 4 then return false end
+  -- Full 16-byte comparison: magic (4B) + "version\0\0\0\0\0" (12B).
+  -- Mirrors std::equal(m_recv_buffer, v1_prefix) in net.cpp:1094.
+  return data:sub(1, 16) == magic_bytes .. "version\0\0\0\0\0"
 end
 
 --------------------------------------------------------------------------------
@@ -652,7 +661,7 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
           return true
         end
         local prefix = self.recv_buffer:sub(1, 16)
-        if looks_like_v1(prefix) then
+        if looks_like_v1(prefix, self.magic_bytes) then
           -- V1 connection detected
           self.recv_state = M.RecvState.V1
           self.send_state = M.SendState.V1
@@ -666,7 +675,7 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
         -- Continue processing
       elseif self.recv_state == M.RecvState.KEY then
         -- For initiator: check for v1 fallback before waiting for full 64 bytes
-        if self.initiator and #self.recv_buffer >= 16 and looks_like_v1(self.recv_buffer:sub(1, 16)) then
+        if self.initiator and #self.recv_buffer >= 16 and looks_like_v1(self.recv_buffer:sub(1, 16), self.magic_bytes) then
           self.recv_state = M.RecvState.V1
           self.send_state = M.SendState.V1
           self.v1_detected = true
