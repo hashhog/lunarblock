@@ -901,8 +901,24 @@ function M.decompress_pubkey(compressed33)
   return ffi.string(output, 65)
 end
 
--- Verify a BIP340 Schnorr signature (64 bytes) against a message and x-only pubkey (32 bytes)
+-- Verify a BIP340 Schnorr signature (64 bytes) against a message and x-only pubkey (32 bytes).
+-- libsecp256k1's secp256k1_xonly_pubkey_parse and secp256k1_schnorrsig_verify both read
+-- exactly 32 and 64 bytes respectively via a raw `const unsigned char *` — passing
+-- a Lua string shorter than that length would have libsecp256k1 read past the
+-- buffer (LuaJIT FFI gives us no automatic bounds check on `const unsigned char *`).
+-- Every callsite *should* already check #sig and #pubkey but defense-in-depth here
+-- catches accidental shorter inputs from non-consensus paths (RPC, tests) before
+-- they reach C land.
 function M.schnorr_verify(xonly_pubkey32, sig64, msg)
+  if type(xonly_pubkey32) ~= "string" or #xonly_pubkey32 ~= 32 then
+    return false, "invalid x-only public key length"
+  end
+  if type(sig64) ~= "string" or #sig64 ~= 64 then
+    return false, "invalid schnorr signature length"
+  end
+  if type(msg) ~= "string" then
+    return false, "invalid message"
+  end
   local pubkey = ffi.new("secp256k1_xonly_pubkey")
   if libsecp256k1.secp256k1_xonly_pubkey_parse(secp_ctx, pubkey, xonly_pubkey32) ~= 1 then
     return false, "invalid x-only public key"

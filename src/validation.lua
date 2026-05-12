@@ -906,15 +906,45 @@ end
 -- hash). Exposed so the bip341-vector-runner shim can validate the
 -- pre-image against Bitcoin Core's BIP-341 wallet vectors before checking
 -- the final hash.
+--
+-- Returns (msg_bytes) on success, or (nil, err_string) when Core's
+-- SignatureHashSchnorr (interpreter.cpp:1483-1570) would return false:
+--   * hash_type outside {0x00..0x03, 0x81..0x83}            (Core line 1516)
+--   * output_type == SIGHASH_SINGLE and in_pos >= vout.size (Core line 1550)
+-- Pre-W95 lunarblock would synthesize a 32-byte zero placeholder for the
+-- SIGHASH_SINGLE-out-of-range branch instead of failing, exposing a real
+-- consensus-split surface: a Schnorr sig forged against that placeholder
+-- digest would verify in lunarblock while Core rejected the input with
+-- SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
 function M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
                                   ext_flag, annex, tapleaf_hash, codesep_pos)
   ext_flag = ext_flag or 0
   codesep_pos = codesep_pos or 0xFFFFFFFF
 
+  -- BIP-341 hash_type range gate (Core interpreter.cpp:1516). Defense-in-
+  -- depth: every consensus call site pre-validates via is_valid_taproot_
+  -- hash_type, but if a non-consensus caller (RPC/wallet/PSBT debug
+  -- shim) ever passes a bogus byte, we must NOT return a synthesized
+  -- digest — that would let policy code build a sig the consensus layer
+  -- could never have produced.
+  if not M.is_valid_taproot_hash_type(hash_type) then
+    return nil, "TAPROOT_BAD_HASH_TYPE"
+  end
+
   local ht = hash_type
   if ht == 0x00 then ht = 0x01 end
   local output_type = bit.band(ht, 0x03)
   local anyone_can_pay = bit.band(ht, 0x80) ~= 0
+
+  -- Core SignatureHashSchnorr line 1550: SIGHASH_SINGLE with in_pos >=
+  -- vout.size() returns false. The Schnorr CHECK then fails with
+  -- SCRIPT_ERR_SCHNORR_SIG_HASHTYPE. The fail-out MUST happen before we
+  -- serialize the message — otherwise a Schnorr sig forged against
+  -- sha256(... || 32-zero-bytes || ...) would verify here while being
+  -- inadmissible in Core.
+  if output_type == 0x03 and input_index >= #tx.outputs then
+    return nil, "TAPROOT_SIGHASH_SINGLE_OUT_OF_RANGE"
+  end
 
   local w = serialize.buffer_writer()
   w.write_u8(0x00)  -- epoch
@@ -979,15 +1009,14 @@ function M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
   end
 
   if output_type == 0x03 then
-    if input_index < #tx.outputs then
-      local ow = serialize.buffer_writer()
-      local out = tx.outputs[input_index + 1]
-      ow.write_i64le(out.value)
-      ow.write_varstr(out.script_pubkey)
-      w.write_bytes(crypto.sha256(ow.result()))
-    else
-      w.write_bytes(string.rep("\0", 32))
-    end
+    -- Out-of-range case is rejected at function entry; here input_index <
+    -- #tx.outputs is invariant. Matches Core SignatureHashSchnorr line
+    -- 1551-1557 (HashWriter sha_single_output << tx_to.vout[in_pos]).
+    local ow = serialize.buffer_writer()
+    local out = tx.outputs[input_index + 1]
+    ow.write_i64le(out.value)
+    ow.write_varstr(out.script_pubkey)
+    w.write_bytes(crypto.sha256(ow.result()))
   end
 
   if ext_flag == 1 then
@@ -1009,11 +1038,13 @@ end
 -- @param annex string|nil: Annex data (if present)
 -- @param tapleaf_hash string|nil: 32-byte leaf hash (for script-path spending)
 -- @param codesep_pos number|nil: Code separator position (default 0xFFFFFFFF)
--- @return string: 32-byte sighash
+-- @return string|nil 32-byte sighash on success, nil + err string on
+--                    failure (bad hash_type or SIGHASH_SINGLE oor-output).
 function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
                                    ext_flag, annex, tapleaf_hash, codesep_pos)
-  local msg = M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
+  local msg, err = M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
                                        ext_flag, annex, tapleaf_hash, codesep_pos)
+  if not msg then return nil, err end
   return crypto.tagged_hash("TapSighash", msg)
 end
 
@@ -1558,6 +1589,13 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
 
     local sighash = M.signature_hash_taproot(
       tx, input_index, hash_type, prev_outputs, 0, annex)
+    -- Core CheckSchnorrSignature line 1737-1738: if SignatureHashSchnorr
+    -- returns false, set SCRIPT_ERR_SCHNORR_SIG_HASHTYPE and fail. We
+    -- mirror by returning false (the surrounding tapscript dispatcher
+    -- raises SIG_SCHNORR). Pre-W95 lunarblock silently fed a 32-zero
+    -- sighash to schnorr_verify here on the SIGHASH_SINGLE-out-of-range
+    -- path — split surface fixed.
+    if not sighash then return false end
     return crypto.schnorr_verify(witness_program, sig_bytes, sighash)
   end
 
@@ -1671,6 +1709,12 @@ function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, a
       tx, input_index, hash_type, prev_outputs,
       1, annex, tapleaf_hash, codesep_pos
     )
+    -- Same Core parity as keypath: SIGHASH_SINGLE-OOR or bad hash_type
+    -- returns nil; we surface false here so the tapscript opcode
+    -- dispatcher (script.lua OP_CHECKSIG{,VERIFY,ADD}) can raise
+    -- SIG_SCHNORR / CHECKSIGVERIFY instead of crashing on the nil
+    -- argument inside libsecp256k1's schnorrsig_verify.
+    if not sighash then return false end
 
     -- Verify BIP340 Schnorr signature
     return crypto.schnorr_verify(pubkey, sig_bytes, sighash)
@@ -1852,6 +1896,10 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
 
     local sighash = M.signature_hash_taproot(
       tx, input_index, hash_type, prev_outputs, 0, annex)
+    -- Core parity (see make_sig_checker.check_schnorr_keypath above):
+    -- nil sighash means SIGHASH_SINGLE-OOR or bad hash_type; surface as
+    -- verify failure so the dispatcher fails the script.
+    if not sighash then return false end
     return crypto.schnorr_verify(witness_program, sig_bytes, sighash)
   end
 

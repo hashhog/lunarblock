@@ -61,10 +61,19 @@ local function process_request(req)
   local hash_type = tonumber(req.hash_type) or 0
 
   -- BIP-341 wallet vectors only exercise key-path (ext_flag=0).
-  local sig_msg = validation.signature_msg_taproot(
+  -- Post-W95: signature_{msg,hash}_taproot now return (nil, err) for the
+  -- Core-rejected hash_type and SIGHASH_SINGLE-OOR cases. Surface the
+  -- error to the test driver instead of crashing on hex_encode(nil).
+  local sig_msg, msg_err = validation.signature_msg_taproot(
     tx, req.input_index, hash_type, prev_outputs, 0, annex)
-  local sig_hash = validation.signature_hash_taproot(
+  if not sig_msg then
+    return { error = "sig_msg: " .. tostring(msg_err) }
+  end
+  local sig_hash, hash_err = validation.signature_hash_taproot(
     tx, req.input_index, hash_type, prev_outputs, 0, annex)
+  if not sig_hash then
+    return { error = "sig_hash: " .. tostring(hash_err) }
+  end
 
   return {
     sig_msg  = hex_encode(sig_msg),
