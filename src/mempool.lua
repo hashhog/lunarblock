@@ -2090,6 +2090,25 @@ function Mempool:has(txid_hex)
   return self.entries[txid_hex] ~= nil
 end
 
+--- Check if a transaction is in the mempool by wtxid.
+-- Used by the MSG_WTX inv handler (BIP-339): the hash in a MSG_WTX inv is
+-- the wtxid, not the txid.  For non-segwit txs wtxid == txid so has()
+-- suffices; for segwit we must scan the wtxid field of each entry.
+-- @param wtxid_hex string: Witness transaction id as hex string
+-- @return boolean: True if transaction is in mempool
+function Mempool:has_wtxid(wtxid_hex)
+  -- Fast path: for non-segwit txs txid == wtxid, so check txid index first.
+  if self.entries[wtxid_hex] then return true end
+  -- Slow path: scan for segwit transactions whose wtxid matches.
+  for _, entry in pairs(self.entries) do
+    if entry.wtxid then
+      local entry_wtxid_hex = types.hash256_hex(entry.wtxid)
+      if entry_wtxid_hex == wtxid_hex then return true end
+    end
+  end
+  return false
+end
+
 --- Check descendant limits for a potential new child transaction.
 -- @param parent_txid_hex string: Parent transaction id
 -- @param child_vsize number: Virtual size of the potential child
