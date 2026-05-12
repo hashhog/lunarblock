@@ -2788,6 +2788,49 @@ describe("mempool", function()
         assert.is_false(ok)
         assert.equal("txn-already-in-mempool", err)
       end)
+
+      -- FIX-6: same txid, different witness → txn-same-nonwitness-data-in-mempool.
+      -- Core validation.cpp:826-829: if pool.exists(GenTxid::Txid(txid)) (but not
+      -- the wtxid lookup above) → "txn-same-nonwitness-data-in-mempool".
+      it("returns txn-same-nonwitness-data-in-mempool on same-txid different-witness", function()
+        local prev_txid = types.hash256(string.rep("\xb2", 32))
+        local prev_txid_hex = types.hash256_hex(prev_txid)
+        local chain_state = make_mock_chain_state()
+        add_utxo(chain_state, prev_txid_hex, 0, 100000)
+        local mp = mempool.new(chain_state)
+
+        -- tx1: no witness (accepted into mempool)
+        local tx1 = make_tx(1, {}, {}, 0)
+        tx1.inputs[1] = make_input(prev_txid, 0)
+        tx1.outputs[1] = make_output(90000)
+        local ok1 = mp:accept_transaction(tx1)
+        assert.is_true(ok1)
+
+        -- tx2: same non-witness data as tx1 (same txid), but different witness.
+        -- txid = hash(non-witness serialization), so adding witness data doesn't
+        -- change txid but does change wtxid.
+        local tx2 = make_tx(1, {}, {}, 0)
+        tx2.inputs[1] = make_input(prev_txid, 0)
+        tx2.outputs[1] = make_output(90000)
+        -- Add a witness item so wtxid != txid (and != tx1's wtxid).
+        -- tx.segwit must be true for serialize_transaction(tx, true) to include
+        -- witness fields in the hash (see serialize.lua:395).
+        tx2.inputs[1].witness = { "\xde\xad\xbe\xef" }
+        tx2.segwit = true
+
+        -- Confirm txids match but wtxids differ.
+        local validation = require("src.validation")
+        local txid1_hex = types.hash256_hex(validation.compute_txid(tx1))
+        local txid2_hex = types.hash256_hex(validation.compute_txid(tx2))
+        local wtxid1_hex = types.hash256_hex(validation.compute_wtxid(tx1))
+        local wtxid2_hex = types.hash256_hex(validation.compute_wtxid(tx2))
+        assert.equal(txid1_hex, txid2_hex, "txids must match")
+        assert.not_equal(wtxid1_hex, wtxid2_hex, "wtxids must differ")
+
+        local ok2, err2 = mp:accept_transaction(tx2)
+        assert.is_false(ok2)
+        assert.equal("txn-same-nonwitness-data-in-mempool", err2)
+      end)
     end)
 
     -- W96 Bug 6: ValidateInputsStandardness (Core policy.cpp:214-263).
