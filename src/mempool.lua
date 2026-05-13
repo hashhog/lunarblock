@@ -1373,6 +1373,58 @@ function Mempool:accept_transaction(tx, allow_rbf)
         additional_fee, required_additional)
     end
 
+    -- Rule #8 (cluster-mempool): ImprovesFeerateDiagram (Core rbf.cpp:127-140).
+    -- After Rules 3 and 4 pass, verify the replacement strictly improves the
+    -- feerate diagram of every affected cluster.  We build the "old" diagram
+    -- from the current mempool state of all clusters that contain a conflicting
+    -- tx, then the "new" diagram with those conflicts removed and the
+    -- replacement tx added, and require compare_diagrams(old, new) == true.
+    do
+      -- Collect the set of all txids in the same clusters as the conflicts.
+      local affected_txids = {}
+      for conflict_hex in pairs(all_conflicts) do
+        local root = uf_find(conflict_hex)
+        for txid_iter, _ in pairs(uf_parent) do
+          if uf_find(txid_iter) == root and self.entries[txid_iter] then
+            affected_txids[txid_iter] = true
+          end
+        end
+      end
+
+      -- Build the old diagram from the affected cluster entries.
+      local old_cluster_txids = {}
+      for txid_iter in pairs(affected_txids) do
+        old_cluster_txids[#old_cluster_txids + 1] = txid_iter
+      end
+      local old_lin = linearize_cluster(old_cluster_txids, self.entries)
+      local old_diag = build_feerate_diagram(old_lin, self.entries)
+
+      -- Build a synthetic entries table: remove all_conflicts, add replacement.
+      local new_entries = {}
+      for txid_iter, e in pairs(self.entries) do
+        if affected_txids[txid_iter] and not all_conflicts[txid_iter] then
+          new_entries[txid_iter] = e
+        end
+      end
+      -- Synthetic entry for the replacement tx (not yet in the mempool).
+      new_entries[txid_hex] = { fee = fee, size = vsize, vsize = vsize }
+
+      -- Build new cluster txid list: old affected minus conflicts, plus replacement.
+      local new_cluster_txids = {}
+      for txid_iter in pairs(new_entries) do
+        -- Include only affected-cluster txids plus the replacement itself.
+        if affected_txids[txid_iter] or txid_iter == txid_hex then
+          new_cluster_txids[#new_cluster_txids + 1] = txid_iter
+        end
+      end
+      local new_lin = linearize_cluster(new_cluster_txids, new_entries)
+      local new_diag = build_feerate_diagram(new_lin, new_entries)
+
+      if not compare_diagrams(old_diag, new_diag) then
+        return false, "insufficient feerate: does not improve feerate diagram"
+      end
+    end
+
     -- BIP125 Rule #2: The replacement may only include an unconfirmed input if
     -- that specific outpoint (txid:vout) was already an input of one of the
     -- conflicting transactions.  We collect all (txid, vout) outpoints that
