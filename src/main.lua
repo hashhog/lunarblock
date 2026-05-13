@@ -1192,7 +1192,9 @@ local function main()
         -- all peers with MSG_WITNESS_TX (legacy) and leaks timing/origin info.
         local txid  = validation.compute_txid(tx)
         local wtxid = validation.compute_wtxid(tx)
-        peer_manager:queue_tx_announcement(txid, wtxid)
+        -- Pass tx object so peers with bloom filters can do per-peer filtering
+        -- (BIP-37 FIX-37: queue_tx_announcement now accepts optional tx arg).
+        peer_manager:queue_tx_announcement(txid, wtxid, tx)
         -- Track for fee estimation
         local txid_hex = types.hash256_hex(txid)
         local entry = mempool:get_entry(txid_hex)
@@ -1299,18 +1301,18 @@ local function main()
     trickle_state.next_send_time = 0
   end)
 
-  -- BIP-111: disconnect peers that send bloom-filter messages when we have
-  -- not advertised NODE_BLOOM.
+  -- BIP-37 / BIP-111: bloom filter P2P dispatch (FIX-37).
   -- Reference: bitcoin-core/src/net_processing.cpp FILTERLOAD/FILTERADD/
-  --            FILTERCLEAR handlers (~4963-5033) — fDisconnect = true when
-  --            !(peer.m_our_services & NODE_BLOOM).
+  --            FILTERCLEAR handlers (4963-5033).
   --
-  -- filterload / filteradd / filterclear are *inbound* messages (peer → us).
+  -- filterload / filteradd / filterclear are inbound messages (peer → us).
   -- When NODE_BLOOM is not in our advertised services, Core disconnects the
-  -- peer immediately (Misbehaving-100 / fDisconnect).  We mirror that exactly.
-  --
-  -- bloom.lua provides parse_filterload/parse_filteradd for the future wiring
-  -- wave; here we only register the BIP-111 disconnect path (FIX-36 Scope A).
+  -- peer immediately (fDisconnect = true).  We mirror that exactly via
+  -- bloom_guard().  When NODE_BLOOM IS advertised the messages are parsed
+  -- and stored in per-peer state for outbound tx INV filtering (Step 4)
+  -- and merkleblock serving (Step 5 via getdata MSG_FILTERED_BLOCK below).
+
+  local bloom = require("lunarblock.bloom")
 
   local function bloom_guard(peer, msg_type)
     -- bit was already required above for the mempool handler; require again is
@@ -1325,26 +1327,65 @@ local function main()
     return true
   end
 
-  peer_manager:register_handler("filterload", function(peer, _payload)
+  peer_manager:register_handler("filterload", function(peer, payload)
     -- BIP-111: disconnect if we did not advertise NODE_BLOOM.
     if not bloom_guard(peer, "filterload") then return end
-    -- NODE_BLOOM *is* advertised — bloom.lua wiring is a separate future wave
-    -- (FIX-36 Scope B).  For now, log and drop so nothing is silently ignored.
-    print(string.format("[bloom] filterload from %s:%d (bloom wiring pending)",
-      peer.ip, peer.port))
+
+    -- Parse the filter payload (varstr(vData) || nHashFuncs || nTweak || nFlags).
+    local f, err = bloom.parse_filterload(payload)
+    if not f then
+      -- Malformed payload — misbehave and disconnect (mirrors Core's
+      -- Misbehaving(peer, "bad filterload message") path).
+      peer:disconnect("filterload parse error: " .. tostring(err))
+      return
+    end
+
+    -- BIP-37: reject oversized filters (IsWithinSizeConstraints).
+    -- Core calls Misbehaving(peer, "too-large bloom filter") → fDisconnect.
+    if not bloom.is_within_size_constraints(f) then
+      peer:disconnect("filterload: filter exceeds size constraints (BIP-37)")
+      return
+    end
+
+    -- Store the filter in per-peer state and enable filtered tx relay.
+    peer.bloom_filter = f
+    peer.relay_txes   = true
+    print(string.format("[bloom] filterload from %s:%d (vdata_len=%d hash_funcs=%d tweak=%d flags=%d)",
+      peer.ip, peer.port, f.vdata_len, f.n_hash_funcs, f.n_tweak, f.n_flags))
   end)
 
-  peer_manager:register_handler("filteradd", function(peer, _payload)
+  peer_manager:register_handler("filteradd", function(peer, payload)
     -- BIP-111: disconnect if we did not advertise NODE_BLOOM.
     if not bloom_guard(peer, "filteradd") then return end
-    print(string.format("[bloom] filteradd from %s:%d (bloom wiring pending)",
-      peer.ip, peer.port))
+
+    -- Parse element (varstr, max 520 bytes per BIP-37 / MAX_SCRIPT_ELEMENT_SIZE).
+    local elem, err = bloom.parse_filteradd(payload)
+    if not elem then
+      -- Oversized element or parse failure.  Core calls
+      -- Misbehaving(peer, "bad filteradd message") → fDisconnect.
+      peer:disconnect("filteradd: " .. tostring(err))
+      return
+    end
+
+    -- No filter loaded yet — treat as bad (Core "else bad = true" path).
+    if not peer.bloom_filter then
+      peer:disconnect("filteradd received without prior filterload")
+      return
+    end
+
+    -- Insert the element into the existing filter.
+    bloom.insert(peer.bloom_filter, elem)
   end)
 
   peer_manager:register_handler("filterclear", function(peer, _payload)
     -- BIP-111: disconnect if we did not advertise NODE_BLOOM.
     if not bloom_guard(peer, "filterclear") then return end
-    print(string.format("[bloom] filterclear from %s:%d (bloom wiring pending)",
+
+    -- Remove the filter and restore unconditional tx relay (Core:
+    -- m_bloom_filter = nullptr; m_relay_txs = true; m_bloom_filter_loaded = false).
+    peer.bloom_filter = nil
+    peer.relay_txes   = true
+    print(string.format("[bloom] filterclear from %s:%d — filter removed, relay restored",
       peer.ip, peer.port))
   end)
 
@@ -1495,6 +1536,52 @@ local function main()
         else
           not_found[#not_found + 1] = item
         end
+      elseif item.type == p2p.INV_TYPE.MSG_FILTERED_BLOCK then
+        -- BIP-37 Step 5: serve merkleblock for MSG_FILTERED_BLOCK (=3).
+        -- Reference: bitcoin-core/src/net_processing.cpp:2438-2458.
+        -- Only send if the peer has a bloom filter loaded (Core silently
+        -- omits the response when m_bloom_filter == nullptr).
+        local blk = db.get_block(item.hash)
+        if blk and peer.bloom_filter then
+          local ok_mb, mb_err = pcall(function()
+            -- Build txid array and match flags from the block.
+            local txid_strings = {}
+            local v_match = {}
+            local matched_tx = {}  -- 1-indexed matched transactions (for tx push)
+            for tx_i, tx in ipairs(blk.transactions) do
+              local tx_validation = require("lunarblock.validation")
+              local txid_obj = tx_validation.compute_txid(tx)
+              txid_strings[tx_i] = txid_obj.bytes
+              local matched = bloom.is_relevant_and_update(peer.bloom_filter, tx)
+              v_match[tx_i] = matched
+              if matched then
+                matched_tx[#matched_tx + 1] = tx
+              end
+            end
+            -- Encode the 80-byte block header.
+            local hdr_bytes = serialize.serialize_block_header(blk)
+            -- Build and send the merkleblock message.
+            local mb_payload = bloom.encode_merkle_block(hdr_bytes, txid_strings, v_match)
+            peer:send_message("merkleblock", mb_payload)
+            -- Push matched transactions immediately after (Core behaviour:
+            -- "CMerkleBlock just contains hashes, so also push any transactions
+            --  in the block the client did not see").
+            for _, matched_tx_entry in ipairs(matched_tx) do
+              local tx_data = serialize.serialize_transaction(matched_tx_entry, false)
+              peer:send_message("tx", tx_data)
+            end
+          end)
+          if not ok_mb then
+            -- Merkleblock build failure (e.g. block has no transactions).
+            -- Fall back to not_found rather than crashing the loop.
+            print(string.format("[bloom] merkleblock build failed for %s:%d: %s",
+              peer.ip, peer.port, tostring(mb_err)))
+            not_found[#not_found + 1] = item
+          end
+        elseif not blk then
+          not_found[#not_found + 1] = item
+        end
+        -- else: block found but no filter loaded → silently omit (Core behaviour)
       end
     end
     if #not_found > 0 then
