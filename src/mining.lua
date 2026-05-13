@@ -147,6 +147,12 @@ function M.create_coinbase_tx(height, value, coinbase_script_extra, witness_comm
       h_bytes[#h_bytes + 1] = h % 256
       h = math.floor(h / 256)
     end
+    -- CScriptNum::serialize sign-bit guard (Core script.h ~line 366-367):
+    -- if the high bit of the last byte is set, the value would be interpreted
+    -- as negative. For positive heights, append a 0x00 padding byte.
+    if bit.band(h_bytes[#h_bytes], 0x80) ~= 0 then
+      h_bytes[#h_bytes + 1] = 0x00
+    end
     w.write_u8(#h_bytes)
     for _, b in ipairs(h_bytes) do
       w.write_u8(b)
