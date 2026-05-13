@@ -399,9 +399,35 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
     0  -- nonce starts at 0
   )
 
+  -- BIP22/BIP23/BIP9 required fields:
+  -- capabilities: server-side features (Core: aCaps = ["proposal"])
+  local capabilities = {"proposal"}
+
+  -- rules: enforced soft-fork rules (Core rpc/mining.cpp:954-963)
+  -- "csv" is always included; "!segwit" and "taproot" once segwit is active.
+  local rules = {"csv"}
+  if height >= network.segwit_height then
+    rules[#rules + 1] = "!segwit"
+    rules[#rules + 1] = "taproot"
+  end
+
+  -- vbavailable: map of pending versionbits deployment names to bit numbers.
+  -- We have no live BIP9 deployments in our state machine right now; emit empty
+  -- object.  Core: result.pushKV("vbavailable", vbavailable).
+  local vbavailable = {}
+
+  -- vbrequired: bitmask of version bits the server requires miners to set.
+  -- Always 0 on current mainnet/testnet/regtest per BIP9.
+  -- Core: result.pushKV("vbrequired", 0).
+  local vbrequired = 0
+
   -- Build the template response (BIP22 format)
   local template = {
+    capabilities = capabilities,
     version = header.version,
+    rules = rules,
+    vbavailable = vbavailable,
+    vbrequired = vbrequired,
     previousblockhash = types.hash256_hex(prev_hash),
     transactions = {},
     coinbaseaux = {flags = ""},
@@ -426,12 +452,35 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
       M.hex_encode("\x6a\x24\xaa\x21\xa9\xed" .. witness_commitment) or nil,
   }
 
-  -- Add transaction data to template
+  -- Build per-tx index map for BIP22 `depends` field.
+  -- Core rpc/mining.cpp:898-923: setTxIndex maps txid → 1-based index in the
+  -- non-coinbase transactions array.  Coinbase is at slot 0 (excluded from the
+  -- template transactions list), so the first real tx is at 1.
+  -- We replicate this: index i starts at 1 for the first selected entry.
+  local tx_index = {}  -- txid_hex -> 1-based index (1 = first non-coinbase tx)
+  for i, entry in ipairs(selected) do
+    tx_index[types.hash256_hex(entry.txid)] = i
+  end
+
+  -- Add transaction data to template, including BIP22 `depends` array.
   for _, entry in ipairs(selected) do
+    -- Compute depends: 1-based indices of in-template transactions this tx
+    -- spends.  Only inputs whose prev txid maps to a selected in-template tx
+    -- are included (inputs spending confirmed UTXOs have no in-template dep).
+    local depends = {}
+    for _, inp in ipairs(entry.tx.inputs) do
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      local dep_idx = tx_index[prev_hex]
+      if dep_idx then
+        depends[#depends + 1] = dep_idx
+      end
+    end
+
     template.transactions[#template.transactions + 1] = {
       data = M.hex_encode(serialize.serialize_transaction(entry.tx, true)),
       txid = types.hash256_hex(entry.txid),
       hash = types.hash256_hex(entry.wtxid),
+      depends = depends,
       fee = entry.fee,
       sigops = 0,  -- simplified
       weight = entry.weight,
