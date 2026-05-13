@@ -1156,8 +1156,19 @@ local function main()
         header_chain:start_sync(peer)
       end
     end
-    if #to_request > 0 then
-      peer:send_message("getdata", p2p.serialize_inv(to_request))
+    -- Core net_processing.cpp:128: MAX_GETDATA_SZ=1000 — cap each outgoing
+    -- getdata to 1000 items.  An inv from a peer can carry up to 50000 entries
+    -- (MAX_INV_SZ); sending them all in one getdata violates the cap and risks
+    -- the remote peer dropping the oversized request.
+    local i = 1
+    while i <= #to_request do
+      local batch = {}
+      local limit = math.min(i + p2p.MAX_GETDATA_SZ - 1, #to_request)
+      for j = i, limit do
+        batch[#batch + 1] = to_request[j]
+      end
+      peer:send_message("getdata", p2p.serialize_inv(batch))
+      i = i + p2p.MAX_GETDATA_SZ
     end
   end)
 

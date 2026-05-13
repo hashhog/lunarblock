@@ -76,6 +76,7 @@ M.MAX_ADDRV2_SIZE = 512
 -- A peer-supplied compact-size count above any of these is a protocol
 -- violation; reject before allocating to prevent OOM DoS.
 M.MAX_INV_SIZE = 50000        -- net_processing.cpp:126 MAX_INV_SZ
+M.MAX_GETDATA_SZ = 1000       -- net_processing.cpp:128 MAX_GETDATA_SZ (outgoing getdata cap)
 M.MAX_HEADERS_RESULTS = 2000  -- net_processing.h:50 MAX_HEADERS_RESULTS
 M.MAX_ADDR_TO_SEND = 1000     -- net_processing.cpp:190 MAX_ADDR_TO_SEND
 M.MAX_LOCATOR_SZ = 101        -- BIP-152: max getheaders/getblocks locator entries
