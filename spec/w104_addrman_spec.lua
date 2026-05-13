@@ -1022,3 +1022,136 @@ describe("G30 bucket hashing determinism", function()
   end)
 
 end)
+
+--------------------------------------------------------------------------------
+-- G31: IsRoutable / RFC1918 filter at AddrMan Add (FIXED)
+-- Core: CNetAddr::IsRoutable() rejects RFC1918, loopback, link-local, CGN, etc.
+--       before inserting into addrman (addrman.cpp Add() → AddSingle()).
+-- lunarblock fix: _is_routable() called in handle_addr and handle_addrv2
+--                 before _add_to_new / known_addresses insertion.
+-- Reference: bitcoin-core/src/netaddress.cpp CNetAddr::IsRoutable()
+--------------------------------------------------------------------------------
+
+describe("G31 IsRoutable filter at AddrMan Add (FIXED)", function()
+
+  local p2p_mod = require("lunarblock.p2p")
+
+  local function addr_payload(ip)
+    return p2p_mod.serialize_addr({{
+      timestamp = os.time() - 60,
+      services = p2p_mod.SERVICES.NODE_NETWORK,
+      ip = ip,
+      port = 8333,
+    }})
+  end
+
+  it("is_routable accepts public IPv4 address", function()
+    assert.is_true(peerman.is_routable("1.2.3.4"))
+    assert.is_true(peerman.is_routable("8.8.8.8"))
+    assert.is_true(peerman.is_routable("203.0.114.1"))  -- outside doc range
+  end)
+
+  it("is_routable rejects RFC1918 10.0.0.0/8", function()
+    assert.is_false(peerman.is_routable("10.0.0.1"))
+    assert.is_false(peerman.is_routable("10.255.255.255"))
+  end)
+
+  it("is_routable rejects RFC1918 172.16.0.0/12", function()
+    assert.is_false(peerman.is_routable("172.16.0.1"))
+    assert.is_false(peerman.is_routable("172.31.255.255"))
+    assert.is_true(peerman.is_routable("172.15.0.1"))   -- just outside range
+    assert.is_true(peerman.is_routable("172.32.0.1"))   -- just outside range
+  end)
+
+  it("is_routable rejects RFC1918 192.168.0.0/16", function()
+    assert.is_false(peerman.is_routable("192.168.0.1"))
+    assert.is_false(peerman.is_routable("192.168.255.255"))
+  end)
+
+  it("is_routable rejects loopback 127.0.0.0/8", function()
+    assert.is_false(peerman.is_routable("127.0.0.1"))
+    assert.is_false(peerman.is_routable("127.0.0.0"))
+    assert.is_false(peerman.is_routable("127.255.255.255"))
+  end)
+
+  it("is_routable rejects 0.0.0.0/8 unspecified", function()
+    assert.is_false(peerman.is_routable("0.0.0.0"))
+    assert.is_false(peerman.is_routable("0.1.2.3"))
+  end)
+
+  it("is_routable rejects RFC3927 link-local 169.254.0.0/16", function()
+    assert.is_false(peerman.is_routable("169.254.0.1"))
+    assert.is_false(peerman.is_routable("169.254.255.255"))
+  end)
+
+  it("is_routable rejects RFC2544 benchmarking 198.18.0.0/15", function()
+    assert.is_false(peerman.is_routable("198.18.0.1"))
+    assert.is_false(peerman.is_routable("198.19.255.255"))
+  end)
+
+  it("is_routable rejects RFC6598 CGN 100.64.0.0/10", function()
+    assert.is_false(peerman.is_routable("100.64.0.1"))
+    assert.is_false(peerman.is_routable("100.127.255.255"))
+    assert.is_true(peerman.is_routable("100.63.255.255"))  -- just outside
+    assert.is_true(peerman.is_routable("100.128.0.1"))     -- just outside
+  end)
+
+  it("is_routable rejects RFC5737 documentation ranges", function()
+    assert.is_false(peerman.is_routable("192.0.2.1"))       -- TEST-NET-1
+    assert.is_false(peerman.is_routable("198.51.100.1"))    -- TEST-NET-2
+    assert.is_false(peerman.is_routable("203.0.113.1"))     -- TEST-NET-3
+  end)
+
+  it("is_routable rejects reserved/broadcast 240.0.0.0/4", function()
+    assert.is_false(peerman.is_routable("240.0.0.1"))
+    assert.is_false(peerman.is_routable("255.255.255.255"))
+  end)
+
+  it("handle_addr rejects RFC1918 address from gossip", function()
+    local pm, d = make_pm()
+    local fake_peer = {ip = "5.6.7.8", port = 8888}
+    pm:handle_addr(fake_peer, addr_payload("192.168.1.1"))
+    assert.is_nil(pm.known_addresses["192.168.1.1:8333"],
+      "RFC1918 address must not enter addrman")
+    assert.equals(0, pm._new_count,
+      "RFC1918 address must not enter new table")
+    rm_dir(d)
+  end)
+
+  it("handle_addr rejects 10.x RFC1918 from gossip", function()
+    local pm, d = make_pm()
+    local fake_peer = {ip = "5.6.7.8", port = 8888}
+    pm:handle_addr(fake_peer, addr_payload("10.0.0.1"))
+    assert.is_nil(pm.known_addresses["10.0.0.1:8333"],
+      "10.x RFC1918 must not enter addrman")
+    rm_dir(d)
+  end)
+
+  it("handle_addr rejects loopback from gossip", function()
+    local pm, d = make_pm()
+    local fake_peer = {ip = "5.6.7.8", port = 8888}
+    pm:handle_addr(fake_peer, addr_payload("127.0.0.1"))
+    assert.is_nil(pm.known_addresses["127.0.0.1:8333"],
+      "loopback must not enter addrman")
+    rm_dir(d)
+  end)
+
+  it("handle_addr rejects link-local from gossip", function()
+    local pm, d = make_pm()
+    local fake_peer = {ip = "5.6.7.8", port = 8888}
+    pm:handle_addr(fake_peer, addr_payload("169.254.0.1"))
+    assert.is_nil(pm.known_addresses["169.254.0.1:8333"],
+      "link-local must not enter addrman")
+    rm_dir(d)
+  end)
+
+  it("handle_addr accepts public IPv4 from gossip", function()
+    local pm, d = make_pm()
+    local fake_peer = {ip = "5.6.7.8", port = 8888}
+    pm:handle_addr(fake_peer, addr_payload("1.2.3.4"))
+    assert.is_not_nil(pm.known_addresses["1.2.3.4:8333"],
+      "public address must be accepted")
+    rm_dir(d)
+  end)
+
+end)
