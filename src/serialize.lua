@@ -1,5 +1,9 @@
 local M = {}
 
+-- Bitcoin Core serialize.h: MAX_SIZE = 0x02000000 (33554432)
+-- ReadCompactSize rejects any value above this.
+local MAX_SIZE = 0x02000000
+
 -- BufferWriter: accumulates binary data for serialization
 function M.buffer_writer()
   local parts = {}
@@ -167,15 +171,29 @@ function M.buffer_reader(data)
 
   function reader.read_varint()
     local first = reader.read_u8()
+    local val
     if first < 0xFD then
       return first
     elseif first == 0xFD then
-      return reader.read_u16le()
+      val = reader.read_u16le()
+      if val < 253 then
+        error("non-canonical ReadCompactSize()")
+      end
     elseif first == 0xFE then
-      return reader.read_u32le()
+      val = reader.read_u32le()
+      if val < 0x10000 then
+        error("non-canonical ReadCompactSize()")
+      end
     else
-      return reader.read_u64le()
+      val = reader.read_u64le()
+      if val < 0x100000000 then
+        error("non-canonical ReadCompactSize()")
+      end
     end
+    if val > MAX_SIZE then
+      error("ReadCompactSize(): size too large")
+    end
+    return val
   end
 
   function reader.read_bytes(n)
@@ -303,15 +321,29 @@ if _ffi_reader_ok and _bit_ok then
 
     function reader.read_varint()
       local first = reader.read_u8()
+      local val
       if first < 0xFD then
         return first
       elseif first == 0xFD then
-        return reader.read_u16le()
+        val = reader.read_u16le()
+        if val < 253 then
+          error("non-canonical ReadCompactSize()")
+        end
       elseif first == 0xFE then
-        return reader.read_u32le()
+        val = reader.read_u32le()
+        if val < 0x10000 then
+          error("non-canonical ReadCompactSize()")
+        end
       else
-        return reader.read_u64le()
+        val = reader.read_u64le()
+        if val < 0x100000000 then
+          error("non-canonical ReadCompactSize()")
+        end
       end
+      if val > MAX_SIZE then
+        error("ReadCompactSize(): size too large")
+      end
+      return val
     end
 
     function reader.read_bytes(n)
