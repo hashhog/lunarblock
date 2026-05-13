@@ -223,107 +223,93 @@ describe("W107 CompactSize + VarInt serialization audit (lunarblock vs Core)", f
 
   ---------------------------------------------------------------------------
   -- G8: CompactSize 9-byte read (canonical)
+  -- Note: The 9-byte form (0xFF prefix) encodes values > 0xFFFFFFFF.
+  -- Since all such values exceed MAX_SIZE (0x02000000 = 33554432),
+  -- read_varint (range_check=true) always rejects them.  Bitcoin Core's
+  -- ReadCompactSize with range_check=true has the same behaviour.
+  -- The write path (write_varint) still supports 9-byte encoding for
+  -- completeness; it is used by the range_check=false code paths.
   ---------------------------------------------------------------------------
   describe("G8 read_varint 9-byte (canonical)", function()
-    it("reads 0xFF + LE64(0x100000000) as 0x100000000", function()
-      -- 0x100000000 = 4294967296 in LE = 00 00 00 00 01 00 00 00
+    it("9-byte form 0xFF + LE64(0x100000000) is rejected by range-checked reader (> MAX_SIZE)", function()
+      -- 0x100000000 = 4294967296 > MAX_SIZE (33554432): correctly rejected.
       local b = string.char(0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00)
-      assert.equal(4294967296, dec(b))
+      assert.has_error(function() dec(b) end,
+        "ReadCompactSize(): size too large")
+    end)
+    it("non-canonical 0xFF form for value < 0x100000000 is also rejected", function()
+      -- 0xFF + LE64(0xFFFFFFFF) is non-canonical; rejected before MAX_SIZE check.
+      local b = string.char(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00)
+      assert.has_error(function() dec(b) end,
+        "non-canonical ReadCompactSize()")
     end)
   end)
 
   ---------------------------------------------------------------------------
-  -- G9: BUG — Non-canonical rejection: 0xFD path
+  -- G9: FIXED — Non-canonical rejection: 0xFD path
   -- Core: if (nSizeRet < 253) throw "non-canonical ReadCompactSize()"
-  -- lunarblock: silently accepts
+  -- Fix: buffer_reader.read_varint now rejects val < 253 on 0xFD path.
   ---------------------------------------------------------------------------
-  describe("G9 non-canonical 0xFD path rejection (BUG)", function()
-    -- XFAIL: lunarblock does not reject non-canonical CompactSize encodings.
-    -- Core throws std::ios_base::failure("non-canonical ReadCompactSize()").
-    -- Reference: serialize.h ReadCompactSize, line with "if (nSizeRet < 253)"
-    pending("BUG: 0xFD + u16(0) should throw non-canonical error (CONSENSUS-DIVERGENT)", function()
+  describe("G9 non-canonical 0xFD path rejection (FIXED)", function()
+    it("0xFD + u16(0) throws non-canonical error", function()
       local b = string.char(0xFD, 0x00, 0x00)  -- encodes 0 non-canonically
       assert.has_error(function() dec(b) end,
         "non-canonical ReadCompactSize()")
     end)
-    it("XFAIL: silently accepts 0xFD + u16(0) = 0 (wrong — Core rejects)", function()
-      local b = string.char(0xFD, 0x00, 0x00)
-      local ok, val = pcall(dec, b)
-      -- Documents the bug: no exception, returns 0
-      assert.is_true(ok, "expected no exception (bug: should throw)")
-      assert.equal(0, val, "expected 0 (bug: should be rejected)")
-    end)
-    it("XFAIL: silently accepts 0xFD + u16(252) = 252 (wrong — Core rejects)", function()
+    it("0xFD + u16(252) throws non-canonical error", function()
       local b = string.char(0xFD, 0xFC, 0x00)
-      local ok, val = pcall(dec, b)
-      assert.is_true(ok, "expected no exception (bug: should throw)")
-      assert.equal(252, val, "expected 252 (bug: should be rejected)")
+      assert.has_error(function() dec(b) end,
+        "non-canonical ReadCompactSize()")
     end)
   end)
 
   ---------------------------------------------------------------------------
-  -- G10: BUG — Non-canonical rejection: 0xFE path
+  -- G10: FIXED — Non-canonical rejection: 0xFE path
   -- Core: if (nSizeRet < 0x10000u) throw "non-canonical ReadCompactSize()"
+  -- Fix: buffer_reader.read_varint now rejects val < 0x10000 on 0xFE path.
   ---------------------------------------------------------------------------
-  describe("G10 non-canonical 0xFE path rejection (BUG)", function()
-    pending("BUG: 0xFE + u32(65535) should throw non-canonical error (CONSENSUS-DIVERGENT)", function()
+  describe("G10 non-canonical 0xFE path rejection (FIXED)", function()
+    it("0xFE + u32(65535) throws non-canonical error", function()
       local b = string.char(0xFE, 0xFF, 0xFF, 0x00, 0x00)  -- encodes 65535 non-canonically
       assert.has_error(function() dec(b) end,
         "non-canonical ReadCompactSize()")
     end)
-    it("XFAIL: silently accepts 0xFE + u32(65535) = 65535 (wrong — Core rejects)", function()
-      local b = string.char(0xFE, 0xFF, 0xFF, 0x00, 0x00)
-      local ok, val = pcall(dec, b)
-      assert.is_true(ok, "expected no exception (bug: should throw)")
-      assert.equal(65535, val, "expected 65535 (bug: should be rejected)")
-    end)
-    it("XFAIL: silently accepts 0xFE + u32(0) = 0 (wrong — Core rejects)", function()
+    it("0xFE + u32(0) throws non-canonical error", function()
       local b = string.char(0xFE, 0x00, 0x00, 0x00, 0x00)
-      local ok, val = pcall(dec, b)
-      assert.is_true(ok)
-      assert.equal(0, val)
+      assert.has_error(function() dec(b) end,
+        "non-canonical ReadCompactSize()")
     end)
   end)
 
   ---------------------------------------------------------------------------
-  -- G11: BUG — Non-canonical rejection: 0xFF path
+  -- G11: FIXED — Non-canonical rejection: 0xFF path
   -- Core: if (nSizeRet < 0x100000000ULL) throw "non-canonical ReadCompactSize()"
+  -- Fix: buffer_reader.read_varint now rejects val < 0x100000000 on 0xFF path.
   ---------------------------------------------------------------------------
-  describe("G11 non-canonical 0xFF path rejection (BUG)", function()
-    pending("BUG: 0xFF + u64(0xFFFFFFFF) should throw non-canonical error (CONSENSUS-DIVERGENT)", function()
+  describe("G11 non-canonical 0xFF path rejection (FIXED)", function()
+    it("0xFF + u64(0xFFFFFFFF) throws non-canonical error", function()
       -- encodes 0xFFFFFFFF (4294967295) non-canonically via 9-byte form
       local b = string.char(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00)
       assert.has_error(function() dec(b) end,
         "non-canonical ReadCompactSize()")
     end)
-    it("XFAIL: silently accepts 0xFF + u64(4294967295) = 4294967295 (wrong — Core rejects)", function()
-      local b = string.char(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00)
-      local ok, val = pcall(dec, b)
-      assert.is_true(ok, "expected no exception (bug: should throw)")
-      assert.equal(4294967295, val, "expected 4294967295 (bug: should be rejected)")
-    end)
   end)
 
   ---------------------------------------------------------------------------
-  -- G12: BUG — MAX_SIZE (0x02000000) range check on read
+  -- G12: FIXED — MAX_SIZE (0x02000000) range check on read
   -- Core: if (range_check && nSizeRet > MAX_SIZE) throw "size too large"
   -- Reference: serialize.h:358 MAX_SIZE = 0x02000000
+  -- Fix: buffer_reader.read_varint now rejects val > MAX_SIZE.
   ---------------------------------------------------------------------------
-  describe("G12 MAX_SIZE range check in read_varint (BUG)", function()
+  describe("G12 MAX_SIZE range check in read_varint (FIXED)", function()
     -- MAX_SIZE = 0x02000000 = 33554432; any vector length above this is
     -- semantically invalid per Core and must be rejected.
-    pending("BUG: values > MAX_SIZE (0x02000000) should throw 'size too large' (CONSENSUS-DIVERGENT + DOS)", function()
+    it("values > MAX_SIZE (0x02000000) throw 'size too large'", function()
       -- Encode 0x02000001 (just over MAX_SIZE) as 5-byte CompactSize
       -- 0x02000001 in LE4 = 01 00 00 02
       local b = string.char(0xFE, 0x01, 0x00, 0x00, 0x02)
       assert.has_error(function() dec(b) end,
         "ReadCompactSize(): size too large")
-    end)
-    it("XFAIL: silently accepts 0x02000001 = 33554433 (> MAX_SIZE, should be rejected)", function()
-      local b = string.char(0xFE, 0x01, 0x00, 0x00, 0x02)
-      local ok, val = pcall(dec, b)
-      assert.is_true(ok, "expected no exception (bug: should throw)")
-      assert.equal(33554433, val, "expected 33554433 (bug: should be rejected)")
     end)
     it("accepts 0x02000000 (exactly MAX_SIZE) — border is inclusive", function()
       -- 0x02000000 in LE4 = 00 00 00 02
@@ -335,40 +321,42 @@ describe("W107 CompactSize + VarInt serialization audit (lunarblock vs Core)", f
   end)
 
   ---------------------------------------------------------------------------
-  -- G13: BUG — FFI reader has same non-canonical bugs (3 paths)
+  -- G13: FIXED — FFI reader non-canonical rejections (3 paths)
+  -- Fix: buffer_reader_ffi.read_varint now rejects non-canonical encodings.
   ---------------------------------------------------------------------------
-  describe("G13 FFI reader non-canonical rejections (BUG)", function()
-    pending("BUG: FFI reader 0xFD path should reject val < 253 (CONSENSUS-DIVERGENT)", function()
+  describe("G13 FFI reader non-canonical rejections (FIXED)", function()
+    it("FFI reader 0xFD path rejects val < 253", function()
       local b = string.char(0xFD, 0x00, 0x00)
-      assert.has_error(function() dec_ffi(b) end)
+      assert.has_error(function() dec_ffi(b) end,
+        "non-canonical ReadCompactSize()")
     end)
-    it("XFAIL: FFI reader silently accepts non-canonical 0xFD+0 (bug)", function()
-      local b = string.char(0xFD, 0x00, 0x00)
-      local ok, val = pcall(dec_ffi, b)
-      assert.is_true(ok)
-      assert.equal(0, val)
+    it("FFI reader 0xFD path rejects val 252 (non-canonical)", function()
+      local b = string.char(0xFD, 0xFC, 0x00)
+      assert.has_error(function() dec_ffi(b) end,
+        "non-canonical ReadCompactSize()")
     end)
-    it("XFAIL: FFI reader silently accepts non-canonical 0xFE+u32(65535) (bug)", function()
+    it("FFI reader 0xFE path rejects val < 0x10000 (e.g. 65535)", function()
       local b = string.char(0xFE, 0xFF, 0xFF, 0x00, 0x00)
-      local ok, val = pcall(dec_ffi, b)
-      assert.is_true(ok)
-      assert.equal(65535, val)
+      assert.has_error(function() dec_ffi(b) end,
+        "non-canonical ReadCompactSize()")
     end)
   end)
 
   ---------------------------------------------------------------------------
-  -- G14: BUG — FFI reader missing MAX_SIZE range check
+  -- G14: FIXED — FFI reader MAX_SIZE range check
+  -- Fix: buffer_reader_ffi.read_varint now rejects val > MAX_SIZE.
   ---------------------------------------------------------------------------
-  describe("G14 FFI reader MAX_SIZE range check (BUG)", function()
-    pending("BUG: FFI reader should reject values > MAX_SIZE (CONSENSUS-DIVERGENT + DOS)", function()
+  describe("G14 FFI reader MAX_SIZE range check (FIXED)", function()
+    it("FFI reader rejects values > MAX_SIZE (0x02000001)", function()
       local b = string.char(0xFE, 0x01, 0x00, 0x00, 0x02)  -- 0x02000001
-      assert.has_error(function() dec_ffi(b) end)
+      assert.has_error(function() dec_ffi(b) end,
+        "ReadCompactSize(): size too large")
     end)
-    it("XFAIL: FFI reader accepts 0x02000001 silently (bug)", function()
-      local b = string.char(0xFE, 0x01, 0x00, 0x00, 0x02)
+    it("FFI reader accepts exactly MAX_SIZE (0x02000000)", function()
+      local b = string.char(0xFE, 0x00, 0x00, 0x00, 0x02)
       local ok, val = pcall(dec_ffi, b)
       assert.is_true(ok)
-      assert.equal(33554433, val)
+      assert.equal(0x02000000, val)
     end)
   end)
 
@@ -611,10 +599,14 @@ describe("W107 CompactSize + VarInt serialization audit (lunarblock vs Core)", f
 
   ---------------------------------------------------------------------------
   -- G23: Round-trip CompactSize boundary values
+  -- Note: values > MAX_SIZE (0x02000000 = 33554432) are rejected by
+  -- read_varint per Bitcoin Core ReadCompactSize(range_check=true).
+  -- 0xFFFFFFFE and 0xFFFFFFFF intentionally omitted — they exceed MAX_SIZE
+  -- and are correctly rejected (not round-trippable through read_varint).
   ---------------------------------------------------------------------------
   describe("G23 CompactSize round-trip boundary values", function()
     local boundaries = {0, 1, 252, 253, 254, 255, 256, 65534, 65535, 65536,
-                        0xFFFFFFFE, 0xFFFFFFFF}
+                        0x01FFFFFF, 0x02000000}
     for _, v in ipairs(boundaries) do
       it(string.format("round-trips %d", v), function()
         local bytes = enc(v)
@@ -622,6 +614,12 @@ describe("W107 CompactSize + VarInt serialization audit (lunarblock vs Core)", f
         assert.equal(v, got, string.format("round-trip failed for %d", v))
       end)
     end
+    it("rejects 0xFFFFFFFE (> MAX_SIZE)", function()
+      assert.has_error(function() dec(enc(0xFFFFFFFE)) end)
+    end)
+    it("rejects 0xFFFFFFFF (> MAX_SIZE)", function()
+      assert.has_error(function() dec(enc(0xFFFFFFFF)) end)
+    end)
   end)
 
   ---------------------------------------------------------------------------
