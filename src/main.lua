@@ -1299,6 +1299,62 @@ local function main()
     trickle_state.next_send_time = 0
   end)
 
+  -- BIP-111: disconnect peers that send bloom-filter messages when we have
+  -- not advertised NODE_BLOOM.
+  -- Reference: bitcoin-core/src/net_processing.cpp FILTERLOAD/FILTERADD/
+  --            FILTERCLEAR handlers (~4963-5033) — fDisconnect = true when
+  --            !(peer.m_our_services & NODE_BLOOM).
+  --
+  -- filterload / filteradd / filterclear are *inbound* messages (peer → us).
+  -- When NODE_BLOOM is not in our advertised services, Core disconnects the
+  -- peer immediately (Misbehaving-100 / fDisconnect).  We mirror that exactly.
+  --
+  -- bloom.lua provides parse_filterload/parse_filteradd for the future wiring
+  -- wave; here we only register the BIP-111 disconnect path (FIX-36 Scope A).
+
+  local function bloom_guard(peer, msg_type)
+    -- bit was already required above for the mempool handler; require again is
+    -- idempotent in Lua (returns cached module).
+    local bit_mod = require("bit")
+    local advertised_bloom = bit_mod.band(peer.our_services or 0,
+                                          p2p.SERVICES.NODE_BLOOM) ~= 0
+    if not advertised_bloom then
+      peer:disconnect(msg_type .. " received but NODE_BLOOM not advertised (BIP-111)")
+      return false
+    end
+    return true
+  end
+
+  peer_manager:register_handler("filterload", function(peer, _payload)
+    -- BIP-111: disconnect if we did not advertise NODE_BLOOM.
+    if not bloom_guard(peer, "filterload") then return end
+    -- NODE_BLOOM *is* advertised — bloom.lua wiring is a separate future wave
+    -- (FIX-36 Scope B).  For now, log and drop so nothing is silently ignored.
+    print(string.format("[bloom] filterload from %s:%d (bloom wiring pending)",
+      peer.ip, peer.port))
+  end)
+
+  peer_manager:register_handler("filteradd", function(peer, _payload)
+    -- BIP-111: disconnect if we did not advertise NODE_BLOOM.
+    if not bloom_guard(peer, "filteradd") then return end
+    print(string.format("[bloom] filteradd from %s:%d (bloom wiring pending)",
+      peer.ip, peer.port))
+  end)
+
+  peer_manager:register_handler("filterclear", function(peer, _payload)
+    -- BIP-111: disconnect if we did not advertise NODE_BLOOM.
+    if not bloom_guard(peer, "filterclear") then return end
+    print(string.format("[bloom] filterclear from %s:%d (bloom wiring pending)",
+      peer.ip, peer.port))
+  end)
+
+  -- merkleblock is server→client (we never expect to receive it as a server).
+  -- Log and drop; no disconnect (not a protocol violation per BIP-111).
+  peer_manager:register_handler("merkleblock", function(peer, _payload)
+    print(string.format("[bloom] unexpected merkleblock from %s:%d — ignored",
+      peer.ip, peer.port))
+  end)
+
   -- BIP 152: Compact block message handlers
   local compact_block = require("lunarblock.compact_block")
 
