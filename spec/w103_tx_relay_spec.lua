@@ -409,14 +409,66 @@ describe("W103 tx relay flow audit", function()
         assert.is_not_nil(entry.time, "orphan entry must record insertion time")
       end
     end)
-    it("XFAIL: orphan pool must have time-based expiry (LimitOrphans in Core)", function()
-      -- Core: LimitOrphans() removes entries that have been in the pool too long.
-      -- Lunarblock: OrphanPool has no expire() method. Old orphans sit
-      --   in the pool until global cap forces FIFO eviction.
+    it("FIXED(W103 G8): ORPHAN_TX_EXPIRE_TIME=300 constant defined", function()
+      -- Core: txorphanage.cpp / Core PR #22503 — 5-min (300s) stale eviction.
+      assert.equals(300, mempool_mod.ORPHAN_TX_EXPIRE_TIME,
+        "FIXED G8: ORPHAN_TX_EXPIRE_TIME must be 300 seconds (5 min)")
+    end)
+    it("FIXED(W103 G8): expire_stale() method exists on OrphanPool", function()
       local op = mempool_mod.new_orphan_pool()
-      local has_expire_method = (op.expire ~= nil) or (op.expire_stale ~= nil)
-      assert.is_true(has_expire_method,
-        "BUG G8: OrphanPool must have time-based expiry method (Core LimitOrphans)")
+      assert.is_function(op.expire_stale,
+        "FIXED G8: OrphanPool must expose expire_stale() for time-based eviction")
+    end)
+    it("FIXED(W103 G8): expire_stale() evicts orphans older than ORPHAN_TX_EXPIRE_TIME", function()
+      -- Add 2 orphans, backdate their insertion times past the expiry window,
+      -- add 1 fresh orphan, then verify expire_stale() removes only the stale ones.
+      local op = mempool_mod.new_orphan_pool()
+      local ok1, _, w1 = add_orphan(op, 301, "peer1")
+      local ok2, _, w2 = add_orphan(op, 302, "peer2")
+      local ok3, _, w3 = add_orphan(op, 303, "peer3")
+      assert.is_truthy(ok1)
+      assert.is_truthy(ok2)
+      assert.is_truthy(ok3)
+      -- Backdate the first two orphans by 400 seconds (past 300s expiry window)
+      local past = os.time() - 400
+      op.entries[w1].time = past
+      op.entries[w2].time = past
+      -- w3 is fresh (current time); must NOT be evicted
+      local now = os.time()
+      local evicted = op:expire_stale(now)
+      assert.equals(2, evicted,
+        "FIXED G8: expire_stale() must evict exactly the 2 stale orphans")
+      assert.equals(1, op:size(),
+        "FIXED G8: 1 fresh orphan must remain after expire_stale()")
+      assert.is_nil(op.entries[w1], "stale orphan w1 must be removed")
+      assert.is_nil(op.entries[w2], "stale orphan w2 must be removed")
+      assert.is_not_nil(op.entries[w3], "fresh orphan w3 must survive")
+    end)
+    it("FIXED(W103 G8): expire_stale() is a no-op when all orphans are fresh", function()
+      local op = mempool_mod.new_orphan_pool()
+      add_orphan(op, 401, "peer1")
+      add_orphan(op, 402, "peer2")
+      assert.equals(2, op:size())
+      local evicted = op:expire_stale()
+      assert.equals(0, evicted,
+        "FIXED G8: no orphans evicted when all are within ORPHAN_TX_EXPIRE_TIME")
+      assert.equals(2, op:size(), "pool size must be unchanged")
+    end)
+    it("FIXED(W103 G8): expire_stale() cleans secondary indexes (txid_to_wtxid)", function()
+      local op = mempool_mod.new_orphan_pool()
+      local ok, _, w = add_orphan(op, 501, "peer1")
+      assert.is_truthy(ok)
+      -- Retrieve the txid_hex used as secondary key
+      local entry = op.entries[w]
+      local txid_hex = entry and entry.txid_hex
+      -- Backdate and expire
+      op.entries[w].time = os.time() - 400
+      op:expire_stale()
+      assert.equals(0, op:size(), "pool must be empty after expiring sole orphan")
+      if txid_hex then
+        assert.is_nil(op.txid_to_wtxid[txid_hex],
+          "FIXED G8: expire_stale must clean txid_to_wtxid secondary index")
+      end
     end)
   end)
 
