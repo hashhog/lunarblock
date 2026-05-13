@@ -397,37 +397,50 @@ end
 --------------------------------------------------------------------------------
 
 -- Serialize a single undo entry (spent UTXO).
--- Format matches Bitcoin Core's TxInUndoFormatter:
---   varint(height * 2 + coinbase_flag) | [dummy byte if height > 0] | value | script
+-- Format matches Bitcoin Core's TxInUndoFormatter (undo.h):
+--   VARINT(height * 2 + coinbase_flag)   -- Core MSB base-128 VarInt (NOT CompactSize)
+--   [VARINT(0) dummy byte if height > 0] -- version dummy, per Core compat note
+--   TxOutCompression(value, script)      -- VARINT(CompressAmount) + ScriptCompression
+-- Reference: bitcoin-core/src/undo.h TxInUndoFormatter::Ser
 function M.serialize_undo_entry(entry)
   local w = serialize.buffer_writer()
   -- Encode height and coinbase flag together: (height * 2) + coinbase_flag
+  -- MUST use Core MSB base-128 VarInt (write_corevarint), NOT CompactSize.
+  -- For code=128 (height=64, no-coinbase): Core emits [0x80 0x00] (2 bytes);
+  -- CompactSize would emit [0x80] (1 byte) — wire-incompatible.
   local code = entry.height * 2 + (entry.is_coinbase and 1 or 0)
-  w.write_varint(code)
-  -- For compatibility with older undo format, write a dummy byte if height > 0
+  M.write_corevarint(w, code)
+  -- For compatibility with older undo format, write a dummy VARINT(0) if height > 0.
+  -- Core Unser reads this back with VARINT(nVersionDummy); VARINT(0) == [0x00].
   if entry.height > 0 then
-    w.write_u8(0)  -- version dummy
+    M.write_corevarint(w, 0)  -- version dummy (encodes as single byte 0x00)
   end
-  -- Write the TxOut data: value + script
-  w.write_i64le(entry.value)
-  w.write_varstr(entry.script_pubkey)
+  -- Write the TxOut data using TxOutCompression:
+  --   VARINT(CompressAmount(value)) + ScriptCompression(script_pubkey)
+  -- This matches Core's Using<TxOutCompression>(txout.out) in TxInUndoFormatter::Ser.
+  M.write_corevarint(w, M.compress_amount(entry.value))
+  w.write_bytes(M.compress_script(entry.script_pubkey))
   return w.result()
 end
 
 -- Deserialize a single undo entry (spent UTXO).
+-- Mirrors TxInUndoFormatter::Unser in bitcoin-core/src/undo.h.
 function M.deserialize_undo_entry(reader)
   if type(reader) == "string" then
     reader = serialize.buffer_reader(reader)
   end
-  local code = reader.read_varint()
+  -- code uses Core MSB base-128 VarInt (NOT CompactSize)
+  local code = tonumber(M.read_corevarint(reader))
   local height = math.floor(code / 2)
   local is_coinbase = (code % 2) == 1
-  -- Read and discard dummy byte if height > 0
+  -- Read and discard dummy VARINT if height > 0 (Core compat, see Ser above)
   if height > 0 then
-    reader.read_u8()  -- version dummy
+    M.read_corevarint(reader)  -- version dummy
   end
-  local value = reader.read_i64le()
-  local script_pubkey = reader.read_varstr()
+  -- Read TxOutCompression: VARINT(compressed_amount) + ScriptCompression
+  local compressed_amount = M.read_corevarint(reader)
+  local value = M.decompress_amount(compressed_amount)
+  local script_pubkey = M.decompress_script(reader)
   return M.utxo_entry(value, script_pubkey, height, is_coinbase)
 end
 
