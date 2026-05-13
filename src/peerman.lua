@@ -407,6 +407,53 @@ local function _is_local_addr(ip)
   return false
 end
 
+--- Check if an IPv4 address string is routable on the public internet.
+-- Mirrors Bitcoin Core CNetAddr::IsRoutable() for IPv4.
+-- Rejects: RFC1918 private, RFC2544 benchmarking, RFC3927 link-local,
+--          RFC6598 CGN, RFC5737 documentation, loopback (0.0.0.0/8,
+--          127.0.0.0/8), and the unspecified/broadcast address.
+-- IPv6 and non-IP addresses (Tor .onion, I2P, CJDNS) are passed through
+-- as routable — their validity is checked elsewhere.
+-- Reference: bitcoin-core/src/netaddress.cpp CNetAddr::IsRoutable()
+-- @param ip string: IPv4 address string (e.g. "1.2.3.4") or nil/non-IPv4
+-- @return boolean: true if the address is routable
+local function _is_routable(ip)
+  if not ip then return false end
+  -- Only apply IPv4 private-range filter here; IPv6 / overlay addrs pass.
+  local a, b, c = ip:match("^(%d+)%.(%d+)%.(%d+)%.")
+  if not a then
+    -- Not a dotted-decimal IPv4 string — treat as non-IPv4 (pass through).
+    return true
+  end
+  a, b, c = tonumber(a), tonumber(b), tonumber(c)
+  -- 0.0.0.0/8 — unspecified / "this network"
+  if a == 0 then return false end
+  -- 127.0.0.0/8 — loopback (IsLocal)
+  if a == 127 then return false end
+  -- 10.0.0.0/8 — RFC1918 private
+  if a == 10 then return false end
+  -- 172.16.0.0/12 — RFC1918 private
+  if a == 172 and b >= 16 and b <= 31 then return false end
+  -- 192.168.0.0/16 — RFC1918 private
+  if a == 192 and b == 168 then return false end
+  -- 169.254.0.0/16 — RFC3927 link-local (also IsRFC3927)
+  if a == 169 and b == 254 then return false end
+  -- 198.18.0.0/15 — RFC2544 benchmarking
+  if a == 198 and (b == 18 or b == 19) then return false end
+  -- 100.64.0.0/10 — RFC6598 shared address (CGN)
+  if a == 100 and b >= 64 and b <= 127 then return false end
+  -- 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 — RFC5737 documentation
+  if a == 192 and b == 0 and c == 2 then return false end
+  if a == 198 and b == 51 and c == 100 then return false end
+  if a == 203 and b == 0 and c == 113 then return false end
+  -- 255.255.255.255 / 240.0.0.0/4 broadcast/reserved
+  if a >= 240 then return false end
+  return true
+end
+
+-- Export for spec access
+M.is_routable = _is_routable
+
 --------------------------------------------------------------------------------
 -- Address Manager Initialization (Eclipse Attack Mitigation)
 --------------------------------------------------------------------------------
@@ -1280,6 +1327,11 @@ function PeerManager:handle_addr(peer, payload)
   local now = os.time()
   local src_ip = peer and peer.ip or "unknown"
   for _, addr in ipairs(addresses) do
+    -- Reject non-routable addresses (RFC1918, loopback, link-local, etc.).
+    -- Mirrors Bitcoin Core CNetAddr::IsRoutable() guard in AddrMan::Add().
+    if not _is_routable(addr.ip) then
+      goto continue
+    end
     -- Only accept addresses with recent timestamps (within 3 hours)
     if addr.timestamp > now - 10800 and addr.timestamp <= now + 600 then
       local key = addr.ip .. ":" .. addr.port
@@ -1297,6 +1349,7 @@ function PeerManager:handle_addr(peer, payload)
       -- Add to address manager new table with source tracking
       self:_add_to_new(addr.ip, addr.port, addr.services, addr.timestamp, src_ip)
     end
+    ::continue::
   end
 end
 
@@ -1331,8 +1384,10 @@ function PeerManager:handle_addrv2(peer, payload)
             last_try = 0,
           }
         end
-        -- Only add to connection pool if it's an IP address we can connect to
-        if addr.ip then
+        -- Only add to connection pool if it's a routable IP address.
+        -- _is_routable rejects RFC1918/loopback/link-local for IPv4;
+        -- non-IPv4 overlay addresses (Tor/I2P/CJDNS) pass through.
+        if addr.ip and _is_routable(addr.ip) then
           self:_add_to_new(addr.ip, addr.port, addr.services, addr.timestamp, src_ip)
         end
       end
