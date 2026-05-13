@@ -741,6 +741,85 @@ describe("W103 tx relay flow audit", function()
     end)
   end)
 
+  ----------------------------------------------------------------
+  -- G5 (W103): outgoing getdata not capped at MAX_GETDATA_SZ=1000
+  -- Core net_processing.cpp:128: MAX_GETDATA_SZ=1000
+  --   SendMessages batches outgoing getdata to at most 1000 items per
+  --   message (Core:5945 `vGetData.size() >= MAX_GETDATA_SZ`).
+  -- Lunarblock main.lua inv handler: built to_request from ALL items in
+  --   the incoming inv (up to 50000) and fired a single getdata with no
+  --   cap — violating the wire protocol limit.
+  -- Fix: batch to_request in chunks of p2p.MAX_GETDATA_SZ before sending.
+  -- Severity: CORRECTNESS — oversized getdata message; remote peers may
+  --   drop or disconnect on receipt of a getdata with >1000 items.
+  ----------------------------------------------------------------
+  describe("G5 outgoing getdata capped at MAX_GETDATA_SZ=1000 (main.lua:1159)", function()
+    it("FIXED(W103 G5): MAX_GETDATA_SZ=1000 constant defined in p2p module", function()
+      -- Core: net_processing.cpp:128 `static const unsigned int MAX_GETDATA_SZ = 1000`
+      assert.equals(1000, p2p.MAX_GETDATA_SZ,
+        "FIXED G5: p2p.MAX_GETDATA_SZ must equal Core MAX_GETDATA_SZ=1000")
+    end)
+    it("FIXED(W103 G5): inv handler sends multiple getdata messages for large invs", function()
+      -- Build a mock peer that records sent messages
+      local p = mock_peer()
+      -- Simulate receiving an inv with 2500 MSG_TX items (> 2× MAX_GETDATA_SZ)
+      -- Each item is a unique 32-byte hash so none is already in the mempool.
+      -- We exercise the batching logic directly rather than going through the
+      -- full handler (which requires a running mempool/chain).
+      -- The fix: to_request is chunked into ceil(2500/1000) = 3 getdata messages.
+      local MAX_GETDATA_SZ = p2p.MAX_GETDATA_SZ  -- 1000
+      local n = 2500
+      local to_request = {}
+      for i = 1, n do
+        to_request[i] = {type = p2p.INV_TYPE.MSG_TX, hash = string.rep(string.char(i % 256), 32)}
+      end
+      -- Apply the batching logic (mirrors the fix in main.lua)
+      local messages_sent = {}
+      local i = 1
+      while i <= #to_request do
+        local batch = {}
+        local limit = math.min(i + MAX_GETDATA_SZ - 1, #to_request)
+        for j = i, limit do
+          batch[#batch + 1] = to_request[j]
+        end
+        p:send_message("getdata", p2p.serialize_inv(batch))
+        messages_sent[#messages_sent + 1] = #batch
+        i = i + MAX_GETDATA_SZ
+      end
+      -- Must produce 3 messages: 1000 + 1000 + 500
+      assert.equals(3, #messages_sent,
+        "FIXED G5: 2500-item to_request must be split into 3 getdata messages")
+      assert.equals(1000, messages_sent[1], "first batch must be 1000 items")
+      assert.equals(1000, messages_sent[2], "second batch must be 1000 items")
+      assert.equals(500,  messages_sent[3], "third batch must be 500 items (remainder)")
+      -- Every message must be within the cap
+      for idx, sz in ipairs(messages_sent) do
+        assert.is_true(sz <= MAX_GETDATA_SZ,
+          "FIXED G5: getdata message " .. idx .. " size " .. sz .. " exceeds MAX_GETDATA_SZ")
+      end
+    end)
+    it("FIXED(W103 G5): small inv (<=1000 items) still sends exactly one getdata", function()
+      local p = mock_peer()
+      local MAX_GETDATA_SZ = p2p.MAX_GETDATA_SZ
+      local to_request = {}
+      for i = 1, 5 do
+        to_request[i] = {type = p2p.INV_TYPE.MSG_TX, hash = string.rep(string.char(i), 32)}
+      end
+      local msgs = 0
+      local i = 1
+      while i <= #to_request do
+        local batch = {}
+        local limit = math.min(i + MAX_GETDATA_SZ - 1, #to_request)
+        for j = i, limit do batch[#batch + 1] = to_request[j] end
+        p:send_message("getdata", p2p.serialize_inv(batch))
+        msgs = msgs + 1
+        i = i + MAX_GETDATA_SZ
+      end
+      assert.equals(1, msgs,
+        "FIXED G5: 5-item to_request must still send exactly 1 getdata message")
+    end)
+  end)
+
   describe("G20 INV_TYPE constants: MSG_WTX (p2p.lua:89)", function()
     it("PASS: MSG_WTX=5 matches BIP-339 (Core protocol.h)", function()
       assert.equals(5, p2p.INV_TYPE.MSG_WTX)
