@@ -1051,6 +1051,11 @@ local function main()
         orphan_pool:remove(c.wtxid_hex)
         pcall(function() mempool:accept_transaction(c.tx) end)
       end
+      -- Time-based expiry: evict orphans older than ORPHAN_TX_EXPIRE_TIME
+      -- (300 s / 5 min) whose parent chain never arrived.  Called here
+      -- so expiry runs at most once per block (cheap, ~100 entries).
+      -- Mirrors Core's LimitOrphans() age gate (txorphanage.cpp).
+      orphan_pool:expire_stale()
     end
     -- Call previous callback (ZMQ, etc.)
     if prev_on_block_connected then
