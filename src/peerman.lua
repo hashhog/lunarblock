@@ -1813,15 +1813,34 @@ end
 
 --- Queue a transaction announcement for all established peers.
 -- Uses trickling: queues inv entries for later batched, randomized sending.
--- @param txid string: transaction id (hash256 as raw bytes)
+-- BIP-37: if a peer has loaded a bloom filter (peer.bloom_filter ~= nil) the
+-- transaction is checked against the filter; only matching txs are queued.
+-- Reference: bitcoin-core/src/net_processing.cpp SendMessages() — filters
+-- outbound tx inv via tx_relay->m_bloom_filter->IsRelevantAndUpdate().
+-- @param txid  string: transaction id (hash256 as raw bytes)
 -- @param wtxid string: witness transaction id (hash256 as raw bytes, optional)
-function PeerManager:queue_tx_announcement(txid, wtxid)
+-- @param tx    table:  deserialized transaction object (optional; required for
+--                      bloom-filter matching when the peer has loaded a filter)
+function PeerManager:queue_tx_announcement(txid, wtxid, tx)
   wtxid = wtxid or txid  -- Non-segwit: wtxid equals txid
   for _, p in ipairs(self.peer_list) do
     if p.state == peer_mod.STATE.ESTABLISHED then
       local key = p.ip .. ":" .. p.port
       local trickle = self._peer_trickle and self._peer_trickle[key]
       if trickle then
+        -- BIP-37: per-peer bloom filter check (FIX-37).
+        -- Skip this peer if it has a loaded filter that rejects the tx.
+        -- If no filter is loaded (peer.bloom_filter == nil) the tx is always
+        -- relayed (unconditional relay, same as Core when no filter is set).
+        if p.bloom_filter ~= nil and tx ~= nil then
+          local bloom = require("lunarblock.bloom")
+          local ok_pcall, matched = pcall(bloom.is_relevant_and_update, p.bloom_filter, tx)
+          if not ok_pcall or not matched then
+            -- tx does not match this peer's filter — skip it
+            goto continue_peer
+          end
+        end
+
         -- Use wtxid for peers that negotiated wtxidrelay (BIP 339)
         local hash = p.wtxid_relay and wtxid or txid
         local is_wtxid = p.wtxid_relay
@@ -1829,6 +1848,7 @@ function PeerManager:queue_tx_announcement(txid, wtxid)
         if not trickle.inv_known[hash] then
           trickle.inv_queue[#trickle.inv_queue + 1] = {hash = hash, is_wtxid = is_wtxid}
         end
+        ::continue_peer::
       end
     end
   end
