@@ -461,14 +461,13 @@ M.is_routable = _is_routable
 --- Initialize the address manager with new/tried bucketing.
 -- Called during PeerManager construction.
 function PeerManager:_init_addrman()
-  -- Generate a random secret key for deterministic bucket assignment
-  -- This key should persist across restarts ideally, but for now we regenerate
-  math.randomseed(os.time() + (socket.gettime() * 1000000) % 1000000)
-  local key_bytes = {}
-  for i = 1, 32 do
-    key_bytes[i] = string.char(math.random(0, 255))
-  end
-  self._addrman_key = table.concat(key_bytes)
+  -- Generate a cryptographically secure random key for deterministic bucket assignment.
+  -- W104 BUG-3: previously used math.random (seeded from os.time()) — not a CSPRNG.
+  -- Read 32 bytes from /dev/urandom instead.
+  -- Persistence across restarts (peers.dat) is tracked separately (BUG-17).
+  local f = assert(io.open("/dev/urandom", "rb"))
+  self._addrman_key = f:read(32)
+  f:close()
 
   -- New table: 256 buckets, each with 64 entries
   -- Stores addresses we've heard about but haven't connected to

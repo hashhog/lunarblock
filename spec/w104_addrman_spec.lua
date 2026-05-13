@@ -174,21 +174,21 @@ end)
 
 describe("G3 addrman key security and persistence (BUG-3)", function()
 
-  it("BUG-3 XFAIL: addrman key is regenerated (non-CSPRNG) on each restart", function()
-    -- The init code explicitly says "for now we regenerate" — meaning two
-    -- PeerManager instances have different keys, and an attacker can steer
-    -- bucket placement if they can observe the math.random seed.
+  it("BUG-3 FIXED: addrman key is sourced from /dev/urandom (CSPRNG)", function()
+    -- Fixed: _init_addrman now reads 32 bytes from /dev/urandom instead of
+    -- calling math.random() seeded from os.time().  Two PeerManager instances
+    -- initialised in rapid succession must have distinct keys (probability of
+    -- collision with a CSPRNG is 2^-256 — negligible).
     local pm1, d1 = make_pm()
     local pm2, d2 = make_pm()
-    -- Keys may accidentally collide (2^-256 probability for CSPRNG),
-    -- but with math.random seeded by os.time() they'll often be the same
-    -- within the same second — or at least they're not from a CSPRNG.
-    -- We document that no persistence mechanism exists.
     assert.is_string(pm1._addrman_key)
     assert.equals(32, #pm1._addrman_key)
-    -- The key is not written to disk (no peers.dat)
-    local f = io.open(d1 .. "/peers.dat", "r")
-    assert.is_nil(f, "peers.dat should not exist (addrman not persisted)")
+    assert.is_string(pm2._addrman_key)
+    assert.equals(32, #pm2._addrman_key)
+    -- Keys from two independent CSPRNG reads must differ.
+    assert.is_not_equal(pm1._addrman_key, pm2._addrman_key,
+      "addrman keys from two PeerManager instances must differ (CSPRNG)")
+    -- Persistence (peers.dat) is a separate bug (BUG-17); not tested here.
     rm_dir(d1)
     rm_dir(d2)
   end)
