@@ -249,68 +249,71 @@ describe("W105 CCheckQueue / parallel script verification audit", function()
 
   -- =========================================================================
   -- BUG-1: G3 Script execution cache key uses txid+inp_idx instead of wtxid
+  -- FIXED: key is now per-TX (SHA-256(nonce||wtxid||flags)); input_index ignored
   -- =========================================================================
-  describe("BUG-1 G3 sig_cache key: txid+inp_idx vs Core wtxid+all-inputs", function()
-    it("cache key is per-input not per-tx (Core uses per-tx wtxid key)", function()
-      -- Core: SHA256(nonce || wtxid || flags) → one key per tx
-      -- Lunarblock: txid .. ":" .. inp_idx .. ":" .. flags → one key per input
-      -- This test verifies the current (wrong) behaviour so a fix can be
-      -- detected by a key-format change.
+  describe("BUG-1 G3 sig_cache key: per-TX (wtxid+flags) — FIXED", function()
+    it("inserting same tx twice (different input_index) produces ONE cache entry", function()
+      -- FIXED: Core's SHA256(nonce || wtxid || flags) is per-TX; one cache entry
+      -- covers all inputs.  input_index is intentionally ignored in make_key.
       local sc = sig_cache_mod.new(100)
       local txid = string.rep("\xaa", 32)
       sc:insert(txid, 1, 7)
       sc:insert(txid, 2, 7)
-      -- Two separate entries exist for the same tx — Core would have ONE
-      assert.equals(2, sc:size(),
-        "BUG-1: cache stores per-input entries; Core uses per-tx")
+      -- Both inserts hash to the same key (input_index excluded) → size = 1
+      assert.equals(1, sc:size(),
+        "FIXED BUG-1: per-TX key — same txid+flags = same key regardless of input_index")
     end)
 
-    it("cache hit on input 1 does not imply hit on input 2 (same tx)", function()
+    it("cache hit on input 1 implies hit on input 2 (same tx, per-TX key)", function()
+      -- FIXED: after one insert for the tx, ALL inputs of that tx are cached.
       local sc = sig_cache_mod.new(100)
       local txid = string.rep("\xbb", 32)
       sc:insert(txid, 1, 3)
       assert.is_true(sc:lookup(txid, 1, 3))
-      -- Core: if the tx is cached, ALL inputs are skipped
-      -- Lunarblock: input 2 is a miss even though same tx
-      assert.is_false(sc:lookup(txid, 2, 3),
-        "BUG-1: per-input cache misses inputs not individually inserted")
+      -- Per-TX key: looking up with input_index=2 also hits (same tx, same flags)
+      assert.is_true(sc:lookup(txid, 2, 3),
+        "FIXED BUG-1: per-TX key — lookup with any input_index hits for cached tx")
     end)
 
-    it("cache uses txid not wtxid — segwit witness mutation not detected", function()
-      -- Core uses GetWitnessHash() (wtxid) so mutated witness gives cache miss.
-      -- Lunarblock uses txid (non-witness id) — same key for both.
-      -- We simulate this by checking the key string directly.
+    it("different wtxid gives cache miss (witness mutation detected)", function()
+      -- FIXED: the key material includes the hash the caller passes.  Callers
+      -- in utxo.lua should pass wtxid (witness txid) so that witness mutation
+      -- produces a distinct key.  We verify that two different hashes produce
+      -- independent cache entries.
       local sc = sig_cache_mod.new(100)
-      local txid = string.rep("\xcc", 32)
-      -- Witness mutation does not change txid; Core would have a different key.
-      sc:insert(txid, 0, 16)
-      assert.is_true(sc:lookup(txid, 0, 16),
-        "BUG-1: txid-keyed cache gives hit even after hypothetical witness mutation")
+      local wtxid_original = string.rep("\xcc", 32)
+      local wtxid_mutated  = string.rep("\xdd", 32)  -- different witness → different wtxid
+      sc:insert(wtxid_original, 0, 16)
+      assert.is_true(sc:lookup(wtxid_original, 0, 16))
+      -- Mutated witness has a different wtxid → cache miss
+      assert.is_false(sc:lookup(wtxid_mutated, 0, 16),
+        "FIXED BUG-1: different wtxid → different key → cache miss (witness mutation detected)")
     end)
   end)
 
   -- =========================================================================
   -- BUG-2: G2 No per-process nonce in cache key
+  -- FIXED: 32-byte /dev/urandom nonce read at SigCache.new(); each instance
+  -- has a distinct nonce → keys differ across instantiations and process runs.
   -- =========================================================================
-  describe("BUG-2 G2 no per-process nonce in sig_cache key", function()
-    it("cache key is deterministic across instantiations (no nonce)", function()
-      -- Core seeds with GetRandHash() so keys differ between runs.
-      -- Lunarblock: key is just concatenated strings — fully deterministic.
+  describe("BUG-2 G2 per-process nonce in sig_cache key — FIXED", function()
+    it("cache key differs across independently-constructed instances (nonce present)", function()
+      -- FIXED: Core seeds with GetRandHash() (validation.cpp:2030-2035).
+      -- Each SigCache.new() reads 32 bytes from /dev/urandom; make_key =
+      -- SHA-256(nonce || txid || flags).  Two independent instances have
+      -- different nonces → different keys for the same input material.
       local sc1 = sig_cache_mod.new(100)
       local sc2 = sig_cache_mod.new(100)
       local txid = string.rep("\xdd", 32)
-      -- If there were a nonce, make_key output would differ between instances.
-      -- Here we can only observe that the two caches agree on lookups, which
-      -- is the symptom of no-nonce (cross-session predictability).
-      sc1:insert(txid, 0, 5)
-      -- A fresh sc2 would also produce the same lookup if both used the same key.
-      assert.is_false(sc2:lookup(txid, 0, 5),
-        "Cross-instance lookup is false (entries are not shared), but keys are predictable")
-      -- Observe that inserting the same "key" produces the same string both times:
+      -- Keys from the two instances must differ (distinct nonces)
       local key1 = sc1:make_key(txid, 0, 5)
       local key2 = sc2:make_key(txid, 0, 5)
-      assert.equals(key1, key2,
-        "BUG-2: cache key is deterministic (no nonce) — same across instantiations")
+      assert.not_equals(key1, key2,
+        "FIXED BUG-2: per-instance nonce makes keys unpredictable across instantiations")
+      -- Entries from sc1 must NOT be reachable via sc2 (separate tables + distinct keys)
+      sc1:insert(txid, 0, 5)
+      assert.is_false(sc2:lookup(txid, 0, 5),
+        "FIXED BUG-2: sc2 cannot hit sc1 entries (different nonce → different key)")
     end)
   end)
 
