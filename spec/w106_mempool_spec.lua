@@ -582,22 +582,120 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
   end)
 
   ---------------------------------------------------------------------------
-  -- G19 BUG: ImprovesFeerateDiagram NOT invoked in RBF accept path
+  -- G19 FIXED: ImprovesFeerateDiagram wired into RBF accept path
   --
-  -- Core's cluster-mempool RBF requires ImprovesFeerateDiagram after Rules 3/4.
-  -- lunarblock defines compare_diagrams/build_feerate_diagram but never calls
-  -- them in accept_transaction's RBF block (lines 1290-1411).
+  -- After Rules 3/4, accept_transaction now builds old/new feerate diagrams
+  -- for the affected clusters and calls compare_diagrams(old, new).
+  -- A replacement that passes Rules 3/4 but does not improve the diagram
+  -- must be rejected with "does not improve feerate diagram".
+  -- Reference: Core rbf.cpp:127-140 ImprovesFeerateDiagram.
   ---------------------------------------------------------------------------
-  describe("G19 BUG: ImprovesFeerateDiagram not invoked in RBF path", function()
-    it("DOCUMENTS: compare_diagrams exported but never called in accept_transaction", function()
-      -- Functions exist in the module
+  describe("G19 FIXED: ImprovesFeerateDiagram wired into RBF accept path", function()
+    it("compare_diagrams and build_feerate_diagram are exported", function()
       assert.is_function(mempool.compare_diagrams,
-        "compare_diagrams is exported from module")
+        "compare_diagrams must be exported from module")
       assert.is_function(mempool.build_feerate_diagram,
-        "build_feerate_diagram is exported from module")
-      -- But the RBF accept path (accept_transaction lines ~1290-1411) does
-      -- NOT call these functions; the feerate-diagram improvement check
-      -- (Core rbf.cpp:127-140 ImprovesFeerateDiagram) is entirely absent.
+        "build_feerate_diagram must be exported from module")
+    end)
+
+    it("accepts RBF replacement that strictly improves the feerate diagram", function()
+      -- A replacement whose feerate is clearly higher than the original must be
+      -- accepted: the diagram gate is live and compare_diagrams returns true.
+      -- Original: 1 input 500 000 sat → output 490 000 sat; fee = 10 000
+      -- Replacement: double-spends same coin + 1 extra coin; total in = 1 000 000 sat
+      --   output = 975 000 sat; fee = 25 000
+      --   additional = 25 000 - 10 000 = 15 000
+      --   required   = ceil(100 * vsize_repl / 1000) ≈ ceil(100 * ~200 / 1000) = 20
+      --   Rule #4 passes.  Replacement feerate ≈ 25000/200 = 125 sat/vB vs
+      --   original feerate ≈ 10000/100 = 100 sat/vB → diagram strictly improves.
+      local cs = make_chain()
+      local coin_a = random_txid()
+      add_utxo(cs, coin_a, 0, 500000)
+      local mp = mempool.new(cs)
+
+      local orig = types.transaction(1,
+        { make_input(coin_a, 0, 0xFFFFFFFD) },
+        { make_output(490000) }, 0)   -- fee = 10 000
+      local ok1, orig_hex = accept(mp, orig)
+      assert.is_true(ok1, "original must be accepted: " .. tostring(orig_hex))
+
+      local coin_b = random_txid()
+      add_utxo(cs, coin_b, 0, 500000)
+      local repl = types.transaction(2,
+        { make_input(coin_a, 0, 0xFFFFFFFD),
+          make_input(coin_b, 0) },
+        { make_output(975000) }, 0)   -- fee = 25 000 > 10 000; diagram improves
+      local ok2, err2 = accept(mp, repl)
+      assert.is_true(ok2,
+        "FIXED G19: high-feerate replacement must be accepted — " ..
+        "ImprovesFeerateDiagram gate is live and correctly passes a better diagram " ..
+        "(was silently absent before this fix); err=" .. tostring(err2))
+    end)
+
+    it("rejects RBF replacement that passes Rules 3+4 but degrades feerate diagram", function()
+      -- Setup a replacement that clearly degrades the feerate diagram:
+      --   original: very high feerate (fee/vsize large)
+      --   replacement: just barely passes Rules 3+4 (additional fee > required),
+      --     but feerate is much lower (large vsize, small fee increment).
+      --
+      -- Original: coin_a(1 000 000) → output(500 000); fee = 500 000; vsize ≈ 100 vB
+      --   feerate ≈ 5000 sat/vB
+      --
+      -- Build a bloated replacement with 30 confirmed inputs each of tiny value:
+      --   30 × coin_tiny = 30 × 20 001 sat = 600 030 sat total tiny
+      --   coin_a input = 1 000 000 sat
+      --   total_in = 1 600 030 sat
+      --   fee_required_r3 = 500 001 (just above original fee)
+      --   additional_required_r4 = ceil(100 * vsize_repl / 1000)
+      --     vsize_repl ≈ 100 + 30 * 41 = 1330 vB → required ≈ 133 sat
+      --   target fee = 500 001 + 133 + 1 = 500 135
+      --   output = 1 600 030 - 500 135 = 1 099 895 sat
+      --   replacement feerate ≈ 500 135 / 1330 ≈ 376 sat/vB << 5000 sat/vB of original
+      --   → compare_diagrams(old, new) must return false → reject with diagram error.
+      local cs = make_chain()
+      local coin_a = random_txid()
+      add_utxo(cs, coin_a, 0, 1000000)
+
+      local tiny_coins = {}
+      local total_tiny = 0
+      for _ = 1, 30 do
+        local c = random_txid()
+        add_utxo(cs, c, 0, 20001)
+        tiny_coins[#tiny_coins + 1] = c
+        total_tiny = total_tiny + 20001
+      end
+
+      local mp = mempool.new(cs)
+
+      -- Accept original (ultra-high feerate)
+      local orig = types.transaction(1,
+        { make_input(coin_a, 0, 0xFFFFFFFD) },
+        { make_output(500000) }, 0)   -- fee = 500 000
+      local ok1, orig_hex = accept(mp, orig)
+      assert.is_true(ok1, "original must be accepted: " .. tostring(orig_hex))
+
+      -- Build replacement inputs: coin_a (double-spend) + all 30 tiny coins
+      local repl_inputs = { make_input(coin_a, 0, 0xFFFFFFFD) }
+      for _, c in ipairs(tiny_coins) do
+        repl_inputs[#repl_inputs + 1] = make_input(c, 0)
+      end
+
+      -- total_in = 1 000 000 + total_tiny; output chosen so fee passes R3+R4
+      -- but feerate is much lower than original
+      local total_in = 1000000 + total_tiny
+      local repl_fee = 500500   -- passes Rule #3 (500500 > 500000); large but tiny feerate
+      local repl_output = total_in - repl_fee
+
+      local repl = types.transaction(2, repl_inputs, { make_output(repl_output) }, 0)
+      local ok2, err2 = accept(mp, repl)
+
+      -- The diagram check must fire and reject the replacement.
+      assert.is_false(ok2,
+        "FIXED G19: low-feerate replacement must be rejected by ImprovesFeerateDiagram " ..
+        "(was silently accepted before this fix; Core rbf.cpp:127-140)")
+      assert.is_string(err2)
+      assert.is_truthy(err2:find("feerate diagram"),
+        "rejection reason must mention 'feerate diagram', got: " .. tostring(err2))
     end)
   end)
 
