@@ -2652,11 +2652,17 @@ end
 --                              is implicitly bounded by the global cap +
 --                              reservation logic — we use a flat 100 to
 --                              keep the bookkeeping simple)
+--   ORPHAN_TX_EXPIRE_TIME   = 300 seconds (5 min) — stale orphans whose
+--                              parent chain never arrived are evicted by
+--                              expire_stale().  Mirror of the constant used
+--                              in Core before the weight-based rewrite
+--                              (txorphanage.cpp, Core PR #22503).
 --------------------------------------------------------------------------------
 
 M.MAX_ORPHAN_TRANSACTIONS = 100
 M.MAX_ORPHAN_TX_SIZE      = 100000
 M.MAX_ORPHANS_PER_PEER    = 100
+M.ORPHAN_TX_EXPIRE_TIME   = 300  -- seconds; Core txorphanage.h (pre-weight-rewrite)
 
 local OrphanPool = {}
 OrphanPool.__index = OrphanPool
@@ -2838,6 +2844,36 @@ function OrphanPool:remove_for_peer(peer_id)
   end
   self.order = kept
   return removed
+end
+
+--- Evict orphans that have been sitting in the pool for longer than
+-- ORPHAN_TX_EXPIRE_TIME seconds (default 300 s / 5 min).  Mirrors
+-- Core's LimitOrphans() time-gate: orphans whose parent chain never
+-- arrived within the expiry window are almost certainly for dead tx
+-- chains and waste memory / inflate the available capacity for genuine
+-- orphans.
+--
+-- @param now number|nil: current UNIX timestamp (os.time() if omitted)
+-- @return integer: number of orphans evicted
+function OrphanPool:expire_stale(now)
+  now = now or os.time()
+  local cutoff = now - (self.expire_time or M.ORPHAN_TX_EXPIRE_TIME)
+  local evicted = 0
+  -- Walk insertion order; collect the stale ones first to avoid
+  -- mutating self.order while iterating it.
+  local stale = {}
+  for _, wtxid_hex in ipairs(self.order) do
+    local e = self.entries[wtxid_hex]
+    if e and e.time <= cutoff then
+      stale[#stale + 1] = wtxid_hex
+    end
+  end
+  for _, wtxid_hex in ipairs(stale) do
+    if self:remove(wtxid_hex) then
+      evicted = evicted + 1
+    end
+  end
+  return evicted
 end
 
 --- A new tx (`parent_txid_hex`) has just been accepted to the chain or
