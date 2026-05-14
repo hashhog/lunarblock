@@ -1659,17 +1659,51 @@ end
 -- Reference: bitcoin-core/src/net_processing.cpp PeerManagerImpl::MaybeSendBlock
 -- and camlcoin/lib/peer_manager.ml::announce_block.
 --
--- @param block_hash string: 32-byte block hash (raw bytes)
+-- W112 BUG-5/BUG-6 fix: HB peers (high_bandwidth=true) now receive an
+-- unsolicited cmpctblock directly.  Non-HB peers continue to get headers
+-- (if they sent sendheaders) or inv.  compact_block.create_compact_block is
+-- called lazily (only when there is at least one HB peer) to avoid the cost
+-- when no HB peers are present.
+--
+-- @param block_hash hash256: block hash object
 -- @param header table: block_header object (for headers announce)
+-- @param full_block table: full block object (optional; needed for HB cmpctblock)
 -- @param filter_fn function: optional filter function(peer) -> boolean
-function PeerManager:announce_block(block_hash, header, filter_fn)
+function PeerManager:announce_block(block_hash, header, full_block, filter_fn)
+  -- Backward-compat: callers that pass only (block_hash, header) without full_block
+  -- will get nil for full_block; HB path is simply skipped in that case.
+  if type(full_block) == "function" then
+    -- Old 3-arg call: announce_block(hash, header, filter_fn)
+    filter_fn = full_block
+    full_block = nil
+  end
+
   local inv_payload = p2p.serialize_inv({
     {type = p2p.INV_TYPE.MSG_BLOCK, hash = block_hash}
   })
   local headers_payload = nil
+  local cmpctblock_payload = nil  -- built lazily for HB peers
+
   for _, p in ipairs(self.peer_list) do
     if p.state == peer_mod.STATE.ESTABLISHED then
       if not filter_fn or filter_fn(p) then
+        -- HB peers: send unsolicited cmpctblock (BIP-152 Section 3.1)
+        if p.high_bandwidth and p.provides_compact and full_block then
+          if not cmpctblock_payload then
+            -- Lazy-require compact_block to avoid circular dependency at module load.
+            local cb_mod = require("lunarblock.compact_block")
+            local serialize_mod = require("lunarblock.serialize")
+            local nonce_val = math.random(0, 2^52)  -- 52-bit safe for Lua double
+            local cb = cb_mod.create_compact_block(full_block, nonce_val)
+            cmpctblock_payload = serialize_mod and cb and p2p.serialize_cmpctblock(
+              cb.header, cb.nonce, cb.short_ids, cb.prefilled_txns)
+          end
+          if cmpctblock_payload then
+            p:send_message("cmpctblock", cmpctblock_payload)
+            goto continue_peer
+          end
+        end
+        -- Non-HB: headers or inv
         if p.send_headers and header then
           if not headers_payload then
             headers_payload = p2p.serialize_headers({header})
@@ -1678,6 +1712,7 @@ function PeerManager:announce_block(block_hash, header, filter_fn)
         else
           p:send_message("inv", inv_payload)
         end
+        ::continue_peer::
       end
     end
   end
