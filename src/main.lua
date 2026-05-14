@@ -1029,6 +1029,19 @@ local function main()
     print("Loaded fee estimation data from " .. fee_est_path)
   end
 
+  -- Wire fee estimator into mempool tx-removal callback.
+  -- Wrap any existing callback (e.g. ZMQ) so both fire.
+  -- Mirrors Core's removeTx(hash, inBlock=false): evicted/replaced/expired txs
+  -- are recorded as failures in failAvg; "confirmed" and "test-accept" are skipped
+  -- (tx_confirmed() handles confirmed txs; test-accept is a dry-run).
+  local prev_on_tx_removed = mempool.callbacks.on_tx_removed
+  mempool.callbacks.on_tx_removed = function(txid_hex, reason)
+    fee_estimator:tx_removed(txid_hex, reason)
+    if prev_on_tx_removed then
+      prev_on_tx_removed(txid_hex, reason)
+    end
+  end
+
   -- Wire fee estimator into block-connected callback.
   -- Wrap any existing callback (e.g. ZMQ) so both fire.
   local prev_on_block_connected = chain_state.callbacks.on_block_connected
