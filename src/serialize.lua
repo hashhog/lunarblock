@@ -1,4 +1,6 @@
 local M = {}
+local ffi_ok, _ffi = pcall(require, "ffi")
+local _ffi64 = ffi_ok and _ffi or nil
 
 -- Bitcoin Core serialize.h: MAX_SIZE = 0x02000000 (33554432)
 -- ReadCompactSize rejects any value above this.
@@ -35,12 +37,22 @@ function M.buffer_writer()
     writer.write_u32le(val)
   end
 
-  -- For 64-bit values, use two 32-bit writes (LuaJIT double precision safe up to 2^53)
+  -- For 64-bit values, use FFI uint64_t to avoid Lua double precision loss
+  -- above 2^53 (W112 BUG-3: old code used val % 4294967296 which silently
+  -- corrupted nonces and other large u64 values).
   function writer.write_u64le(val)
-    local low = val % 4294967296
-    local high = math.floor(val / 4294967296)
-    writer.write_u32le(low)
-    writer.write_u32le(high)
+    if _ffi64 then
+      local v = _ffi64.new("uint64_t", val)
+      local low  = tonumber(_ffi64.cast("uint32_t", v))
+      local high = tonumber(_ffi64.cast("uint32_t", bit.rshift(v, 32)))
+      writer.write_u32le(low)
+      writer.write_u32le(high)
+    else
+      local low = val % 4294967296
+      local high = math.floor(val / 4294967296)
+      writer.write_u32le(low)
+      writer.write_u32le(high)
+    end
   end
 
   function writer.write_i64le(val)
@@ -147,8 +159,15 @@ function M.buffer_reader(data)
   end
 
   function reader.read_u64le()
-    local low = reader.read_u32le()
+    -- Use FFI uint64_t to avoid Lua double precision loss above 2^53
+    -- (W112 BUG-2: old code returned low + high * 4294967296 as a Lua
+    -- double which silently corrupts nonces and other large values).
+    local low  = reader.read_u32le()
     local high = reader.read_u32le()
+    if _ffi64 then
+      return _ffi64.new("uint64_t", low) +
+             _ffi64.new("uint64_t", high) * _ffi64.new("uint64_t", 0x100000000ULL)
+    end
     return low + high * 4294967296
   end
 
@@ -302,9 +321,11 @@ if _ffi_reader_ok and _bit_ok then
     end
 
     function reader.read_u64le()
-      local low = reader.read_u32le()
+      -- Use FFI uint64_t to avoid precision loss above 2^53 (W112 BUG-2).
+      local low  = reader.read_u32le()
       local high = reader.read_u32le()
-      return low + high * 4294967296
+      return ffi.new("uint64_t", low) +
+             ffi.new("uint64_t", high) * ffi.new("uint64_t", 0x100000000ULL)
     end
 
     function reader.read_i64le()

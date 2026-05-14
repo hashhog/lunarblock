@@ -2161,6 +2161,36 @@ function Mempool:has_wtxid(wtxid_hex)
   return false
 end
 
+--- Iterate over all mempool transactions yielding (wtxid_bytes, tx) pairs.
+-- Used by compact_block.lua PartiallyDownloadedBlock:init to match short IDs
+-- against mempool transactions (BIP-152 step 4).  W112 BUG-4 fix: this method
+-- was absent, causing compact_block.lua to silently skip mempool lookup and
+-- always fall back to getblocktxn round-trips.
+--
+-- Returns a stateful iterator suitable for "for wtxid, tx in mempool:iter_by_wtxid() do".
+-- @return function, table, nil: standard Lua iterator triple
+function Mempool:iter_by_wtxid()
+  local _validation = nil  -- lazy-require to avoid circular dependency
+  local entries = self.entries
+  -- Collect txid keys once so we get a stable iteration.
+  local keys = {}
+  for k in pairs(entries) do keys[#keys + 1] = k end
+  local idx = 0
+  return function()
+    idx = idx + 1
+    local entry = entries[keys[idx]]
+    if entry == nil then return nil end
+    if entry.wtxid then
+      return entry.wtxid.bytes, entry.tx
+    else
+      -- Non-segwit: wtxid == txid; compute on demand.
+      if not _validation then _validation = require("lunarblock.validation") end
+      local wtxid = _validation.compute_wtxid(entry.tx)
+      return wtxid.bytes, entry.tx
+    end
+  end
+end
+
 --- Check descendant limits for a potential new child transaction.
 -- @param parent_txid_hex string: Parent transaction id
 -- @param child_vsize number: Virtual size of the potential child

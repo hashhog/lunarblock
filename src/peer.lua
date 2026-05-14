@@ -855,13 +855,15 @@ function Peer:process_messages()
       self.send_headers = true
     elseif msg.command == "sendcmpct" then
       local sc = p2p.deserialize_sendcmpct(msg.payload)
-      -- Only accept compact blocks version 2 (wtxid-based, BIP152)
+      -- Only accept compact blocks version 2 (wtxid-based, BIP152).
+      -- W112 BUG-8 fix: send_compact was set unconditionally outside this block,
+      -- allowing version 1 to enable compact mode even though we only support v2.
       if sc.version == 2 then
         self.provides_compact = true
         self.high_bandwidth = sc.announce
         self.compact_version = sc.version
+        self.send_compact = sc.announce
       end
-      self.send_compact = sc.announce
     elseif msg.command == "feefilter" then
       self.fee_filter = p2p.deserialize_feefilter(msg.payload)
     elseif msg.command == "wtxidrelay" then

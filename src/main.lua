@@ -602,6 +602,7 @@ local function main()
   local p2p = require("lunarblock.p2p")
   local types = require("lunarblock.types")
   local serialize = require("lunarblock.serialize")
+  local crypto = require("lunarblock.crypto")
 
   -- Get network configuration
   local network = consensus_mod.networks[args.network]
@@ -943,12 +944,13 @@ local function main()
       pruner:maybe_prune(height)
     end
     -- Announce newly connected blocks to peers (skip during IBD).
-    -- BIP-130: peers that sent `sendheaders` get a `headers` announce;
-    -- everyone else gets the legacy `inv` announce. PeerManager:announce_block
-    -- branches per peer based on the send_headers flag set by peer.lua's
-    -- sendheaders handler.
+    -- BIP-130: peers that sent `sendheaders` get a `headers` announce.
+    -- BIP-152: HB peers (high_bandwidth=true) get an unsolicited cmpctblock.
+    -- Everyone else gets the legacy `inv` announce.
+    -- W112 BUG-5/BUG-6 fix: pass full block so announce_block can build
+    -- cmpctblock payloads for HB peers (was passing only block_hash+header).
     if block_downloader.ibd_complete then
-      peer_manager:announce_block(block_hash, block.header)
+      peer_manager:announce_block(block_hash, block.header, block)
     end
   end
 
@@ -1403,7 +1405,22 @@ local function main()
     local ok, err = pcall(function()
       local cmpctblock = p2p.deserialize_cmpctblock(payload)
       local header_bytes = serialize.serialize_block_header(cmpctblock.header)
-      local block_hash = types.hash256(header_bytes)
+      -- W112 BUG-1 fix: types.hash256 wraps raw bytes; we need double-SHA256
+      -- of the 80-byte header to get the 32-byte block hash (crypto.hash256_type).
+      local block_hash = crypto.hash256_type(header_bytes)
+
+      -- W112 BUG-7 fix: enforce MAX_CMPCTBLOCK_DEPTH=5 — reject stale compact
+      -- blocks more than 5 blocks below our current tip (Core net_processing.cpp).
+      do
+        local entry = header_chain:get_header(block_hash)
+        local tip_h = header_chain.header_tip_height or 0
+        if entry and tip_h - (entry.height or 0) > compact_block.MAX_CMPCTBLOCK_DEPTH then
+          print(string.format("cmpctblock too deep (depth=%d, max=%d) — ignored",
+            tip_h - entry.height, compact_block.MAX_CMPCTBLOCK_DEPTH))
+          return
+        end
+      end
+
       print(string.format("Received compact block from %s:%d (short_ids=%d, prefilled=%d)",
         peer.ip, peer.port, #cmpctblock.short_ids, #cmpctblock.prefilled_txns))
 
