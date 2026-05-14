@@ -29,6 +29,7 @@ local function default_args()
     reindex = false,
     reindex_chainstate = false,
     daemon = false,
+    asmap = nil,              -- Path to ASMap file for ASN-based IP bucketing (--asmap)
     jitprofile = false,
     jitverbose = false,
     prune = 0,  -- 0=disabled, 1=manual only, >=550=target MB
@@ -97,6 +98,7 @@ local function parse_args(argv)
       print("      --zmqpubsequence ENDPOINT   Publish sequence notifications")
       print("      --zmqpubhwm N               ZMQ high water mark (default: 1000)")
       print("      --nov2transport             Disable BIP324 v2 encrypted transport")
+      print("      --asmap PATH                Path to ASMap file for ASN-based IP bucketing")
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --txindex                   Maintain a full transaction index (txid → blockhash) for getrawtransaction")
       print("      --blockfilterindex          Maintain a BIP-157/158 basic block-filter index (compact filters per block)")
@@ -161,6 +163,16 @@ local function parse_args(argv)
       args.jitverbose = true
     elseif arg == "--nov2transport" then
       args.nov2transport = true
+    elseif arg == "--asmap" or arg:match("^%-%-asmap=") then
+      -- BUG-1 fix (W115 FIX-50): add --asmap CLI option for ASN-based bucketing.
+      -- Mirrors Bitcoin Core's -asmap=<path> / -asmap (embedded) in init.cpp:540.
+      local v = arg:match("^%-%-asmap=(.*)$")
+      if v then
+        args.asmap = v
+      else
+        i = i + 1
+        args.asmap = argv[i]
+      end
     elseif arg == "--peerbloomfilters" then
       i = i + 1
       local v = argv[i]
@@ -1091,6 +1103,21 @@ local function main()
     data_dir = datadir,
   })
   peer_manager.our_height = header_chain.header_tip_height
+
+  -- Load ASMap for ASN-based IP bucketing (W115 FIX-50, BUG-25 startup log).
+  -- --asmap PATH: load from disk.  No --asmap: skip (plain /16//32 bucketing).
+  if args.asmap then
+    local ok, asmap_err = peer_manager:load_asmap(args.asmap)
+    if ok then
+      -- BUG-25: log ASMap health on startup after loading.
+      -- asmap_health_check also emits a log line to stderr internally.
+      peer_manager:asmap_health_check()
+    else
+      io.stderr:write(string.format(
+        "[asmap] WARNING: failed to load asmap from %s: %s\n",
+        args.asmap, tostring(asmap_err)))
+    end
+  end
 
   -- Clear any stale bans from previous sessions (genesis hash was wrong,
   -- causing all peers to be banned — now fixed).

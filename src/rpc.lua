@@ -2408,6 +2408,13 @@ function RPCServer:register_methods()
         end
       end
     end
+    -- BUG-23 fix (W115 FIX-50): include asmap_version when asmap is loaded.
+    -- Core: src/rpc/net.cpp getnetworkinfo returns "asmap_version" hex string.
+    local asmap_ver = ""
+    local ok_pm, pm_mod = pcall(require, "lunarblock.peerman")
+    if ok_pm then
+      asmap_ver = pm_mod.get_asmap_version()
+    end
     return {
       version = 250000,
       subversion = "/LunarBlock:0.1.0/",
@@ -2428,11 +2435,19 @@ function RPCServer:register_methods()
       incrementalfee = 0.00001,
       localaddresses = {},
       warnings = "",
+      asmap_version = asmap_ver,
     }
   end
 
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
+    -- BUG-22 fix (W115 FIX-50): include mapped_as field per peer.
+    -- Core: src/rpc/net.cpp getpeerinfo includes "mapped_as" (uint32) when
+    -- asmap is loaded.  We always include the field; it is 0 when no asmap
+    -- is loaded or the address has no mapping.
+    local ok_asmap, asmap_mod_rpc = pcall(require, "lunarblock.asmap")
+    local ok_pm, pm_mod = pcall(require, "lunarblock.peerman")
+    local loaded_asmap = (ok_pm and pm_mod._asmap_data) or nil
     if rpc.peer_manager then
       for i, p in ipairs(rpc.peer_manager.peer_list) do
         local svc = p.services or 0
@@ -2442,6 +2457,11 @@ function RPCServer:register_methods()
         if bit.band(svc, 1024) ~= 0 then svc_names[#svc_names + 1] = "NETWORK_LIMITED" end
         local is_inbound = p.inbound or false
         local ping_sec = (p.latency_ms or 0) / 1000
+        -- Compute ASN for this peer's IP (0 if no asmap or not mapped).
+        local peer_mapped_as = 0
+        if ok_asmap and loaded_asmap then
+          peer_mapped_as = asmap_mod_rpc.get_mapped_as(loaded_asmap, p.ip)
+        end
         peers[#peers + 1] = {
           id = i - 1,
           addr = p.ip .. ":" .. p.port,
@@ -2481,6 +2501,7 @@ function RPCServer:register_methods()
           connection_type = is_inbound and "inbound" or "outbound-full-relay",
           transport_protocol_type = "v1",
           session_id = "",
+          mapped_as = peer_mapped_as,
         }
       end
     end
