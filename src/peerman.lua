@@ -583,9 +583,10 @@ function PeerManager:load_asmap(path)
   io.stderr:write(string.format(
     "[asmap] Using asmap version %s for IP bucketing\n", version_hex))
 
-  -- Re-bucket addrman entries if the asmap changed since last save (BUG-13).
-  if self._serialized_asmap_version ~= ""
-      and self._serialized_asmap_version ~= version_hex then
+  -- Re-bucket addrman entries when the asmap changes (BUG-13).
+  -- Also fires on first-time asmap load (_serialized_asmap_version == ""),
+  -- ensuring any entries that were bucketed without ASN info get rebucketed.
+  if self._serialized_asmap_version ~= version_hex then
     io.stderr:write(
       "[asmap] asmap version changed — rebucketing addrman entries\n")
     self:_rebucket_addrman()
@@ -1331,6 +1332,25 @@ function PeerManager:maintain_connections()
     local ok = self:connect_peer(candidate.ip, candidate.port)
     attempts_this_tick = attempts_this_tick + 1
     if ok then outbound = outbound + 1 end
+  end
+
+  -- When asmap is active, log ASN diversity stats every time we revisit
+  -- outbound targets so operators can confirm eclipse-mitigation is working.
+  -- FIX-51: wires get_asn_diversity() out of dead-helper status.
+  if M.using_asmap() then
+    local div = self:get_asn_diversity()
+    -- Only log when there are outbound peers to avoid spamming during IBD.
+    if div.total_outbound > 0 then
+      -- Track last log time to avoid flooding stderr every 100 ms tick.
+      local now = os.time()
+      if not self._last_asn_diversity_log
+          or (now - self._last_asn_diversity_log) >= 300 then
+        self._last_asn_diversity_log = now
+        io.stderr:write(string.format(
+          "[asmap] outbound diversity: %d peers, %d ASN-mapped, %d distinct ASNs\n",
+          div.total_outbound, div.asn_count, div.distinct_asn))
+      end
+    end
   end
 end
 
