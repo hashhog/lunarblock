@@ -1112,13 +1112,18 @@ function M.descriptor_to_script(desc, index, network)
     end
     if not pubkey then return nil, "failed to derive key" end
 
-    -- For basic tr(key) without scripts, use key as-is (simplified)
-    -- Full implementation would tweak the key with script tree commitment
+    -- BIP-341 §4.2: output_key = lift_x(internal_key) + int(hashTapTweak(ser_xonly(internal_key)))*G
+    -- For key-path-only (no script tree), merkle_root = "" so hash input is just the 32-byte x-only key.
     local xonly = pubkey
     if #pubkey == 33 then
-      xonly = pubkey:sub(2)  -- Strip prefix byte
+      xonly = pubkey:sub(2)  -- Strip prefix byte to get 32-byte x-only form
     end
-    return script_mod.make_p2tr_script(xonly)
+    local tweak = crypto.tagged_hash("TapTweak", xonly)
+    local tweaked_xonly, _parity = crypto.tweak_pubkey(xonly, tweak)
+    if not tweaked_xonly then
+      return nil, "TapTweak failed: invalid internal pubkey"
+    end
+    return script_mod.make_p2tr_script(tweaked_xonly)
 
   elseif desc.type == "addr" then
     -- Decode address to script
