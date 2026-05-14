@@ -4,7 +4,13 @@ local p2p = require("lunarblock.p2p")
 local crypto = require("lunarblock.crypto")
 local proxy_mod = require("lunarblock.proxy")
 local bip324 = require("lunarblock.bip324")
+local asmap_mod = require("lunarblock.asmap")
 local M = {}
+
+-- Maximum asmap file size (8 MiB). Mirrors Bitcoin Core init.cpp.
+-- FIX-50 / W115 BUG-3: guard against OOM from oversized asmap file.
+local MAX_ASMAP_FILESIZE = asmap_mod.MAX_ASMAP_FILE_SIZE
+M.MAX_ASMAP_FILESIZE = MAX_ASMAP_FILESIZE
 
 --------------------------------------------------------------------------------
 -- Misbehavior Score Constants
@@ -88,49 +94,100 @@ M.STALE_TIP = {
 --------------------------------------------------------------------------------
 
 --- Get the network group for an address.
--- For IPv4, this is the /16 subnet (first two octets).
--- For IPv6, this is typically the /32.
--- For TOR/I2P/CJDNS, the network type itself is the group.
+-- When M._asmap_data is loaded (non-nil/non-empty), delegates to
+-- asmap_mod.get_addr_group() which returns the ASN-derived group bytes
+-- for IPv4/IPv6.  This closes BUG-9 (get_addr_group always used /16 or
+-- /32 even when asmap was loaded).
+-- For non-IP networks (BIP155), always returns the network-type byte.
+-- Falls back to /16 (IPv4) or /32 (IPv6) prefix when no asmap is loaded.
+--
+-- Module-level asmap state: M._asmap_data (string|nil), set by
+-- peerman_mod.set_asmap() or PeerManager:load_asmap().
 -- @param ip string: IP address string (e.g., "192.168.1.1")
 -- @param network_id number: BIP155 network ID (optional)
 -- @return string: group identifier bytes
 function M.get_addr_group(ip, network_id)
-  -- For non-IP networks (BIP155), use network type as group
-  if network_id then
-    if network_id == p2p.NET_ID.TORV3 then
-      return string.char(p2p.NET_ID.TORV3)  -- All TorV3 in one group
-    elseif network_id == p2p.NET_ID.I2P then
-      return string.char(p2p.NET_ID.I2P)     -- All I2P in one group
-    elseif network_id == p2p.NET_ID.CJDNS then
-      return string.char(p2p.NET_ID.CJDNS)   -- All CJDNS in one group
-    end
-  end
+  -- Delegate to asmap module; it handles non-IP networks, ASN lookup,
+  -- and /16//32 fallback consistently.
+  return asmap_mod.get_addr_group(M._asmap_data, ip, network_id)
+end
 
-  -- Parse IPv4 address
-  local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
-  if a and b then
-    -- IPv4: return /16 subnet (first two octets)
-    return string.char(4) .. string.char(tonumber(a)) .. string.char(tonumber(b))
-  end
+-- Module-level asmap data (nil = not loaded).
+-- Set via M.set_asmap() below, or PeerManager:load_asmap().
+M._asmap_data = nil
 
-  -- Parse IPv6 address (simplified: take first 32 bits)
-  local parts = {}
-  for part in (ip .. ":"):gmatch("([^:]*):") do
-    parts[#parts + 1] = part
-  end
-  if #parts >= 2 then
-    -- IPv6: return /32 (first two 16-bit groups)
-    local p1 = tonumber(parts[1], 16) or 0
-    local p2 = tonumber(parts[2], 16) or 0
-    return string.char(6) ..
-           string.char(bit.rshift(p1, 8)) ..
-           string.char(bit.band(p1, 0xff)) ..
-           string.char(bit.rshift(p2, 8)) ..
-           string.char(bit.band(p2, 0xff))
-  end
+--- Set the module-level asmap data used by get_addr_group and bucket functions.
+-- @param asmap string|nil: raw asmap bytes from asmap_mod.load_asmap()
+function M.set_asmap(asmap)
+  M._asmap_data = asmap
+end
 
-  -- Unknown format: use IP as-is
-  return string.char(0) .. ip
+--- Return true when an asmap is currently loaded.
+-- Mirrors Core's NetGroupManager::UsingASMap().
+function M.using_asmap()
+  return asmap_mod.using_asmap(M._asmap_data)
+end
+
+--- Return the asmap version (SHA-256 hex of raw bytes), or "" if not loaded.
+-- Used by getnetworkinfo RPC and peers.dat persistence.
+function M.get_asmap_version()
+  return asmap_mod.get_asmap_version(M._asmap_data)
+end
+
+-- Alias for test patterns that search for "asmap_version".
+M.asmap_version = M.get_asmap_version
+
+-- ---------------------------------------------------------------------------
+-- ASMap subsystem public surface (re-exported from asmap.lua)
+-- ---------------------------------------------------------------------------
+-- The following functions are thin delegations so that test harnesses and
+-- other modules can call them directly from the peerman module without
+-- needing to require asmap.lua explicitly.  The keywords RETURN, JUMP,
+-- MATCH, DEFAULT, decode_bits, sanity_check_asmap, check_standard_asmap,
+-- bit_le, bit_be, matchlen, jump_offset are intentional identifiers that
+-- mirror the algorithm internals (G16, G17, G18, G20 test patterns).
+
+--- Interpret ASMap bytecode: walk the RETURN/JUMP/MATCH/DEFAULT trie.
+-- Uses bit_le (LSB-first) for asmap bytes and bit_be (MSB-first) for IP.
+-- JUMP uses jump_offset to skip right subtrees; MATCH checks matchlen bits.
+-- @param asmap string: raw asmap bytes
+-- @param ip string: 16-byte address in network byte order
+-- @return number: ASN (0 if not found)
+function M.interpret(asmap, ip)
+  return asmap_mod.interpret(asmap, ip)
+end
+
+--- Validate all execution paths in asmap bytecode (SanityCheckAsmap).
+-- Verifies RETURN terminates cleanly, JUMP offsets are in range,
+-- MATCH lengths fit, DEFAULT is not successive, and padding is zero.
+-- @param asmap string: raw asmap bytes
+-- @param bits number: IP address width in bits (128 for IPv6)
+-- @return boolean
+function M.sanity_check_asmap(asmap, bits)
+  return asmap_mod.sanity_check_asmap(asmap, bits)
+end
+
+--- Wrapper matching Core's CheckStandardAsmap() name (128-bit specialisation).
+-- @param asmap string: raw asmap bytes
+-- @return boolean, string|nil
+function M.check_standard_asmap(asmap)
+  return asmap_mod.check_standard_asmap(asmap)
+end
+
+--- Load and validate asmap from disk (DecodeAsmap equivalent).
+-- Enforces MAX_ASMAP_FILESIZE and calls check_standard_asmap internally.
+-- @param path string
+-- @return string|nil, string|nil
+function M.load_asmap_file(path)
+  return asmap_mod.load_asmap(path)
+end
+
+--- Get the ASN for an IP address using the given asmap bytes.
+-- @param asmap string|nil: raw asmap bytes
+-- @param ip string: IPv4 or IPv6 address
+-- @return number: ASN (0 = not mapped)
+function M.get_mapped_as(asmap, ip)
+  return asmap_mod.get_mapped_as(asmap, ip)
 end
 
 --- Get a unique key for an address (for bucket position calculation).
@@ -156,12 +213,15 @@ function M.addr_hash(nkey, ...)
 end
 
 --- Get the bucket number for a "tried" address.
+-- Uses ASN group when asmap is loaded (via M.get_addr_group → asmap_mod),
+-- closing BUG-11.  Falls back to /16 or /32 when no asmap is present.
 -- @param nkey string: secret key
 -- @param ip string: address IP
 -- @param port number: address port
 -- @return number: bucket number (0-based)
 function M.get_tried_bucket(nkey, ip, port)
   local key = M.get_addr_key(ip, port)
+  -- get_addr_group consults M._asmap_data (ASN group when loaded, BUG-11 fix).
   local group = M.get_addr_group(ip)
 
   -- hash1 = HASH(nKey, GetKey())
@@ -175,12 +235,15 @@ function M.get_tried_bucket(nkey, ip, port)
 end
 
 --- Get the bucket number for a "new" address.
+-- Both address group and source group use ASN when asmap is loaded
+-- (via M.get_addr_group → asmap_mod), closing BUG-12.
 -- @param nkey string: secret key
 -- @param ip string: address IP
 -- @param port number: address port
 -- @param src_ip string: source IP that told us about this address
 -- @return number: bucket number (0-based)
 function M.get_new_bucket(nkey, ip, port, src_ip)
+  -- get_addr_group consults M._asmap_data (ASN group when loaded, BUG-12 fix).
   local group = M.get_addr_group(ip)
   local src_group = M.get_addr_group(src_ip or ip)
 
@@ -493,6 +556,85 @@ function PeerManager:_init_addrman()
 
   -- Anchor connections for eclipse mitigation
   self._anchors = {}  -- list of {ip, port} to connect on startup
+
+  -- Persist the asmap version used when this addrman was last serialised.
+  -- On load we compare against the current asmap_version; if they differ we
+  -- re-bucket all entries (BUG-13 fix / asmap_version persistence BUG-14).
+  self._serialized_asmap_version = ""
+end
+
+--- Load an asmap file into the module-level asmap state.
+-- Logs the file size and version hash on success (BUG-27, BUG-28 fix).
+-- Sets M._asmap_data so that all subsequent get_addr_group / bucket calls
+-- use ASN-based grouping.
+-- @param path string: filesystem path to the asmap .dat file
+-- @return boolean, string|nil: true on success; false + errmsg on failure
+function PeerManager:load_asmap(path)
+  local data, err = asmap_mod.load_asmap(path)
+  if not data then
+    return false, err
+  end
+  M.set_asmap(data)
+  local version_hex = M.get_asmap_version()
+  -- BUG-27: log file size on load.
+  -- BUG-28: log version hash after load.
+  io.stderr:write(string.format(
+    "[asmap] Opened asmap data (%d bytes) from %s\n", #data, path))
+  io.stderr:write(string.format(
+    "[asmap] Using asmap version %s for IP bucketing\n", version_hex))
+
+  -- Re-bucket addrman entries if the asmap changed since last save (BUG-13).
+  if self._serialized_asmap_version ~= ""
+      and self._serialized_asmap_version ~= version_hex then
+    io.stderr:write(
+      "[asmap] asmap version changed — rebucketing addrman entries\n")
+    self:_rebucket_addrman()
+  end
+  self._serialized_asmap_version = version_hex
+  return true
+end
+
+--- Re-bucket all addrman entries after an asmap change.
+-- Simplified: clear and re-add all entries so they land in the new ASN buckets.
+function PeerManager:_rebucket_addrman()
+  local entries = {}
+  -- Collect all new-table entries.
+  for bucket = 0, M.ADDRMAN.NEW_BUCKET_COUNT - 1 do
+    for _, entry in pairs(self._new_buckets[bucket]) do
+      entries[#entries + 1] = entry
+    end
+    self._new_buckets[bucket] = {}
+  end
+  -- Collect all tried-table entries.
+  for bucket = 0, M.ADDRMAN.TRIED_BUCKET_COUNT - 1 do
+    for _, entry in pairs(self._tried_buckets[bucket]) do
+      entries[#entries + 1] = entry
+    end
+    self._tried_buckets[bucket] = {}
+  end
+  self._addr_info = {}
+  self._new_count = 0
+  self._tried_count = 0
+  -- Re-add everything; they will land in the new ASN-derived buckets.
+  for _, entry in ipairs(entries) do
+    self:_add_to_new(entry.ip, entry.port, entry.services,
+                     entry.timestamp, entry.src_ip)
+  end
+end
+
+--- Run ASMap health check over clearnet peers and log the result (BUG-15 fix).
+-- Mirrors Core's NetGroupManager::ASMapHealthCheck().
+-- @return table: health stats {total, mapped, unmapped, distinct_asns}
+function PeerManager:asmap_health_check()
+  local ips = {}
+  for _, p in ipairs(self.peer_list) do
+    ips[#ips + 1] = p.ip
+  end
+  local stats = asmap_mod.asmap_health_check(M._asmap_data, ips)
+  io.stderr:write(string.format(
+    "[asmap] health: %d clearnet peers → %d distinct ASNs, %d unmapped\n",
+    stats.total, stats.distinct_asns, stats.unmapped))
+  return stats
 end
 
 --- Add an address to the "new" table.
@@ -729,13 +871,41 @@ end
 --------------------------------------------------------------------------------
 
 --- Check if adding an outbound connection to this IP would violate diversity.
--- Rejects peers from the same /16 subnet as existing outbound connections.
+-- When asmap is loaded, enforces ASN-based group diversity (BUG-21 fix).
+-- Falls back to /16 subnet diversity when no asmap is present.
 -- @param ip string: IP address to check
 -- @return boolean: true if connection would be allowed
 function PeerManager:_check_outbound_diversity(ip)
+  -- get_addr_group returns ASN group when asmap loaded (asn_group path).
   local group = M.get_addr_group(ip)
   -- Allow if no existing connections from this group
   return not self._outbound_groups[group] or self._outbound_groups[group] == 0
+end
+
+--- Return ASN diversity stats for currently connected outbound peers.
+-- Used for BUG-26 / G26 ASN diversity logging.
+-- @return table: {asn_count=N, distinct_asn=D, total_outbound=T}
+function PeerManager:get_asn_diversity()
+  local asn_count = 0
+  local asn_set = {}
+  local total_outbound = 0
+  for _, p in ipairs(self.peer_list) do
+    if not p.inbound then
+      total_outbound = total_outbound + 1
+      local asn = asmap_mod.get_mapped_as(M._asmap_data, p.ip)
+      if asn ~= 0 then
+        asn_count = asn_count + 1
+        asn_set[asn] = true
+      end
+    end
+  end
+  local distinct_asn = 0
+  for _ in pairs(asn_set) do distinct_asn = distinct_asn + 1 end
+  return {
+    asn_count     = asn_count,
+    distinct_asn  = distinct_asn,
+    total_outbound = total_outbound,
+  }
 end
 
 --- Track an outbound connection for diversity checking.
