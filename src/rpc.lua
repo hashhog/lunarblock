@@ -3516,6 +3516,7 @@ function RPCServer:register_methods()
   -- Wallet-side propagation (broadcasting an inv per tx) is handled the
   -- same way sendrawtransaction does it.
   self.methods["submitpackage"] = function(rpc, params)
+    local mempool_mod = require("lunarblock.mempool")
     if not rpc.mempool then
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
     end
@@ -3536,6 +3537,13 @@ function RPCServer:register_methods()
           message = "package[" .. i .. "] failed to deserialize: " .. tostring(tx)})
       end
       txs[i] = tx
+    end
+    -- IsChildWithParentsTree topology check (Bitcoin Core: rpc/mempool.cpp:1395).
+    -- Reject packages where parents depend on each other (chain A→B→C within
+    -- the parent set is not a valid child-with-parents-tree topology).
+    if #txs > 1 and not mempool_mod.is_child_with_parents_tree(txs) then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "package-not-child-with-parents-tree: parents must not spend other parents in the package"})
     end
     local accept_ok, err_or_results = rpc.mempool:accept_package(txs)
     local tx_results = {}

@@ -2380,6 +2380,40 @@ function M.is_child_with_parents(txns)
   return true
 end
 
+--- Check if a package is child-with-parents *tree* topology.
+-- Extends is_child_with_parents by additionally verifying that no parent
+-- depends on another parent in the same package.  Mirrors Core's
+-- IsChildWithParentsTree (policy/packages.cpp).
+-- @param txns table: Array of transactions (sorted, child last)
+-- @return boolean: true iff is_child_with_parents AND no parent spends another parent
+function M.is_child_with_parents_tree(txns)
+  if not M.is_child_with_parents(txns) then
+    return false
+  end
+
+  -- Build set of parent txids (all but the last tx)
+  local parent_txids = {}
+  for i = 1, #txns - 1 do
+    local parent = txns[i]
+    local parent_txid = validation.compute_txid(parent)
+    local parent_hex = types.hash256_hex(parent_txid)
+    parent_txids[parent_hex] = true
+  end
+
+  -- Each parent must not spend an output of another parent
+  for i = 1, #txns - 1 do
+    local parent = txns[i]
+    for _, inp in ipairs(parent.inputs) do
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      if parent_txids[prev_hex] then
+        return false
+      end
+    end
+  end
+
+  return true
+end
+
 --- Calculate package fee rate.
 -- @param txns table: Array of transactions
 -- @param fees table: Array of fees for each transaction (parallel to txns)
