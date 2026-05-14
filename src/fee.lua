@@ -59,6 +59,17 @@ function M.new(max_target)
   self.best_height = 0
   -- Decay factor: exponentially weight recent data more heavily
   self.decay = 0.998
+  -- Failure tracking: txs that left the mempool without confirming
+  -- (evicted/replaced/expired).  Mirrors Core's failAvg[period][bucket].
+  -- failAvg[target][bucket] = {count, total} — same shape as confirmed[][],
+  -- but count is the number of txs that failed to confirm within `target` blocks.
+  self.failAvg = {}
+  for t = 1, self.max_target do
+    self.failAvg[t] = {}
+    for b = 1, M.BUCKET_COUNT do
+      self.failAvg[t][b] = {count = 0, total = 0}
+    end
+  end
   return self
 end
 
@@ -104,9 +115,48 @@ function FeeEstimator:tx_confirmed(txid_hex, confirmed_height)
   self.unconfirmed[txid_hex] = nil
 end
 
---- Remove a transaction from tracking (e.g., evicted from mempool)
+--- Remove a transaction from tracking (e.g., evicted or replaced).
+-- Mirrors Core's _removeTx(hash, inBlock):
+--   inBlock=true  → confirmed by a block; do NOT record as failure (tx_confirmed handles it).
+--   inBlock=false → evicted/replaced/expired; record in failAvg for every target >= blocks_waited.
 -- @param txid_hex Transaction ID in hex
-function FeeEstimator:tx_removed(txid_hex)
+-- @param reason   string: removal reason — "confirmed" means inBlock=true; all other values
+--                          ("evicted","replaced","expiry","cluster-limit","truc-sibling-eviction",
+--                           "conflict") mean inBlock=false and are counted as failures.
+--                          "test-accept" is a dry-run removal and is silently ignored.
+function FeeEstimator:tx_removed(txid_hex, reason)
+  local info = self.unconfirmed[txid_hex]
+  if not info then return end
+
+  -- Ignore dry-run / test-accept removals (never tracked as failures in Core either).
+  if reason == "test-accept" then
+    self.unconfirmed[txid_hex] = nil
+    return
+  end
+
+  -- "confirmed" means the block-connected path already called tx_confirmed().
+  -- tx_confirmed() removed the entry and credited success; nothing more to do here.
+  if reason == "confirmed" then
+    self.unconfirmed[txid_hex] = nil
+    return
+  end
+
+  -- inBlock=false: record this tx as a failure in failAvg.
+  -- Core: for every horizon period t, if the tx has been waiting longer than t blocks,
+  -- it counts as a failure for that target (the tx "tried" to confirm in t blocks but did not).
+  -- blocks_waited = best_height - entry_height (0 if still in same block, clamped to max_target).
+  local blocks_waited = self.best_height - info.entry_height
+  if blocks_waited < 0 then blocks_waited = 0 end
+  if blocks_waited > self.max_target then blocks_waited = self.max_target end
+
+  -- Record failure for all targets where the tx had sufficient time to confirm
+  -- (i.e., target <= blocks_waited: it was given at least `target` blocks but did not confirm).
+  for t = 1, blocks_waited do
+    local bucket_data = self.failAvg[t][info.bucket]
+    bucket_data.count = bucket_data.count + 1
+    bucket_data.total = bucket_data.total + 1
+  end
+
   self.unconfirmed[txid_hex] = nil
 end
 
@@ -114,12 +164,15 @@ end
 -- @param height New best block height
 function FeeEstimator:on_block(height)
   self.best_height = height
-  -- Apply decay to all buckets
+  -- Apply decay to all buckets (both success and failure data)
   for t = 1, self.max_target do
     for b = 1, M.BUCKET_COUNT do
       local d = self.confirmed[t][b]
       d.count = d.count * self.decay
       d.total = d.total * self.decay
+      local f = self.failAvg[t][b]
+      f.count = f.count * self.decay
+      f.total = f.total * self.decay
     end
   end
 end
