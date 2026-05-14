@@ -358,6 +358,9 @@ function M.new(network, storage, config)
   self._extra_peer_check_time = socket.gettime() + M.STALE_TIP.EXTRA_PEER_CHECK_INTERVAL
   self._try_new_outbound_peer = false
   self._initial_sync_finished = false
+  -- FIX-52 / W115 G16: periodic ASMap health-check timer.
+  -- nil → fires on the first tick after asmap is loaded; thereafter every 3600s.
+  self._last_health_check = nil
   self._blocks_in_flight = {}  -- global tracking of block hashes being downloaded
   self._peer_chain_sync = {}   -- ip:port -> {timeout, work_header, sent_getheaders, protect}
 
@@ -1803,6 +1806,19 @@ function PeerManager:tick()
 
   -- Maintain outbound connections
   self:maintain_connections()
+
+  -- Periodic ASMap health check every 3600s (1 hour).
+  -- FIX-52 / W115 G16: mirrors Core's init.cpp ASMapHealthCheck() call after
+  -- peers.dat load; here we repeat it hourly so operators can confirm
+  -- eclipse-mitigation is still healthy at runtime (not just at startup).
+  if M.using_asmap() then
+    local now_h = os.time()
+    if not self._last_health_check
+        or (now_h - self._last_health_check) >= 3600 then
+      self._last_health_check = now_h
+      self:asmap_health_check()
+    end
+  end
 
   -- Reconnect dropped manual peers last, AFTER stale-tip eviction has
   -- had its chance.  Running every tick is cheap — the per-entry
