@@ -299,17 +299,16 @@ test("G14: wpkh() descriptor to P2WPKH scriptPubKey", function()
   expect_eq(spk:byte(2), 0x14, "push 20 bytes")
 end)
 
--- G15-BUG: tr() descriptor does NOT apply BIP-341 TapTweak (x-only key used raw)
--- Core: tr(KEY) computes output_key = lift_x(internal_key) + hash_tagged("TapTweak", ser_xonly(internal_key))*G
--- lunarblock: address.lua:1115-1121 just strips prefix byte, no tweak
-test("G15-BUG: tr() descriptor skips BIP-341 TapTweak [BUG-6]", function()
-  log_bug("BUG-6", "P0-CDIV: tr(KEY) descriptor_to_script does NOT apply BIP-341 taptweak. address.lua:1115-1121 comment says 'Full implementation would tweak the key'. Outputs a P2TR scriptPubKey with untweaked x-only key — different address from Core, watch-only xpub descriptors produce wrong scripts. Also: tr(KEY,SCRIPT_TREE) script tree commitment absent (tree stored as raw string, never processed into merkle root).")
-  -- Demonstrate: tr(xonly) should yield a tweaked output key, not the raw xonly
-  local xonly_hex = "cc8a4bc64d897bddc5fbc2f670f7a8ba0a386f3dade870027125d6aa223b8c8e"
-  local desc_str = "tr(" .. xonly_hex .. ")"
+-- G15: tr() descriptor applies BIP-341 TapTweak (FIX-38)
+-- BIP-86 test vector: internal_key=cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115
+--                     tweaked output key=a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c
+test("G15: tr() descriptor applies BIP-341 TapTweak — BIP-86 vector (FIX-38)", function()
+  -- BIP-86 test vector (key-path-only, no script tree)
+  local internal_hex = "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+  local expected_output_hex = "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"
+  local desc_str = "tr(" .. internal_hex .. ")"
   local desc, err = address.parse_descriptor(desc_str)
   if not desc then
-    -- If parsing fails, skip this assertion
     error("Failed to parse tr() descriptor: " .. tostring(err))
   end
   local spk = address.descriptor_to_script(desc, 0, "mainnet")
@@ -317,13 +316,13 @@ test("G15-BUG: tr() descriptor skips BIP-341 TapTweak [BUG-6]", function()
   expect_eq(#spk, 34, "P2TR scriptPubKey length should be 34")
   expect_eq(spk:byte(1), 0x51, "OP_1")
   expect_eq(spk:byte(2), 0x20, "push 32 bytes")
-  -- The output key should be the TWEAKED key, not the raw xonly.
-  -- For tr(KEY) with no script tree, tweak = hash_tagged("TapTweak", xonly)
-  -- We document the BUG: raw xonly is used, not tweaked.
-  local raw_xonly = hex_to_bin(xonly_hex)
+  -- FIX-38: output key MUST be the BIP-341 tweaked key, not the raw internal key
   local output_key = spk:sub(3, 34)
-  -- BUG: output_key == raw_xonly (no tweak applied)
-  expect_eq(output_key, raw_xonly, "BUG-6 confirmed: tr() uses raw xonly, not tweaked key")
+  local raw_internal = hex_to_bin(internal_hex)
+  -- Confirm the output key is NOT the raw internal key (tweak was applied)
+  expect_true(output_key ~= raw_internal, "FIX-38: output key must differ from raw internal key")
+  -- Confirm the output key matches the BIP-86 test vector
+  expect_eq(output_key, hex_to_bin(expected_output_hex), "FIX-38: tweaked output key matches BIP-86 vector")
 end)
 
 -- G16: Descriptor checksum computed for tr() with rawtr
@@ -454,18 +453,18 @@ test("G21: P2SH address from script", function()
   expect_true(#addr >= 34 and #addr <= 35, "P2SH address length in expected range")
 end)
 
--- G22: P2TR address generation
-test("G22: P2TR (Taproot) address generation", function()
-  -- BIP-86 test vector: internal_key = cc8a4bc64d897bddc5fbc2f670f7a8ba0a386f3dade870027125d6aa223b8c8e
-  -- tweaked output key = a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c
-  -- address: bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr
-  local xonly = hex_to_bin("cc8a4bc64d897bddc5fbc2f670f7a8ba0a386f3dade870027125d6aa223b8c8e")
-  -- Note: xonly_pubkey_to_p2tr generates the address from raw x-only (no tweak)
-  -- A correct BIP-341/BIP-86 address from an internal key requires applying the tweak
-  -- This test documents current behavior (raw x-only used)
-  local addr = address.xonly_pubkey_to_p2tr(xonly, "mainnet")
+-- G22: P2TR address generation (FIX-38 — xonly_pubkey_to_p2tr takes tweaked output key)
+test("G22: P2TR (Taproot) address generation — BIP-86 output key yields correct address", function()
+  -- BIP-86 test vector:
+  --   internal_key       = cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115
+  --   tweaked output key = a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c
+  --   address            = bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr
+  -- xonly_pubkey_to_p2tr expects the tweaked output key (bech32m encodes it directly)
+  local tweaked_xonly = hex_to_bin("a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c")
+  local addr = address.xonly_pubkey_to_p2tr(tweaked_xonly, "mainnet")
   expect_true(addr:sub(1, 4) == "bc1p", "P2TR mainnet address starts with 'bc1p'")
   expect_eq(#addr, 62, "P2TR address length should be 62")
+  expect_eq(addr, "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr", "BIP-86 address matches")
 end)
 
 -- G22b-BUG: P2SH-P2WPKH (BIP-49) address type absent from wallet
