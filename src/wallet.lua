@@ -301,19 +301,34 @@ function M.select_coins_bnb(utxos, target, fee_rate, cost_of_change)
   return best_selection
 end
 
+--- Return a cryptographically secure random integer in [1, n] (1-indexed).
+-- Uses wallet.random_bytes (OpenSSL RAND_bytes) to mirror Core's FastRandomContext
+-- used in KnapsackSolver / SelectCoinsSRD Fisher-Yates shuffles.
+-- @param n number: Upper bound (inclusive), must be >= 1
+-- @return number: Integer in [1, n]
+local function csprng_intn(n)
+  local bytes = M.random_bytes(4)
+  local v = string.byte(bytes, 1) * 0x1000000
+          + string.byte(bytes, 2) * 0x10000
+          + string.byte(bytes, 3) * 0x100
+          + string.byte(bytes, 4)
+  return (v % n) + 1
+end
+
 --- Random selection fallback (simple largest-first with randomization).
 -- Used when BnB fails to find an exact match.
 -- @param utxos table: Array of {key=string, utxo={value=number, ...}}
 -- @param target number: Target amount including fees
 -- @return table|nil: Selected UTXOs
 function M.select_coins_random(utxos, target)
-  -- Shuffle the UTXOs
+  -- Shuffle the UTXOs using CSPRNG (OpenSSL RAND_bytes via csprng_intn).
+  -- Core uses FastRandomContext for all coin shuffle operations (W88 fix: FIX-45).
   local shuffled = {}
   for i, item in ipairs(utxos) do
     shuffled[i] = item
   end
   for i = #shuffled, 2, -1 do
-    local j = math.random(1, i)
+    local j = csprng_intn(i)
     shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
   end
 

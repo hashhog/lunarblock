@@ -273,17 +273,36 @@ test("G16: Knapsack finds single exact-match UTXO", function()
   end
 end)
 
--- G17: Knapsack uses math.random internally (not CSPRNG) - W88 anti-pattern
-test("G17: Knapsack uses math.random (W88 anti-pattern - not CSPRNG)", function()
-  -- select_coins_random at wallet.lua:316 uses math.random(1, i) for Fisher-Yates
-  -- Core's KnapsackSolver uses FastRandomContext (CSPRNG) via rng.randbool()
-  -- math.random without math.randomseed defaults to seed=0 or deterministic state
-  log_bug("BUG-9", "W88 anti-pattern: select_coins_random uses math.random(1,i) (Lua's non-CSPRNG); Core KnapsackSolver uses FastRandomContext; wallet.random_bytes() exists but is NOT used for shuffle")
-  -- Verify: wallet.random_bytes uses OpenSSL RAND_bytes (correct CSPRNG)
-  expect_true(type(wallet.random_bytes) == "function", "random_bytes CSPRNG helper exists")
-  -- Verify: select_coins_random does NOT use wallet.random_bytes
-  -- (confirmed by reading wallet.lua:309-331: only math.random used)
-  expect_true(true, "W88 anti-pattern confirmed by inspection")
+-- G17: Fisher-Yates shuffle in select_coins_random uses wallet.random_bytes (CSPRNG)
+-- FIX-45: BUG-9 closed — math.random replaced with csprng_intn(n) backed by
+-- wallet.random_bytes (OpenSSL RAND_bytes), matching Core's FastRandomContext usage.
+test("G17: select_coins_random uses wallet.random_bytes CSPRNG, NOT math.random", function()
+  -- Verify wallet.random_bytes (OpenSSL RAND_bytes) is available
+  expect_true(type(wallet.random_bytes) == "function", "wallet.random_bytes CSPRNG helper exists")
+
+  -- Monkey-patch math.random to a sentinel that records calls.
+  -- If select_coins_random still uses math.random the call will be recorded and the test fails.
+  local math_random_called = false
+  local orig_math_random = math.random
+  math.random = function(...)
+    math_random_called = true
+    return orig_math_random(...)
+  end
+
+  local utxos = make_utxos({50000, 30000, 20000, 10000})
+  local selected = wallet.select_coins_random(utxos, 60000)
+
+  -- Restore math.random unconditionally
+  math.random = orig_math_random
+
+  -- The fix: math.random must NOT have been called during the shuffle
+  expect_false(math_random_called, "math.random must NOT be called by select_coins_random (BUG-9 fix)")
+
+  -- Basic correctness: a selection covering the target should be returned
+  expect_true(selected ~= nil, "select_coins_random should still return a valid selection")
+  local total = 0
+  for _, item in ipairs(selected) do total = total + item.utxo.value end
+  expect_true(total >= 60000, "selected UTXOs must cover the target")
 end)
 
 -- G18: Knapsack stochastic subset-sum (ApproximateBestSubset with 1000 iters) absent
