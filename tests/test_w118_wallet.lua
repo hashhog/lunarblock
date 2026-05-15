@@ -145,30 +145,49 @@ test("G5: BIP-386 rawtr(<32-byte xonly>) emits OP_1 <xonly> with NO tweak", func
   expect_eq(bin_to_hex(spk:sub(3, 34)), xonly, "rawtr is NOT tweaked")
 end)
 
--- G6: BUG — ranged descriptor with xpub-rooted key does not derive correctly.
--- address.derive_child contains a placeholder ("Placeholder - needs proper
--- implementation") that returns IL alone instead of (IL + parent_priv) mod n,
--- and refuses public-only derivation entirely.  Wpkh+xpub w/*/ is the
--- workhorse external descriptor; this is the single most consequential
--- wallet correctness bug in lunarblock.
-test("G6: BUG — xpub-rooted ranged descriptor derive_path is broken (G6-BUG-1)", function()
-  -- BIP-32 vector 1: master from seed 000102...0f, then derive m/0'/1 the
-  -- canonical way; we expect a known child key for index 0 of a /0/* range
-  -- against the matching xpub.  Lunarblock's address.derive_child returns
-  -- a placeholder, so the resulting pubkey will NOT match the known vector.
+-- G6: address.derive_child must perform real BIP-32 CKD.
+-- Originally annotated "INCORRECT for real use!" — returned IL alone
+-- as the child priv instead of (parse256(IL) + k_par) mod n, and
+-- refused CKDpub entirely. Fixed in FIX-59 via libsecp256k1
+-- ec_seckey_tweak_add / ec_pubkey_tweak_add. The full BIP-32 Test
+-- Vector 1 + 2 sweep lives in tests/test_fix59_bip32_ckd.lua; this
+-- assertion is the single-step witness used by W118.
+test("G6: address.derive_child matches BIP-32 vector 1 m/0'/1 (G6-BUG-1 FIXED)", function()
+  -- BIP-32 Test Vector 1: master from seed 000102...0f.
+  -- Master (m):
+  local m_priv = hex_to_bin("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35")
+  local m_cc   = hex_to_bin("873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508")
+  local m_pub  = hex_to_bin("0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2")
+  -- Step 1: m/0' (hardened) — exercises (IL + parent_priv) mod n with the
+  -- hardened-message form.
+  local c1_pub, c1_cc, err, c1_priv =
+    address.derive_child(m_pub, m_cc, 0x80000000, m_priv)
+  expect_eq(err, nil, "no error: " .. tostring(err))
+  expect_eq(bin_to_hex(c1_priv),
+            "edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea",
+            "m/0' priv matches BIP-32 vector")
+  expect_eq(bin_to_hex(c1_cc),
+            "47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141",
+            "m/0' chain_code matches BIP-32 vector")
+  expect_eq(bin_to_hex(c1_pub),
+            "035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56",
+            "m/0' pubkey matches BIP-32 vector")
+  -- Step 2: m/0'/1 (non-hardened) — exercises (IL + parent_priv) mod n
+  -- with the non-hardened-message form.
+  local c2_pub, c2_cc, err2, c2_priv =
+    address.derive_child(c1_pub, c1_cc, 1, c1_priv)
+  expect_eq(err2, nil, "no error: " .. tostring(err2))
+  expect_eq(bin_to_hex(c2_priv),
+            "3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368",
+            "m/0'/1 priv matches BIP-32 vector")
+  expect_eq(bin_to_hex(c2_pub),
+            "03501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c",
+            "m/0'/1 pubkey matches BIP-32 vector")
+  -- Source assertion: the "INCORRECT for real use" annotation is gone.
   local src = io.open("src/address.lua", "r")
   local content = src:read("*a"); src:close()
-  -- The placeholder is annotated "needs proper implementation" — confirm.
-  local placeholder = content:find("Placeholder %- needs proper implementation")
-                       or content:find("just XOR")
-                       or content:find("simplification")
-  expect_true(placeholder ~= nil,
-    "address.lua:derive_child must NOT contain a placeholder for production use")
-  bug("G6-BUG-1", "P0",
-      "address.derive_child uses XOR/IL placeholder instead of secp256k1 " ..
-      "scalar addition mod-n; xpub-rooted descriptors (wpkh(xpub.../0/*) etc.) " ..
-      "do NOT derive correctly. address.lua:797-813.")
-  error("G6-BUG-1 confirmed: derive_child is a placeholder, ranged xpub descriptors are broken")
+  expect_eq(content:find("INCORRECT for real"), nil,
+    "address.lua must not still claim derive_child is INCORRECT")
 end)
 
 -- ===================================================================

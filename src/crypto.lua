@@ -426,6 +426,26 @@ ffi.cdef[[
     const unsigned char* seckey
   );
 
+  /* BIP-32 CKD scalar + point operations.
+   * - secp256k1_ec_seckey_tweak_add: (seckey + tweak) mod n, returns 0 if the
+   *   result is zero or seckey/tweak is invalid (matches BIP-32's
+   *   "if parse256(IL) >= n or k_i == 0, derivation is invalid; retry next i").
+   * - secp256k1_ec_pubkey_tweak_add: P_new = P + tweak*G, returns 0 if the
+   *   result is the point at infinity or tweak >= n (matches BIP-32 CKDpub
+   *   invalid-derivation rule).
+   * Used by address.derive_child for BIP-32 private + public CKD paths. */
+  int secp256k1_ec_seckey_tweak_add(
+    const secp256k1_context* ctx,
+    unsigned char* seckey,
+    const unsigned char* tweak32
+  );
+
+  int secp256k1_ec_pubkey_tweak_add(
+    const secp256k1_context* ctx,
+    secp256k1_pubkey* pubkey,
+    const unsigned char* tweak32
+  );
+
   int secp256k1_ecdsa_sign(
     const secp256k1_context* ctx,
     secp256k1_ecdsa_signature* sig,
@@ -777,6 +797,72 @@ function M.pubkey_from_privkey(privkey32, compressed)
     return nil, "invalid private key"
   end
 
+  local flags = compressed and 0x0102 or 0x0002
+  local outlen = compressed and 33 or 65
+  local output = ffi.new("unsigned char[?]", outlen)
+  local outputlen = ffi.new("size_t[1]", outlen)
+  libsecp256k1.secp256k1_ec_pubkey_serialize(secp_ctx, output, outputlen, pubkey, flags)
+  return ffi.string(output, outputlen[0])
+end
+
+-- BIP-32 CKDpriv scalar addition: child_priv = (tweak + parent_priv) mod n.
+-- Wraps libsecp256k1's secp256k1_ec_seckey_tweak_add which performs the
+-- modular add and returns 0 on:
+--   - tweak >= n             (BIP-32: parse256(IL) >= n -> retry next index)
+--   - result == 0            (BIP-32: k_i == 0          -> retry next index)
+--   - parent_priv invalid    (>= n or zero)
+-- This is the exact semantics Bitcoin Core's CKey::Derive relies on
+-- (bitcoin-core/src/key.cpp ~line 211).
+-- @param parent_priv32 string: 32-byte parent private key
+-- @param tweak32       string: 32-byte left half of HMAC-SHA512 (IL)
+-- @return string|nil:   32-byte child private key, or nil on invalid derivation
+-- @return string|nil:   error message
+function M.ec_seckey_tweak_add(parent_priv32, tweak32)
+  if type(parent_priv32) ~= "string" or #parent_priv32 ~= 32 then
+    return nil, "parent_priv must be 32 bytes"
+  end
+  if type(tweak32) ~= "string" or #tweak32 ~= 32 then
+    return nil, "tweak must be 32 bytes"
+  end
+  -- secp256k1_ec_seckey_tweak_add mutates the seckey in place.
+  local seckey = ffi.new("unsigned char[32]")
+  ffi.copy(seckey, parent_priv32, 32)
+  if libsecp256k1.secp256k1_ec_seckey_tweak_add(secp_ctx, seckey, tweak32) ~= 1 then
+    return nil, "invalid derivation (tweak >= n, k_i == 0, or bad parent)"
+  end
+  return ffi.string(seckey, 32)
+end
+
+-- BIP-32 CKDpub point addition: child_pub = parent_pub + tweak*G.
+-- Wraps libsecp256k1's secp256k1_ec_pubkey_tweak_add which performs the
+-- EC point add and returns 0 on:
+--   - tweak >= n               (BIP-32: parse256(IL) >= n -> retry next index)
+--   - result == infinity       (BIP-32 invalid case        -> retry next index)
+--   - parent_pub invalid
+-- Used for non-hardened CKDpub when only the xpub is available.
+-- @param parent_pub_bytes string: 33-byte (compressed) or 65-byte parent pubkey
+-- @param tweak32          string: 32-byte left half of HMAC-SHA512 (IL)
+-- @param compressed       boolean: serialize child as 33-byte compressed (default true)
+-- @return string|nil:      serialized child pubkey or nil on invalid derivation
+-- @return string|nil:      error message
+function M.ec_pubkey_tweak_add(parent_pub_bytes, tweak32, compressed)
+  if compressed == nil then compressed = true end
+  if type(parent_pub_bytes) ~= "string"
+     or (#parent_pub_bytes ~= 33 and #parent_pub_bytes ~= 65) then
+    return nil, "parent_pub must be 33 or 65 bytes"
+  end
+  if type(tweak32) ~= "string" or #tweak32 ~= 32 then
+    return nil, "tweak must be 32 bytes"
+  end
+  local pubkey = ffi.new("secp256k1_pubkey")
+  if libsecp256k1.secp256k1_ec_pubkey_parse(
+    secp_ctx, pubkey, parent_pub_bytes, #parent_pub_bytes
+  ) ~= 1 then
+    return nil, "invalid parent pubkey"
+  end
+  if libsecp256k1.secp256k1_ec_pubkey_tweak_add(secp_ctx, pubkey, tweak32) ~= 1 then
+    return nil, "invalid derivation (tweak >= n or result at infinity)"
+  end
   local flags = compressed and 0x0102 or 0x0002
   local outlen = compressed and 33 or 65
   local output = ffi.new("unsigned char[?]", outlen)
