@@ -201,6 +201,12 @@ function M.parse(input, network)
 
   -- Validate against our address layer.  decode_address can raise on
   -- non-Base58 input via the base58_decode assert; wrap in pcall.
+  --
+  -- FIX-63 (2026-05-15): address.decode_address is now strictly
+  -- network-byte-correct (the earlier defensive Base58 version-byte
+  -- filter that lived here became redundant and was removed in favour
+  -- of trusting the address layer).  See src/address.lua::decode_address
+  -- for the strict prefix check; bech32 HRP was already correct.
   local ok, addr_type, payload_or_err = pcall(address.decode_address,
                                               decoded_addr, network)
   if not ok then
@@ -208,27 +214,6 @@ function M.parse(input, network)
   end
   if not addr_type then
     return { err = "address is not valid for network " .. network }
-  end
-
-  -- address.decode_address accepts EITHER network's Base58 version byte
-  -- regardless of the `network` arg (it only filters bech32 via HRP).
-  -- BIP-21 callers expect a network-correct check, so we enforce it
-  -- here for Base58 types by re-decoding and comparing the version byte
-  -- against the expected one for `network`.
-  if addr_type == "p2pkh" or addr_type == "p2sh" then
-    local v_ok, ver = pcall(address.base58check_decode, decoded_addr)
-    if not v_ok or not ver then
-      return { err = "address is not valid for network " .. network }
-    end
-    local expect_p2pkh = (network == "mainnet")
-                          and address.VERSION.MAINNET_P2PKH
-                          or  address.VERSION.TESTNET_P2PKH
-    local expect_p2sh  = (network == "mainnet")
-                          and address.VERSION.MAINNET_P2SH
-                          or  address.VERSION.TESTNET_P2SH
-    if ver ~= expect_p2pkh and ver ~= expect_p2sh then
-      return { err = "address is not valid for network " .. network }
-    end
   end
 
   local result = {
