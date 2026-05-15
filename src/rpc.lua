@@ -5476,6 +5476,172 @@ function RPCServer:register_methods()
     return M.hex_encode(txid:reverse())
   end
 
+  --- bumpfee: BIP-125 RBF fee bump of an own wallet transaction.
+  --
+  -- Mirrors Bitcoin Core wallet/rpc/spend.cpp bumpfee (and the supporting
+  -- wallet/feebumper.cpp). The bumped tx reuses the original inputs, leaves
+  -- recipient outputs untouched, and shrinks the wallet-owned change output
+  -- by (new_fee - old_fee). The new tx is re-signed and submitted to the
+  -- mempool, which performs BIP-125 replacement against the original. The
+  -- original wallet entry is marked `replaced_by` so a second bumpfee on
+  -- the same txid is rejected.
+  --
+  -- @param params[1] txid string: hex txid of the wallet transaction to bump
+  -- @param params[2] options table|nil: {
+  --   "fee_rate"   = number  -- target feerate, sat/vB (overrides the default
+  --                            old_fee + ceil(vsize) sat-per-vB bump)
+  -- }
+  -- @return {txid=<new_txid_hex>, origfee=<old_fee_BTC>, fee=<new_fee_BTC>,
+  --          errors=[<string>...]}
+  self.methods["bumpfee"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+
+    local txid_hex_disp = params[1] or params.txid
+    if type(txid_hex_disp) ~= "string" or #txid_hex_disp ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "txid (64-hex string) is required"})
+    end
+
+    local opts = params[2] or params.options or {}
+    local fee_rate
+    if opts.fee_rate ~= nil and opts.fee_rate ~= cjson.null then
+      fee_rate = tonumber(opts.fee_rate)
+      if not fee_rate or fee_rate <= 0 then
+        error({code = M.ERROR.INVALID_PARAMS,
+               message = "fee_rate must be a positive number (sat/vB)"})
+      end
+    end
+
+    -- self.transactions keys are display-form (big-endian) hex (see
+    -- types.hash256_hex), which is exactly what RPC clients hand us as
+    -- the txid parameter. No conversion needed.
+    local lookup_hex = txid_hex_disp:lower()
+
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+    end
+    if rpc.mempool then
+      wallet:set_mempool(rpc.mempool)
+    end
+
+    local new_tx, old_fee_or_errs, new_fee = wallet:bump_fee(lookup_hex, {
+      fee_rate = fee_rate,
+      sign     = true,
+    })
+    if not new_tx then
+      -- bump_fee returns (nil, errors_table) on failure
+      local err_msg
+      if type(old_fee_or_errs) == "table" and old_fee_or_errs[1] then
+        err_msg = old_fee_or_errs[1]
+      else
+        err_msg = tostring(old_fee_or_errs)
+      end
+      error({code = M.ERROR.WALLET_ERROR, message = err_msg})
+    end
+
+    -- Submit the replacement. The mempool's BIP-125 path will evict the
+    -- original; mark the wallet entry as replaced.
+    local ok, send_err = wallet:send_transaction(new_tx,
+      {fee = new_fee, replaces = lookup_hex})
+    if not ok then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Failed to broadcast replacement: " .. tostring(send_err)})
+    end
+
+    local new_txid_bin = validation.compute_txid(new_tx).bytes
+    local new_txid_hex = M.hex_encode(new_txid_bin:reverse())
+
+    local errors_arr = setmetatable({}, cjson.empty_array_mt)
+    return {
+      txid    = new_txid_hex,
+      origfee = old_fee_or_errs / 100000000,  -- sat -> BTC
+      fee     = new_fee          / 100000000,
+      errors  = errors_arr,
+    }
+  end
+
+  --- psbtbumpfee: BIP-125 RBF fee bump that returns an unsigned PSBT.
+  --
+  -- Mirrors Bitcoin Core wallet/rpc/spend.cpp psbtbumpfee. Same flow as
+  -- bumpfee, but the rebuilt transaction is NOT signed — it is wrapped in
+  -- a BIP-174 PSBT (witness_utxo populated on every input so an offline
+  -- signer can produce sighashes) and returned base64-encoded. The
+  -- original transaction is left in place; psbtbumpfee does NOT broadcast.
+  --
+  -- @param params[1] txid string: hex txid of the wallet transaction to bump
+  -- @param params[2] options table|nil: same shape as bumpfee
+  -- @return {psbt=<base64>, origfee=<BTC>, fee=<BTC>, errors=[]}
+  self.methods["psbtbumpfee"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+
+    local txid_hex_disp = params[1] or params.txid
+    if type(txid_hex_disp) ~= "string" or #txid_hex_disp ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "txid (64-hex string) is required"})
+    end
+
+    local opts = params[2] or params.options or {}
+    local fee_rate
+    if opts.fee_rate ~= nil and opts.fee_rate ~= cjson.null then
+      fee_rate = tonumber(opts.fee_rate)
+      if not fee_rate or fee_rate <= 0 then
+        error({code = M.ERROR.INVALID_PARAMS,
+               message = "fee_rate must be a positive number (sat/vB)"})
+      end
+    end
+
+    -- self.transactions keys are display-form (big-endian) hex (see
+    -- types.hash256_hex), which is exactly what RPC clients hand us as
+    -- the txid parameter. No conversion needed.
+    local lookup_hex = txid_hex_disp:lower()
+
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+    end
+
+    local new_tx, old_fee_or_errs, new_fee, input_utxos =
+      wallet:bump_fee(lookup_hex, {
+        fee_rate = fee_rate,
+        sign     = false,   -- unsigned for PSBT
+      })
+    if not new_tx then
+      local err_msg
+      if type(old_fee_or_errs) == "table" and old_fee_or_errs[1] then
+        err_msg = old_fee_or_errs[1]
+      else
+        err_msg = tostring(old_fee_or_errs)
+      end
+      error({code = M.ERROR.WALLET_ERROR, message = err_msg})
+    end
+
+    -- Wrap in PSBT. psbt.new requires every input to be unsigned, which
+    -- bump_fee(sign=false) guarantees.
+    local psbt_mod = require("lunarblock.psbt")
+    local psbt = psbt_mod.new(new_tx)
+    -- Populate witness_utxo on every input so an offline signer has the
+    -- value and scriptPubKey it needs to produce the BIP-143 sighash.
+    for i, u in ipairs(input_utxos) do
+      psbt.inputs[i].witness_utxo = {
+        value         = u.value,
+        script_pubkey = u.script_pubkey,
+      }
+    end
+
+    local errors_arr = setmetatable({}, cjson.empty_array_mt)
+    return {
+      psbt    = psbt_mod.to_base64(psbt),
+      origfee = old_fee_or_errs / 100000000,
+      fee     = new_fee          / 100000000,
+      errors  = errors_arr,
+    }
+  end
+
   --- walletpassphrase: Unlock wallet with passphrase.
   -- @param passphrase string: Wallet passphrase
   -- @param timeout number: Seconds to keep unlocked (ignored, stays unlocked)
