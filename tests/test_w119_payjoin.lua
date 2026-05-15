@@ -82,7 +82,7 @@ end
 local SRC_FILES = {
   "src/wallet.lua", "src/rpc.lua", "src/psbt.lua", "src/rest.lua",
   "src/main.lua", "src/address.lua", "src/p2p.lua", "src/peerman.lua",
-  "src/proxy.lua",
+  "src/proxy.lua", "src/bip21.lua",  -- FIX-62: BIP-21 URI parser landed.
 }
 
 local function any_source_matches(pattern)
@@ -539,29 +539,40 @@ test("G27: sendpayjoinrequest RPC absent (G27-BUG-27)", function()
       "lunarblock has sendtoaddress but no PayJoin-aware variant.")
 end)
 
--- G28: BIP-21 pj= URI parameter
-test("G28: BIP-21 pj= URI parameter absent (G28-BUG-28)", function()
-  -- Note: lunarblock has NO BIP-21 URI parser to begin with — confirm both
-  -- the upstream absence AND that no pj=-specific code exists.
+-- G28: BIP-21 pj= URI parameter — FIX-62 LANDED.
+-- The BIP-21 parser lives in src/bip21.lua and recognises pj= as the
+-- PayJoin endpoint indicator.  The audit assertion has been flipped:
+-- we now confirm the parser exists AND that bip21.parse() returns a
+-- table whose `pj` field captures the URL.  Note: this only closes the
+-- URI-layer half of BIP-78 — the actual PayJoin client/server flow
+-- (G1-G27, G30) remains MISSING; FIX-62 deliberately scopes to BIP-21.
+test("G28: BIP-21 pj= URI parameter now supported (FIX-62)", function()
   local has21, _ = any_source_matches("bitcoin:")
-  expect_eq(has21, false, "no BIP-21 'bitcoin:' URI parser at all")
-  local has_pj, _ = any_source_matches("pj=")
-  expect_eq(has_pj, false, "no pj= parameter handler")
-  bug("G28-BUG-28", "P0",
-      "BIP-21 pj= URI parameter unsupported because BIP-21 itself is " ..
-      "unsupported. lunarblock has no parser for 'bitcoin:<addr>?amount=...' " ..
-      "URIs anywhere — neither the wallet RPCs nor src/address.lua. " ..
-      "Without BIP-21 the PayJoin endpoint indicator (pj=) cannot exist.")
+  expect_true(has21, "BIP-21 'bitcoin:' URI parser source must be present")
+  local ok, bip21 = pcall(require, "lunarblock.bip21")
+  expect_true(ok and type(bip21) == "table",
+              "lunarblock.bip21 must be require-able")
+  expect_true(type(bip21.parse) == "function",
+              "bip21.parse must exist")
+  local uri = bip21.parse(
+    "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" ..
+    "?pj=https%3A%2F%2Fexample.com%2Fpayjoin", "mainnet")
+  expect_true(type(uri) == "table" and not uri.err,
+              "bip21.parse must accept pj= without error")
+  expect_eq(uri.pj, "https://example.com/payjoin",
+            "pj= URL must be captured (percent-decoded)")
 end)
 
--- G29: BIP-21 pjos= URI parameter (output substitution opt-out)
-test("G29: BIP-21 pjos= URI parameter absent (G29-BUG-29)", function()
-  local has, _ = any_source_matches("pjos=")
-  expect_eq(has, false, "no pjos= parameter handler")
-  bug("G29-BUG-29", "P1",
-      "BIP-21 pjos= URI parameter unsupported. pjos=0 is the receiver-side " ..
-      "way to declare 'do not let the sender substitute outputs'; absent in " ..
-      "lunarblock alongside the missing BIP-21 layer (see G28).")
+-- G29: BIP-21 pjos= URI parameter — FIX-62 LANDED.
+test("G29: BIP-21 pjos= URI parameter now supported (FIX-62)", function()
+  local ok, bip21 = pcall(require, "lunarblock.bip21")
+  expect_true(ok and type(bip21) == "table", "lunarblock.bip21 require-able")
+  local uri = bip21.parse(
+    "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" ..
+    "?pj=https%3A%2F%2Fx.example%2Fpj&pjos=0", "mainnet")
+  expect_true(type(uri) == "table" and not uri.err,
+              "bip21.parse must accept pjos= without error")
+  expect_eq(uri.pjos, "0", "pjos=0 must be captured")
 end)
 
 -- =================================================================== --
@@ -594,16 +605,19 @@ print(string.format("Bugs documented: %d", #BUGS))
 print("\n--- Bug List ---")
 for _, b in ipairs(BUGS) do print("  " .. b) end
 
--- All 30 gates are MISSING-confirmation tests; each is expected to PASS
--- (the test itself asserts absence). If a test FAILS it means an
+-- 28 of 30 gates are MISSING-confirmation tests (asserting absence).
+-- G28+G29 were flipped by FIX-62 (BIP-21 URI parser landed) and now
+-- assert PRESENCE. If a MISSING-gate test FAILS it means an
 -- expectation about absence broke — which would be GOOD NEWS (someone
--- shipped PayJoin), but the surface change must be reviewed.
+-- shipped more of PayJoin), but the surface change must be reviewed.
 if FAIL > 0 then
   print(string.format(
     "\nUNEXPECTED FAILURES: %d -- review whether PayJoin landed " ..
     "or a search pattern needs updating.", FAIL))
   os.exit(1)
 else
-  print("\nAll 30 absence-confirmation gates passed; PayJoin is MISSING ENTIRELY.")
+  print("\nAll 30 gates passed: 28 absence-confirmed, 2 presence-confirmed " ..
+        "(G28+G29 closed by FIX-62 BIP-21). PayJoin remains MOSTLY MISSING; " ..
+        "1 spec behind (BIP-78), not 2.")
   os.exit(0)
 end
