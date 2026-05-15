@@ -14,7 +14,13 @@ docker run -v lunarblock-data:/data -p 48351:48351 -p 48341:48341 lunarblock
 ### From Source
 
 ```bash
-# Requires: luajit, luasocket, lua-cjson, libsecp256k1, openssl, rocksdb
+# Required: luajit, luasocket, lua-cjson, libsecp256k1, openssl, rocksdb
+# Optional: lua-sec (luasec) — enables HTTPS/TLS termination on the
+#           RPC server when --rpc-tls-cert/--rpc-tls-key are passed.
+#           Install via `luarocks install luasec` or
+#           `apt install lua-sec` on Debian/Ubuntu.  Without luasec
+#           lunarblock runs fine in plaintext mode; the TLS flags
+#           simply produce a clear startup error if you try to use them.
 LD_LIBRARY_PATH=./lib luajit src/main.lua --help
 LD_LIBRARY_PATH=./lib luajit src/main.lua --network mainnet
 LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
@@ -60,6 +66,8 @@ LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
 | `--rpcport PORT` | per-network | RPC server port |
 | `--rpcuser USER` | `lunarblock` | RPC username |
 | `--rpcpassword PW` | empty | RPC password |
+| `--rpc-tls-cert PATH` | none | PEM cert path — enables HTTPS RPC (pair with `--rpc-tls-key`; requires `luasec`) |
+| `--rpc-tls-key PATH` | none | PEM private-key path — pair with `--rpc-tls-cert` |
 | `--port PORT` | per-network | P2P listen port |
 | `--maxpeers N` | `125` | Maximum peer connections |
 | `--dbcache MB` | `450` | Database cache size in MB |

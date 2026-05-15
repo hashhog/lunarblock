@@ -126,6 +126,12 @@ function M.apply_conf_to_args(args, defaults, conf)
     rpcport       = {"rpcport",       "number"},
     rpcuser       = {"rpcuser",       "string"},
     rpcpassword   = {"rpcpassword",   "string"},
+    -- FIX-64 (W119): PEM paths for optional HTTPS RPC termination.  Bare
+    -- ASCII flag names (TOML `rpc-tls-cert = "..."`) and the underscore
+    -- aliases stay parseable through the same path-style key handling that
+    -- `ready-fd` uses.
+    ["rpc-tls-cert"] = {"rpc_tls_cert", "string"},
+    ["rpc-tls-key"]  = {"rpc_tls_key",  "string"},
     port          = {"port",          "number"},
     maxpeers      = {"maxpeers",      "number"},
     dbcache       = {"dbcache",       "number"},

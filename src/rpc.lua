@@ -917,6 +917,14 @@ function M.new(config)
   self.port = config.rpcport or 8332
   self.username = config.rpcuser or "lunarblock"
   self.password = config.rpcpassword or ""
+  -- FIX-64 (W119): optional HTTPS/TLS termination.  When both paths are set
+  -- the listening socket is wrapped with luasec at accept() time.  When
+  -- neither is set the server stays plaintext (backward-compat).  Mismatch
+  -- (only one set) is a fatal error in :start().  luasec missing while
+  -- flags ARE set is also a fatal error in :start() — see docs/README.
+  self.tls_cert_path = config.rpc_tls_cert
+  self.tls_key_path  = config.rpc_tls_key
+  self.tls_ctx       = nil  -- populated lazily in :start() when both paths set
   self.server_socket = nil
   self.methods = {}        -- method_name -> handler function
   self.chain_state = config.chain_state
@@ -8156,7 +8164,75 @@ end
 -- HTTP Server
 --------------------------------------------------------------------------------
 
+-- FIX-64 (W119): build a luasec context from the cert/key pair set on
+-- self.  Factored out so the unit tests can exercise the cert/key
+-- validation, "luasec missing" path, and mismatched-flag path without
+-- standing up a real bound listener.
+--
+-- Returns ctx, nil on success.
+-- Returns nil, err_string on failure.  Callers MUST error()/exit on err.
+-- Returns nil, nil when TLS is not requested (neither cert nor key set).
+function RPCServer:_init_tls_context()
+  local cert, key = self.tls_cert_path, self.tls_key_path
+  if (cert == nil or cert == "") and (key == nil or key == "") then
+    return nil, nil  -- TLS not requested — plaintext path
+  end
+  if (cert == nil or cert == "") or (key == nil or key == "") then
+    return nil, "--rpc-tls-cert and --rpc-tls-key must both be set " ..
+                "(got cert=" .. tostring(cert) .. ", key=" .. tostring(key) .. ")"
+  end
+  -- Require luasec only when TLS is requested.  Operators who never set
+  -- the flags must NOT be forced to install luasec just to run plaintext.
+  local ok, ssl_or_err = pcall(require, "ssl")
+  if not ok then
+    return nil,
+      "luasec required for --rpc-tls-cert/--rpc-tls-key; install via " ..
+      "`luarocks install luasec` or `apt install lua-sec` " ..
+      "(require('ssl') error: " .. tostring(ssl_or_err) .. ")"
+  end
+  local ssl = ssl_or_err
+  -- Verify the files exist+readable up front so the error fires at
+  -- start() (visible to operator) and not on first accepted client
+  -- (silent in handlers).
+  local cf, cerr = io.open(cert, "rb")
+  if not cf then
+    return nil, "--rpc-tls-cert unreadable: " .. tostring(cerr)
+  end
+  cf:close()
+  local kf, kerr = io.open(key, "rb")
+  if not kf then
+    return nil, "--rpc-tls-key unreadable: " .. tostring(kerr)
+  end
+  kf:close()
+  -- Server-mode context.  TLSv1.2+ baseline (matches Core's libevent+OpenSSL
+  -- default in src/httpserver.cpp; sslv2/sslv3/tlsv1.0/1.1 all disabled).
+  -- "all" selects the highest mutually supported protocol; "options" disables
+  -- legacy fallbacks.  No client-cert verification by default — same shape
+  -- as Core: HTTPS is transport encryption, RPC Basic auth is the user check.
+  local ctx_ok, ctx_or_err = pcall(ssl.newcontext, {
+    mode     = "server",
+    protocol = "any",
+    certificate = cert,
+    key         = key,
+    verify   = {"none"},
+    options  = {"all", "no_sslv2", "no_sslv3", "no_tlsv1", "no_tlsv1_1"},
+  })
+  if not ctx_ok or not ctx_or_err then
+    return nil, "ssl.newcontext failed: " .. tostring(ctx_or_err)
+  end
+  return ctx_or_err, nil
+end
+
 function RPCServer:start()
+  -- FIX-64 (W119): init TLS context FIRST so any mismatched-flag or
+  -- missing-luasec error fires before we bind the port.  This keeps the
+  -- listener from coming up half-configured and confusing supervisors.
+  local ctx, tls_err = self:_init_tls_context()
+  if tls_err then
+    error("RPC TLS init: " .. tls_err)
+  end
+  self.tls_ctx = ctx  -- nil if plaintext mode
+
   -- Use tcp4() (not tcp()) so setoption("reuseaddr", true) actually succeeds
   -- on LuaSocket 3.0 — on this build setsockopt fails on a generic master
   -- socket returned by tcp(), leaving bind() to fail with "address already
@@ -8167,7 +8243,12 @@ function RPCServer:start()
   assert(self.server_socket:listen(32))
   self.server_socket:settimeout(0)  -- Non-blocking accept
   self.running = true
-  print("RPC server listening on " .. self.host .. ":" .. self.port)
+  if self.tls_ctx then
+    print("RPC server listening on https://" .. self.host .. ":" .. self.port ..
+          " (TLS via luasec)")
+  else
+    print("RPC server listening on " .. self.host .. ":" .. self.port)
+  end
 end
 
 function RPCServer:tick()
@@ -8177,7 +8258,40 @@ function RPCServer:tick()
   local client = self.server_socket:accept()
   if not client then return end
 
-  client:settimeout(1)  -- 1s max per read (was 5s) to limit event-loop blocking
+  -- FIX-64 (W119): when HTTPS is enabled, wrap the accepted plain TCP socket
+  -- with luasec and complete the TLS handshake BEFORE any HTTP parsing.  We
+  -- intentionally do the handshake synchronously here — this server's tick()
+  -- is already a per-tick serial accept loop and the rest of the request
+  -- handling is synchronous too, so a slow handshake just delays the same
+  -- tick that the plaintext path would have spent on parse_http_request.
+  -- A TLS handshake failure is treated as the encrypted equivalent of a
+  -- malformed request: log + close + bail.  We DO NOT send a plaintext
+  -- HTTP error back — the peer is speaking some other protocol and
+  -- responding in cleartext would itself be a protocol violation.
+  if self.tls_ctx then
+    local ssl = require("ssl")  -- safe: :start() already proved this loads
+    -- Plain-socket-side timeout: the wrapped TLS object inherits it.
+    client:settimeout(5)  -- handshake budget; plaintext used 1s for body reads
+    local tls_client, wrap_err = ssl.wrap(client, self.tls_ctx)
+    if not tls_client then
+      pcall(function() client:close() end)
+      return
+    end
+    tls_client:settimeout(5)
+    local ok, hs_err = tls_client:dohandshake()
+    if not ok then
+      pcall(function() tls_client:close() end)
+      pcall(function() client:close() end)
+      return
+    end
+    -- From here, everything reads/writes through tls_client.  Note that
+    -- LuaSec's wrapped object exposes the same receive/send/close API as
+    -- LuaSocket so the existing HTTP code path below is unchanged.
+    client = tls_client
+    client:settimeout(1)  -- per-receive cap, matches plaintext
+  else
+    client:settimeout(1)  -- 1s max per read (was 5s) to limit event-loop blocking
+  end
   -- Read HTTP headers line-by-line, then read exact body by Content-Length.
   -- This avoids the LuaSocket receive(n) blocking issue where it waits for
   -- exactly n bytes or timeout.

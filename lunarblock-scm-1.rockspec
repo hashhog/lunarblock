@@ -12,6 +12,14 @@ dependencies = {
   "lua >= 5.1",
   "luasocket >= 3.1.0",
   "lua-cjson >= 2.1.0",
+  -- luasec is OPTIONAL at runtime — required only when the RPC server
+  -- is started with --rpc-tls-cert/--rpc-tls-key (FIX-64 / W119).  The
+  -- node runs fine in plaintext mode without it.  Listed here so
+  -- `luarocks install --only-deps lunarblock-scm-1.rockspec` provisions
+  -- a TLS-capable environment by default.  Operators on the plaintext
+  -- path may omit the install (gracefully degraded; clear startup
+  -- error if TLS flags are nonetheless set).  See README "From Source".
+  "luasec >= 1.0",
 }
 test_dependencies = {
   "busted >= 2.1.0",
