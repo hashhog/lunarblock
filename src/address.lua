@@ -390,12 +390,39 @@ function M.xonly_pubkey_to_p2tr(xonly_pubkey32, network)
   return M.segwit_encode(hrp, 1, xonly_pubkey32)
 end
 
--- Decode any address and return its type and hash/program
+-- Decode any address and return its type and hash/program.
+--
+-- Per Bitcoin Core's CBitcoinAddress::IsValid / DecodeDestination
+-- (src/key_io.cpp), the Base58 version byte MUST match the requested
+-- network's PUBKEY_ADDRESS / SCRIPT_ADDRESS prefix.  An older revision
+-- of this function accepted EITHER network's prefix regardless of
+-- `network`, which silently let mainnet '1...' addresses parse on a
+-- testnet wallet (and vice versa) — a cross-network payment hazard.
+-- FIX-63 (2026-05-15): strict per-network prefix check, matching the
+-- bech32 HRP check already enforced by segwit_decode below.
+--
+-- Bech32 addresses are already constrained correctly: segwit_decode
+-- compares the decoded HRP against the network-derived `hrp` and
+-- rejects mismatches (e.g. 'tb1...' on mainnet → HRP mismatch).
 function M.decode_address(address, network)
   network = network or "mainnet"
   local hrp = M.BECH32_HRP[network] or "bc"
 
-  -- Try SegWit first
+  -- Per-network Base58 prefix sets.  testnet/regtest/signet share
+  -- prefixes — Core does the same: testnet4, signet, and regtest all
+  -- use base58Prefixes = {0x6F, 0xC4} for PUBKEY_ADDRESS / SCRIPT_ADDRESS.
+  local p2pkh_byte, p2sh_byte
+  if network == "mainnet" then
+    p2pkh_byte = M.VERSION.MAINNET_P2PKH
+    p2sh_byte  = M.VERSION.MAINNET_P2SH
+  else
+    -- testnet | regtest | signet (and anything else falls through to
+    -- the testnet prefix set, mirroring how M.BECH32_HRP defaults).
+    p2pkh_byte = M.VERSION.TESTNET_P2PKH
+    p2sh_byte  = M.VERSION.TESTNET_P2SH
+  end
+
+  -- Try SegWit first (HRP-checked by segwit_decode against `hrp`).
   local witness_version, witness_program = M.segwit_decode(hrp, address)
   if witness_version then
     if witness_version == 0 and #witness_program == 20 then
@@ -409,13 +436,39 @@ function M.decode_address(address, network)
     end
   end
 
-  -- Try Base58Check
+  -- If the input looks like a bech32 address for a DIFFERENT known
+  -- network (e.g. 'tb1...' decoded on mainnet), the segwit_decode call
+  -- above returned nil and we must NOT fall through to base58check_decode
+  -- — base58_decode asserts on the '0' character which is legal in
+  -- bech32 but not in Base58.  Probe the other HRPs explicitly so we
+  -- can return "wrong-network" cleanly.
+  local lower_addr = address:lower()
+  for net, candidate_hrp in pairs(M.BECH32_HRP) do
+    if net ~= network then
+      local prefix = candidate_hrp .. "1"
+      if lower_addr:sub(1, #prefix) == prefix then
+        local wv = M.segwit_decode(candidate_hrp, address)
+        if wv then
+          return nil, "wrong-network address"
+        end
+      end
+    end
+  end
+
+  -- Try Base58Check, then strictly check the version byte against the
+  -- requested network's prefixes.
   local version, payload = M.base58check_decode(address)
   if version then
-    if version == M.VERSION.MAINNET_P2PKH or version == M.VERSION.TESTNET_P2PKH then
+    if version == p2pkh_byte then
       return "p2pkh", payload
-    elseif version == M.VERSION.MAINNET_P2SH or version == M.VERSION.TESTNET_P2SH then
+    elseif version == p2sh_byte then
       return "p2sh", payload
+    end
+    -- Version byte was recognised as a Bitcoin address prefix but
+    -- belongs to the wrong network.  This is the FIX-63 hazard.
+    if version == M.VERSION.MAINNET_P2PKH or version == M.VERSION.MAINNET_P2SH
+        or version == M.VERSION.TESTNET_P2PKH or version == M.VERSION.TESTNET_P2SH then
+      return nil, "wrong-network address"
     end
   end
 
