@@ -18,6 +18,15 @@ local function default_args()
     rpcport = nil,  -- will default from network config
     rpcuser = "lunarblock",
     rpcpassword = "",
+    -- FIX-64 (W119): optional HTTPS/TLS termination for the RPC server.
+    -- When BOTH paths are set, the JSON-RPC HTTP server wraps each accepted
+    -- socket with luasec so traffic is TLS-encrypted (Core's httpserver.cpp
+    -- pattern, mediated by libevent + OpenSSL).  When NEITHER is set, the
+    -- server stays plaintext (backward-compat).  Mismatched (only one set) is
+    -- a startup error.  Requires `luasec` (`luarocks install luasec` or
+    -- `apt install lua-sec` on Debian/Ubuntu).
+    rpc_tls_cert = nil,
+    rpc_tls_key  = nil,
     port = nil,  -- will default from network config
     maxpeers = 125,
     dbcache = 450,
@@ -74,6 +83,8 @@ local function parse_args(argv)
       print("      --rpcport PORT      RPC server port")
       print("      --rpcuser USER      RPC username (default: lunarblock)")
       print("      --rpcpassword PW    RPC password")
+      print("      --rpc-tls-cert PATH PEM cert path (enables HTTPS; requires --rpc-tls-key)")
+      print("      --rpc-tls-key PATH  PEM private-key path (requires --rpc-tls-cert)")
       print("      --port PORT         P2P listen port")
       print("      --maxpeers N        Maximum peer connections (default: 125)")
       print("      --dbcache MB        Database cache size in MB (default: 450)")
@@ -131,6 +142,23 @@ local function parse_args(argv)
     elseif arg == "--rpcpassword" then
       i = i + 1
       args.rpcpassword = argv[i]
+    elseif arg == "--rpc-tls-cert" or arg:match("^%-%-rpc%-tls%-cert=") then
+      -- FIX-64 (W119): PEM cert path for HTTPS RPC.  Must be paired with
+      -- --rpc-tls-key.  Mirrors Bitcoin Core's optional libevent+OpenSSL
+      -- HTTPS termination in src/httpserver.cpp (Core's pattern is bind via
+      -- evhttp_bind_socket_with_handle then wrap with SSL_CTX).  We use
+      -- luasec instead; same shape: ssl.newcontext(params) + ssl.wrap(sock).
+      local v = arg:match("^%-%-rpc%-tls%-cert=(.*)$")
+      if v then args.rpc_tls_cert = v else i = i + 1; args.rpc_tls_cert = argv[i] end
+    elseif arg == "--rpc-tls-key" or arg:match("^%-%-rpc%-tls%-key=") then
+      -- FIX-64 (W119): PEM private-key path for HTTPS RPC.  Must be paired
+      -- with --rpc-tls-cert.  No password-on-key support yet (Core's
+      -- httpserver.cpp uses SSL_CTX_use_PrivateKey_file with PEM type and
+      -- defers passphrase to the operator via SSL_CTX_set_default_passwd_cb;
+      -- a follow-up can add --rpc-tls-key-passphrase if real deployments
+      -- ever ship encrypted PEMs to lunarblock).
+      local v = arg:match("^%-%-rpc%-tls%-key=(.*)$")
+      if v then args.rpc_tls_key = v else i = i + 1; args.rpc_tls_key = argv[i] end
     elseif arg == "--port" then
       i = i + 1
       args.port = tonumber(argv[i])
@@ -1686,6 +1714,12 @@ local function main()
     rpcport = args.rpcport,
     rpcuser = args.rpcuser,
     rpcpassword = args.rpcpassword,
+    -- FIX-64 (W119): optional HTTPS termination.  When both paths are set
+    -- RPCServer:start() wraps the listening socket via luasec.  When neither
+    -- is set, plaintext path (backward-compat).  Mismatch is a fatal error
+    -- raised inside RPCServer:start() so callers see a clear message.
+    rpc_tls_cert = args.rpc_tls_cert,
+    rpc_tls_key  = args.rpc_tls_key,
     chain_state = chain_state,
     mempool = mempool,
     peer_manager = peer_manager,
@@ -1995,6 +2029,8 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --rpcport PORT      RPC server port")
       print("      --rpcuser USER      RPC username (default: lunarblock)")
       print("      --rpcpassword PW    RPC password")
+      print("      --rpc-tls-cert PATH PEM cert path (enables HTTPS; requires --rpc-tls-key)")
+      print("      --rpc-tls-key PATH  PEM private-key path (requires --rpc-tls-cert)")
       print("      --port PORT         P2P listen port")
       print("      --maxpeers N        Maximum peer connections (default: 125)")
       print("      --dbcache MB        Database cache size in MB (default: 450)")
