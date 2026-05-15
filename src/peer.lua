@@ -665,7 +665,15 @@ function Peer:handle_version(payload)
   -- Check for self-connection via nonce
   -- (caller should check nonce against known connections)
 
-  -- Send feature negotiation messages BEFORE verack (BIP330, BIP155, BIP339)
+  -- Send feature negotiation messages BEFORE verack (BIP155, BIP330, BIP339)
+  -- SENDADDRV2 (BIP155): signal addrv2 support so peer relays Tor/I2P/CJDNS to us.
+  -- Per Bitcoin Core net_processing.cpp (ProcessMessage VERSION handler), this is
+  -- sent right after VERSION is received, only when peer's protocol >= 70016.
+  -- BIP155: empty payload; must be sent before VERACK to be valid.
+  if ver.version >= 70016 then
+    self:send_message("sendaddrv2", p2p.serialize_sendaddrv2())
+  end
+
   -- SENDTXRCNCL (BIP330): Erlay transaction reconciliation
   -- Only send to outbound full relay peers (not block-only connections)
   if not self.inbound and ver.relay then
