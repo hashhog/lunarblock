@@ -427,25 +427,21 @@ test("G19: BIP-125 wallet.create_transaction emits seq=0xFFFFFFFD (signals RBF)"
   expect_true(mempool.signals_rbf(tx), "mempool.signals_rbf accepts 0xFFFFFFFD")
 end)
 
--- G20: BUG — `bumpfee` RPC absent
-test("G20: BUG — bumpfee RPC not implemented (G20-BUG-7)", function()
+-- G20: bumpfee RPC wired (FIX-61).  Closed by FIX-61: bumpfee+psbtbumpfee
+-- now live in src/rpc.lua and re-sign through the FIX-59 unified ec_sign
+-- pipeline.  Functional round-trip lives in tests/test_fix61_bumpfee.lua;
+-- this assertion is the single-line wire check used by W118.
+test("G20: bumpfee RPC is wired (G20-BUG-7 FIXED)", function()
   local rpc_src = io.open("src/rpc.lua", "r"):read("*a")
-  expect_nil(rpc_src:find('self%.methods%["bumpfee"%]'), "bumpfee RPC must NOT be wired (BUG)")
-  bug("G20-BUG-7", "P1",
-      "bumpfee RPC absent. Core ships bumpfee (RBF fee bump of own wallet tx, " ..
-      "wallet/rpc/spend.cpp). Wallet users cannot RBF a stuck transaction " ..
-      "from this node. Compounds G21-BUG-8 (psbtbumpfee also absent).")
+  expect_true(rpc_src:find('self%.methods%["bumpfee"%]') ~= nil,
+              "bumpfee RPC wired")
 end)
 
--- G21: BUG — `psbtbumpfee` RPC absent
-test("G21: BUG — psbtbumpfee RPC not implemented (G21-BUG-8)", function()
+-- G21: psbtbumpfee RPC wired (FIX-61).
+test("G21: psbtbumpfee RPC is wired (G21-BUG-8 FIXED)", function()
   local rpc_src = io.open("src/rpc.lua", "r"):read("*a")
-  expect_nil(rpc_src:find('self%.methods%["psbtbumpfee"%]'),
-             "psbtbumpfee RPC must NOT be wired (BUG)")
-  bug("G21-BUG-8", "P1",
-      "psbtbumpfee RPC absent. Core ships psbtbumpfee (RBF bump that yields a " ..
-      "PSBT for offline signing). Hardware-wallet users have no replacement " ..
-      "workflow on lunarblock. wallet/rpc/spend.cpp.")
+  expect_true(rpc_src:find('self%.methods%["psbtbumpfee"%]') ~= nil,
+              "psbtbumpfee RPC wired")
 end)
 
 -- G22: BIP-125 Rule #3 — replacement fee must exceed original (relative)
@@ -482,7 +478,18 @@ test("G24: BUG — anti-fee-sniping (BIP-326 locktime=tip) absent (G24-BUG-9)", 
   local hardcoded = src:find("types%.transaction%(2, inputs, outputs, 0%)") ~= nil
   expect_true(hardcoded, "wallet.create_transaction hardcodes locktime=0")
   expect_nil(src:find("anti.fee.sniping"), "no anti-fee-sniping comment")
-  expect_nil(src:find("tip_height.*locktime"), "no tip-height locktime wiring")
+  -- Per-line scan: the bug-marker we care about is a SINGLE expression
+  -- writing a locktime field from tip_height. The original full-file
+  -- regex cross-matched unrelated uses of `tip_height` (scan_utxos
+  -- confirmation math, line 1083) against unrelated uses of `locktime`
+  -- elsewhere (e.g. bump_fee preserving orig.locktime from FIX-61).
+  local cross = false
+  for line in src:gmatch("[^\n]+") do
+    if line:find("locktime") and line:find("tip_height") then
+      cross = true; break
+    end
+  end
+  expect_false(cross, "no tip-height locktime wiring (per-line)")
   bug("G24-BUG-9", "P2",
       "wallet.create_transaction hardcodes locktime=0 (wallet.lua:1464). " ..
       "BIP-326 / Core CreateTransactionInternal sets nLockTime=tip with 90% " ..
