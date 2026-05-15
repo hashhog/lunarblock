@@ -1502,13 +1502,65 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
   return tx, fee, algo
 end
 
+--- Build lookup tables from outpoint_key -> input_value and
+-- outpoint_key -> script_pubkey for every input of `tx` whose previous
+-- output is in `self.utxos` or `self.pending_utxos`. Used by
+-- `send_transaction` (to record absolute fee at submission time and to
+-- preserve the data bumpfee needs after the rescan) and by `bump_fee`
+-- (to recompute fee on the replacement and re-sign every input).
+function Wallet:_lookup_input_values(tx)
+  local input_values, input_scripts = {}, {}
+  local all_found = true
+  for _, inp in ipairs(tx.inputs) do
+    local key = inp.prev_out.hash.bytes .. string.char(
+      bit.band(inp.prev_out.index, 0xFF),
+      bit.band(bit.rshift(inp.prev_out.index, 8), 0xFF),
+      bit.band(bit.rshift(inp.prev_out.index, 16), 0xFF),
+      bit.band(bit.rshift(inp.prev_out.index, 24), 0xFF)
+    )
+    local u = self.utxos[key] or self.pending_utxos[key]
+    if u then
+      input_values[key] = u.value
+      input_scripts[key] = u.script_pubkey
+    else
+      all_found = false
+    end
+  end
+  return input_values, all_found, input_scripts
+end
+
 --- Send a transaction to the mempool.
 -- @param tx transaction: Signed transaction
+-- @param meta table|nil: Optional metadata to fold into self.transactions[]
+--                        — e.g. {fee=12345, replaces=<old_txid_hex>}.
+--                        When `fee` is absent we recompute it from wallet UTXO
+--                        input values minus tx output total (mirrors Core's
+--                        CWalletTx.GetDebit - GetCredit shortcut for owned tx).
 -- @return boolean: true on success
 -- @return string|nil: Error message on failure
-function Wallet:send_transaction(tx)
+function Wallet:send_transaction(tx, meta)
   if not self.mempool then
     return false, "No mempool configured"
+  end
+
+  -- Compute fee + capture input values/scripts BEFORE accept_transaction +
+  -- scan_mempool, because scan_mempool removes spent confirmed UTXOs from
+  -- self.utxos. Once we come out the other side of accept the inputs may
+  -- no longer be in self.utxos but rather marked in self.spent_pending.
+  -- bumpfee needs both fee + input snapshot, so we always capture.
+  local input_values, all_found, input_scripts = self:_lookup_input_values(tx)
+  local fee = meta and meta.fee
+  if not fee then
+    if all_found then
+      local total_in = 0
+      for _, v in pairs(input_values) do total_in = total_in + v end
+      local total_out = 0
+      for _, o in ipairs(tx.outputs) do total_out = total_out + o.value end
+      fee = total_in - total_out
+      if fee < 0 then fee = 0 end
+    else
+      fee = 0  -- foreign inputs; we don't know
+    end
   end
 
   local ok, err = self.mempool:accept_transaction(tx, true)
@@ -1518,12 +1570,25 @@ function Wallet:send_transaction(tx)
 
   -- Track the transaction
   local txid = validation.compute_txid(tx)
-  self.transactions[types.hash256_hex(txid)] = {
+  local txid_hex = types.hash256_hex(txid)
+  local entry = {
     tx = tx,
     height = 0,  -- unconfirmed
     time = os.time(),
-    fee = 0,  -- TODO: calculate from inputs - outputs
+    fee = fee,
+    input_values = input_values,
+    input_scripts = input_scripts,
   }
+  if meta and meta.replaces then
+    entry.replaces = meta.replaces
+    -- Mark the conflict so a second bumpfee can refuse (Core's
+    -- "Cannot bump transaction X which was already bumped by Y").
+    local old = self.transactions[meta.replaces]
+    if old then
+      old.replaced_by = txid_hex
+    end
+  end
+  self.transactions[txid_hex] = entry
 
   -- Rescan mempool to update balances
   self:scan_mempool(self.mempool)
@@ -1542,12 +1607,298 @@ function Wallet:send_to(recipients, options)
     return nil, result  -- result is error message
   end
 
-  local ok, err = self:send_transaction(tx)
+  local ok, err = self:send_transaction(tx, {fee = result})
   if not ok then
     return nil, err
   end
 
   return tx
+end
+
+--------------------------------------------------------------------------------
+-- BIP-125 fee bumping (bumpfee + psbtbumpfee)
+--
+-- Mirrors bitcoin-core/src/wallet/feebumper.{h,cpp}:
+--   * PreconditionChecks  — owner, unconfirmed, not already replaced, BIP-125
+--   * CreateRateBumpTransaction — reuse inputs, reduce change to fund the bump
+--   * SignTransaction     — re-sign each input via the FIX-59 unified path
+--   * CommitTransaction   — submit to mempool, mark the old tx replaced
+--
+-- The single Wallet:bump_fee helper returns the rebuilt transaction (signed
+-- or unsigned depending on `options.sign`) so the bumpfee RPC can broadcast
+-- it directly and the psbtbumpfee RPC can wrap it in a PSBT.
+--------------------------------------------------------------------------------
+
+--- Classify a scriptPubKey to one of our wallet addresses (if any).
+-- @param script_pubkey string
+-- @return string|nil: address, or nil if not ours
+-- @return string|nil: address type ("p2wpkh"|"p2pkh"|...)
+function Wallet:_address_for_script(script_pubkey)
+  local script_type, hash_or_program = script.classify_script(script_pubkey)
+  local addr
+  if script_type == "p2wpkh" then
+    local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
+    addr = address.segwit_encode(hrp, 0, hash_or_program)
+  elseif script_type == "p2pkh" then
+    local version = self.network.pubkey_address_prefix
+    addr = address.base58check_encode(version, hash_or_program)
+  end
+  if addr and self.keys[addr] then
+    return addr, script_type
+  end
+  return nil
+end
+
+--- Sign every input of `tx` in place using wallet keys, mirroring the
+-- create_transaction signing block (FIX-59 unified ecdsa_sign path).
+-- @param tx transaction
+-- @param input_utxos table: tx.inputs index (1-based) -> {value, script_pubkey, address}
+-- @return boolean ok, string|nil err
+function Wallet:_sign_inputs(tx, input_utxos)
+  for i, _ in ipairs(tx.inputs) do
+    local utxo = input_utxos[i]
+    if not utxo then
+      return false, "Missing UTXO for input " .. tostring(i - 1)
+    end
+    local key_info = self.keys[utxo.address]
+    if not key_info then
+      return false, "No key for address: " .. tostring(utxo.address)
+    end
+    if not key_info.privkey then
+      return false, "Private key not available (wallet locked?)"
+    end
+
+    if key_info.type == "p2wpkh" then
+      local pkh = crypto.hash160(key_info.pubkey)
+      local script_code = script.make_p2pkh_script(pkh)
+      local sighash = validation.signature_hash_segwit_v0(
+        tx, i - 1, script_code, utxo.value, consensus.SIGHASH.ALL
+      )
+      local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
+      sig = sig .. string.char(consensus.SIGHASH.ALL)
+      tx.inputs[i].witness = {sig, key_info.pubkey}
+    else
+      local sighash = validation.signature_hash_legacy(
+        tx, i - 1, utxo.script_pubkey, consensus.SIGHASH.ALL
+      )
+      local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
+      sig = sig .. string.char(consensus.SIGHASH.ALL)
+      local w = serialize.buffer_writer()
+      w.write_varstr(sig)
+      w.write_varstr(key_info.pubkey)
+      tx.inputs[i].script_sig = w.result()
+    end
+  end
+  return true
+end
+
+--- Compute virtual size of a transaction in vbytes.
+-- vsize = ceil((base_size * 3 + total_size) / 4)
+-- base_size  = serialization WITHOUT witness
+-- total_size = serialization WITH witness
+local function _compute_vsize(tx)
+  local base = #serialize.serialize_transaction(tx, false)
+  local total = #serialize.serialize_transaction(tx, true)
+  return math.ceil((base * 3 + total) / 4)
+end
+
+--- BIP-125 fee bump (a.k.a. bumpfee / psbtbumpfee in Core).
+-- Returns the rebuilt transaction and the fee accounting, or nil + errors.
+--
+-- @param orig_txid_hex string: hex txid (big-endian display form, as
+--                              returned by sendtoaddress) of the wallet tx
+--                              to bump.
+-- @param options table|nil: {
+--   fee_rate   = number  -- override target sat/vB
+--   sign       = boolean -- when false return the unsigned tx (for PSBT path)
+-- }
+-- @return transaction|nil  rebuilt tx (signed if options.sign ~= false)
+-- @return number|table     old_fee on success, errors-array on failure
+-- @return number|nil       new_fee on success
+-- @return table|nil        input_utxos {idx -> {value, script_pubkey, address}}
+--                          — exposed so the psbtbumpfee path can populate
+--                          witness_utxo on every PSBT input.
+function Wallet:bump_fee(orig_txid_hex, options)
+  options = options or {}
+  local errors = {}
+
+  -- ---- 0. Wallet unlocked + tx lookup -------------------------------------
+  if self.is_encrypted and self.is_locked then
+    errors[#errors + 1] = "Wallet is locked"
+    return nil, errors
+  end
+
+  local entry = self.transactions[orig_txid_hex]
+  if not entry then
+    errors[#errors + 1] = "Invalid or non-wallet transaction id"
+    return nil, errors
+  end
+  local orig = entry.tx
+
+  -- ---- 1. PreconditionChecks (feebumper.cpp:23) ---------------------------
+  if entry.height and entry.height > 0 then
+    errors[#errors + 1] = "Transaction has been mined, or is conflicted with a mined transaction"
+    return nil, errors
+  end
+  if entry.replaced_by then
+    errors[#errors + 1] = string.format(
+      "Cannot bump transaction %s which was already bumped by transaction %s",
+      orig_txid_hex, entry.replaced_by)
+    return nil, errors
+  end
+
+  -- BIP-125 rule 1: opt-in (any input sequence <= 0xFFFFFFFD).
+  local mempool_mod = require("lunarblock.mempool")
+  if not mempool_mod.signals_rbf(orig) then
+    errors[#errors + 1] = "Transaction is not BIP-125 replaceable"
+    return nil, errors
+  end
+
+  -- require_mine: every input must be ours (we need each input value).
+  local input_utxos = {}
+  for i, inp in ipairs(orig.inputs) do
+    local key = inp.prev_out.hash.bytes .. string.char(
+      bit.band(inp.prev_out.index, 0xFF),
+      bit.band(bit.rshift(inp.prev_out.index, 8), 0xFF),
+      bit.band(bit.rshift(inp.prev_out.index, 16), 0xFF),
+      bit.band(bit.rshift(inp.prev_out.index, 24), 0xFF)
+    )
+    -- The confirmed UTXO has been removed by scan_mempool once we spent it,
+    -- so look at both: spent-pending tells us it WAS ours and the value
+    -- lives on entry.tx itself. Easier: walk self.keys -> need value.
+    -- We stored the originating coin in self.utxos prior to send_transaction;
+    -- after scan_mempool it migrates to self.spent_pending. We don't keep the
+    -- value there. Use the wallet's keys + the orig tx's predecessor:
+    -- iterate confirmed/pending and fall back to chain_state lookup is
+    -- unavailable here, so the wallet must have witnessed the prev tx via
+    -- scan_utxos OR be the sender (the typical bumpfee path: we sent it,
+    -- so the original input UTXOs were in self.utxos and we recorded their
+    -- values at create_transaction time). We store input values on entry
+    -- to make this robust.
+    local v
+    local u = self.utxos[key] or self.pending_utxos[key]
+    if u then
+      v = u.value
+    elseif entry.input_values and entry.input_values[key] then
+      v = entry.input_values[key]
+    end
+    if not v then
+      errors[#errors + 1] = "Transaction contains inputs that don't belong to this wallet"
+      return nil, errors
+    end
+
+    -- Reconstruct the script_pubkey + address for signing. For an input we
+    -- spent from our wallet we have the address in `keys`. We need to know
+    -- which one — recover by classifying the prev outpoint's script_pubkey,
+    -- which we cached on send when available.
+    local script_pubkey, addr
+    if entry.input_scripts and entry.input_scripts[key] then
+      script_pubkey = entry.input_scripts[key]
+    elseif u then
+      script_pubkey = u.script_pubkey
+    end
+    if script_pubkey then
+      addr = self:_address_for_script(script_pubkey)
+    end
+    if not addr then
+      errors[#errors + 1] = "Transaction contains inputs that don't belong to this wallet"
+      return nil, errors
+    end
+    input_utxos[i] = {value = v, script_pubkey = script_pubkey, address = addr}
+  end
+
+  -- ---- 2. Locate the change output ----------------------------------------
+  --
+  -- Core's CreateRateBumpTransaction accepts an explicit `original_change_index`
+  -- but, in the common path, picks the first output whose scriptPubKey
+  -- decodes to one of our addresses. We mirror that here. If no change
+  -- output is present (a pure send-everything tx), bumpfee can't shrink
+  -- change to fund the bump and must fail with a clear message.
+  local change_index = nil
+  for i, out in ipairs(orig.outputs) do
+    local addr = self:_address_for_script(out.script_pubkey)
+    if addr then
+      change_index = i
+      break
+    end
+  end
+  if not change_index then
+    errors[#errors + 1] = "Transaction does not have a change output owned by this wallet"
+    return nil, errors
+  end
+
+  -- ---- 3. Compute target fee ---------------------------------------------
+  local old_fee = entry.fee
+  if not old_fee or old_fee <= 0 then
+    -- Recompute from inputs - outputs as a safety net.
+    local total_in = 0
+    for i = 1, #orig.inputs do total_in = total_in + input_utxos[i].value end
+    local total_out = 0
+    for _, o in ipairs(orig.outputs) do total_out = total_out + o.value end
+    old_fee = total_in - total_out
+  end
+
+  local orig_vsize = _compute_vsize(orig)
+  local new_fee
+  if options.fee_rate and options.fee_rate > 0 then
+    new_fee = math.ceil(orig_vsize * options.fee_rate)
+  else
+    -- Default: original fee + ceil(vsize * 1 sat/vB) — mirrors EstimateFeeRate
+    -- which adds wallet's WALLET_INCREMENTAL_RELAY_FEE (1 sat/vB) on top of
+    -- the original feerate, applied across the same vsize.
+    new_fee = old_fee + math.ceil(orig_vsize * 1)
+  end
+
+  -- BIP-125 Rule 3: new absolute fee must exceed old fee.
+  if new_fee <= old_fee then
+    errors[#errors + 1] = string.format(
+      "New fee (%d) must exceed old fee (%d)", new_fee, old_fee)
+    return nil, errors
+  end
+
+  -- ---- 4. Adjust change ---------------------------------------------------
+  local delta = new_fee - old_fee
+  local new_change = orig.outputs[change_index].value - delta
+  if new_change <= M.DUST_THRESHOLD then
+    errors[#errors + 1] = string.format(
+      "Change after fee bump (%d) would be dust (<= %d); insufficient funds",
+      new_change, M.DUST_THRESHOLD)
+    return nil, errors
+  end
+
+  -- ---- 5. Build replacement tx -------------------------------------------
+  local inputs = {}
+  for _, inp in ipairs(orig.inputs) do
+    -- Reuse sequence as-is (already <= 0xFFFFFFFD).
+    inputs[#inputs + 1] = types.txin(
+      types.outpoint(inp.prev_out.hash, inp.prev_out.index),
+      "",   -- to be replaced by re-sign
+      inp.sequence
+    )
+  end
+
+  local outputs = {}
+  for i, out in ipairs(orig.outputs) do
+    if i == change_index then
+      outputs[#outputs + 1] = types.txout(new_change, out.script_pubkey)
+    else
+      outputs[#outputs + 1] = types.txout(out.value, out.script_pubkey)
+    end
+  end
+
+  local new_tx = types.transaction(orig.version, inputs, outputs, orig.locktime)
+  new_tx.segwit = true
+
+  -- ---- 6. Sign (unless caller asked for unsigned, e.g. psbtbumpfee) ------
+  if options.sign ~= false then
+    local ok, err = self:_sign_inputs(new_tx, input_utxos)
+    if not ok then
+      errors[#errors + 1] = err
+      return nil, errors
+    end
+  end
+
+  return new_tx, old_fee, new_fee, input_utxos
 end
 
 --------------------------------------------------------------------------------
