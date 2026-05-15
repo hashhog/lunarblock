@@ -763,10 +763,38 @@ function M.parse_key_expression(key_str, network)
   return nil, "unrecognized key format: " .. key_part
 end
 
--- BIP32 child key derivation
+-- BIP-32 child key derivation (CKDpriv + CKDpub).
+--
+-- Per BIP-32 §"Private parent key -> private child key" and
+-- §"Public parent key -> public child key":
+--
+--   if hardened (i >= 2^31):
+--     I = HMAC-SHA512(c_par, 0x00 || ser256(k_par) || ser32(i))
+--   else:
+--     I = HMAC-SHA512(c_par, ser_P(K_par) || ser32(i))
+--   IL = I[0:32]; IR = I[32:64]
+--   CKDpriv: k_i = (parse256(IL) + k_par) mod n
+--   CKDpub:  K_i = parse256(IL) * G + K_par
+--   c_i = IR
+--
+-- If parse256(IL) >= n OR the resulting key/point is invalid (k_i == 0
+-- or K_i == point at infinity), the derivation is "invalid" and the
+-- caller MUST advance to the next index. libsecp256k1's
+-- ec_seckey_tweak_add / ec_pubkey_tweak_add already return 0 on these
+-- conditions; we surface that as an error so the caller can retry.
+--
+-- Reference: bitcoin-core/src/key.cpp::CKey::Derive (priv) and
+-- src/pubkey.cpp::CPubKey::Derive (pub).
 function M.derive_child(parent_pubkey, parent_chaincode, child_index, parent_privkey)
   local crypto = require("lunarblock.crypto")
   local is_hardened = child_index >= 0x80000000
+
+  local index_bytes = string.char(
+    bit.band(bit.rshift(child_index, 24), 0xFF),
+    bit.band(bit.rshift(child_index, 16), 0xFF),
+    bit.band(bit.rshift(child_index, 8), 0xFF),
+    bit.band(child_index, 0xFF)
+  )
 
   local data
   if is_hardened then
@@ -774,42 +802,44 @@ function M.derive_child(parent_pubkey, parent_chaincode, child_index, parent_pri
       return nil, nil, "hardened derivation requires private key"
     end
     -- Hardened: HMAC-SHA512(chaincode, 0x00 || privkey || index)
-    data = "\x00" .. parent_privkey .. string.char(
-      bit.band(bit.rshift(child_index, 24), 0xFF),
-      bit.band(bit.rshift(child_index, 16), 0xFF),
-      bit.band(bit.rshift(child_index, 8), 0xFF),
-      bit.band(child_index, 0xFF)
-    )
+    data = "\x00" .. parent_privkey .. index_bytes
   else
-    -- Normal: HMAC-SHA512(chaincode, pubkey || index)
-    data = parent_pubkey .. string.char(
-      bit.band(bit.rshift(child_index, 24), 0xFF),
-      bit.band(bit.rshift(child_index, 16), 0xFF),
-      bit.band(bit.rshift(child_index, 8), 0xFF),
-      bit.band(child_index, 0xFF)
-    )
+    -- Normal: HMAC-SHA512(chaincode, ser_P(K_par) || index)
+    -- ser_P expects the compressed 33-byte serialization. If the caller
+    -- only has a private key, derive the matching compressed pubkey first.
+    local pub_for_hmac = parent_pubkey
+    if (not pub_for_hmac) and parent_privkey then
+      pub_for_hmac = crypto.pubkey_from_privkey(parent_privkey, true)
+    end
+    if not pub_for_hmac then
+      return nil, nil, "normal derivation requires parent pubkey or privkey"
+    end
+    data = pub_for_hmac .. index_bytes
   end
 
   local I = crypto.hmac_sha512(parent_chaincode, data)
   local IL = I:sub(1, 32)
   local IR = I:sub(33, 64)
 
-  -- For proper implementation, we'd need secp256k1 point addition
-  -- For now, we'll use a simplified approach that works for non-hardened derivation
-  -- In production, this needs proper EC point arithmetic
-
   if parent_privkey then
-    -- Private key derivation: child_priv = (IL + parent_priv) mod n
-    -- This is a simplification - proper implementation needs big integer mod
-    -- For now, we'll just XOR (this is INCORRECT for real use!)
-    -- TODO: Implement proper scalar addition mod secp256k1 order
-    local child_privkey = IL  -- Placeholder - needs proper implementation
+    -- CKDpriv: child_priv = (parse256(IL) + parent_priv) mod n.
+    -- libsecp256k1 enforces parse256(IL) < n and child_priv != 0; it
+    -- returns 0 (signalling "invalid derivation") otherwise. Caller
+    -- should advance to (child_index + 1) on this error per BIP-32.
+    local child_privkey, err = crypto.ec_seckey_tweak_add(parent_privkey, IL)
+    if not child_privkey then
+      return nil, nil, err or "invalid CKDpriv derivation"
+    end
     local child_pubkey = crypto.pubkey_from_privkey(child_privkey, true)
     return child_pubkey, IR, nil, child_privkey
   else
-    -- Public key derivation - needs EC point addition
-    -- This is a placeholder - proper implementation needs secp256k1 bindings
-    return nil, nil, "public key derivation not yet implemented"
+    -- CKDpub: child_pub = parent_pub + parse256(IL)*G  (non-hardened only;
+    -- the is_hardened branch above already errored if privkey is nil).
+    local child_pubkey, err = crypto.ec_pubkey_tweak_add(parent_pubkey, IL, true)
+    if not child_pubkey then
+      return nil, nil, err or "invalid CKDpub derivation"
+    end
+    return child_pubkey, IR, nil, nil
   end
 end
 
