@@ -6913,81 +6913,170 @@ function RPCServer:register_methods()
   end
 
   --- testmempoolaccept: Dry-run mempool validation for raw transactions.
-  -- @param rawtxs table: Array of hex-encoded raw transactions
+  -- Mirrors Bitcoin Core's testmempoolaccept RPC (src/rpc/mempool.cpp).
+  -- For single-tx submissions, routes through accept_to_memory_pool with
+  -- test_accept=true so the full validation pipeline (script checks, dust
+  -- policy, TRUC, fee-rate) runs without committing to the mempool.
+  -- For multi-tx submissions (packages), routes through accept_package with
+  -- test_accept=true.
+  --
+  -- Response fields (per-tx):
+  --   txid            string   hex txid
+  --   wtxid           string   hex wtxid (differs from txid for segwit txs)
+  --   allowed         boolean
+  --   vsize           number   (present when allowed)
+  --   fees            table    {base, effective-feerate, effective-includes}
+  --   reject-reason   string   (present when not allowed)
+  --   package-error   string   (present when a package-level check fails)
+  --
+  -- @param params[1] rawtxs table: Array of hex-encoded raw transactions
+  -- @param params[2] maxfeerate number: Optional max fee rate in BTC/kvB
   self.methods["testmempoolaccept"] = function(rpc, params)
+    -- params[1]: rawtxs array.  params[2]: optional maxfeerate (BTC/kvB).
+    -- Per-tx response includes effective-feerate and effective-includes in fees.
     local rawtxs = params[1]
+    local maxfeerate_btc_per_kvb = (params[2] ~= nil and params[2] ~= cjson.null)
+                                   and tonumber(params[2]) or nil
     if type(rawtxs) ~= "table" then
       error({code = M.ERROR.INVALID_PARAMS, message = "rawtxs must be an array"})
+    end
+    if params[2] ~= nil and params[2] ~= cjson.null and not maxfeerate_btc_per_kvb then
+      error({code = M.ERROR.INVALID_PARAMS, message = "maxfeerate must be a number"})
     end
 
     if not rpc.mempool then
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
     end
 
+    -- MAX_PACKAGE_COUNT guard (Bitcoin Core: RPCTypeCheck then CheckPackageLimits).
+    local mempool_mod = require("lunarblock.mempool")
+    if #rawtxs > mempool_mod.MAX_PACKAGE_COUNT then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = string.format("Too many transactions: %d > %d",
+          #rawtxs, mempool_mod.MAX_PACKAGE_COUNT)})
+    end
+
+    -- Decode all raw transactions first.  Report decode failures inline.
+    local txs = {}
     local results = {}
-    for _, hex in ipairs(rawtxs) do
-      local entry = {txid = "", allowed = false}
+    local has_decode_failure = false
+
+    for i, hex in ipairs(rawtxs) do
       local ok_d, tx = pcall(function()
         local raw = M.hex_decode(hex)
         return serialize.deserialize_transaction(raw)
       end)
       if not ok_d or not tx then
-        entry["reject-reason"] = "decode-failed"
-        results[#results + 1] = entry
+        local txid_str = ""
+        txs[i] = false  -- sentinel: decode failed
+        results[i] = {txid = txid_str, wtxid = txid_str, allowed = false,
+                      ["reject-reason"] = "decode-failed"}
+        has_decode_failure = true
       else
-        local txid = validation.compute_txid(tx)
-        entry.txid = types.hash256_hex(txid)
-        -- Check basic structure
-        local ok_chk, chk_ok, is_coinbase = pcall(validation.check_transaction, tx)
-        if not ok_chk or not chk_ok then
-          entry["reject-reason"] = "invalid-structure"
-        elseif is_coinbase then
-          entry["reject-reason"] = "coinbase"
-        elseif rpc.mempool.entries[entry.txid] then
-          entry["reject-reason"] = "txn-already-in-mempool"
-        else
-          -- Dry-run: attempt acceptance and then roll back
-          -- For simplicity, just check if accept_transaction would succeed
-          -- without actually modifying the mempool.
-          -- We use a lightweight check here.
-          local weight = validation.get_tx_weight(tx)
-          local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
-          entry.vsize = vsize
-          entry.allowed = true
-          -- Try to compute fees
-          local input_total = 0
-          local missing = false
-          for _, inp in ipairs(tx.inputs) do
-            local mempool_mod = require("lunarblock.mempool")
-            local outpoint_key = mempool_mod.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
-            local utxo = rpc.chain_state and rpc.chain_state.coin_view and
-                         rpc.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
-            if utxo then
-              input_total = input_total + utxo.value
-            else
-              missing = true
-            end
-          end
-          if missing then
-            entry.allowed = false
-            entry["reject-reason"] = "missing-inputs"
-          else
-            local output_total = 0
-            for _, out in ipairs(tx.outputs) do
-              output_total = output_total + out.value
-            end
-            local fee = input_total - output_total
-            if fee < 0 then
-              entry.allowed = false
-              entry["reject-reason"] = "outputs-exceed-inputs"
-            else
-              entry.fees = {base = fee / 1e8}
-            end
-          end
-        end
-        results[#results + 1] = entry
+        txs[i] = tx
+        local txid  = validation.compute_txid(tx)
+        local wtxid = validation.compute_wtxid(tx)
+        results[i] = {
+          txid  = types.hash256_hex(txid),
+          wtxid = types.hash256_hex(wtxid),
+          allowed = false,
+        }
       end
     end
+
+    -- If any decode failed, return early (can't run package validation).
+    if has_decode_failure then
+      return results
+    end
+
+    -- Single-tx path: call accept_to_memory_pool(tx, test_accept=true).
+    -- This runs the full pipeline without committing.
+    if #txs == 1 then
+      local tx = txs[1]
+      local res = results[1]
+      -- Check already-in-mempool (Core returns specific error here).
+      if rpc.mempool.entries[res.txid] then
+        res["reject-reason"] = "txn-already-in-mempool"
+        return results
+      end
+      local atmp = rpc.mempool:accept_to_memory_pool(tx, true)
+      if atmp.accepted then
+        local fee_btc = atmp.fee / consensus.COIN
+        local vsize = atmp.vsize
+        local feerate_btc_per_kvb = (vsize > 0) and (fee_btc / vsize * 1000) or 0
+        -- maxfeerate check (BTC/kvB)
+        if maxfeerate_btc_per_kvb and feerate_btc_per_kvb > maxfeerate_btc_per_kvb then
+          res.allowed = false
+          res["reject-reason"] = "max-fee-exceeded"
+        else
+          res.allowed = true
+          res.vsize = vsize
+          res.fees = {
+            base = fee_btc,
+            ["effective-feerate"] = feerate_btc_per_kvb,
+            ["effective-includes"] = {res.txid},
+          }
+        end
+      else
+        res["reject-reason"] = atmp.reject_reason or "unknown"
+      end
+      return results
+    end
+
+    -- Multi-tx (package) path: route through accept_package(txns, test_accept=true).
+    -- Collect decoded txs; decode failures already handled above.
+    local tx_list = {}
+    for i = 1, #txs do
+      tx_list[i] = txs[i]
+    end
+
+    -- Empty package: return empty results without calling accept_package.
+    if #tx_list == 0 then
+      return results
+    end
+
+    local pkg_ok, pkg_result = rpc.mempool:accept_package(tx_list, true)
+    if not pkg_ok then
+      -- Package-level failure: mark all txs with package-error.
+      for i = 1, #results do
+        results[i]["package-error"] = tostring(pkg_result)
+        results[i].allowed = false
+      end
+      return results
+    end
+
+    -- Package accepted (dry-run): populate per-tx results.
+    local pkg_total_fees = pkg_result.total_fees or 0
+    local pkg_total_vsize = pkg_result.total_vsize or 0
+    local pkg_feerate = (pkg_total_vsize > 0) and
+                        ((pkg_total_fees / consensus.COIN) / pkg_total_vsize * 1000) or 0
+
+    -- Build a txid→index map for effective-includes.
+    local txid_list = {}
+    for i, tx in ipairs(tx_list) do
+      txid_list[i] = results[i].txid
+    end
+
+    for i, tx in ipairs(tx_list) do
+      local res = results[i]
+      local fee_btc = (pkg_result.fees and pkg_result.fees[i] or 0) / consensus.COIN
+      local weight = validation.get_tx_weight(tx)
+      local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+      -- maxfeerate check uses package fee rate.
+      if maxfeerate_btc_per_kvb and pkg_feerate > maxfeerate_btc_per_kvb then
+        res.allowed = false
+        res["reject-reason"] = "max-fee-exceeded"
+      else
+        res.allowed = true
+        res.vsize = vsize
+        res.fees = {
+          base = fee_btc,
+          ["effective-feerate"] = pkg_feerate,
+          ["effective-includes"] = txid_list,
+        }
+      end
+    end
+
     return results
   end
 

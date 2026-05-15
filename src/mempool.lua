@@ -2469,8 +2469,10 @@ end
 --- Accept a package of transactions into the mempool.
 -- Implements CPFP: a child with high fee can pay for low-fee parents.
 -- @param txns table: Array of transactions (topologically sorted, parents first)
+-- @param test_accept boolean: When true, run full validation but skip mempool insertion
+--   (mirrors Core's m_test_accept — no state is mutated when this flag is set).
 -- @return boolean, table|string: success, {txid_hexes, package_fee_rate} or error message
-function Mempool:accept_package(txns)
+function Mempool:accept_package(txns, test_accept)
   -- 1. Well-formed package check
   local ok, err = M.is_well_formed_package(txns)
   if not ok then
@@ -2673,35 +2675,40 @@ function Mempool:accept_package(txns)
       end
     end
 
-    -- Create mempool entry
+    -- Create mempool entry (always built for vsize/fee tracking; only inserted
+    -- into self.entries when test_accept is false).
     local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time())
     entry.ancestor_count = ancestor_count - 1
     entry.ancestor_size = ancestor_size - vsize
     entry.ancestor_fees = ancestor_fees - fee
     entry.ancestors = ancestors
-    self.entries[txid_hex] = entry
-    self.tx_count = self.tx_count + 1
-    self.total_size = self.total_size + entry.size
 
-    -- Track outpoint spending and parent relationships
-    for _, inp in ipairs(tx.inputs) do
-      local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
-      self.outpoint_to_tx[outpoint_key] = txid_hex
+    if not test_accept then
+      -- Real insertion: mutate mempool state.
+      self.entries[txid_hex] = entry
+      self.tx_count = self.tx_count + 1
+      self.total_size = self.total_size + entry.size
 
-      local prev_hex = types.hash256_hex(inp.prev_out.hash)
-      if direct_parents[prev_hex] then
-        entry.spends_from[outpoint_key] = prev_hex
+      -- Track outpoint spending and parent relationships
+      for _, inp in ipairs(tx.inputs) do
+        local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+        self.outpoint_to_tx[outpoint_key] = txid_hex
+
+        local prev_hex = types.hash256_hex(inp.prev_out.hash)
+        if direct_parents[prev_hex] then
+          entry.spends_from[outpoint_key] = prev_hex
+        end
       end
-    end
 
-    -- Update all ancestors with descendant info
-    for anc_hex in pairs(ancestors) do
-      local anc_entry = self.entries[anc_hex]
-      if anc_entry then
-        anc_entry.descendants[txid_hex] = true
-        anc_entry.descendant_count = anc_entry.descendant_count + 1
-        anc_entry.descendant_size = anc_entry.descendant_size + vsize
-        anc_entry.descendant_fees = anc_entry.descendant_fees + fee
+      -- Update all ancestors with descendant info
+      for anc_hex in pairs(ancestors) do
+        local anc_entry = self.entries[anc_hex]
+        if anc_entry then
+          anc_entry.descendants[txid_hex] = true
+          anc_entry.descendant_count = anc_entry.descendant_count + 1
+          anc_entry.descendant_size = anc_entry.descendant_size + vsize
+          anc_entry.descendant_fees = anc_entry.descendant_fees + fee
+        end
       end
     end
 
@@ -2709,8 +2716,10 @@ function Mempool:accept_package(txns)
     ::continue::
   end
 
-  -- 8. Trim mempool if needed
-  self:trim()
+  -- 8. Trim mempool if needed (skip when test_accept — no state was mutated)
+  if not test_accept then
+    self:trim()
+  end
 
   return true, {
     txids = accepted_txids,
