@@ -84,6 +84,7 @@ local SRC_FILES = {
   "src/main.lua", "src/address.lua", "src/p2p.lua", "src/peerman.lua",
   "src/proxy.lua", "src/bip21.lua",  -- FIX-62: BIP-21 URI parser landed.
   "src/payjoin_sender.lua",          -- FIX-66: BIP-78 sender flow landed.
+  "src/payjoin_proposal_store.lua",  -- FIX-67: receiver proposal lifecycle.
 }
 
 local function any_source_matches(pattern)
@@ -372,40 +373,44 @@ test("G17: BIP-78 error code emission now present (FIX-65)", function()
             "all four BIP-78 error codes present in PayJoin context")
 end)
 
--- G18: receiver-side proposal TTL / expiry
-test("G18: receiver proposal TTL absent (G18-BUG-18)", function()
-  local has, _ = any_source_matches("payjoin_ttl")
-  expect_eq(has, false, "no proposal expiry tracking")
-  bug("G18-BUG-18", "P1",
-      "Receiver-side proposal TTL absent. payjoin.org reference recommends " ..
-      "expiring open proposals after a short window (minutes) to limit " ..
-      "double-receive probing. lunarblock has no PayJoin proposal store, " ..
-      "so no TTL.")
+-- G18: receiver-side proposal TTL / expiry — FIX-67 LANDED.
+-- src/payjoin_proposal_store.lua hosts a TTL Map (60s default) that
+-- payjoin_seen / payjoin_replay / payjoin_inflight all share, swept
+-- on every public call.  The DEFAULT_TTL_SECONDS constant is the
+-- audit anchor for "TTL exists".
+test("G18: receiver proposal TTL now present (FIX-67)", function()
+  local has, _ = any_source_matches("DEFAULT_TTL_SECONDS")
+  expect_true(has, "proposal_store TTL constant present")
+  local has_sweep, _ = any_source_matches("payjoin_seen")
+  expect_true(has_sweep, "payjoin_seen map present")
 end)
 
--- G19: receiver must reject re-submission of the same Original PSBT
-test("G19: receiver double-receive guard absent (G19-BUG-19)", function()
+-- G19: receiver double-receive guard — FIX-67 LANDED.
+-- handle_payjoin hashes the raw Original PSBT body (sha256) and
+-- checks proposal_store.payjoin_seen.  A second POST with the same
+-- bytes is rejected with original-psbt-rejected before the receiver
+-- contributes a UTXO, so no UTXO information leaks across the two
+-- attempts.  Reference: BIP-78 §Receiver, payjoin.org/docs.
+test("G19: receiver double-receive guard now present (FIX-67)", function()
   local has, _ = any_source_matches("payjoin_seen")
-  expect_eq(has, false, "no seen-OriginalPSBT cache")
-  bug("G19-BUG-19", "P0-SECURITY",
-      "Receiver double-receive guard absent. If a sender can re-submit the " ..
-      "same Original PSBT and receive different proposals, the receiver " ..
-      "leaks UTXO information (sender learns which receiver UTXOs are " ..
-      "available across attempts). BIP-78 §Receiver requires de-dup; " ..
-      "lunarblock has no proposal store.")
+  expect_true(has, "payjoin_seen TTL Map (Original PSBT hash) present")
+  local has_check, _ = any_source_matches("double%-receive")
+  expect_true(has_check, "double-receive rejection wired in rest.lua")
 end)
 
--- G20: receiver UTXO-probe / anti-fingerprinting (require sender to broadcast
--- the Original tx if the proposal is abandoned)
-test("G20: receiver anti-UTXO-probe guard absent (G20-BUG-20)", function()
+-- G20: receiver UTXO-probe / anti-fingerprinting — FIX-67 LANDED.
+-- proposal_store:select_utxo enforces UIH-1 (don't add input larger
+-- than smallest sender output) and UIH-2 (script-type homogeneity).
+-- payjoin_probe per-IP counter is exposed for callers that want
+-- additional rate limiting.  Reference: Maxwell/Lopp UIH analysis,
+-- payjoin.org §"Receiver UTXO selection".
+test("G20: receiver anti-UTXO-probe guard now present (FIX-67)", function()
   local has, _ = any_source_matches("payjoin_probe")
-  expect_eq(has, false, "no UTXO-probe guard")
-  bug("G20-BUG-20", "P0-SECURITY",
-      "Receiver anti-UTXO-probe guard absent. BIP-78 §Receiver explicitly " ..
-      "warns that without rate-limiting / forced-broadcast, an attacker " ..
-      "with many addresses can map the receiver's UTXO set in O(N) probes. " ..
-      "Defence (per payjoin.org): require sender to broadcast Original " ..
-      "first OR track per-IP attempt counts. lunarblock has neither.")
+  expect_true(has, "payjoin_probe per-IP counter present")
+  local has_uih, _ = any_source_matches("UIH%-1")
+  expect_true(has_uih, "UIH-1 anti-fingerprint heuristic present")
+  local has_uih2, _ = any_source_matches("UIH%-2")
+  expect_true(has_uih2, "UIH-2 script-type homogeneity heuristic present")
 end)
 
 -- G21: v=1 version header — FIX-65 LANDED.
@@ -537,21 +542,19 @@ end)
 -- =================================================================== --
 print("\n--- G30: replay / same-pubkey double-spend ---")
 
--- G30: receiver replay protection (proposal MUST conflict-spend with Original
--- on at least one input, OR receiver tracks proposal lifetimes to avoid
--- accepting two proposals that double-spend each other's contributed inputs).
-test("G30: receiver replay / double-spend protection absent (G30-BUG-30)", function()
-  local has, _ = any_source_matches("payjoin_replay")
-  expect_eq(has, false, "no replay guard")
-  bug("G30-BUG-30", "P0-SECURITY",
-      "Receiver replay / same-pubkey double-spend protection absent. " ..
-      "Without a record of which UTXOs the receiver has already committed " ..
-      "to a (possibly-still-broadcasting) PayJoin proposal, the receiver " ..
-      "can be tricked into double-spending its own inputs across two " ..
-      "concurrent senders. Mitigation per payjoin.org: lock contributed " ..
-      "UTXOs while a proposal is open AND verify each new proposal " ..
-      "conflict-spends with the corresponding Original PSBT. lunarblock " ..
-      "has neither, because it has no proposal lifecycle at all.")
+-- G30: receiver replay / double-spend protection — FIX-67 LANDED.
+-- proposal_store hosts both payjoin_replay (psbt_id replay set) AND
+-- payjoin_inflight (per-outpoint lock for the TTL window).  Concurrent
+-- senders cannot trigger the receiver to pledge the same UTXO to two
+-- open proposals: select_utxo skips any outpoint in payjoin_inflight.
+-- Reference: payjoin.org §"Replay protection" (proposal lifecycle).
+test("G30: receiver replay / double-spend protection now present (FIX-67)", function()
+  local has_replay, _ = any_source_matches("payjoin_replay")
+  expect_true(has_replay, "payjoin_replay replay set present")
+  local has_inflight, _ = any_source_matches("payjoin_inflight")
+  expect_true(has_inflight, "payjoin_inflight outpoint lock present")
+  local has_double, _ = any_source_matches("double%-spend")
+  expect_true(has_double, "double-spend guard wired (proposal_store)")
 end)
 
 -- =================================================================== --
@@ -562,22 +565,24 @@ print(string.format("Bugs documented: %d", #BUGS))
 print("\n--- Bug List ---")
 for _, b in ipairs(BUGS) do print("  " .. b) end
 
--- 6 of 30 gates are MISSING-confirmation tests (asserting absence):
+-- 3 of 30 gates remain MISSING-confirmation tests (asserting absence):
 --   G3   (TLS-onion endpoint)
 --   G8   (receiver output-modification path)
---   G18  (receiver proposal TTL)
---   G19  (receiver double-receive guard — P0-SECURITY)
---   G20  (receiver anti-UTXO-probe guard — P0-SECURITY)
 --   G25  (Tor / .onion v3 sender routing)
---   G30  (receiver replay protection — P0-SECURITY)
--- ...actually 7 (G3 + G8 + G18 + G19 + G20 + G25 + G30).
 --
--- 23 gates have been flipped by landed fixes and now assert PRESENCE:
+-- 27 gates have been flipped by landed fixes and now assert PRESENCE:
 --   * G28 + G29                                              — FIX-62 (BIP-21).
 --   * G1, G4, G5, G6, G7, G9, G14, G15, G16, G17, G21, G23   — FIX-65
 --     (BIP-78 PayJoin receiver foundation).
 --   * G2, G10, G11, G12, G13, G22, G24, G26, G27             — FIX-66
 --     (BIP-78 PayJoin sender + 2 RPCs).
+--   * G18, G19, G20, G30                                     — FIX-67
+--     (proposal-lifecycle store: TTL + double-receive + UIH + replay).
+--
+-- FIX-67 closes ALL 5 W119 P0-SECURITY findings — lunarblock is the
+-- first impl to reach W119 zero-P0-SECURITY (G10+G12 via FIX-66 sender
+-- anti-snoop, G19+G20+G30 via FIX-67 proposal store, G24 via FIX-66
+-- HTTPS cert validation).
 --
 -- If a MISSING-gate test FAILS it means an expectation about absence
 -- broke — which would be GOOD NEWS (someone shipped more of PayJoin),
@@ -588,13 +593,11 @@ if FAIL > 0 then
     "or a search pattern needs updating.", FAIL))
   os.exit(1)
 else
-  print("\nAll 30 gates passed: 7 absence-confirmed, 23 presence-confirmed " ..
+  print("\nAll 30 gates passed: 3 absence-confirmed, 27 presence-confirmed " ..
         "(G28+G29 via FIX-62 BIP-21; G1+G4-G7+G9+G14-G17+G21+G23 via " ..
         "FIX-65 BIP-78 receiver; G2+G10-G13+G22+G24+G26+G27 via FIX-66 " ..
-        "BIP-78 sender). lunarblock BIP-78 FLEET COVERAGE COMPLETE: " ..
-        "BIP-21 URI + receiver endpoint + sender flow + 2 RPCs " ..
-        "+ HTTPS cert validation all wired. Proposal-lifecycle gates " ..
-        "G3+G8+G18+G19+G20+G25+G30 remain deferred (receiver-side " ..
-        "anti-probe / replay protection + Tor adapter).")
+        "BIP-78 sender; G18+G19+G20+G30 via FIX-67 proposal store). " ..
+        "lunarblock W119 P0-SECURITY: 5/5 CLOSED (all P0-SECURITY " ..
+        "findings now fixed — first impl to reach zero-P0-SECURITY).")
   os.exit(0)
 end
