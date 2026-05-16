@@ -5650,6 +5650,169 @@ function RPCServer:register_methods()
     }
   end
 
+  --------------------------------------------------------------------------
+  -- BIP-78 PayJoin RPCs (FIX-66 — closes W119 G26 + G27).
+  --
+  -- These are the operator-facing surface for PayJoin.  The actual
+  -- receiver endpoint lives in src/rest.lua handle_payjoin (FIX-65);
+  -- the sender flow lives in src/payjoin_sender.lua (FIX-66).  Both
+  -- RPCs follow the canonical btcpayserver/payjoin and payjoin-cli
+  -- command shapes.
+  --------------------------------------------------------------------------
+
+  --- getpayjoinrequest: Generate a BIP-21 URI advertising a PayJoin
+  --  receiver endpoint.
+  --
+  --  @param params[1] amount_btc  number  Amount to request (BTC)
+  --  @param params[2] options     table   {
+  --     endpoint   string  base URL of the receiver endpoint
+  --                        (defaults to "https://<host>/payjoin",
+  --                        host taken from rpc.payjoin_host or
+  --                        "localhost").  MUST be reachable by the
+  --                        sender — operator's responsibility.
+  --     label      string  BIP-21 label= parameter
+  --     message    string  BIP-21 message= parameter
+  --     pjos       string  "0" or "1" (BIP-21 pjos= — output substitution
+  --                        opt-out by the receiver)
+  --   }
+  --  @return  {address=<bech32>, uri=<bitcoin:...?amount=&pj=&pjos=>}
+  self.methods["getpayjoinrequest"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+
+    local amount_btc = params[1] or params.amount
+    if amount_btc == nil then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "amount (BTC) is required"})
+    end
+    local amount_num = tonumber(amount_btc)
+    if not amount_num or amount_num <= 0 then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "amount must be a positive number"})
+    end
+
+    local opts = params[2] or params.options or {}
+
+    -- Fetch a fresh receiving address.  The wallet handles HD
+    -- derivation; we don't pre-allocate.
+    local addr = wallet:get_new_address()
+    if not addr then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "wallet failed to derive new address"})
+    end
+
+    -- Build the pj= endpoint URL.  Operators typically expose the
+    -- REST server on https://<their-host>/payjoin.  We honour any
+    -- explicit override.
+    local endpoint = opts.endpoint
+    if not endpoint or endpoint == "" then
+      local host = rpc.payjoin_host or "localhost"
+      endpoint = "https://" .. host .. "/payjoin"
+    end
+
+    -- Quote-protect the endpoint for the URI query value.  We only
+    -- need to encode ':' '/' '?' '#' '&' '=' '+' '%' ' '.
+    local function uri_quote(s)
+      return (s:gsub("[^A-Za-z0-9%-_.~]", function(c)
+        return string.format("%%%02X", string.byte(c))
+      end))
+    end
+
+    local query = {
+      "amount=" .. string.format("%.8f", amount_num):gsub("0+$", "")
+                                                   :gsub("%.$", ""),
+      "pj="     .. uri_quote(endpoint),
+    }
+    if opts.label and opts.label ~= "" then
+      query[#query + 1] = "label=" .. uri_quote(tostring(opts.label))
+    end
+    if opts.message and opts.message ~= "" then
+      query[#query + 1] = "message=" .. uri_quote(tostring(opts.message))
+    end
+    if opts.pjos ~= nil then
+      query[#query + 1] = "pjos=" .. tostring(opts.pjos)
+    end
+
+    local uri = "bitcoin:" .. addr .. "?" .. table.concat(query, "&")
+
+    return {
+      address  = addr,
+      uri      = uri,
+      endpoint = endpoint,
+    }
+  end
+
+  --- sendpayjoinrequest: Execute the sender side of a BIP-78 PayJoin
+  --  handshake against the given BIP-21 URI.
+  --
+  --  Flow (delegates to lunarblock.payjoin_sender.send_payjoin_request):
+  --    1. Parse the URI (BIP-21).  Reject if no pj= parameter.
+  --    2. Build + sign the Original transaction.
+  --    3. POST the Original PSBT to pj= over HTTPS (cert-validated)
+  --       or Tor (if .onion).
+  --    4. Run six anti-snoop validators (G10-G15).
+  --    5. Re-sign sender inputs in the proposal (single-pipeline via
+  --       Wallet:_sign_inputs).
+  --    6. Broadcast.
+  --    7. On ANY failure, fall back to broadcasting the Original (G22).
+  --
+  --  @param params[1] uri   string  BIP-21 URI with pj=
+  --  @param params[2] options  table  {
+  --     fee_rate                       number   sat/vB
+  --     conf_target                    number
+  --     maxadditionalfeecontribution   number   sats
+  --     additionalfeeoutputindex       number   0-based
+  --     disableoutputsubstitution      boolean
+  --     minfeerate                     number   sat/vB
+  --   }
+  --  @return  {txid=<hex>, status="payjoin"|"fallback",
+  --            error=<string|nil>}
+  self.methods["sendpayjoinrequest"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+    if wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+
+    local uri = params[1] or params.uri
+    if type(uri) ~= "string" or #uri == 0 then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "uri (BIP-21 string) is required"})
+    end
+
+    local opts = params[2] or params.options or {}
+
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+    end
+    if rpc.mempool then
+      wallet:set_mempool(rpc.mempool)
+    end
+
+    local network_name = (rpc.network and rpc.network.name) or "mainnet"
+    opts.network = opts.network or network_name
+
+    local payjoin_sender = require("lunarblock.payjoin_sender")
+    local txid_hex, status, err = payjoin_sender.send_payjoin_request(
+      wallet, rpc.mempool, rpc.peer_manager, uri, nil, opts)
+
+    if not txid_hex then
+      local emsg = (err and err.message) or "PayJoin failed"
+      local ecode = (err and err.code) or "payjoin-failed"
+      error({code = M.ERROR.WALLET_ERROR,
+             message = ecode .. ": " .. emsg})
+    end
+    return {
+      txid   = txid_hex,
+      status = status,
+      error  = err and (err.code .. ": " .. err.message) or cjson.null,
+    }
+  end
+
   --- walletpassphrase: Unlock wallet with passphrase.
   -- @param passphrase string: Wallet passphrase
   -- @param timeout number: Seconds to keep unlocked (ignored, stays unlocked)
