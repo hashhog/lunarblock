@@ -1654,39 +1654,66 @@ end
 -- @param tx transaction
 -- @param input_utxos table: tx.inputs index (1-based) -> {value, script_pubkey, address}
 -- @return boolean ok, string|nil err
-function Wallet:_sign_inputs(tx, input_utxos)
-  for i, _ in ipairs(tx.inputs) do
-    local utxo = input_utxos[i]
-    if not utxo then
-      return false, "Missing UTXO for input " .. tostring(i - 1)
+-- @param tx           transaction: tx with inputs to sign
+-- @param input_utxos  table: i (1-based) -> {value, script_pubkey, address}
+-- @param indices      table|nil: optional 1-based-index set to restrict
+--                     signing to a subset.  When nil, every input in `tx`
+--                     is signed (legacy behaviour for create_transaction +
+--                     bump_fee).  When non-nil only the listed indices are
+--                     signed and the remaining inputs are left untouched
+--                     — used by BIP-78 PayJoin receiver (FIX-65), where
+--                     the sender's inputs MUST NOT be touched and the
+--                     receiver only contributes its own added input(s).
+function Wallet:_sign_inputs(tx, input_utxos, indices)
+  local should_sign
+  if indices then
+    -- Build a 1-based index lookup table.  Accept either array form
+    -- {3, 5} or set form {[3]=true, [5]=true}; canonicalise to set.
+    local set = {}
+    for k, v in pairs(indices) do
+      if type(k) == "number" and v ~= false then
+        if v == true then set[k] = true else set[v] = true end
+      end
     end
-    local key_info = self.keys[utxo.address]
-    if not key_info then
-      return false, "No key for address: " .. tostring(utxo.address)
-    end
-    if not key_info.privkey then
-      return false, "Private key not available (wallet locked?)"
-    end
+    should_sign = function(i) return set[i] == true end
+  else
+    should_sign = function() return true end
+  end
 
-    if key_info.type == "p2wpkh" then
-      local pkh = crypto.hash160(key_info.pubkey)
-      local script_code = script.make_p2pkh_script(pkh)
-      local sighash = validation.signature_hash_segwit_v0(
-        tx, i - 1, script_code, utxo.value, consensus.SIGHASH.ALL
-      )
-      local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
-      sig = sig .. string.char(consensus.SIGHASH.ALL)
-      tx.inputs[i].witness = {sig, key_info.pubkey}
-    else
-      local sighash = validation.signature_hash_legacy(
-        tx, i - 1, utxo.script_pubkey, consensus.SIGHASH.ALL
-      )
-      local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
-      sig = sig .. string.char(consensus.SIGHASH.ALL)
-      local w = serialize.buffer_writer()
-      w.write_varstr(sig)
-      w.write_varstr(key_info.pubkey)
-      tx.inputs[i].script_sig = w.result()
+  for i, _ in ipairs(tx.inputs) do
+    if should_sign(i) then
+      local utxo = input_utxos[i]
+      if not utxo then
+        return false, "Missing UTXO for input " .. tostring(i - 1)
+      end
+      local key_info = self.keys[utxo.address]
+      if not key_info then
+        return false, "No key for address: " .. tostring(utxo.address)
+      end
+      if not key_info.privkey then
+        return false, "Private key not available (wallet locked?)"
+      end
+
+      if key_info.type == "p2wpkh" then
+        local pkh = crypto.hash160(key_info.pubkey)
+        local script_code = script.make_p2pkh_script(pkh)
+        local sighash = validation.signature_hash_segwit_v0(
+          tx, i - 1, script_code, utxo.value, consensus.SIGHASH.ALL
+        )
+        local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
+        sig = sig .. string.char(consensus.SIGHASH.ALL)
+        tx.inputs[i].witness = {sig, key_info.pubkey}
+      else
+        local sighash = validation.signature_hash_legacy(
+          tx, i - 1, utxo.script_pubkey, consensus.SIGHASH.ALL
+        )
+        local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
+        sig = sig .. string.char(consensus.SIGHASH.ALL)
+        local w = serialize.buffer_writer()
+        w.write_varstr(sig)
+        w.write_varstr(key_info.pubkey)
+        tx.inputs[i].script_sig = w.result()
+      end
     end
   end
   return true
