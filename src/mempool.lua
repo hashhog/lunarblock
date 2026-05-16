@@ -282,6 +282,17 @@ M.MAX_REPLACEMENT_CANDIDATES = 100       -- Max transactions that can be evicted
 -- Previously wrong: 1000 (10× too high).  Core is 100 sat/kvB.
 M.INCREMENTAL_RELAY_FEE = 100            -- 100 sat/kvB (policy/policy.h:48)
 
+-- FIX-68 (W120 BUG-9): full-RBF default.  Bitcoin Core v28+ defaults
+-- DEFAULT_MEMPOOL_FULL_RBF = true (src/policy/rbf.h since the cluster-mempool
+-- branch removed Rule 1 / SignalsOptInRBF from ReplacementChecks) and
+-- src/rpc/mempool.cpp:1058 hardcodes the JSON field to true.  The W120 audit
+-- found lunarblock advertised fullrbf=true while still enforcing Rule 1 —
+-- this constant exposes the toggle so accept_transaction can skip Rule 1
+-- when fullrbf is enabled, and getmempoolinfo reads the actual setting.
+-- Operator can flip to false via --mempool-fullrbf=0 / mempool config
+-- `fullrbf = false` for legacy strict-opt-in policy.
+M.DEFAULT_MEMPOOL_FULL_RBF = true
+
 -- Rolling minimum fee half-life in seconds (txmempool.h:212).
 -- The rolling minimum fee decays by half every ROLLING_FEE_HALFLIFE seconds.
 -- When the pool is < 1/4 full, halflife is divided by 4 (faster decay).
@@ -866,6 +877,19 @@ function M.new(chain_state, config)
   self.max_size = (config and config.max_mempool_size) or M.DEFAULT_MAX_MEMPOOL_SIZE
   self.min_relay_fee = (config and config.min_relay_fee) or M.DEFAULT_MIN_RELAY_FEE
   self.expiry = (config and config.expiry) or M.DEFAULT_MEMPOOL_EXPIRY
+  -- FIX-68 (W120 BUG-9): full-RBF mode (Bitcoin Core v28+ default).
+  -- When true (default), accept_transaction skips BIP-125 Rule 1
+  -- (opt-in signaling) — any confirmed-feeable replacement is allowed.
+  -- When false (legacy), Rule 1 is enforced: every direct conflict must
+  -- signal RBF (sequence <= MAX_BIP125_RBF_SEQUENCE) directly or via an
+  -- unconfirmed ancestor.  Set via config.fullrbf or main.lua's
+  -- --mempool-fullrbf CLI flag.  Mirrors Core's m_pool.m_opts.full_rbf
+  -- (validation.cpp ReplacementChecks) and DEFAULT_MEMPOOL_FULL_RBF.
+  if config ~= nil and config.fullrbf ~= nil then
+    self.fullrbf = config.fullrbf and true or false
+  else
+    self.fullrbf = M.DEFAULT_MEMPOOL_FULL_RBF
+  end
   self.entries = {}            -- txid_hex -> MempoolEntry
   self.outpoint_to_tx = {}    -- outpoint_key -> txid_hex (tracks which tx spends each output)
   self.total_size = 0          -- Current memory usage estimate
@@ -1291,10 +1315,21 @@ function Mempool:accept_transaction(tx, allow_rbf)
   local all_conflicts = {}  -- All txs to be evicted (conflicts + descendants)
   if next(conflicts) then
     -- BIP125 Rule #1: All conflicting transactions must be replaceable
-    -- (signal RBF directly or have an ancestor that does)
-    for conflict_txid_hex in pairs(conflicts) do
-      if not self:is_replaceable(conflict_txid_hex) then
-        return false, "conflicting tx does not signal RBF"
+    -- (signal RBF directly or have an ancestor that does).
+    --
+    -- FIX-68 (W120 BUG-9): Skip Rule 1 when fullrbf is enabled.  Bitcoin
+    -- Core v28+ removed SignalsOptInRBF from src/validation.cpp
+    -- ReplacementChecks (cluster-mempool branch) — fullrbf default-on means
+    -- replacement acceptance no longer gates on opt-in signaling.  We keep
+    -- the check available behind self.fullrbf=false for operators who want
+    -- legacy strict-opt-in policy; getmempoolinfo.fullrbf reflects the
+    -- actual setting (no longer lies).  See policy/rbf.h
+    -- DEFAULT_MEMPOOL_FULL_RBF=true.
+    if not self.fullrbf then
+      for conflict_txid_hex in pairs(conflicts) do
+        if not self:is_replaceable(conflict_txid_hex) then
+          return false, "conflicting tx does not signal RBF"
+        end
       end
     end
 
@@ -2115,7 +2150,63 @@ function Mempool:get_info()
     usage = self.total_size,
     maxmempool = self.max_size,
     mempoolminfee = effective_min,
+    -- FIX-68 (W120 BUG-9): Honest fullrbf reporting — reflects the actual
+    -- mempool setting, not a hardcoded `true`.  Operator can toggle via
+    -- --mempool-fullrbf=0 / config.fullrbf=false.  Bitcoin Core v28+ hardcodes
+    -- `true` in src/rpc/mempool.cpp:1058 because cluster-mempool removed
+    -- Rule 1 entirely; lunarblock retains the toggle for backward-compat
+    -- with operators who want strict opt-in.  See M.DEFAULT_MEMPOOL_FULL_RBF.
+    fullrbf = self.fullrbf,
   }
+end
+
+-- FIX-68 (W120 BUG-9): BIP-125 "bip125-replaceable" walker for any tx.
+--
+-- Bitcoin Core's policy/rbf.cpp IsRBFOptIn(tx, pool) — used by rpc/mempool.cpp
+-- (entryToJSON) and rpc/rawtransaction.cpp — first checks the tx itself,
+-- and if it doesn't signal, walks its in-mempool ancestors.  Lunarblock's
+-- existing Mempool:is_replaceable(txid_hex) does the right walk for mempool
+-- entries; this helper extends the contract to also accept a raw tx for the
+-- "is this incoming tx replaceable?" path and matches Core's 3-state semantics
+-- collapsed to bool (REPLACEABLE_BIP125 => true; UNKNOWN/FINAL => false).
+--
+-- For txs in the mempool, this is identical to is_replaceable.
+-- For txs not in the mempool, we still inspect direct ancestors via the
+-- mempool entries (Core's IsRBFOptInEmptyMempool returns UNKNOWN here, but
+-- we mirror the wallet-side hint: walk any unconfirmed parents we know
+-- about so the RPC field still reflects the actual replaceability state.)
+--
+-- Reference: bitcoin-core/src/policy/rbf.cpp:24-50.
+function Mempool:bip125_replaceable_tx(tx)
+  -- 1. Tx itself signals?
+  if M.signals_rbf(tx) then return true end
+  -- 2. Any unconfirmed ancestor signals?  Walk via prev_out → mempool entry.
+  --    Use a BFS over the unconfirmed ancestor graph so we cover transitive
+  --    parents, not just direct ones (matches CalculateMemPoolAncestors).
+  local seen = {}
+  local stack = {}
+  for _, inp in ipairs(tx.inputs) do
+    local prev_hex = types.hash256_hex(inp.prev_out.hash)
+    if not seen[prev_hex] then
+      seen[prev_hex] = true
+      stack[#stack + 1] = prev_hex
+    end
+  end
+  while #stack > 0 do
+    local hex = table.remove(stack)
+    local entry = self.entries[hex]
+    if entry then
+      if M.signals_rbf(entry.tx) then return true end
+      for _, inp in ipairs(entry.tx.inputs) do
+        local prev_hex = types.hash256_hex(inp.prev_out.hash)
+        if not seen[prev_hex] then
+          seen[prev_hex] = true
+          stack[#stack + 1] = prev_hex
+        end
+      end
+    end
+  end
+  return false
 end
 
 --- Get all transaction ids in the mempool.

@@ -1894,7 +1894,17 @@ function RPCServer:register_methods()
       minrelaytxfee = min_relay_fee / 100000000,  -- Convert sat/kvB to BTC/kvB
       incrementalrelayfee = 0.00001,
       unbroadcastcount = 0,
-      fullrbf = true,
+      -- FIX-68 (W120 BUG-9): Honest fullrbf field.  Reads the actual mempool
+      -- setting (defaults true per Core v28+ DEFAULT_MEMPOOL_FULL_RBF) instead
+      -- of unconditionally advertising `true` while the relay code may still
+      -- enforce BIP-125 Rule 1.  When fullrbf=false, accept_transaction
+      -- rejects non-signaling replacements with "conflicting tx does not
+      -- signal RBF" — RPC and policy now match.  See mempool.lua:Mempool.fullrbf.
+      -- info.fullrbf is provided by Mempool:get_info() when a mempool exists;
+      -- the no-mempool branch above doesn't populate it so we default to the
+      -- module constant for the "RPC up but mempool unavailable" case.
+      fullrbf = (info.fullrbf ~= nil) and info.fullrbf
+                or (require("lunarblock.mempool").DEFAULT_MEMPOOL_FULL_RBF),
     }
   end
 
@@ -1920,6 +1930,11 @@ function RPCServer:register_methods()
       local entry = rpc.mempool:get_entry(txid_hex)
       if entry then
         local fee_btc = entry.fee / consensus.COIN
+        -- FIX-68 (W120 BUG-9): bip125-replaceable per Bitcoin Core
+        -- policy/rbf.cpp IsRBFOptIn — walks tx + unconfirmed ancestors.
+        -- Was hardcoded `true`, lying to wallets when neither the tx nor
+        -- any ancestor signals RBF.  Walker is rpc.mempool:is_replaceable
+        -- which scans entry.ancestors via signals_rbf (mempool.lua:2218).
         result[txid_hex] = {
           vsize = entry.vsize,
           weight = entry.weight,
@@ -1942,7 +1957,7 @@ function RPCServer:register_methods()
           },
           depends = entry.depends or {},
           spentby = entry.spent_by or {},
-          ["bip125-replaceable"] = true,
+          ["bip125-replaceable"] = rpc.mempool:is_replaceable(txid_hex),
           unbroadcast = false,
         }
       end
@@ -2952,7 +2967,13 @@ function RPCServer:register_methods()
   -- Bitcoin Core: rpc/mempool.cpp::{getmempoolentry,getmempoolancestors,getmempooldescendants}.
   -- Each walks the in-memory CTxMemPool graph; we mirror that with the
   -- ancestor/descendant sets already maintained on each Mempool entry.
-  local function format_mempool_entry(entry, txid_hex)
+  --
+  -- FIX-68 (W120 BUG-9): bip125-replaceable computed per Core
+  -- policy/rbf.cpp IsRBFOptIn (walks tx + unconfirmed ancestors); the
+  -- caller must pass `mp` so we can run the ancestor scan via
+  -- Mempool:is_replaceable.  Previously hardcoded `true`, which lied
+  -- to wallets for non-signaling, no-signaling-ancestor mempool entries.
+  local function format_mempool_entry(entry, txid_hex, mp)
     local fee_btc = entry.fee / consensus.COIN
     return {
       vsize = entry.vsize,
@@ -2976,7 +2997,7 @@ function RPCServer:register_methods()
       },
       depends = entry.depends or {},
       spentby = entry.spent_by or {},
-      ["bip125-replaceable"] = true,
+      ["bip125-replaceable"] = mp and mp:is_replaceable(txid_hex) or false,
       unbroadcast = false,
     }
   end
@@ -2993,7 +3014,7 @@ function RPCServer:register_methods()
     if not entry then
       error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
     end
-    return format_mempool_entry(entry, txid_hex)
+    return format_mempool_entry(entry, txid_hex, rpc.mempool)
   end
 
   self.methods["getmempoolancestors"] = function(rpc, params)
@@ -3020,7 +3041,7 @@ function RPCServer:register_methods()
     for anc_hex in pairs(entry.ancestors or {}) do
       local anc_entry = rpc.mempool:get_entry(anc_hex)
       if anc_entry then
-        out[anc_hex] = format_mempool_entry(anc_entry, anc_hex)
+        out[anc_hex] = format_mempool_entry(anc_entry, anc_hex, rpc.mempool)
       end
     end
     return out
@@ -3050,7 +3071,7 @@ function RPCServer:register_methods()
     for desc_hex in pairs(entry.descendants or {}) do
       local desc_entry = rpc.mempool:get_entry(desc_hex)
       if desc_entry then
-        out[desc_hex] = format_mempool_entry(desc_entry, desc_hex)
+        out[desc_hex] = format_mempool_entry(desc_entry, desc_hex, rpc.mempool)
       end
     end
     return out

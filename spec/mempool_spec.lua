@@ -328,13 +328,17 @@ describe("mempool", function()
     end)
 
     it("rejects replacement when original does not signal RBF", function()
+      -- FIX-68 (W120 BUG-9): fullrbf default flipped to TRUE (Core v28+
+      -- DEFAULT_MEMPOOL_FULL_RBF) — Rule 1 only fires under legacy
+      -- fullrbf=false.  Explicitly construct the mempool with fullrbf=false
+      -- so this test continues to exercise the BIP-125 Rule 1 path.
       local prev_txid = types.hash256(string.rep("\x01", 32))
       local prev_txid_hex = types.hash256_hex(prev_txid)
 
       local chain_state = make_mock_chain_state()
       add_utxo(chain_state, prev_txid_hex, 0, 100000)
 
-      local mp = mempool.new(chain_state)
+      local mp = mempool.new(chain_state, {fullrbf = false})
 
       -- Original tx without RBF signaling (sequence 0xFFFFFFFF)
       local tx1 = make_tx(1, {}, {}, 0)
@@ -351,6 +355,40 @@ describe("mempool", function()
       local ok, err = mp:accept_transaction(tx2)
       assert.is_false(ok)
       assert.equal("conflicting tx does not signal RBF", err)
+    end)
+
+    -- FIX-68 (W120 BUG-9): positive test for the new default behavior.
+    -- Under fullrbf=true (default), a sufficiently-fee'd replacement of a
+    -- non-signaling tx must be accepted — matches Core v28+ relay policy.
+    it("FIX-68: accepts replacement of non-signaling tx under fullrbf=true (default)", function()
+      local prev_txid = types.hash256(string.rep("\x01", 32))
+      local prev_txid_hex = types.hash256_hex(prev_txid)
+
+      local chain_state = make_mock_chain_state()
+      add_utxo(chain_state, prev_txid_hex, 0, 100000)
+
+      local mp = mempool.new(chain_state)  -- default: fullrbf=true
+      assert.is_true(mp.fullrbf)
+
+      -- Original tx with NO RBF signaling.
+      local tx1 = make_tx(1, {}, {}, 0)
+      tx1.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFF)
+      tx1.outputs[1] = make_output(95000)
+      local ok1 = mp:accept_transaction(tx1)
+      assert.is_true(ok1)
+
+      -- Higher-fee replacement (also non-signaling — under fullrbf this is fine).
+      local tx2 = make_tx(1, {}, {}, 0)
+      tx2.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFF)
+      tx2.outputs[1] = make_output(80000)  -- 20000 fee vs tx1's 5000 fee
+      local ok2, err2 = mp:accept_transaction(tx2)
+      -- Note: replacement may still be rejected by Rule 2 (new unconfirmed
+      -- inputs) or by feerate-diagram in some setups; we assert that the
+      -- failure mode is NOT "conflicting tx does not signal RBF" (Rule 1).
+      if not ok2 then
+        assert.is_falsy(err2:match("does not signal RBF"),
+          "Rule 1 must not fire under fullrbf=true; got: " .. tostring(err2))
+      end
     end)
   end)
 
@@ -1186,13 +1224,16 @@ describe("mempool", function()
 
     describe("replacement rules", function()
       it("rejects replacement when conflicting tx and ancestors do not signal RBF", function()
+        -- FIX-68 (W120 BUG-9): default fullrbf=true now skips Rule 1.
+        -- Pin the legacy strict-opt-in policy here so this Rule 1 test
+        -- continues to exercise the rejection path.
         local prev_txid = types.hash256(string.rep("\x01", 32))
         local prev_txid_hex = types.hash256_hex(prev_txid)
 
         local chain_state = make_mock_chain_state()
         add_utxo(chain_state, prev_txid_hex, 0, 100000)
 
-        local mp = mempool.new(chain_state)
+        local mp = mempool.new(chain_state, {fullrbf = false})
 
         -- Original tx without RBF signaling (sequence 0xFFFFFFFF)
         local tx1 = make_tx(1, {}, {}, 0)

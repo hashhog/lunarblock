@@ -61,6 +61,14 @@ local function default_args()
     log = nil,             -- Path to log file (default: <datadir>/debug.log)
     conf = nil,            -- Path to bitcoin.conf-style config file
     ready_fd = nil,        -- File descriptor for ready-signal (systemd-style)
+    -- FIX-68 (W120 BUG-9): mempool full-RBF toggle.  Mirrors Bitcoin Core's
+    -- -mempoolfullrbf, default TRUE per DEFAULT_MEMPOOL_FULL_RBF (Core v28+,
+    -- policy/rbf.h).  When TRUE (default), accept_transaction skips BIP-125
+    -- Rule 1 — any sufficiently-fee'd replacement is allowed, matching Core's
+    -- cluster-mempool relay policy.  When FALSE, Rule 1 is enforced and
+    -- non-signaling replacements are rejected with "conflicting tx does not
+    -- signal RBF".  getmempoolinfo.fullrbf reads this value (honest).
+    mempool_fullrbf = nil,  -- nil = take mempool.lua default; true/false override
   }
 end
 
@@ -120,6 +128,7 @@ local function parse_args(argv)
       print("      --log PATH                  Path to log file (default: <datadir>/debug.log)")
       print("      --conf PATH                 Path to bitcoin.conf-style config file")
       print("      --ready-fd N                Write READY token to this FD when listeners are up")
+      print("      --mempool-fullrbf BOOL      Mempool full-RBF policy (default: 1 = on, Core v28+ default)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -295,6 +304,27 @@ local function parse_args(argv)
     elseif arg == "--ready-fd" or arg:match("^%-%-ready%-fd=") then
       local v = arg:match("^%-%-ready%-fd=(.*)$")
       if v then args.ready_fd = tonumber(v) else i = i + 1; args.ready_fd = tonumber(argv[i]) end
+    elseif arg == "--mempool-fullrbf" or arg:match("^%-%-mempool%-fullrbf=") then
+      -- FIX-68 (W120 BUG-9): mempool full-RBF toggle.  Mirrors Bitcoin Core's
+      -- -mempoolfullrbf option (init.cpp adds it via SetupServerArgs).  Default
+      -- TRUE per DEFAULT_MEMPOOL_FULL_RBF (Core policy/rbf.h since v28).
+      -- Accepts "0/1", "true/false", "yes/no", "on/off"; passing nothing
+      -- after the bare flag is treated as "1" (enable).  Wired to mempool
+      -- config below — getmempoolinfo.fullrbf then reflects the actual setting.
+      local v = arg:match("^%-%-mempool%-fullrbf=(.*)$")
+      if v == nil then
+        -- Look ahead — if next arg is a known bool literal, consume it;
+        -- otherwise treat bare "--mempool-fullrbf" as enable.
+        local nxt = argv[i + 1]
+        if nxt == "0" or nxt == "1" or nxt == "true" or nxt == "false"
+           or nxt == "yes" or nxt == "no" or nxt == "on" or nxt == "off" then
+          i = i + 1
+          v = nxt
+        else
+          v = "1"
+        end
+      end
+      args.mempool_fullrbf = (v == "1" or v == "true" or v == "yes" or v == "on")
     else
       io.stderr:write("Unknown option: " .. arg .. "\n")
       os.exit(1)
@@ -995,9 +1025,14 @@ local function main()
   end
 
   -- Initialize mempool
+  -- FIX-68 (W120 BUG-9): plumb --mempool-fullrbf into mempool config.  When
+  -- the CLI flag was provided (true or false), it wins; otherwise the
+  -- module-level default (Mempool.fullrbf = DEFAULT_MEMPOOL_FULL_RBF = true)
+  -- applies.  getmempoolinfo.fullrbf then mirrors the actual relay policy.
   local mempool = mempool_mod.new(chain_state, {
     max_mempool_size = 300 * 1024 * 1024,
     min_relay_fee = 1000,
+    fullrbf = args.mempool_fullrbf,  -- nil => mempool uses DEFAULT_MEMPOOL_FULL_RBF
   })
 
   -- Orphan tx pool (Core txorphanage parity).  Buffers up to 100 txs that
@@ -2061,6 +2096,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --log PATH                  Path to log file (default: <datadir>/debug.log)")
       print("      --conf PATH                 Path to bitcoin.conf-style config file")
       print("      --ready-fd N                Write READY token to this FD when listeners are up")
+      print("      --mempool-fullrbf BOOL      Mempool full-RBF policy (default: 1 = on, Core v28+ default)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)

@@ -658,19 +658,108 @@ test("G27-a: BUG-2 — modern Core ReplacementChecks does NOT call SignalsOptInR
 end)
 
 -- ---------------------------------------------------------------------------
--- G28: fullrbf RPC contradiction (BUG-9)
+-- G28: fullrbf RPC honesty (BUG-9 FIXED by FIX-68)
 -- ---------------------------------------------------------------------------
-print("\n--- G28: fullrbf RPC contradicts mempool code ---")
+print("\n--- G28: fullrbf RPC honesty (BUG-9 FIX-68 closed) ---")
 
-test("G28-a: BUG-9 — getmempoolinfo claims fullrbf=true while Rule 1 enforced", function()
+test("G28-a: FIX-68 — DEFAULT_MEMPOOL_FULL_RBF constant exists in mempool.lua", function()
+  -- Core: src/policy/rbf.h DEFAULT_MEMPOOL_FULL_RBF = true (since v28).
+  expect_eq(mempool_mod.DEFAULT_MEMPOOL_FULL_RBF, true,
+    "mempool exposes DEFAULT_MEMPOOL_FULL_RBF = true matching Core v28+")
+end)
+
+test("G28-b: FIX-68 — Mempool.new defaults fullrbf to true (Core v28+ default)", function()
+  -- Construct a minimal mempool with no config override; expect fullrbf=true.
+  local mp = mempool_mod.new({}, nil)
+  expect_eq(mp.fullrbf, true, "default Mempool.fullrbf = true")
+end)
+
+test("G28-c: FIX-68 — Mempool.new honors explicit fullrbf=false override", function()
+  -- Legacy operators who want strict opt-in can disable fullrbf.
+  local mp = mempool_mod.new({}, {fullrbf = false})
+  expect_eq(mp.fullrbf, false, "explicit fullrbf=false respected")
+end)
+
+test("G28-d: FIX-68 — Mempool.new honors explicit fullrbf=true override", function()
+  local mp = mempool_mod.new({}, {fullrbf = true})
+  expect_eq(mp.fullrbf, true, "explicit fullrbf=true respected")
+end)
+
+test("G28-e: FIX-68 — Mempool:get_info reports actual fullrbf setting", function()
+  -- Honest reporting: get_info().fullrbf reflects self.fullrbf (not hardcoded).
+  local mp_on = mempool_mod.new({}, {fullrbf = true})
+  expect_eq(mp_on:get_info().fullrbf, true, "fullrbf=true reflected")
+  local mp_off = mempool_mod.new({}, {fullrbf = false})
+  expect_eq(mp_off:get_info().fullrbf, false, "fullrbf=false reflected")
+end)
+
+test("G28-f: FIX-68 — Rule 1 enforcement is conditional on fullrbf=false", function()
+  -- The previous hardcoded `if not self:is_replaceable(conflict_txid_hex)`
+  -- check must now be guarded by `if not self.fullrbf then`.  Verify via
+  -- source-level inspection that the guard is present.
+  local src = io.open("src/mempool.lua", "r"):read("*a")
+  expect_true(src:find("if not self.fullrbf then") ~= nil,
+    "Rule 1 is gated on self.fullrbf=false (FIX-68 guard present)")
+  -- And the error string is still reachable via the legacy path.
+  expect_true(src:find('"conflicting tx does not signal RBF"') ~= nil,
+    "Rule 1 error string still present for legacy fullrbf=false path")
+end)
+
+test("G28-g: FIX-68 — rpc getmempoolinfo no longer hardcodes fullrbf=true", function()
+  -- The literal `fullrbf = true,` line in getmempoolinfo (rpc.lua) is gone;
+  -- the RPC reads `info.fullrbf` (mempool.get_info()) or the module default.
   local src = io.open("src/rpc.lua", "r"):read("*a")
-  expect_true(src:find("fullrbf = true") ~= nil,
-    "getmempoolinfo advertises fullrbf=true")
-  -- ...but the mempool code rejects non-signaling conflicts.  Contradiction.
-  local mp = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(mp:find('"conflicting tx does not signal RBF"') ~= nil,
-    "mempool still enforces Rule 1 — RPC lies to wallets/peers")
-  bug("BUG-9", "MED")
+  -- A hardcoded "fullrbf = true" inside the getmempoolinfo return table is
+  -- the smoking gun for BUG-9.  Verify it's absent (the only `fullrbf`
+  -- references should be dynamic reads or comments).
+  expect_false(src:find("fullrbf = true,") ~= nil,
+    "no `fullrbf = true,` hardcoded literal in rpc.lua (BUG-9 closed)")
+  expect_true(src:find("info%.fullrbf") ~= nil,
+    "getmempoolinfo reads info.fullrbf from Mempool:get_info()")
+end)
+
+test("G28-h: FIX-68 — --mempool-fullrbf CLI flag plumbed in main.lua", function()
+  -- Operator-facing toggle: argv handler parses --mempool-fullrbf BOOL and
+  -- wires args.mempool_fullrbf into mempool_mod.new config.
+  local src = io.open("src/main.lua", "r"):read("*a")
+  expect_true(src:find('"%-%-mempool%-fullrbf"') ~= nil,
+    "--mempool-fullrbf flag handled in argv parser")
+  expect_true(src:find("args%.mempool_fullrbf") ~= nil,
+    "args.mempool_fullrbf set by parser")
+  expect_true(src:find("fullrbf = args%.mempool_fullrbf") ~= nil,
+    "args.mempool_fullrbf passed to mempool_mod.new config")
+end)
+
+test("G28-i: FIX-68 — bip125_replaceable_tx walks tx + unconfirmed ancestors", function()
+  -- New tx-level walker mirrors Core IsRBFOptIn(tx, pool) for non-mempool txs.
+  -- Tx that itself signals RBF → true.
+  local tx_signaling = make_tx(
+    {make_input(make_hash("x"), 0, mempool_mod.MAX_BIP125_RBF_SEQUENCE)},
+    {make_output(1000)})
+  local mp = mempool_mod.new({})
+  expect_eq(mp:bip125_replaceable_tx(tx_signaling), true,
+    "tx with signaling input returns true (no mempool walk needed)")
+  -- Tx that does NOT signal and has no in-mempool parents → false.
+  local tx_final = make_tx(
+    {make_input(make_hash("y"), 0, 0xFFFFFFFF)},
+    {make_output(1000)})
+  expect_eq(mp:bip125_replaceable_tx(tx_final), false,
+    "tx with no signaling and no unconfirmed parent returns false")
+end)
+
+test("G28-j: FIX-68 — rpc.lua format_mempool_entry computes replaceable per-entry", function()
+  -- Replaces hardcoded `["bip125-replaceable"] = true` with a dynamic call
+  -- to mp:is_replaceable(txid_hex).  Verify via source inspection.
+  local src = io.open("src/rpc.lua", "r"):read("*a")
+  expect_true(src:find('%[\"bip125%-replaceable\"%] = mp and mp:is_replaceable') ~= nil,
+    "format_mempool_entry uses dynamic mp:is_replaceable walker")
+  expect_true(src:find('%[\"bip125%-replaceable\"%] = rpc%.mempool:is_replaceable') ~= nil,
+    "getrawmempool verbose uses dynamic rpc.mempool:is_replaceable walker")
+  -- And the literal hardcode is gone.
+  -- We allow exactly the two dynamic occurrences above; the hardcoded
+  -- `["bip125-replaceable"] = true,` literal must be absent.
+  expect_false(src:find('%[\"bip125%-replaceable\"%] = true,') ~= nil,
+    "no hardcoded `[\"bip125-replaceable\"] = true,` literal in rpc.lua")
 end)
 
 -- ---------------------------------------------------------------------------
