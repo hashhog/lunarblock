@@ -12,6 +12,12 @@ local script_mod = require("lunarblock.script")
 local address_mod = require("lunarblock.address")
 local psbt_mod = require("lunarblock.psbt")
 local bit = require("bit")
+-- FIX-67: BIP-78 receiver proposal-lifecycle store (G18 TTL +
+-- G19 double-receive + G20 anti-fingerprint UIH + G30 replay /
+-- in-flight outpoint lock).  Optional dependency: nodes built
+-- without crypto / lua-cjson can still serve /rest/* — the store
+-- module pulls crypto, which the wallet path already requires.
+local proposal_store_mod = require("lunarblock.payjoin_proposal_store")
 
 local M = {}
 
@@ -382,6 +388,14 @@ function M.new(config)
   -- input via FIX-61 Wallet:_sign_inputs, and returns the signed
   -- proposal PSBT.  FIX-65.
   self.wallet = config.wallet
+  -- FIX-67: BIP-78 receiver-side proposal-lifecycle store.  Holds
+  -- short-window (60s) TTL state for open proposals so handle_payjoin
+  -- can reject double-receive / replay / double-spend attempts (W119
+  -- gates G18+G19+G20+G30).  Tests may pass their own clock via
+  -- config.proposal_store; otherwise we create a fresh one per server.
+  self.proposal_store = config.proposal_store or proposal_store_mod.new({
+    ttl_seconds = config.payjoin_ttl_seconds,
+  })
   self.running = false
   return self
 end
@@ -1454,6 +1468,23 @@ function RESTServer:handle_payjoin(query_params, body)
   end
   local psbt = psbt_or_err
 
+  -- ---- Gate 3b: FIX-67 G19 double-receive guard (Original-PSBT hash) ----
+  -- Hash the raw POST body (the Original PSBT exactly as the sender sent
+  -- it) and look up payjoin_seen.  If we already have a proposal pending
+  -- for the same Original PSBT, refuse to mint a second one — that's the
+  -- BIP-78 §Receiver "double-receive" defence (an attacker resubmitting
+  -- the same PSBT must NOT get a different proposal back, because doing
+  -- so leaks two distinct receiver UTXOs).
+  local orig_hash = proposal_store_mod.hash_original_psbt(body)
+  if self.proposal_store.payjoin_seen[orig_hash] then
+    -- Run the sweep once so an expired entry doesn't latch forever.
+    self.proposal_store:sweep()
+  end
+  if self.proposal_store.payjoin_seen[orig_hash] then
+    return payjoin_error("original-psbt-rejected",
+      "double-receive (this Original PSBT is already pending a proposal)")
+  end
+
   -- ---- Gate 4: BIP-78 §Receiver checks ----------------------------------
   -- (a) at least one input
   if not psbt.tx or not psbt.tx.inputs or #psbt.tx.inputs == 0 then
@@ -1497,40 +1528,62 @@ function RESTServer:handle_payjoin(query_params, body)
 
   -- ---- Gate 5: pick a receiver UTXO -------------------------------------
   -- BIP-78 receiver MUST contribute >=1 of its own inputs (defeats the
-  -- common-input-ownership heuristic).  Pick the largest confirmed UTXO
-  -- for the simple foundation; future work can swap this for the BnB-style
-  -- "avoid round-numbered combined value" coin selection payjoin.org
-  -- recommends.
+  -- common-input-ownership heuristic).
+  --
+  -- FIX-67 G20: route UTXO selection through proposal_store:select_utxo,
+  -- which enforces UIH-1 (don't add an input larger than the smallest
+  -- sender output — would identify the smaller output as change) and
+  -- UIH-2 (script-type homogeneity — receiver input MUST match sender
+  -- input policy).  Falls back to "largest available" when no candidate
+  -- satisfies UIH-1 (UIH-2 is hard-required, UIH-1 is soft).
+  --
+  -- Reference: payjoin.org §"Receiver UTXO selection" (Maxwell/Lopp UIH).
   local utxos = self.wallet:get_available_utxos(false)  -- confirmed only
   if #utxos == 0 then
     return payjoin_error("not-enough-money",
       "receiver wallet has no confirmed UTXOs to contribute")
   end
+  -- Pre-sort largest-first so select_utxo's strict pass picks the biggest
+  -- candidate that still satisfies UIH-1.
   table.sort(utxos, function(a, b) return a.utxo.value > b.utxo.value end)
 
-  -- Avoid double-spending: skip any wallet UTXO that the Original PSBT
-  -- already references (shouldn't happen for a real sender, but a
-  -- malicious or buggy sender could submit a PSBT spending our own UTXO
-  -- — defensive guard).
-  local pjin_utxo = nil
-  for _, item in ipairs(utxos) do
-    local already_used = false
-    for _, inp in ipairs(psbt.tx.inputs) do
-      if inp.prev_out.hash.bytes == item.utxo.txid.bytes and
-         inp.prev_out.index == item.utxo.vout then
-        already_used = true
-        break
-      end
-    end
-    if not already_used then
-      pjin_utxo = item.utxo
-      break
+  -- Build the already_used set from the sender's Original PSBT inputs
+  -- AND from the in-flight outpoint lock (G30 double-spend guard).
+  -- A receiver UTXO that's already committed to *another* still-open
+  -- proposal MUST NOT be reused.
+  local already_used = {}
+  for _, inp in ipairs(psbt.tx.inputs) do
+    local key = proposal_store_mod.outpoint_key(
+      inp.prev_out.hash.bytes, inp.prev_out.index)
+    already_used[key] = true
+  end
+  self.proposal_store:sweep()
+  for key, _ in pairs(self.proposal_store.payjoin_inflight) do
+    already_used[key] = true
+  end
+
+  -- Classify the sender's first input script type for UIH-2.  We look at
+  -- psbt.inputs[1].witness_utxo (BIP-78 §Receiver requires sender to set
+  -- this) and fall back to "unknown" if absent.
+  local sender_input_type = nil
+  if psbt.inputs and psbt.inputs[1] and psbt.inputs[1].witness_utxo then
+    local spk = psbt.inputs[1].witness_utxo.script_pubkey
+    if spk then
+      sender_input_type = script_mod.classify_script(spk)
     end
   end
+
+  local pjin_utxo, sel_warn = self.proposal_store:select_utxo(
+    utxos, psbt.tx.outputs, sender_input_type, already_used)
   if not pjin_utxo then
+    -- sel_warn carries the diagnostic from select_utxo (e.g. "no UTXO
+    -- satisfies UIH-2 (script-type homogeneity)").  Treated as
+    -- not-enough-money per BIP-78 — the sender will fall back.
     return payjoin_error("not-enough-money",
-      "no wallet UTXO eligible for PayJoin contribution")
+      "no wallet UTXO eligible for PayJoin contribution: " ..
+      tostring(sel_warn or "no UIH-compatible candidate"))
   end
+  _ = sel_warn  -- (informational: UIH-1 may have been relaxed)
 
   -- ---- Gate 6: append receiver input ------------------------------------
   -- BIP-125 RBF signal (sequence 0xFFFFFFFD) — matches what
@@ -1620,6 +1673,23 @@ function RESTServer:handle_payjoin(query_params, body)
   -- Clear the tx-level witness so the returned PSBT's unsigned-tx
   -- serialization stays "no signatures embedded" per BIP-174.
   psbt.tx.inputs[new_input_idx].witness = nil
+
+  -- ---- Gate 9b: FIX-67 G19+G30 commit the proposal lifecycle ------------
+  -- Now that the proposal PSBT is fully built and signed, record the
+  -- lifecycle bookkeeping atomically:
+  --   * payjoin_seen   <- orig_hash       (G19 double-receive)
+  --   * payjoin_replay <- psbt_id         (G30 replay)
+  --   * payjoin_inflight <- outpoint_key  (G30 double-spend)
+  -- Each entry expires after proposal_store.ttl_seconds (default 60s).
+  --
+  -- Important: commit AFTER signing succeeds — a failed sign path
+  -- (Gate 8) must not occupy a TTL slot, otherwise an attacker could
+  -- DoS the receiver by spamming PSBTs that always fail signing.
+  local psbt_id = proposal_store_mod.compute_psbt_id(psbt.tx, payment_idx)
+  local commit_outpoints = {
+    proposal_store_mod.outpoint_key(pjin_utxo.txid.bytes, pjin_utxo.vout),
+  }
+  self.proposal_store:commit(orig_hash, psbt_id, commit_outpoints)
 
   -- ---- Gate 10: serialize and return ------------------------------------
   local ok_ser, serialized = pcall(psbt_mod.to_base64, psbt)
