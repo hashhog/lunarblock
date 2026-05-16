@@ -124,8 +124,12 @@ Peer.__index = Peer
 -- @param proxy_config table: proxy configuration (optional)
 -- @param peerbloomfilters boolean: advertise NODE_BLOOM (BIP-35) (optional, default false — matches Core)
 -- @param prune_mode boolean: advertise NODE_NETWORK_LIMITED (BIP-159) (optional, default false; set when --prune > 0)
+-- @param compactfilters_opts table: NODE_COMPACT_FILTERS advertisement gate (FIX-71 W121 BUG-2).
+--   Optional table {peerblockfilters=bool, blockfilterindex_enabled=bool}.  Both must
+--   be true AND p2p.BIP157_P2P_DISPATCH_PRESENT must be true for the bit to advertise.
+--   Default nil = do NOT advertise (matches current state: dispatch absent).
 -- @return Peer: new peer object
-function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfilters, prune_mode)
+function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfilters, prune_mode, compactfilters_opts)
   local self = setmetatable({}, Peer)
   self.ip = ip
   self.port = port or (network and network.port) or 8333
@@ -194,6 +198,22 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
     self.prune_mode = false
   else
     self.prune_mode = prune_mode and true or false
+  end
+  -- FIX-71 W121 BUG-2: NODE_COMPACT_FILTERS advertisement gate inputs.
+  -- The actual gate decision happens inside p2p.our_services via
+  -- p2p.should_advertise_compact_filters().  We stash the opts table
+  -- here so the version-message handlers in start_handshake() and
+  -- handle_version() can hand them off without re-reading config.
+  -- Currently always evaluates false (BIP157_P2P_DISPATCH_PRESENT=
+  -- false in p2p.lua) — advertising would lie to peers because
+  -- peer.lua:854 has no BIP-157 case branches.
+  if compactfilters_opts == nil then
+    self.compactfilters_opts = nil
+  else
+    self.compactfilters_opts = {
+      peerblockfilters = compactfilters_opts.peerblockfilters and true or false,
+      blockfilterindex_enabled = compactfilters_opts.blockfilterindex_enabled and true or false,
+    }
   end
 
   -- Erlay (BIP330)
@@ -621,7 +641,13 @@ function Peer:start_handshake()
   -- Compute and remember the services we advertise (NODE_NETWORK|NODE_WITNESS,
   -- plus NODE_BLOOM when --peerbloomfilters is enabled — see BIP-35 / Core
   -- net_processing.cpp MEMPOOL handler).
-  self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode)
+  -- FIX-71 W121 BUG-2: the third arg (compactfilters_opts) is the
+  -- NODE_COMPACT_FILTERS gate.  Currently nil/disabled because
+  -- peer.lua:854 has no BIP-157 dispatch (p2p.BIP157_P2P_DISPATCH_
+  -- PRESENT=false).  When the future P2P fix wave lands, the gate
+  -- evaluates true automatically.
+  self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode,
+                                       self.compactfilters_opts)
   -- Send version message
   local payload = p2p.serialize_version({
     version = p2p.PROTOCOL_VERSION,
@@ -688,7 +714,9 @@ function Peer:handle_version(payload)
     self.nonce = math.random(1, 2^52)
     -- Track the services we advertise so the BIP-35 mempool handler can gate
     -- on whether we promised NODE_BLOOM to this specific peer.
-    self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode)
+    -- FIX-71 W121 BUG-2: third arg is the NODE_COMPACT_FILTERS gate input.
+    self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode,
+                                         self.compactfilters_opts)
     local ver_payload = p2p.serialize_version({
       version = p2p.PROTOCOL_VERSION,
       services = self.our_services,

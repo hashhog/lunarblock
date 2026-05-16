@@ -22,6 +22,81 @@ M.SERVICES = {
   NODE_NETWORK_LIMITED = 1024,
 }
 
+-- BIP-157 P2P dispatch presence flag (FIX-71 W121 BUG-2).
+--
+-- Peer.lua:854's command dispatch is a chained if/elseif over message
+-- commands.  As of FIX-71 there is NO case for any of the 6 BIP-157
+-- compact-filter wire messages (getcfilters / cfilter / getcfheaders /
+-- cfheaders / getcfcheckpt / cfcheckpt).  The codecs in this file plus
+-- the index lifecycle in blockfilter.lua plus the REST handlers in
+-- rest.lua are all wired — only the P2P case branches are absent.
+--
+-- This module-level flag is the canonical signal for
+-- should_advertise_compact_filters().  When a future P2P fix wave
+-- adds the case branches to peer.lua:854 (and updates the inbound
+-- handlers in peerman.lua / main.lua), it MUST flip this flag to true.
+-- Until then advertising NODE_COMPACT_FILTERS would lie to peers:
+-- they would route getcfilters at this node and the response would
+-- never arrive, causing a 30s timeout-then-disconnect at the remote
+-- (net_processing.cpp PoissonNextSend path).
+--
+-- Tests in tests/test_w121_compact_filters.lua + tests/test_fix71_*
+-- assert this flag stays false until the dispatch lands.  Source-level
+-- regression guards reject any unconditional OR-into-services-bitfield
+-- of NODE_COMPACT_FILTERS outside should_advertise_compact_filters().
+M.BIP157_P2P_DISPATCH_PRESENT = false
+
+--- Gate: should we advertise NODE_COMPACT_FILTERS in our version handshake?
+--
+-- Mirrors bitcoin-core/src/init.cpp lines 992-999:
+--   if (peerblockfilters) {
+--     if (!filter_types.contains(BASIC)) return InitError(...);
+--     g_local_services |= NODE_COMPACT_FILTERS;
+--   }
+--
+-- Lunarblock adds a third condition over Core because the P2P
+-- dispatch is currently absent (W121 BUG-1).  Advertising the bit
+-- without the dispatch would mean peers route requests to dead
+-- handlers — they wait 30s then disconnect.  Better to keep the bit
+-- dark until the handlers ship.
+--
+-- The 3 conditions are AND'd:
+--   (a) opts.peerblockfilters         — operator opt-in (matches Core's flag)
+--   (b) opts.blockfilterindex_enabled — basic filter index runs at all
+--   (c) opts.bip157_dispatch_present  — peer.lua:854 has handlers for
+--                                       the 6 cf* messages
+--
+-- The caller (peer.lua / main.lua) is responsible for AND'ing the
+-- index-synced signal in too: a node still building the index from
+-- height 0 advertising the bit would respond to getcfilters with
+-- "not found" until catchup.  Core handles this via BaseIndex::
+-- IsSynced() in the index_block path; here we lift the same gate
+-- to the advertisement decision so peers don't waste round-trips
+-- on a node that can't actually serve.  See should_advertise_
+-- compact_filters_full() below for the form that takes opts.
+--
+-- @param opts table: gate options table
+-- @return boolean: true iff all 3 conditions hold
+function M.should_advertise_compact_filters(opts)
+  opts = opts or {}
+  -- Condition (a): operator opt-in.  Default false.
+  if not opts.peerblockfilters then return false end
+  -- Condition (b): basic filter index actually runs.  Without this the
+  -- index lookup in any served getcfilters would fail.
+  if not opts.blockfilterindex_enabled then return false end
+  -- Condition (c): P2P dispatch case branches exist in peer.lua:854.
+  -- Default reads the module-level flag, but callers can override (e.g.
+  -- for unit tests that want to drill the all-conditions-true path).
+  local dispatch_present
+  if opts.bip157_dispatch_present == nil then
+    dispatch_present = M.BIP157_P2P_DISPATCH_PRESENT
+  else
+    dispatch_present = opts.bip157_dispatch_present and true or false
+  end
+  if not dispatch_present then return false end
+  return true
+end
+
 --- Compute the service-flags bitfield we advertise to peers.
 -- @param peerbloomfilters boolean: include NODE_BLOOM (BIP-35 mempool support)
 -- @param prune_mode boolean: include NODE_NETWORK_LIMITED (BIP-159, 1<<10).
@@ -31,9 +106,19 @@ M.SERVICES = {
 --   NODE_NETWORK alongside NODE_NETWORK_LIMITED in the auto-prune case
 --   (the node still has the recent-288 window), so we keep NODE_NETWORK
 --   set as well.
+-- @param compactfilters table|nil: optional gate options for NODE_COMPACT_FILTERS
+--   advertisement.  When provided, the table is passed to
+--   should_advertise_compact_filters() (see above for the 3 conditions —
+--   peerblockfilters + blockfilterindex_enabled + bip157_dispatch_present).
+--   The default (nil) means do NOT advertise — matches Core's
+--   DEFAULT_PEERBLOCKFILTERS=false (init.cpp:993).  When the future
+--   P2P fix wave adds the dispatch branches to peer.lua:854, callers
+--   pass {peerblockfilters=args.peerblockfilters,
+--   blockfilterindex_enabled=args.blockfilterindex} and the
+--   module-level BIP157_P2P_DISPATCH_PRESENT flag flips to true.
 -- @return number: services bitfield (NODE_NETWORK|NODE_WITNESS
---   [|NODE_BLOOM] [|NODE_NETWORK_LIMITED])
-function M.our_services(peerbloomfilters, prune_mode)
+--   [|NODE_BLOOM] [|NODE_NETWORK_LIMITED] [|NODE_COMPACT_FILTERS])
+function M.our_services(peerbloomfilters, prune_mode, compactfilters)
   local bit = require("bit")
   local s = bit.bor(M.SERVICES.NODE_NETWORK, M.SERVICES.NODE_WITNESS)
   if peerbloomfilters then
@@ -41,6 +126,13 @@ function M.our_services(peerbloomfilters, prune_mode)
   end
   if prune_mode then
     s = bit.bor(s, M.SERVICES.NODE_NETWORK_LIMITED)
+  end
+  -- BIP-157 NODE_COMPACT_FILTERS gate.  Plumbed through the gate
+  -- function rather than a raw boolean so the 3 AND'd conditions
+  -- live in one place and the dispatch-presence signal cannot be
+  -- bypassed by a caller that only checks blockfilterindex.
+  if compactfilters and M.should_advertise_compact_filters(compactfilters) then
+    s = bit.bor(s, M.SERVICES.NODE_COMPACT_FILTERS)
   end
   return s
 end

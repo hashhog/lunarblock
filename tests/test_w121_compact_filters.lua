@@ -498,23 +498,97 @@ print("\n--- G13: NODE_COMPACT_FILTERS service-bit advertisement ---")
 test("G13-a: NODE_COMPACT_FILTERS constant defined", function()
   expect_eq(p2p.SERVICES.NODE_COMPACT_FILTERS, 64,
     "BIP-157 service bit = 1<<6 = 64")
-  bug("BUG-2", "P0-WIRE")
 end)
 
-test("G13-b: BUG-2 — our_services() does not include NODE_COMPACT_FILTERS", function()
-  -- our_services(peerbloomfilters, prune_mode) has only 2 toggles; no
-  -- compactfilters path.  Verify by inspecting the source — function
-  -- signature must remain (compactfilters, ...) when fix lands.
-  local s = p2p.our_services(true, true)
-  expect_false(require("bit").band(s,
-    p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
-    "NODE_COMPACT_FILTERS is set with current (false, false) call — fix wired")
+test("G13-b: FIX-71 — gate plumbed, returns FALSE while dispatch absent", function()
+  -- FIX-71 W121 BUG-2 (post-fix): our_services takes a 3rd arg
+  -- compactfilters_opts.  The gate function should_advertise_compact_
+  -- filters() AND's three signals:
+  --   (a) opts.peerblockfilters         (operator opt-in)
+  --   (b) opts.blockfilterindex_enabled (basic filter index running)
+  --   (c) p2p.BIP157_P2P_DISPATCH_PRESENT (handlers in peer.lua:854)
+  -- The third is currently false in p2p.lua because peer.lua:854 has
+  -- no BIP-157 case branches.  So even with (a) AND (b) true, the
+  -- bit stays dark — advertising would lie to peers.
+  local bit = require("bit")
+  local s = p2p.our_services(true, true, {
+    peerblockfilters = true,
+    blockfilterindex_enabled = true,
+  })
+  expect_false(bit.band(s, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "gate plumbed correctly — third condition (dispatch present) is false")
+  -- Same call without opts also leaves the bit dark.
+  local s2 = p2p.our_services(true, true)
+  expect_false(bit.band(s2, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "no opts table → no advertisement")
 end)
 
-test("G13-c: source confirms no compactfilters parameter", function()
-  local src = read_file("src/p2p.lua")
-  expect_false(src:find("compactfilters", 1, true) ~= nil,
-    "our_services accepts compactfilters arg — fix landed")
+test("G13-c: FIX-71 — source-level regression guard rejects unconditional OR", function()
+  -- Forward-regression guard: assert no source file unconditionally
+  -- ORs NODE_COMPACT_FILTERS into a service bitfield.  Any new wiring
+  -- must go through should_advertise_compact_filters().
+  for _, path in ipairs({"src/p2p.lua", "src/peer.lua", "src/peerman.lua",
+                          "src/main.lua"}) do
+    local src = read_file(path)
+    -- Match `bit.bor(...NODE_COMPACT_FILTERS...)` ONLY if the line is
+    -- gated by `should_advertise_compact_filters`.  We scan line-by-line
+    -- and check each occurrence.  In p2p.lua's our_services() the OR is
+    -- inside `if ... should_advertise_compact_filters(compactfilters)`.
+    for line in src:gmatch("[^\n]+") do
+      if line:find("bit%.bor.*NODE_COMPACT_FILTERS") then
+        -- This is the gated OR inside our_services.  Verify the
+        -- enclosing function has the gate call.
+        local idx = src:find(line, 1, true)
+        if idx then
+          local window = src:sub(math.max(1, idx - 400), idx)
+          expect_true(window:find("should_advertise_compact_filters") ~= nil,
+            "unconditional NODE_COMPACT_FILTERS OR found in " .. path
+            .. " — must be gated by should_advertise_compact_filters")
+        end
+      end
+    end
+  end
+end)
+
+test("G13-d: FIX-71 — gate function signature + BIP157_P2P_DISPATCH_PRESENT", function()
+  -- Documentation gate: when peer.lua:854 dispatch is registered, set
+  -- p2p.BIP157_P2P_DISPATCH_PRESENT = true and the gate flips
+  -- automatically.  This test asserts the flag exists and is currently
+  -- false (the canonical signal for the dispatch-absence state).
+  expect_eq(type(p2p.should_advertise_compact_filters), "function",
+    "p2p.should_advertise_compact_filters exists")
+  expect_eq(p2p.BIP157_P2P_DISPATCH_PRESENT, false,
+    "BIP157_P2P_DISPATCH_PRESENT is false — peer.lua:854 dispatch still absent")
+  -- Drilling all 3 conditions true (overriding the dispatch flag for
+  -- the call) DOES set the bit — proves the gate wires correctly.
+  local bit = require("bit")
+  local s = p2p.our_services(false, false, {
+    peerblockfilters = true,
+    blockfilterindex_enabled = true,
+    bip157_dispatch_present = true,  -- override module-level flag
+  })
+  expect_true(bit.band(s, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "with all 3 conditions true (including override), bit DOES set")
+end)
+
+test("G13-e: FIX-71 — partial conditions leave the bit dark", function()
+  local bit = require("bit")
+  -- peerblockfilters=true, others default → dark
+  local s1 = p2p.our_services(false, false, {peerblockfilters = true})
+  expect_false(bit.band(s1, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "peerblockfilters alone → bit dark (blockfilterindex_enabled missing)")
+  -- blockfilterindex_enabled=true only → dark
+  local s2 = p2p.our_services(false, false, {blockfilterindex_enabled = true})
+  expect_false(bit.band(s2, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "blockfilterindex_enabled alone → bit dark (peerblockfilters missing)")
+  -- Both opts true but module-level dispatch flag still false → dark
+  local s3 = p2p.our_services(false, false, {
+    peerblockfilters = true,
+    blockfilterindex_enabled = true,
+  })
+  expect_false(bit.band(s3, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "(a)+(b) true but (c) BIP157_P2P_DISPATCH_PRESENT=false → bit dark")
+  bug("BUG-2", "P0-WIRE (gate plumbed correctly, awaits peer.lua:854 dispatch)")
 end)
 
 -- ---------------------------------------------------------------------------
