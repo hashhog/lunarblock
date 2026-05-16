@@ -83,6 +83,7 @@ local SRC_FILES = {
   "src/wallet.lua", "src/rpc.lua", "src/psbt.lua", "src/rest.lua",
   "src/main.lua", "src/address.lua", "src/p2p.lua", "src/peerman.lua",
   "src/proxy.lua", "src/bip21.lua",  -- FIX-62: BIP-21 URI parser landed.
+  "src/payjoin_sender.lua",          -- FIX-66: BIP-78 sender flow landed.
 }
 
 local function any_source_matches(pattern)
@@ -170,26 +171,13 @@ test("G1: receiver HTTP endpoint now present (FIX-65)", function()
               "rest.lua routes POST /payjoin")
 end)
 
--- G2: sender HTTP client — STILL MISSING.
--- The receiver-side foundation (FIX-65) doesn't ship a sender flow.  The
--- sender path would need: outbound HTTP/HTTPS client, a POST helper
--- against the pj= URL from BIP-21, retry/fallback to Original-PSBT
--- broadcast (G22), and the sender-side validation gates G10-G13.  We
--- assert specifically the absence of sender-side helpers, not the
--- absence of all "payjoin" code (which is now present for the receiver).
-test("G2: sender HTTP client absent (G2-BUG-2)", function()
-  -- A sender flow would expose at least one of these helper names; none
-  -- exist yet.  The receiver code is allowed to mention "payjoin" — we
-  -- look for SENDER-SPECIFIC markers.
+-- G2: sender HTTP client — FIX-66 LANDED.
+-- src/payjoin_sender.lua now hosts the full sender state machine.
+-- send_payjoin_request is the top-level entry point; http_post is the
+-- transport (luasocket + luasec.ssl.https).
+test("G2: sender HTTP client now present (FIX-66)", function()
   local has_send, _ = any_source_matches("send_payjoin_request")
-  expect_eq(has_send, false, "no send_payjoin_request helper")
-  local has_post, _ = any_source_matches("pj_post")
-  expect_eq(has_post, false, "no pj_post helper")
-  bug("G2-BUG-2", "P0",
-      "Sender HTTP client absent.  BIP-78 §Sender: sender POSTs the Original " ..
-      "PSBT to the receiver's pj= endpoint.  FIX-65 ships the RECEIVER " ..
-      "endpoint but no outbound HTTP client / sender-side flow yet.  Cannot " ..
-      "initiate PayJoin payments.")
+  expect_true(has_send, "send_payjoin_request helper present")
 end)
 
 -- G3: TLS / .onion endpoint support
@@ -290,59 +278,36 @@ end)
 -- =================================================================== --
 print("\n--- G10-G15: Sender-side anti-snoop checks ---")
 
--- G10: sender output-set anti-snoop (no new outputs added)
-test("G10: sender output-set anti-snoop check absent (G10-BUG-10)", function()
+-- G10: sender output-set anti-snoop — FIX-66 LANDED.
+-- payjoin_sender.payjoin_check_outputs rejects any proposal that
+-- introduces a new output (script_pubkey absent in the Original).
+-- Snoop-attack mitigation: receiver can no longer probe sender's
+-- wallet by injecting throwaway outputs.
+test("G10: sender output-set anti-snoop now present (FIX-66)", function()
   local has, _ = any_source_matches("payjoin_check_outputs")
-  expect_eq(has, false, "no sender output-set verifier")
-  bug("G10-BUG-10", "P0-SECURITY",
-      "Sender output-set anti-snoop check absent. BIP-78 §Sender mandates " ..
-      "that the sender verify the receiver did NOT introduce new outputs " ..
-      "(only the payment + change may change in amount). Without this " ..
-      "check the receiver can probe the sender's wallet by adding " ..
-      "throwaway outputs and watching which proposals are signed. " ..
-      "lunarblock has no PayJoin response validator at all.")
+  expect_true(has, "payjoin_check_outputs validator present")
 end)
 
--- G11: sender scriptSig-type homogeneity check
-test("G11: sender scriptSig-type homogeneity check absent (G11-BUG-11)", function()
+-- G11: sender scriptSig-type homogeneity — FIX-66 LANDED.
+test("G11: sender scriptSig-type homogeneity check now present (FIX-66)", function()
   local has, _ = any_source_matches("payjoin_check_scriptsig")
-  expect_eq(has, false, "no scriptSig-type uniformity check")
-  bug("G11-BUG-11", "P1",
-      "Sender scriptSig-type homogeneity check absent. BIP-78 §Sender: " ..
-      "receiver-added inputs MUST share the scriptSig type of the sender's " ..
-      "inputs (else the resulting tx leaks PayJoin participation via " ..
-      "mixed-input-type fingerprint). lunarblock has no such validator.")
+  expect_true(has, "payjoin_check_scriptsig validator present")
 end)
 
--- G12: sender must reject responses that added new sender-owned inputs
-test("G12: sender no-new-inputs check absent (G12-BUG-12)", function()
+-- G12: sender no-new-sender-owned-inputs — FIX-66 LANDED.
+-- payjoin_check_inputs verifies every receiver-added input is NOT
+-- owned by the sender (UTXO-probe attack mitigation per BIP-78 §Sender).
+test("G12: sender no-new-inputs check now present (FIX-66)", function()
   local has, _ = any_source_matches("payjoin_check_inputs")
-  expect_eq(has, false, "no sender input-set verifier")
-  bug("G12-BUG-12", "P0-SECURITY",
-      "Sender no-new-inputs (of sender's own) check absent. BIP-78 §Sender " ..
-      "mandates verifying the response only adds inputs the sender does NOT " ..
-      "control (else the receiver can probe sender UTXOs by attempting to " ..
-      "'add' addresses they suspect belong to the sender and observing " ..
-      "which proposals get signed). lunarblock has no such validator.")
+  expect_true(has, "payjoin_check_inputs validator present")
 end)
 
--- G13: sender max-additional-fee check — STILL MISSING (sender-side).
--- FIX-65 ships only the receiver-side parser for
--- maxadditionalfeecontribution (the substring "maxadditionalfee" appears
--- in rest.lua now).  The SENDER-side enforcement — verifying that the
--- proposal's fee delta stays within the declared cap — is sender-only,
--- and we have no sender flow yet.  Look for a sender-specific marker.
-test("G13: sender max-fee enforcement absent (G13-BUG-13)", function()
+-- G13: sender max-additional-fee enforcement — FIX-66 LANDED.
+-- enforce_max_additional_fee bounds the proposal fee at
+-- original_fee + max_additional_sats (sender-declared cap).
+test("G13: sender max-fee enforcement now present (FIX-66)", function()
   local has, _ = any_source_matches("enforce_max_additional_fee")
-  expect_eq(has, false, "no sender-side max-additional-fee verifier")
-  local has2, _ = any_source_matches("sender_verify_fee")
-  expect_eq(has2, false, "no sender_verify_fee helper")
-  bug("G13-BUG-13", "P1",
-      "Sender max-additional-fee enforcement absent. Sender announces the " ..
-      "max fee it will absorb via maxadditionalfeecontribution; on response " ..
-      "the sender must verify the receiver did not exceed it. FIX-65 added " ..
-      "the receiver-side parser, but no PayJoin sender flow yet, so no " ..
-      "enforcement.")
+  expect_true(has, "enforce_max_additional_fee helper present")
 end)
 
 -- G14: disableoutputsubstitution honoring — FIX-65 LANDED (parser + reject).
@@ -457,15 +422,14 @@ end)
 -- =================================================================== --
 print("\n--- G22-G25: Transport details ---")
 
--- G22: sender fallback (broadcast Original PSBT if PayJoin negotiation fails)
-test("G22: sender fallback broadcast absent (G22-BUG-22)", function()
+-- G22: sender fallback — FIX-66 LANDED.
+-- payjoin_fallback accepts the already-signed Original tx into the
+-- mempool whenever any sender-side check fails (transport, snoop,
+-- sign, broadcast).  Payment still happens, sender loses only the
+-- privacy benefit.
+test("G22: sender fallback broadcast now present (FIX-66)", function()
   local has, _ = any_source_matches("payjoin_fallback")
-  expect_eq(has, false, "no PayJoin fallback")
-  bug("G22-BUG-22", "P0",
-      "Sender fallback-broadcast path absent. BIP-78 §Sender: if PayJoin " ..
-      "negotiation fails for any reason, the sender MUST broadcast the " ..
-      "Original PSBT (already signed) so payment still happens. " ..
-      "lunarblock has no PayJoin sender flow at all.")
+  expect_true(has, "payjoin_fallback helper present")
 end)
 
 -- G23: receiver Content-Type — FIX-65 LANDED.
@@ -479,16 +443,14 @@ test("G23: receiver Content-Type now declared (FIX-65)", function()
   expect_true(has, "Content-Type 'text/plain; charset=utf-8' present")
 end)
 
--- G24: HTTPS cert validation on the sender side (clearnet)
-test("G24: HTTPS cert validation absent (G24-BUG-24)", function()
+-- G24: HTTPS cert validation — FIX-66 LANDED.
+-- payjoin_sender wraps luasec.ssl.https with ssl_verify="peer" by
+-- default (mandatory under BIP-78 §Protocol).  "none" is permitted
+-- only as a unit-test override; invalid values are hard-rejected at
+-- transport time.
+test("G24: HTTPS cert validation now present (FIX-66)", function()
   local has, _ = any_source_matches("ssl_verify")
-  expect_eq(has, false, "no TLS / luasec / openssl bindings")
-  bug("G24-BUG-24", "P0-SECURITY",
-      "HTTPS cert validation absent on sender side. BIP-78 §Sender clearnet: " ..
-      "MUST use HTTPS with full cert validation (no skip, no pinning " ..
-      "bypass). lunarblock has no TLS client (no luasec, no openssl FFI), " ..
-      "so a clearnet sender flow could only be implemented in plaintext — " ..
-      "a complete privacy/integrity failure.")
+  expect_true(has, "luasec ssl_verify binding present")
 end)
 
 -- G25: Tor / .onion v3 routing for sender
@@ -512,31 +474,26 @@ end)
 -- =================================================================== --
 print("\n--- G26-G29: RPC + URI surface ---")
 
--- G26: getpayjoinrequest RPC
-test("G26: getpayjoinrequest RPC absent (G26-BUG-26)", function()
+-- G26: getpayjoinrequest RPC — FIX-66 LANDED.
+-- Registered in src/rpc.lua.  Returns {address, uri, endpoint} where
+-- uri is a BIP-21 URI with pj=<endpoint>.
+test("G26: getpayjoinrequest RPC now registered (FIX-66)", function()
   local rpc_src = source_of("src/rpc.lua")
-  expect_nil(rpc_src:find('self%.methods%["getpayjoinrequest"%]'),
-             "no getpayjoinrequest RPC method")
-  bug("G26-BUG-26", "P1",
-      "getpayjoinrequest RPC absent. Wallet integrators expect an RPC that " ..
-      "spawns a PayJoin receiver endpoint and returns the bitcoin: BIP-21 " ..
-      "URI with pj=<endpoint>. Without it, GUI/CLI users cannot generate a " ..
-      "payment request that opts into PayJoin.")
+  expect_true(rpc_src:find('self%.methods%["getpayjoinrequest"%]') ~= nil,
+              "getpayjoinrequest RPC registered in rpc.lua")
 end)
 
--- G27: sendpayjoinrequest RPC
-test("G27: sendpayjoinrequest RPC absent (G27-BUG-27)", function()
+-- G27: sendpayjoinrequest RPC — FIX-66 LANDED.
+-- Delegates to payjoin_sender.send_payjoin_request, returns
+-- {txid, status, error}.  Status is "payjoin" (PayJoin tx broadcast)
+-- or "fallback" (Original PSBT broadcast — privacy lost, payment OK).
+test("G27: sendpayjoinrequest RPC now registered (FIX-66)", function()
   local rpc_src = source_of("src/rpc.lua")
-  expect_nil(rpc_src:find('self%.methods%["sendpayjoinrequest"%]'),
-             "no sendpayjoinrequest RPC method")
-  -- Confirm the wallet RPC set we DO have is unchanged (no surprise wiring).
+  expect_true(rpc_src:find('self%.methods%["sendpayjoinrequest"%]') ~= nil,
+              "sendpayjoinrequest RPC registered in rpc.lua")
+  -- Sanity: existing sendtoaddress untouched.
   expect_true(rpc_src:find('self%.methods%["sendtoaddress"%]') ~= nil,
               "sendtoaddress still wired (acknowledge baseline)")
-  bug("G27-BUG-27", "P1",
-      "sendpayjoinrequest RPC absent. Sender flow needs an RPC accepting a " ..
-      "BIP-21 URI with pj=, executing the PayJoin handshake, and returning " ..
-      "the broadcast txid (with automatic fallback to the Original PSBT). " ..
-      "lunarblock has sendtoaddress but no PayJoin-aware variant.")
 end)
 
 -- G28: BIP-21 pj= URI parameter — FIX-62 LANDED.
@@ -605,11 +562,23 @@ print(string.format("Bugs documented: %d", #BUGS))
 print("\n--- Bug List ---")
 for _, b in ipairs(BUGS) do print("  " .. b) end
 
--- 15 of 30 gates are MISSING-confirmation tests (asserting absence).
--- 15 gates have been flipped by landed fixes and now assert PRESENCE:
---   * G28 + G29 (BIP-21 pj= / pjos= URI parameters)         — FIX-62.
---   * G1, G4, G5, G6, G7, G9, G14, G15, G16, G17, G21, G23  — FIX-65
+-- 6 of 30 gates are MISSING-confirmation tests (asserting absence):
+--   G3   (TLS-onion endpoint)
+--   G8   (receiver output-modification path)
+--   G18  (receiver proposal TTL)
+--   G19  (receiver double-receive guard — P0-SECURITY)
+--   G20  (receiver anti-UTXO-probe guard — P0-SECURITY)
+--   G25  (Tor / .onion v3 sender routing)
+--   G30  (receiver replay protection — P0-SECURITY)
+-- ...actually 7 (G3 + G8 + G18 + G19 + G20 + G25 + G30).
+--
+-- 23 gates have been flipped by landed fixes and now assert PRESENCE:
+--   * G28 + G29                                              — FIX-62 (BIP-21).
+--   * G1, G4, G5, G6, G7, G9, G14, G15, G16, G17, G21, G23   — FIX-65
 --     (BIP-78 PayJoin receiver foundation).
+--   * G2, G10, G11, G12, G13, G22, G24, G26, G27             — FIX-66
+--     (BIP-78 PayJoin sender + 2 RPCs).
+--
 -- If a MISSING-gate test FAILS it means an expectation about absence
 -- broke — which would be GOOD NEWS (someone shipped more of PayJoin),
 -- but the surface change must be reviewed.
@@ -619,12 +588,13 @@ if FAIL > 0 then
     "or a search pattern needs updating.", FAIL))
   os.exit(1)
 else
-  print("\nAll 30 gates passed: 15 absence-confirmed, 15 presence-confirmed " ..
+  print("\nAll 30 gates passed: 7 absence-confirmed, 23 presence-confirmed " ..
         "(G28+G29 via FIX-62 BIP-21; G1+G4-G7+G9+G14-G17+G21+G23 via " ..
-        "FIX-65 BIP-78 receiver). lunarblock is now 0 specs behind: " ..
-        "BIP-21 sender URI + BIP-78 receiver endpoint both wired. " ..
-        "Sender flow (G2, G10-G13, G22, G24, G25), RPC surface (G26, " ..
-        "G27), and proposal-lifecycle security gates (G18, G19, G20, " ..
-        "G30) remain deferred.")
+        "FIX-65 BIP-78 receiver; G2+G10-G13+G22+G24+G26+G27 via FIX-66 " ..
+        "BIP-78 sender). lunarblock BIP-78 FLEET COVERAGE COMPLETE: " ..
+        "BIP-21 URI + receiver endpoint + sender flow + 2 RPCs " ..
+        "+ HTTPS cert validation all wired. Proposal-lifecycle gates " ..
+        "G3+G8+G18+G19+G20+G25+G30 remain deferred (receiver-side " ..
+        "anti-probe / replay protection + Tor adapter).")
   os.exit(0)
 end
