@@ -1153,7 +1153,12 @@ function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override, is_
     use_v2 = not self.config.nov2transport
   end
   local p = peer_mod.new(ip, port, self.network, self.our_height, use_v2, self.proxy_config,
-                         self.config.peerbloomfilters, self.config.prune_mode)
+                         self.config.peerbloomfilters, self.config.prune_mode,
+                         {
+                           -- FIX-71 W121 BUG-2: NODE_COMPACT_FILTERS gate inputs.
+                           peerblockfilters = self.config.peerblockfilters,
+                           blockfilterindex_enabled = self.config.blockfilterindex_enabled,
+                         })
   -- Register all our message handlers
   for cmd, handler in pairs(self.message_handlers) do
     p:on(cmd, handler)
@@ -1691,7 +1696,12 @@ function PeerManager:accept_inbound()
 
   local inbound_v2 = not self.config.nov2transport
   local p = peer_mod.new(ip, port, self.network, self.our_height, inbound_v2, nil,
-                         self.config.peerbloomfilters, self.config.prune_mode)
+                         self.config.peerbloomfilters, self.config.prune_mode,
+                         {
+                           -- FIX-71 W121 BUG-2: NODE_COMPACT_FILTERS gate inputs.
+                           peerblockfilters = self.config.peerblockfilters,
+                           blockfilterindex_enabled = self.config.blockfilterindex_enabled,
+                         })
   p.socket = client
   p.state = peer_mod.STATE.CONNECTED
   p.inbound = true

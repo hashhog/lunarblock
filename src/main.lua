@@ -53,6 +53,11 @@ local function default_args()
     zmqpubhwm = 1000,  -- ZMQ high water mark
     nov2transport = false,  -- Disable BIP324 v2 transport
     peerbloomfilters = false, -- BIP-35 / NODE_BLOOM: matches Core DEFAULT_PEERBLOOMFILTERS=false (net_processing.h)
+    peerblockfilters = false, -- BIP-157 / NODE_COMPACT_FILTERS: matches Core DEFAULT_PEERBLOCKFILTERS=false (init.cpp:993).
+                              -- FIX-71 W121 BUG-2: gate plumbed but currently always false at advertisement time because
+                              -- peer.lua:854 has no BIP-157 case branches (p2p.lua BIP157_P2P_DISPATCH_PRESENT=false).
+                              -- When future P2P fix wave lands the dispatch + flips the flag, this CLI bit alone enables
+                              -- the advertisement (assuming --blockfilterindex is also on, matching Core).
     import_blocks = nil,   -- Path to framed block file for import (or "-" for stdin)
     import_utxo = nil,     -- Path to Core-format UTXO snapshot file for AssumeUTXO import
     -- Operational-parity flags (mirrors Bitcoin Core init.cpp + util/system.cpp)
@@ -121,6 +126,7 @@ local function parse_args(argv)
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --txindex                   Maintain a full transaction index (txid → blockhash) for getrawtransaction")
       print("      --blockfilterindex          Maintain a BIP-157/158 basic block-filter index (compact filters per block)")
+      print("      --peerblockfilters BOOL     Advertise NODE_COMPACT_FILTERS service bit (default: 0; requires --blockfilterindex AND BIP-157 P2P dispatch)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
       print("      --import-utxo FILE          Import UTXO snapshot from Core dumptxoutset file (AssumeUTXO)")
       print("      --pid PATH                  Path to PID file (default: <datadir>/lunarblock.pid)")
@@ -214,6 +220,25 @@ local function parse_args(argv)
       i = i + 1
       local v = argv[i]
       args.peerbloomfilters = (v == "1" or v == "true" or v == "yes" or v == "on")
+    elseif arg == "--peerblockfilters" or arg:match("^%-%-peerblockfilters=") then
+      -- FIX-71 W121 BUG-2: opt-in to advertising NODE_COMPACT_FILTERS to
+      -- peers.  Mirrors bitcoin-core init.cpp:993 -peerblockfilters.
+      -- Setting this WITHOUT --blockfilterindex is a no-op (the gate in
+      -- p2p.should_advertise_compact_filters() requires both).  Core
+      -- treats the same combination as an init error; lunarblock chooses
+      -- silent no-op to keep the gate simple and stay loud-error-free
+      -- in the start_testnet4.sh / start_mainnet.sh paths.  Also
+      -- requires p2p.BIP157_P2P_DISPATCH_PRESENT=true — currently false
+      -- because peer.lua:854 has no BIP-157 case branches; the gate
+      -- structurally returns false until the dispatch lands.
+      local v = arg:match("^%-%-peerblockfilters=(.*)$")
+      if v == nil then
+        i = i + 1
+        v = argv[i]
+        args.peerblockfilters = (v == "1" or v == "true" or v == "yes" or v == "on")
+      else
+        args.peerblockfilters = (v == "1" or v == "true" or v == "yes" or v == "on")
+      end
     elseif arg == "--txindex" or arg:match("^%-%-txindex=") then
       -- Pattern C0 (2026-05-06): enable inline txindex maintenance.
       -- Accepts "--txindex" (bare) or "--txindex=BOOL".  Mirrors
@@ -1163,6 +1188,16 @@ local function main()
     -- in our outbound version handshake.  args.prune > 0 selects between
     -- archive-mode and limited-archive serving.
     prune_mode = (type(args.prune) == "number" and args.prune > 0),
+    -- FIX-71 W121 BUG-2: NODE_COMPACT_FILTERS advertisement gate inputs.
+    -- The gate function p2p.should_advertise_compact_filters() AND's
+    -- three signals; the third (BIP157_P2P_DISPATCH_PRESENT) is module-
+    -- level in p2p.lua and currently false because peer.lua:854 has no
+    -- BIP-157 case branches.  When the future P2P fix wave lands the
+    -- dispatch, no change is needed here — the module-level flag flips
+    -- and the gate evaluates true (assuming the operator opted in via
+    -- --peerblockfilters AND --blockfilterindex).
+    peerblockfilters = args.peerblockfilters,
+    blockfilterindex_enabled = args.blockfilterindex,
     data_dir = datadir,
   })
   peer_manager.our_height = header_chain.header_tip_height
