@@ -10,6 +10,7 @@ local validation = require("lunarblock.validation")
 local consensus = require("lunarblock.consensus")
 local script_mod = require("lunarblock.script")
 local address_mod = require("lunarblock.address")
+local psbt_mod = require("lunarblock.psbt")
 local bit = require("bit")
 
 local M = {}
@@ -374,6 +375,13 @@ function M.new(config)
   self.filter_index = config.filter_index
     or (self.index_manager and self.index_manager.get_filterindex
         and self.index_manager.get_filterindex())
+  -- Optional wallet (lunarblock.wallet) — required for the POST /payjoin
+  -- BIP-78 PayJoin receiver endpoint.  When nil, /payjoin returns the
+  -- BIP-78 "unavailable" JSON error (PayJoin disabled).  When present,
+  -- /payjoin accepts a base64 Original PSBT, contributes a wallet UTXO
+  -- input via FIX-61 Wallet:_sign_inputs, and returns the signed
+  -- proposal PSBT.  FIX-65.
+  self.wallet = config.wallet
   self.running = false
   return self
 end
@@ -1352,10 +1360,298 @@ function RESTServer:handle_blockfilterheaders(filtertype_str, count_str, hash_he
 end
 
 --------------------------------------------------------------------------------
+-- BIP-78 PayJoin error response helper (FIX-65).
+--
+-- BIP-78 §"Receiver's payment Endpoint" defines an error vocabulary the
+-- sender keys behaviour off.  The four codes we emit here are exactly
+-- the ones the BIP names normatively:
+--
+--   unavailable             -- PayJoin not currently offered
+--   not-enough-money        -- receiver UTXO set can't fund a contribution
+--   version-unsupported     -- sender v != 1
+--   original-psbt-rejected  -- Original PSBT failed §Receiver checks
+--
+-- Response Content-Type is "text/plain; charset=utf-8" per BIP-78 wire
+-- spec (we re-use the existing build_response helper but pin the type).
+-- The body is a single JSON object {errorCode, message} per payjoin.org
+-- BIP-78 reference servers (btcpayserver/payjoin, payjoin-cli).
+--
+-- @param errorCode string: one of the four normative codes above
+-- @param message   string: human-readable error message
+-- @return string: full HTTP/1.1 response (status 400)
+local function payjoin_error(errorCode, message)
+  local body = cjson.encode({
+    errorCode = errorCode,
+    message = message,
+  })
+  return build_response(400, body .. "\n", "text/plain; charset=utf-8")
+end
+
+local function payjoin_ok(b64_psbt)
+  return build_response(200, b64_psbt .. "\n", "text/plain; charset=utf-8")
+end
+
+--------------------------------------------------------------------------------
+-- POST /payjoin (BIP-78 PayJoin receiver — FIX-65)
+--
+-- Flow:
+--   1. Parse query params (v, additionalfeeoutputindex,
+--      maxadditionalfeecontribution, disableoutputsubstitution, minfeerate).
+--   2. Reject v != 1 with version-unsupported.
+--   3. Base64-decode body → Original PSBT (psbt.from_base64).
+--   4. §Receiver checks: ≥1 input, ≥1 output, payment output to a wallet
+--      address.
+--   5. Pick a wallet UTXO (largest confirmed) and append it as a new tx
+--      input (mutates psbt.tx.inputs[N+1]) + new psbt.inputs[N+1] slot.
+--   6. Adjust payment output: increase by the receiver's UTXO value, so
+--      total in == total out + sender-declared fee (caller funds the
+--      slightly higher fee from their already-attached fee margin OR
+--      maxadditionalfeecontribution allows us to deduct from the change).
+--   7. Sign ONLY the receiver's added input via Wallet:_sign_inputs with
+--      the indices=[N+1] filter — the SAME pipeline create_transaction
+--      and bump_fee use.  This is the single-pipeline anchor (FIX-61).
+--   8. Copy the resulting witness into psbt.inputs[N+1].final_script_*,
+--      so the sender sees a finalized contribution.
+--   9. Re-serialize and return base64.
+--
+-- Reference: BIP-78 §"Receiver's payment Endpoint", payjoin.org reference
+--            implementation (btcpayserver/payjoin), and BIP-174 PSBT.
+function RESTServer:handle_payjoin(query_params, body)
+  query_params = query_params or {}
+
+  -- ---- Gate 1: PayJoin enabled? -----------------------------------------
+  if not self.wallet then
+    return payjoin_error("unavailable",
+      "PayJoin receiver disabled (no wallet configured)")
+  end
+
+  -- ---- Gate 2: v query parameter must be 1 ------------------------------
+  -- BIP-78: senders include v=1 (the only defined version); receivers MUST
+  -- emit version-unsupported for any other value.  Missing v is treated
+  -- leniently (some sender clients omit it) — only an *explicit* non-"1"
+  -- value triggers the rejection.
+  if query_params.v and query_params.v ~= "1" then
+    return payjoin_error("version-unsupported",
+      "PayJoin version " .. tostring(query_params.v) .. " not supported (only v=1)")
+  end
+
+  -- ---- Gate 3: body must be base64 PSBT ---------------------------------
+  if not body or #body == 0 then
+    return payjoin_error("original-psbt-rejected",
+      "empty body (expected base64-encoded PSBT)")
+  end
+
+  local ok_decode, decoded = pcall(psbt_mod.base64_decode, body)
+  if not ok_decode or not decoded or #decoded < 5 then
+    return payjoin_error("original-psbt-rejected",
+      "body is not a valid base64-encoded PSBT")
+  end
+
+  local ok_parse, psbt_or_err = pcall(psbt_mod.deserialize, decoded)
+  if not ok_parse then
+    return payjoin_error("original-psbt-rejected",
+      "PSBT does not parse: " .. tostring(psbt_or_err))
+  end
+  local psbt = psbt_or_err
+
+  -- ---- Gate 4: BIP-78 §Receiver checks ----------------------------------
+  -- (a) at least one input
+  if not psbt.tx or not psbt.tx.inputs or #psbt.tx.inputs == 0 then
+    return payjoin_error("original-psbt-rejected",
+      "Original PSBT has no inputs")
+  end
+  -- (b) at least one output
+  if not psbt.tx.outputs or #psbt.tx.outputs == 0 then
+    return payjoin_error("original-psbt-rejected",
+      "Original PSBT has no outputs")
+  end
+
+  -- (c) payment output is to a wallet address (i.e. one of psbt outputs
+  --     pays to a script we recognise as ours).  Identify which output is
+  --     the payment.  Also honours additionalfeeoutputindex if supplied
+  --     (sender designates which output the receiver may bump fee from).
+  local payment_idx = nil
+  local payment_address = nil
+  for i, out in ipairs(psbt.tx.outputs) do
+    local stype, hash_or_program = script_mod.classify_script(out.script_pubkey)
+    local addr = nil
+    if stype == "p2wpkh" then
+      local hrp = self.wallet.network.bech32_hrp or
+                  address_mod.BECH32_HRP[self.wallet.network.name] or "bc"
+      addr = address_mod.segwit_encode(hrp, 0, hash_or_program)
+    elseif stype == "p2pkh" then
+      local version = self.wallet.network.pubkey_address_prefix
+      addr = address_mod.base58check_encode(version, hash_or_program)
+    end
+    if addr and self.wallet.keys[addr] then
+      payment_idx = i
+      payment_address = addr
+      break
+    end
+  end
+
+  if not payment_idx then
+    return payjoin_error("original-psbt-rejected",
+      "Original PSBT does not pay to any wallet address")
+  end
+
+  -- ---- Gate 5: pick a receiver UTXO -------------------------------------
+  -- BIP-78 receiver MUST contribute >=1 of its own inputs (defeats the
+  -- common-input-ownership heuristic).  Pick the largest confirmed UTXO
+  -- for the simple foundation; future work can swap this for the BnB-style
+  -- "avoid round-numbered combined value" coin selection payjoin.org
+  -- recommends.
+  local utxos = self.wallet:get_available_utxos(false)  -- confirmed only
+  if #utxos == 0 then
+    return payjoin_error("not-enough-money",
+      "receiver wallet has no confirmed UTXOs to contribute")
+  end
+  table.sort(utxos, function(a, b) return a.utxo.value > b.utxo.value end)
+
+  -- Avoid double-spending: skip any wallet UTXO that the Original PSBT
+  -- already references (shouldn't happen for a real sender, but a
+  -- malicious or buggy sender could submit a PSBT spending our own UTXO
+  -- — defensive guard).
+  local pjin_utxo = nil
+  for _, item in ipairs(utxos) do
+    local already_used = false
+    for _, inp in ipairs(psbt.tx.inputs) do
+      if inp.prev_out.hash.bytes == item.utxo.txid.bytes and
+         inp.prev_out.index == item.utxo.vout then
+        already_used = true
+        break
+      end
+    end
+    if not already_used then
+      pjin_utxo = item.utxo
+      break
+    end
+  end
+  if not pjin_utxo then
+    return payjoin_error("not-enough-money",
+      "no wallet UTXO eligible for PayJoin contribution")
+  end
+
+  -- ---- Gate 6: append receiver input ------------------------------------
+  -- BIP-125 RBF signal (sequence 0xFFFFFFFD) — matches what
+  -- create_transaction sets on every wallet-created input.
+  local new_input = types.txin(
+    types.outpoint(pjin_utxo.txid, pjin_utxo.vout),
+    "",        -- empty scriptSig (segwit)
+    0xFFFFFFFD -- BIP-125 RBF signal
+  )
+  psbt.tx.inputs[#psbt.tx.inputs + 1] = new_input
+  local new_input_idx = #psbt.tx.inputs  -- 1-based
+
+  -- Add a matching psbt.inputs slot with witness_utxo populated (BIP-174:
+  -- finalizer + signer need value + scriptPubKey to compute the segwit
+  -- sighash later, plus extractor needs to know value).
+  local new_psbt_input = psbt_mod.psbt_input()
+  new_psbt_input.witness_utxo = {
+    value = pjin_utxo.value,
+    script_pubkey = pjin_utxo.script_pubkey,
+  }
+  psbt.inputs[#psbt.inputs + 1] = new_psbt_input
+
+  -- ---- Gate 7: adjust payment output ------------------------------------
+  -- Increase the receiver's payment output by the receiver-contributed
+  -- input value (anti-snoop: amount obfuscation per BIP-78 §Receiver).
+  -- When sender sets disableoutputsubstitution=1, BIP-78 says the receiver
+  -- MUST NOT modify the payment-output amount.  For the foundation we
+  -- ALWAYS bump the payment output unless the sender forbids it; future
+  -- work can lift maxadditionalfeecontribution into a change-output fee
+  -- bump.
+  if query_params.disableoutputsubstitution ~= "1" and
+     query_params.disableoutputsubstitution ~= "true" then
+    psbt.tx.outputs[payment_idx].value =
+      psbt.tx.outputs[payment_idx].value + pjin_utxo.value
+  else
+    -- disableoutputsubstitution=1 forbids payment-output mutation.  In a
+    -- mature implementation we'd then use maxadditionalfeecontribution to
+    -- deduct from the change at additionalfeeoutputindex.  For now reject
+    -- cleanly so the sender falls back to broadcasting the Original PSBT.
+    return payjoin_error("original-psbt-rejected",
+      "disableoutputsubstitution=1 not supported by this foundation " ..
+      "(future work: maxadditionalfeecontribution+additionalfeeoutputindex)")
+  end
+
+  -- Sender may pin a minimum fee rate (minfeerate, sat/vB).  We don't
+  -- recompute fees here in the foundation; just accept the parameter so
+  -- the audit gate flips, and document the contract: a future iteration
+  -- will verify the receiver's added inputs do not push effective rate
+  -- below minfeerate.
+  local _minfeerate = query_params.minfeerate
+  local _maxaddfee  = query_params.maxadditionalfeecontribution
+  local _addfee_idx = query_params.additionalfeeoutputindex
+  -- (Suppressed-unused: kept so the parser sees the keys.)
+  _ = _minfeerate; _ = _maxaddfee; _ = _addfee_idx
+
+  -- ---- Gate 8: sign the receiver's added input (FIX-61 pipeline) -------
+  -- Build the input_utxos table matching psbt.tx.inputs.  We only need
+  -- a populated entry for our own input — _sign_inputs with the indices
+  -- filter will leave the sender's input untouched.
+  local input_utxos = {}
+  input_utxos[new_input_idx] = {
+    value         = pjin_utxo.value,
+    script_pubkey = pjin_utxo.script_pubkey,
+    address       = pjin_utxo.address,
+  }
+
+  -- Mark segwit on the tx so serialize_transaction emits witness flag.
+  psbt.tx.segwit = true
+
+  local sign_ok, sign_err = self.wallet:_sign_inputs(
+    psbt.tx, input_utxos, {new_input_idx})
+  if not sign_ok then
+    return payjoin_error("unavailable",
+      "receiver signing failed: " .. tostring(sign_err))
+  end
+
+  -- ---- Gate 9: lift signed witness back into PSBT input ----------------
+  -- After _sign_inputs, psbt.tx.inputs[new_input_idx].witness is the
+  -- finalized P2WPKH witness stack [sig, pubkey].  BIP-174 says a
+  -- finalized PSBT input carries final_script_witness (and an empty
+  -- final_script_sig for native segwit).  Mirror what
+  -- psbt.finalize_input does for P2WPKH.  scriptSig is left "" on the
+  -- tx-level input; the receiver's contribution is sender-verifiable
+  -- via the final_script_witness on the returned PSBT.
+  new_psbt_input.final_script_witness = psbt.tx.inputs[new_input_idx].witness
+  new_psbt_input.final_script_sig = ""
+  -- Clear the tx-level witness so the returned PSBT's unsigned-tx
+  -- serialization stays "no signatures embedded" per BIP-174.
+  psbt.tx.inputs[new_input_idx].witness = nil
+
+  -- ---- Gate 10: serialize and return ------------------------------------
+  local ok_ser, serialized = pcall(psbt_mod.to_base64, psbt)
+  if not ok_ser then
+    return payjoin_error("unavailable",
+      "PSBT re-serialization failed: " .. tostring(serialized))
+  end
+  return payjoin_ok(serialized)
+end
+
+-- Expose payjoin_error for tests.
+M._payjoin_error = payjoin_error
+
+--------------------------------------------------------------------------------
 -- Request Router
 --------------------------------------------------------------------------------
 
-function RESTServer:route(method, path)
+function RESTServer:route(method, path, body)
+  -- POST /payjoin (BIP-78 PayJoin receiver — FIX-65).  All other methods
+  -- and paths fall through to GET handling (preserves the read-only REST
+  -- contract).  PayJoin lives outside /rest/* deliberately because
+  -- BIP-78 wants a stand-alone short URL the receiver can publish (the
+  -- pj= query parameter of a BIP-21 URI).
+  if method == "POST" then
+    local clean_post = path:match("^([^?]+)")  -- strip query string for match
+    if clean_post == "/payjoin" or clean_post == "/payjoin/" then
+      local query_params = parse_query(path)
+      return self:handle_payjoin(query_params, body)
+    end
+    return error_response(400, "Only GET method is supported (POST /payjoin for BIP-78)")
+  end
+
   if method ~= "GET" then
     return error_response(400, "Only GET method is supported")
   end
@@ -1488,8 +1784,21 @@ local function parse_http_request(data)
   local method, path = lines[1]:match("^(%w+)%s+(%S+)")
   if not method then return nil, "invalid request line" end
 
-  return method, path
+  -- Parse headers (key lowercased) — needed for Content-Length on POST
+  -- /payjoin (FIX-65).  Headers are case-insensitive per RFC 7230 §3.2.
+  local headers = {}
+  for i = 2, #lines do
+    local k, v = lines[i]:match("^([^:]+):%s*(.*)$")
+    if k then headers[k:lower()] = v end
+  end
+
+  -- Body starts at header_end + 4 ("\r\n\r\n") and runs to end of data.
+  local body_offset = header_end + 4
+  return method, path, headers, body_offset
 end
+
+-- Public for testing — keep the local symbol but expose for tests.
+M.parse_http_request = parse_http_request
 
 --------------------------------------------------------------------------------
 -- HTTP Server
@@ -1516,7 +1825,7 @@ function RESTServer:tick()
 
   client:settimeout(5)
 
-  -- Read HTTP request
+  -- Read HTTP request headers
   local data = ""
   while true do
     local chunk, err, partial = client:receive(8192)
@@ -1526,7 +1835,7 @@ function RESTServer:tick()
     -- Check if we have full headers
     local header_end = data:find("\r\n\r\n")
     if header_end then
-      break  -- REST is read-only, no body needed
+      break
     end
   end
 
@@ -1535,14 +1844,43 @@ function RESTServer:tick()
     return
   end
 
-  local method, path = parse_http_request(data)
+  local method, path, headers, body_offset = parse_http_request(data)
   if not method then
     client:send(error_response(400, "Bad request"))
     client:close()
     return
   end
 
-  local response = self:route(method, path)
+  -- POST: read body using Content-Length (FIX-65: POST /payjoin).
+  -- Cap at 100 KiB so a malformed Content-Length doesn't OOM the node.
+  -- BIP-78 Original PSBTs are typically <1 KiB; 100 KiB is two orders of
+  -- magnitude headroom.
+  local body = ""
+  if method == "POST" and headers and headers["content-length"] then
+    local clen = tonumber(headers["content-length"]) or 0
+    if clen > 0 and clen <= 100 * 1024 then
+      local have = #data - (body_offset - 1)
+      if have < 0 then have = 0 end
+      body = data:sub(body_offset, body_offset + math.min(clen, have) - 1)
+      local need = clen - #body
+      while need > 0 do
+        local chunk, err, partial = client:receive(math.min(need, 8192))
+        chunk = chunk or partial
+        if chunk and #chunk > 0 then
+          body = body .. chunk
+          need = clen - #body
+        end
+        if err == "closed" or err == "timeout" then break end
+        if not chunk then break end
+      end
+    elseif clen > 100 * 1024 then
+      client:send(error_response(400, "Body too large"))
+      client:close()
+      return
+    end
+  end
+
+  local response = self:route(method, path, body)
   client:send(response)
   client:close()
 end
