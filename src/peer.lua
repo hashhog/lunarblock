@@ -926,6 +926,43 @@ function Peer:process_messages()
           )
         end
       end
+    elseif msg.command == "getcfilters" or
+           msg.command == "getcfheaders" or
+           msg.command == "getcfcheckpt" then
+      -- FIX-81 / W121 BUG-1: BIP-157 compact-filter request dispatch.
+      -- Three incoming wire messages (getcfilters / getcfheaders /
+      -- getcfcheckpt) require Core-parity validation and a server-side
+      -- response.  The dispatch is delegated to a registered handler
+      -- (main.lua peer_manager:register_handler) which has closure
+      -- access to chain_state / header_chain / storage / index_manager
+      -- needed to walk stop_index ancestors per Core's
+      -- PrepareBlockFilterRequest (net_processing.cpp:3262).
+      --
+      -- If no handler is registered (e.g. --blockfilterindex disabled),
+      -- silently drop — Core also does not respond when the index
+      -- isn't available (PrepareBlockFilterRequest falls through after
+      -- the supported_filter_type check fires).  Setting the
+      -- BIP157_P2P_DISPATCH_PRESENT flag without a handler would still
+      -- not advertise NODE_COMPACT_FILTERS because the gate's (b)
+      -- condition (blockfilterindex_enabled) AND'd in.
+      local handler = self.message_handlers[msg.command]
+      if handler then
+        handler(self, msg.payload)
+      end
+    elseif msg.command == "cfilter" or
+           msg.command == "cfheaders" or
+           msg.command == "cfcheckpt" then
+      -- FIX-81: response-side messages.  lunarblock is server-side only
+      -- for BIP-157 — we never issue getcfilters / getcfheaders /
+      -- getcfcheckpt to peers, so receiving these is unexpected.  Core
+      -- in client mode would route to CChainStateManager updates; here
+      -- we log via the registered handler (if any) and otherwise drop
+      -- silently.  Future BIP-157 client-mode work can register a
+      -- handler without changing the dispatch.
+      local handler = self.message_handlers[msg.command]
+      if handler then
+        handler(self, msg.payload)
+      end
     else
       -- Dispatch to registered handler
       local handler = self.message_handlers[msg.command]
