@@ -207,31 +207,31 @@ end)
 
 -- ---------------------------------------------------------------------------
 -- G5-G9: BUG ZONE — q in [32, 63]
--- These tests are EXPECTED TO FAIL pre-fix.
+-- FIX-83 (W122 BUG-1 closure) flipped these from XFAIL_PRE_FIX → PASS.
 -- ---------------------------------------------------------------------------
-print("\n--- G5-G9: BUG ZONE q in [32, 63] (BUG-1) ---")
+print("\n--- G5-G9: BUG ZONE q in [32, 63] (BUG-1, FIX-83 closed) ---")
 
-test_xfail_pre_fix("G5: q=32 round-trip (smallest BUG ZONE)", function()
+test("G5: q=32 round-trip (smallest BUG ZONE, FIX-83 closed)", function()
   local v = value_with_quotient(32)
   expect_eq(round_trip(v), v, "q=32 BUG-1")
 end)
 
-test_xfail_pre_fix("G6: q=33 round-trip", function()
+test("G6: q=33 round-trip (FIX-83 closed)", function()
   local v = value_with_quotient(33)
   expect_eq(round_trip(v), v, "q=33 BUG-1")
 end)
 
-test_xfail_pre_fix("G7: q=40 round-trip", function()
+test("G7: q=40 round-trip (FIX-83 closed)", function()
   local v = value_with_quotient(40)
   expect_eq(round_trip(v), v, "q=40 BUG-1")
 end)
 
-test_xfail_pre_fix("G8: q=50 round-trip", function()
+test("G8: q=50 round-trip (FIX-83 closed)", function()
   local v = value_with_quotient(50)
   expect_eq(round_trip(v), v, "q=50 BUG-1")
 end)
 
-test_xfail_pre_fix("G9: q=63 round-trip (BUG ZONE upper bound)", function()
+test("G9: q=63 round-trip (BUG ZONE upper bound, FIX-83 closed)", function()
   local v = value_with_quotient(63)
   expect_eq(round_trip(v), v, "q=63 BUG-1")
 end)
@@ -257,8 +257,8 @@ end)
 -- ---------------------------------------------------------------------------
 -- G12: q = 100 (64-path + nbits=36 IN BUG ZONE)
 -- ---------------------------------------------------------------------------
-print("\n--- G12: q = 100 (64+36 tail in BUG ZONE) ---")
-test_xfail_pre_fix("G12: q=100 round-trip", function()
+print("\n--- G12: q = 100 (64+36 tail in BUG ZONE, FIX-83 closed) ---")
+test("G12: q=100 round-trip (FIX-83 closed)", function()
   local v = value_with_quotient(100)
   expect_eq(round_trip(v), v, "q=100 BUG-1 (tail=36)")
 end)
@@ -275,8 +275,8 @@ end)
 -- ---------------------------------------------------------------------------
 -- G14: q = 1000 (15*64 + 40 tail in BUG ZONE)
 -- ---------------------------------------------------------------------------
-print("\n--- G14: q = 1000 (15*64+40 tail in BUG ZONE) ---")
-test_xfail_pre_fix("G14: q=1000 round-trip", function()
+print("\n--- G14: q = 1000 (15*64+40 tail in BUG ZONE, FIX-83 closed) ---")
+test("G14: q=1000 round-trip (FIX-83 closed)", function()
   local v = value_with_quotient(1000)
   expect_eq(round_trip(v), v, "q=1000 BUG-1 (tail=40)")
 end)
@@ -284,8 +284,8 @@ end)
 -- ---------------------------------------------------------------------------
 -- G15: Mixed-quotient stream (deltas straddling the boundary)
 -- ---------------------------------------------------------------------------
-print("\n--- G15: Mixed-quotient delta stream ---")
-test_xfail_pre_fix("G15: encode+decode sorted deltas {q=1, 5, 30, 33, 50, 64, 100}", function()
+print("\n--- G15: Mixed-quotient delta stream (FIX-83 closed) ---")
+test("G15: encode+decode sorted deltas {q=1, 5, 30, 33, 50, 64, 100} (FIX-83 closed)", function()
   local deltas = {
     value_with_quotient(1,  100),
     value_with_quotient(5,  200),
@@ -310,8 +310,8 @@ end)
 -- ---------------------------------------------------------------------------
 -- G16: Random sorted-delta stream (seeded for reproducibility)
 -- ---------------------------------------------------------------------------
-print("\n--- G16: Random sorted-delta stream (seed=42, 50 elements) ---")
-test_xfail_pre_fix("G16: round-trip 50 random values, deltas span the bug zone", function()
+print("\n--- G16: Random sorted-delta stream (seed=42, 50 elements, FIX-83 closed) ---")
+test("G16: round-trip 50 random values, deltas span the bug zone (FIX-83 closed)", function()
   math.randomseed(42)
   local values = {}
   for i = 1, 50 do
@@ -361,18 +361,16 @@ local identity_values = {
 }
 
 for _, v in ipairs(identity_values) do
-  -- The bug-zone values land in g5/g7/g14; we still emit a marker for
-  -- the q < 32 + q == 64 cases to confirm the identity holds where
-  -- expected.  Use test (not test_xfail) and let failures surface
-  -- explicitly — the audit doc explains which are expected.
+  -- FIX-83 (W122 BUG-1 closure) made the bug-zone and safe-zone tests
+  -- both round-trip identically.  We still tag the zone in the test name
+  -- for diagnostic value when a future regression breaks this.
   local q = math.floor(v / TWO_P)
   local in_bug_zone = (q >= 32 and q <= 63) or
     ((q - 64) >= 32 and (q - 64) <= 63 and q >= 64) or
     ((q - 128) >= 32 and (q - 128) <= 63 and q >= 128) or
     ((q - 192) >= 32 and (q - 192) <= 63 and q >= 192)
-  local fn = in_bug_zone and test_xfail_pre_fix or test
-  fn(string.format("G17: identity round_trip(%d) [q=%d %s]",
-       v, q, in_bug_zone and "BUG-1" or "safe"),
+  test(string.format("G17: identity round_trip(%d) [q=%d %s]",
+       v, q, in_bug_zone and "BUG-1 FIX-83 closed" or "safe"),
      function()
        expect_eq(round_trip(v), v, "value=" .. v)
      end)
@@ -382,11 +380,12 @@ end
 -- G18: Source-level regression marker — q=33 trigger
 -- This is the canonical haskoin-style "smallest failing case" — the
 -- audit doc references this exact value as BUG-1 evidence.
+-- FIX-83 closure flipped this from XFAIL_PRE_FIX → PASS.
 -- ---------------------------------------------------------------------------
-print("\n--- G18: BUG-1 regression marker (q=33) ---")
-test_xfail_pre_fix("G18: golomb_rice_encode(P=19, x=17313849) round-trips", function()
+print("\n--- G18: BUG-1 regression marker (q=33, FIX-83 closed) ---")
+test("G18: golomb_rice_encode(P=19, x=17313849) round-trips (FIX-83 closed)", function()
   expect_eq(round_trip(17313849), 17313849,
-    "BUG-1 regression marker — q=33, r=12345, expect identity post-fix")
+    "BUG-1 regression marker — q=33, r=12345, identity post-FIX-83")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -429,10 +428,86 @@ test("G20: writer accepts ffi.new uint64_t all-ones mask, decoder reads 33 ones"
   expect_eq(ones, 33, "33 ones via cdata uint64_t mask")
 end)
 
--- Note: BUG-2 (reader 32-bit-mod accumulator) is a W121 carryover (BUG-8
--- there).  We do not add a gate-flipping test for it in W122 since the
--- gate test would only fail post-FIX-4 (P-hardcoding removed).  Listed
--- in audit doc for completeness; tracked by W121.
+-- ---------------------------------------------------------------------------
+-- G21: Source-level regression guard for FIX-83 (W122 BUG-1 closure).
+-- Forward-guard: assert golomb_rice_encode in src/blockfilter.lua routes
+-- every unary write through the writer's cdata-uint64 branch — NOT
+-- through `bit.lshift(1, nbits) - 1` which has LuaJIT 32-bit modular
+-- semantics for nbits in [32, 63] and silently produces a wrong mask.
+-- If a future refactor reintroduces the broken pattern this test fires.
+-- ---------------------------------------------------------------------------
+print("\n--- G21: FIX-83 source-level regression guard ---")
+test("G21: golomb_rice_encode uses cdata-uint64 mask (no bit.lshift(1,nbits)-1)", function()
+  local f = io.open("src/blockfilter.lua", "r")
+  expect_eq(f ~= nil, true, "open src/blockfilter.lua")
+  local src = f:read("*a")
+  f:close()
+  -- Find the golomb_rice_encode function body
+  local start_idx = src:find("local function golomb_rice_encode", 1, true)
+  expect_eq(type(start_idx), "number", "golomb_rice_encode function found")
+  -- The function ends at "^end$" — find the next function definition
+  local end_idx = src:find("\n-- Golomb%-Rice decode", start_idx, false)
+  if not end_idx then
+    end_idx = src:find("local function golomb_rice_decode", start_idx + 1, true)
+  end
+  expect_eq(type(end_idx), "number", "golomb_rice_encode body terminated")
+  local body = src:sub(start_idx, end_idx)
+  -- POSITIVE: the cdata-uint64 all-ones mask must appear in the unary path.
+  expect_eq(body:find('ffi%.new%("uint64_t", 0xFFFFFFFFFFFFFFFFULL%)') ~= nil, true,
+    "FIX-83 cdata-uint64 unary mask present in golomb_rice_encode")
+  -- NEGATIVE: the broken `bit.lshift(1, nbits) - 1` (or equivalent) MUST NOT
+  -- appear as a writer argument for the unary path.  We tolerate the
+  -- pattern only inside comments or in golomb_rice_decode (which uses
+  -- per-bit reads, not masks).
+  for line in body:gmatch("[^\n]+") do
+    local trimmed = line:gsub("^%s+", "")
+    -- skip pure comment lines
+    if not trimmed:match("^%-%-") then
+      -- forbid the literal broken pattern on a non-comment line
+      if line:find("bit%.lshift%(1, nbits%)") and line:find("bitwriter%.write") then
+        error("FIX-83 regression: bit.lshift(1, nbits) - 1 used as writer arg: " .. line)
+      end
+    end
+  end
+end)
+
+-- ---------------------------------------------------------------------------
+-- G22: BUG-2 closure (W121 BUG-8 carryover) — bit_stream_reader.read uses
+-- uint64_t cdata accumulator for nbits > 32 so the LuaJIT 32-bit modular
+-- semantics on bit.lshift(result, 1) no longer silently truncate.  This
+-- guards a future larger-P filter or wide-field consumer.
+-- ---------------------------------------------------------------------------
+print("\n--- G22: BUG-2 closure (reader cdata path for nbits>32) ---")
+test("G22-a: reader.read(33) preserves bit 33 (no 32-bit truncation)", function()
+  -- Encode 33 bits where the top bit is 1 and the rest are zero.
+  -- Expected: bit_stream_reader.read(33) returns 2^32 = 4294967296.
+  -- Pre-fix: returns 0 because bit.lshift wraps mod 2^32.
+  local w = blockfilter.bit_stream_writer()
+  w.write(1, 1)
+  for _ = 1, 32 do w.write(0, 1) end
+  w.flush()
+  local r = blockfilter.bit_stream_reader(w.result())
+  local v = r.read(33)
+  expect_eq(v, 4294967296, "33-bit read with top bit set")
+end)
+test("G22-b: reader.read(40) preserves high bits", function()
+  -- Write all 40 ones; expect 2^40 - 1 = 1099511627775.
+  local w = blockfilter.bit_stream_writer()
+  w.write(ffi.new("uint64_t", 0xFFFFFFFFFFFFFFFFULL), 40)
+  w.flush()
+  local r = blockfilter.bit_stream_reader(w.result())
+  local v = r.read(40)
+  expect_eq(v, 1099511627775, "40-bit read of all ones")
+end)
+test("G22-c: reader.read(<=32) unchanged (safe-zone numeric path)", function()
+  -- Regression guard: P=19 BIP-158 callers must not be perturbed.
+  local w = blockfilter.bit_stream_writer()
+  w.write(0x7FFFF, 19)  -- 19-bit remainder field, all ones
+  w.flush()
+  local r = blockfilter.bit_stream_reader(w.result())
+  local v = r.read(19)
+  expect_eq(v, 0x7FFFF, "P=19 remainder read unchanged")
+end)
 
 -- ---------------------------------------------------------------------------
 -- Summary
