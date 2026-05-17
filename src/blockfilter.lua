@@ -206,6 +206,32 @@ local function bit_stream_reader(data)
   }
 
   function reader.read(nbits)
+    -- For nbits > 32 the accumulator must be uint64_t cdata to avoid the
+    -- LuaJIT bit.lshift 32-bit modular semantics (W121 BUG-8 / W122 BUG-2:
+    -- a Lua-number accumulator silently wraps after 32 left-shifts).
+    -- BIP-158 P=19 callers (unary 1-bit reads + 19-bit remainder) never
+    -- hit this, but any future larger-P filter or wide-field consumer
+    -- would.  We pick the cdata path for nbits > 32 and the cheaper
+    -- Lua-number path otherwise.  Result is returned as a Lua number
+    -- via tonumber() for backward compat with downstream call sites
+    -- (decode-q loop uses == 1 comparison; remainder uses + q*2^P).
+    if nbits > 32 then
+      local result = ffi.new("uint64_t", 0)
+      for _ = 1, nbits do
+        if reader._bits_count == 0 then
+          if reader._pos > #reader._data then
+            error("unexpected end of bitstream")
+          end
+          reader._bits = reader._data:byte(reader._pos)
+          reader._pos = reader._pos + 1
+          reader._bits_count = 8
+        end
+        result = bit.lshift(result, 1) + ffi.new("uint64_t",
+          bit.band(bit.rshift(reader._bits, reader._bits_count - 1), 1))
+        reader._bits_count = reader._bits_count - 1
+      end
+      return tonumber(result)
+    end
     local result = 0
     for _ = 1, nbits do
       if reader._bits_count == 0 then
@@ -240,12 +266,13 @@ local function golomb_rice_encode(bitwriter, P, x)
   -- For other P values use: local shift = bit.lshift(1, P); q = math.floor(x / shift)
   while q > 0 do
     local nbits = math.min(q, 64)
-    -- Write nbits ones; use 64-bit mask to write up to 64 bits at a time
-    if nbits == 64 then
-      bitwriter.write(ffi.new("uint64_t", 0xFFFFFFFFFFFFFFFFULL), 64)
-    else
-      bitwriter.write(bit.lshift(1, nbits) - 1, nbits)
-    end
+    -- Write nbits ones; route through the writer's cdata-uint64 branch so
+    -- LuaJIT bit.lshift's 32-bit modular semantics do not corrupt the mask
+    -- for nbits in [32, 63] (W122 BUG-1 / FIX-83).  The writer's per-bit
+    -- extraction path uses bit.rshift on a uint64_t cdata which has 64-bit
+    -- semantics, so all 64 high bits of the all-ones mask are preserved.
+    -- Mirror of Core util/golombrice.h GolombRiceEncode (writes ~0ULL).
+    bitwriter.write(ffi.new("uint64_t", 0xFFFFFFFFFFFFFFFFULL), nbits)
     q = q - nbits
   end
   bitwriter.write(0, 1)  -- terminating zero
