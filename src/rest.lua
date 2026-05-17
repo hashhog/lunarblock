@@ -11,6 +11,7 @@ local consensus = require("lunarblock.consensus")
 local script_mod = require("lunarblock.script")
 local address_mod = require("lunarblock.address")
 local psbt_mod = require("lunarblock.psbt")
+local rpc_mod = require("lunarblock.rpc")  -- for core_chain_name (FIX-80)
 local bit = require("bit")
 -- FIX-67: BIP-78 receiver proposal-lifecycle store (G18 TTL +
 -- G19 double-receive + G20 anti-fingerprint UIH + G30 replay /
@@ -1167,7 +1168,7 @@ function RESTServer:handle_chaininfo(format)
   end
 
   local result = {
-    chain = self.network.name,
+    chain = rpc_mod.core_chain_name(self.network.name),
     blocks = tip_height,
     headers = header_height,
     bestblockhash = types.hash256_hex(tip_hash),
