@@ -223,7 +223,9 @@ describe("rpc", function()
       local response = server:handle_request(request)
       local decoded = cjson.decode(response)
 
-      assert.equal("mainnet", decoded.result.chain)
+      -- FIX-80: Core's canonical chain name is "main"
+      -- (bitcoin-core/src/util/chaintype.cpp::ChainTypeToString).
+      assert.equal("main", decoded.result.chain)
       assert.equal(700000, decoded.result.blocks)
       assert.equal(700000, decoded.result.headers)
       assert.is_string(decoded.result.bestblockhash)
@@ -249,7 +251,9 @@ describe("rpc", function()
       local response = server:handle_request(request)
       local decoded = cjson.decode(response)
 
-      assert.equal("testnet", decoded.result.chain)
+      -- FIX-80: Core's canonical testnet name is "test", not "testnet"
+      -- (bitcoin-core/src/util/chaintype.cpp::ChainTypeToString).
+      assert.equal("test", decoded.result.chain)
     end)
 
     it("pruned=false and no pruneheight when pruner disabled", function()
