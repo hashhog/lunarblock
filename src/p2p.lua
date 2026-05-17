@@ -12,6 +12,14 @@ M.MAX_MESSAGE_SIZE = 4 * 1000 * 1000  -- 4 MB max message (Bitcoin Core MAX_PROT
 
 M.PROTOCOL_VERSION = 70016
 
+-- BIP-157 wire limits (Bitcoin Core net_processing.cpp:184-186).
+-- A peer whose getcfilters/getcfheaders request exceeds these gets
+-- fDisconnect=true in Core's PrepareBlockFilterRequest (line 3299-3304).
+-- Mirrored here so the FIX-81 dispatch handlers can enforce identical
+-- limits and disconnect abusive peers symmetrically.
+M.MAX_GETCFILTERS_SIZE = 1000
+M.MAX_GETCFHEADERS_SIZE = 2000
+
 M.SERVICES = {
   NODE_NONE = 0,
   NODE_NETWORK = 1,
@@ -22,29 +30,36 @@ M.SERVICES = {
   NODE_NETWORK_LIMITED = 1024,
 }
 
--- BIP-157 P2P dispatch presence flag (FIX-71 W121 BUG-2).
+-- BIP-157 P2P dispatch presence flag (FIX-71 plumbed, FIX-81 flipped).
 --
--- Peer.lua:854's command dispatch is a chained if/elseif over message
--- commands.  As of FIX-71 there is NO case for any of the 6 BIP-157
+-- Peer.lua's command dispatch is a chained if/elseif over message
+-- commands.  Prior to FIX-81 there was NO case for any of the 6 BIP-157
 -- compact-filter wire messages (getcfilters / cfilter / getcfheaders /
 -- cfheaders / getcfcheckpt / cfcheckpt).  The codecs in this file plus
 -- the index lifecycle in blockfilter.lua plus the REST handlers in
--- rest.lua are all wired — only the P2P case branches are absent.
+-- rest.lua were all wired — only the P2P case branches were absent.
+--
+-- FIX-81 added incoming dispatch arms for the 3 request messages
+-- (getcfilters / getcfheaders / getcfcheckpt) plus full Core-parity
+-- validation (range / stop_hash on active chain / filter_type /
+-- NODE_COMPACT_FILTERS advertised) and the corresponding
+-- send-cfilter / cfheaders / cfcheckpt response messages.  The 3
+-- response messages (cfilter / cfheaders / cfcheckpt) are server→client
+-- only — lunarblock as a server emits them via peer:send_message and
+-- does not consume them as a BIP-157 client (no client mode wired yet).
 --
 -- This module-level flag is the canonical signal for
--- should_advertise_compact_filters().  When a future P2P fix wave
--- adds the case branches to peer.lua:854 (and updates the inbound
--- handlers in peerman.lua / main.lua), it MUST flip this flag to true.
--- Until then advertising NODE_COMPACT_FILTERS would lie to peers:
--- they would route getcfilters at this node and the response would
--- never arrive, causing a 30s timeout-then-disconnect at the remote
--- (net_processing.cpp PoissonNextSend path).
+-- should_advertise_compact_filters().  Flipped to TRUE by FIX-81
+-- alongside the dispatch arms.  When operator passes --peerblockfilters
+-- AND --blockfilterindex, NODE_COMPACT_FILTERS is now advertised
+-- honestly in the version handshake.
 --
 -- Tests in tests/test_w121_compact_filters.lua + tests/test_fix71_*
--- assert this flag stays false until the dispatch lands.  Source-level
--- regression guards reject any unconditional OR-into-services-bitfield
--- of NODE_COMPACT_FILTERS outside should_advertise_compact_filters().
-M.BIP157_P2P_DISPATCH_PRESENT = false
+-- + tests/test_fix81_* assert the flag matches the dispatch state.
+-- Source-level regression guards reject any unconditional OR-into-
+-- services-bitfield of NODE_COMPACT_FILTERS outside
+-- should_advertise_compact_filters().
+M.BIP157_P2P_DISPATCH_PRESENT = true
 
 --- Gate: should we advertise NODE_COMPACT_FILTERS in our version handshake?
 --

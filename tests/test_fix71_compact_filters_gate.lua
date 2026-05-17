@@ -103,9 +103,12 @@ test("A1: gate function exists", function()
     "p2p.should_advertise_compact_filters must be callable")
 end)
 
-test("A2: BIP157_P2P_DISPATCH_PRESENT module flag exists and is false", function()
-  expect_eq(p2p.BIP157_P2P_DISPATCH_PRESENT, false,
-    "peer.lua:854 has no BIP-157 case branches; flag must be false")
+test("A2: BIP157_P2P_DISPATCH_PRESENT module flag exists and is true (FIX-81)", function()
+  -- FIX-81: dispatch arms shipped in peer.lua; flag flipped to true so
+  -- should_advertise_compact_filters() returns true when operator opts
+  -- in via --peerblockfilters AND --blockfilterindex.
+  expect_eq(p2p.BIP157_P2P_DISPATCH_PRESENT, true,
+    "FIX-81 wired the 3 BIP-157 request dispatch arms; flag must be true")
 end)
 
 test("A3: gate with empty opts → false", function()
@@ -127,14 +130,19 @@ test("A5: gate with blockfilterindex only → false", function()
   }), "missing peerblockfilters")
 end)
 
-test("A6: gate with both opts true but dispatch absent → false", function()
-  expect_false(p2p.should_advertise_compact_filters({
+test("A6: FIX-81 — gate with both opts true and dispatch present → true", function()
+  -- FIX-81: peer.lua:854 now has 3 BIP-157 request dispatch arms; the
+  -- module-level BIP157_P2P_DISPATCH_PRESENT flipped to true.  With
+  -- (a)+(b)+(c) all true, the gate fires.
+  expect_true(p2p.should_advertise_compact_filters({
     peerblockfilters = true,
     blockfilterindex_enabled = true,
-  }), "(a)+(b) true but (c) dispatch absent ⇒ no advertisement")
+  }), "FIX-81: (a)+(b)+(c) all true ⇒ NODE_COMPACT_FILTERS advertised")
 end)
 
 test("A7: explicit bip157_dispatch_present=false overrides → false", function()
+  -- Test-only override path: even with FIX-81's flag-flip, callers can
+  -- explicitly pass bip157_dispatch_present=false to force-disable.
   expect_false(p2p.should_advertise_compact_filters({
     peerblockfilters = true,
     blockfilterindex_enabled = true,

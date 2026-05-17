@@ -447,19 +447,27 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G10: P2P dispatch — getcfilters handler ---")
 
-test("G10-a: BUG-1 — no peer.lua dispatch for getcfilters", function()
+test("G10-a: FIX-81 — peer.lua dispatch arm for getcfilters present", function()
+  -- FIX-81 closure of BUG-1: peer.lua now has an explicit case branch
+  -- dispatching getcfilters to the registered handler chain.
   local peer_src = read_file("src/peer.lua")
-  expect_false(peer_src:find('"getcfilters"', 1, true) ~= nil,
-    "peer.lua dispatch references getcfilters — handler now wired")
-  bug("BUG-1", "P0-WIRE")
+  expect_true(peer_src:find('"getcfilters"', 1, true) ~= nil,
+    "peer.lua dispatch arm for getcfilters is present (FIX-81)")
+  -- The handler lives in main.lua as a peer_manager:register_handler
+  -- closure (deserialization happens inside the handler, not in peer.lua).
+  local main_src = read_file("src/main.lua")
+  expect_true(main_src:find("deserialize_getcfilters", 1, true) ~= nil,
+    "main.lua handler invokes p2p.deserialize_getcfilters")
 end)
 
-test("G10-b: BUG-1 — codec exists but no handler invokes it", function()
+test("G10-b: FIX-81 — codec + main.lua handler + peer.lua dispatch wire end-to-end", function()
   expect_true(type(p2p.deserialize_getcfilters) == "function",
     "deserialize_getcfilters wire codec exists")
-  local peer_src = read_file("src/peer.lua")
-  expect_false(peer_src:find("deserialize_getcfilters", 1, true) ~= nil,
-    "peer.lua dispatch references deserialize_getcfilters — handler wired")
+  expect_true(type(p2p.serialize_cfilter) == "function",
+    "serialize_cfilter response codec exists")
+  local main_src = read_file("src/main.lua")
+  expect_true(main_src:find('register_handler%("getcfilters"') ~= nil,
+    "main.lua registers getcfilters handler")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -467,10 +475,13 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G11: P2P dispatch — getcfheaders handler ---")
 
-test("G11-a: BUG-1 — no peer.lua dispatch for getcfheaders", function()
+test("G11-a: FIX-81 — peer.lua dispatch arm for getcfheaders present", function()
   local peer_src = read_file("src/peer.lua")
-  expect_false(peer_src:find('"getcfheaders"', 1, true) ~= nil,
-    "peer.lua references getcfheaders — handler wired")
+  expect_true(peer_src:find('"getcfheaders"', 1, true) ~= nil,
+    "peer.lua dispatch arm for getcfheaders is present (FIX-81)")
+  local main_src = read_file("src/main.lua")
+  expect_true(main_src:find('register_handler%("getcfheaders"') ~= nil,
+    "main.lua registers getcfheaders handler")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -478,16 +489,21 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G12: P2P dispatch — getcfcheckpt handler ---")
 
-test("G12-a: BUG-1 — no peer.lua dispatch for getcfcheckpt", function()
+test("G12-a: FIX-81 — peer.lua dispatch arm for getcfcheckpt present", function()
   local peer_src = read_file("src/peer.lua")
-  expect_false(peer_src:find('"getcfcheckpt"', 1, true) ~= nil,
-    "peer.lua references getcfcheckpt — handler wired")
+  expect_true(peer_src:find('"getcfcheckpt"', 1, true) ~= nil,
+    "peer.lua dispatch arm for getcfcheckpt is present (FIX-81)")
+  local main_src = read_file("src/main.lua")
+  expect_true(main_src:find('register_handler%("getcfcheckpt"') ~= nil,
+    "main.lua registers getcfcheckpt handler")
 end)
 
-test("G12-b: BUG-1 — no peerman.lua dispatch either", function()
+test("G12-b: FIX-81 — main.lua hosts the handlers (not peerman.lua)", function()
+  -- The handlers are registered in main.lua via peer_manager:register_handler.
+  -- peerman.lua only plumbs the gate inputs; it does not host filter handlers.
   local peerman_src = read_file("src/peerman.lua")
-  expect_false(peerman_src:find("getcfcheckpt", 1, true) ~= nil,
-    "peerman.lua handles getcfcheckpt — wired elsewhere")
+  expect_false(peerman_src:find('"getcfcheckpt"', 1, true) ~= nil,
+    "peerman.lua does not host the getcfcheckpt handler (lives in main.lua)")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -500,27 +516,21 @@ test("G13-a: NODE_COMPACT_FILTERS constant defined", function()
     "BIP-157 service bit = 1<<6 = 64")
 end)
 
-test("G13-b: FIX-71 — gate plumbed, returns FALSE while dispatch absent", function()
-  -- FIX-71 W121 BUG-2 (post-fix): our_services takes a 3rd arg
-  -- compactfilters_opts.  The gate function should_advertise_compact_
-  -- filters() AND's three signals:
-  --   (a) opts.peerblockfilters         (operator opt-in)
-  --   (b) opts.blockfilterindex_enabled (basic filter index running)
-  --   (c) p2p.BIP157_P2P_DISPATCH_PRESENT (handlers in peer.lua:854)
-  -- The third is currently false in p2p.lua because peer.lua:854 has
-  -- no BIP-157 case branches.  So even with (a) AND (b) true, the
-  -- bit stays dark — advertising would lie to peers.
+test("G13-b: FIX-81 — gate fires when operator opts in and dispatch is present", function()
+  -- FIX-81 closure: BIP157_P2P_DISPATCH_PRESENT flipped to true now
+  -- that peer.lua:854 dispatch arms are wired.  With (a)+(b)+(c) all
+  -- true, NODE_COMPACT_FILTERS is honestly advertised.
   local bit = require("bit")
   local s = p2p.our_services(true, true, {
     peerblockfilters = true,
     blockfilterindex_enabled = true,
   })
-  expect_false(bit.band(s, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
-    "gate plumbed correctly — third condition (dispatch present) is false")
-  -- Same call without opts also leaves the bit dark.
+  expect_true(bit.band(s, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "FIX-81: all 3 gate conditions true ⇒ NODE_COMPACT_FILTERS advertised")
+  -- Without opts the bit still stays dark (Core default: peerblockfilters=false).
   local s2 = p2p.our_services(true, true)
   expect_false(bit.band(s2, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
-    "no opts table → no advertisement")
+    "no opts table → no advertisement (matches Core DEFAULT_PEERBLOCKFILTERS)")
 end)
 
 test("G13-c: FIX-71 — source-level regression guard rejects unconditional OR", function()
@@ -550,45 +560,42 @@ test("G13-c: FIX-71 — source-level regression guard rejects unconditional OR",
   end
 end)
 
-test("G13-d: FIX-71 — gate function signature + BIP157_P2P_DISPATCH_PRESENT", function()
-  -- Documentation gate: when peer.lua:854 dispatch is registered, set
-  -- p2p.BIP157_P2P_DISPATCH_PRESENT = true and the gate flips
-  -- automatically.  This test asserts the flag exists and is currently
-  -- false (the canonical signal for the dispatch-absence state).
+test("G13-d: FIX-81 — gate function signature + BIP157_P2P_DISPATCH_PRESENT flipped", function()
+  -- FIX-81 closure: BIP157_P2P_DISPATCH_PRESENT flipped to true after
+  -- peer.lua dispatch arms shipped.  The gate fires for any caller
+  -- passing peerblockfilters + blockfilterindex_enabled (no override).
   expect_eq(type(p2p.should_advertise_compact_filters), "function",
     "p2p.should_advertise_compact_filters exists")
-  expect_eq(p2p.BIP157_P2P_DISPATCH_PRESENT, false,
-    "BIP157_P2P_DISPATCH_PRESENT is false — peer.lua:854 dispatch still absent")
-  -- Drilling all 3 conditions true (overriding the dispatch flag for
-  -- the call) DOES set the bit — proves the gate wires correctly.
+  expect_eq(p2p.BIP157_P2P_DISPATCH_PRESENT, true,
+    "FIX-81: BIP157_P2P_DISPATCH_PRESENT=true — dispatch arms wired")
+  -- Confirm the bit fires via the module-level flag (no override).
   local bit = require("bit")
   local s = p2p.our_services(false, false, {
     peerblockfilters = true,
     blockfilterindex_enabled = true,
-    bip157_dispatch_present = true,  -- override module-level flag
   })
   expect_true(bit.band(s, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
-    "with all 3 conditions true (including override), bit DOES set")
+    "with (a)+(b)+(c=module flag) all true, bit DOES set")
 end)
 
-test("G13-e: FIX-71 — partial conditions leave the bit dark", function()
+test("G13-e: FIX-81 — operator opt-in is the only remaining knob", function()
   local bit = require("bit")
-  -- peerblockfilters=true, others default → dark
+  -- peerblockfilters=true, others default → dark (operator wants but no index).
   local s1 = p2p.our_services(false, false, {peerblockfilters = true})
   expect_false(bit.band(s1, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
     "peerblockfilters alone → bit dark (blockfilterindex_enabled missing)")
-  -- blockfilterindex_enabled=true only → dark
+  -- blockfilterindex_enabled=true only → dark (index but operator opted out).
   local s2 = p2p.our_services(false, false, {blockfilterindex_enabled = true})
   expect_false(bit.band(s2, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
     "blockfilterindex_enabled alone → bit dark (peerblockfilters missing)")
-  -- Both opts true but module-level dispatch flag still false → dark
+  -- Both opts true ⇒ bit fires (FIX-81: dispatch present).
   local s3 = p2p.our_services(false, false, {
     peerblockfilters = true,
     blockfilterindex_enabled = true,
   })
-  expect_false(bit.band(s3, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
-    "(a)+(b) true but (c) BIP157_P2P_DISPATCH_PRESENT=false → bit dark")
-  bug("BUG-2", "P0-WIRE (gate plumbed correctly, awaits peer.lua:854 dispatch)")
+  expect_true(bit.band(s3, p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0,
+    "FIX-81: (a)+(b)+(c) all true → bit set")
+  bug("BUG-2", "P0-WIRE (CLOSED by FIX-81 — peer.lua dispatch + flag flip)")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -596,10 +603,13 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G14: MAX_GETCFILTERS_SIZE ---")
 
-test("G14-a: BUG-5 — no MAX_GETCFILTERS_SIZE constant in p2p.lua", function()
-  expect_false(p2p.MAX_GETCFILTERS_SIZE ~= nil,
-    "MAX_GETCFILTERS_SIZE constant is defined — fix wired")
-  bug("BUG-5", "P1-CDIV")
+test("G14-a: FIX-81 — MAX_GETCFILTERS_SIZE constant defined in p2p.lua", function()
+  -- FIX-81 closure of BUG-5: net_processing.cpp:184 mirror.
+  expect_true(p2p.MAX_GETCFILTERS_SIZE ~= nil,
+    "MAX_GETCFILTERS_SIZE constant must exist after FIX-81")
+  expect_eq(p2p.MAX_GETCFILTERS_SIZE, 1000,
+    "Core value (net_processing.cpp:184) is 1000")
+  bug("BUG-5", "P1-CDIV (CLOSED by FIX-81)")
 end)
 
 test("G14-b: Core value is 1000", function()
@@ -612,9 +622,12 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G15: MAX_GETCFHEADERS_SIZE ---")
 
-test("G15-a: BUG-5 — no MAX_GETCFHEADERS_SIZE constant in p2p.lua", function()
-  expect_false(p2p.MAX_GETCFHEADERS_SIZE ~= nil,
-    "MAX_GETCFHEADERS_SIZE constant is defined — fix wired")
+test("G15-a: FIX-81 — MAX_GETCFHEADERS_SIZE constant defined in p2p.lua", function()
+  -- FIX-81 closure of BUG-5: net_processing.cpp:186 mirror.
+  expect_true(p2p.MAX_GETCFHEADERS_SIZE ~= nil,
+    "MAX_GETCFHEADERS_SIZE constant must exist after FIX-81")
+  expect_eq(p2p.MAX_GETCFHEADERS_SIZE, 2000,
+    "Core value (net_processing.cpp:186) is 2000")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -622,10 +635,13 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G16: CFCHECKPT_INTERVAL ---")
 
-test("G16-a: BUG-6 — no CFCHECKPT_INTERVAL constant in blockfilter.lua", function()
-  expect_false(blockfilter.CFCHECKPT_INTERVAL ~= nil,
-    "CFCHECKPT_INTERVAL is defined — fix wired")
-  bug("BUG-6", "P1-CDIV")
+test("G16-a: FIX-81 — CFCHECKPT_INTERVAL constant defined in blockfilter.lua", function()
+  -- FIX-81 closure of BUG-6: blockfilterindex.h:31 mirror.
+  expect_true(blockfilter.CFCHECKPT_INTERVAL ~= nil,
+    "CFCHECKPT_INTERVAL constant must exist after FIX-81")
+  expect_eq(blockfilter.CFCHECKPT_INTERVAL, 1000,
+    "Core value (blockfilterindex.h:31) is 1000")
+  bug("BUG-6", "P1-CDIV (CLOSED by FIX-81)")
 end)
 
 test("G16-b: Core value is 1000", function()

@@ -56,6 +56,15 @@ local M = {}
 M.BASIC_FILTER_P = 19      -- Golomb-Rice parameter  (blockfilter.h:90)
 M.BASIC_FILTER_M = 784931  -- Inverse false positive rate  (blockfilter.h:91)
 
+-- BIP-157 filter-header checkpoint interval.  Reference:
+-- bitcoin-core/src/index/blockfilterindex.h:31 (`static constexpr int
+-- CFCHECKPT_INTERVAL = 1000;`).  ProcessGetCFCheckPt (net_processing.cpp
+-- :3403) returns `stop_index->nHeight / CFCHECKPT_INTERVAL` filter
+-- headers, one per CFCHECKPT_INTERVAL'th block on the active chain
+-- ending at stop_hash.  Lifted to module scope in FIX-81 so the
+-- cfcheckpt dispatch handler can walk the chain by interval.
+M.CFCHECKPT_INTERVAL = 1000
+
 -- Filter types
 M.FILTER_TYPE = {
   BASIC = 0,
