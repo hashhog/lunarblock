@@ -15,6 +15,30 @@ local storage_mod = require("lunarblock.storage")
 local M = {}
 
 --------------------------------------------------------------------------------
+-- Network Name Translation
+--------------------------------------------------------------------------------
+--
+-- Internal network names (consensus.lua) → canonical Bitcoin Core RPC strings
+-- as defined by Core's src/util/chaintype.cpp::ChainTypeToString():
+--   mainnet  → main
+--   testnet  → test
+--   testnet3 → test
+--   testnet4 → testnet4
+--   signet   → signet
+--   regtest  → regtest
+--
+-- All RPC/REST endpoints that emit the `chain` field MUST translate via this
+-- helper so daily consensus-diff vs Core stays clean (FIX-80).
+local function core_chain_name(internal_name)
+  if internal_name == "mainnet" then return "main"
+  elseif internal_name == "testnet" then return "test"
+  elseif internal_name == "testnet3" then return "test"
+  else return internal_name
+  end
+end
+M.core_chain_name = core_chain_name
+
+--------------------------------------------------------------------------------
 -- BIP-22 result string mapping
 --------------------------------------------------------------------------------
 
@@ -1313,7 +1337,7 @@ function RPCServer:register_methods()
     end
 
     local result = {
-      chain = rpc.network.name,
+      chain = core_chain_name(rpc.network.name),
       blocks = tip_height,
       headers = header_height,
       bestblockhash = types.hash256_hex(tip_hash),
@@ -1768,15 +1792,7 @@ function RPCServer:register_methods()
     -- Chain label in Bitcoin Core's canonical shape.
     local chain_label = cjson.null
     if rpc.network and rpc.network.name then
-      local name = rpc.network.name
-      if name == "mainnet" then
-        chain_label = "main"
-      elseif name == "testnet" or name == "testnet3" then
-        chain_label = "test"
-      else
-        -- testnet4, signet, regtest are identical in both conventions.
-        chain_label = name
-      end
+      chain_label = core_chain_name(rpc.network.name)
     end
 
     return {
@@ -7234,7 +7250,7 @@ function RPCServer:register_methods()
       blockmintxfee = 0.00001000,
       networkhashps = 0,
       pooledtx = pooledtx,
-      chain = rpc.network.name,
+      chain = core_chain_name(rpc.network.name),
       next = {
         height = tip_height + 1,
         bits = bits_hex,

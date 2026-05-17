@@ -756,7 +756,9 @@ describe("rest", function()
       assert.truthy(content_type:match("application/json"))
 
       local d = cjson.decode(body)
-      assert.equal("mainnet",            d.chain)
+      -- FIX-80: Core's canonical chain name is "main", not "mainnet"
+      -- (bitcoin-core/src/util/chaintype.cpp::ChainTypeToString).
+      assert.equal("main",               d.chain)
       assert.equal(100,                  d.blocks)
       assert.equal(100,                  d.headers)
       assert.equal(types.hash256_hex(m.tip_hash), d.bestblockhash)
