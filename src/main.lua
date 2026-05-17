@@ -698,6 +698,7 @@ local function main()
   local types = require("lunarblock.types")
   local serialize = require("lunarblock.serialize")
   local crypto = require("lunarblock.crypto")
+  local blockfilter_mod = require("lunarblock.blockfilter")
 
   -- Get network configuration
   local network = consensus_mod.networks[args.network]
@@ -1742,6 +1743,217 @@ local function main()
     if #not_found > 0 then
       peer:send_message("notfound", p2p.serialize_notfound(not_found))
     end
+  end)
+
+  --------------------------------------------------------------------------
+  -- BIP-157 compact-filter request handlers (FIX-81 — W121 BUG-1/2 closure)
+  --
+  -- Mirrors bitcoin-core/src/net_processing.cpp:
+  --   PrepareBlockFilterRequest  (line 3262) — shared validation
+  --   ProcessGetCFilters         (line 3315) — getcfilters → cfilter*
+  --   ProcessGetCFHeaders        (line 3344) — getcfheaders → cfheaders
+  --   ProcessGetCFCheckPt        (line 3386) — getcfcheckpt → cfcheckpt
+  --
+  -- Validation common to all 3:
+  --   (a) filter_type != 0   → peer:disconnect (Core fDisconnect=true)
+  --   (b) !NODE_COMPACT_FILTERS in our advertised services → disconnect
+  --       (Core's `peer.m_our_services & NODE_COMPACT_FILTERS` check)
+  --   (c) stop_hash not in active chain → disconnect
+  --       (Core's LookupBlockIndex + BlockRequestAllowed)
+  --   (d) start_height > stop_index.height → disconnect (cfilters/cfheaders)
+  --   (e) (stop_index.height - start_height) >= max_height_diff → disconnect
+  --
+  -- On success: walk the active chain (height_to_hash) from start_height
+  -- to stop_index.height, look up each filter via storage CF.BLOCK_FILTER,
+  -- and send the response message(s).
+  --
+  -- We use the active-chain walk (header_chain.height_to_hash[h]) because
+  -- Core's stop_index.GetAncestor(h) by definition walks back from
+  -- stop_index, and BlockRequestAllowed restricts stop_hash to peers we
+  -- can serve.  When stop_hash IS on the active chain (the only case
+  -- where BlockRequestAllowed passes the W14_REQUEST_BLOCKS threshold),
+  -- GetAncestor(h) == height_to_hash[h].  Cross-fork stop_hashes are
+  -- rejected outright — matches Core's BlockRequestAllowed false path.
+  --
+  local function bip157_dispatch_present()
+    return p2p.BIP157_P2P_DISPATCH_PRESENT
+  end
+
+  local function get_active_chain_hash(height)
+    local hash_hex = header_chain.height_to_hash[height]
+    if not hash_hex then return nil end
+    return types.hash256_from_hex(hash_hex)
+  end
+
+  -- Resolve `stop_hash` to a height on the active chain, mirroring Core's
+  -- LookupBlockIndex + active-chain check.  Returns the height or nil.
+  -- Rejects unknown hashes AND known headers that are not on the active
+  -- chain (cross-fork getcfilters).  The header_chain.get_header path
+  -- returns an entry with a height; height_to_hash[entry.height] must
+  -- equal the requested hash hex to confirm active-chain membership.
+  local function resolve_stop_hash_on_active_chain(stop_hash)
+    local entry = header_chain:get_header(stop_hash)
+    if not entry then return nil end
+    local stop_height = entry.height
+    local active_hex = header_chain.height_to_hash[stop_height]
+    if not active_hex then return nil end
+    if active_hex ~= types.hash256_hex(stop_hash) then return nil end
+    return stop_height
+  end
+
+  -- Read a filter blob directly from CF.BLOCK_FILTER (matches the inline
+  -- writes done by chain_state.connect_block; see utxo.lua:2952).  The
+  -- on-disk layout is {filter_hash || filter_header || varstr(filter)}.
+  local function read_filter_blob(block_hash)
+    local data = db.get(storage_mod.CF.BLOCK_FILTER, block_hash.bytes)
+    if not data then return nil end
+    local r = serialize.buffer_reader(data)
+    return {
+      filter_hash   = r.read_hash256(),
+      filter_header = r.read_hash256(),
+      filter        = r.read_varstr(),
+    }
+  end
+
+  local function our_compact_filters_advertised(peer)
+    local bit_mod = require("bit")
+    return bit_mod.band(peer.our_services or 0,
+                        p2p.SERVICES.NODE_COMPACT_FILTERS) ~= 0
+  end
+
+  peer_manager:register_handler("getcfilters", function(peer, payload)
+    if not bip157_dispatch_present() then return end
+    if not chain_state.filterindex_enabled then
+      -- Core: !filter_index → log + return (no disconnect)
+      return
+    end
+    local ok, req = pcall(p2p.deserialize_getcfilters, payload)
+    if not ok or not req then
+      peer:misbehaving(10, "malformed getcfilters")
+      return
+    end
+    -- Validation (b): filter_type==BASIC + service advertised.
+    if req.filter_type ~= p2p.FILTER_TYPE.BASIC or
+       not our_compact_filters_advertised(peer) then
+      peer:disconnect("getcfilters: unsupported filter_type or NODE_COMPACT_FILTERS not advertised")
+      return
+    end
+    -- Validation (c): stop_hash on active chain.
+    local stop_height = resolve_stop_hash_on_active_chain(req.stop_hash)
+    if not stop_height then
+      peer:disconnect("getcfilters: stop_hash not on active chain (BlockRequestAllowed)")
+      return
+    end
+    -- Validation (d): start_height > stop_height.
+    if req.start_height > stop_height then
+      peer:disconnect("getcfilters: start_height > stop_height")
+      return
+    end
+    -- Validation (e): range too large (Core: >= max).
+    if stop_height - req.start_height >= p2p.MAX_GETCFILTERS_SIZE then
+      peer:disconnect("getcfilters: range exceeds MAX_GETCFILTERS_SIZE")
+      return
+    end
+    -- Walk active chain, look up each filter, send cfilter responses.
+    for h = req.start_height, stop_height do
+      local block_hash = get_active_chain_hash(h)
+      if not block_hash then break end
+      local info = read_filter_blob(block_hash)
+      if not info then break end
+      local out = p2p.serialize_cfilter(req.filter_type, block_hash, info.filter)
+      peer:send_message("cfilter", out)
+    end
+  end)
+
+  peer_manager:register_handler("getcfheaders", function(peer, payload)
+    if not bip157_dispatch_present() then return end
+    if not chain_state.filterindex_enabled then return end
+    local ok, req = pcall(p2p.deserialize_getcfheaders, payload)
+    if not ok or not req then
+      peer:misbehaving(10, "malformed getcfheaders")
+      return
+    end
+    if req.filter_type ~= p2p.FILTER_TYPE.BASIC or
+       not our_compact_filters_advertised(peer) then
+      peer:disconnect("getcfheaders: unsupported filter_type or NODE_COMPACT_FILTERS not advertised")
+      return
+    end
+    local stop_height = resolve_stop_hash_on_active_chain(req.stop_hash)
+    if not stop_height then
+      peer:disconnect("getcfheaders: stop_hash not on active chain (BlockRequestAllowed)")
+      return
+    end
+    if req.start_height > stop_height then
+      peer:disconnect("getcfheaders: start_height > stop_height")
+      return
+    end
+    if stop_height - req.start_height >= p2p.MAX_GETCFHEADERS_SIZE then
+      peer:disconnect("getcfheaders: range exceeds MAX_GETCFHEADERS_SIZE")
+      return
+    end
+    -- prev_header: filter_header at start_height - 1.  Genesis (h=0):
+    -- prev_header = uint256() = all-zeros (BIP-157 §"Filter Headers").
+    local prev_filter_header
+    if req.start_height == 0 then
+      prev_filter_header = types.hash256_zero()
+    else
+      local prev_block_hash = get_active_chain_hash(req.start_height - 1)
+      if not prev_block_hash then return end
+      local prev_info = read_filter_blob(prev_block_hash)
+      if not prev_info then return end
+      prev_filter_header = prev_info.filter_header
+    end
+    -- Collect filter_hashes from start_height..stop_height.
+    local filter_hashes = {}
+    for h = req.start_height, stop_height do
+      local block_hash = get_active_chain_hash(h)
+      if not block_hash then return end
+      local info = read_filter_blob(block_hash)
+      if not info then return end
+      filter_hashes[#filter_hashes + 1] = info.filter_hash
+    end
+    -- stop_index.GetBlockHash() in Core: send the stop_hash itself.
+    local stop_hash = get_active_chain_hash(stop_height) or req.stop_hash
+    local out = p2p.serialize_cfheaders(req.filter_type, stop_hash,
+                                        prev_filter_header, filter_hashes)
+    peer:send_message("cfheaders", out)
+  end)
+
+  peer_manager:register_handler("getcfcheckpt", function(peer, payload)
+    if not bip157_dispatch_present() then return end
+    if not chain_state.filterindex_enabled then return end
+    local ok, req = pcall(p2p.deserialize_getcfcheckpt, payload)
+    if not ok or not req then
+      peer:misbehaving(10, "malformed getcfcheckpt")
+      return
+    end
+    if req.filter_type ~= p2p.FILTER_TYPE.BASIC or
+       not our_compact_filters_advertised(peer) then
+      peer:disconnect("getcfcheckpt: unsupported filter_type or NODE_COMPACT_FILTERS not advertised")
+      return
+    end
+    local stop_height = resolve_stop_hash_on_active_chain(req.stop_hash)
+    if not stop_height then
+      peer:disconnect("getcfcheckpt: stop_hash not on active chain (BlockRequestAllowed)")
+      return
+    end
+    -- Core (net_processing.cpp:3403): N = stop_index.height / CFCHECKPT_INTERVAL.
+    -- For each i in [0, N): height = (i + 1) * CFCHECKPT_INTERVAL,
+    -- header = filter_header at that height.
+    local interval = blockfilter_mod.CFCHECKPT_INTERVAL
+    local n = math.floor(stop_height / interval)
+    local headers = {}
+    for i = 1, n do
+      local h = i * interval
+      local block_hash = get_active_chain_hash(h)
+      if not block_hash then return end
+      local info = read_filter_blob(block_hash)
+      if not info then return end
+      headers[i] = info.filter_header
+    end
+    local stop_hash = get_active_chain_hash(stop_height) or req.stop_hash
+    local out = p2p.serialize_cfcheckpt(req.filter_type, stop_hash, headers)
+    peer:send_message("cfcheckpt", out)
   end)
 
   -- Peer established callback: start sync
