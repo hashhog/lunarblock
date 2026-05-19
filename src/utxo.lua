@@ -2404,20 +2404,6 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
         -- Script verification (skip if assumevalid optimization is active)
         if not skip_script_validation then
-          -- Compute cache key flags as a bitmask
-          local cache_flags = 0
-          if height >= self.network.bip34_height then cache_flags = cache_flags + 1 end     -- P2SH
-          if height >= self.network.bip66_height then cache_flags = cache_flags + 2 end     -- DERSIG
-          if height >= self.network.bip65_height then cache_flags = cache_flags + 4 end     -- CLTV
-          if height >= self.network.csv_height then cache_flags = cache_flags + 8 end       -- CSV
-          if height >= self.network.segwit_height then cache_flags = cache_flags + 16 end   -- WITNESS
-
-          -- Check signature cache first
-          local txid_bytes = txid.bytes
-          if self.sig_cache:lookup(txid_bytes, inp_idx, cache_flags) then
-            goto skip_verification
-          end
-
           -- Consensus-only script flags (MANDATORY_SCRIPT_VERIFY_FLAGS parity).
           -- verify_nullfail and verify_witness_pubkeytype are policy-only
           -- (STANDARD_SCRIPT_VERIFY_FLAGS per Bitcoin Core policy/policy.h:125,128)
@@ -2434,6 +2420,45 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             verify_nulldummy = height >= self.network.segwit_height,
             verify_taproot = height >= self.network.taproot_height,
           }
+
+          -- W160 BUG-9 fix: cache key must include ALL consensus script-verify
+          -- flag bits, not a coarse height-bitmask. Core's SignatureCacheHasher
+          -- (sigcache.cpp:39-50) mixes in the FULL `flags` integer. Collapsing
+          -- BIP34/66/65/CSV/WITNESS into 5 bits dropped TAPROOT, NULLDUMMY and
+          -- the implicit MANDATORY flag bits (LOW_S, NULLFAIL, STRICTENC,
+          -- MINIMALDATA, MINIMALIF, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE). A
+          -- cache entry that passed under verify_low_s=unset could be HIT by
+          -- a later strict-flag context and falsely-verify a high-S sig. We
+          -- derive cache_flags from the `flags` table above so the key
+          -- materially covers every consensus flag the verifier consumes.
+          local cache_flags = 0
+          if flags.verify_p2sh                then cache_flags = cache_flags +     1 end
+          if flags.verify_dersig              then cache_flags = cache_flags +     2 end
+          if flags.verify_checklocktimeverify then cache_flags = cache_flags +     4 end
+          if flags.verify_checksequenceverify then cache_flags = cache_flags +     8 end
+          if flags.verify_witness             then cache_flags = cache_flags +    16 end
+          if flags.verify_nulldummy           then cache_flags = cache_flags +    32 end
+          if flags.verify_taproot             then cache_flags = cache_flags +    64 end
+          -- Mandatory consensus flags always enabled in block-connect path
+          -- (LOW_S, NULLFAIL, STRICTENC, MINIMALDATA, MINIMALIF,
+          -- WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE). Encoded as constant bits
+          -- so that any future toggle here forces a distinct cache key.
+          cache_flags = cache_flags + 128 + 256 + 512 + 1024 + 2048 + 4096 + 8192
+
+          -- W160 BUG-9 fix: cache key must use wtxid (witness-bearing) not
+          -- txid (non-witness). sig_cache.lua:6-7 documents the contract:
+          -- "Callers should pass the wtxid (witness txid) so that segwit
+          -- witness mutation produces a cache miss". Using txid here meant
+          -- a SegWit tx with a malleated witness had the same cache key
+          -- as the canonical tx → cache HIT on the malleated witness →
+          -- invalid signature admitted. Core uses wtxid in
+          -- SignatureCacheHasher::ComputeEntry (sigcache.cpp:39-50).
+          local wtxid_bytes = validation.compute_wtxid(tx).bytes
+
+          -- Check signature cache first
+          if self.sig_cache:lookup(wtxid_bytes, inp_idx, cache_flags) then
+            goto skip_verification
+          end
 
           -- Build prev_outputs once per tx for Taproot key-path checker.
           -- (utxo_cache is built in the first pass above; lazy because
@@ -2742,8 +2767,8 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               inp_idx, types.hash256_hex(txid), err or "verify_script returned false"))
           end
 
-          -- Cache successful verification
-          self.sig_cache:insert(txid_bytes, inp_idx, cache_flags)
+          -- Cache successful verification (W160 BUG-9: keyed on wtxid).
+          self.sig_cache:insert(wtxid_bytes, inp_idx, cache_flags)
           ::skip_verification::
         end
 
