@@ -3873,7 +3873,14 @@ function RPCServer:register_methods()
       if params[1] and params[1].coinbase_payout then
         payout_script = params[1].coinbase_payout
       else
-        payout_script = script_mod.make_p2pkh_script(string.rep("\0", 20))
+        -- OP_TRUE (anyone-can-spend) — Core's convention for unconfigured
+        -- mining contexts. Previously defaulted to an all-zero P2PKH
+        -- (1111111111111111111114oLvT2 — the canonical "burn address"
+        -- where no preimage exists), which permanently destroys the
+        -- block reward (~3.125 BTC + fees per block) for any pool that
+        -- calls getblocktemplate without explicit coinbase_payout. With
+        -- OP_TRUE, the failure mode is race-claimable rather than burn.
+        payout_script = "\x51"
       end
       local template = rpc.mining.create_block_template(
         rpc.mempool, rpc.chain_state, rpc.network,
