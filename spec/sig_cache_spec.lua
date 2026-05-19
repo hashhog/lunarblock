@@ -113,6 +113,42 @@ describe("sig_cache", function()
     end)
   end)
 
+  describe("W160 BUG-9: wtxid-vs-txid key separation", function()
+    -- SegWit malleability defense: two transactions that share the same
+    -- non-witness txid but differ in their witness (and therefore their
+    -- wtxid) MUST produce distinct cache keys. If they collided, a
+    -- cache HIT on a malleated witness would skip verification and
+    -- admit an invalid signature. Mirrors Core's SignatureCacheHasher
+    -- (sigcache.cpp:39-50) which keys on wtxid.
+    it("two SegWit txs sharing txid but distinct wtxids produce distinct keys", function()
+      local cache = sig_cache.new()
+      -- Same 32-byte txid, but different wtxids (e.g. a malleated witness
+      -- gives the same txid but a different witness commitment).
+      local wtxid_canonical = string.rep("\xaa", 32)
+      local wtxid_malleated = string.rep("\xab", 32)
+      -- Same input_index and flags — only the key bytes differ.
+      local key_canonical = cache:make_key(wtxid_canonical, 0, 0xFFFF)
+      local key_malleated = cache:make_key(wtxid_malleated, 0, 0xFFFF)
+      assert.are_not.equal(key_canonical, key_malleated)
+      -- Insert canonical; malleated must NOT cache-hit.
+      cache:insert(wtxid_canonical, 0, 0xFFFF)
+      assert.is_true(cache:lookup(wtxid_canonical, 0, 0xFFFF))
+      assert.is_false(cache:lookup(wtxid_malleated, 0, 0xFFFF))
+    end)
+
+    -- Cache-flags width: two distinct script-verify flag sets must produce
+    -- distinct cache keys. A high-S signature accepted under flags-without-
+    -- LOW_S must NOT cache-hit a later lookup with LOW_S enforced.
+    it("differing flag bits (low_s on/off) produce distinct keys", function()
+      local cache = sig_cache.new()
+      local wtxid = string.rep("\xcd", 32)
+      -- flags=0xFF (mandatory bits set) vs 0xFF + LOW_S bit (128)
+      local key_lax    = cache:make_key(wtxid, 0, 0xFF)
+      local key_strict = cache:make_key(wtxid, 0, 0xFF + 128)
+      assert.are_not.equal(key_lax, key_strict)
+    end)
+  end)
+
   describe("clear", function()
     it("removes all entries", function()
       local cache = sig_cache.new()
