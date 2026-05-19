@@ -391,6 +391,17 @@ ffi.cdef[[
   secp256k1_context* secp256k1_context_create(unsigned int flags);
   void secp256k1_context_destroy(secp256k1_context* ctx);
 
+  /* Side-channel blinding seed. Core's ECC_Start (key.cpp:572-587) calls this
+   * unconditionally with 32 random bytes after every context_create, and
+   * asserts the return. secp256k1.h:820-841 marks it
+   * SECP256K1_WARN_UNUSED_RESULT and "highly recommended" for any context that
+   * will be used for secret-key operations (signing, pubkey_create, keypair
+   * ops). Returns 1 on success, 0 on failure. */
+  int secp256k1_context_randomize(
+    secp256k1_context* ctx,
+    const unsigned char* seed32
+  );
+
   int secp256k1_ec_pubkey_parse(
     const secp256k1_context* ctx,
     secp256k1_pubkey* pubkey,
@@ -613,6 +624,20 @@ local libsecp256k1 = ffi.load("secp256k1")
 local secp_ctx = libsecp256k1.secp256k1_context_create(
   bit.bor(0x0101, 0x0201)  -- VERIFY | SIGN
 )
+
+-- W158 BUG-7 / W159 BUG-2 fix: side-channel blinding.
+-- Per bitcoin-core/src/key.cpp:572-587 (ECC_Start), unconditionally seed the
+-- context with 32 bytes of fresh entropy immediately after _create. Defeats
+-- timing / cache / EM side-channel attacks on every secret-key operation
+-- (ecdsa_sign, ecdsa_sign_recoverable, schnorr_sign via keypair_create,
+-- taproot_tweak_seckey, ec_seckey_tweak_add, pubkey_from_privkey,
+-- ellswift_create). secp256k1.h:820-841 marks the call WARN_UNUSED_RESULT
+-- and "highly recommended"; Core asserts on the return. We mirror that.
+do
+  local seed32 = M.random_bytes(32)
+  local ok = libsecp256k1.secp256k1_context_randomize(secp_ctx, seed32)
+  assert(ok == 1, "secp256k1_context_randomize failed (side-channel blinding seed rejected)")
+end
 
 -- Verify an ECDSA signature (DER-encoded) against a message hash and public key.
 -- NOTE: secp256k1_ecdsa_verify only accepts normalised (low-S) signatures.
