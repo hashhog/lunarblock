@@ -2121,8 +2121,19 @@ local function main()
     -- Cheap: just int compares when no signal is pending.
     ops.poll_signals()
 
-    -- Process P2P
-    peer_manager:tick()
+    -- Process P2P (pcall — defense against malformed peer payloads
+    -- crashing the main loop. A bad getdata varint mismatch trips an
+    -- assert in src/serialize.lua:219 read_bytes that unwinds 5 frames
+    -- and aborts the entire LuaJIT process; without this pcall the RPC
+    -- server dies with it. Fixes the P0 DoS finding from Phase B
+    -- fleet-replay 2026-05-24, see CORE-PARITY-AUDIT/_bug-reports/
+    -- lunarblock-getblockcount-fails-2026-05-24.md.
+    -- Per-peer dispatch isolation in src/peer.lua is the deeper fix;
+    -- this top-level pcall is the symptom-layer safety net.)
+    local p2p_ok, p2p_err = pcall(function() peer_manager:tick() end)
+    if not p2p_ok then
+      print(string.format("P2P tick error: %s", tostring(p2p_err)))
+    end
 
     -- Schedule block downloads — both during IBD and at tip.
     -- After IBD, new blocks are discovered via inv→getheaders→headers
