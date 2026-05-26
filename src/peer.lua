@@ -961,19 +961,47 @@ function Peer:process_messages()
       -- handler without changing the dispatch.
       local handler = self.message_handlers[msg.command]
       if handler then
-        handler(self, msg.payload)
+        Peer._safe_dispatch(self, msg.command, handler, msg.payload)
       end
     else
-      -- Dispatch to registered handler
+      -- Dispatch to registered handler.
       local handler = self.message_handlers[msg.command]
       if handler then
-        handler(self, msg.payload)
+        Peer._safe_dispatch(self, msg.command, handler, msg.payload)
       end
     end
 
     ::continue::
   end
   return processed
+end
+
+--- Defense-in-depth: every handler dispatch is pcall-wrapped here so a
+--- malformed peer payload that crashes any per-handler deserializer
+--- (e.g. read_bytes' assert in src/serialize.lua:219 when a varint
+--- count exceeds the actual payload length) is contained to the offending
+--- peer instead of unwinding all the way up through peer_manager:tick
+--- and aborting the entire LuaJIT process. Closes the class of bug
+--- documented in CORE-PARITY-AUDIT/_bug-reports/lunarblock-getblockcount-
+--- fails-2026-05-24.md — the top-level pcall in main.lua's event loop
+--- (commit 78e1e22) covers the SYMPTOM (process doesn't die); this
+--- per-peer wrapper covers the CLASS (the offending peer is disconnected
+--- so it can't keep tripping the same assert on every pass).
+---
+--- A handler raising on a recognised command IS a protocol violation
+--- per Bitcoin Core's NetEventsInterface, so we disconnect. Misbehavior
+--- scoring escalation is a follow-up (the MISBEHAVIOR table lives in
+--- src/peerman.lua but only the peer manager has direct access).
+function Peer._safe_dispatch(self, command, handler, payload)
+  local ok, err = pcall(handler, self, payload)
+  if not ok then
+    print(string.format(
+      "peer %s: handler %q raised: %s — disconnecting",
+      tostring(self.addr or "?"), tostring(command), tostring(err)))
+    if type(self.disconnect) == "function" then
+      pcall(function() self:disconnect("malformed " .. tostring(command) .. " payload") end)
+    end
+  end
 end
 
 --------------------------------------------------------------------------------
