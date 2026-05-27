@@ -1015,7 +1015,28 @@ local function main()
     -- correctly from storage, fixing the silent BIP-113 IsFinalTx + BIP-68
     -- time-based sequence-lock degradation that existed when connect_block
     -- was called directly with nil MTP args.
-    local pcall_ok, ok_or_err = pcall(chain_state.accept_block, chain_state,
+    -- accept_block can fail in two ways:
+    --   (a) raise a Lua error via assert() (e.g. tapscript SCRIPT_SIZE fires
+    --       inside connect_block) → pcall_ok=false, ok_or_err=error message.
+    --   (b) return (nil, err_string) from a structured validation gate
+    --       (e.g. connect_block: "prev_hash mismatch ...", "non-final
+    --       transaction: bad-txns-nonfinal", "bad-cb-amount ...",
+    --       "too-far-ahead", "bad-blk-sigops ..."). These paths return
+    --       cleanly without raising. pcall_ok=true, accept_ok=nil, accept_err=string.
+    -- Pre-fix, only (a) was handled — (b) silently fell through, sync.lua's
+    -- pcall around connect_callback returned cb_ok=true, and
+    -- connect_pending_blocks then ran `next_connect_height += 1` on a block
+    -- that was NEVER connected. The local chain_state.tip_height stayed put
+    -- (because connect_block bailed before its `self.tip_height = height`
+    -- assignment), but next_connect_height marched past. Two heights later
+    -- the scheduler attempted a block whose prev had never been applied,
+    -- producing the 949207 wedge: "Missing UTXO for input 2 of tx
+    -- 201efbc8..." where the missing UTXO was created in 949205, which
+    -- silently dropped on a structured-error path.
+    -- Both failure modes are now funnelled to the same handler: discard the
+    -- partial in-memory cache mutations and raise so sync.lua's `if not
+    -- cb_ok` branch fires and next_connect_height is NOT incremented.
+    local pcall_ok, accept_ok, accept_err = pcall(chain_state.accept_block, chain_state,
       block, height, block_hash, {
         skip_check_block = true,    -- already validated by sync.lua above
         skip_scripts     = skip_scripts,
@@ -1023,13 +1044,22 @@ local function main()
         caller_batch_fn  = caller_batch_fn,
       })
     if not pcall_ok then
-      -- A Lua error was raised (typically assert() inside connect_block).
+      -- (a) A Lua error was raised (typically assert() inside connect_block).
+      -- accept_ok is the error message in this case (pcall's 2nd return).
       -- Discard partial in-memory cache mutations from the failed attempt
       -- so a retry (or any sibling block) sees pre-attempt UTXO state.
       -- Disk is already consistent (no flush ran).
       chain_state.coin_view:discard_dirty()
       -- Re-raise so pcall in connect_pending_blocks catches it.
-      error(string.format("Failed to connect block %d: %s", height, tostring(ok_or_err)))
+      error(string.format("Failed to connect block %d: %s", height, tostring(accept_ok)))
+    end
+    if not accept_ok then
+      -- (b) Structured validation failure — accept_block returned (nil, err).
+      -- Symmetric handling to the raised-error path above: drop dirty cache
+      -- so retry sees clean state, then raise so sync.lua does NOT advance
+      -- next_connect_height past a block whose UTXO mutations never landed.
+      chain_state.coin_view:discard_dirty()
+      error(string.format("Failed to connect block %d: %s", height, tostring(accept_err)))
     end
     -- Run the prune sweep AFTER the block is connected. maybe_prune is
     -- self-throttled (PRUNE_INTERVAL_BLOCKS) and capped per-call
