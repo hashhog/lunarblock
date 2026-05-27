@@ -1413,6 +1413,9 @@ function Wallet:scan_utxos(chain_state)
     if script_type == "p2wpkh" then
       local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
       addr = address.segwit_encode(hrp, 0, hash_or_program)
+    elseif script_type == "p2tr" then
+      -- P2-4: discover our own P2TR coins in the confirmed UTXO set.
+      addr = address.xonly_pubkey_to_p2tr(hash_or_program, self.network.name)
     elseif script_type == "p2pkh" then
       local version = self.network.pubkey_address_prefix
       addr = address.base58check_encode(version, hash_or_program)
@@ -1484,6 +1487,9 @@ function Wallet:scan_mempool(mempool)
       if script_type == "p2wpkh" then
         local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
         addr = address.segwit_encode(hrp, 0, hash_or_program)
+      elseif script_type == "p2tr" then
+        -- P2-4: discover our own P2TR coins in pending mempool txs too.
+        addr = address.xonly_pubkey_to_p2tr(hash_or_program, self.network.name)
       elseif script_type == "p2pkh" then
         local version = self.network.pubkey_address_prefix
         addr = address.base58check_encode(version, hash_or_program)
@@ -1631,6 +1637,126 @@ function M.sign_input_p2wsh(tx, inputIdx, witnessScript, value, signKeys, hashTy
   local sig, err = crypto.ecdsa_sign(k.privkey, sighash)
   if not sig then return nil, err or "signing failed" end
   return {sig .. string.char(hashType), witnessScript}
+end
+
+--------------------------------------------------------------------------------
+-- BIP-86 Taproot key-path signer (P2-4)
+--------------------------------------------------------------------------------
+
+-- BIP-341 SIGHASH_DEFAULT (0x00). When this hash type is used the BIP-341
+-- witness omits the trailing sighash flag byte (the wire format is a bare
+-- 64-byte Schnorr signature instead of 65 bytes). All other taproot hash
+-- types DO carry the trailing byte. Lunarblock defaults to SIGHASH_DEFAULT
+-- — that is what BIP-86 wallets emit and what every block-explorer +
+-- standard tooling expects in production.
+M.SIGHASH_DEFAULT = 0x00
+
+--- Sign a single input as a BIP-86 P2TR key-path spend.
+--
+-- Mirrors Core MutableTransactionSignatureCreator + CreateTaprootScriptSig
+-- (script/sign.cpp + script/signingprovider.cpp) for the BIP-86 key-path
+-- branch, and the rustoshi reference signer at
+-- crates/wallet/src/wallet.rs::sign_p2tr_input (W27-C P0-1). Wires the
+-- TapTweak + tweaked-key Schnorr signing primitives that already live in
+-- src/crypto.lua (M.tagged_hash, M.taproot_tweak_seckey, M.schnorr_sign)
+-- but were never composed into a signer until this fix. Closes the
+-- "write-only Taproot wallets" P0 from W161 (impl-triage 2026-05-19):
+-- before this fix a user could deposit to a lunarblock P2TR address but
+-- could never spend, because `_sign_inputs` fell through to the legacy
+-- ECDSA branch and emitted a DER-encoded sig the network rejects on a
+-- v1 segwit output.
+--
+-- BIP-86 specifies: merkle_root is empty (key-path only, no script tree).
+-- The TapTweak preimage is therefore just the 32-byte internal x-only key.
+--
+-- @param tx           transaction: tx being signed (segwit shape required).
+-- @param input_index  number: 0-based input index being signed.
+-- @param prev_outputs table: array of {value, script_pubkey} for EVERY
+--                    input of `tx` (BIP-341 commits to all prevouts, not
+--                    just the one being signed). Same shape consumed by
+--                    validation.signature_hash_taproot.
+-- @param privkey32   string: 32-byte secret key (the BIP-32 derived priv
+--                    BEFORE the TapTweak — this function applies the
+--                    tweak; callers must NOT pre-tweak).
+-- @param hash_type   number|nil: SIGHASH byte (default M.SIGHASH_DEFAULT
+--                    = 0x00, the BIP-86 default). Per BIP-341, the
+--                    witness omits the trailing hash byte iff hash_type
+--                    == 0x00, so callers asking for any other type get a
+--                    65-byte witness item.
+-- @param aux_rand32  string|nil: 32 bytes of fresh randomness. Defaults
+--                    to crypto.random_bytes(32) — production Core does
+--                    the same in MutableTransactionSignatureCreator via
+--                    GetRandBytes. Pass an explicit zero-string only for
+--                    BIP-340 vector reproduction.
+-- @return string|nil 64- or 65-byte witness item on success, or
+--                    nil + err on failure.
+function M.sign_input_p2tr_keypath(tx, input_index, prev_outputs, privkey32, hash_type, aux_rand32)
+  hash_type = hash_type or M.SIGHASH_DEFAULT
+  if type(privkey32) ~= "string" or #privkey32 ~= 32 then
+    return nil, "privkey32 must be a 32-byte string"
+  end
+  if type(prev_outputs) ~= "table" or #prev_outputs ~= #tx.inputs then
+    return nil, "prev_outputs must be one entry per tx input"
+  end
+
+  -- 1. Derive the internal x-only pubkey FROM the secret key. Done before
+  --    the tweak so we hash the BIP-86 preimage (the internal key — Core
+  --    interpreter.cpp:1693 / BIP-86 wallet vector).
+  local internal_pub33 = crypto.pubkey_from_privkey(privkey32, true)
+  if not internal_pub33 or #internal_pub33 ~= 33 then
+    return nil, "pubkey_from_privkey failed"
+  end
+  local internal_xonly = internal_pub33:sub(2, 33)
+  if #internal_xonly ~= 32 then
+    return nil, "internal_xonly extraction failed"
+  end
+
+  -- 2. BIP-86 TapTweak — merkle_root absent (key-path-only). Preimage is
+  --    JUST the 32-byte internal key (no concatenation). Identical to the
+  --    address-side derivation in pubkey_to_address_for_purpose; the two
+  --    sites MUST stay in lock-step or funds burn (silently sending to a
+  --    tweaked output the wallet can never reproduce on the sign side).
+  local tweak = crypto.tagged_hash("TapTweak", internal_xonly)
+  if not tweak or #tweak ~= 32 then
+    return nil, "TapTweak hash failed"
+  end
+
+  -- 3. Apply tweak to the secret key. Uses libsecp256k1's keypair_xonly_
+  --    tweak_add (the in-place mirror of pubkey-side tweak_add), which
+  --    correctly handles BIP-340's even-Y normalisation (Core key.cpp
+  --    SignSchnorr applies the same step transparently via Keypair).
+  local tweaked_priv, terr = crypto.taproot_tweak_seckey(privkey32, tweak)
+  if not tweaked_priv then
+    return nil, "taproot_tweak_seckey failed: " .. tostring(terr)
+  end
+
+  -- 4. BIP-341 sighash. ext_flag=0 selects the key-path commitment shape
+  --    (no tapleaf_hash / no codesep_pos).
+  local sighash, sherr = validation.signature_hash_taproot(
+    tx, input_index, hash_type, prev_outputs, 0, nil, nil, nil
+  )
+  if not sighash then
+    return nil, "signature_hash_taproot failed: " .. tostring(sherr)
+  end
+
+  -- 5. Fresh aux_rand per BIP-340 §"Default Signing" — randomises the
+  --    nonce, hardens against fault attacks. Pass-through allowed for
+  --    deterministic vector reproduction.
+  aux_rand32 = aux_rand32 or crypto.random_bytes(32)
+
+  local sig64, signerr = crypto.schnorr_sign(tweaked_priv, sighash, aux_rand32)
+  if not sig64 then
+    return nil, "schnorr_sign failed: " .. tostring(signerr)
+  end
+
+  -- 6. BIP-341 wire format: hash_type byte appended ONLY if non-default.
+  --    SIGHASH_DEFAULT (0x00) → 64-byte witness item.
+  --    Anything else → 65 bytes (sig || hash_type).
+  if hash_type == M.SIGHASH_DEFAULT then
+    return sig64
+  else
+    return sig64 .. string.char(hash_type)
+  end
 end
 
 --- Estimate fee rate for a transaction.
@@ -1783,7 +1909,18 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
   local tx = types.transaction(2, inputs, outputs, 0)
   tx.segwit = true
 
-  -- 8. Sign inputs
+  -- 8. Sign inputs.
+  -- BIP-341 sighash needs the prevouts for EVERY input — pre-build the
+  -- array once. Only consumed by the P2TR branch; the segwit-v0 + legacy
+  -- branches commit to a single prevout each.
+  local prev_outputs = {}
+  for j, sel in ipairs(selected) do
+    prev_outputs[j] = {
+      value = sel.utxo.value,
+      script_pubkey = sel.utxo.script_pubkey,
+    }
+  end
+
   for i, item in ipairs(selected) do
     local key_info = self.keys[item.utxo.address]
     if not key_info then
@@ -1803,6 +1940,16 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
       local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
       sig = sig .. string.char(consensus.SIGHASH.ALL)
       tx.inputs[i].witness = {sig, key_info.pubkey}
+    elseif key_info.type == "p2tr" then
+      -- BIP-86 key-path signing (P2-4).
+      local witness_item, terr = M.sign_input_p2tr_keypath(
+        tx, i - 1, prev_outputs, key_info.privkey
+      )
+      if not witness_item then
+        return nil, "P2TR sign failed: " .. tostring(terr)
+      end
+      tx.inputs[i].witness = { witness_item }
+      tx.inputs[i].script_sig = ""
     else
       -- Legacy P2PKH signing
       local sighash = validation.signature_hash_legacy(
@@ -1958,6 +2105,12 @@ function Wallet:_address_for_script(script_pubkey)
   if script_type == "p2wpkh" then
     local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
     addr = address.segwit_encode(hrp, 0, hash_or_program)
+  elseif script_type == "p2tr" then
+    -- P2-4: recognise our own P2TR coins so bump_fee / coin reconciliation
+    -- can locate the key_info for a spent taproot UTXO. hash_or_program is
+    -- the 32-byte tweaked x-only key; that maps 1-1 to the bech32m address
+    -- via xonly_pubkey_to_p2tr.
+    addr = address.xonly_pubkey_to_p2tr(hash_or_program, self.network.name)
   elseif script_type == "p2pkh" then
     local version = self.network.pubkey_address_prefix
     addr = address.base58check_encode(version, hash_or_program)
@@ -1999,6 +2152,18 @@ function Wallet:_sign_inputs(tx, input_utxos, indices)
     should_sign = function() return true end
   end
 
+  -- BIP-341 requires the prev_outputs of EVERY input (not just the one
+  -- being signed) for any taproot input. Pre-build the array once; the
+  -- legacy + segwit-v0 paths ignore it. Used by sign_input_p2tr_keypath.
+  local prev_outputs = nil
+  for j = 1, #tx.inputs do
+    local u = input_utxos[j]
+    if u then
+      prev_outputs = prev_outputs or {}
+      prev_outputs[j] = { value = u.value, script_pubkey = u.script_pubkey }
+    end
+  end
+
   for i, _ in ipairs(tx.inputs) do
     if should_sign(i) then
       local utxo = input_utxos[i]
@@ -2022,6 +2187,25 @@ function Wallet:_sign_inputs(tx, input_utxos, indices)
         local sig = crypto.ecdsa_sign(key_info.privkey, sighash)
         sig = sig .. string.char(consensus.SIGHASH.ALL)
         tx.inputs[i].witness = {sig, key_info.pubkey}
+      elseif key_info.type == "p2tr" then
+        -- BIP-86 key-path spend (P2-4). The taproot signer needs the
+        -- prevouts of every input, not just this one — BIP-341 commits
+        -- to the whole input set unless ANYONECANPAY is in play.
+        -- Wallets created post-P2-3 with address_type="p2tr" have keys
+        -- tagged with type="p2tr"; legacy fallthrough to ECDSA used to
+        -- silently produce DER sigs the network rejects on a v1 segwit
+        -- output (the "write-only Taproot wallets" P0 from W161).
+        if not prev_outputs then
+          return false, "Missing prev_outputs for taproot input " .. tostring(i - 1)
+        end
+        local witness_item, terr = M.sign_input_p2tr_keypath(
+          tx, i - 1, prev_outputs, key_info.privkey
+        )
+        if not witness_item then
+          return false, "P2TR sign failed: " .. tostring(terr)
+        end
+        tx.inputs[i].witness = { witness_item }
+        tx.inputs[i].script_sig = ""
       else
         local sighash = validation.signature_hash_legacy(
           tx, i - 1, utxo.script_pubkey, consensus.SIGHASH.ALL
