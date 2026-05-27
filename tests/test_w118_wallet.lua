@@ -230,34 +230,37 @@ test("G9: BIP-32 v1 normal child m/0'/1 matches vector (add_mod_n correct)", fun
   expect_eq(c2.depth, 2, "depth=2")
 end)
 
--- G10: BUG — coin_type hardcoded to 0 in derive_bip44_key / derive_bip84_key
--- (SLIP-0044 says testnet is m/.../1'/, lunarblock always passes 0).
-test("G10: BUG — BIP-44/84 coin_type is hardcoded to 0 (G10-BUG-2)", function()
-  local src = io.open("src/wallet.lua", "r")
-  local content = src:read("*a"); src:close()
-  -- Both functions hardcode the coin step
-  local has_44_hard = content:find("derive_bip44_key")        ~= nil
-                      and content:find("derive_child%(purpose, 0x80000000 %+ 0%)") ~= nil
-  local has_84_hard = content:find("derive_bip84_key")        ~= nil
-  expect_true(has_44_hard, "derive_bip44_key exists with hardcoded 0x80000000+0")
-  expect_true(has_84_hard, "derive_bip84_key exists")
-  bug("G10-BUG-2", "P2",
-      "wallet.derive_bip44_key/derive_bip84_key hardcode coin_type=0 " ..
-      "(mainnet Bitcoin) regardless of network. Testnet/regtest wallets " ..
-      "generate the SAME keys as mainnet, violating SLIP-0044. wallet.lua:621/630.")
-  error("G10-BUG-2 confirmed: coin_type hardcoded to 0")
+-- G10: FIXED in P2-3 — SLIP-0044 coin_type is now network-aware via
+-- M.coin_type_for_network and threaded through M.derive_for_purpose. The
+-- legacy derive_bip44_key / derive_bip84_key shims still pass coin_type=0
+-- to byte-match historical mainnet behaviour (back-compat for callers that
+-- predate the refactor), but new wallet code paths (generate_address,
+-- unlock) call derive_for_purpose with the network's actual coin_type.
+-- Original bug: lunarblock unfreeze plan P2-3 / W118 G10-BUG-2.
+test("G10: P2-3 FIX — SLIP-0044 coin_type is network-aware in derive_for_purpose", function()
+  expect_eq(wallet.coin_type_for_network("mainnet"), 0, "mainnet coin_type=0")
+  expect_eq(wallet.coin_type_for_network("testnet"), 1, "testnet coin_type=1")
+  expect_eq(wallet.coin_type_for_network("testnet4"), 1, "testnet4 coin_type=1")
+  expect_eq(wallet.coin_type_for_network("regtest"), 1, "regtest coin_type=1")
+  expect_eq(wallet.coin_type_for_network("signet"), 1, "signet coin_type=1")
 end)
 
--- G11: BUG — BIP-49 (m/49') and BIP-86 (m/86') derivation absent
-test("G11: BUG — derive_bip49_key + derive_bip86_key absent (G11-BUG-3)", function()
-  expect_nil(wallet.derive_bip49_key, "no derive_bip49_key")
-  expect_nil(wallet.derive_bip86_key, "no derive_bip86_key")
-  bug("G11-BUG-3", "P2",
-      "wallet.lua only ships derive_bip44_key and derive_bip84_key. " ..
-      "BIP-49 (P2SH-P2WPKH, m/49') and BIP-86 (P2TR, m/86') derivation " ..
-      "absent. Setting address_type='p2sh_p2wpkh' or 'p2tr' on a wallet " ..
-      "silently falls through to derive_bip44_key + P2PKH. wallet.lua:619-635.")
-  error("G11-BUG-3 confirmed: BIP-49 and BIP-86 derivation absent")
+-- G11: FIXED in P2-3 — BIP-49 (P2SH-P2WPKH) and BIP-86 (P2TR) derivation
+-- now exist as table-driven entries in M.PURPOSE_TEMPLATES + shim helpers
+-- derive_bip49_key / derive_bip86_key. Setting wallet.address_type to
+-- "p2sh-p2wpkh" or "p2tr" now routes to the correct purpose + address
+-- builder instead of silently falling back to BIP-44 + P2PKH.
+-- Original bug: lunarblock unfreeze plan P2-3 / W118 G11-BUG-3.
+test("G11: P2-3 FIX — all 4 BIP-43 purpose codes are registered (44/49/84/86)", function()
+  expect_eq(type(wallet.derive_bip44_key), "function", "BIP-44 shim present")
+  expect_eq(type(wallet.derive_bip49_key), "function", "BIP-49 shim present")
+  expect_eq(type(wallet.derive_bip84_key), "function", "BIP-84 shim present")
+  expect_eq(type(wallet.derive_bip86_key), "function", "BIP-86 shim present")
+  expect_eq(type(wallet.derive_for_purpose), "function", "table-driven derive_for_purpose present")
+  expect_eq(wallet.purpose_for_address_type("p2pkh"),       44, "address_type p2pkh → 44")
+  expect_eq(wallet.purpose_for_address_type("p2sh-p2wpkh"), 49, "address_type p2sh-p2wpkh → 49")
+  expect_eq(wallet.purpose_for_address_type("p2wpkh"),      84, "address_type p2wpkh → 84")
+  expect_eq(wallet.purpose_for_address_type("p2tr"),        86, "address_type p2tr → 86")
 end)
 
 -- G12: BUG — xpub / xprv Base58Check serialization absent

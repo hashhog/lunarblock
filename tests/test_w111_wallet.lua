@@ -219,16 +219,20 @@ test("G8: BIP-44 and BIP-84 produce different keys", function()
   expect_true(key44.key ~= key84.key, "BIP-44 and BIP-84 should produce different keys")
 end)
 
--- G9-BUG: BIP-49 (P2SH-P2WPKH) path m/49'/0'/account'/change/index MISSING
-test("G9-BUG: BIP-49 path derivation (m/49') not implemented [BUG-3]", function()
-  log_bug("BUG-3", "P2: BIP-49 (P2SH-P2WPKH, m/49'/0'/account'/change/index) derivation absent. wallet.lua only has derive_bip44_key (m/44') and derive_bip84_key (m/84'). No derive_bip49_key.")
-  expect_eq(wallet.derive_bip49_key, nil, "derive_bip49_key should be absent (BUG-3)")
+-- G9-FIXED-IN-P2-3: BIP-49 (P2SH-P2WPKH) path m/49'/0'/account'/change/index
+-- now exists via wallet.derive_bip49_key (shim) + the table-driven
+-- M.derive_for_purpose. See tests/test_p2_3_bip43_purpose_table.lua and
+-- CORE-PARITY-AUDIT/_lunarblock-unfreeze-plan-2026-05-26.md (P2-3).
+test("G9: P2-3 FIX — BIP-49 derivation now present", function()
+  expect_true(wallet.derive_bip49_key ~= nil, "derive_bip49_key shim now exists")
+  expect_true(wallet.derive_for_purpose ~= nil, "table-driven derive_for_purpose now exists")
 end)
 
--- G10-BUG: BIP-86 (P2TR) path m/86'/0'/account'/change/index MISSING
-test("G10-BUG: BIP-86 path derivation (m/86') not implemented [BUG-4]", function()
-  log_bug("BUG-4", "P2: BIP-86 (P2TR native taproot, m/86'/0'/account'/change/index) derivation absent. wallet.lua only has derive_bip44_key and derive_bip84_key. No derive_bip86_key.")
-  expect_eq(wallet.derive_bip86_key, nil, "derive_bip86_key should be absent (BUG-4)")
+-- G10-FIXED-IN-P2-3: BIP-86 (P2TR) path m/86'/0'/account'/change/index now
+-- exists via wallet.derive_bip86_key (shim) + the table-driven path.
+test("G10: P2-3 FIX — BIP-86 derivation now present", function()
+  expect_true(wallet.derive_bip86_key ~= nil, "derive_bip86_key shim now exists")
+  expect_true(wallet.PURPOSE_TEMPLATES[86] ~= nil, "BIP-86 registered in PURPOSE_TEMPLATES")
 end)
 
 -- G10b-BUG: Coin type always hardcoded to 0 (mainnet Bitcoin) regardless of network

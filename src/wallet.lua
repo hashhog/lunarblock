@@ -660,25 +660,276 @@ function M.derive_child(parent, index)
 end
 
 --------------------------------------------------------------------------------
--- BIP44/BIP84 Path Derivation
+-- BIP-43 purpose-code → derivation-template table (P2-3)
+--
+-- Before P2-3 the wallet hard-branched on `address_type == "p2wpkh"` and
+-- shipped exactly two derivation helpers (`derive_bip44_key`,
+-- `derive_bip84_key`).  That left BIP-49 (P2SH-P2WPKH) and BIP-86 (P2TR)
+-- silently broken — setting `address_type = "p2sh-p2wpkh"` or `"p2tr"` fell
+-- through to the BIP-44 + P2PKH branch and emitted the WRONG address +
+-- script type for the WRONG derivation path.  See `tests/test_w118_wallet.lua`
+-- G11-BUG-3 (BIP-49 + BIP-86 derivation absent).
+--
+-- The refactor here makes purpose-code handling table-driven so adding a
+-- new BIP only requires extending `M.PURPOSE_TEMPLATES` (and the
+-- corresponding address builder in `M.pubkey_to_address_for_purpose`).
+-- The 3 hardcoded if/elseif sites (`unlock`, `generate_address`,
+-- `import_privkey`) now consult the table; the old `derive_bip44_key` /
+-- `derive_bip84_key` helpers remain as 1-line shims for callers that
+-- pre-date the refactor (tests, RPC dispatch, fixture loaders).
+--
+-- Closes: lunarblock unfreeze plan P2-3 ("Generalize BIP-43 purpose-code
+-- handling") — `CORE-PARITY-AUDIT/_lunarblock-unfreeze-plan-2026-05-26.md`.
+--------------------------------------------------------------------------------
+
+--- SLIP-0044 coin types per network.
+-- Mainnet uses 0', everything else (testnet3/testnet4/regtest/signet) uses
+-- 1' per SLIP-0044.  Previously every derivation hardcoded coin_type=0
+-- regardless of network (`tests/test_w118_wallet.lua` G10-BUG-2: testnet
+-- wallets generated the SAME keys as mainnet, violating SLIP-0044).
+--
+-- @param network_name string: e.g. "mainnet", "testnet", "testnet4", "regtest"
+-- @return number: SLIP-0044 coin_type (0 for mainnet, 1 for testnets)
+function M.coin_type_for_network(network_name)
+  if network_name == "mainnet" then return 0 end
+  return 1
+end
+
+--- BIP-43 purpose-code → derivation + address-type template.
+--
+-- Each entry is keyed by the unhardened purpose number (44/49/84/86) and
+-- carries:
+--   * `name`         human-readable BIP (used in errors + paths)
+--   * `output_type`  Bitcoin output type produced by this BIP — one of
+--                    "p2pkh" | "p2sh-p2wpkh" | "p2wpkh" | "p2tr"
+--   * `address_type` legacy wallet `address_type` string for back-compat
+--                    with existing `wallet.address_type` callers.  This is
+--                    the value stored in `key_info.type` and serialised in
+--                    `data.address_type` on disk.
+--   * `bip_number`   the BIP number, for tags + tests
+M.PURPOSE_TEMPLATES = {
+  [44] = {
+    name         = "BIP-44 legacy P2PKH",
+    output_type  = "p2pkh",
+    address_type = "p2pkh",
+    bip_number   = 44,
+  },
+  [49] = {
+    name         = "BIP-49 P2SH-wrapped P2WPKH",
+    output_type  = "p2sh-p2wpkh",
+    address_type = "p2sh-p2wpkh",
+    bip_number   = 49,
+  },
+  [84] = {
+    name         = "BIP-84 native P2WPKH",
+    output_type  = "p2wpkh",
+    address_type = "p2wpkh",
+    bip_number   = 84,
+  },
+  [86] = {
+    name         = "BIP-86 P2TR key-path",
+    output_type  = "p2tr",
+    address_type = "p2tr",
+    bip_number   = 86,
+  },
+}
+
+--- Core-compat RPC synonyms for address_type. Bitcoin Core's getnewaddress
+-- accepts {legacy, p2sh-segwit, bech32, bech32m}; we translate those to our
+-- internal {p2pkh, p2sh-p2wpkh, p2wpkh, p2tr} canonical strings so a
+-- Core-compatible RPC client can drive lunarblock without changing its
+-- vocabulary. Extending PURPOSE_TEMPLATES does NOT automatically extend
+-- this synonym map (synonyms are an RPC-surface concern, not a
+-- derivation-template concern).
+M.ADDRESS_TYPE_SYNONYMS = {
+  ["legacy"]      = "p2pkh",
+  ["p2sh-segwit"] = "p2sh-p2wpkh",
+  ["bech32"]      = "p2wpkh",
+  ["bech32m"]     = "p2tr",
+}
+
+--- Reverse map: address_type string → purpose number.
+-- Built lazily once on first lookup; rebuilt only if PURPOSE_TEMPLATES is
+-- mutated (extending the table at runtime is supported by `M.add_purpose`).
+local _address_type_to_purpose = nil
+local function _build_addr_to_purpose()
+  local t = {}
+  for purpose, tmpl in pairs(M.PURPOSE_TEMPLATES) do
+    t[tmpl.address_type] = purpose
+  end
+  return t
+end
+
+--- Normalise an address_type string by translating Core RPC synonyms to
+-- our internal canonical form. Idempotent: canonical strings pass through.
+-- @param address_type string|nil
+-- @return string|nil canonical address_type
+function M.canonical_address_type(address_type)
+  if address_type == nil then return nil end
+  return M.ADDRESS_TYPE_SYNONYMS[address_type] or address_type
+end
+
+--- Look up the purpose number for a given wallet `address_type` string.
+-- Accepts both internal canonical strings (p2pkh / p2sh-p2wpkh / p2wpkh /
+-- p2tr) AND Core's RPC synonyms (legacy / p2sh-segwit / bech32 / bech32m).
+-- @param address_type string: canonical or Core-synonym address type
+-- @return number|nil: purpose number, or nil if address_type unknown
+function M.purpose_for_address_type(address_type)
+  if not _address_type_to_purpose then
+    _address_type_to_purpose = _build_addr_to_purpose()
+  end
+  local canonical = M.canonical_address_type(address_type)
+  return _address_type_to_purpose[canonical]
+end
+
+--- Look up the wallet `address_type` string for a given purpose number.
+-- @param purpose number: 44 | 49 | 84 | 86
+-- @return string|nil: address_type, or nil if purpose unknown
+function M.address_type_for_purpose(purpose)
+  local tmpl = M.PURPOSE_TEMPLATES[purpose]
+  if not tmpl then return nil end
+  return tmpl.address_type
+end
+
+--- Register a new BIP-43 purpose-code template at runtime.
+-- Future-proofing hook: extending the PURPOSE_TEMPLATES table from outside
+-- this module (e.g. from a downstream plugin adding a new BIP) needs to
+-- invalidate the cached reverse map.
+-- @param purpose number
+-- @param tmpl    table with name/output_type/address_type/bip_number
+function M.add_purpose(purpose, tmpl)
+  assert(type(purpose) == "number" and purpose >= 0 and purpose < 0x80000000,
+    "purpose must be an unhardened uint32")
+  assert(type(tmpl) == "table" and tmpl.output_type and tmpl.address_type,
+    "purpose template must have output_type + address_type")
+  M.PURPOSE_TEMPLATES[purpose] = tmpl
+  _address_type_to_purpose = nil  -- invalidate cache
+end
+
+--- Derive a BIP-43-style HD child key: m/purpose'/coin_type'/account'/change/index
+--
+-- Generalises `derive_bip44_key` / `derive_bip84_key`.  Every step is
+-- hardened down to `account'`; `change` and `index` are non-hardened, per
+-- BIP-44 §"Path levels".
+--
+-- @param master    extended_key: BIP-32 master extended private key
+-- @param purpose   number: BIP-43 purpose code (44/49/84/86; unhardened)
+-- @param coin_type number: SLIP-0044 coin type (0 mainnet, 1 testnet)
+-- @param account   number: account index (unhardened, will be hardened here)
+-- @param change    number: 0 = external receive, 1 = internal change
+-- @param index     number: address index within the chain
+-- @return extended_key: derived child extended private key
+function M.derive_for_purpose(master, purpose, coin_type, account, change, index)
+  assert(M.PURPOSE_TEMPLATES[purpose],
+    "unsupported BIP-43 purpose code " .. tostring(purpose) ..
+    "; known purposes: " .. table.concat(M.list_purposes(), ", "))
+  local p   = M.derive_child(master,    0x80000000 + purpose)    -- purpose'
+  local c   = M.derive_child(p,         0x80000000 + coin_type)  -- coin_type'
+  local a   = M.derive_child(c,         0x80000000 + account)    -- account'
+  local chn = M.derive_child(a,         change)                  -- change
+  return       M.derive_child(chn,      index)                   -- index
+end
+
+--- Enumerate registered purpose codes (sorted ascending) for error messages
+-- and validation.
+-- @return table: sorted array of purpose numbers (as strings, for joining)
+function M.list_purposes()
+  local out = {}
+  for p, _ in pairs(M.PURPOSE_TEMPLATES) do out[#out + 1] = tostring(p) end
+  table.sort(out, function(a, b) return tonumber(a) < tonumber(b) end)
+  return out
+end
+
+--- Enumerate registered wallet `address_type` strings (sorted) for error
+-- messages and the deriveaddresses / getnewaddress RPC validators.
+-- @return table: sorted array of address_type strings
+function M.list_address_types()
+  local out = {}
+  for _, tmpl in pairs(M.PURPOSE_TEMPLATES) do out[#out + 1] = tmpl.address_type end
+  table.sort(out)
+  return out
+end
+
+--- Derive the network-appropriate address for `pubkey` under purpose `purpose`.
+--
+-- BIP-44 → P2PKH (`pubkey_to_p2pkh`)
+-- BIP-49 → P2SH-wrap of P2WPKH redeem script
+-- BIP-84 → native P2WPKH
+-- BIP-86 → P2TR key-path (tweaks internal key per BIP-341 with empty merkle root)
+--
+-- @param purpose      number: BIP-43 purpose code
+-- @param pubkey       string: 33-byte compressed pubkey (caller's responsibility)
+-- @param network_name string: "mainnet" | "testnet" | "regtest" | "signet"
+-- @return string: encoded address
+function M.pubkey_to_address_for_purpose(purpose, pubkey, network_name)
+  local tmpl = M.PURPOSE_TEMPLATES[purpose]
+  assert(tmpl, "unsupported BIP-43 purpose code " .. tostring(purpose))
+  network_name = network_name or "mainnet"
+
+  if tmpl.output_type == "p2pkh" then
+    return address.pubkey_to_p2pkh(pubkey, network_name)
+
+  elseif tmpl.output_type == "p2wpkh" then
+    return address.pubkey_to_p2wpkh(pubkey, network_name)
+
+  elseif tmpl.output_type == "p2sh-p2wpkh" then
+    -- BIP-49: redeem script = OP_0 <hash160(pubkey)>, address = P2SH(redeem)
+    local h = crypto.hash160(pubkey)
+    local redeem = script.make_p2wpkh_script(h)
+    return address.script_to_p2sh(redeem, network_name)
+
+  elseif tmpl.output_type == "p2tr" then
+    -- BIP-86 key-path: internal_xonly = pubkey[1:33] (strip parity byte),
+    -- tweak = tagged_hash("TapTweak", internal_xonly), output_key = tweak_pubkey(internal, tweak).
+    -- Per BIP-86 the merkle root is empty so the tweak is over just the
+    -- 32-byte x-only internal key (no script-tree).
+    local internal_xonly = pubkey:sub(2, 33)
+    assert(#internal_xonly == 32,
+      "P2TR requires a 33-byte compressed pubkey to extract the 32-byte x-only key")
+    local tweak = crypto.tagged_hash("TapTweak", internal_xonly)
+    local output_xonly = crypto.tweak_pubkey(internal_xonly, tweak)
+    if not output_xonly then
+      error("BIP-86 TapTweak failed for derived pubkey")
+    end
+    return address.xonly_pubkey_to_p2tr(output_xonly, network_name)
+
+  else
+    error("unhandled output_type '" .. tostring(tmpl.output_type) ..
+          "' for purpose " .. tostring(purpose))
+  end
+end
+
+--------------------------------------------------------------------------------
+-- BIP44 / BIP84 helpers — back-compat shims around derive_for_purpose
+--
+-- Pre-P2-3 callers (tests + a handful of internal sites) called these
+-- directly.  Keep them as 1-line shims to avoid breaking the API surface.
+-- New code should call `M.derive_for_purpose` instead.
+--
+-- NOTE: these shims preserve the historical coin_type=0 hardcoding so they
+-- byte-match the previous behaviour for mainnet callers.  Callers that
+-- need network-aware coin_type should call `derive_for_purpose` with the
+-- network's coin_type (see `coin_type_for_network`).
 --------------------------------------------------------------------------------
 
 -- Derive a BIP44 path: m/44'/0'/account'/change/index
 function M.derive_bip44_key(master, account, change, index)
-  local purpose = M.derive_child(master, 0x80000000 + 44)   -- 44'
-  local coin = M.derive_child(purpose, 0x80000000 + 0)      -- 0' (Bitcoin)
-  local acct = M.derive_child(coin, 0x80000000 + account)   -- account'
-  local chain = M.derive_child(acct, change)                 -- 0 = external, 1 = internal
-  return M.derive_child(chain, index)
+  return M.derive_for_purpose(master, 44, 0, account, change, index)
 end
 
 -- Derive a BIP84 path: m/84'/0'/account'/change/index (native segwit)
 function M.derive_bip84_key(master, account, change, index)
-  local purpose = M.derive_child(master, 0x80000000 + 84)
-  local coin = M.derive_child(purpose, 0x80000000 + 0)
-  local acct = M.derive_child(coin, 0x80000000 + account)
-  local chain = M.derive_child(acct, change)
-  return M.derive_child(chain, index)
+  return M.derive_for_purpose(master, 84, 0, account, change, index)
+end
+
+-- Derive a BIP49 path: m/49'/0'/account'/change/index (P2SH-wrapped segwit)
+function M.derive_bip49_key(master, account, change, index)
+  return M.derive_for_purpose(master, 49, 0, account, change, index)
+end
+
+-- Derive a BIP86 path: m/86'/0'/account'/change/index (P2TR key-path)
+function M.derive_bip86_key(master, account, change, index)
+  return M.derive_for_purpose(master, 86, 0, account, change, index)
 end
 
 -- Parse a derivation path string like "m/44'/0'/0'/0/0"
@@ -1019,16 +1270,27 @@ function Wallet:unlock(passphrase)
     end
   end
 
-  -- Regenerate private keys for all addresses
-  for addr, key_info in pairs(self.keys) do
+  -- Regenerate private keys for all addresses.  Each key_info.type is the
+  -- wallet `address_type` string that was active when the key was first
+  -- generated; look up the matching BIP-43 purpose and re-derive at the
+  -- network's SLIP-0044 coin_type.  Imported keys (index == -1) have no
+  -- derivation path — skip them; their privkey is restored from the
+  -- encrypted store directly elsewhere.
+  local coin_type = M.coin_type_for_network(self.network.name)
+  for _, key_info in pairs(self.keys) do
     if key_info.change ~= nil and key_info.index >= 0 then
-      local derived
-      if key_info.type == "p2wpkh" then
-        derived = M.derive_bip84_key(self.master_key, self.account, key_info.change, key_info.index)
+      local purpose = M.purpose_for_address_type(key_info.type)
+      if not purpose then
+        -- Unknown address_type — skip rather than crash unlock; the privkey
+        -- stays nil so any spend attempt fails loudly with "Private key not
+        -- available".  Logging would be nice but unlock() is on the hot path.
       else
-        derived = M.derive_bip44_key(self.master_key, self.account, key_info.change, key_info.index)
+        local derived = M.derive_for_purpose(
+          self.master_key, purpose, coin_type,
+          self.account, key_info.change, key_info.index
+        )
+        key_info.privkey = derived.key
       end
-      key_info.privkey = derived.key
     end
   end
 
@@ -1067,27 +1329,37 @@ function Wallet:generate_addresses(count)
 end
 
 function Wallet:generate_address(change, index)
-  local key
-  if self.address_type == "p2wpkh" then
-    key = M.derive_bip84_key(self.master_key, self.account, change, index)
-  else
-    key = M.derive_bip44_key(self.master_key, self.account, change, index)
+  -- P2-3: look up the BIP-43 purpose from the wallet's address_type and
+  -- derive via the table-driven path.  This is the ONLY place that maps
+  -- address_type → purpose for new-address generation; unlock() does the
+  -- same lookup for existing addresses (so the two paths cannot drift).
+  local purpose = M.purpose_for_address_type(self.address_type)
+  if not purpose then
+    error(string.format(
+      "unsupported wallet.address_type %q; known types: %s (Core synonyms: %s)",
+      tostring(self.address_type),
+      table.concat(M.list_address_types(), ", "),
+      "legacy / p2sh-segwit / bech32 / bech32m"
+    ))
   end
+  local coin_type = M.coin_type_for_network(self.network.name)
+  -- Store the canonical address_type on the key record so unlock() (and
+  -- any future code that reads key_info.type) always sees a value that's
+  -- in PURPOSE_TEMPLATES, not a Core RPC synonym.
+  local canonical_type = M.canonical_address_type(self.address_type)
 
+  local key    = M.derive_for_purpose(
+    self.master_key, purpose, coin_type, self.account, change, index
+  )
   local pubkey = crypto.pubkey_from_privkey(key.key, true)
-  local addr
-  if self.address_type == "p2wpkh" then
-    addr = address.pubkey_to_p2wpkh(pubkey, self.network.name)
-  else
-    addr = address.pubkey_to_p2pkh(pubkey, self.network.name)
-  end
+  local addr   = M.pubkey_to_address_for_purpose(purpose, pubkey, self.network.name)
 
   self.keys[addr] = {
     privkey = key.key,
     pubkey = pubkey,
     path = string.format("m/%d'/%d'/%d'/%d/%d",
-      self.address_type == "p2wpkh" and 84 or 44, 0, self.account, change, index),
-    type = self.address_type,
+      purpose, coin_type, self.account, change, index),
+    type = canonical_type,
     change = change,
     index = index,
   }
@@ -2116,24 +2388,47 @@ function Wallet:dump_privkey(addr)
   return address.base58check_encode(self.network.wif_prefix, payload)
 end
 
--- Import a WIF private key
+-- Import a WIF private key.
+--
+-- The imported key's address-type is chosen by the wallet's current
+-- `address_type` setting when the key is compressed (so an "address_type
+-- = p2tr" wallet importing a compressed WIF gets a P2TR address via the
+-- BIP-86 tweak path).  Uncompressed WIFs predate witness, so they always
+-- map to legacy P2PKH regardless of wallet.address_type.
 function Wallet:import_privkey(wif)
   local version, payload = address.base58check_decode(wif)
   assert(version == self.network.wif_prefix, "Wrong network WIF prefix")
   local compressed = (#payload == 33 and payload:byte(33) == 0x01)
   local privkey = payload:sub(1, 32)
   local pubkey = crypto.pubkey_from_privkey(privkey, compressed)
-  local addr
-  if compressed and self.address_type == "p2wpkh" then
-    addr = address.pubkey_to_p2wpkh(pubkey, self.network.name)
+
+  local addr_type, addr
+  if compressed then
+    local purpose = M.purpose_for_address_type(self.address_type)
+    if purpose then
+      -- Use the canonical (post-synonym) type so the on-disk record
+      -- matches what unlock() will look up later.
+      addr_type = M.canonical_address_type(self.address_type)
+      addr = M.pubkey_to_address_for_purpose(purpose, pubkey, self.network.name)
+    else
+      -- Defensive fallback: should never trigger for a wallet whose
+      -- generate_address would have errored upstream.  Imported keys
+      -- still need a home if the wallet was constructed with an unknown
+      -- address_type and we got here anyway.
+      addr_type = "p2pkh"
+      addr = address.pubkey_to_p2pkh(pubkey, self.network.name)
+    end
   else
+    -- Uncompressed key — witness output types require compressed pubkeys.
+    addr_type = "p2pkh"
     addr = address.pubkey_to_p2pkh(pubkey, self.network.name)
   end
+
   self.keys[addr] = {
     privkey = privkey,
     pubkey = pubkey,
     path = "imported",
-    type = compressed and self.address_type or "p2pkh",
+    type = addr_type,
     change = 0,
     index = -1,
   }
