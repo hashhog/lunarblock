@@ -362,9 +362,14 @@ test("G16: BIP-174 combine merges partial_sigs from two PSBTs", function()
   expect_eq(n, 2, "combined PSBT has 2 partial sigs")
 end)
 
--- G17: BUG — BIP-371 taproot key-path sign is not wired in psbt.sign_input
--- (the input struct has tap_key_sig but sign_input returns false for p2tr).
-test("G17: BUG — BIP-371 P2TR sign_input not wired (G17-BUG-5)", function()
+-- G17: BIP-371 taproot key-path sign IS now wired in psbt.sign_input.
+-- G17-BUG-5 was P0 ("write-only Taproot wallets"); closed by lunarblock
+-- unfreeze plan P2-4 (2026-05-27). The post-fix expectation: sign_input
+-- on a p2tr witness_utxo produces a 64-byte BIP-340 Schnorr sig under
+-- tap_key_sig (BIP-371 PSBT_IN_TAP_KEY_SIG 0x13), partial_sigs stays
+-- empty (ECDSA + Schnorr namespaces are deliberately disjoint), and
+-- finalize_input collapses tap_key_sig into the witness stack.
+test("G17: BIP-371 P2TR sign_input wired (G17-BUG-5 CLOSED by P2-4)", function()
   -- Build a tr() PSBT and try to sign with a key.
   local privkey = hex_to_bin(string.rep("0e", 32))
   local pub     = crypto.pubkey_from_privkey(privkey, true)
@@ -381,18 +386,14 @@ test("G17: BUG — BIP-371 P2TR sign_input not wired (G17-BUG-5)", function()
   local p = psbt.new(tx)
   psbt.update_input_utxo(p, 0, {value=100000, script_pubkey=p2tr_spk}, true)
 
-  -- sign_input on a p2tr witness_utxo should produce tap_key_sig.
-  -- Currently the function falls through the if/elseif chain (no p2tr branch)
-  -- and returns false; tap_key_sig stays nil.
+  -- Post-P2-4 expectation: sign_input returns true + tap_key_sig populated.
+  -- The bare 64-byte SIGHASH_DEFAULT shape is what BIP-86 wallets emit.
   local ok = psbt.sign_input(p, 0, privkey, pub, 0x00)
-  expect_false(ok, "sign_input returns false for p2tr (no branch)")
-  expect_nil(p.inputs[1].tap_key_sig, "tap_key_sig stays nil — BIP-371 key-path unsigned")
-
-  bug("G17-BUG-5", "P0",
-      "psbt.sign_input has no p2tr branch; BIP-371 PSBT_IN_TAP_KEY_SIG (0x13) " ..
-      "is never produced. PSBTs with P2TR inputs cannot be signed via this " ..
-      "module despite the data model (tap_key_sig, tap_script_sigs, " ..
-      "tap_internal_key) being present. psbt.lua:926-1000.")
+  expect_true(ok, "sign_input returns true for p2tr (P2-4 branch active)")
+  expect_true(p.inputs[1].tap_key_sig ~= nil,
+    "tap_key_sig populated — BIP-371 key-path SIGNED")
+  expect_eq(#p.inputs[1].tap_key_sig, 64,
+    "SIGHASH_DEFAULT (0x00) sig is bare 64-byte Schnorr (no trailing flag)")
 end)
 
 -- G18: BUG — BIP-370 PSBTv2 not supported (no PSBT_GLOBAL_TX_VERSION etc.)

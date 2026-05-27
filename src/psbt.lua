@@ -994,6 +994,81 @@ function M.sign_input(psbt, input_index, privkey, pubkey, sighash_type)
     sighash = validation.signature_hash_segwit_v0(
       psbt.tx, input_index, script_code, utxo_value, sighash_type
     )
+  elseif script_type == "p2tr" then
+    -- BIP-371 P2TR key-path signing (P2-4). Diverges from the legacy +
+    -- segwit-v0 branches above on every axis: Schnorr sigs not ECDSA,
+    -- BIP-341 sighash not BIP-143, witness is a bare 64-byte sig under
+    -- IN_TAP_KEY_SIG (no DER, no trailing flag byte for SIGHASH_DEFAULT),
+    -- and BIP-341 commits to the prev_outputs of EVERY input.
+    --
+    -- Closes "write-only Taproot wallets" P0 from the W161 audit + the
+    -- 2026-05-19 impl-triage decision. Before this branch, an unwrapped
+    -- P2TR input fell through to `return false` ("Unsupported script
+    -- type") and the user could never spend.
+    --
+    -- BIP-86 (key-path only) signing — `tap_merkle_root` is empty. If
+    -- we ever support script-path spending here, that field on `inp`
+    -- must be threaded through to sign_input_p2tr_keypath (and into the
+    -- corresponding finalize_input branch).
+    local wallet = require("lunarblock.wallet")
+
+    -- BIP-341 needs the prevouts of EVERY input, not just this one. Pull
+    -- them from witness_utxo first (BIP-371 requires it for taproot
+    -- inputs) and fall back to non_witness_utxo per-output where present.
+    local prev_outputs = {}
+    for i = 1, #psbt.tx.inputs do
+      local pi = psbt.inputs[i]
+      if pi.witness_utxo then
+        prev_outputs[i] = {
+          value         = pi.witness_utxo.value,
+          script_pubkey = pi.witness_utxo.script_pubkey,
+        }
+      elseif pi.non_witness_utxo then
+        local ti = psbt.tx.inputs[i]
+        local po = pi.non_witness_utxo.outputs[ti.prev_out.index + 1]
+        if po then
+          prev_outputs[i] = { value = po.value, script_pubkey = po.script_pubkey }
+        end
+      end
+    end
+    if #prev_outputs ~= #psbt.tx.inputs then
+      error("PSBT taproot signing requires witness_utxo on every input " ..
+            "(BIP-371). Missing prevout for input " .. tostring(#prev_outputs))
+    end
+
+    -- BIP-341 sighash types: bare key-path defaults to SIGHASH_DEFAULT
+    -- (0x00). Callers that pass an explicit ECDSA-shaped SIGHASH.ALL get
+    -- remapped to BIP-341 SIGHASH_DEFAULT — Core does this transparently
+    -- in MutableTransactionSignatureCreator. Any other type is passed
+    -- through verbatim (must validate against
+    -- is_valid_taproot_hash_type).
+    local tap_hash_type = sighash_type
+    if tap_hash_type == nil or tap_hash_type == consensus.SIGHASH.ALL then
+      tap_hash_type = wallet.SIGHASH_DEFAULT
+    end
+
+    local witness_item, terr = wallet.sign_input_p2tr_keypath(
+      psbt.tx, input_index, prev_outputs, privkey, tap_hash_type
+    )
+    if not witness_item then
+      error("P2TR key-path sign failed: " .. tostring(terr))
+    end
+
+    -- BIP-371: store under IN_TAP_KEY_SIG (psbt_input.tap_key_sig). The
+    -- partial_sigs / sighash_type fields are ECDSA-only and stay nil for
+    -- the taproot path.
+    inp.tap_key_sig = witness_item
+    -- Track the internal x-only key for the finalizer (matches the
+    -- BIP-371 IN_TAP_INTERNAL_KEY field; populated even when the caller
+    -- didn't pre-fill it, since we just derived it from the signing key).
+    if not inp.tap_internal_key then
+      local internal_xonly = pubkey:sub(2, 33)
+      if #internal_xonly == 32 then
+        inp.tap_internal_key = hex_encode(internal_xonly)
+      end
+    end
+
+    return true
   else
     -- Unsupported script type
     return false
@@ -1162,6 +1237,33 @@ function M.finalize_input(psbt, input_index)
   end
 
   local script_type = script.classify_script(script_pubkey)
+
+  -- P2-4 (P2TR key-path): finalize from BIP-371 tap_key_sig BEFORE we
+  -- fall through to the ECDSA partial_sigs path. Taproot inputs never
+  -- populate partial_sigs (those are pubkey-keyed ECDSA sigs); their
+  -- key-path sig lives on inp.tap_key_sig as either 64 bytes
+  -- (SIGHASH_DEFAULT) or 65 bytes (sig || hash_type). The witness is a
+  -- single stack element.
+  if script_type == "p2tr" then
+    if not inp.tap_key_sig then
+      return false  -- not signed yet
+    end
+    inp.final_script_witness = { inp.tap_key_sig }
+    inp.final_script_sig = ""
+    -- Clear non-final fields per BIP-174 + BIP-371 finalizer rules.
+    inp.partial_sigs = {}
+    inp.bip32_derivations = {}
+    inp.sighash_type = nil
+    inp.redeem_script = nil
+    inp.witness_script = nil
+    inp.tap_key_sig = nil
+    inp.tap_script_sigs = {}
+    inp.tap_scripts = {}
+    inp.tap_bip32_derivs = {}
+    inp.tap_internal_key = nil
+    inp.tap_merkle_root = nil
+    return true
+  end
 
   -- Check for at least one signature
   local pubkey_hex, sig
