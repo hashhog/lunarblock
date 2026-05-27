@@ -53,6 +53,20 @@ M.CRYPTO_IV_SIZE = 16       -- AES block size
 M.CRYPTO_SALT_SIZE = 8      -- Salt size for key derivation
 M.CRYPTO_ROUNDS = 25000     -- PBKDF2 iterations
 
+-- At-rest encryption constants (P2-1 fix for W161 master_key plaintext P0).
+-- When a wallet is not user-encrypted (no passphrase set), the master key is
+-- STILL encrypted at rest with a deterministic key derived from this fixed
+-- phrase. This is NOT a security boundary on its own — anyone with the source
+-- can decrypt — but it ensures `cat wallet.json` never leaks the literal
+-- master_key + chain_code bytes, and it makes the "no plaintext master key on
+-- disk" invariant testable (see tests/test_p2_1_p2_2_wallet_security.lua).
+-- Users who want a real security boundary MUST call `encryptwallet` with a
+-- strong passphrase. Mirrors clearbit's f302997 model (every persisted
+-- master_key is ciphertext) and the W161 audit's "Encrypted-by-default
+-- wallet storage" goal.
+M.AT_REST_PHRASE  = "lunarblock-wallet-at-rest-v1"
+M.AT_REST_ROUNDS  = 4096    -- lighter than user PBKDF2 since this is obfuscation, not protection
+
 --- Generate cryptographically secure random bytes.
 -- @param n number: Number of bytes to generate
 -- @return string: Random bytes
@@ -93,6 +107,17 @@ function M.derive_key(passphrase, salt, rounds)
   ffi.copy(key, combined, 32)
   ffi.copy(iv, combined + 32, 16)
   return ffi.string(key, 32), ffi.string(iv, 16)
+end
+
+--- Derive the at-rest encryption key (P2-1).
+-- Used for wallets that are NOT user-encrypted, so plaintext master_key never
+-- hits disk. Same PBKDF2-SHA512 / AES-256-CBC primitives as user encryption,
+-- with the AT_REST_PHRASE constant as the "passphrase" and the per-wallet
+-- encryption_salt for binding to a specific wallet file.
+-- @param salt string: Salt bytes (must match the on-disk encryption_salt)
+-- @return string: 32-byte key, string: 16-byte IV
+function M.derive_at_rest_key(salt)
+  return M.derive_key(M.AT_REST_PHRASE, salt, M.AT_REST_ROUNDS)
 end
 
 --- Encrypt data using AES-256-CBC.
@@ -579,20 +604,42 @@ function M.derive_child(parent, index)
   local il = hmac:sub(1, 32)
   local ir = hmac:sub(33, 64)
 
-  -- Check that il is a valid key
+  -- P2-2 FIX (W118 G6-BUG-1 2nd carry-forward / W161 BUG-18): per BIP-32
+  -- §"Private parent key -> private child key", if parse256(IL) >= n OR the
+  -- resulting child key is 0, the derivation is invalid and the caller MUST
+  -- "proceed with the next value for i". Bitcoin Core key.cpp::CKey::Derive
+  -- implements this AND requires the next i to stay in the same hardened
+  -- range — incrementing from 0x7FFFFFFF (last non-hardened) to 0x80000000
+  -- (first hardened) silently changes the derivation type and is forbidden.
+  -- Wraparound past 0xFFFFFFFF is likewise illegal. is_valid_key() checks
+  -- both parse256(IL) >= n AND IL == 0 (over-eager on IL==0 vs the spec but
+  -- the differential is ~2^-256 and harmless).
+  local function retry_next(reason)
+    local next_index = index + 1
+    if next_index > 0xFFFFFFFF then
+      error("BIP-32 derivation exhausted at index " .. tostring(index) ..
+            " (" .. reason .. "); no valid next index")
+    end
+    if bit.rshift(next_index, 31) ~= bit.rshift(index, 31) then
+      error("BIP-32 derivation invalid at index " .. tostring(index) ..
+            " (" .. reason .. "); cannot cross hardened boundary on retry")
+    end
+    return M.derive_child(parent, next_index)
+  end
+
+  -- Check that parse256(IL) is in [1, n) per BIP-32.
   if not is_valid_key(il) then
-    -- Skip this index (extremely rare)
-    return M.derive_child(parent, index + 1)
+    return retry_next("parse256(IL) invalid (>= n or zero)")
   end
 
   local child_key
   if parent.is_private then
-    -- child_key = (il + parent_key) mod n
+    -- child_key = (parse256(IL) + parent_key) mod n
     child_key = add_mod_n(il, parent.key)
 
-    -- Check that child key is valid
+    -- Check that child key is non-zero (add_mod_n already reduces mod n).
     if not is_valid_key(child_key) then
-      return M.derive_child(parent, index + 1)
+      return retry_next("child key == 0")
     end
   else
     -- For public key derivation, we'd need point addition
@@ -2228,15 +2275,24 @@ function Wallet:serialize()
       data.encrypted_mnemonic = M.hex_encode(self.encrypted_mnemonic)
     end
   else
-    -- Store unencrypted (for non-encrypted wallets)
+    -- P2-1 FIX (W161 master_key plaintext P0): even when the wallet is NOT
+    -- user-encrypted, never write the master_key + chain_code as plaintext
+    -- bytes on disk. Encrypt at rest with the AT_REST_PHRASE-derived key so
+    -- `cat wallet.json` cannot leak the literal master key. This is NOT a
+    -- security boundary (the AT_REST_PHRASE is a public source constant) —
+    -- users who need a real boundary MUST call encryptwallet with a strong
+    -- passphrase. The deserializer (M.load) detects at_rest_encrypted_master
+    -- and decrypts transparently.
     if self.master_key then
-      data.master_key = M.hex_encode(self.master_key.key)
-      data.master_chain_code = M.hex_encode(self.master_key.chain_code)
-    end
-    -- Plaintext mnemonic for unencrypted wallets (matches plaintext master
-    -- key handling above; user opted out of at-rest encryption).
-    if self.mnemonic_words then
-      data.mnemonic = table.concat(self.mnemonic_words, " ")
+      local salt = M.random_bytes(M.CRYPTO_SALT_SIZE)
+      local key, iv = M.derive_at_rest_key(salt)
+      local plaintext = self.master_key.key .. self.master_key.chain_code
+      data.at_rest_encrypted_master = M.hex_encode(M.aes_encrypt(plaintext, key, iv))
+      data.at_rest_salt = M.hex_encode(salt)
+      if self.mnemonic_words then
+        local m_plain = table.concat(self.mnemonic_words, " ")
+        data.at_rest_encrypted_mnemonic = M.hex_encode(M.aes_encrypt(m_plain, key, iv))
+      end
     end
   end
 
@@ -2345,18 +2401,44 @@ function M.load(filepath, network, storage, passphrase)
       end
     end
   else
-    -- Load unencrypted key
-    if data.master_key and data.master_chain_code then
+    -- P2-1 FIX (W161): preferred path — at-rest encrypted master_key.
+    if data.at_rest_encrypted_master and data.at_rest_salt then
+      local salt = M.hex_decode(data.at_rest_salt)
+      local key, iv = M.derive_at_rest_key(salt)
+      local ciphertext = M.hex_decode(data.at_rest_encrypted_master)
+      local plaintext, err = M.aes_decrypt(ciphertext, key, iv)
+      if not plaintext or #plaintext ~= 64 then
+        return nil, "at-rest decryption failed: " .. (err or "invalid length")
+      end
+      local seed_key = plaintext:sub(1, 32)
+      local chain_code = plaintext:sub(33, 64)
+      wallet.master_key = M.extended_key(seed_key, chain_code, 0, "\0\0\0\0", 0, true)
+      wallet.is_locked = false
+      if data.at_rest_encrypted_mnemonic then
+        local m_plain = M.aes_decrypt(M.hex_decode(data.at_rest_encrypted_mnemonic), key, iv)
+        if m_plain then
+          local words = {}
+          for w in m_plain:gmatch("%S+") do words[#words + 1] = w end
+          if ({[12]=true,[15]=true,[18]=true,[21]=true,[24]=true})[#words] then
+            wallet.mnemonic_words = words
+          end
+        end
+      end
+    -- Legacy back-compat path: old wallet files written before the P2-1 fix
+    -- still stored master_key as plaintext. Load them, log a warning so the
+    -- next save() upgrades to at-rest-encrypted, and never re-emit plaintext.
+    elseif data.master_key and data.master_chain_code then
+      io.stderr:write("WARNING: loading legacy plaintext master_key wallet; will be upgraded to at-rest-encrypted on next save\n")
       local seed_key = M.hex_decode(data.master_key)
       local chain_code = M.hex_decode(data.master_chain_code)
       wallet.master_key = M.extended_key(seed_key, chain_code, 0, "\0\0\0\0", 0, true)
       wallet.is_locked = false
-    end
-    if data.mnemonic and type(data.mnemonic) == "string" then
-      local words = {}
-      for w in data.mnemonic:gmatch("%S+") do words[#words + 1] = w end
-      if ({[12]=true,[15]=true,[18]=true,[21]=true,[24]=true})[#words] then
-        wallet.mnemonic_words = words
+      if data.mnemonic and type(data.mnemonic) == "string" then
+        local words = {}
+        for w in data.mnemonic:gmatch("%S+") do words[#words + 1] = w end
+        if ({[12]=true,[15]=true,[18]=true,[21]=true,[24]=true})[#words] then
+          wallet.mnemonic_words = words
+        end
       end
     end
   end
