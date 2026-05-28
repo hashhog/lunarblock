@@ -372,6 +372,20 @@ function M.new(network, storage, config)
   -- Proxy configuration (Tor/I2P support)
   self.proxy_config = nil      -- ProxyConfig object from proxy module
 
+  -- BIP-324 outbound v2 fallback table.  Many Bitcoin peers (Core <v26,
+  -- older alt-impls) silently drop our ellswift+garbage prelude and
+  -- never respond, so the connection sits in V2_KEY_SENT until
+  -- HANDSHAKE_TIMEOUT (60s) and is torn down with no headers exchanged.
+  -- If v2 is on by default the node never makes IBD progress against
+  -- those peers.  When a v2-handshake-stage disconnect happens we add
+  -- "ip:port" -> last_v2_fail_time here, and connect_peer() forces
+  -- use_v2=false for the next attempt to that address.  Entries are
+  -- soft-cleared after V2_RETRY_AFTER seconds so a peer that gains v2
+  -- support is eventually re-probed.  See restart.log 2026-05-27 for
+  -- the 14-hour h=0 IBD stall this addresses.
+  self.v1_only_addrs = {}      -- "ip:port" -> timestamp of last v2 failure
+  self.V2_RETRY_AFTER = 24 * 3600  -- 24h before re-trying v2 on a v1-only addr
+
   -- Initialize proxy if configured
   if config.proxy then
     self:_init_proxy(config)
@@ -1151,6 +1165,21 @@ function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override, is_
     use_v2 = use_v2_override
   else
     use_v2 = not self.config.nov2transport
+    -- Honor per-address v2 fallback: a previous attempt to this
+    -- "ip:port" stalled in the v2 handshake (peer doesn't speak BIP-324
+    -- or silently dropped our ellswift prelude).  Force v1 for
+    -- V2_RETRY_AFTER seconds so the next attempt actually finishes the
+    -- version exchange and we can request headers.  Without this gate
+    -- a v2-only outbound retries the same dead handshake forever and
+    -- IBD never starts (see 2026-05-27 lunarblock h=0 14h stall).
+    if use_v2 and self.v1_only_addrs[key] then
+      if os.time() - self.v1_only_addrs[key] < self.V2_RETRY_AFTER then
+        use_v2 = false
+      else
+        -- Soft-expire: drop the marker and try v2 again.
+        self.v1_only_addrs[key] = nil
+      end
+    end
   end
   local p = peer_mod.new(ip, port, self.network, self.our_height, use_v2, self.proxy_config,
                          self.config.peerbloomfilters, self.config.prune_mode,
@@ -1211,6 +1240,22 @@ end
 -- @param reason string: reason for disconnection (optional)
 function PeerManager:disconnect_peer(p, reason)
   local key = p.ip .. ":" .. p.port
+
+  -- BIP-324 v2 fallback marker.  If the peer was outbound, v2 was
+  -- attempted (use_v2 + v2_transport present), and we never finished
+  -- the v2 cipher handshake (v2_active false), then the peer almost
+  -- certainly does not speak BIP-324 or silently drops our ellswift
+  -- prelude.  Record this so the next attempt to "ip:port" forces v1
+  -- via the connect_peer() v1_only_addrs gate.  We deliberately do NOT
+  -- gate on the precise disconnect reason — "handshake timeout",
+  -- "connection closed by peer", "v2 recv failed" and "v2 handshake
+  -- failed" all map to the same fallback decision once v2 is what
+  -- failed.  Without this marker the same v2-incompatible peer is
+  -- retried v2-first forever and outbound slots never reach the
+  -- application handshake (see lunarblock h=0 IBD stall 2026-05-27).
+  if not p.inbound and p.use_v2 and p.v2_transport and not p.v2_active then
+    self.v1_only_addrs[key] = os.time()
+  end
 
   -- If this was an established outbound connection, move to tried table
   if not p.inbound and p.state == peer_mod.STATE.ESTABLISHED then
