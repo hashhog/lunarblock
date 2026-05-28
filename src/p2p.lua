@@ -965,6 +965,16 @@ end
 -- Short txid length in bytes
 M.SHORTTXIDS_LENGTH = 6
 
+-- Wire-level cap on BIP-152 BlockTxCount (short_ids + prefilled).  Core
+-- enforces this mid-deserialize via the post-read throw in
+-- CBlockHeaderAndShortTxIDs::SerializeMethods
+-- (bitcoin-core/src/blockencodings.h:121-130) because
+-- BlockTransactionsRequest::indexes and PrefilledTransaction::index are
+-- both uint16_t.  Without this cap, a single malicious cmpctblock can
+-- amplify ~50-byte wire bytes into ~33 MiB of allocations
+-- (W156 BUG-3 / W156 BUG-4 / W156 BUG-10).
+M.CMPCTBLOCK_MAX_TX_COUNT = 0xFFFF  -- numeric_limits<uint16_t>::max()
+
 --- Serialize a prefilled transaction for cmpctblock.
 -- Index is encoded as a differential offset from the previous prefilled tx.
 -- @param index number: differential index (offset from previous)
@@ -1019,6 +1029,24 @@ end
 --- Deserialize a cmpctblock message.
 -- @param data string: cmpctblock payload
 -- @return table: {header, nonce, short_ids, prefilled_txns}
+--
+-- W156 BUG-3 / BUG-4 fix: enforce the wire-level uint16 caps that Core
+-- enforces inside its SerializeMethods / DifferenceFormatter.  Failing
+-- fast before allocating prevents single-packet allocation-amplification
+-- DoS (~33 MiB transient heap + multi-second CPU from one 50-byte input).
+--
+-- Three caps:
+--   (1) short_id_count alone must fit in uint16 (Core's BlockTxCount
+--       post-throw kicks in at the combined sum, but a value above
+--       UINT16_MAX is already game-over for the next addition with any
+--       non-zero prefilled_count — fail fast).
+--   (2) short_id_count + prefilled_count must fit in uint16 (Core's
+--       BlockHeaderAndShortTxIDs post-read throw,
+--       bitcoin-core/src/blockencodings.h:121-130).
+--   (3) The running `last_index` in the differential decode must not
+--       exceed UINT16_MAX (Core's DifferenceFormatter::Unser throw at
+--       blockencodings.h:36-42, since PrefilledTransaction::index is
+--       uint16_t).
 function M.deserialize_cmpctblock(data)
   local r = serialize.buffer_reader(data)
 
@@ -1030,6 +1058,14 @@ function M.deserialize_cmpctblock(data)
 
   -- Short IDs
   local short_id_count = r.read_varint()
+  -- (1) Fail fast on absurd short_id_count BEFORE allocating any table
+  -- entries.  Mirrors Core's invariant that the post-throw at line 125
+  -- would catch this once the prefilled count is added; we just fire
+  -- earlier so the LuaJIT GC never sees the ~5.6M-entry table that the
+  -- MAX_SIZE-bounded varint would otherwise permit.
+  if short_id_count > M.CMPCTBLOCK_MAX_TX_COUNT then
+    error("indexes overflowed 16 bits")
+  end
   local short_ids = {}
   for i = 1, short_id_count do
     -- Read 6 bytes little-endian as a number
@@ -1042,11 +1078,23 @@ function M.deserialize_cmpctblock(data)
 
   -- Prefilled transactions with differential decoding
   local prefilled_count = r.read_varint()
+  -- (2) Combined-count cap: matches Core's post-read throw on
+  -- BlockTxCount() > numeric_limits<uint16_t>::max().
+  if short_id_count + prefilled_count > M.CMPCTBLOCK_MAX_TX_COUNT then
+    error("indexes overflowed 16 bits")
+  end
   local prefilled_txns = {}
   local last_index = -1
   for i = 1, prefilled_count do
     local diff_index = r.read_varint()
     local index = last_index + diff_index + 1
+    -- (3) Mid-stream overflow check: Core's DifferenceFormatter::Unser
+    -- (blockencodings.h:36-42) throws on `m_shift > UINT16_MAX` for
+    -- uint16 index types.  Fires before we deserialize the (potentially
+    -- many-MiB) prefilled transaction body that follows.
+    if index < 0 or index > M.CMPCTBLOCK_MAX_TX_COUNT then
+      error("differential value overflow")
+    end
     local tx = serialize.deserialize_transaction(r)
     prefilled_txns[i] = { index = index, tx = tx }
     last_index = index
@@ -1095,17 +1143,36 @@ end
 --- Deserialize a getblocktxn message.
 -- @param data string: getblocktxn payload
 -- @return table: {block_hash, indexes}
+--
+-- W156 BUG-10 fix: enforce DifferenceFormatter's UINT16 cap on the
+-- running differential sum.  BlockTransactionsRequest::indexes is
+-- std::vector<uint16_t> in Core (blockencodings.h:49) and the
+-- formatter throws on `m_shift > UINT16_MAX`
+-- (blockencodings.h:36-42).  Also caps the index count itself so a
+-- single packet can't allocate a multi-million-entry Lua table.
 function M.deserialize_getblocktxn(data)
   local r = serialize.buffer_reader(data)
   local block_hash = r.read_hash256()
 
-  -- Differential decoding of indices
+  -- Differential decoding of indices.
   local count = r.read_varint()
+  -- Fail fast: getblocktxn can never legitimately request more than
+  -- UINT16_MAX indices.  Matches the implicit cap in Core's
+  -- std::vector<uint16_t> indexes population (it would still allocate
+  -- the vector but every push beyond 65535 would error out via the
+  -- formatter throw on the next iteration).
+  if count > M.CMPCTBLOCK_MAX_TX_COUNT then
+    error("indexes overflowed 16 bits")
+  end
   local indexes = {}
   local last_index = -1
   for i = 1, count do
     local diff = r.read_varint()
     local index = last_index + diff + 1
+    -- Mid-stream uint16 overflow check (Core blockencodings.h:36-42).
+    if index < 0 or index > M.CMPCTBLOCK_MAX_TX_COUNT then
+      error("differential value overflow")
+    end
     indexes[i] = index
     last_index = index
   end
