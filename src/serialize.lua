@@ -188,7 +188,19 @@ function M.buffer_reader(data)
     end
   end
 
-  function reader.read_varint()
+  -- range_check (default true): when false, skip the MAX_SIZE check.
+  -- Set to false ONLY when the CompactSize-encoded value is NOT a container
+  -- length but a raw bitfield, e.g. the BIP-155 addrv2 `services` field
+  -- which is a 64-bit service bitfield serialised with
+  -- `CompactSizeFormatter<false>` in Bitcoin Core (protocol.h:446).
+  -- Without this opt-out, any address gossipped with a service bit at
+  -- position >= 26 (value > 0x02000000) triggers
+  -- "ReadCompactSize(): size too large", tearing down the addrv2 handler
+  -- and (via _safe_dispatch) disconnecting the peer.  That destroys any
+  -- in-flight PRESYNC state for that peer and prevents from-genesis IBD
+  -- from making progress.  Mirrors nimrod commit 0454cf0.
+  function reader.read_varint(range_check)
+    if range_check == nil then range_check = true end
     local first = reader.read_u8()
     local val
     if first < 0xFD then
@@ -209,7 +221,7 @@ function M.buffer_reader(data)
         error("non-canonical ReadCompactSize()")
       end
     end
-    if val > MAX_SIZE then
+    if range_check and val > MAX_SIZE then
       error("ReadCompactSize(): size too large")
     end
     return val
@@ -340,7 +352,10 @@ if _ffi_reader_ok and _bit_ok then
       end
     end
 
-    function reader.read_varint()
+    -- See pure-Lua buffer_reader.read_varint above for the rationale of
+    -- the `range_check` opt-out (BIP-155 services bitfield; nimrod 0454cf0).
+    function reader.read_varint(range_check)
+      if range_check == nil then range_check = true end
       local first = reader.read_u8()
       local val
       if first < 0xFD then
@@ -361,7 +376,7 @@ if _ffi_reader_ok and _bit_ok then
           error("non-canonical ReadCompactSize()")
         end
       end
-      if val > MAX_SIZE then
+      if range_check and val > MAX_SIZE then
         error("ReadCompactSize(): size too large")
       end
       return val
