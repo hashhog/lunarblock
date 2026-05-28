@@ -1482,9 +1482,24 @@ function HeaderChain:handle_headers(peer, payload)
   -- Normal sync path - process headers directly
   local accepted, err = self:process_headers(headers, peer)
   if err then
-    -- Check if this is just an unknown parent due to low-work chain
-    -- In that case, try to initiate PRESYNC
-    if err:match("unknown parent") and self:try_low_work_sync(peer, headers) then
+    -- Check if this is a low-work-chain situation that PRESYNC should handle.
+    -- Two trigger shapes both route to TryLowWorkHeadersSync (Core
+    -- net_processing.cpp:3064 — TryLowWorkHeadersSync runs BEFORE the regular
+    -- header pipeline; we approximate that by re-routing on error):
+    --
+    --   * "unknown parent" — peer is on a chain whose fork point we don't yet
+    --     have, i.e. it's far above genesis. Trigger first added here.
+    --   * "too-little-chainwork" — peer is replaying headers from genesis (or
+    --     close to it) where the cumulative work of the first batch is below
+    --     network.min_chain_work. THIS IS THE ONLY SHAPE AT GENESIS IBD: the
+    --     genesis parent IS known, so process_headers passes the parent check
+    --     and dies in accept_header step 8 ("too-little-chainwork"). Without
+    --     this trigger lunarblock bans every honest mainnet peer on the first
+    --     headers message and IBD never starts (see 2026-05-28 h=0 stall —
+    --     400 too-little-chainwork events + 200 bans across 17h of restart.log,
+    --     all surviving peers stuck at startingheight=0).
+    if (err:match("unknown parent") or err:match("too%-little%-chainwork"))
+       and self:try_low_work_sync(peer, headers) then
       -- Low-work sync initiated, request more headers
       local new_sync_state = self.peer_sync_states[peer_id]
       if new_sync_state then
