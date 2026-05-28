@@ -1159,14 +1159,22 @@ end
 -- Block Locator
 --------------------------------------------------------------------------------
 
---- Build a block locator for getheaders messages.
--- Returns hashes starting from tip, going back with exponentially increasing gaps:
--- tip, tip-1, tip-2, ..., tip-9, tip-11, tip-15, tip-23, tip-39, ..., genesis
+--- Build a block locator with exponential backoff starting at `start_height`.
+-- Equivalent of Bitcoin Core's chain.cpp::LocatorEntries(index): collect
+-- hashes at heights start, start-1, ..., start-9, then doubling step back
+-- to 0, always terminating with the genesis hash.
+--
+-- Used by:
+--   * get_block_locator() — start_height = header_tip_height (main-chain tip).
+--   * build_presync_locator() — start_height = chain_start_height of an
+--     in-flight PRESYNC / REDOWNLOAD low-work sync.
+--
+-- @param start_height number: height to start the exponential locator at
 -- @return table: list of hash256 objects
-function HeaderChain:get_block_locator()
+function HeaderChain:build_locator_from_height(start_height)
   local hashes = {}
   local step = 1
-  local height = self.header_tip_height
+  local height = start_height
 
   while height >= 0 do
     local hex = self.height_to_hash[height]
@@ -1192,6 +1200,65 @@ function HeaderChain:get_block_locator()
   end
 
   return hashes
+end
+
+--- Build a block locator for getheaders messages.
+-- Returns hashes starting from tip, going back with exponentially increasing gaps:
+-- tip, tip-1, tip-2, ..., tip-9, tip-11, tip-15, tip-23, tip-39, ..., genesis
+-- @return table: list of hash256 objects
+function HeaderChain:get_block_locator()
+  return self:build_locator_from_height(self.header_tip_height)
+end
+
+--- Build a full getheaders locator for an in-flight PRESYNC/REDOWNLOAD sync.
+--
+-- Mirrors Bitcoin Core's HeadersSyncState::NextHeadersRequestLocator()
+-- (headerssync.cpp:296): the locator starts with the per-phase continue-from
+-- hash (presync.last_hash in PRESYNC, redownload.last_hash in REDOWNLOAD)
+-- and is followed by the exponential-backoff locator built from
+-- chain_start back to genesis (Core's chain.cpp::LocatorEntries).
+--
+-- Pre-fix lunarblock's get_getheaders_request returned ONLY the continue-from
+-- hash.  PRESYNC commitment-only headers live in the sync_state and are
+-- never relayed back to peers, so a syncing peer that had not yet seen our
+-- most recent commitment-only header (the COMMON case during PRESYNC) had
+-- no way to honour the getheaders — it'd fall back to genesis or send no
+-- headers, and the next continuity check (header.prev_hash ==
+-- presync.last_hash) would fail.  Mirrors nimrod commit 4deead0.
+--
+-- @param sync_state HeadersSyncState: per-peer sync state (PRESYNC or REDOWNLOAD)
+-- @return table: list of hash256 objects (continue-from hash + exponential locator)
+function HeaderChain:build_presync_locator(sync_state)
+  local locator = {}
+
+  local state = sync_state:get_state()
+  if state == sync_state.STATE.PRESYNC then
+    locator[#locator + 1] = sync_state.presync.last_hash
+  elseif state == sync_state.STATE.REDOWNLOAD then
+    locator[#locator + 1] = sync_state.redownload.last_hash
+  else
+    -- FINAL — nothing meaningful to request.
+    return locator
+  end
+
+  -- Append the chain_start exponential-backoff locator.  Skip duplicates
+  -- at the boundary so we don't emit the same hash twice (common when
+  -- chain_start_height is small or PRESYNC has not advanced yet).
+  local chain_start_locator =
+    self:build_locator_from_height(sync_state.chain_start_height or 0)
+  local seen = {}
+  for _, h in ipairs(locator) do
+    seen[types.hash256_hex(h)] = true
+  end
+  for _, h in ipairs(chain_start_locator) do
+    local k = types.hash256_hex(h)
+    if not seen[k] then
+      locator[#locator + 1] = h
+      seen[k] = true
+    end
+  end
+
+  return locator
 end
 
 --------------------------------------------------------------------------------
@@ -1325,19 +1392,55 @@ function HeaderChain:try_low_work_sync(peer, headers)
     return false  -- Already syncing with this peer
   end
 
-  -- Calculate claimed work from headers
-  local claimed_work = self:get_chain_work()
-  for _, header in ipairs(headers) do
-    local block_work = consensus.get_block_work(header.bits)
-    claimed_work = consensus.work_add(claimed_work, block_work)
+  -- Calculate claimed total work AT THIS BATCH'S TIP using the same
+  -- floating-point work_for_bits that accept_header uses.
+  --
+  -- Bug-fix: previously the work was computed via consensus.get_block_work
+  -- (32-byte big-endian) and compared against consensus.work_from_hex(
+  -- self.network.min_chain_work).  consensus.get_block_work has a latent
+  -- byte-placement bug that inflates the per-block contribution by many
+  -- orders of magnitude; the byte-compare then incorrectly reported the
+  -- candidate chain as having ENOUGH work, so try_low_work_sync returned
+  -- false ("Chain has sufficient work, use normal sync") and the caller
+  -- fell through to ban the peer for "too-little-chainwork".
+  --
+  -- That was the 2026-05-28 mainnet stall: every honest peer banned on
+  -- its first headers batch, because try_low_work_sync claimed the
+  -- 2000-header batch from genesis was already above min_chain_work.
+  -- See src/consensus.lua:1342 (get_block_work).
+  --
+  -- Using the float path keeps this gate consistent with accept_header
+  -- step 8 (sync.lua:1083) — they MUST agree, otherwise accept_header
+  -- rejects on a chain that try_low_work_sync claims is fine.
+  local tip_total_work
+  if self.header_tip_hash then
+    local tip_hex = types.hash256_hex(self.header_tip_hash)
+    local tip_entry = self.headers[tip_hex]
+    if tip_entry then
+      tip_total_work = tip_entry.total_work or 0
+    else
+      tip_total_work = 0
+    end
+  else
+    tip_total_work = 0
   end
 
-  -- Check if claimed work is below minimum
-  local min_work = consensus.work_from_hex(
-    self.network.min_chain_work or string.rep("00", 64)
-  )
+  local claimed_work_float = tip_total_work
+  for _, header in ipairs(headers) do
+    claimed_work_float = claimed_work_float + self:work_for_bits(header.bits)
+  end
 
-  if consensus.work_compare(claimed_work, min_work) >= 0 then
+  -- Convert min_chain_work hex → float (same byte→float conversion the
+  -- accept_header gate's candidate_work_bytes → comparison effectively
+  -- inverts).  min_chain_work is the cumulative work threshold per
+  -- chainparams; for mainnet ~2^91 today.
+  local min_work_hex = self.network.min_chain_work or string.rep("00", 64)
+  local min_work_float = 0
+  for i = 1, 32 do
+    min_work_float = min_work_float * 256 + tonumber(min_work_hex:sub(2*i-1, 2*i), 16)
+  end
+
+  if claimed_work_float >= min_work_float then
     -- Chain has sufficient work, use normal sync
     return false
   end
@@ -1455,14 +1558,19 @@ function HeaderChain:handle_headers(peer, payload)
       end
     end
 
-    -- Request more headers if still syncing
+    -- Request more headers if still syncing.
+    -- Use the full chain_start exponential-backoff locator (Core parity,
+    -- headerssync.cpp:296) so a peer that has not yet seen our
+    -- commitment-only header still recognises some entry and replies with
+    -- the correct continuation, instead of falling back to genesis and
+    -- re-sending the same batch.  Mirrors nimrod commit 4deead0.
     if sync_state:needs_headers() then
-      local req = sync_state:get_getheaders_request()
-      if req then
+      local locator = self:build_presync_locator(sync_state)
+      if #locator > 0 then
         local send_payload = p2p.serialize_getheaders(
           p2p.PROTOCOL_VERSION,
-          req.locator_hashes,
-          req.stop_hash
+          locator,
+          types.hash256_zero()
         )
         peer:send_message("getheaders", send_payload)
       end
@@ -1500,15 +1608,17 @@ function HeaderChain:handle_headers(peer, payload)
     --     all surviving peers stuck at startingheight=0).
     if (err:match("unknown parent") or err:match("too%-little%-chainwork"))
        and self:try_low_work_sync(peer, headers) then
-      -- Low-work sync initiated, request more headers
+      -- Low-work sync initiated, request more headers.
+      -- Use the full chain_start exponential-backoff locator (Core parity,
+      -- headerssync.cpp:296) — see comment above and nimrod commit 4deead0.
       local new_sync_state = self.peer_sync_states[peer_id]
       if new_sync_state then
-        local req = new_sync_state:get_getheaders_request()
-        if req then
+        local locator = self:build_presync_locator(new_sync_state)
+        if #locator > 0 then
           local send_payload = p2p.serialize_getheaders(
             p2p.PROTOCOL_VERSION,
-            req.locator_hashes,
-            req.stop_hash
+            locator,
+            types.hash256_zero()
           )
           peer:send_message("getheaders", send_payload)
         end
