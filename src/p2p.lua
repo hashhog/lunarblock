@@ -840,7 +840,16 @@ function M.deserialize_addrv2(data)
   local addresses = {}
   for i = 1, count do
     local timestamp = r.read_u32le()
-    local services = r.read_varint()
+    -- BIP-155 `services` is a 64-bit bitfield, NOT a container length, and
+    -- is serialised with `CompactSizeFormatter<false>` in Bitcoin Core
+    -- (protocol.h:446 — `READWRITE(Using<CompactSizeFormatter<false>>(services_tmp))`).
+    -- Pass range_check=false so a peer announcing an experimental / future
+    -- service bit at position >= 26 (value > 0x02000000) does not raise
+    -- "ReadCompactSize(): size too large", which would tear down the
+    -- addrv2 handler (Peer._safe_dispatch then disconnects the peer) and
+    -- destroy any in-flight PRESYNC state from that peer.  Mirrors
+    -- nimrod commit 0454cf0.
+    local services = r.read_varint(false)
     local network_id = r.read_u8()
     local addr_len = r.read_varint()
 
