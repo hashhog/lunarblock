@@ -648,6 +648,17 @@ end
 function M.classify_script(script)
   local len = #script
 
+  -- An empty script matches none of the patterns below and is never P2SH.
+  -- Guard here so the unguarded `script:byte(1)` comparisons further down
+  -- (witness-program / OP_RETURN / bare-multisig detection) never index
+  -- past the end of an empty string (`script:byte(1)` -> nil -> compare
+  -- with a number raises). Core treats an empty scriptPubKey as
+  -- non-P2SH, leaving the scriptSig's stack result to decide. (BIP16:
+  -- a P2SH spk is exactly 23 bytes; nothing shorter can be P2SH.)
+  if len == 0 then
+    return "nonstandard", nil
+  end
+
   -- P2PKH: 25 bytes: 76 a9 14 <20> 88 ac
   if len == 25 and
      script:byte(1) == 0x76 and
