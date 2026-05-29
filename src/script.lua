@@ -383,6 +383,14 @@ function M.parse_script(script_bytes)
   local len = #script_bytes
 
   while pos <= len do
+    -- `start` is the 1-based byte offset of this op's first byte (its opcode).
+    -- `next_pos` (recorded below) is the 1-based byte offset of the byte
+    -- immediately after this op. For an executed OP_CODESEPARATOR, that
+    -- next-byte offset is exactly Core's pbegincodehash (CScript scriptCode
+    -- begins at the byte after the most-recent OP_CODESEPARATOR,
+    -- interpreter.cpp:1054). Both are additive metadata; existing callers
+    -- only read .opcode/.data.
+    local start = pos
     local opcode = script_bytes:byte(pos)
     pos = pos + 1
 
@@ -392,7 +400,7 @@ function M.parse_script(script_bytes)
       assert(pos + data_len - 1 <= len, "unexpected end of script in push")
       local data = script_bytes:sub(pos, pos + data_len - 1)
       pos = pos + data_len
-      ops[#ops + 1] = {opcode = opcode, data = data}
+      ops[#ops + 1] = {opcode = opcode, data = data, pos = start, next_pos = pos}
     elseif opcode == 0x4c then
       -- OP_PUSHDATA1: read 1-byte length, then data
       assert(pos <= len, "unexpected end of script in PUSHDATA1")
@@ -401,7 +409,7 @@ function M.parse_script(script_bytes)
       assert(pos + data_len - 1 <= len, "unexpected end of script in PUSHDATA1 data")
       local data = script_bytes:sub(pos, pos + data_len - 1)
       pos = pos + data_len
-      ops[#ops + 1] = {opcode = opcode, data = data}
+      ops[#ops + 1] = {opcode = opcode, data = data, pos = start, next_pos = pos}
     elseif opcode == 0x4d then
       -- OP_PUSHDATA2: read 2-byte length (little-endian), then data
       assert(pos + 1 <= len, "unexpected end of script in PUSHDATA2")
@@ -410,7 +418,7 @@ function M.parse_script(script_bytes)
       assert(pos + data_len - 1 <= len, "unexpected end of script in PUSHDATA2 data")
       local data = script_bytes:sub(pos, pos + data_len - 1)
       pos = pos + data_len
-      ops[#ops + 1] = {opcode = opcode, data = data}
+      ops[#ops + 1] = {opcode = opcode, data = data, pos = start, next_pos = pos}
     elseif opcode == 0x4e then
       -- OP_PUSHDATA4: read 4-byte length (little-endian), then data
       assert(pos + 3 <= len, "unexpected end of script in PUSHDATA4")
@@ -420,10 +428,10 @@ function M.parse_script(script_bytes)
       assert(pos + data_len - 1 <= len, "unexpected end of script in PUSHDATA4 data")
       local data = script_bytes:sub(pos, pos + data_len - 1)
       pos = pos + data_len
-      ops[#ops + 1] = {opcode = opcode, data = data}
+      ops[#ops + 1] = {opcode = opcode, data = data, pos = start, next_pos = pos}
     else
       -- Regular opcode
-      ops[#ops + 1] = {opcode = opcode, data = nil}
+      ops[#ops + 1] = {opcode = opcode, data = nil, pos = start, next_pos = pos}
     end
   end
 
@@ -1052,6 +1060,21 @@ function M.execute_script(script_bytes, stack, flags, checker)
   local op_count = 0
   local codesep_pos = 0xFFFFFFFF  -- BIP143/342: initialize to 0xFFFFFFFF
 
+  -- Reset the legacy/segwit-v0 codeseparator byte offset at the start of
+  -- every script execution: Core re-initializes pbegincodehash to
+  -- script.begin() at the top of each EvalScript (interpreter.cpp:422), so a
+  -- codeseparator that executed in the scriptSig must NOT leak into the
+  -- scriptPubKey's (or redeem/witness script's) CHECKSIG scriptCode. nil
+  -- byte_offset means "full scriptCode". The 3rd arg is the script CURRENTLY
+  -- being evaluated: Core's legacy scriptCode is always CScript(pbegincodehash,
+  -- pend) over THIS script, not the prevout scriptPubKey — that distinction
+  -- matters when a CHECKSIG executes inside the scriptSig (script_tests rows
+  -- "CHECKSIG is legal in scriptSigs"). The tapscript checker ignores the
+  -- extra args (its codesep position is committed differently).
+  if checker.set_codesep then
+    checker.set_codesep(0xFFFFFFFF, nil, script_bytes)
+  end
+
   -- Helper: check if we're in an executing branch
   local function is_executing()
     for _, v in ipairs(if_stack) do
@@ -1504,8 +1527,16 @@ function M.execute_script(script_bytes, stack, flags, checker)
       -- committed to the tapscript sigmsg at interpreter.cpp:1565.
       -- `i` is 1-indexed in Lua, so the 0-based index is `i - 1`.
       codesep_pos = i - 1
+      -- For LEGACY (BASE) + SegWit v0 sighash, Core slices the scriptCode at
+      -- pbegincodehash = the BYTE position right AFTER this OP_CODESEPARATOR
+      -- (interpreter.cpp:1054 `pbegincodehash = pc`), then SignatureHash uses
+      -- CScript(pbegincodehash, pend). `op.next_pos` is exactly that 1-based
+      -- byte offset within the currently-executing script. We pass it as the
+      -- second arg so the checker can truncate its scriptCode. The first arg
+      -- (0-based opcode index) is unchanged for the tapscript codesep
+      -- commitment, which uses a different rule.
       if checker.set_codesep then
-        checker.set_codesep(codesep_pos)
+        checker.set_codesep(codesep_pos, op.next_pos, script_bytes)
       end
     elseif opcode == M.OP.OP_CHECKSIG then
       -- Pop pubkey first (top of stack), then signature (deeper)
@@ -1740,7 +1771,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
 
         local fOk = false
         if checker.check_sig then
-          fOk = checker.check_sig(sig_j, pubkey)
+          -- Core (interpreter.cpp:1138-1167) builds ONE scriptCode and
+          -- FindAndDeletes EVERY signature (all `sigs`) from it before using
+          -- it for each CheckECDSASignature. Pass the full sig list so the
+          -- checker removes all of them, not just the one being verified.
+          fOk = checker.check_sig(sig_j, pubkey, sigs)
         end
 
         if fOk then
@@ -2357,6 +2392,18 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
     end
   end
 
+  -- Whether a witness program was actually executed (native or P2SH-wrapped).
+  -- Core (VerifyScript, interpreter.cpp:2045-2047 / 2090-2092) does
+  -- `stack.resize(1)` right after a SUCCESSFUL VerifyWitnessProgram — "Bypass
+  -- the cleanstack check ... the actual stack is obviously not clean for
+  -- witness programs". We mirror that by skipping the legacy CLEANSTACK
+  -- size==1 guard on the main stack whenever a witness program ran (the
+  -- witness program's own ExecuteWitnessProgram already enforced its
+  -- single-element / clean-stack requirement). Without this, a native
+  -- witness spend (e.g. P2WPKH scriptPubKey `OP_0 <20-byte>`) leaves 2
+  -- elements on the main stack and the size==1 guard false-rejects.
+  local did_witness = false
+
   -- Witness handling (BIP141)
   if flags.verify_witness then
     local witness_version, witness_program
@@ -2367,6 +2414,7 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
 
     if witness_version then
       had_witness = true
+      did_witness = true
       -- Native witness: scriptSig must be empty
       if #script_sig > 0 then
         return nil, "WITNESS_MALLEATED"
@@ -2397,6 +2445,7 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
         witness_version, witness_program = M.is_witness_program(p2sh_redeem)
         if witness_version then
           had_witness = true
+          did_witness = true
 
           -- P2SH-wrapped witness: scriptSig must be exactly a single push of the witness program
           -- Verify scriptSig is push-only and contains exactly 1 element
@@ -2429,8 +2478,12 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
     end
   end
 
-  -- CLEANSTACK for non-P2SH non-witness: check main stack
-  if flags.verify_cleanstack and not did_p2sh then
+  -- CLEANSTACK for non-P2SH non-witness: check main stack.
+  -- Skip when a witness program ran: Core does stack.resize(1) after a
+  -- successful VerifyWitnessProgram (interpreter.cpp:2047/2092) so the
+  -- size==1 guard is satisfied for witness spends. did_p2sh already covers
+  -- the P2SH(-wrapped-witness) case; did_witness covers native witness.
+  if flags.verify_cleanstack and not did_p2sh and not did_witness then
     if #stack ~= 1 then
       return nil, "CLEANSTACK"
     end
