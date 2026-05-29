@@ -471,6 +471,45 @@ function M.build_script(ops)
   return table.concat(parts)
 end
 
+-- Minimal push-encoding of `data` as a CScript pushdata, matching
+-- Core's `CScript() << vchSig` (the operand of FindAndDelete in
+-- EvalChecksigPreTapscript / OP_CHECKMULTISIG). Mirrors
+-- validation.serialize_push_data so the bytes searched for are identical
+-- to those the legacy sighash FindAndDelete removes.
+local function serialize_push_bytes(data)
+  local len = #data
+  if len <= 75 then
+    return string.char(len) .. data
+  elseif len <= 255 then
+    return string.char(0x4c, len) .. data            -- OP_PUSHDATA1
+  elseif len <= 65535 then
+    return string.char(0x4d, len % 256, math.floor(len / 256)) .. data  -- OP_PUSHDATA2
+  else
+    return string.char(0x4e,
+      len % 256,
+      math.floor(len / 256) % 256,
+      math.floor(len / 65536) % 256,
+      math.floor(len / 16777216)) .. data            -- OP_PUSHDATA4
+  end
+end
+
+-- Count occurrences of the push-encoded signature `sig` inside `script_code`
+-- WITHOUT mutating it. This is the `FindAndDelete(scriptCode, CScript() << vchSig)`
+-- return value (the number of deletions) used purely for the
+-- SCRIPT_VERIFY_CONST_SCRIPTCODE consensus check
+-- (interpreter.cpp:330-332 / 1146-1148). The actual signature removal for
+-- the legacy sighash still happens in validation.find_and_delete.
+local function findanddelete_count(script_code, sig)
+  if not sig or #sig == 0 or not script_code or #script_code == 0 then
+    return 0
+  end
+  local needle = serialize_push_bytes(sig)
+  -- Lua's gsub returns (result, n); the second return is the match count.
+  local pattern = needle:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1")
+  local _, n = script_code:gsub(pattern, "")
+  return n
+end
+
 -- Helper: create a push opcode for data
 local function make_push(data)
   local len = #data
@@ -1067,6 +1106,26 @@ function M.execute_script(script_bytes, stack, flags, checker)
   -- Parse the script
   local ops = M.parse_script(script_bytes)
 
+  -- Reconstruct the scriptCode the way Core does for the legacy/segwit-v0
+  -- (SigVersion::BASE/WITNESS_V0) CHECKSIG family: the subset of the script
+  -- starting at the most recent OP_CODESEPARATOR, i.e. CScript(pbegincodehash,
+  -- pend) (interpreter.cpp:326). Used ONLY for the SCRIPT_VERIFY_CONST_SCRIPTCODE
+  -- FindAndDelete check below — it must NOT alter the sighash subscript logic
+  -- in validation.lua. When no OP_CODESEPARATOR has executed yet (codesep_pos ==
+  -- 0xFFFFFFFF) the scriptCode is the full currently-executing script.
+  local function compute_script_code()
+    if codesep_pos == 0xFFFFFFFF then
+      return script_bytes
+    end
+    -- codesep_pos is the 0-based op index of the OP_CODESEPARATOR; the
+    -- subscript begins with the NEXT op (1-based codesep_pos + 2).
+    local tail = {}
+    for k = codesep_pos + 2, #ops do
+      tail[#tail + 1] = ops[k]
+    end
+    return M.build_script(tail)
+  end
+
   -- Execute each operation
   local i = 1
   while i <= #ops do
@@ -1159,6 +1218,17 @@ function M.execute_script(script_bytes, stack, flags, checker)
     -- Check for disabled opcodes - must fail even in unexecuted branches
     if is_disabled_opcode(opcode) then
       error("disabled opcode: " .. (M.OP_NAMES[opcode] or string.format("0x%02x", opcode)))
+    end
+
+    -- SCRIPT_VERIFY_CONST_SCRIPTCODE (interpreter.cpp:474-476): in
+    -- SigVersion::BASE (legacy, NOT witness v0 / tapscript) an OP_CODESEPARATOR
+    -- is rejected outright when the flag is set, EVEN in an unexecuted branch.
+    -- This is the dispatch-level sibling of the FindAndDelete rule below and
+    -- is independent of the legacy sighash subscript logic in validation.lua.
+    if opcode == M.OP.OP_CODESEPARATOR
+       and not flags.is_witness_v0 and not flags.is_tapscript
+       and flags.verify_const_scriptcode then
+      return nil, "OP_CODESEPARATOR"
     end
 
     -- PUSH_SIZE: 520-byte limit applies even in unexecuted branches
@@ -1494,6 +1564,15 @@ function M.execute_script(script_bytes, stack, flags, checker)
         push_bool(valid)
       else
         -- Legacy/segwit v0 OP_CHECKSIG
+        -- SCRIPT_VERIFY_CONST_SCRIPTCODE (interpreter.cpp:329-332): only in
+        -- SigVersion::BASE (legacy, NOT witness v0) FindAndDelete drops the
+        -- signature from scriptCode; if it removed >=1 occurrence AND the flag
+        -- is set, the script fails with SIG_FINDANDDELETE.
+        if not flags.is_witness_v0 and flags.verify_const_scriptcode then
+          if findanddelete_count(compute_script_code(), sig) > 0 then
+            return nil, "SIG_FINDANDDELETE"
+          end
+        end
         local sig_ok, sig_err = check_signature_encoding(sig, flags)
         if not sig_ok then
           return nil, sig_err
@@ -1555,6 +1634,12 @@ function M.execute_script(script_bytes, stack, flags, checker)
           return nil, "CHECKSIGVERIFY"
         end
       else
+        -- SCRIPT_VERIFY_CONST_SCRIPTCODE (interpreter.cpp:329-332): BASE only.
+        if not flags.is_witness_v0 and flags.verify_const_scriptcode then
+          if findanddelete_count(compute_script_code(), sig) > 0 then
+            return nil, "SIG_FINDANDDELETE"
+          end
+        end
         local sig_ok, sig_err = check_signature_encoding(sig, flags)
         if not sig_ok then
           return nil, sig_err
@@ -1601,6 +1686,20 @@ function M.execute_script(script_bytes, stack, flags, checker)
       local sigs = {}
       for j = 1, m do
         sigs[j] = pop()
+      end
+
+      -- SCRIPT_VERIFY_CONST_SCRIPTCODE (interpreter.cpp:1142-1150): in
+      -- SigVersion::BASE (legacy, NOT witness v0) drop each signature from
+      -- scriptCode via FindAndDelete; if any removed >=1 occurrence AND the
+      -- flag is set, fail with SIG_FINDANDDELETE. Runs over ALL sigs before
+      -- the verify loop, and (per Core) before the NULLDUMMY check below.
+      if not flags.is_witness_v0 and flags.verify_const_scriptcode then
+        local sc = compute_script_code()
+        for j = 1, m do
+          if findanddelete_count(sc, sigs[j]) > 0 then
+            return nil, "SIG_FINDANDDELETE"
+          end
+        end
       end
 
       -- Pop dummy element (off-by-one bug)
