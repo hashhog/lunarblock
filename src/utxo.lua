@@ -2419,6 +2419,15 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             verify_witness = height >= self.network.segwit_height,
             verify_nulldummy = height >= self.network.segwit_height,
             verify_taproot = height >= self.network.taproot_height,
+            -- CONST_SCRIPTCODE: reject legacy scripts where FindAndDelete would
+            -- mutate the scriptCode (SIG_FINDANDDELETE). The cache_flags block
+            -- below already accounts for this bit as "always enabled" in the
+            -- block-connect path; wire it into the actual flag table so the
+            -- Batch-A FindAndDelete reject (script.lua OP_CHECKSIG/MULTISIG
+            -- CONST_SCRIPTCODE guard) fires here too, not only in the
+            -- mempool/harness path. Without it the table silently dropped the
+            -- flag the interpreter consumes.
+            verify_const_scriptcode = true,
           }
 
           -- W160 BUG-9 fix: cache key must include ALL consensus script-verify

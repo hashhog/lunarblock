@@ -922,7 +922,13 @@ describe("validation", function()
       -- SIGHASH_SINGLE for input 1 (no matching output)
       local hash = validation.signature_hash_legacy(tx, 1, "\x00", consensus.SIGHASH.SINGLE)
 
-      local expected = string.rep("\0", 31) .. "\1"
+      -- Core (SignatureHash, interpreter.cpp:1640) returns uint256::ONE — the
+      -- legacy SIGHASH_SINGLE "bug" value. uint256::ONE has m_data[0]==0x01 and
+      -- the rest zero, so the 32-byte message is 0x01 followed by 31 zeros
+      -- (little-endian), NOT 31 zeros then 0x01. The previous expectation here
+      -- pinned the reversed (incorrect) byte order, which made every
+      -- out-of-range SIGHASH_SINGLE legacy signature fail to verify.
+      local expected = "\1" .. string.rep("\0", 31)
       assert.equals(expected, hash)
     end)
 

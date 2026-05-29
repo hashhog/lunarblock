@@ -587,9 +587,46 @@ local function escape_pattern(str)
   return (str:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
 end
 
+-- Advance one opcode from 1-based byte position `pos` in `script`, returning
+-- the 1-based position of the byte immediately after that opcode (including
+-- its push payload). Mirrors CScript::GetOp's cursor advance. On a truncated
+-- push it advances to len+1 (Core's GetOp returns false but still moves pc to
+-- end); the caller's loop terminates either way.
+local function script_get_op_end(script, pos)
+  local len = #script
+  if pos > len then return pos end
+  local opcode = script:byte(pos)
+  pos = pos + 1
+  if opcode <= 0x4b then
+    pos = pos + opcode
+  elseif opcode == 0x4c then
+    if pos > len then return len + 1 end
+    pos = pos + 1 + script:byte(pos)
+  elseif opcode == 0x4d then
+    if pos + 1 > len then return len + 1 end
+    pos = pos + 2 + script:byte(pos) + script:byte(pos + 1) * 256
+  elseif opcode == 0x4e then
+    if pos + 3 > len then return len + 1 end
+    local b1, b2, b3, b4 = script:byte(pos, pos + 3)
+    pos = pos + 4 + b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+  end
+  if pos > len + 1 then pos = len + 1 end
+  return pos
+end
+
 --- Find and delete all occurrences of a push-encoded signature from a script.
 -- This is used in legacy sighash computation to remove the signature being
 -- verified from the scriptCode before hashing.
+--
+-- Faithful port of Bitcoin Core FindAndDelete (interpreter.cpp:229-255):
+-- non-overlapping, greedy removal of the needle, with the match cursor only
+-- advancing one opcode at a time via GetOp between match windows. Implemented
+-- with byte-exact comparisons (string.sub) instead of Lua string patterns —
+-- the previous gsub-pattern implementation silently truncated the match at the
+-- first 0x00 byte inside a DER signature (Lua patterns treat an embedded NUL
+-- as a terminator), so a `02 21 00 ...` signature was only partially deleted,
+-- corrupting the scriptCode and the sighash (NULLFAIL on every FindAndDelete
+-- script_tests / tx_valid vector).
 -- @param script_bytes string: The script bytes
 -- @param sig_bytes string: The signature bytes (without push opcode)
 -- @return string: Script with signature removed
@@ -599,13 +636,43 @@ function M.find_and_delete(script_bytes, sig_bytes)
   end
 
   -- The signature is push-encoded in the script: [push_opcode] [data]
-  local push_encoded = serialize_push_data(sig_bytes)
+  local b = serialize_push_data(sig_bytes)
+  local blen = #b
+  local slen = #script_bytes
+  if blen == 0 or slen < blen then
+    return script_bytes
+  end
 
-  -- Remove all occurrences of the push-encoded signature
-  local pattern = escape_pattern(push_encoded)
-  local result = script_bytes:gsub(pattern, "")
+  local parts = {}
+  local pc = 1     -- current scan cursor (1-based)
+  local pc2 = 1    -- start of the not-yet-copied run
+  local found = 0
 
-  return result
+  while true do
+    -- Copy the run [pc2, pc) accumulated since the last match window.
+    if pc > pc2 then
+      parts[#parts + 1] = script_bytes:sub(pc2, pc - 1)
+    end
+    -- Greedily skip every contiguous needle occurrence at pc (byte-exact;
+    -- string.sub comparison handles embedded NUL bytes correctly).
+    while (slen - (pc - 1)) >= blen
+          and script_bytes:sub(pc, pc + blen - 1) == b do
+      pc = pc + blen
+      found = found + 1
+    end
+    pc2 = pc
+    -- GetOp: advance one opcode. Terminate when the cursor reaches the end.
+    if pc > slen then break end
+    pc = script_get_op_end(script_bytes, pc)
+  end
+
+  if found > 0 then
+    if pc2 <= slen then
+      parts[#parts + 1] = script_bytes:sub(pc2, slen)
+    end
+    return table.concat(parts)
+  end
+  return script_bytes
 end
 
 --- Remove all OP_CODESEPARATOR (0xab) opcodes from a script.
@@ -695,9 +762,15 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig_by
   local ht = bit.band(hash_type, 0x1F)
   local anyone_can_pay = bit.band(hash_type, 0x80) ~= 0
 
-  -- Special case: SIGHASH_SINGLE with input_index > #outputs
+  -- Special case: SIGHASH_SINGLE with input_index >= #outputs.
+  -- Core (SignatureHash, interpreter.cpp:1640) returns uint256::ONE here —
+  -- the legacy SIGHASH_SINGLE "bug" value. uint256::ONE has m_data[0]==0x01
+  -- and the rest zero (uint256.h base_blob(uint8_t v):m_data{v}), so the raw
+  -- 32-byte message hash is 0x01 followed by 31 zero bytes (LITTLE-endian),
+  -- NOT 31 zeros then 0x01. Returning the reversed bytes made every
+  -- out-of-range SIGHASH_SINGLE legacy signature fail to verify (NULLFAIL).
   if ht == consensus.SIGHASH.SINGLE and input_index >= #tx.outputs then
-    return string.rep("\0", 31) .. "\1"
+    return "\1" .. string.rep("\0", 31)
   end
 
   -- Apply FindAndDelete: remove the signature from scriptCode (legacy only)
@@ -1498,6 +1571,43 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     wsh_script = p2wsh_witness_script
   end
 
+  -- LEGACY/SegWit-v0 OP_CODESEPARATOR sighash truncation.
+  -- pbegincodehash (interpreter.cpp:422,1054): the 1-based BYTE offset of the
+  -- byte right after the most-recently-EXECUTED OP_CODESEPARATOR within the
+  -- currently-executing script. nil = no codesep executed yet (full
+  -- scriptCode). The interpreter's execute_script resets this to nil on
+  -- entry (Core resets pbegincodehash to script.begin() per EvalScript) and
+  -- updates it via set_codesep when a codesep runs. check_sig slices its
+  -- scriptCode at this offset for both BASE (then FindAndDelete +
+  -- remove-codeseparators) and WITNESS_V0 (slice only) — see interpreter.cpp
+  -- EvalChecksigPreTapscript line 326 `CScript scriptCode(pbegincodehash, pend)`.
+  local codesep_byte_offset = nil
+  -- The script CURRENTLY being evaluated (scriptSig, scriptPubKey, or P2SH
+  -- redeem script). Core's legacy scriptCode is CScript(pbegincodehash, pend)
+  -- over THIS script (interpreter.cpp:326,420-422), NOT the prevout
+  -- scriptPubKey. Set by the interpreter at each execute_script entry.
+  local current_script = nil
+
+  --- Record codeseparator state. First arg is the 0-based opcode index
+  -- (unused by the legacy/segwit ECDSA path; kept for API symmetry with the
+  -- tapscript checker). Second arg is the 1-based byte offset of
+  -- pbegincodehash within the executing script; nil resets to full scriptCode.
+  -- Third arg is the currently-executing script bytes.
+  function checker.set_codesep(opcode_idx, byte_offset, exec_script)
+    codesep_byte_offset = byte_offset
+    current_script = exec_script
+  end
+
+  -- Slice a scriptCode at the recorded pbegincodehash byte offset (Core
+  -- CScript(pbegincodehash, pend)). When no codesep has executed the full
+  -- script is returned unchanged.
+  local function apply_codesep(sc)
+    if codesep_byte_offset and codesep_byte_offset > 1 then
+      return sc:sub(codesep_byte_offset)
+    end
+    return sc
+  end
+
   --- Get witness data from the spending transaction input.
   -- @return table: witness stack
   function checker.get_witness()
@@ -1511,8 +1621,12 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
   --- Check a signature against a public key.
   -- @param sig string: DER-encoded signature with hash type byte appended
   -- @param pubkey string: Public key (33 or 65 bytes)
+  -- @param all_sigs table|nil: For OP_CHECKMULTISIG, the full list of
+  --   signatures to FindAndDelete from the legacy scriptCode (Core builds one
+  --   scriptCode with ALL sigs removed and reuses it for every key — see
+  --   interpreter.cpp:1142-1167). nil for single OP_CHECKSIG.
   -- @return boolean: true if valid
-  function checker.check_sig(sig, pubkey)
+  function checker.check_sig(sig, pubkey, all_sigs)
     if #sig == 0 then
       return false
     end
@@ -1540,17 +1654,41 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
         end
       end
     else
-      -- Legacy: use the script code provided
-      script_code = flags.script_code or prev_script_pubkey
+      -- Legacy: Core's scriptCode is the script CURRENTLY being evaluated
+      -- (interpreter.cpp:326,420-422), not the prevout scriptPubKey. This
+      -- matters when a CHECKSIG runs inside the scriptSig or a P2SH redeem
+      -- script — the FindAndDelete + codeseparator handling must operate on
+      -- THAT script. Fall back to flags.script_code / prev_script_pubkey only
+      -- when the interpreter did not record the executing script.
+      script_code = current_script or flags.script_code or prev_script_pubkey
     end
+
+    -- OP_CODESEPARATOR truncation: scriptCode = bytes from pbegincodehash to
+    -- end of the executing script (interpreter.cpp:326). Applies to BOTH the
+    -- legacy and segwit-v0 sighash. For legacy the truncated subscript then
+    -- goes through FindAndDelete + remove-codeseparators inside
+    -- signature_hash_legacy; for segwit-v0 BIP143 the truncation is the only
+    -- codesep transform (no FindAndDelete, codeseparators NOT stripped).
+    script_code = apply_codesep(script_code)
 
     -- Compute sighash
     local sighash
     if is_segwit then
       -- SegWit does NOT use FindAndDelete
       sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
+    elseif all_sigs then
+      -- OP_CHECKMULTISIG (legacy): FindAndDelete EVERY signature from the
+      -- scriptCode up front, then build the sighash without a further
+      -- per-sig FindAndDelete (sig_bytes=nil), matching Core's single shared
+      -- scriptCode.
+      for _, s in ipairs(all_sigs) do
+        if s and #s > 0 then
+          script_code = M.find_and_delete(script_code, s)
+        end
+      end
+      sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, nil)
     else
-      -- Legacy: pass the full signature (with hash type byte) for FindAndDelete
+      -- Legacy single CHECKSIG: pass the signature for FindAndDelete.
       sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig)
     end
 
@@ -1822,6 +1960,23 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
     wsh_script = p2wsh_witness_script
   end
 
+  -- LEGACY/SegWit-v0 OP_CODESEPARATOR sighash truncation (see the same
+  -- machinery documented in make_sig_checker). Required on the block-connect
+  -- path too, or a CODESEPARATOR-bearing script (legacy or P2WSH) computes
+  -- the wrong sighash during block validation.
+  local codesep_byte_offset = nil
+  local current_script = nil
+  function checker.set_codesep(opcode_idx, byte_offset, exec_script)
+    codesep_byte_offset = byte_offset
+    current_script = exec_script
+  end
+  local function apply_codesep(sc)
+    if codesep_byte_offset and codesep_byte_offset > 1 then
+      return sc:sub(codesep_byte_offset)
+    end
+    return sc
+  end
+
   function checker.get_witness()
     local inp = tx.inputs[input_index + 1]
     if inp and inp.witness then
@@ -1834,7 +1989,7 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
   -- sighash) to the collector for batch verification at end-of-block.  In
   -- inline mode (CHECKMULTISIG-bearing scripts) verify immediately and
   -- return the real result so OP_CHECKMULTISIG's trial pairing works.
-  function checker.check_sig(sig, pubkey)
+  function checker.check_sig(sig, pubkey, all_sigs)
     if #sig == 0 then
       return false
     end
@@ -1858,13 +2013,27 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
         end
       end
     else
-      script_code = flags.script_code or prev_script_pubkey
+      -- Legacy: scriptCode is the script currently being evaluated (Core
+      -- interpreter.cpp:326,420-422), not the prevout scriptPubKey.
+      script_code = current_script or flags.script_code or prev_script_pubkey
     end
+
+    -- OP_CODESEPARATOR truncation (scriptCode = pbegincodehash..end).
+    script_code = apply_codesep(script_code)
 
     -- Compute sighash now (order-dependent — must run here in script execution)
     local sighash
     if is_segwit then
       sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
+    elseif all_sigs then
+      -- OP_CHECKMULTISIG (legacy): FindAndDelete every signature up front
+      -- (Core interpreter.cpp:1142-1167), then hash without per-sig FAD.
+      for _, s in ipairs(all_sigs) do
+        if s and #s > 0 then
+          script_code = M.find_and_delete(script_code, s)
+        end
+      end
+      sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, nil)
     else
       sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig)
     end
