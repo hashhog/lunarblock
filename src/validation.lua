@@ -1633,7 +1633,12 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     local inp = tx.inputs[input_index + 1]
 
     -- Transaction version must be >= 2
-    if tx.version < 2 then
+    -- BIP68/BIP112: Core treats CTransaction::version as uint32_t
+    -- (interpreter.cpp CheckSequence: `if (txTo->version < 2)`), so the
+    -- comparison is UNSIGNED. serialize.read_i32le returns a SIGNED value,
+    -- so a high-bit-set version (e.g. 0xffffffff -> -1) must NOT be treated
+    -- as < 2. Only a small non-negative version (0 or 1) fails the gate.
+    if tx.version >= 0 and tx.version < 2 then
       return false
     end
 
@@ -1739,7 +1744,12 @@ function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, a
       return true
     end
     local inp = tx.inputs[input_index + 1]
-    if tx.version < 2 then
+    -- BIP68/BIP112: Core treats CTransaction::version as uint32_t
+    -- (interpreter.cpp CheckSequence: `if (txTo->version < 2)`), so the
+    -- comparison is UNSIGNED. serialize.read_i32le returns a SIGNED value,
+    -- so a high-bit-set version (e.g. 0xffffffff -> -1) must NOT be treated
+    -- as < 2. Only a small non-negative version (0 or 1) fails the gate.
+    if tx.version >= 0 and tx.version < 2 then
       return false
     end
     if not consensus.sequence_locks_active(inp.sequence) then
@@ -1920,7 +1930,10 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
       return true
     end
     local inp = tx.inputs[input_index + 1]
-    if tx.version < 2 then return false end
+    -- Unsigned version comparison (see make_sig_checker.check_sequence):
+    -- Core's CheckSequence uses uint32_t version; a high-bit-set version is
+    -- never < 2. read_i32le is signed, so guard with `>= 0`.
+    if tx.version >= 0 and tx.version < 2 then return false end
     if not consensus.sequence_locks_active(inp.sequence) then return false end
     local script_is_time = consensus.sequence_lock_is_time_based(script_sequence)
     local input_is_time = consensus.sequence_lock_is_time_based(inp.sequence)
