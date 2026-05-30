@@ -1171,16 +1171,33 @@ end
 --------------------------------------------------------------------------------
 
 --- Check if block's merkle root is correct.
+--
+-- Mirrors Core CheckMerkleRoot (validation.cpp:3837-3862): computes the
+-- block merkle root (with CVE-2012-2459 mutation detection) and rejects on
+-- EITHER a root mismatch (bad-txnmrklroot) OR a detected duplicate-tx
+-- malleation (bad-txns-duplicate, CVE-2012-2459). The mutation flag is set
+-- by crypto.compute_merkle_root when any complete adjacent pair at any level
+-- is bit-identical — Core treats that identically to an invalid root.
+--
 -- @param block block: The full block
--- @return boolean: true if valid
+-- @return boolean, string|nil: true if valid; false + reject reason otherwise
 function M.check_merkle_root(block)
   local tx_hashes = {}
   for i, tx in ipairs(block.transactions) do
     tx_hashes[i] = M.compute_txid(tx)
   end
 
-  local computed_root = crypto.compute_merkle_root(tx_hashes)
-  return types.hash256_eq(computed_root, block.header.merkle_root)
+  local computed_root, mutated = crypto.compute_merkle_root(tx_hashes)
+  if not types.hash256_eq(computed_root, block.header.merkle_root) then
+    return false, "bad-txnmrklroot"
+  end
+  -- CVE-2012-2459: a duplicate-tx malleation reproduces the SAME root, so the
+  -- mismatch check above passes; reject on the mutation flag (Core:
+  -- bad-txns-duplicate).
+  if mutated then
+    return false, "bad-txns-duplicate"
+  end
+  return true
 end
 
 --------------------------------------------------------------------------------
@@ -1420,8 +1437,11 @@ function M.check_block(block, network, height)
          "sigops cost " .. (total_sigops * consensus.WITNESS_SCALE_FACTOR) ..
          " exceeds maximum " .. consensus.MAX_BLOCK_SIGOPS_COST)
 
-  -- Verify merkle root
-  assert(M.check_merkle_root(block), "merkle root mismatch")
+  -- Verify merkle root (+ CVE-2012-2459 duplicate-tx malleation, Core
+  -- CheckMerkleRoot validation.cpp:3837-3862). check_merkle_root returns
+  -- false + the Core reject reason (bad-txnmrklroot / bad-txns-duplicate).
+  local merkle_ok, merkle_err = M.check_merkle_root(block)
+  assert(merkle_ok, merkle_err or "merkle root mismatch")
 
   -- Verify witness commitment / malleation (BIP-141, ContextualCheckBlock).
   -- Segwit is active when height >= network.segwit_height.
