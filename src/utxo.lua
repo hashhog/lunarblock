@@ -2419,27 +2419,31 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             verify_witness = height >= self.network.segwit_height,
             verify_nulldummy = height >= self.network.segwit_height,
             verify_taproot = height >= self.network.taproot_height,
-            -- CONST_SCRIPTCODE: reject legacy scripts where FindAndDelete would
-            -- mutate the scriptCode (SIG_FINDANDDELETE). The cache_flags block
-            -- below already accounts for this bit as "always enabled" in the
-            -- block-connect path; wire it into the actual flag table so the
-            -- Batch-A FindAndDelete reject (script.lua OP_CHECKSIG/MULTISIG
-            -- CONST_SCRIPTCODE guard) fires here too, not only in the
-            -- mempool/harness path. Without it the table silently dropped the
-            -- flag the interpreter consumes.
-            verify_const_scriptcode = true,
+            -- NOTE: verify_const_scriptcode is INTENTIONALLY NOT set here.
+            -- SCRIPT_VERIFY_CONST_SCRIPTCODE is a relay/standardness flag
+            -- (STANDARD_SCRIPT_VERIFY_FLAGS, Core policy/policy.h:129), NOT a
+            -- block-consensus flag. Core's GetBlockScriptFlags
+            -- (validation.cpp:2250-2289) only enables P2SH, WITNESS, TAPROOT
+            -- (always, modulo two historical exception blocks) plus DERSIG,
+            -- CLTV, CSV, NULLDUMMY when their deployment is active — exactly
+            -- the MANDATORY_SCRIPT_VERIFY_FLAGS set (policy.h:105-111). Setting
+            -- verify_const_scriptcode in the block-connect path OVER-FLAGS:
+            -- Core only returns SCRIPT_ERR_SIG_FINDANDDELETE when the flag is
+            -- set (interpreter.cpp:330-332, 1146-1148), so a legacy script
+            -- whose scriptCode contains the signature push is ACCEPTED by Core
+            -- during block connection but would be FALSE-REJECTED here. That is
+            -- a consensus divergence / chain-split risk. The flag belongs in
+            -- the mempool/relay path only (see mempool.lua), not here.
           }
 
           -- W160 BUG-9 fix: cache key must include ALL consensus script-verify
           -- flag bits, not a coarse height-bitmask. Core's SignatureCacheHasher
           -- (sigcache.cpp:39-50) mixes in the FULL `flags` integer. Collapsing
-          -- BIP34/66/65/CSV/WITNESS into 5 bits dropped TAPROOT, NULLDUMMY and
-          -- the implicit MANDATORY flag bits (LOW_S, NULLFAIL, STRICTENC,
-          -- MINIMALDATA, MINIMALIF, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE). A
-          -- cache entry that passed under verify_low_s=unset could be HIT by
-          -- a later strict-flag context and falsely-verify a high-S sig. We
-          -- derive cache_flags from the `flags` table above so the key
-          -- materially covers every consensus flag the verifier consumes.
+          -- BIP34/66/65/CSV/WITNESS into a few bits dropped TAPROOT and
+          -- NULLDUMMY. A cache entry that passed under a looser flag context
+          -- could be HIT by a later strict-flag context and falsely-verify a
+          -- bad sig. We derive cache_flags from the `flags` table above so the
+          -- key materially covers every consensus flag the verifier consumes.
           local cache_flags = 0
           if flags.verify_p2sh                then cache_flags = cache_flags +     1 end
           if flags.verify_dersig              then cache_flags = cache_flags +     2 end
@@ -2448,10 +2452,13 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           if flags.verify_witness             then cache_flags = cache_flags +    16 end
           if flags.verify_nulldummy           then cache_flags = cache_flags +    32 end
           if flags.verify_taproot             then cache_flags = cache_flags +    64 end
-          -- Mandatory consensus flags always enabled in block-connect path
-          -- (LOW_S, NULLFAIL, STRICTENC, MINIMALDATA, MINIMALIF,
-          -- WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE). Encoded as constant bits
-          -- so that any future toggle here forces a distinct cache key.
+          -- Constant namespace offset for the block-connect ("consensus")
+          -- verification context, distinguishing these cache entries from any
+          -- relay/standardness verification that runs the STANDARD flag set
+          -- (STRICTENC, LOW_S, NULLFAIL, MINIMALDATA, MINIMALIF,
+          -- WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE — see mempool.lua). NONE of
+          -- those are block-consensus flags (GetBlockScriptFlags omits them);
+          -- this is purely a cache-key namespace constant, not an enabled flag.
           cache_flags = cache_flags + 128 + 256 + 512 + 1024 + 2048 + 4096 + 8192
 
           -- W160 BUG-9 fix: cache key must use wtxid (witness-bearing) not
