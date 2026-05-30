@@ -1310,13 +1310,27 @@ end
 -- Merkle Root
 --------------------------------------------------------------------------------
 
--- Compute the merkle root from a list of transaction hashes
+-- Compute the merkle root from a list of transaction hashes.
+--
+-- Mirrors Bitcoin Core's ComputeMerkleRoot (consensus/merkle.cpp:46-63),
+-- including CVE-2012-2459 mutation detection. Returns:
+--   root     hash256 table (internal wire order)
+--   mutated  boolean: true iff at any level two ADJACENT hashes in a
+--            COMPLETE pair were bit-identical (the duplicate-tx malleation).
+--
+-- The scan happens at the TOP of each level-collapse iteration, BEFORE the
+-- odd-tail duplication, and only over complete pairs (pos+1 < size), exactly
+-- like Core. The lone trailing element of an odd level is therefore NOT
+-- compared at that level — once it is duplicated (`right = current[i] when
+-- nil`) it becomes an identical adjacent pair caught on the NEXT level's
+-- scan. Scanning before the odd-dup and over complete pairs only is what
+-- keeps honest odd-N blocks from false-rejecting.
 function M.compute_merkle_root(tx_hashes)
   if #tx_hashes == 0 then
-    return types.hash256_zero()
+    return types.hash256_zero(), false
   end
   if #tx_hashes == 1 then
-    return tx_hashes[1]
+    return tx_hashes[1], false
   end
 
   local current = {}
@@ -1324,7 +1338,18 @@ function M.compute_merkle_root(tx_hashes)
     current[#current + 1] = h.bytes
   end
 
+  local mutated = false
+
   while #current > 1 do
+    -- CVE-2012-2459 scan: BEFORE the odd-tail duplication, compare each
+    -- complete adjacent pair. The trailing lone element on an odd level is
+    -- excluded here (pos+1 must be in range) and caught on the next level.
+    for i = 1, #current - 1, 2 do
+      if current[i] == current[i + 1] then
+        mutated = true
+      end
+    end
+
     local next_level = {}
     for i = 1, #current, 2 do
       local left = current[i]
@@ -1334,7 +1359,7 @@ function M.compute_merkle_root(tx_hashes)
     current = next_level
   end
 
-  return types.hash256(current[1])
+  return types.hash256(current[1]), mutated
 end
 
 --------------------------------------------------------------------------------
