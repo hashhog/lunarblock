@@ -2880,7 +2880,12 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- itself more than subsidy + fees.  Error string matches Core's
   -- BLOCK_CONSENSUS reject reason ("bad-cb-amount") for diff-test parity.
   -- Per-output MoneyRange checks happen earlier in check_block.
-  local subsidy = consensus.get_block_subsidy(height)
+  -- Pass the network's subsidy halving interval so regtest (150-block interval,
+  -- Core kernel/chainparams.cpp:535) computes the correct cap; mainnet/testnet
+  -- have no field set and fall back to the 210000 default (Core GetBlockSubsidy
+  -- reads consensusParams.nSubsidyHalvingInterval per network).
+  local subsidy = consensus.get_block_subsidy(
+    height, self.network.subsidy_halving_interval)
   local coinbase_value = 0
   for _, out in ipairs(block.transactions[1].outputs) do
     coinbase_value = coinbase_value + out.value
