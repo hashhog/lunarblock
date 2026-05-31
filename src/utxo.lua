@@ -1622,6 +1622,33 @@ function ChainState:set_filterindex_enabled(enabled)
   self.filterindex_enabled = enabled and true or false
 end
 
+-- Read (and cache) the assumeUTXO snapshot base height persisted by
+-- HeaderChain:set_snapshot_base_height (sync.lua) under CF.META key
+-- "snapshot_base_height" as a u32 LE.  Returns the height, or nil for a
+-- genesis-synced / production node that never imported a snapshot.
+--
+-- Used by the BIP68 time-lock relaxation in connect_block: coins created
+-- within the first (MEDIAN_TIME_PAST_BLOCKS-1) blocks above the snapshot base
+-- have a truncated MTP window (the pre-base headers are absent by design), so
+-- their relative-TIME sequence lock cannot be recomputed exactly and is
+-- treated as trivially satisfied.  See validation.lua::calculate_sequence_locks.
+function ChainState:get_snapshot_base_height()
+  -- _snapshot_base_height: nil = not yet read; false = read, none present.
+  if self._snapshot_base_height == nil then
+    local data = self.storage.get(self.storage.CF.META, "snapshot_base_height")
+    if data and #data >= 4 then
+      local r = serialize.buffer_reader(data:sub(1, 4))
+      self._snapshot_base_height = r.read_u32le()
+    else
+      self._snapshot_base_height = false
+    end
+  end
+  if self._snapshot_base_height == false then
+    return nil
+  end
+  return self._snapshot_base_height
+end
+
 function ChainState:init()
   local hash, height = self.storage.get_chain_tip()
   if hash then
@@ -2362,9 +2389,15 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           return idx and utxo_cache[idx].height or nil
         end
 
-        -- Calculate and check sequence locks
+        -- Calculate and check sequence locks.  snapshot_base_height lets
+        -- calculate_sequence_locks relax the relative-TIME lock for coins in
+        -- the snapshot-frontier zone whose MTP window underflows the base
+        -- (the pre-base headers are absent on an assumeUTXO-bootstrapped node).
+        -- nil for genesis-synced / production nodes → no relaxation.
+        local snapshot_base_height = self:get_snapshot_base_height()
         local min_height, min_time = validation.calculate_sequence_locks(
-          tx, height, get_utxo_height, get_block_mtp, enforce_bip68
+          tx, height, get_utxo_height, get_block_mtp, enforce_bip68,
+          snapshot_base_height
         )
 
         assert(validation.check_sequence_locks(min_height, min_time, height, prev_block_mtp),
