@@ -1339,14 +1339,31 @@ function M.check_block_header(header, network, check_pow)
   network = network or consensus.networks.mainnet
   if check_pow == nil then check_pow = true end
 
-  -- Check timestamp not more than 2 hours in future (time-too-new).
-  -- Bitcoin Core chain.h:29, validation.cpp:4108-4110.
-  local current_time = os.time()
-  assert(header.timestamp <= current_time + consensus.MAX_FUTURE_BLOCK_TIME,
-         "time-too-new")
-
-  -- Check proof of work (Core fCheckPOW gate).
+  -- Check proof of work (Core fCheckPOW gate) and the wall-clock future-time
+  -- gate, BOTH under the check_pow flag.
+  --
+  -- Faithfulness note (Core structure): in Bitcoin Core, CheckBlockHeader
+  -- (validation.cpp:3828-3834) is context-free and checks ONLY proof of work;
+  -- the "time-too-new" 2-hour future-time gate is a CONTEXTUAL check that lives
+  -- in ContextualCheckBlockHeader (validation.cpp:4108-4110, chain.h:29) because
+  -- it depends on wall-clock time (NodeClock::now()), not on block bytes alone.
+  -- lunarblock enforces that contextual gate on the LIVE header-acceptance path
+  -- in sync.lua:1101-1107 (alongside the time-too-old MTP gate), exactly where
+  -- Core does. Keeping a second wall-clock copy in this context-free function is
+  -- a divergence from Core's CheckBlock structure AND makes the function
+  -- non-deterministic (a synthetic block re-validated by the differential
+  -- reject-bar harness with a deliberately-high "final" timestamp would trip
+  -- this gate and dead-gate every inner body check, e.g. BIP30). Gating it under
+  -- check_pow keeps the LIVE default IDENTICAL — every production caller omits
+  -- the flag, it defaults true, and the gate stays on (and is in any case
+  -- already enforced contextually in sync.lua) — while the harness's
+  -- check_pow=false makes the inner body gates LIVE, mirroring Core's own
+  -- fCheckPOW=false usage in the TestBlockValidity / re-validation paths where
+  -- the header's contextual preconditions were established upstream.
   if check_pow then
+    local current_time = os.time()
+    assert(header.timestamp <= current_time + consensus.MAX_FUTURE_BLOCK_TIME,
+           "time-too-new")
     assert(M.check_proof_of_work(header, network), "proof of work failed")
   end
 
