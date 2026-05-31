@@ -1324,8 +1324,20 @@ end
 -- @param header block_header: The block header
 -- @param network table: Network configuration
 -- @return boolean: true if valid
-function M.check_block_header(header, network)
+-- @param check_pow boolean|nil: when false, SKIP the proof-of-work assert.
+--   Mirrors Bitcoin Core CheckBlockHeader(block, state, params, fCheckPOW)
+--   (validation.cpp:3997): "if (fCheckPOW && !CheckProofOfWork(...))". Defaults
+--   to true so every existing caller (no 3rd arg) is unchanged — the live
+--   IBD / reorg / RPC paths all keep full PoW enforcement. fCheckPOW=false is
+--   used ONLY by the differential reject-bar harness, which re-serializes a
+--   real block after a structural mutation: the new header hash no longer meets
+--   the network target, so the unconditional PoW gate would short-circuit on a
+--   high-hash reject BEFORE the body gate under test runs (a dead-gate). This
+--   exactly parallels Core's own use of fCheckPOW=false in ContextualCheckBlock
+--   /TestBlockValidity-style paths where PoW was already established upstream.
+function M.check_block_header(header, network, check_pow)
   network = network or consensus.networks.mainnet
+  if check_pow == nil then check_pow = true end
 
   -- Check timestamp not more than 2 hours in future (time-too-new).
   -- Bitcoin Core chain.h:29, validation.cpp:4108-4110.
@@ -1333,8 +1345,10 @@ function M.check_block_header(header, network)
   assert(header.timestamp <= current_time + consensus.MAX_FUTURE_BLOCK_TIME,
          "time-too-new")
 
-  -- Check proof of work
-  assert(M.check_proof_of_work(header, network), "proof of work failed")
+  -- Check proof of work (Core fCheckPOW gate).
+  if check_pow then
+    assert(M.check_proof_of_work(header, network), "proof of work failed")
+  end
 
   return true
 end
@@ -1385,11 +1399,19 @@ end
 -- @param network table: Network configuration
 -- @param height number: Block height (optional, for BIP34 check)
 -- @return boolean: true if valid
-function M.check_block(block, network, height)
+-- @param check_pow boolean|nil: forwarded to check_block_header. Defaults to
+--   true (every existing positional caller passes (block, network, height) and
+--   is unchanged). See check_block_header for the fCheckPOW rationale — the
+--   differential reject-bar harness passes false so a structurally-mutated real
+--   block reaches the body gates (merkle / sigops / weight / coinbase) instead
+--   of being rejected on a high-hash header. Core: CheckBlock(block, state,
+--   params, fCheckPOW, fCheckMerkleRoot) validation.cpp:4017.
+function M.check_block(block, network, height, check_pow)
   network = network or consensus.networks.mainnet
+  if check_pow == nil then check_pow = true end
 
   -- Check header
-  M.check_block_header(block.header, network)
+  M.check_block_header(block.header, network, check_pow)
 
   -- Must have at least one transaction
   assert(#block.transactions > 0, "block has no transactions")
