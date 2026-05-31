@@ -1083,9 +1083,26 @@ function HeaderChain:accept_header(header, opts)
   end
 
   -- 4. Validate proof of work
-  local target = consensus.bits_to_target(header.bits)
-  if not consensus.hash_meets_target(hash.bytes, target) then
-    return false, "insufficient proof of work"
+  --
+  --    In Bitcoin Core the proof-of-work check is the context-free
+  --    CheckBlockHeader/CheckProofOfWork gate (validation.cpp:3831), SEPARATE
+  --    from ContextualCheckBlockHeader (which lunarblock mirrors in steps 5-6
+  --    below). lunarblock folds the hash<=target check into accept_header for
+  --    convenience. opts.skip_pow (when true) bypasses ONLY this folded PoW
+  --    check so a differential harness that already drove the strict
+  --    CheckProofOfWork twin (validation.check_proof_of_work, which ALSO
+  --    enforces target<=powLimit) up front can isolate a contextual gate
+  --    (bad-version / timewarp) on a header whose nonce was never mined —
+  --    otherwise step 4 would dead-gate the contextual check behind an
+  --    "insufficient proof of work" reject. Flag-gated and DEFAULT-PRESERVING:
+  --    every production caller omits skip_pow, so the live header-accept path
+  --    runs this check byte-identically. Mirrors Core's structural separation
+  --    of CheckBlockHeader (PoW) from ContextualCheckBlockHeader.
+  if not (opts and opts.skip_pow) then
+    local target = consensus.bits_to_target(header.bits)
+    if not consensus.hash_meets_target(hash.bytes, target) then
+      return false, "insufficient proof of work"
+    end
   end
 
   -- 5a. Check timestamp: must be > median time past of previous 11 blocks
@@ -1101,7 +1118,18 @@ function HeaderChain:accept_header(header, opts)
   -- 5b. Check timestamp: must not exceed wall-clock by MAX_FUTURE_BLOCK_TIME
   --     (time-too-new gate).
   --     Bitcoin Core validation.cpp:4108-4110 (chain.h:29).
-  local now = os.time()
+  --
+  --     The "now" reference is wall-clock (NodeClock::now() in Core). For
+  --     deterministic differential testing of this gate, opts.current_time
+  --     (when provided, non-nil) overrides os.time(). This is flag-gated and
+  --     DEFAULT-PRESERVING: every production caller (process_headers,
+  --     try_low_work_sync, the {min_pow_checked=true} reconnect path) omits
+  --     current_time, so the live path uses os.time() byte-identically. Only
+  --     the header-reject differential harness injects a fixed clock so the
+  --     7200s future-time boundary (==now+7200 accept, +7201 reject) is
+  --     reproducible. Mirrors Core passing a controllable adjusted-time in its
+  --     ContextualCheckBlockHeader unit tests.
+  local now = (opts and opts.current_time) or os.time()
   if header.timestamp > now + consensus.MAX_FUTURE_BLOCK_TIME then
     return false, "time-too-new"
   end
@@ -1166,11 +1194,23 @@ function HeaderChain:accept_header(header, opts)
   --     activated (bad-version gate).
   --     Bitcoin Core validation.cpp:4113-4118.
   --
-  --     height-1 is pindexPrev; the network table stores the activation heights
-  --     matching DeploymentActiveAfter(pindexPrev, ...).  "ActiveAfter(prev)"
-  --     means the rule is active starting at the block AFTER prev, i.e. when
-  --     the new block's height > activation_height.  Use (height - 1) >=
-  --     activation_height to mirror Core's DeploymentActiveAfter semantics.
+  --     Core: `block.nVersion < N && DeploymentActiveAfter(pindexPrev, ...)`.
+  --     DeploymentActiveAfter(pindexPrev) for a buried deployment is
+  --     `(pindexPrev->nHeight + 1) >= DeploymentHeight` (deploymentstatus.h:17).
+  --     pindexPrev->nHeight + 1 is the block's OWN height, so the gate fires for
+  --     a block at height >= activation_height — INCLUDING the activation height
+  --     itself. The network table stores the activation heights as
+  --     DeploymentHeight, so the correct comparison is `height >=
+  --     activation_height`, NOT `(height - 1) >= activation_height`.
+  --
+  --     [FIX] The previous `(height - 1) >= activation_height` was OFF BY ONE:
+  --     it under-enforced by exactly one block, ACCEPTING an outdated-version
+  --     header AT the soft-fork activation height that Core REJECTS (e.g. a v1
+  --     header at the BIP34 activation height 227931). This is a real
+  --     false-accept (header-level difficulty/version-mandate bypass at the
+  --     boundary). The boundary-just-below case (height == activation-1) still
+  --     ACCEPTS under both forms, so the fix introduces no false-reject. Faithful
+  --     to Core deploymentstatus.h:17 DeploymentActiveAfter(pindexPrev).
   --
   --     nVersion < 2  after HEIGHTINCB (BIP34) activation
   --     nVersion < 3  after DERSIG     (BIP66) activation
@@ -1178,17 +1218,17 @@ function HeaderChain:accept_header(header, opts)
   local net = self.network
   if header.version < 2
     and net.bip34_height
-    and (height - 1) >= net.bip34_height then
+    and height >= net.bip34_height then
     return false, string.format("bad-version(0x%08x)", header.version)
   end
   if header.version < 3
     and net.bip66_height
-    and (height - 1) >= net.bip66_height then
+    and height >= net.bip66_height then
     return false, string.format("bad-version(0x%08x)", header.version)
   end
   if header.version < 4
     and net.bip65_height
-    and (height - 1) >= net.bip65_height then
+    and height >= net.bip65_height then
     return false, string.format("bad-version(0x%08x)", header.version)
   end
 
