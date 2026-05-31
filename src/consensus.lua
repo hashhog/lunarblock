@@ -47,8 +47,20 @@ M.MAX_TIMEWARP = 600   -- 600 seconds
 M.INITIAL_BLOCK_REWARD = 5000000000  -- 50 BTC
 M.HALVING_INTERVAL = 210000
 
-function M.get_block_subsidy(height)
-  local halvings = math.floor(height / M.HALVING_INTERVAL)
+-- @param height number: block height
+-- @param halving_interval number|nil: subsidy halving interval. Defaults to
+--   M.HALVING_INTERVAL (210000) so every existing caller (mainnet/testnet,
+--   which all use 210000) is UNCHANGED. Bitcoin Core's GetBlockSubsidy
+--   (validation.cpp:1832) reads consensusParams.nSubsidyHalvingInterval, which
+--   is 210000 for mainnet/testnet3/testnet4/signet but **150 for regtest**
+--   (kernel/chainparams.cpp:535). Hardcoding 210000 made every regtest block
+--   below height 210000 over-pay-tolerant: a coinbase claiming up to the
+--   un-halved 50 BTC was ACCEPTED where Core (150-block interval) rejects it as
+--   bad-cb-amount. Callers that know the network (connect_block's coinbase cap)
+--   pass network.subsidy_halving_interval; height-only callers keep 210000.
+function M.get_block_subsidy(height, halving_interval)
+  local interval = halving_interval or M.HALVING_INTERVAL
+  local halvings = math.floor(height / interval)
   if halvings >= 64 then return 0 end
   local subsidy = M.INITIAL_BLOCK_REWARD
   for _ = 1, halvings do
@@ -1156,6 +1168,12 @@ M.networks.testnet4 = {
 -- Regtest
 M.networks.regtest = {
   name = "regtest",
+  -- Bitcoin Core kernel/chainparams.cpp:535: regtest halves the subsidy every
+  -- 150 blocks (NOT 210000 like mainnet/testnet). Drives get_block_subsidy via
+  -- connect_block's bad-cb-amount coinbase cap so regtest coinbase amounts
+  -- match Core. Absent on the other network tables => they fall back to the
+  -- 210000 M.HALVING_INTERVAL default (unchanged).
+  subsidy_halving_interval = 150,
   magic_bytes = "\xfa\xbf\xb5\xda",
   port = 18444,
   rpc_port = 18443,
