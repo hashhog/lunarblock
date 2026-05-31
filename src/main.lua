@@ -613,8 +613,62 @@ local function run_import_utxo(args)
   local cs = utxo_mod.new_chain_state(db, network)
   cs:init()
 
+  -- Peek the 51-byte snapshot metadata header BEFORE loading so we can
+  -- resolve the snapshot's base height from the assumeutxo table and pass
+  -- it to load_snapshot as base_height.  Without this, load_snapshot's
+  -- per-coin height guard (Core validation.cpp:5814-5819 "Bad snapshot data
+  -- after deserializing N coins") used effective_base_height = tip_height,
+  -- which is 0 immediately after connect_genesis() on a fresh datadir.
+  -- Every snapshot coin from a block > 0 then failed the guard, so the load
+  -- aborted with "Bad snapshot data after deserializing 0 coins" on the very
+  -- first coin.  We resolve the height here (the loaded-after lookup at the
+  -- bottom of this function did the same thing, just too late to help the
+  -- guard) and feed it in.
+  local pre_base_height = nil
+  do
+    local hf = io.open(args.import_utxo, "rb")
+    if not hf then
+      db.close()
+      io.stderr:write("import-utxo FAILED: cannot open snapshot file: "
+        .. tostring(args.import_utxo) .. "\n")
+      os.exit(1)
+    end
+    local header = hf:read(51)
+    hf:close()
+    if not header or #header < 51 then
+      db.close()
+      io.stderr:write("import-utxo FAILED: cannot read snapshot header\n")
+      os.exit(1)
+    end
+    local meta, meta_err = utxo_mod.deserialize_snapshot_metadata(header)
+    if not meta then
+      db.close()
+      io.stderr:write("import-utxo FAILED: " .. tostring(meta_err) .. "\n")
+      os.exit(1)
+    end
+    local base_hex = types.hash256_hex(meta.base_blockhash)
+    local _au_data, _au_height =
+      consensus_mod.assumeutxo_for_blockhash(network, base_hex)
+    if _au_height then
+      pre_base_height = _au_height
+      print(string.format(
+        "import-utxo: base block %s -> assumeutxo height %d",
+        base_hex, _au_height))
+    else
+      -- No assumeutxo entry for this base block.  We still attempt the load,
+      -- but warn loudly: the per-coin height guard will reject the snapshot
+      -- because effective_base_height falls back to the genesis tip (0).
+      io.stderr:write(string.format(
+        "import-utxo WARNING: no assumeutxo entry for base block %s; "
+        .. "per-coin height guard will reject coins from blocks > 0\n",
+        base_hex))
+    end
+  end
+
   local t0 = os.time()
-  local ok, err = cs:load_snapshot(args.import_utxo)
+  -- Pass base_height so the per-coin height guard uses the true snapshot
+  -- height instead of the fresh-datadir genesis tip (0).
+  local ok, err = cs:load_snapshot(args.import_utxo, nil, pre_base_height)
   local elapsed = os.time() - t0
 
   if not ok then
@@ -888,6 +942,70 @@ local function main()
     header_chain.header_tip_height,
     header_chain.header_tip_hash and types.hash256_hex(header_chain.header_tip_hash) or "none"
   ))
+
+  -- AssumeUTXO snapshot forward-sync: inject the snapshot base block-index.
+  --
+  -- After a fresh `--import-utxo`, the chainstate tip is the snapshot base
+  -- (e.g. mainnet 944183) but the header chain only has genesis, because the
+  -- snapshot file does not carry the base block's header.  Without a
+  -- connectable base block-index the node cannot forward-sync past the base:
+  -- it would have to re-download every header from genesis, and even then the
+  -- post-snapshot blocks hit the 3-layer stall (chainwork below min /
+  -- parent-not-found / empty MTP window) documented in
+  -- sync.lua::inject_snapshot_base.
+  --
+  -- We detect the condition (chainstate tip is a known assumeutxo base AND the
+  -- header chain sits below it) and inject a connectable base block-index from
+  -- the assumeutxo entry's `header` + `chain_work` fields.  Forward-sync then
+  -- starts directly from the base (Core's assumeUTXO model; mirrors nimrod's
+  -- header-persist approach).  This touches ONLY the forward path — the base
+  -- is only ever extended upward and never participates in reorg.
+  if chain_state.tip_hash and (chain_state.tip_height or -1) > (header_chain.header_tip_height or -1) then
+    local tip_hex = types.hash256_hex(chain_state.tip_hash)
+    local au_data, au_height = consensus_mod.assumeutxo_for_blockhash(network, tip_hex)
+    if au_data and au_height and au_data.header and au_data.chain_work then
+      local hdr = au_data.header
+      local base_header = types.block_header(
+        hdr.version,
+        types.hash256_from_hex(hdr.prev_hash),
+        types.hash256_from_hex(hdr.merkle_root),
+        hdr.timestamp,
+        hdr.bits,
+        hdr.nonce
+      )
+      -- Sanity: the reconstructed header must hash to the snapshot base block
+      -- hash. A mismatch means the assumeutxo `header` fields are wrong; we
+      -- refuse to inject a forged base block-index rather than poison the
+      -- header chain.
+      local computed_hex = types.hash256_hex(validation.compute_block_hash(base_header))
+      if computed_hex ~= tip_hex then
+        io.stderr:write(string.format(
+          "[assumeutxo] WARNING: base header for height %d hashes to %s, expected %s; "
+          .. "NOT injecting base block-index (header chain will sync from genesis)\n",
+          au_height, computed_hex, tip_hex))
+      else
+        local base_work = consensus_mod.work_float_from_hex(au_data.chain_work)
+        local injected, why = header_chain:inject_snapshot_base(
+          au_height, chain_state.tip_hash, base_header, base_work)
+        if injected then
+          io.stdout:write(string.format(
+            "[assumeutxo] injected snapshot base block-index: height=%d hash=%s "
+            .. "chain_work=%s -> header chain forward-syncs from base\n",
+            au_height, tip_hex, au_data.chain_work))
+          io.stdout:flush()
+          -- Keep peer_manager's advertised height in sync with the new header
+          -- tip (set later from header_chain.header_tip_height, but make the
+          -- intent explicit here for clarity).
+          print(string.format("Header tip advanced to snapshot base: height=%d", au_height))
+        else
+          io.stdout:write(string.format(
+            "[assumeutxo] base block-index NOT injected (%s); height=%d\n",
+            tostring(why), au_height))
+          io.stdout:flush()
+        end
+      end
+    end
+  end
 
   -- --reindex (full): Bitcoin Core re-reads every blk*.dat file from disk
   -- and rebuilds BOTH the block index AND the chainstate (init.cpp
@@ -1212,7 +1330,10 @@ local function main()
   -- Initialize peer manager
   local peer_manager = peerman_mod.new(network, db, {
     maxpeers = args.maxpeers,
-    max_outbound = (args.maxpeers == 0) and 0 or 8,
+    -- Core-semantic --connect: pin to ONLY the given peer, no auto-outbound
+    -- fill (the block-downloader can stall on flaky DNS peers; a single
+    -- reliable pinned peer avoids that).
+    max_outbound = (args.connect and 0) or ((args.maxpeers == 0) and 0 or 8),
     nov2transport = args.nov2transport,
     peerbloomfilters = args.peerbloomfilters,
     -- BIP-159: when prune mode is enabled, peers see NODE_NETWORK_LIMITED
@@ -1252,12 +1373,16 @@ local function main()
   -- causing all peers to be banned — now fixed).
   peer_manager.banned = {}
 
-  -- Bootstrap: connect to local Bitcoin Core directly
-  local bootstrap_ok, bootstrap_err = peer_manager:connect_peer("127.0.0.1", 48332, true)
-  if bootstrap_ok then
-    print("Bootstrap: connected to Bitcoin Core at 127.0.0.1:48332")
-  else
-    print("Bootstrap: failed to connect to Bitcoin Core: " .. tostring(bootstrap_err))
+  -- Legacy dev bootstrap: connect to a local Bitcoin Core directly. The
+  -- 127.0.0.1:48332 target is a stale dev default (fails everywhere else), and
+  -- when --connect is given that pins the real peer below, so skip this.
+  if not args.connect then
+    local bootstrap_ok, bootstrap_err = peer_manager:connect_peer("127.0.0.1", 48332, true)
+    if bootstrap_ok then
+      print("Bootstrap: connected to Bitcoin Core at 127.0.0.1:48332")
+    else
+      print("Bootstrap: failed to connect to Bitcoin Core: " .. tostring(bootstrap_err))
+    end
   end
 
   -- Register P2P message handlers
@@ -2096,7 +2221,25 @@ local function main()
   if args.connect then
     local ip, port_str = args.connect:match("^([^:]+):?(%d*)$")
     local connect_port = tonumber(port_str) or network.port
-    peer_manager:connect_peer(ip, connect_port)
+    -- Register in manual_peers BEFORE the initial connect so the tick-level
+    -- _reconnect_manual_peers() keeps the pin alive after any disconnect.
+    -- With max_outbound forced to 0 (Core -connect semantics) the maintain
+    -- loop opens NO outbound peers, so this is the only mechanism that
+    -- re-establishes the pin if it drops (e.g. a transient handshake/headers
+    -- hiccup) — without it the node falls to Peers:0 permanently and the body
+    -- gap never downloads.  Same entry shape the addnode RPC uses.
+    local key = ip .. ":" .. connect_port
+    peer_manager.manual_peers[key] = {
+      ip = ip,
+      port = connect_port,
+      use_v2_override = nil,
+      last_try = 0,
+      attempts = 0,
+      success_count = 0,
+    }
+    -- Manual, diversity-exempt, eviction-protected pin (Core -connect
+    -- semantics): with max_outbound forced to 0 above, this is the ONLY peer.
+    peer_manager:connect_peer(ip, connect_port, true, nil, true)
   end
 
   -- Start P2P listener

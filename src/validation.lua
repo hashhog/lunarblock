@@ -1501,8 +1501,11 @@ end
 -- @param get_utxo_height function(inp) -> number: Returns the height where each input's UTXO was confirmed
 -- @param get_block_mtp function(height) -> number: Returns the MTP of the block at given height
 -- @param enforce_bip68 boolean: Whether BIP68 is active at this height
+-- @param snapshot_base_height number|nil: assumeUTXO snapshot base height, or
+--        nil for a genesis-synced / production node.  See the BIP68 time-lock
+--        relaxation note below.
 -- @return number, number: min_height (last invalid), min_time (last invalid)
-function M.calculate_sequence_locks(tx, height, get_utxo_height, get_block_mtp, enforce_bip68)
+function M.calculate_sequence_locks(tx, height, get_utxo_height, get_block_mtp, enforce_bip68, snapshot_base_height)
   -- Initialize to -1: "last invalid" semantics means -1 allows any height/time
   local min_height = -1
   local min_time = -1
@@ -1524,12 +1527,45 @@ function M.calculate_sequence_locks(tx, height, get_utxo_height, get_block_mtp, 
       -- Check type flag (bit 22): time-based or height-based
       if bit.band(seq, consensus.SEQUENCE_LOCKTIME_TYPE_FLAG) ~= 0 then
         -- Time-based lock
-        -- Get MTP of the block BEFORE the one containing the UTXO
-        local coin_time = get_block_mtp(math.max(coin_height - 1, 0))
-        -- Lock value in 512-second units, convert to seconds, apply "last invalid" adjustment
-        local lock_value = bit.band(seq, consensus.SEQUENCE_LOCKTIME_MASK)
-        local lock_seconds = bit.lshift(lock_value, consensus.SEQUENCE_LOCKTIME_GRANULARITY)
-        min_time = math.max(min_time, coin_time + lock_seconds - 1)
+        -- Core (tx_verify.cpp:74) uses GetMedianTimePast of the block PRIOR to
+        -- the coin's height, i.e. the 11-block MTP window ending at
+        -- (coin_height-1) → heights [coin_height-11 .. coin_height-1].
+        --
+        -- SNAPSHOT-BOOTSTRAP RELAXATION: an assumeUTXO-bootstrapped node only
+        -- has block headers from the snapshot base forward; the (up to 10)
+        -- pre-base headers are absent by design.  For a coin created within the
+        -- first 10 blocks above the base, that MTP window is *truncated* — the
+        -- median is computed over fewer than 11 timestamps and is biased
+        -- upward (the oldest/smallest timestamps are missing), yielding a
+        -- min_time that is seconds-too-high and a FALSE BIP68 time-lock reject
+        -- (observed: tx 3f0cdb03… at h948465, coin@944193, base 944183 →
+        -- window dipped to 944182 which is below the base → min_time 41s high →
+        -- 17s over the block MTP → false reject of a block Core accepts).
+        --
+        -- These snapshot-frontier coins sit at/just above the assumeUTXO base,
+        -- which is below nMinimumChainWork and is effectively assumevalid, so
+        -- their exact relative TIME lock is not recomputable from the
+        -- forward-synced header set.  Treat such an input's time-lock as
+        -- trivially satisfied (skip it).  This is gated strictly on
+        -- snapshot_base_height being set AND the coin being inside the
+        -- truncation zone, so genesis-synced and production nodes (where the
+        -- full pre-coin header window is present) are unaffected, and only the
+        -- relative-TIME lock is relaxed — the relative-HEIGHT lock below is
+        -- always computed exactly from the snapshot-preserved coin height.
+        --
+        -- Truncation zone: window underflows the base iff
+        --   (coin_height-1) - (MEDIAN_TIME_PAST_BLOCKS-1) < snapshot_base_height
+        --   ⇔ coin_height <= snapshot_base_height + (MEDIAN_TIME_PAST_BLOCKS-1)
+        local truncated = snapshot_base_height
+          and coin_height <= snapshot_base_height + (consensus.MEDIAN_TIME_PAST_BLOCKS - 1)
+        if not truncated then
+          -- Get MTP of the block BEFORE the one containing the UTXO
+          local coin_time = get_block_mtp(math.max(coin_height - 1, 0))
+          -- Lock value in 512-second units, convert to seconds, apply "last invalid" adjustment
+          local lock_value = bit.band(seq, consensus.SEQUENCE_LOCKTIME_MASK)
+          local lock_seconds = bit.lshift(lock_value, consensus.SEQUENCE_LOCKTIME_GRANULARITY)
+          min_time = math.max(min_time, coin_time + lock_seconds - 1)
+        end
       else
         -- Height-based lock
         local lock_value = bit.band(seq, consensus.SEQUENCE_LOCKTIME_MASK)

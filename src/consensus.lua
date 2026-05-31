@@ -978,7 +978,34 @@ M.networks.mainnet = {
     [944183] = {
       hash_serialized = "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8",
       m_chain_tx_count = 1334000000,
-      blockhash = "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
+      blockhash = "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
+      -- Snapshot forward-sync base block-index (Core assumeUTXO model).
+      -- The snapshot file (utxo-snapshot-raw.dat) carries only the UTXO set
+      -- plus a 51-byte metadata header (magic + base_blockhash + coins_count)
+      -- — it does NOT carry the base block's *header*.  Without the header,
+      -- a fresh `--import-utxo` leaves the header chain empty (genesis only),
+      -- the base 944183 absent from the connectable block index, and the
+      -- post-snapshot MTP window unable to reach the base.  These fields let
+      -- main.lua inject a connectable base block-index at startup so the node
+      -- forward-syncs from 944183 instead of re-downloading every header from
+      -- genesis (which is what triggered the 3-layer stall at ~944184).
+      --
+      -- Header fields verified against bitcoind getblockheader 944183: the
+      -- six fields below recompute to `blockhash` above (see test, 2026-05-30).
+      -- chain_work is the *cumulative* work at 944183 (Core pindex->nChainWork,
+      -- uint256.ToString big-endian display order).  As a float (lunarblock's
+      -- HeaderChain.total_work representation) this is ~8.848e+28, well above
+      -- mainnet min_chain_work (~4.217e+28), so LAYER-1 header batches built
+      -- on top of the base clear the too-little-chainwork gate.
+      header = {
+        version    = 537247744,                                                          -- 0x2005c000
+        prev_hash  = "00000000000000000000d6e603dff7e37cffedb78c4d090436cc428e956a6904",  -- 944182
+        merkle_root = "0fb2e4c1582eea56eb68c2196b762237341119764c562a003711a14e72cf6ba8",
+        timestamp  = 1775651930,
+        bits       = 0x17020684,
+        nonce      = 2918950304,
+      },
+      chain_work = "00000000000000000000000000000000000000011de68a167d5dad115a96be80",
     }
   }
 }
@@ -1415,6 +1442,25 @@ end
 -- @return string: 32-byte zero value
 function M.work_zero()
   return string.rep("\0", 32)
+end
+
+--- Convert a cumulative-chainwork hex string (uint256 big-endian display
+-- order) to the floating-point value used by HeaderChain.total_work.
+-- This mirrors the float representation produced by HeaderChain:work_for_bits
+-- so an injected snapshot-base total_work is comparable with subsequently
+-- accumulated header work.  Used only for the AssumeUTXO snapshot-base
+-- block-index injection (forward-sync); not on any consensus hot path.
+-- @param hex string: 64-character hex string (big-endian)
+-- @return number: float approximation of the 256-bit work value
+function M.work_float_from_hex(hex)
+  if #hex ~= 64 then
+    error("work hex must be 64 characters")
+  end
+  local v = 0.0
+  for i = 1, 64, 2 do
+    v = v * 256.0 + tonumber(hex:sub(i, i + 1), 16)
+  end
+  return v
 end
 
 --------------------------------------------------------------------------------

@@ -688,6 +688,9 @@ end
 
 --- Initialize the header chain from storage or genesis.
 function HeaderChain:init()
+  -- Recover the snapshot base height (if this datadir was snapshot-bootstrapped)
+  -- so the first-retarget-above-base diffbits relaxation survives restarts.
+  self.snapshot_base_height = self:get_snapshot_base_height()
   -- Check if we have a stored header tip (separate from chain tip!)
   io.stdout:write("  Checking header tip...\n"); io.stdout:flush()
   local tip_hash, tip_height = self:get_header_tip()
@@ -877,6 +880,121 @@ function HeaderChain:add_genesis()
 end
 
 --------------------------------------------------------------------------------
+-- Snapshot base block-index injection (Core assumeUTXO forward-sync)
+--------------------------------------------------------------------------------
+
+--- Inject a snapshot base block-index so the header chain can forward-sync
+-- from the snapshot base instead of re-downloading every header from genesis.
+--
+-- The AssumeUTXO snapshot file carries the UTXO set but NOT the base block's
+-- header (its 51-byte metadata is just magic + base_blockhash + coins_count).
+-- After a fresh `--import-utxo`, the chainstate tip is the base height but the
+-- header chain has only genesis.  Three things break (the "3-layer" stall):
+--
+--   LAYER 1 (chainwork): a base entry with total_work derived only from
+--     genesis is ~2^20, so post-snapshot header batches stay below
+--     min_chain_work and get rejected ("too-little-chainwork") / peers banned.
+--   LAYER 2 (base block-index): block base+1's parent (the base) is absent
+--     from the connectable block index, so the body request loop (which only
+--     requests heights <= header_tip_height and looks the hash up in
+--     height_to_hash) never reaches it, and connect_block / MTP can't resolve
+--     the parent header.
+--   LAYER 3 (MTP window): the first ~11 post-snapshot blocks have an
+--     11-block median-time-past window reaching below the un-indexed base;
+--     compute_mtp_from_storage breaks early and returns nothing.
+--
+-- Injecting a connectable base block-index fixes all three:
+--   * LAYER 1: total_work is seeded with the base's REAL cumulative chainwork
+--     (passed in as a float from the assumeutxo entry's chain_work), which is
+--     by construction above min_chain_work — so header batches built on the
+--     base clear the gate (Core: a snapshot node is past nMinimumChainWork).
+--   * LAYER 2: the base header is written to storage (put_header) and to the
+--     in-memory headers/height_to_hash maps, and becomes header_tip — so the
+--     download loop requests base+1 immediately and connect_block resolves the
+--     parent.
+--   * LAYER 3: with the base header in storage, compute_mtp_from_storage walks
+--     down to the base and uses the base TIMESTAMP as the MTP proxy for the
+--     incomplete window, until it fills with real post-base timestamps.
+--
+-- Idempotent: a no-op if the base is already present (e.g. on a restart where
+-- the header chain has already been persisted past the base).  Only ever
+-- extends the header chain UP from the base — it never touches blocks below
+-- the base, and never participates in reorg.
+--
+-- @param base_height number: snapshot base height
+-- @param base_hash hash256: snapshot base block hash
+-- @param header table: base block header (types.block_header)
+-- @param total_work number: base cumulative chainwork as a float
+-- @return boolean, string|nil: true if injected, false + reason otherwise
+function HeaderChain:inject_snapshot_base(base_height, base_hash, header, total_work)
+  local hash_hex = types.hash256_hex(base_hash)
+
+  -- Idempotence: already indexed (restart where headers persisted past base).
+  if self.headers[hash_hex] then
+    return false, "base already indexed"
+  end
+
+  -- Only inject FORWARD: if the header chain is already at/above the base
+  -- height (genuine genesis-synced header chain that reached the base), do
+  -- nothing — that path already has the full ancestry and is strictly better.
+  if (self.header_tip_height or -1) >= base_height then
+    return false, "header tip already at/above base"
+  end
+
+  self.headers[hash_hex] = {
+    header = header,
+    height = base_height,
+    total_work = total_work,
+  }
+  self.height_to_hash[base_height] = hash_hex
+  self.header_tip_hash = base_hash
+  self.header_tip_height = base_height
+
+  -- Record the snapshot base height so the difficulty check can detect when a
+  -- retarget's "first block of the prior period" ancestor (boundary - 2016)
+  -- falls BELOW the base and is therefore un-indexed.  In a snapshot-bootstrap
+  -- node we only forward-sync headers from the base up; the pre-base headers
+  -- are never downloaded, so the very first retarget boundary above the base
+  -- cannot be recomputed locally (Core, by contrast, holds the full genesis->
+  -- tip header chain and always has the ancestor).  At that single boundary we
+  -- trust the peer's declared bits — the snapshot base is already past
+  -- min_chain_work (effectively assumevalid), so its sub-chain difficulty is
+  -- accepted as authoritative.  See the difficulty-check step (bad-diffbits).
+  self.snapshot_base_height = base_height
+  -- Persist for restart: a restarted snapshot node loads only base..tip from
+  -- storage (the backward walk stops at the base where get_header returns nil),
+  -- so it must read the base height back to keep relaxing that first boundary.
+  self:set_snapshot_base_height(base_height)
+
+  -- Persist the base header + height-index row so it survives restart and so
+  -- compute_mtp_from_storage / connect_block can resolve it from storage.
+  self.storage.put_header(base_hash, header)
+  self.storage.put_height_index(base_height, base_hash)
+  self:set_header_tip(base_hash, base_height, true)
+
+  return true
+end
+
+--- Persist the snapshot base height to META storage.
+-- @param height number: snapshot base height
+function HeaderChain:set_snapshot_base_height(height)
+  local w = serialize.buffer_writer()
+  w.write_u32le(height)
+  self.storage.put(self.storage.CF.META, "snapshot_base_height", w.result(), true)
+end
+
+--- Read the persisted snapshot base height from META storage.
+-- @return number|nil: snapshot base height, or nil if never bootstrapped
+function HeaderChain:get_snapshot_base_height()
+  local data = self.storage.get(self.storage.CF.META, "snapshot_base_height")
+  if not data or #data < 4 then
+    return nil
+  end
+  local r = serialize.buffer_reader(data:sub(1, 4))
+  return r.read_u32le()
+end
+
+--------------------------------------------------------------------------------
 -- Work Calculation
 --------------------------------------------------------------------------------
 
@@ -1003,19 +1121,45 @@ function HeaderChain:accept_header(header, opts)
   -- 6. Check difficulty target using consensus.get_next_work_required
   -- This handles mainnet, testnet3 walk-back, BIP94/testnet4, and regtest
   local chain = self
-  local expected_bits = consensus.get_next_work_required(
-    height,
-    header.timestamp,
-    self.network,
-    function(h)
-      local hex = chain.height_to_hash[h]
-      if hex then return chain.headers[hex] end
-      return nil
+
+  -- Snapshot-bootstrap relaxation: at the FIRST retarget boundary above the
+  -- snapshot base, the "first block of the prior period" ancestor
+  -- (boundary - 2016) lies BELOW the base and was never downloaded (we only
+  -- forward-sync headers up from the base).  get_next_work_required cannot
+  -- recompute the retarget without it and silently falls back to prev.nBits,
+  -- which then fails to match the peer's correct (higher-difficulty) bits and
+  -- wedges the header chain one block short of the boundary (observed:
+  -- "bad-diffbits expected 0x17020684 got 0x17021369" at h=945504 with base
+  -- 944183).  A snapshot node is past min_chain_work (effectively assumevalid
+  -- below the base), so we trust the peer's declared bits at exactly this
+  -- boundary.  This affects only the single first boundary above the base; all
+  -- later retargets have their full 2016-ancestor window within the synced
+  -- range and are recomputed normally.  Core never hits this because it holds
+  -- the full genesis->tip header chain regardless of the UTXO snapshot.
+  local interval = consensus.DIFFICULTY_ADJUSTMENT_INTERVAL
+  local skip_diffbits = false
+  if chain.snapshot_base_height
+     and not self.network.pow_no_retarget
+     and height % interval == 0
+     and (height - interval) < chain.snapshot_base_height then
+    skip_diffbits = true
+  end
+
+  if not skip_diffbits then
+    local expected_bits = consensus.get_next_work_required(
+      height,
+      header.timestamp,
+      self.network,
+      function(h)
+        local hex = chain.height_to_hash[h]
+        if hex then return chain.headers[hex] end
+        return nil
+      end
+    )
+    if header.bits ~= expected_bits then
+      return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
+        expected_bits, header.bits)
     end
-  )
-  if header.bits ~= expected_bits then
-    return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
-      expected_bits, header.bits)
   end
 
   -- 6b. Reject outdated block versions once the corresponding soft fork has
