@@ -572,6 +572,20 @@ local function _to_u64(v)
   return ffi.cast(u64_t, v)
 end
 
+-- Hoisted cdata constants for the rare exact-tail of read_corevarint (see
+-- below).  Allocated once at module load, NOT per byte, so the exact path
+-- adds no per-call boxing of these literals.
+local U64_VARINT_GUARD = u64_t(0x01FFFFFFFFFFFFFFULL)  -- UINT64_MAX >> 7
+local U64_128 = u64_t(128)
+local U64_1 = u64_t(1)
+-- Largest accumulator value for which (n*128 + 127 + 1) is still < 2^53 and
+-- therefore exact in a Lua double: floor((2^53 - 128) / 128) = 70368744177663.
+-- While the running varint accumulator stays below this, plain-Lua-number
+-- arithmetic is bit-for-bit exact; once it could cross into the lossy band we
+-- hand the (still-exact) accumulator to an exact cdata tail.
+local VARINT_LOSSY_THRESHOLD = 70368744177663
+local VARINT_GUARD_NUM = 144115188075855871  -- 0x01FFFFFFFFFFFFFF as a number
+
 --- Write a Core VARINT (MSB base-128 with -1 carry).
 -- @param w buffer_writer
 -- @param val number|cdata: non-negative integer in uint64 range
@@ -599,11 +613,57 @@ function M.write_corevarint(w, val)
   end
 end
 
---- Read a Core VARINT.
+-- Exact cdata tail for read_corevarint.  Only entered for the rare adversarial
+-- case where the running accumulator would cross out of the 53-bit-exact band
+-- (i.e. a varint encoding a value above ~2^53 — far outside any legitimate
+-- snapshot field, which are all <= MAX_MONEY = 2.1e15 < 2^53).  Continues the
+-- ReadVarInt loop in 64-bit cdata arithmetic so the overflow guard's
+-- accept/reject decision and the decoded value stay BIT-FOR-BIT identical to
+-- the pre-perf-fix all-cdata implementation across the full uint64 range.
 -- @param r buffer_reader
+-- @param n_double number: accumulator so far (guaranteed exact, < 2^53)
+-- @param guard number: iteration count already consumed
+-- @param b number: the byte to process first (guard for it already checked)
 -- @return cdata uint64_t
+local function _read_corevarint_exact_tail(r, n_double, guard, b)
+  local n = U64_1 * 0 + n_double  -- exact promotion of the (still-exact) double
+  while true do
+    -- size check matching ReadVarInt:
+    -- if (n > (UINT64_MAX >> 7)) throw "size too large".  UINT64_MAX >> 7
+    -- == 0x01FFFFFFFFFFFFFF.  The guard for the FIRST byte handled here was
+    -- already evaluated by the caller (numeric, on the same exact n), so this
+    -- check is redundant-but-identical on the first pass.
+    if n > U64_VARINT_GUARD then
+      error("read_corevarint: size too large")
+    end
+    n = (n * U64_128) + u64_t(b % 128)  -- band 0x7F
+    if b >= 0x80 then
+      n = n + U64_1
+    else
+      return n
+    end
+    guard = guard + 1
+    if guard > 18 then
+      error("read_corevarint: encoded length exceeds uint64 range")
+    end
+    b = r.read_u8()
+  end
+end
+
+--- Read a Core VARINT.
+-- Perf: the accumulator is a plain Lua double on the hot path, which is
+-- bit-for-bit exact for every value < 2^53 — i.e. ALL legitimate snapshot
+-- fields (heights, vouts, compressed amounts <= MAX_MONEY).  This removes the
+-- per-byte boxed-uint64 (cdata) allocations that previously stormed the GC on
+-- a ~165M-coin AssumeUTXO import.  The instant the accumulator could grow into
+-- the lossy band (>= 2^53) we hand off to _read_corevarint_exact_tail, which
+-- finishes in 64-bit cdata so the overflow-guard decision and decoded value
+-- remain byte-identical to the old all-cdata path over the full uint64 range
+-- (proven exhaustively; see spec/utxo_corevarint_debox_spec.lua).
+-- @param r buffer_reader
+-- @return number (value < 2^53) or cdata uint64_t (rare out-of-domain tail)
 function M.read_corevarint(r)
-  local n = u64_t(0)
+  local n = 0
   local guard = 0
   while true do
     guard = guard + 1
@@ -611,16 +671,20 @@ function M.read_corevarint(r)
       error("read_corevarint: encoded length exceeds uint64 range")
     end
     local b = r.read_u8()
-    -- size check matching ReadVarInt:
-    -- if (n > (UINT64_MAX >> 7)) throw "size too large"
-    -- UINT64_MAX >> 7 == 0x01FFFFFFFFFFFFFF
-    if n > u64_t(0x01FFFFFFFFFFFFFFULL) then
+    -- size check matching ReadVarInt (numeric; exact because n < 2^53 here):
+    -- if (n > (UINT64_MAX >> 7)) throw "size too large".
+    if n > VARINT_GUARD_NUM then
       error("read_corevarint: size too large")
     end
-    n = (n * u64_t(128)) + u64_t(b % 128)  -- band 0x7F
+    -- If the next multiply could push n out of the 53-bit-exact band, finish
+    -- in exact cdata so no decision/value can drift.  n is still exact here.
+    if n >= VARINT_LOSSY_THRESHOLD then
+      return _read_corevarint_exact_tail(r, n, guard, b)
+    end
+    n = (n * 128) + (b % 128)  -- band 0x7F
     if b >= 0x80 then
       -- not the final byte: increment carry and continue
-      n = n + u64_t(1)
+      n = n + 1
     else
       return n
     end
@@ -658,26 +722,55 @@ function M.compress_amount(n)
 end
 
 --- Decompress an amount produced by compress_amount.
+-- Perf: a plain compressed amount is a Lua number (read_corevarint hot path)
+-- well under 2^53 (compress_amount(MAX_MONEY) = 1.89e12), so the arithmetic is
+-- done in exact Lua doubles, avoiding the per-call boxed-uint64 churn on the
+-- AssumeUTXO import path.  If the caller passes a cdata (the rare out-of-domain
+-- read_corevarint exact tail, value > 2^53), we fall back to the original
+-- 64-bit cdata arithmetic so the decoded value stays bit-for-bit identical to
+-- the old all-cdata implementation over the full uint64 range (proven
+-- exhaustively; see spec/utxo_corevarint_debox_spec.lua).
 -- @param x number|cdata
 -- @return number satoshis
 function M.decompress_amount(x)
-  local v = _to_u64(x)
-  if v == u64_t(0) then return 0 end
-  v = v - u64_t(1)
-  local e = tonumber(v % u64_t(10))
-  v = v / u64_t(10)
+  if type(x) == "cdata" then
+    -- exact 64-bit path, byte-identical to the pre-perf-fix implementation.
+    local v = _to_u64(x)
+    if v == u64_t(0) then return 0 end
+    v = v - u64_t(1)
+    local e = tonumber(v % u64_t(10))
+    v = v / u64_t(10)
+    local n
+    if e < 9 then
+      local d = tonumber(v % u64_t(9)) + 1
+      v = v / u64_t(9)
+      n = v * u64_t(10) + u64_t(d)
+    else
+      n = v + u64_t(1)
+    end
+    for _ = 1, e do
+      n = n * u64_t(10)
+    end
+    return tonumber(n)
+  end
+  -- plain-number fast path (x < 2^53 → exact in a Lua double)
+  local v = x
+  if v == 0 then return 0 end
+  v = v - 1
+  local e = v % 10
+  v = (v - e) / 10  -- exact integer divide
   local n
   if e < 9 then
-    local d = tonumber(v % u64_t(9)) + 1
-    v = v / u64_t(9)
-    n = v * u64_t(10) + u64_t(d)
+    local d = (v % 9) + 1
+    v = (v - (v % 9)) / 9  -- exact integer divide
+    n = v * 10 + d
   else
-    n = v + u64_t(1)
+    n = v + 1
   end
   for _ = 1, e do
-    n = n * u64_t(10)
+    n = n * 10
   end
-  return tonumber(n)
+  return n
 end
 
 --------------------------------------------------------------------------------
@@ -4571,7 +4664,10 @@ end
 -- @param file file*: open binary file handle
 -- @return reader: object with read_u8, read_bytes, read_u32le, read_i64le
 local function _file_reader(file)
-  local REFILL = 65536  -- 64 KiB
+  local REFILL = 1048576  -- 1 MiB (was 64 KiB): quarters+ the tail-copy refill
+                          -- count over an 11GB snapshot, matching camlcoin's
+                          -- ~1MiB low_water window.  Still streaming (RSS stays
+                          -- bounded) — NOT a whole-file read.
   local buf = ""
   local pos = 1
 
@@ -4779,9 +4875,14 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
         coins_left = coins_left - 1
 
         -- Periodic flush to keep the cache from running away on a 100M+
-        -- UTXO load.
-        if coins_loaded % 100000 == 0 then
-          self.coin_view:flush()
+        -- UTXO load.  Use a 1M window with reallocate=true so each flush
+        -- takes the cheap `self.cache = {}` clear path (CoinView:flush
+        -- reallocate branch) instead of the O(cache_size) pairs()-rebuild
+        -- eviction branch — converting ~1650 full-cache rebuilds into ~165
+        -- wholesale clears.  Same coins, same async WriteBatch, same write
+        -- ordering; no consensus surface (mirrors camlcoin flush_every=1M).
+        if coins_loaded % 1000000 == 0 then
+          self.coin_view:flush(true)
         end
       end
     end
