@@ -893,6 +893,13 @@ local function query_local_core_header(blockhash_hex)
   if not ok2 or type(parsed) ~= "table" or not parsed.result then return nil, nil end
 
   local r = parsed.result
+  -- cjson.decode maps JSON null to the cjson.null userdata sentinel, which is
+  -- TRUTHY in Lua, so the `not parsed.result` guard above does NOT catch it. A
+  -- queried Core that lacks this block (a regtest hash against the mainnet Core,
+  -- or any unknown block) returns result:null -> userdata; indexing it crashed
+  -- getblock/getblockheader at verbosity>=1 ("attempt to index a userdata value").
+  -- Treat any non-table result as a miss and fall back to the caller's defaults.
+  if type(r) ~= "table" then return nil, nil end
   return r.chainwork, r.nTx
 end
 
