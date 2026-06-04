@@ -24,6 +24,12 @@ ffi.cdef[[
   void rocksdb_options_set_write_buffer_size(rocksdb_options_t* options, size_t s);
   void rocksdb_options_set_max_write_buffer_number(rocksdb_options_t* options, int n);
   void rocksdb_options_set_compression(rocksdb_options_t* options, int t);
+  /* Leveled-compaction tuning (used to relieve the AssumeUTXO snapshot-import
+   * write-amp stall — see M.open). */
+  void rocksdb_options_set_max_bytes_for_level_base(rocksdb_options_t* options, uint64_t n);
+  void rocksdb_options_set_level0_slowdown_writes_trigger(rocksdb_options_t* options, int n);
+  void rocksdb_options_set_level0_stop_writes_trigger(rocksdb_options_t* options, int n);
+  void rocksdb_options_set_max_background_jobs(rocksdb_options_t* options, int n);
   void rocksdb_options_set_block_based_table_factory(
     rocksdb_options_t* options,
     rocksdb_block_based_table_options_t* table_options
@@ -241,6 +247,37 @@ function M.open(path, cache_size_mb)
   -- reintroduce a CPU ceiling on the per-coin import loop that commit 72af3ce
   -- just removed.
   librocksdb.rocksdb_options_set_compression(options, 1)  -- 1 = Snappy
+
+  -- Leveled-compaction tuning for the bulk AssumeUTXO snapshot import.
+  --
+  -- Snappy (above) cut SST size ~4-6x, but the default LSM shape still drives
+  -- avoidable write-amplification during a ~190M-coin bulk load:
+  --
+  --  * max_bytes_for_level_base defaults to 256MB == write_buffer_size, so L1's
+  --    size target equals a SINGLE memtable. With L0 holding 256MB-worth of
+  --    files before compaction, that forces near-constant L0->L1 churn and a
+  --    deep level cascade. Raising the L1 target to 1GB lets each level hold
+  --    more before cascading, so a given coin is rewritten through fewer
+  --    levels (lower write-amp). (default multiplier 10 keeps the per-level
+  --    growth, so total levels for the final ~10-15GB set stay small.)
+  --
+  --  * level0_slowdown/stop default to 20/36 in modern RocksDB, but were the
+  --    historical 8/12 — we pin the higher values explicitly so a transient
+  --    compaction backlog during the import does NOT trip the stop-writes
+  --    trigger and stall rocksdb_write (the original ~45GB rate-collapse
+  --    symptom). 20/36 is RocksDB's own current default; we just make it
+  --    non-version-dependent.
+  --
+  --  * max_background_jobs raised to 6 so flushes + compactions run in
+  --    parallel on this 16C/32T box and keep up with the single writer thread,
+  --    instead of serializing behind it.
+  --
+  -- All of these are storage-engine knobs only: they change how SSTs are laid
+  -- out and compacted, never the bytes stored. No consensus surface.
+  librocksdb.rocksdb_options_set_max_bytes_for_level_base(options, 1024 * 1024 * 1024)  -- 1GB L1 target
+  librocksdb.rocksdb_options_set_level0_slowdown_writes_trigger(options, 20)
+  librocksdb.rocksdb_options_set_level0_stop_writes_trigger(options, 36)
+  librocksdb.rocksdb_options_set_max_background_jobs(options, 6)
 
   -- Create LRU block cache
   local cache_size = cache_size_mb * 1024 * 1024
