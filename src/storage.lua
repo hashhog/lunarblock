@@ -216,7 +216,31 @@ function M.open(path, cache_size_mb)
   librocksdb.rocksdb_options_set_max_open_files(options, 1000)
   librocksdb.rocksdb_options_set_write_buffer_size(options, 256 * 1024 * 1024)  -- 256MB
   librocksdb.rocksdb_options_set_max_write_buffer_number(options, 4)
-  librocksdb.rocksdb_options_set_compression(options, 0)  -- No compression (LZ4 not linked)
+  -- Snappy compression (RocksDB type 1).
+  --
+  -- The old comment "(LZ4 not linked)" was stale: the librocksdb.so on this
+  -- platform links snappy, lz4, zlib AND zstd (verified via `ldd librocksdb.so`
+  -- + `nm -D`).  Running uncompressed was the dominant cause of the AssumeUTXO
+  -- snapshot-import throughput collapse: the chainstate grew to ~45GB (≈4× Core's
+  -- ~11GB LevelDB chainstate for the same ~190M-coin set) and the resulting
+  -- write-amplification overwhelmed RocksDB's leveled compaction, eventually
+  -- backing L0 up to the stop-writes trigger so `rocksdb_write` stalled and the
+  -- loader rate collapsed to ~0 around the 45GB mark.
+  --
+  -- A bounded repro on UTXO-shaped data measured ~5.8× smaller SSTs with Snappy
+  -- (58.0 → 10.0 bytes/coin post-compaction; zstd reaches 6.9 but costs more
+  -- CPU).  On-disk SST size is a direct proxy for bytes-rewritten-per-compaction,
+  -- so this cuts compaction write volume by the same factor and relieves the
+  -- stall.  Compression is per-SST (codec recorded in the SST footer), so this
+  -- is backward-compatible: existing uncompressed SSTs stay readable; only new
+  -- writes/compactions use Snappy.  No consensus surface — the serialized bytes
+  -- handed to RocksDB are byte-identical; compression is fully transparent below
+  -- the get/put boundary.
+  --
+  -- Snappy chosen over lz4/zstd for the lowest CPU overhead (GB/s) so it cannot
+  -- reintroduce a CPU ceiling on the per-coin import loop that commit 72af3ce
+  -- just removed.
+  librocksdb.rocksdb_options_set_compression(options, 1)  -- 1 = Snappy
 
   -- Create LRU block cache
   local cache_size = cache_size_mb * 1024 * 1024
