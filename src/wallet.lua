@@ -983,7 +983,9 @@ function M.new(network, storage)
   self.pending_utxos = {}          -- Unconfirmed UTXOs (in mempool)
   self.spent_pending = {}          -- Outpoints spent in pending transactions
   self.transactions = {}           -- txid_hex -> {tx, height, time, fee}
-  self.confirmed_balance = 0       -- Balance from confirmed transactions
+  self.confirmed_balance = 0       -- Balance from confirmed transactions (incl. immature coinbase)
+  self.spendable_balance = 0       -- Confirmed balance excluding immature coinbase
+  self.immature_balance = 0        -- Sum of confirmed-but-immature coinbase values
   self.unconfirmed_balance = 0     -- Balance from unconfirmed transactions
   self.next_external_index = 0     -- BIP44 external chain index
   self.next_internal_index = 0     -- BIP44 internal (change) chain index
@@ -1388,6 +1390,11 @@ end
 function Wallet:scan_utxos(chain_state)
   self.utxos = {}
   self.confirmed_balance = 0
+  -- spendable_balance excludes immature coinbases; immature_balance is the sum
+  -- of confirmed-but-immature coinbase values. Mirrors Bitcoin Core's split of
+  -- the trusted/spendable balance vs. m_mine_immature (wallet/receive.cpp).
+  self.spendable_balance = 0
+  self.immature_balance = 0
 
   if not self.storage then
     return  -- No storage, skip scan
@@ -1444,6 +1451,15 @@ function Wallet:scan_utxos(chain_state)
         confirmations = confirmations,
       }
       self.confirmed_balance = self.confirmed_balance + entry.value
+      -- Split into spendable vs. immature. A coinbase is spendable only once
+      -- it has COINBASE_MATURITY+1 (=101) confirmations; below that it is
+      -- immature and excluded from the spendable/trusted balance (Core
+      -- getbalance behaviour). Non-coinbase outputs are always spendable.
+      if entry.is_coinbase and confirmations < consensus.COINBASE_MATURITY + 1 then
+        self.immature_balance = self.immature_balance + entry.value
+      else
+        self.spendable_balance = self.spendable_balance + entry.value
+      end
     end
 
     iter.next()
@@ -1532,9 +1548,16 @@ function Wallet:get_available_utxos(include_unconfirmed, min_confirmations)
   for key, utxo in pairs(self.utxos) do
     if not self.spent_pending[key] then
       if utxo.confirmations >= min_confirmations then
-        -- Check coinbase maturity
+        -- Coinbase maturity (matches the node's own consensus rule, and
+        -- Bitcoin Core CWallet::GetTxBlocksToMaturity / CheckTxInputs):
+        -- a coinbase is spendable only once it has COINBASE_MATURITY+1 (=101)
+        -- confirmations, i.e. chain depth >= 101 (tip - height >= 100). A
+        -- coinbase with exactly COINBASE_MATURITY (100) confirmations is still
+        -- IMMATURE and would be rejected by mempool.lua as
+        -- "spending immature coinbase"; never select it here. Non-coinbase
+        -- UTXOs are spendable normally.
         if utxo.is_coinbase then
-          if utxo.confirmations >= consensus.COINBASE_MATURITY then
+          if (utxo.confirmations or 0) >= consensus.COINBASE_MATURITY + 1 then
             result[#result + 1] = {key = key, utxo = utxo}
           end
         else
@@ -2435,10 +2458,14 @@ end
 -- Wallet Info Queries
 --------------------------------------------------------------------------------
 
---- Get confirmed balance.
--- @return number: Balance in satoshis
+--- Get spendable (trusted) balance.
+-- Excludes immature coinbase outputs (< COINBASE_MATURITY+1 = 101
+-- confirmations), matching Bitcoin Core's getbalance / GetBalance, which never
+-- counts immature coinbases toward the spendable balance. Falls back to the
+-- raw confirmed balance only if a scan has not run yet (spendable_balance nil).
+-- @return number: Spendable balance in satoshis
 function Wallet:get_balance()
-  return self.confirmed_balance
+  return self.spendable_balance or self.confirmed_balance
 end
 
 --- Get unconfirmed balance.
@@ -2457,12 +2484,18 @@ end
 -- @return table: {confirmed=number, unconfirmed=number, total=number, spendable=number}
 function Wallet:get_balance_details()
   local spendable = 0
+  local immature = 0
   for key, utxo in pairs(self.utxos) do
     if not self.spent_pending[key] then
-      -- Check coinbase maturity
+      -- Coinbase maturity: spendable only at COINBASE_MATURITY+1 (=101)
+      -- confirmations (chain depth >= 101); below that it is immature and
+      -- excluded from the spendable/trusted balance (Bitcoin Core
+      -- GetBalance skips immature coinbases, tracking them as m_mine_immature).
       if utxo.is_coinbase then
-        if utxo.confirmations >= consensus.COINBASE_MATURITY then
+        if (utxo.confirmations or 0) >= consensus.COINBASE_MATURITY + 1 then
           spendable = spendable + utxo.value
+        else
+          immature = immature + utxo.value
         end
       else
         spendable = spendable + utxo.value
@@ -2475,6 +2508,7 @@ function Wallet:get_balance_details()
     unconfirmed = self.unconfirmed_balance,
     total = self.confirmed_balance + self.unconfirmed_balance,
     spendable = spendable,
+    immature = immature,
   }
 end
 
@@ -2492,7 +2526,10 @@ function Wallet:list_unspent(include_unconfirmed)
     if self.spent_pending[key] then
       spendable = false
     end
-    if utxo.is_coinbase and utxo.confirmations < consensus.COINBASE_MATURITY then
+    -- Immature coinbase (< COINBASE_MATURITY+1 = 101 confirmations) is not
+    -- spendable: the node would reject the spend as "spending immature
+    -- coinbase". Matches Bitcoin Core, which marks such outputs not spendable.
+    if utxo.is_coinbase and (utxo.confirmations or 0) < consensus.COINBASE_MATURITY + 1 then
       spendable = false
     end
 
