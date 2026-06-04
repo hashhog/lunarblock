@@ -8111,6 +8111,216 @@ function RPCServer:setup_w47b_methods()
     }
   end
 
+  -- scantxoutset: scan the live UTXO set by scriptPubKey.
+  -- Bitcoin Core: src/rpc/blockchain.cpp::scantxoutset → EvalDescriptor.
+  -- This is the wallet-recovery primitive: a wallet restored from seed only
+  -- (no on-disk UTXO record) re-derives its receiving scriptPubKeys and asks
+  -- the node which of them are funded on-chain.  It iterates the CF.UTXO
+  -- column family (the same walk gettxoutsetinfo does) and collects every
+  -- coin whose scriptPubKey matches one of the supplied scan objects.
+  --
+  -- Supported scan-object forms (string, or {desc=...} object):
+  --   addr(<address>)         — match the address's scriptPubKey
+  --   raw(<scriptPubKey-hex>) — match this exact scriptPubKey
+  --   pkh(<hex-pubkey>)       — P2PKH for the key's hash160
+  --   wpkh(<hex-pubkey>)      — P2WPKH for the key's hash160
+  --   tr(<hex-xonly-key>)     — P2TR for an already-tweaked 32-byte output key
+  --   a bare scriptPubKey-hex — Core's raw() shorthand
+  --
+  -- Actions: "start" (default) runs the scan; "abort"/"status" return false
+  -- (no background scan is tracked here), matching Core when nothing runs.
+  self.methods["scantxoutset"] = function(rpc, params)
+    local action = (params and params[1]) or "start"
+    if type(action) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "action must be a string"})
+    end
+    action = action:lower()
+
+    if action == "abort" or action == "status" then
+      -- No long-running background scan is tracked in this minimal impl;
+      -- Core returns false from abort/status when nothing is in progress.
+      return false
+    end
+    if action ~= "start" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid action '" .. action .. "'"})
+    end
+
+    local scanobjects = params and params[2]
+    if type(scanobjects) ~= "table" or #scanobjects == 0 then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "scanobjects argument is required for the start action"})
+    end
+
+    if not rpc.storage or not rpc.storage.iterator then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    local network_name = rpc.network and rpc.network.name or "mainnet"
+
+    -- Resolve every scan object to a scriptPubKey needle.  `needles` maps
+    -- the raw scriptPubKey bytes -> the descriptor string echoed back per
+    -- matched unspent (Core's UnspentOutput.desc).
+    local needles = {}
+    local function add_needle(spk, desc)
+      needles[spk] = desc
+    end
+    local function spk_for_addr(addr)
+      local addr_type, addr_data, _wv = address_mod.decode_address(addr, network_name)
+      if not addr_type then
+        error({code = M.ERROR.INVALID_ADDRESS,
+               message = "Invalid address in addr(): " .. tostring(addr_data)})
+      end
+      if addr_type == "p2pkh" then
+        return script_mod.make_p2pkh_script(addr_data)
+      elseif addr_type == "p2sh" then
+        return script_mod.make_p2sh_script(addr_data)
+      elseif addr_type == "p2wpkh" then
+        return script_mod.make_p2wpkh_script(addr_data)
+      elseif addr_type == "p2wsh" then
+        return script_mod.make_p2wsh_script(addr_data)
+      elseif addr_type == "p2tr" then
+        return script_mod.make_p2tr_script(addr_data)
+      else
+        error({code = M.ERROR.INVALID_ADDRESS,
+               message = "Unsupported address type in addr(): " .. addr_type})
+      end
+    end
+    local function hex_to_bytes(h)
+      h = h:gsub("%s", "")
+      if #h % 2 ~= 0 or h:match("[^0-9a-fA-F]") then
+        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid hex in scan object"})
+      end
+      return (h:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+    end
+    local function hash160_of(pubkey_bytes)
+      return require("lunarblock.crypto").hash160(pubkey_bytes)
+    end
+
+    for _, obj in ipairs(scanobjects) do
+      local spec
+      if type(obj) == "table" then
+        spec = obj.desc
+      else
+        spec = obj
+      end
+      if type(spec) ~= "string" then
+        error({code = M.ERROR.INVALID_PARAMS,
+               message = "Scan object must be a descriptor string"})
+      end
+      spec = spec:gsub("^%s+", ""):gsub("%s+$", "")
+      -- Strip a trailing descriptor checksum (#xxxxxxxx) if present.
+      local hash_pos = spec:find("#", 1, true)
+      if hash_pos then spec = spec:sub(1, hash_pos - 1) end
+
+      local inner = spec:match("^addr%((.+)%)$")
+      if inner then
+        add_needle(spk_for_addr(inner), spec)
+      else
+        inner = spec:match("^raw%((.+)%)$")
+        if inner then
+          add_needle(hex_to_bytes(inner), spec)
+        else
+          inner = spec:match("^pkh%((.+)%)$")
+          if inner then
+            local h = hash160_of(hex_to_bytes(inner))
+            add_needle(script_mod.make_p2pkh_script(h), spec)
+          else
+            inner = spec:match("^wpkh%((.+)%)$")
+            if inner then
+              local h = hash160_of(hex_to_bytes(inner))
+              add_needle(script_mod.make_p2wpkh_script(h), spec)
+            else
+              inner = spec:match("^tr%((.+)%)$")
+              if inner then
+                local xonly = hex_to_bytes(inner)
+                if #xonly ~= 32 then
+                  error({code = M.ERROR.INVALID_PARAMS,
+                         message = "tr() expects a 32-byte x-only output key"})
+                end
+                add_needle(script_mod.make_p2tr_script(xonly), spec)
+              elseif spec:match("^[0-9a-fA-F]+$") and #spec % 2 == 0 then
+                -- bare hex == Core raw() shorthand
+                add_needle(hex_to_bytes(spec), spec)
+              else
+                error({code = M.ERROR.INVALID_PARAMS,
+                       message = "Unsupported scan object: " .. spec})
+              end
+            end
+          end
+        end
+      end
+    end
+
+    local utxo_mod = require("lunarblock.utxo")
+
+    local tip_height = rpc.chain_state and rpc.chain_state.tip_height or 0
+    local tip_hash_hex
+    if rpc.chain_state and rpc.chain_state.tip_hash then
+      tip_hash_hex = types.hash256_hex(rpc.chain_state.tip_hash)
+    else
+      tip_hash_hex = string.rep("0", 64)
+    end
+
+    local n_txouts = 0
+    local total_sats = 0
+    local unspents = {}
+
+    local iter = rpc.storage.iterator(storage_mod.CF.UTXO)
+    iter.seek_to_first()
+    while iter.valid() do
+      local k = iter.key()
+      local v = iter.value()
+      if k and v and #k == 36 then
+        local ok, entry = pcall(utxo_mod.deserialize_utxo_entry, v)
+        if ok and entry then
+          n_txouts = n_txouts + 1
+          local desc = needles[entry.script_pubkey]
+          if desc ~= nil then
+            total_sats = total_sats + (entry.value or 0)
+            -- Key layout: txid[32] (internal byte order) + vout[4] LE.
+            -- JSON-RPC reports txid in display order (reversed hex), matching
+            -- gettxout / Core's COutPoint::hash.GetHex().
+            local txid_internal = k:sub(1, 32)
+            local txid_display = types.hash256_hex(types.hash256(txid_internal))
+            local v0, v1, v2, v3 = k:byte(33, 36)
+            local vout = v0 + v1 * 256 + v2 * 65536 + v3 * 16777216
+            unspents[#unspents + 1] = {
+              txid = txid_display,
+              vout = vout,
+              scriptPubKey = (function()
+                local hx = {}
+                for i = 1, #entry.script_pubkey do
+                  hx[i] = string.format("%02x", entry.script_pubkey:byte(i))
+                end
+                return table.concat(hx)
+              end)(),
+              desc = desc,
+              amount = btc_sentinel(entry.value or 0),
+              coinbase = entry.is_coinbase and true or false,
+              height = entry.height or 0,
+            }
+          end
+        end
+      end
+      iter.next()
+    end
+    iter.destroy()
+
+    local result = {
+      success = true,
+      txouts = n_txouts,
+      height = tip_height,
+      bestblock = tip_hash_hex,
+      unspents = unspents,
+      total_amount = btc_sentinel(total_sats),
+    }
+    if #unspents == 0 then
+      result.unspents = setmetatable({}, cjson.empty_array_mt)
+    end
+    local json = strip_btc_sentinels(cjson.encode(result))
+    return {_raw_json = json}
+  end
+
   -- getnetworkhashps: estimate network hash rate over last nblocks
   self.methods["getnetworkhashps"] = function(rpc, params)
     local nblocks = (params and type(params[1]) == "number") and math.floor(params[1]) or 120
