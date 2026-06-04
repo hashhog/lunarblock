@@ -688,8 +688,13 @@ local function run_import_utxo(args)
     end
   end
 
-  -- Compute and display the resulting set hash.
+  -- Compute and display the resulting set hash.  This is the HASH_SERIALIZED
+  -- pass over the whole UTXO set (Core's coinstats.cpp HashWriter path); on
+  -- the ~190M-coin mainnet snapshot it is the dominant post-load cost, so we
+  -- time it on its own line for operator visibility.
+  local h0 = os.time()
   local set_hash, count = cs:compute_utxo_hash()
+  local hash_elapsed = os.time() - h0
   local set_hash_hex = ""
   for i = 1, 32 do
     set_hash_hex = set_hash_hex .. string.format("%02x", set_hash:byte(i))
@@ -698,8 +703,8 @@ local function run_import_utxo(args)
   db.close()
 
   print(string.format(
-    "import-utxo complete: utxos=%d block=%s set_hash=%s elapsed=%ds",
-    count, tip_hex, set_hash_hex, elapsed))
+    "import-utxo complete: utxos=%d block=%s set_hash=%s load_elapsed=%ds hash_elapsed=%ds",
+    count, tip_hex, set_hash_hex, elapsed, hash_elapsed))
 end
 
 --------------------------------------------------------------------------------
