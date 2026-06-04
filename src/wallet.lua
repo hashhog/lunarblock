@@ -978,8 +978,25 @@ function M.new(network, storage)
   self.is_encrypted = false        -- Whether wallet is encrypted
   self.is_locked = true            -- Whether wallet is locked (keys unavailable)
   self.keys = {}                   -- address -> {privkey, pubkey, path, type}
+  -- IMPORTED keys (importprivkey): a registry of addresses whose private key
+  -- did NOT come from the HD master key. They live in self.keys like any other
+  -- key (so every scan/sign/own-script path sees them), but are ALSO recorded
+  -- here, held apart from the HD keychain, so a restore-from-seed / reseed flow
+  -- (which rebuilds self.keys from the master key) can re-merge them and never
+  -- silently wipe them. Maps address -> {privkey, pubkey, compressed, type, label}.
+  self.imported_keys = {}
   self.addresses = {}              -- ordered list of addresses
   self.utxos = {}                  -- outpoint_key -> {value, script_pubkey, address, txid, vout}
+  -- Has this wallet ever scanned the chain for its own funds?  A wallet
+  -- restored from seed / created blank derives its keys deterministically but
+  -- does NOT yet know which of those scripts are funded on-chain — exactly
+  -- like Bitcoin Core, where a fresh import shows balance 0 until
+  -- rescanblockchain (CWallet::ScanForWalletTransactions) walks the chain.
+  -- scan_utxos / scan_history leave the ledger EMPTY while this is false, so
+  -- getbalance / listunspent report 0 until an explicit rescan (or a chain-
+  -- mutating wallet op — generatetoaddress / sendtoaddress — which implies the
+  -- wallet is live) flips it true.
+  self.scanned = false
   self.pending_utxos = {}          -- Unconfirmed UTXOs (in mempool)
   self.spent_pending = {}          -- Outpoints spent in pending transactions
   self.transactions = {}           -- txid_hex -> {tx, height, time, fee}
@@ -1400,6 +1417,15 @@ function Wallet:scan_utxos(chain_state)
   self.spendable_balance = 0
   self.immature_balance = 0
 
+  -- A wallet that has never scanned the chain (fresh restore-from-seed / blank
+  -- import) reports an empty ledger until rescanblockchain runs — Core parity
+  -- (CWallet::ScanForWalletTransactions). Leaving the cleared ledger in place
+  -- keeps getbalance / listunspent at 0 until the wallet is explicitly rescanned
+  -- or performs a chain-mutating op (which flips self.scanned true).
+  if not self.scanned then
+    return
+  end
+
   if not self.storage then
     return  -- No storage, skip scan
   end
@@ -1594,6 +1620,9 @@ end
 -- @param mempool table|nil (unused for confirmed history; reserved)
 function Wallet:scan_history(chain_state, mempool)
   self.tx_history = {}
+  -- Same gate as scan_utxos: an unscanned wallet has no rediscovered history
+  -- until rescanblockchain walks the chain (Core parity).
+  if not self.scanned then return end
   if not self.storage or not chain_state then return end
 
   local tip_height = chain_state.tip_height or 0
@@ -1712,6 +1741,71 @@ function Wallet:scan_history(chain_state, mempool)
       end
     end
   end
+end
+
+--- Mark the wallet as having scanned the chain. Called by rescanblockchain and
+--- by chain-mutating wallet ops (generatetoaddress / sendtoaddress) which imply
+--- the wallet is live. Once set, scan_utxos / scan_history credit normally.
+function Wallet:mark_scanned()
+  self.scanned = true
+end
+
+--- Rescan the connected chain for this wallet's own funds.
+--
+-- The BACKWARD counterpart of the block-connect-driven scan: walk the existing
+-- chain (the chainstate UTXO set + the block history) and credit every output
+-- paying a wallet-owned script into the wallet UTXO ledger + transaction
+-- history, debiting spent inputs. This is the REAL wallet rescan — distinct
+-- from scantxoutset, which scans the chainstate without ever touching a wallet.
+--
+-- Mirrors Bitcoin Core CWallet::ScanForWalletTransactions
+-- (wallet/rpc/transactions.cpp::rescanblockchain): start_height defaults to 0,
+-- stop_height defaults to the active tip; the range is validated
+-- (0 <= start <= tip, start <= stop <= tip) and the {start_height, stop_height}
+-- actually scanned is returned. lunarblock's scan_utxos walks the whole
+-- chainstate UTXO set and scan_history walks 0..tip, so the range here governs
+-- the Core return shape + validation; both scans are idempotent and rebuild
+-- the ledger from scratch, so a from-genesis rescan never double-counts.
+--
+-- @param chain_state ChainState
+-- @param mempool table|nil
+-- @param start_height number|nil (default 0)
+-- @param stop_height  number|nil (default tip)
+-- @return table|nil {start_height, stop_height}, or nil + err string
+function Wallet:rescan(chain_state, mempool, start_height, stop_height)
+  if not chain_state then return nil, "no chain state available" end
+  local tip = chain_state.tip_height or 0
+  if tip < 0 then tip = 0 end
+
+  start_height = start_height or 0
+  if stop_height == nil then stop_height = tip end
+
+  if type(start_height) ~= "number" or start_height < 0 then
+    return nil, "Invalid start_height"
+  end
+  if start_height > tip then
+    return nil, "Invalid start_height (above tip)"
+  end
+  if type(stop_height) ~= "number" then
+    return nil, "Invalid stop_height"
+  end
+  if stop_height < start_height then
+    return nil, "stop_height must be greater than start_height"
+  end
+  if stop_height > tip then stop_height = tip end
+
+  -- This wallet now knows the chain; credit normally from here on.
+  self.scanned = true
+
+  -- Rebuild the UTXO ledger + balances from the chainstate UTXO set, and the
+  -- transaction history from the connected blocks. Both rebuild from scratch.
+  self:scan_utxos(chain_state)
+  self:scan_history(chain_state, mempool)
+  if mempool then
+    self:scan_mempool(mempool)
+  end
+
+  return {start_height = start_height, stop_height = stop_height}
 end
 
 --- Best-effort destination address for an arbitrary scriptPubKey (recipient of
@@ -3038,7 +3132,24 @@ function Wallet:import_privkey(wif)
     change = 0,
     index = -1,
   }
-  self.addresses[#self.addresses + 1] = addr
+  -- Register in the imported-key store so a later restore-from-seed / reseed
+  -- (which rebuilds self.keys from the HD master key) can re-merge it and never
+  -- wipe it. index == -1 / path == "imported" already excludes it from the HD
+  -- re-derivation loop in unlock(); this is the durable companion record.
+  self.imported_keys[addr] = {
+    privkey = privkey,
+    pubkey = pubkey,
+    compressed = compressed,
+    type = addr_type,
+  }
+  -- Avoid a duplicate entry in the ordered address list if re-imported.
+  local already = false
+  for _, a in ipairs(self.addresses) do
+    if a == addr then already = true; break end
+  end
+  if not already then
+    self.addresses[#self.addresses + 1] = addr
+  end
   return addr
 end
 
@@ -3165,7 +3276,25 @@ function Wallet:serialize()
     next_external_index = self.next_external_index,
     next_internal_index = self.next_internal_index,
     is_encrypted = self.is_encrypted,
+    -- Persist whether the wallet has scanned the chain, so a reload does not
+    -- regress a live wallet back to the "balance 0 until rescan" state.
+    scanned = self.scanned and true or false,
   }
+
+  -- Persist imported keys (importprivkey). These are NOT derivable from the HD
+  -- master key, so unlike HD keys they MUST be serialized or they are lost on
+  -- reload. Held apart from the HD keychain so a reseed never wipes them.
+  if self.imported_keys and next(self.imported_keys) ~= nil then
+    local imp = {}
+    for addr, info in pairs(self.imported_keys) do
+      imp[addr] = {
+        privkey = M.hex_encode(info.privkey),
+        compressed = info.compressed and true or false,
+        type = info.type,
+      }
+    end
+    data.imported_keys = imp
+  end
 
   if self.is_encrypted then
     -- Store encrypted key
@@ -3360,6 +3489,41 @@ function M.load(filepath, network, storage, passphrase)
       wallet:generate_addresses(wallet.gap_limit)
     end
   end
+
+  -- Re-merge imported keys AFTER HD address regeneration. They are not derivable
+  -- from the master key, so the HD regen above would never recreate them — they
+  -- are held apart in self.imported_keys and re-installed into self.keys here so
+  -- every scan / sign / own-script path sees them. A reseed never wipes them.
+  if data.imported_keys and not wallet.is_locked then
+    for addr, info in pairs(data.imported_keys) do
+      local privkey = M.hex_decode(info.privkey)
+      local pubkey = crypto.pubkey_from_privkey(privkey, info.compressed ~= false)
+      wallet.keys[addr] = {
+        privkey = privkey,
+        pubkey = pubkey,
+        path = "imported",
+        type = info.type or "p2pkh",
+        change = 0,
+        index = -1,
+      }
+      wallet.imported_keys[addr] = {
+        privkey = privkey,
+        pubkey = pubkey,
+        compressed = info.compressed ~= false,
+        type = info.type or "p2pkh",
+      }
+      local seen = false
+      for _, a in ipairs(wallet.addresses) do
+        if a == addr then seen = true; break end
+      end
+      if not seen then
+        wallet.addresses[#wallet.addresses + 1] = addr
+      end
+    end
+  end
+
+  -- Restore the scanned flag (a reloaded live wallet stays live).
+  wallet.scanned = data.scanned and true or false
 
   return wallet
 end
