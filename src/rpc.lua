@@ -5453,9 +5453,12 @@ function RPCServer:register_methods()
     local details = wallet:get_balance_details()
     return {
       mine = {
-        trusted = details.confirmed / 100000000,
+        -- trusted = confirmed spendable balance, EXCLUDING immature coinbase
+        -- (Bitcoin Core getbalances: immature coinbases are reported under
+        -- `immature`, never under `trusted`).
+        trusted = details.spendable / 100000000,
         untrusted_pending = details.unconfirmed / 100000000,
-        immature = 0,
+        immature = (details.immature or 0) / 100000000,
       },
       watchonly = {
         trusted = 0,
