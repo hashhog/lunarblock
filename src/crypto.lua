@@ -164,6 +164,17 @@ function M.sha256_init()
     libcrypto.EVP_DigestUpdate(ctx, data, #data)
   end
 
+  -- Feed raw bytes from an FFI pointer + explicit length. This avoids the
+  -- per-call Lua string allocation that hasher.update(data) forces (it must
+  -- materialise `data` as a GC string and recompute #data). Hot loops that
+  -- build their payload in a reusable C buffer (e.g. compute_utxo_hash's
+  -- per-coin TxOutSer serialization over ~190M coins) call this to stream
+  -- straight into EVP_DigestUpdate with zero Lua-side garbage.
+  function hasher.update_ptr(ptr, len)
+    assert(ctx ~= nil, "sha256 hasher: update_ptr() called after final()")
+    libcrypto.EVP_DigestUpdate(ctx, ptr, len)
+  end
+
   function hasher.final()
     assert(ctx ~= nil, "sha256 hasher: final() called after final()")
     local md = ffi.new("unsigned char[32]")
