@@ -983,6 +983,10 @@ function M.new(network, storage)
   self.pending_utxos = {}          -- Unconfirmed UTXOs (in mempool)
   self.spent_pending = {}          -- Outpoints spent in pending transactions
   self.transactions = {}           -- txid_hex -> {tx, height, time, fee}
+  -- WALLET TRANSACTION HISTORY (listtransactions / gettransaction). Built by
+  -- scan_history() from the connected chain — one entry per wallet-relevant
+  -- tx, mirroring Bitcoin Core's mapWallet + CWalletTx accounting.
+  self.tx_history = {}             -- txid_hex -> history entry (see scan_history)
   self.confirmed_balance = 0       -- Balance from confirmed transactions (incl. immature coinbase)
   self.spendable_balance = 0       -- Confirmed balance excluding immature coinbase
   self.immature_balance = 0        -- Sum of confirmed-but-immature coinbase values
@@ -1532,6 +1536,387 @@ function Wallet:scan_mempool(mempool)
       end
     end
   end
+end
+
+--------------------------------------------------------------------------------
+-- WALLET TRANSACTION HISTORY (listtransactions / gettransaction)
+--
+-- Mirrors Bitcoin Core's mapWallet + CWalletTx accounting (wallet/receive.cpp
+-- CachedTxGetAmounts; wallet/rpc/transactions.cpp ListTransactions /
+-- gettransaction). The wallet keeps no durable history ledger you can trust
+-- after a disk loss, so — exactly like scan_utxos rebuilds the UTXO view by
+-- walking the connected chain — scan_history rebuilds the transaction history
+-- by walking every connected block in chain order and classifying each tx as a
+-- wallet credit (an output paying one of our scripts) and/or a wallet debit
+-- (an input spending one of our earlier outputs). A block-disconnect (reorg)
+-- is handled implicitly: scan_history rebuilds from height 1..tip on every
+-- call, so a rolled-back block's txs simply vanish from the rebuilt history.
+--------------------------------------------------------------------------------
+
+--- Classify a scriptPubKey to one of our wallet addresses (if any). Shared by
+--- scan_utxos / scan_mempool / scan_history. Returns nil when not ours.
+-- @param script_pubkey string
+-- @return string|nil address
+function Wallet:_owned_addr_for_spk(script_pubkey)
+  if not script_pubkey then return nil end
+  local script_type, hash_or_program = script.classify_script(script_pubkey)
+  local addr
+  if script_type == "p2wpkh" then
+    local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
+    addr = address.segwit_encode(hrp, 0, hash_or_program)
+  elseif script_type == "p2tr" then
+    addr = address.xonly_pubkey_to_p2tr(hash_or_program, self.network.name)
+  elseif script_type == "p2pkh" then
+    local version = self.network.pubkey_address_prefix
+    addr = address.base58check_encode(version, hash_or_program)
+  end
+  if addr and self.keys[addr] then return addr end
+  return nil
+end
+
+--- Rebuild the wallet transaction history by walking the connected chain.
+--
+-- Builds self.tx_history: txid_hex -> {
+--   txid, txid_hex, tx, height, blockhash (hash256), block_index, time,
+--   is_coinbase,
+--   credit            = sum of output value to us (satoshis),
+--   debit             = sum of input value from us (satoshis),
+--   fee               = debit - value_out (satoshis, only when debit>0 i.e. ours),
+--   received[]        = {address, vout, amount(sat)}     -- outputs to us
+--   sent[]            = {address, vout, amount(sat), fee} -- present iff debit>0
+-- }
+-- credit/debit/received/sent mirror Core's CachedTxGetAmounts exactly:
+--   * fee is computed only when we are the sender (debit>0) as debit-value_out.
+--   * "sent" entries enumerate EVERY non-change output of a from-me tx
+--     (include_change=false → outputs paying our own keys are skipped).
+--   * "received" entries enumerate every output paying one of our keys.
+-- @param chain_state ChainState
+-- @param mempool table|nil (unused for confirmed history; reserved)
+function Wallet:scan_history(chain_state, mempool)
+  self.tx_history = {}
+  if not self.storage or not chain_state then return end
+
+  local tip_height = chain_state.tip_height or 0
+  if tip_height < 0 then tip_height = 0 end
+
+  -- outpoint_key (32-byte txid + 4-byte LE vout) -> {value, address} for every
+  -- wallet-owned output seen so far. Built incrementally so a later tx's input
+  -- can be recognised as spending one of our coins (chain order guarantees the
+  -- creating output is processed before the spending input).
+  local owned_out = {}
+
+  local function outpoint_key(txid_bytes, vout)
+    return txid_bytes .. string.char(
+      bit.band(vout, 0xFF),
+      bit.band(bit.rshift(vout, 8), 0xFF),
+      bit.band(bit.rshift(vout, 16), 0xFF),
+      bit.band(bit.rshift(vout, 24), 0xFF))
+  end
+
+  for height = 0, tip_height do
+    local bhash = self.storage.get_hash_by_height(height)
+    if bhash then
+      local block = self.storage.get_block(bhash)
+      if block and block.transactions then
+        local btime = (block.header and block.header.timestamp) or 0
+        for tx_index = 1, #block.transactions do
+          local tx = block.transactions[tx_index]
+          local txid = validation.compute_txid(tx)
+          local txid_hex = types.hash256_hex(txid)
+
+          -- Coinbase detection (validation.lua: single input, null prevout
+          -- hash, index 0xFFFFFFFF).
+          local is_coinbase = false
+          if #tx.inputs == 1 then
+            local inp = tx.inputs[1]
+            if inp.prev_out and inp.prev_out.index == 0xFFFFFFFF
+               and inp.prev_out.hash and inp.prev_out.hash.bytes == string.rep("\0", 32) then
+              is_coinbase = true
+            end
+          end
+
+          -- Debit: inputs spending our previously-seen outputs.
+          local debit = 0
+          if not is_coinbase then
+            for _, inp in ipairs(tx.inputs) do
+              if inp.prev_out and inp.prev_out.hash then
+                local k = outpoint_key(inp.prev_out.hash.bytes, inp.prev_out.index)
+                local owned = owned_out[k]
+                if owned then debit = debit + owned.value end
+              end
+            end
+          end
+
+          -- Credit + record each owned output; also register owned outputs for
+          -- future debit detection.
+          local credit = 0
+          local received = {}
+          local value_out = 0
+          for vout_idx = 1, #tx.outputs do
+            local out = tx.outputs[vout_idx]
+            value_out = value_out + out.value
+            local addr = self:_owned_addr_for_spk(out.script_pubkey)
+            if addr then
+              local vout = vout_idx - 1
+              credit = credit + out.value
+              received[#received + 1] = {
+                address = addr, vout = vout, amount = out.value,
+              }
+              owned_out[outpoint_key(txid.bytes, vout)] = {
+                value = out.value, address = addr,
+              }
+            end
+          end
+
+          if credit > 0 or debit > 0 then
+            -- Fee + sent[] only when we are the sender (debit>0). Mirrors Core
+            -- CachedTxGetAmounts: nFee = nDebit - nValueOut when nDebit>0.
+            local fee = 0
+            local sent = {}
+            if debit > 0 then
+              fee = debit - value_out
+              if fee < 0 then fee = 0 end
+              for vout_idx = 1, #tx.outputs do
+                local out = tx.outputs[vout_idx]
+                -- include_change=false: skip outputs that pay back to us
+                -- (change). Core's OutputIsChange excludes our own outputs from
+                -- the "send" list for a from-me tx.
+                if not self:_owned_addr_for_spk(out.script_pubkey) then
+                  local dest_addr = self:_address_label_for_spk(out.script_pubkey)
+                  sent[#sent + 1] = {
+                    address = dest_addr, vout = vout_idx - 1,
+                    amount = out.value, fee = fee,
+                  }
+                end
+              end
+            end
+
+            self.tx_history[txid_hex] = {
+              txid = txid,
+              txid_hex = txid_hex,
+              tx = tx,
+              height = height,
+              blockhash = bhash,
+              block_index = tx_index - 1,
+              time = btime,
+              is_coinbase = is_coinbase,
+              credit = credit,
+              debit = debit,
+              value_out = value_out,
+              fee = fee,
+              received = received,
+              sent = sent,
+            }
+          end
+        end
+      end
+    end
+  end
+end
+
+--- Best-effort destination address for an arbitrary scriptPubKey (recipient of
+--- a send). Returns the encoded address, or nil for unspendable / unknown.
+-- @param script_pubkey string
+-- @return string|nil
+function Wallet:_address_label_for_spk(script_pubkey)
+  if not script_pubkey then return nil end
+  local ok, script_type, hash_or_program = pcall(script.classify_script, script_pubkey)
+  if not ok then return nil end
+  if script_type == "p2wpkh" then
+    local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
+    return address.segwit_encode(hrp, 0, hash_or_program)
+  elseif script_type == "p2wsh" then
+    local hrp = self.network.bech32_hrp or address.BECH32_HRP[self.network.name] or "bc"
+    return address.segwit_encode(hrp, 0, hash_or_program)
+  elseif script_type == "p2tr" then
+    return address.xonly_pubkey_to_p2tr(hash_or_program, self.network.name)
+  elseif script_type == "p2pkh" then
+    return address.base58check_encode(self.network.pubkey_address_prefix, hash_or_program)
+  elseif script_type == "p2sh" then
+    return address.base58check_encode(self.network.script_address_prefix, hash_or_program)
+  end
+  return nil
+end
+
+--- Build the per-entry "transaction description" fields shared by
+--- listtransactions and gettransaction (Core WalletTxToJSON), as a plain table.
+-- @param h history entry
+-- @param tip_height number
+-- @return table
+function Wallet:_tx_description(h, tip_height)
+  local confirmations = 0
+  if tip_height and tip_height > 0 and h.height and h.height > 0 then
+    confirmations = tip_height - h.height + 1
+  elseif tip_height and h.height == 0 then
+    -- genesis-height coinbase (regtest height 0 is genesis; real coinbases
+    -- start at height 1 so this branch is for completeness only).
+    confirmations = tip_height + 1
+  end
+  local desc = {
+    confirmations = confirmations,
+    blockhash = types.hash256_hex(h.blockhash),
+    blockheight = h.height,
+    blockindex = h.block_index,
+    blocktime = h.time,
+    txid = h.txid_hex,
+    time = h.time,
+    timereceived = h.time,
+  }
+  if h.is_coinbase then desc.generated = true end
+  return desc
+end
+
+--- listtransactions backing: return up to `count` recent wallet history
+--- entries (most recent first), skipping `skip`, Core-shaped. Each on-chain tx
+--- expands to one entry per "send" output then one per "receive" output, just
+--- like Core's ListTransactions.
+-- @param count number
+-- @param skip number
+-- @param tip_height number
+-- @return table array of entries
+function Wallet:get_transactions(count, skip, tip_height)
+  count = count or 10
+  skip = skip or 0
+
+  -- Stable order: by (height, block_index). Core lists oldest→newest then the
+  -- RPC slices the tail (most recent `count`). We collect ordered then slice.
+  local ordered = {}
+  for _, h in pairs(self.tx_history) do ordered[#ordered + 1] = h end
+  table.sort(ordered, function(a, b)
+    if a.height ~= b.height then return a.height < b.height end
+    return a.block_index < b.block_index
+  end)
+
+  local entries = {}
+  for _, h in ipairs(ordered) do
+    local desc = self:_tx_description(h, tip_height)
+    -- Sent rows first (Core emits listSent before listReceived).
+    if h.debit > 0 then
+      for _, s in ipairs(h.sent) do
+        local e = {
+          address = s.address,
+          category = "send",
+          amount = -(s.amount) / consensus.COIN,
+          vout = s.vout,
+          fee = -(s.fee) / consensus.COIN,
+          abandoned = false,
+        }
+        for k, v in pairs(desc) do e[k] = v end
+        entries[#entries + 1] = e
+      end
+    end
+    -- Received rows.
+    for _, r in ipairs(h.received) do
+      local category
+      if h.is_coinbase then
+        if desc.confirmations < 1 then
+          category = "orphan"
+        elseif desc.confirmations < consensus.COINBASE_MATURITY + 1 then
+          category = "immature"
+        else
+          category = "generate"
+        end
+      else
+        category = "receive"
+      end
+      local e = {
+        address = r.address,
+        category = category,
+        amount = r.amount / consensus.COIN,
+        vout = r.vout,
+        abandoned = false,
+      }
+      for k, v in pairs(desc) do e[k] = v end
+      entries[#entries + 1] = e
+    end
+  end
+
+  -- Most-recent-`count` window (Core: ListTransactions over the whole map then
+  -- the RPC keeps the last `count` after `skip` from the end).
+  local total = #entries
+  local result = {}
+  -- Slice: take entries [total-skip-count+1 .. total-skip] (1-based), clamped.
+  local last = total - skip
+  local first = last - count + 1
+  if first < 1 then first = 1 end
+  for i = first, last do
+    if entries[i] then result[#result + 1] = entries[i] end
+  end
+  return result
+end
+
+--- gettransaction backing: return the full Core-shaped object for one txid, or
+--- nil if the tx is not wallet-relevant.
+-- @param txid_hex string
+-- @param tip_height number
+-- @return table|nil
+function Wallet:get_transaction_detail(txid_hex, tip_height)
+  local h = self.tx_history[txid_hex]
+  if not h then return nil end
+
+  -- amount = nNet - nFee  where nNet = credit - debit and, for a from-me tx,
+  -- nFee_gettx = value_out - debit (NEGATIVE). For a pure send this reduces to
+  -- credit - value_out = -(amount sent). (Core gettransaction.)
+  local net = h.credit - h.debit
+  local from_me = h.debit > 0
+  local gettx_fee = from_me and (h.value_out - h.debit) or 0  -- negative when from-me
+  local amount = (net - gettx_fee) / consensus.COIN
+
+  local result = {
+    amount = amount,
+  }
+  if from_me then
+    result.fee = gettx_fee / consensus.COIN  -- negative (paid)
+  end
+
+  local desc = self:_tx_description(h, tip_height)
+  for k, v in pairs(desc) do result[k] = v end
+
+  -- details[] : Core calls ListTransactions(fLong=false) — send rows then
+  -- receive rows, each WITHOUT the description fields.
+  local details = {}
+  if from_me then
+    for _, s in ipairs(h.sent) do
+      details[#details + 1] = {
+        address = s.address,
+        category = "send",
+        amount = -(s.amount) / consensus.COIN,
+        vout = s.vout,
+        fee = -(s.fee) / consensus.COIN,
+        abandoned = false,
+      }
+    end
+  end
+  for _, r in ipairs(h.received) do
+    local category
+    if h.is_coinbase then
+      if desc.confirmations < 1 then
+        category = "orphan"
+      elseif desc.confirmations < consensus.COINBASE_MATURITY + 1 then
+        category = "immature"
+      else
+        category = "generate"
+      end
+    else
+      category = "receive"
+    end
+    details[#details + 1] = {
+      address = r.address,
+      category = category,
+      amount = r.amount / consensus.COIN,
+      vout = r.vout,
+      abandoned = false,
+    }
+  end
+  result.details = details
+
+  -- hex: full witness serialization of the tx.
+  local ok_hex, raw = pcall(serialize.serialize_transaction, h.tx, true)
+  if ok_hex and raw then
+    result.hex = M.hex_encode(raw)
+  end
+
+  return result
 end
 
 --- Get available UTXOs (confirmed and optionally unconfirmed).

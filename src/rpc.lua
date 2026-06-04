@@ -7307,24 +7307,66 @@ function RPCServer:register_methods()
   -- @param count number: Number of transactions (default 10)
   -- @param skip number: Number to skip (default 0)
   self.methods["listtransactions"] = function(rpc, params)
-    local _label = params[1] or "*"
-    local count = params[2] or 10
-    local skip = params[3] or 0
+    local _label = (params[1] ~= nil and params[1] ~= cjson.null) and params[1] or "*"
+    local count = (params[2] ~= nil and params[2] ~= cjson.null) and tonumber(params[2]) or 10
+    local skip = (params[3] ~= nil and params[3] ~= cjson.null) and tonumber(params[3]) or 0
 
     local wallet, err = rpc:get_request_wallet()
     if not wallet then
       error({code = M.ERROR.WALLET_ERROR, message = err})
     end
 
-    -- If the wallet has a get_transactions method, use it
+    -- Rebuild wallet UTXO view + transaction history from the connected chain
+    -- (same on-demand pattern as getbalance/listunspent). scan_utxos must run
+    -- first so scan_history's owned-output detection (and the listunspent the
+    -- caller will use) see a consistent view.
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+      wallet:scan_history(rpc.chain_state, rpc.mempool)
+    end
+
     if wallet.get_transactions then
-      local txns = wallet:get_transactions(count, skip)
+      local tip = rpc.chain_state and rpc.chain_state.tip_height or 0
+      local txns = wallet:get_transactions(count, skip, tip)
       if txns and #txns > 0 then return txns end
       return setmetatable({}, cjson.empty_array_mt)
     end
 
     -- Fallback: return empty list (cjson needs empty_array_mt to encode as []).
     return setmetatable({}, cjson.empty_array_mt)
+  end
+
+  --- gettransaction: Detailed info about an in-wallet transaction.
+  -- Mirrors Bitcoin Core's gettransaction (wallet/rpc/transactions.cpp):
+  --   {amount, fee (send only), confirmations, generated (coinbase),
+  --    blockhash, blockheight, blockindex, blocktime, txid, time,
+  --    details:[{address, category, amount, vout, fee}], hex}.
+  -- @param params[1] txid string
+  self.methods["gettransaction"] = function(rpc, params)
+    local txid_hex = params[1]
+    if type(txid_hex) ~= "string" or not txid_hex:match("^[0-9a-fA-F]+$") or #txid_hex ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "parameter 1 must be hexadecimal string (not '" .. tostring(txid_hex) .. "')"})
+    end
+    txid_hex = txid_hex:lower()
+
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    if rpc.chain_state then
+      wallet:scan_utxos(rpc.chain_state)
+      wallet:scan_history(rpc.chain_state, rpc.mempool)
+    end
+
+    local tip = rpc.chain_state and rpc.chain_state.tip_height or 0
+    local detail = wallet.get_transaction_detail and wallet:get_transaction_detail(txid_hex, tip) or nil
+    if not detail then
+      -- Core: RPC_INVALID_ADDRESS_OR_KEY (-5) "Invalid or non-wallet transaction id"
+      error({code = M.ERROR.INVALID_ADDRESS,
+             message = "Invalid or non-wallet transaction id"})
+    end
+    return detail
   end
 
   --- testmempoolaccept: Dry-run mempool validation for raw transactions.
