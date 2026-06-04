@@ -136,28 +136,16 @@ function M.create_coinbase_tx(height, value, coinbase_script_extra, witness_comm
   -- Build the coinbase scriptSig: height (BIP34) + extra data
   local w = serialize.buffer_writer()
 
-  -- Encode height as minimal push (BIP34)
-  if height == 0 then
-    w.write_u8(1)
-    w.write_u8(0)
-  else
-    local h_bytes = {}
-    local h = height
-    while h > 0 do
-      h_bytes[#h_bytes + 1] = h % 256
-      h = math.floor(h / 256)
-    end
-    -- CScriptNum::serialize sign-bit guard (Core script.h ~line 366-367):
-    -- if the high bit of the last byte is set, the value would be interpreted
-    -- as negative. For positive heights, append a 0x00 padding byte.
-    if bit.band(h_bytes[#h_bytes], 0x80) ~= 0 then
-      h_bytes[#h_bytes + 1] = 0x00
-    end
-    w.write_u8(#h_bytes)
-    for _, b in ipairs(h_bytes) do
-      w.write_u8(b)
-    end
-  end
+  -- Encode height as minimal push (BIP34), byte-identical to the validator.
+  -- Reuse validation.encode_bip34_height so the miner and the consensus check
+  -- (validation.check_block, which does `CScript() << nHeight` per Core
+  -- script.h:433-448) can never disagree.  The previous inline encoder always
+  -- emitted a length-prefixed CScriptNum push, but Core / the validator use
+  -- single-byte opcodes for the small cases: OP_0 (0x00) for height 0 and
+  -- OP_1..OP_16 (0x51..0x60) for heights 1..16.  For height 1 the old code
+  -- produced 0x01 0x01 instead of the required 0x51, so every generatetoaddress
+  -- block was rejected with "bad-cb-height" (height mismatch at byte 1).
+  w.write_bytes(validation.encode_bip34_height(height))
 
   if coinbase_script_extra then
     w.write_bytes(coinbase_script_extra)
