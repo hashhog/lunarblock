@@ -3863,6 +3863,11 @@ function RPCServer:register_methods()
         error({code = M.ERROR.VERIFY_ERROR,
           message = "Failed to connect block: " .. tostring(err)})
       end
+      -- Evict confirmed txs from the mempool (Core removeForBlock) so they are
+      -- not re-selected into the next template and rejected bad-txns-BIP30.
+      if rpc.mempool then
+        rpc.mempool:on_block_connected(block)
+      end
     end
 
     local result = { hash = types.hash256_hex(block_hash) }
@@ -3990,6 +3995,17 @@ function RPCServer:register_methods()
       end
 
       block_hashes[#block_hashes + 1] = types.hash256_hex(block_hash)
+
+      -- Evict the block's now-confirmed transactions from the mempool, exactly
+      -- like the submitblock / side-branch accept paths (Core's CTxMemPool::
+      -- removeForBlock, called from BlockConnected). Without this, a tx mined
+      -- by generatetoaddress stays in the mempool, gets re-selected into the
+      -- NEXT block template, and that block is rejected bad-txns-BIP30
+      -- ("tried to overwrite transaction") — wedging block production after
+      -- the first wallet send.
+      if rpc.mempool then
+        rpc.mempool:on_block_connected(block)
+      end
 
       -- Broadcast inv to peers so they learn about the new block
       if rpc.peer_manager then
@@ -5468,15 +5484,20 @@ function RPCServer:register_methods()
     local utxos = wallet:list_unspent(include_unconfirmed)
     local result = setmetatable({}, cjson.empty_array_mt)
     for _, u in ipairs(utxos) do
+      -- wallet:list_unspent() entries carry the amount in `satoshis` (and a
+      -- pre-divided `amount` in BTC); the field is NOT named `value`. The old
+      -- `u.value / 100000000` therefore did arithmetic on nil and crashed
+      -- (rpc.lua "arithmetic on field 'value' (a nil value)"). Convert from
+      -- the satoshi field so the BTC amount is computed here consistently.
       result[#result + 1] = {
         txid = u.txid,
         vout = u.vout,
         address = u.address,
-        amount = u.value / 100000000,
+        amount = (u.satoshis or 0) / 100000000,
         confirmations = u.confirmations or 0,
-        spendable = true,
+        spendable = u.spendable ~= false,
         solvable = true,
-        safe = (u.confirmations or 0) >= min_conf,
+        safe = u.safe == true and (u.confirmations or 0) >= min_conf,
       }
     end
 
@@ -5527,12 +5548,15 @@ function RPCServer:register_methods()
       error({code = M.ERROR.WALLET_ERROR, message = err or "Failed to create transaction"})
     end
 
-    -- Return txid as hex
-    local crypto = require("lunarblock.crypto")
-    local txid = crypto.sha256d(rpc.storage and
-      require("lunarblock.serialize").serialize_transaction(tx, false) or
-      tx.txid or "")
-    return M.hex_encode(txid:reverse())
+    -- Return txid as hex. Use the canonical txid path (hash256 over the
+    -- non-witness serialization, returned in big-endian display form) — the
+    -- same path send_transaction itself uses to key self.transactions. The
+    -- old code called crypto.sha256d, which does not exist (the double-SHA256
+    -- helper is crypto.hash256 / validation.compute_txid), so sendtoaddress
+    -- moved the coins on-chain but then crashed (-32603) computing its return
+    -- value and the caller never received the txid.
+    local txid = validation.compute_txid(tx)
+    return types.hash256_hex(txid)
   end
 
   --- bumpfee: BIP-125 RBF fee bump of an own wallet transaction.
