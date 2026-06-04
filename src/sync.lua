@@ -771,8 +771,53 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
   io.stdout:write(string.format("  Loaded %d headers, computing work...\n", loaded))
   io.stdout:flush()
 
-  -- Forward pass: compute total_work incrementally from genesis to tip
-  local cumulative_work = 0
+  -- Snapshot-bootstrap seed (the too-little-chainwork near-tip stall fix):
+  --
+  -- On a snapshot-bootstrapped datadir the backward walk above stops at the
+  -- snapshot base (its parent header is never downloaded), so the in-memory
+  -- chain spans base..tip, NOT genesis..tip.  The forward pass below
+  -- accumulates total_work from ZERO, which discards the base's REAL
+  -- cumulative chainwork (the assumeutxo `chain_work`, ~8.85e28 for mainnet
+  -- 944183 — well above min_chain_work ~4.22e28).  The result: every
+  -- post-base header carries total_work ~(tip-base)*per_block ≈ 4.8e27, which
+  -- is BELOW min_chain_work, so accept_header step 8 rejects the next batch
+  -- with "too-little-chainwork".  During IBD a FULL 2000-header batch is
+  -- recovered via the PRESYNC/REDOWNLOAD low-work path (min_pow_checked), but
+  -- once the node reaches the real tip the final PARTIAL batch (<2000) is NOT
+  -- eligible for PRESYNC (try_low_work_sync requires a full batch) and wedges
+  -- ~200 blocks short of tip in a permanent too-little-chainwork reconnect
+  -- loop.  This is exactly main.lua's inject_snapshot_base LAYER-1 seed, which
+  -- only fires on a FRESH bootstrap (header tip strictly below the chainstate
+  -- tip) and is skipped on restart (tips equal) — so the seed must be
+  -- re-applied here on every load of a snapshot datadir.
+  --
+  -- We seed cumulative_work so that the BASE block's total_work equals the
+  -- assumeutxo cumulative chain_work (which already includes the base block's
+  -- own work, matching inject_snapshot_base's total_work argument).  All
+  -- blocks above the base then accumulate normally on top of the real seed.
+  local seed_cumulative_work = 0
+  local base_height = self.snapshot_base_height
+  if base_height and base_height > 0 then
+    local au_data = consensus.assumeutxo_for_height(self.network, base_height)
+    if au_data and au_data.chain_work then
+      local base_chain_work = consensus.work_float_from_hex(au_data.chain_work)
+      local base_hex = self.height_to_hash[base_height]
+      local base_entry = base_hex and self.headers[base_hex]
+      if base_entry and base_entry.header then
+        -- Pre-subtract the base block's own work so that when the forward
+        -- pass adds it back, base_entry.total_work == base_chain_work.
+        seed_cumulative_work = base_chain_work - self:work_for_bits(base_entry.header.bits)
+        io.stdout:write(string.format(
+          "  [snapshot-seed] base height=%d seeded with assumeutxo chain_work (=%.4e)\n",
+          base_height, base_chain_work))
+        io.stdout:flush()
+      end
+    end
+  end
+
+  -- Forward pass: compute total_work incrementally from the chain start
+  -- (genesis, or the snapshot base when bootstrapped) to tip.
+  local cumulative_work = seed_cumulative_work
   for h = 0, tip_height do
     local hash_hex = self.height_to_hash[h]
     if hash_hex then
