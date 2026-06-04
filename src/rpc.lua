@@ -3907,6 +3907,15 @@ function RPCServer:register_methods()
   self.methods["generatetoaddress"] = function(rpc, params)
     local nblocks = params[1]
     local address = params[2]
+    -- A wallet that mines blocks is live — mark it scanned so its subsequent
+    -- getbalance / listunspent credit normally (no explicit rescan needed for a
+    -- wallet that produced the chain itself). Only the request-context wallet is
+    -- marked; node-level mining (no bound wallet) is left untouched so it can't
+    -- accidentally flip an unrelated default wallet live.
+    do
+      local rw = rpc.request_wallet
+      if rw and rw.mark_scanned then rw:mark_scanned() end
+    end
     if type(nblocks) ~= "number" or nblocks < 1 then
       error({code = M.ERROR.INVALID_PARAMS, message = "Invalid nblocks"})
     end
@@ -5521,6 +5530,11 @@ function RPCServer:register_methods()
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
     end
 
+    -- A wallet that spends is live: mark it scanned so the scan_utxos below
+    -- credits its coins (a wallet that funded itself + sends does not require an
+    -- explicit rescan first).
+    if wallet.mark_scanned then wallet:mark_scanned() end
+
     local addr = params[1] or params.address
     local amount = params[2] or params.amount
 
@@ -6117,10 +6131,18 @@ function RPCServer:register_methods()
     end
   end
 
-  --- importprivkey: Import a private key.
-  -- @param privkey string: Private key in WIF format
-  -- @param label string: (ignored)
-  -- @param rescan boolean: (ignored)
+  --- importprivkey: Import a WIF private key into the wallet.
+  --
+  -- Mirrors Bitcoin Core wallet/rpc/backup.cpp::importprivkey: decode the WIF,
+  -- register the key's standard scripts as an imported key (held apart from the
+  -- HD keychain so a restore-from-seed / reseed never wipes it), and — when
+  -- rescan is true (the default) — rescan the chain so the key's already-on-chain
+  -- funds are credited into the wallet ledger.
+  --
+  -- @param params[1] privkey string: private key in WIF format
+  -- @param params[2] label   string: optional label (best-effort; ignored)
+  -- @param params[3] rescan  boolean: rescan the chain after import (default true)
+  -- @return null
   self.methods["importprivkey"] = function(rpc, params)
     local wallet, err = rpc:get_request_wallet()
     if not wallet then
@@ -6135,13 +6157,34 @@ function RPCServer:register_methods()
     if not wif then
       error({code = M.ERROR.INVALID_PARAMS, message = "privkey is required"})
     end
+    -- rescan defaults to true (Core). Only an explicit false / null disables it.
+    local do_rescan = params[3]
+    if do_rescan == nil then do_rescan = params.rescan end
+    if do_rescan == nil or do_rescan == cjson.null then do_rescan = true end
 
-    local addr, import_err = wallet:import_privkey(wif)
+    -- import_privkey can throw (assert on a wrong-network WIF prefix) — wrap it.
+    local ok, addr_or_err, import_err = pcall(function()
+      return wallet:import_privkey(wif)
+    end)
+    if not ok then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Invalid private key: " .. tostring(addr_or_err)})
+    end
+    local addr = addr_or_err
     if not addr then
       error({code = M.ERROR.WALLET_ERROR, message = import_err or "Invalid private key"})
     end
 
-    -- Save wallet
+    -- Rescan the chain so the imported key's existing funds are credited.
+    if do_rescan and rpc.chain_state then
+      local rok, rerr = wallet:rescan(rpc.chain_state, rpc.mempool)
+      if not rok then
+        error({code = M.ERROR.WALLET_ERROR,
+               message = "importprivkey rescan failed: " .. tostring(rerr)})
+      end
+    end
+
+    -- Save wallet (persists the imported key so it survives reload / reseed).
     if rpc.wallet_manager then
       for name, w in pairs(rpc.wallet_manager.wallets) do
         if w == wallet then
@@ -6153,6 +6196,57 @@ function RPCServer:register_methods()
     end
 
     return cjson.null
+  end
+
+  --- rescanblockchain: rescan the local blockchain for wallet-related txs.
+  --
+  -- Mirrors Bitcoin Core wallet/rpc/transactions.cpp::rescanblockchain
+  -- (CWallet::ScanForWalletTransactions): walk the existing chain over
+  -- [start_height, stop_height] crediting outputs that pay wallet-owned scripts
+  -- into the wallet UTXO ledger + history (the BACKWARD counterpart of the
+  -- block-connect scan), and return the {start_height, stop_height} actually
+  -- scanned. This is the REAL wallet rescan — distinct from scantxoutset, which
+  -- scans the chainstate UTXO set without ever touching a wallet.
+  --
+  -- @param params[1] start_height number: optional, default 0
+  -- @param params[2] stop_height  number: optional, default current tip
+  -- @return table: { start_height, stop_height }
+  self.methods["rescanblockchain"] = function(rpc, params)
+    local wallet, err = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "No chain state available"})
+    end
+
+    local start_height = params[1] or params.start_height
+    local stop_height  = params[2] or params.stop_height
+    if start_height == cjson.null then start_height = nil end
+    if stop_height == cjson.null then stop_height = nil end
+
+    local res, rerr = wallet:rescan(rpc.chain_state, rpc.mempool, start_height, stop_height)
+    if not res then
+      error({code = M.ERROR.INVALID_PARAMS, message = rerr or "rescan failed"})
+    end
+
+    -- Persist the now-scanned wallet so a reload stays live.
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then
+          local ok = pcall(function()
+            wallet:save(rpc.wallet_manager:get_wallet_path(name))
+          end)
+          _ = ok
+          break
+        end
+      end
+    end
+
+    return {
+      start_height = res.start_height,
+      stop_height = res.stop_height,
+    }
   end
 
   ----------------------------------------------------------------------------
