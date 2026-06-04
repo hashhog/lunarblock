@@ -178,6 +178,14 @@ function M.decode_dump(data)
 
   local pr = serialize.buffer_reader(payload)
   local count = pr.read_u64le()
+  -- A truncated/malformed payload makes read_u64le return nil; `for i = 1, nil` then
+  -- crashes the whole node at startup ("'for' limit must be a number"). Guard it.
+  if type(count) ~= "number" then
+    return nil, "truncated mempool dump: missing entry count"
+  end
+  if count < 0 or count > 100000000 then
+    return nil, "implausible mempool entry count: " .. tostring(count)
+  end
   local entries = {}
   for i = 1, count do
     local tx = serialize.deserialize_transaction(pr)
@@ -261,7 +269,13 @@ function M.load(mempool, path, opts)
   end
   local data = f:read("*a")
   f:close()
-  local parsed, perr = M.decode_dump(data)
+  -- A corrupt/truncated/incompatible mempool.dat must NEVER crash the node on startup
+  -- (Core treats a bad mempool.dat as non-fatal and just skips it). Decode under pcall
+  -- so any decoder error becomes a clean "skip the mempool", not a fatal Lua error.
+  local ok, parsed, perr = pcall(M.decode_dump, data)
+  if not ok then
+    return false, "mempool dump decode failed: " .. tostring(parsed)
+  end
   if not parsed then
     return false, perr
   end
