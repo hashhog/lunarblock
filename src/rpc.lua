@@ -1738,6 +1738,148 @@ function RPCServer:register_methods()
     return types.hash256_hex(types.hash256_zero())
   end
 
+  --- getchaintxstats ( nblocks "blockhash" )
+  -- Compute statistics about the total number and rate of transactions in the
+  -- chain.  Core-shaped: bitcoin-core/src/rpc/blockchain.cpp getchaintxstats
+  -- (1809-1898).  Both args optional.
+  --   nblocks   default = "one month" = 30*24*60*60 / nPowTargetSpacing (4320
+  --             on the 600s networks); on a short chain the default clamps to
+  --             max(0, min(default, pindex.height - 1)).
+  --   blockhash default = active chain tip; else must be a block in the active
+  --             main chain (else error -8) and must exist (else error -5).
+  -- Output object fields and emit conditions mirror Core exactly:
+  --   time                       — final block's RAW header nTime (NOT mediantime)
+  --   txcount                    — cumulative #txs genesis..pindex (m_chain_tx_count)
+  --   window_final_block_hash    — pindex block hash hex
+  --   window_final_block_height  — pindex height
+  --   window_block_count         — the resolved nblocks
+  --   window_interval (opt)      — MTP(pindex) - MTP(pindex - nblocks); only when nblocks>0
+  --   window_tx_count (opt)      — txcount(pindex) - txcount(pindex - nblocks);
+  --                                only when nblocks>0 and both endpoints have a txcount
+  --   txrate (opt)               — window_tx_count / window_interval; only when interval>0
+  self.methods["getchaintxstats"] = function(rpc, params)
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+
+    local tip_height = rpc.chain_state.tip_height or 0
+    local tip_hash = rpc.chain_state.tip_hash
+
+    -- Resolve pindex (the final block of the window).
+    local final_hash, final_height
+    local blockhash_arg = params[2]
+    if blockhash_arg == nil or blockhash_arg == cjson.null then
+      -- Default: active chain tip.
+      final_hash = tip_hash or types.hash256_zero()
+      final_height = tip_height
+    else
+      if type(blockhash_arg) ~= "string" or #blockhash_arg ~= 64 then
+        error({code = M.ERROR.INVALID_PARAMS, message = "blockhash must be of length 64 (not " ..
+          tostring(type(blockhash_arg) == "string" and #blockhash_arg or "?") .. ")"})
+      end
+      local hash = types.hash256_from_hex(blockhash_arg)
+      local header = rpc.storage.get_header(hash)
+      if not header then
+        -- RPC_INVALID_ADDRESS_OR_KEY (-5): "Block not found"
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+      end
+      -- Determine the block's height and verify active-main-chain membership:
+      -- the active-chain HEIGHT_INDEX maps height -> active block, so a block
+      -- is in the main chain iff get_hash_by_height(h) == hash for its height.
+      local block_height = nil
+      local iter = rpc.storage.iterator("height")
+      if iter then
+        iter.seek_to_first()
+        while iter.valid() do
+          local v = iter.value()
+          if v and #v == 32 and v == hash.bytes then
+            local k = iter.key()
+            block_height = k:byte(1) * 16777216 + k:byte(2) * 65536
+                         + k:byte(3) * 256 + k:byte(4)
+            break
+          end
+          iter.next()
+        end
+        iter.destroy()
+      end
+      if not block_height then
+        -- Header exists but no active-chain height maps to it -> side branch.
+        -- RPC_INVALID_PARAMETER (-8): "Block is not in main chain"
+        error({code = M.ERROR.INVALID_PARAMS_RANGE or -8,
+               message = "Block is not in main chain"})
+      end
+      final_hash = hash
+      final_height = block_height
+    end
+
+    -- Default nblocks: one month of blocks for this network.
+    local spacing = rpc.network and rpc.network.pow_target_spacing or 600
+    local default_blockcount = math.floor(30 * 24 * 60 * 60 / spacing)
+    local blockcount
+    local nblocks_arg = params[1]
+    if nblocks_arg == nil or nblocks_arg == cjson.null then
+      -- max(0, min(default, height - 1))
+      blockcount = math.max(0, math.min(default_blockcount, final_height - 1))
+    else
+      if type(nblocks_arg) ~= "number" then
+        error({code = M.ERROR.INVALID_PARAMS, message = "nblocks must be a number"})
+      end
+      blockcount = math.floor(nblocks_arg)
+      if blockcount < 0 or (blockcount > 0 and blockcount >= final_height) then
+        -- RPC_INVALID_PARAMETER (-8)
+        error({code = M.ERROR.INVALID_PARAMS_RANGE or -8,
+               message = "Invalid block count: should be between 0 and the block's height - 1"})
+      end
+    end
+
+    -- past_block = ancestor at (final_height - blockcount) on the active chain.
+    local past_height = final_height - blockcount
+    local past_hash = rpc.storage.get_hash_by_height(past_height)
+
+    -- time = the FINAL block's RAW header nTime (NOT mediantime).
+    local final_header = rpc.storage.get_header(final_hash)
+    local final_time = final_header and final_header.timestamp or 0
+
+    -- window_interval uses MEDIAN-TIME-PAST (11-block window), not raw times.
+    local final_mtp = get_median_time_past(rpc.storage, final_hash)
+    local past_mtp = past_hash and get_median_time_past(rpc.storage, past_hash) or final_mtp
+    local time_diff = final_mtp - past_mtp
+
+    -- Cumulative tx counts (m_chain_tx_count analogue).
+    local final_txcount = rpc.storage.get_chaintx_at_height(final_height)
+    local past_txcount = rpc.storage.get_chaintx_at_height(past_height)
+
+    -- Build the response object preserving Core's key order. cjson cannot
+    -- guarantee table key order, so emit raw JSON to match Core's field order
+    -- and to control integer-vs-float typing of txrate.
+    local parts = {}
+    parts[#parts + 1] = string.format('"time":%d', final_time)
+    if final_txcount and final_txcount ~= 0 then
+      parts[#parts + 1] = string.format('"txcount":%d', final_txcount)
+    end
+    parts[#parts + 1] = string.format('"window_final_block_hash":"%s"',
+                                      types.hash256_hex(final_hash))
+    parts[#parts + 1] = string.format('"window_final_block_height":%d', final_height)
+    parts[#parts + 1] = string.format('"window_block_count":%d', blockcount)
+    if blockcount > 0 then
+      parts[#parts + 1] = string.format('"window_interval":%d', time_diff)
+      if final_txcount and final_txcount ~= 0 and past_txcount and past_txcount ~= 0 then
+        local window_tx_count = final_txcount - past_txcount
+        parts[#parts + 1] = string.format('"window_tx_count":%d', window_tx_count)
+        if time_diff > 0 then
+          -- txrate is a double in Core (window_tx_count / nTimeDiff).
+          parts[#parts + 1] = string.format('"txrate":%.16g',
+                                            window_tx_count / time_diff)
+        end
+      end
+    end
+
+    return { _raw_json = "{" .. table.concat(parts, ",") .. "}" }
+  end
+
   -- W70: canonical sync-state RPC. See spec/getsyncstate.md in the
   -- hashhog meta-repo for the full field-by-field contract.
   self.methods["getsyncstate"] = function(rpc, _params)
