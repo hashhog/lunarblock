@@ -1288,9 +1288,12 @@ describe("mempool", function()
         assert.is_true(mp:is_replaceable(child_hex))
 
         -- Replacement of child (spending different output, conflicting by spending same parent output)
+        -- Output value 600 (> the ~546-sat P2PKH dust threshold) so the tx is not
+        -- caught by the ephemeral-dust 0-fee gate, while still leaving a higher
+        -- fee (5000-600=4400) than the original child (5000-1000=4000) for RBF.
         local replace_tx = make_tx(1, {}, {}, 0)
         replace_tx.inputs[1] = make_input(parent_txid, 1, 0xFFFFFFFD)
-        replace_tx.outputs[1] = make_output(500)  -- Higher fee
+        replace_tx.outputs[1] = make_output(600)  -- Higher fee, above dust
 
         local ok3, replace_hex = mp:accept_transaction(replace_tx)
         assert.is_true(ok3)
@@ -2125,7 +2128,17 @@ describe("mempool", function()
     end)
 
     describe("mempool acceptance with P2A", function()
-      it("accepts tx with zero-value P2A anchor output", function()
+      it("rejects fee-paying tx with zero-value P2A anchor output (ephemeral 0-fee gate)", function()
+        -- A zero-value P2A output is dust (P2A is NOT IsUnspendable, so it gets a
+        -- nonzero dust threshold and value 0 < threshold).  Core's
+        -- PreCheckEphemeralTx (policy/ephemeral_policy.cpp:23-31) requires any tx
+        -- carrying a dust output to pay ZERO fee, so a FEE-paying tx with a
+        -- zero-value P2A anchor is rejected with reason "dust".  Verified against
+        -- the box's bitcoind v31.99: testmempoolaccept ->
+        --   {"allowed": false, "reject-reason": "dust",
+        --    "reject-details": "dust, tx with dust output must be 0-fee"}.
+        -- The legitimate ephemeral-anchor use is a 0-fee parent CPFP'd by a child
+        -- inside a PACKAGE, not a standalone fee-paying tx.
         local prev_txid = types.hash256(string.rep("\x01", 32))
         local prev_txid_hex = types.hash256_hex(prev_txid)
 
@@ -2136,13 +2149,12 @@ describe("mempool", function()
 
         local tx = make_tx(1, {}, {}, 0)
         tx.inputs[1] = make_input(prev_txid, 0)
-        tx.outputs[1] = make_output(90000)  -- Normal output
-        tx.outputs[2] = make_output(0, P2A_SCRIPT)  -- P2A anchor
+        tx.outputs[1] = make_output(90000)  -- Normal output (10000 sat fee)
+        tx.outputs[2] = make_output(0, P2A_SCRIPT)  -- P2A anchor (dust)
 
-        local ok, txid_hex, fee = mp:accept_transaction(tx)
-        assert.is_true(ok)
-        assert.is_string(txid_hex)
-        assert.equal(10000, fee)
+        local ok, err = mp:accept_transaction(tx)
+        assert.is_false(ok)
+        assert.truthy(err:match("dust"))
       end)
 
       it("rejects tx with non-zero P2A anchor output", function()

@@ -1096,6 +1096,10 @@ function Mempool:accept_transaction(tx, allow_rbf)
   if dust_count > 1 then
     return false, "dust"
   end
+  -- NOTE: a single dust output is allowed HERE (the IsStandardTx gate), but is
+  -- still subject to the ephemeral-dust 0-fee gate enforced AFTER the fee is
+  -- known (step 5b2 below, Core PreCheckEphemeralTx).  dust_count remains in
+  -- scope for that check.
 
   -- 2c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
   -- Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp ~line 819).
@@ -1249,6 +1253,22 @@ function Mempool:accept_transaction(tx, allow_rbf)
   local fee = input_total - output_total
   if fee < 0 then
     return false, "outputs exceed inputs"
+  end
+
+  -- 5b2. Ephemeral-dust 0-fee gate (Bitcoin Core PreCheckEphemeralTx,
+  -- policy/ephemeral_policy.cpp:23-31, called from validation.cpp PreChecks
+  -- ~line 934-939 when require_standard is set).  The IsStandardTx gate above
+  -- permits up to MAX_DUST_OUTPUTS_PER_TX (=1) dust outputs to support
+  -- ephemeral anchors, but Core ADDITIONALLY requires that a tx carrying ANY
+  -- dust output pay ZERO fee — "we never want to give incentives to mine this
+  -- transaction alone".  A fee-paying tx with a dust output is rejected with
+  -- reason "dust" / "tx with dust output must be 0-fee".  Without this gate a
+  -- fee-paying single-dust tx was accepted by lunarblock that BOTH strict and
+  -- default Core reject (genuine relay-policy hole).  dust_count was computed
+  -- in step 2b5 above (GetDust); reuse it here now that the fee is known.
+  -- Reference: bitcoin-core/src/policy/ephemeral_policy.cpp:23-31.
+  if dust_count > 0 and fee ~= 0 then
+    return false, "dust: tx with dust output must be 0-fee"
   end
 
   -- 5b. BIP-68 SequenceLocks: per-input relative locktimes (CSV).
