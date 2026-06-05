@@ -1880,6 +1880,114 @@ function RPCServer:register_methods()
     return { _raw_json = "{" .. table.concat(parts, ",") .. "}" }
   end
 
+  --- getindexinfo ( "index_name" )
+  -- Returns the status of one or all available indices currently running in
+  -- the node.  Core-shaped: bitcoin-core/src/rpc/node.cpp getindexinfo
+  -- (363-410) + SummaryToJSON (351-361).
+  --
+  -- SHAPE: a dynamic JSON OBJECT keyed by index name.  For each *running*
+  -- index Core pushes one entry whose value has EXACTLY two fields, in THIS
+  -- ORDER:
+  --   { "<index name>": { "synced": <bool>, "best_block_height": <int> } }
+  -- Nothing else — no best_hash / best_block_hash / name-inside-the-value.
+  --
+  -- INDEX NAMES are the literal Core GetName() strings:
+  --   "txindex"                    (index/txindex.cpp:69)
+  --   "basic block filter index"   (index/blockfilterindex.cpp:78 =
+  --                                 BlockFilterTypeName(BASIC)+" block filter index")
+  -- An index appears ONLY if it is enabled/running (Core guards each with
+  -- if (g_txindex){...} / ForEachBlockFilterIndex(...)).  lunarblock runs at
+  -- most these two; coinstatsindex / txospenderindex are not implemented, so
+  -- they are never listed (Core only lists running ones).
+  --
+  -- VALUE SEMANTICS (GetSummary, index/base.cpp:472-484):
+  --   best_block_height = the height the index reached (0 if no best block).
+  --   synced            = whether the index has caught up to the chain tip.
+  -- In lunarblock both indexes are maintained inline inside connect_block's
+  -- atomic batch (see utxo.lua ChainState ctor notes), so an enabled index's
+  -- best height is always exactly the active chain tip and there is no
+  -- partial-sync window: the index is synced iff the block tip has caught up
+  -- to the header tip.  The filter index additionally persists its height in
+  -- CF.META["filterindex_height"] (4-byte LE); the txindex's best height IS
+  -- the chain tip (no separate counter in the inline path).
+  --
+  -- ARG index_name (optional, positional 0): filters to a single index.  An
+  -- entry is dropped when index_name is non-empty AND != the index's name, so
+  -- getindexinfo "txindex" returns only {"txindex":{...}} and
+  -- getindexinfo "no-such-index" returns {} (empty object, NOT an error).
+  self.methods["getindexinfo"] = function(rpc, params)
+    -- Resolve the optional name filter (positional 0).  Empty / omitted /
+    -- null = all running indexes.
+    local index_name = params and params[1]
+    if index_name == nil or index_name == cjson.null then
+      index_name = ""
+    end
+    if type(index_name) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "index_name must be a string"})
+    end
+
+    -- Chain tip height (== inline-index best height when enabled).  Header
+    -- tip drives the "synced" decision: an enabled inline index is synced iff
+    -- the block tip has caught up to the header tip.
+    local tip_height = (rpc.chain_state and rpc.chain_state.tip_height) or 0
+    local header_tip_height = tip_height
+    if rpc.header_chain and rpc.header_chain.header_tip_height
+        and rpc.header_chain.header_tip_height >= 0 then
+      header_tip_height = rpc.header_chain.header_tip_height
+    end
+
+    -- Read the filter index's persisted best height from CF.META (4-byte LE),
+    -- matching the encoding written inline in utxo.lua connect_block.  Falls
+    -- back to the chain tip when the meta key is absent (e.g. genesis-only).
+    local function read_meta_height_le(key)
+      if not (rpc.storage and rpc.storage.get and rpc.storage.CF) then
+        return nil
+      end
+      local ok, data = pcall(rpc.storage.get, rpc.storage.CF.META, key)
+      if ok and data and #data >= 4 then
+        local r = serialize.buffer_reader(data)
+        return r.read_u32le()
+      end
+      return nil
+    end
+
+    -- Build one Core-shaped entry, honoring the name filter.  Returns the raw
+    -- JSON fragment `"name":{"synced":...,"best_block_height":...}` or nil
+    -- when the filter drops it.  Order is fixed: synced, then height.
+    local fragments = {}
+    local function push_entry(name, synced, best_height)
+      if index_name ~= "" and index_name ~= name then
+        return
+      end
+      -- cjson.encode of a Lua string yields a properly-quoted JSON string;
+      -- the two index names are plain ASCII so no escaping surprises.
+      fragments[#fragments + 1] = string.format(
+        '%s:{"synced":%s,"best_block_height":%d}',
+        cjson.encode(name),
+        synced and "true" or "false",
+        best_height)
+    end
+
+    -- Emit in Core's order: txindex first, then the basic block filter index.
+    if rpc.chain_state and rpc.chain_state.txindex_enabled then
+      -- Inline txindex is always at the chain tip when enabled.
+      local synced = tip_height >= header_tip_height
+      push_entry("txindex", synced, tip_height)
+    end
+
+    if rpc.chain_state and rpc.chain_state.filterindex_enabled then
+      local best = read_meta_height_le("filterindex_height")
+      if best == nil then best = tip_height end
+      -- Inline filter index advances atomically with the tip; synced once the
+      -- block tip has caught the header tip and the index reached the tip.
+      local synced = (tip_height >= header_tip_height) and (best >= tip_height)
+      push_entry("basic block filter index", synced, best)
+    end
+
+    return { _raw_json = "{" .. table.concat(fragments, ",") .. "}" }
+  end
+
   -- W70: canonical sync-state RPC. See spec/getsyncstate.md in the
   -- hashhog meta-repo for the full field-by-field contract.
   self.methods["getsyncstate"] = function(rpc, _params)
