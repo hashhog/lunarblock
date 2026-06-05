@@ -237,6 +237,8 @@ M.ERROR = {
   INVALID_ADDRESS = -5,
   INSUFFICIENT_FUNDS = -6,
   OUT_OF_MEMORY = -7,
+  INVALID_PARAMETER = -8,  -- RPC_INVALID_PARAMETER (Core: protocol.h)
+  CLIENT_INVALID_IP_OR_SUBNET = -30,  -- RPC_CLIENT_INVALID_IP_OR_SUBNET
   DESERIALIZATION_ERROR = -22,
   VERIFY_ERROR = -25,
   VERIFY_REJECTED = -26,
@@ -3014,6 +3016,187 @@ function RPCServer:register_methods()
     rpc.peer_manager.banned = {}
     rpc.peer_manager:_save_bans()
     return nil
+  end
+
+  -- ────────────────────────────────────────────────────────────────────
+  -- getnodeaddresses / addpeeraddress  (P2P addrman dump + injector)
+  -- ────────────────────────────────────────────────────────────────────
+  --
+  -- Core ref: bitcoin-core/src/rpc/net.cpp:911-970 (getnodeaddresses),
+  -- :972-1030 (addpeeraddress), src/netbase.cpp:100-128
+  -- (ParseNetwork / GetNetworkName).
+  --
+  -- getnodeaddresses ( count "network" ) returns a JSON ARRAY of objects,
+  -- each with EXACTLY 5 keys in THIS ORDER:
+  --   time     NUM_TIME  unix seconds (integer)
+  --   services NUM       raw services bitfield as an INTEGER (not hex)
+  --   address  STR       ToStringAddr — ip literal / .onion / .b32.i2p
+  --   port     NUM       integer
+  --   network  STR       ipv4|ipv6|onion|i2p|cjdns|not_publicly_routable|internal
+  --
+  -- Source is the addrman; Core's GetAddressesUnsafe SHUFFLES the result so
+  -- callers must treat order as non-deterministic.  We walk the existing
+  -- peerman.known_addresses map (keyed "ip:port" with
+  -- {ip,addr_str,addr_bytes,port,services,timestamp,network_id,...}).
+  --
+  -- ParseNetwork lowercases and accepts ONLY ipv4|ipv6|onion|i2p|cjdns;
+  -- anything else is NET_UNROUTABLE → error -8.  count<0 → error -8.
+
+  -- Map a known-address entry to the Core network-name string
+  -- (GetNetworkName(addr.GetNetClass())).  We prefer an explicit
+  -- network_id (from BIP155 addrv2); otherwise classify by the textual
+  -- address form, mirroring CNetAddr::GetNetClass().
+  local function _classify_network(info)
+    local p2p = require("lunarblock.p2p")
+    local nid = info.network_id
+    if nid == p2p.NET_ID.IPV4 then return "ipv4" end
+    if nid == p2p.NET_ID.IPV6 then return "ipv6" end
+    if nid == p2p.NET_ID.TORV3 or nid == p2p.NET_ID.TORV2 then return "onion" end
+    if nid == p2p.NET_ID.I2P then return "i2p" end
+    if nid == p2p.NET_ID.CJDNS then return "cjdns" end
+    -- No network_id — classify by the address string form.
+    local s = info.addr_str or info.ip
+    if type(s) == "string" then
+      if s:match("%.onion$") then return "onion" end
+      if s:match("%.b32%.i2p$") or s:match("%.i2p$") then return "i2p" end
+      if s:match("^%d+%.%d+%.%d+%.%d+$") then return "ipv4" end
+      if s:find(":", 1, true) then return "ipv6" end
+    end
+    return "not_publicly_routable"
+  end
+
+  -- The address literal Core emits via ToStringAddr (no port).
+  local function _addr_string(info)
+    return info.addr_str or info.ip or ""
+  end
+
+  self.methods["getnodeaddresses"] = function(rpc, params)
+    -- count: positional 0, default 1.  0 means "return ALL known".
+    local count_arg = params and params[1]
+    local count
+    if count_arg == nil or count_arg == cjson.null then
+      count = 1
+    else
+      if type(count_arg) ~= "number" then
+        error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type string is not of expected type number"})
+      end
+      count = math.floor(count_arg)
+    end
+    if count < 0 then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Address count out of range"})
+    end
+
+    -- network: positional 1, optional.  ParseNetwork lowercases and
+    -- accepts ONLY ipv4|ipv6|onion|i2p|cjdns; anything else → -8.
+    local net_arg = params and params[2]
+    local net_filter = nil
+    if net_arg ~= nil and net_arg ~= cjson.null then
+      if type(net_arg) ~= "string" then
+        error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type is not of expected type string"})
+      end
+      local lowered = net_arg:lower()
+      local valid = { ipv4 = true, ipv6 = true, onion = true, i2p = true, cjdns = true }
+      if not valid[lowered] then
+        error({code = M.ERROR.INVALID_PARAMETER, message = "Network not recognized: " .. net_arg})
+      end
+      net_filter = lowered
+    end
+
+    -- Walk known_addresses.  Filter by network if requested.
+    local matched = {}
+    if rpc.peer_manager and rpc.peer_manager.known_addresses then
+      for _, info in pairs(rpc.peer_manager.known_addresses) do
+        local netname = _classify_network(info)
+        if net_filter == nil or netname == net_filter then
+          matched[#matched + 1] = { info = info, netname = netname }
+        end
+      end
+    end
+
+    -- Shuffle (Core's GetAddressesUnsafe returns a shuffled list).
+    -- Fisher–Yates so callers can never depend on insertion order.
+    for i = #matched, 2, -1 do
+      local j = math.random(i)
+      matched[i], matched[j] = matched[j], matched[i]
+    end
+
+    -- count==0 → all; otherwise cap at count.
+    local limit = (count == 0) and #matched or math.min(count, #matched)
+
+    -- Build the JSON array by hand so the 5 keys appear in Core's exact
+    -- order (cjson does not preserve table key order).
+    local function json_str(s)
+      return cjson.encode(tostring(s))
+    end
+    local parts = {}
+    for idx = 1, limit do
+      local m = matched[idx]
+      local info = m.info
+      local services = math.floor(tonumber(info.services) or 0)
+      local time_sec = math.floor(tonumber(info.timestamp) or 0)
+      local port = math.floor(tonumber(info.port) or 0)
+      parts[#parts + 1] = table.concat({
+        "{",
+        '"time":', tostring(time_sec), ",",
+        '"services":', tostring(services), ",",
+        '"address":', json_str(_addr_string(info)), ",",
+        '"port":', tostring(port), ",",
+        '"network":', json_str(m.netname),
+        "}",
+      })
+    end
+    local json = "[" .. table.concat(parts, ",") .. "]"
+    return { _raw_json = json }
+  end
+
+  -- addpeeraddress "address" port ( tried )  — testing-only addrman
+  -- injector (Core: net.cpp:972).  Inserts a routable address into our
+  -- known_addresses pool.  Returns {"success": bool}.
+  self.methods["addpeeraddress"] = function(rpc, params)
+    local p2p = require("lunarblock.p2p")
+    local addr = params and params[1]
+    local port = params and params[2]
+    -- params[3] = tried (bool) — we have no separate tried table; accepted
+    -- and treated as advisory (the address still lands in known_addresses).
+    if type(addr) ~= "string" or addr == "" then
+      error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type null is not of expected type string"})
+    end
+    if type(port) ~= "number" then
+      error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type null is not of expected type number"})
+    end
+    port = math.floor(port)
+    if port < 0 or port > 65535 then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Port out of range"})
+    end
+
+    if not rpc.peer_manager then
+      error({code = M.ERROR.MISC_ERROR, message = "peer manager not available"})
+    end
+
+    -- Core requires a valid IP (LookupHost) and a routable address
+    -- (AddrMan::Add rejects non-routable).  We accept dotted-decimal
+    -- IPv4 / bracketless IPv6 literals; non-routable → success=false.
+    local pm = require("lunarblock.peerman")
+    local is_ipv4 = addr:match("^%d+%.%d+%.%d+%.%d+$") ~= nil
+    if is_ipv4 and not pm.is_routable(addr) then
+      return { success = false }
+    end
+
+    -- Mirror Core: services = NODE_NETWORK | NODE_WITNESS, nTime = now.
+    local services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS)
+    local added = rpc.peer_manager:add_known_address(addr, port, services, os.time())
+    -- If the entry already existed add_known_address returns false; Core's
+    -- addrman would still report success on a duplicate insert path
+    -- (Add returns true when the addr is present/refreshed).  Treat a
+    -- duplicate as success too, matching Core's "already known" behavior.
+    if not added then
+      local key = addr .. ":" .. port
+      if rpc.peer_manager.known_addresses[key] then
+        return { success = true }
+      end
+      return { success = false }
+    end
+    return { success = true }
   end
 
   -- Fee estimation
