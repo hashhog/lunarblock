@@ -564,6 +564,55 @@ function M.open(path, cache_size_mb)
     dbobj.put(M.CF.META, "chain_tip", w.result(), sync)
   end
 
+  -- High-level helpers: cumulative transaction count by height
+  -- (Bitcoin Core's CBlockIndex::m_chain_tx_count analogue — the total number
+  -- of transactions in the chain from genesis up to and including the block at
+  -- this height).  Stored as an 8-byte little-endian count keyed by the same
+  -- 4-byte big-endian height encoding the HEIGHT_INDEX uses, in CF.META under
+  -- the "chaintx:" prefix.  Maintained as an O(1) running counter in
+  -- connect_block (prev_cumulative + #block.transactions) and read by the
+  -- getchaintxstats RPC.  Because each height key is overwritten by the
+  -- most-recently-connected block at that height, the value for an active-chain
+  -- height always reflects the active-chain block (reorg-safe).
+  local CHAINTX_PREFIX = "chaintx:"
+
+  local function chaintx_key(height)
+    return CHAINTX_PREFIX .. encode_height(height)
+  end
+
+  function dbobj.get_chaintx_at_height(height)
+    if type(height) ~= "number" or height < 0 then return nil end
+    local data = dbobj.get(M.CF.META, chaintx_key(height))
+    if not data or #data ~= 8 then return nil end
+    -- 8-byte little-endian -> Lua number.  Tx counts stay well under 2^53.
+    local n = 0
+    for i = 8, 1, -1 do
+      n = n * 256 + data:byte(i)
+    end
+    return n
+  end
+
+  -- Encode an 8-byte little-endian count from a Lua number.
+  local function encode_count8(n)
+    local b = {}
+    local v = n
+    for i = 1, 8 do
+      b[i] = string.char(v % 256)
+      v = math.floor(v / 256)
+    end
+    return table.concat(b)
+  end
+
+  -- Direct (non-batched) write — used by genesis seeding paths.
+  function dbobj.put_chaintx_at_height(height, count, sync)
+    dbobj.put(M.CF.META, chaintx_key(height), encode_count8(count), sync)
+  end
+
+  -- Expose the key + encoder so connect_block can fold the cumulative-count
+  -- write into its existing atomic WriteBatch (chain_tip is the last op).
+  dbobj.chaintx_meta_key = chaintx_key
+  dbobj.encode_chaintx_count = encode_count8
+
   -- High-level helpers: block headers
   function dbobj.get_header(block_hash)
     local data = dbobj.get(M.CF.HEADERS, block_hash.bytes)
