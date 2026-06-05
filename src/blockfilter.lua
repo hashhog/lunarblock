@@ -560,6 +560,16 @@ function M.new_index(db, enabled)
     return index._enabled
   end
 
+  --- Check if the filter index has finished building to the chain tip.
+  -- indexmanager.lua's tick()/get_stats() call this; the field existed but
+  -- the accessor did not, so any path that enabled the legacy index object
+  -- and then queried sync state would error with "attempt to call a nil
+  -- value". (The live node uses the inline utxo.lua path, not this object,
+  -- which is why it was never exercised.)
+  function index.is_synced()
+    return index._synced
+  end
+
   --- Set enabled state
   function index.set_enabled(enabled)
     index._enabled = enabled
