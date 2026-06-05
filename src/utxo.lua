@@ -1835,6 +1835,51 @@ function ChainState:connect_genesis()
   -- See: bitcoin-core/src/validation.cpp ConnectBlock genesis special-case;
   --      CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
 
+  -- BIP-157/158: build the block filter for genesis (height 0) too.
+  -- Bitcoin Core's BlockFilterIndex indexes EVERY connected block including
+  -- the genesis (index/blockfilterindex.cpp CustomAppend runs for height 0),
+  -- and the genesis filter HEADER is the first link in the chain:
+  --   header[0] = SHA256d(SHA256d(genesis_filter) || 0x00*32).
+  -- If we skip genesis here, block 1's header chains from all-zero instead of
+  -- from the genesis filter header, so EVERY filter header on the chain would
+  -- diverge from Core by one link (the `filter` field would still match but
+  -- the `header`/getblockfilter "header" would not).  The genesis block has
+  -- no inputs to spend (no undo data), so the element set is just the
+  -- non-empty, non-OP_RETURN output scriptPubKeys of its coinbase (the P2PK
+  -- output → a 1-element filter, matching Core's "014756c0" on regtest).
+  -- Mirrors the inline connect_block path; written through the storage's own
+  -- batch (genesis is connected exactly once at fresh init, outside the
+  -- per-block reorg-atomic flush, so a dedicated batch is sufficient).
+  if self.filterindex_enabled then
+    local filter_data = blockfilter.build_basic_filter(block, block_hash, nil)
+    local filter_hash = blockfilter.compute_filter_hash(filter_data)
+    local filter_header = blockfilter.compute_filter_header(
+      filter_hash, types.hash256_zero())
+
+    local fw = serialize.buffer_writer()
+    fw.write_hash256(filter_hash)
+    fw.write_hash256(filter_header)
+    fw.write_varstr(filter_data)
+    local filter_blob = fw.result()
+
+    local filter_height_key = string.char(0, 0, 0, 0)  -- height 0, 4-byte BE
+
+    local gbatch = self.storage.batch()
+    gbatch.put(storage_mod.CF.BLOCK_FILTER, block_hash.bytes, filter_blob)
+    gbatch.put(storage_mod.CF.BLOCK_FILTER_HEIGHT, filter_height_key,
+               block_hash.bytes)
+    gbatch.put(storage_mod.CF.META, "filterindex_height",
+               string.char(0, 0, 0, 0))  -- height 0, 4-byte LE
+    gbatch.put(storage_mod.CF.META, "filterindex_last_header",
+               filter_header.bytes)
+    gbatch.write()
+    gbatch.destroy()
+
+    -- Seed the in-flight header so the first connect_block (height 1) chains
+    -- from the genesis filter header even before its CF.META write lands.
+    self._filterindex_pending_header = filter_header
+  end
+
   -- Set chain tip to genesis
   self.tip_hash = block_hash
   self.tip_height = 0

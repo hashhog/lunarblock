@@ -7626,6 +7626,81 @@ function RPCServer:register_methods()
     return {_raw_json = "{" .. table.concat(parts, ",") .. "}"}
   end
 
+  --- getblockfilter: Retrieve a BIP-157 compact block filter for a block.
+  -- Reference: bitcoin-core/src/rpc/blockchain.cpp:2956-3031 getblockfilter.
+  --   SIGNATURE: getblockfilter "blockhash" ( "filtertype" )
+  --     filtertype default "basic" (the only type Core knows).
+  --   RESULT: { "filter": <hex GCS>, "header": <hex 32-byte filter header> }.
+  --     "filter" = HexStr(BlockFilter::GetEncodedFilter()) — CompactSize(N)
+  --       followed by the Golomb-Rice bitstream, hex-encoded (forward bytes).
+  --     "header" = filter_header.GetHex() — the 32-byte BIP-157 filter header
+  --       in display byte order (reversed), which chains as
+  --       SHA256d(SHA256d(rawFilterBytes) || prev_block_filter_header).
+  --   ERRORS:
+  --     unknown filtertype          -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+  --                                    "Unknown filtertype"          (bc.cpp:2982)
+  --     filter index not enabled    -> RPC_MISC_ERROR (-1)
+  --                                    "Index is not enabled for filtertype basic"
+  --                                                                   (bc.cpp:2987)
+  --     block hash not in the index -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+  --                                    "Block not found"             (bc.cpp:2997)
+  --
+  -- lunarblock stores the per-block filter blob in CF.BLOCK_FILTER as
+  --   filter_hash(32) || filter_header(32) || varstr(filter_data)
+  -- written inline in utxo.lua connect_block (BIP-157 Phase 2).  We slice the
+  -- header (already in internal/little-endian byte order) and the raw encoded
+  -- filter, then hex-encode each per Core's contract.
+  self.methods["getblockfilter"] = function(rpc, params)
+    local blockhash = params and params[1]
+    local filtertype = params and params[2]
+    if filtertype == nil or filtertype == cjson.null then
+      filtertype = "basic"
+    end
+
+    -- Core resolves the filtertype name FIRST (before any block lookup), so an
+    -- unknown type errors even for a valid block hash.
+    if type(filtertype) ~= "string" or filtertype ~= "basic" then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Unknown filtertype"})
+    end
+
+    if type(blockhash) ~= "string" or #blockhash ~= 64
+        or not blockhash:match("^%x+$") then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+    end
+
+    -- The filter index must be enabled (Core: GetBlockFilterIndex(BASIC) nil).
+    if not (rpc.chain_state and rpc.chain_state.filterindex_enabled) then
+      error({code = M.ERROR.MISC_ERROR,
+             message = "Index is not enabled for filtertype " .. filtertype})
+    end
+
+    if not (rpc.storage and rpc.storage.get and rpc.storage.CF) then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    local hash = types.hash256_from_hex(blockhash)
+
+    -- Read the per-block filter blob from CF.BLOCK_FILTER. A missing entry
+    -- means the block hash is not in the index → Core's "Block not found"
+    -- (-5).  (Core distinguishes "header but not connected" from "block
+    -- not found", but lunarblock only writes the filter for connected
+    -- active-chain blocks, so an absent entry maps to -5 in both cases.)
+    local ok, data = pcall(rpc.storage.get, rpc.storage.CF.BLOCK_FILTER, hash.bytes)
+    if not ok or not data or #data < 64 then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+    end
+
+    local r = serialize.buffer_reader(data)
+    local _filter_hash = r.read_hash256()       -- bytes 0..32 (unused here)
+    local filter_header = r.read_hash256()      -- bytes 32..64
+    local filter_data = r.read_varstr()         -- CompactSize(N) || GCS stream
+
+    return {
+      filter = M.hex_encode(filter_data),
+      header = types.hash256_hex(filter_header),
+    }
+  end
+
   --- getchaintips: Return information about all known chain tips.
   self.methods["getchaintips"] = function(rpc, _params)
     local tip_height = 0
