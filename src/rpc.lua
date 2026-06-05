@@ -2335,6 +2335,28 @@ function RPCServer:register_methods()
       error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
     end
 
+    -- Genesis-coinbase exception (matches Core rpc/rawtransaction.cpp:290-293):
+    -- the genesis block coinbase txid (== genesis block merkle root) is not an
+    -- ordinary transaction and is never retrievable.  Throw RPC -5 before any
+    -- lookup, exactly as Core does.  Derive the txid from the height-0 block's
+    -- first transaction so this is network-correct (mainnet/testnet/regtest).
+    if rpc.storage and rpc.storage.get_hash_by_height then
+      local ok_g, gen_hash = pcall(rpc.storage.get_hash_by_height, 0)
+      if ok_g and gen_hash then
+        local ok_b, gen_block = pcall(rpc.storage.get_block, gen_hash)
+        if ok_b and gen_block and gen_block.transactions
+            and gen_block.transactions[1] then
+          local gtxid = types.hash256_hex(
+            validation.compute_txid(gen_block.transactions[1]))
+          if gtxid == txid_hex then
+            error({code = M.ERROR.INVALID_ADDRESS,
+                   message = "The genesis block coinbase is not considered an " ..
+                             "ordinary transaction and cannot be retrieved"})
+          end
+        end
+      end
+    end
+
     -- Validate blockhash if provided
     if blockhash_hex ~= nil and blockhash_hex ~= cjson.null then
       if type(blockhash_hex) ~= "string" or #blockhash_hex ~= 64 then
@@ -2369,22 +2391,14 @@ function RPCServer:register_methods()
       if not block then
         error({code = M.ERROR.INVALID_ADDRESS, message = "Block hash not found"})
       end
-      -- Search for transaction in block
+      -- Search for transaction in block.  block_height is resolved later via
+      -- the height-index reverse lookup (HEIGHT_INDEX is keyed height->hash,
+      -- so there is no direct hash->height row to read here).
       for _, btx in ipairs(block.transactions) do
         local btx_txid = types.hash256_hex(validation.compute_txid(btx))
         if btx_txid == txid_hex then
           tx = btx
           found_blockhash = blockhash_hex
-          -- Look up block height and time
-          local iter = rpc.storage.iterator(rpc.storage._handles and "height" or nil)
-          if rpc.storage.get then
-            -- Try to get height from metadata
-            local height_data = rpc.storage.get("height", block_hash.bytes)
-            if height_data then
-              local r = serialize.buffer_reader(height_data)
-              block_height = r.read_u32le()
-            end
-          end
           block_time = block.header.timestamp
           break
         end
@@ -2395,28 +2409,40 @@ function RPCServer:register_methods()
       end
     end
 
-    -- 3. Check transaction index if available and tx still not found
-    if not tx and rpc.storage then
+    -- 3. Check transaction index if available and tx still not found.
+    -- Only attempt this when txindex is enabled AND no blockhash was supplied
+    -- (Core only consults g_txindex when !blockindex; rpc/rawtransaction.cpp:308).
+    -- The CF.TX_INDEX value layout written by ChainState:connect_block is
+    --   block_hash (32 bytes LE) || height (4 bytes LE)   = 36 bytes
+    -- (see utxo.lua:3045-3049 / 3156-3159).
+    local txindex_on = rpc.chain_state and rpc.chain_state.txindex_enabled
+    if not tx and not blockhash_hex and txindex_on and rpc.storage and rpc.storage.get then
       local txid_bytes = types.hash256_from_hex(txid_hex)
-      -- Try TX_INDEX column family
-      local tx_index_data = rpc.storage.get and rpc.storage.get("tx_index", txid_bytes.bytes)
-      if tx_index_data then
-        -- TX index stores: block_hash (32 bytes) + offset (optional)
-        if #tx_index_data >= 32 then
-          local index_block_hash = types.hash256(tx_index_data:sub(1, 32))
-          found_blockhash = types.hash256_hex(index_block_hash)
-          block = rpc.storage.get_block(index_block_hash)
-          if block then
-            -- Find tx in block
-            for _, btx in ipairs(block.transactions) do
-              local btx_txid = types.hash256_hex(validation.compute_txid(btx))
-              if btx_txid == txid_hex then
-                tx = btx
-                block_time = block.header.timestamp
-                break
-              end
+      local tx_index_data = rpc.storage.get("tx_index", txid_bytes.bytes)
+      if tx_index_data and #tx_index_data >= 32 then
+        local index_block_hash = types.hash256(tx_index_data:sub(1, 32))
+        found_blockhash = types.hash256_hex(index_block_hash)
+        if #tx_index_data >= 36 then
+          local r = serialize.buffer_reader(tx_index_data:sub(33, 36))
+          block_height = r.read_u32le()
+        end
+        block = rpc.storage.get_block(index_block_hash)
+        if block then
+          -- Find tx in block
+          for _, btx in ipairs(block.transactions) do
+            local btx_txid = types.hash256_hex(validation.compute_txid(btx))
+            if btx_txid == txid_hex then
+              tx = btx
+              block_time = block.header.timestamp
+              break
             end
           end
+        end
+        -- TX_INDEX row pointed at a block we no longer have / tx not present:
+        -- fall through to the not-found error below rather than half-answering.
+        if not tx then
+          found_blockhash = nil
+          block_height = nil
         end
       end
     end
@@ -2490,13 +2516,13 @@ function RPCServer:register_methods()
       local vin_entry = {}
       if is_coinbase and i == 1 then
         vin_entry.coinbase = M.hex_encode(inp.script_sig)
-        vin_entry.sequence = inp.sequence
         if inp.witness and #inp.witness > 0 then
-          vin_entry.txinwitness = {}
+          vin_entry.txinwitness = setmetatable({}, cjson.array_mt)
           for j, wit in ipairs(inp.witness) do
             vin_entry.txinwitness[j] = M.hex_encode(wit)
           end
         end
+        vin_entry.sequence = inp.sequence
       else
         vin_entry.txid = types.hash256_hex(inp.prev_out.hash)
         vin_entry.vout = inp.prev_out.index
@@ -2504,13 +2530,13 @@ function RPCServer:register_methods()
           asm = disassemble_scriptsig(inp.script_sig),
           hex = M.hex_encode(inp.script_sig),
         }
-        vin_entry.sequence = inp.sequence
         if inp.witness and #inp.witness > 0 then
-          vin_entry.txinwitness = {}
+          vin_entry.txinwitness = setmetatable({}, cjson.array_mt)
           for j, wit in ipairs(inp.witness) do
             vin_entry.txinwitness[j] = M.hex_encode(wit)
           end
         end
+        vin_entry.sequence = inp.sequence
 
         -- W60: per-vin prevout enrichment (verbosity=2).
         -- undo index: tx_in_block_idx is 1-based in block (coinbase = idx 1),
@@ -2533,9 +2559,12 @@ function RPCServer:register_methods()
       vin[i] = vin_entry
     end
 
+    -- vin always encodes as a JSON array (cjson.array_mt) even when empty.
+    setmetatable(vin, cjson.array_mt)
+
     -- Build vout array
     -- W60: use btc_sentinel for value (fixed-8 decimal precision, same as W59 getblock).
-    local vout = {}
+    local vout = setmetatable({}, cjson.array_mt)
     local total_out = 0
     for i, out in ipairs(tx.outputs) do
       vout[i] = {
@@ -2571,63 +2600,55 @@ function RPCServer:register_methods()
       end
     end
 
-    -- Add block info if transaction is confirmed
-    if found_blockhash then
-      -- W60: in_active_chain (verbosity=2 with explicit blockhash).
-      if verbosity >= 2 and blockhash_hex then
-        result.in_active_chain = true
-        if rpc.chain_state and rpc.chain_state.tip_height then
-          -- Verify block is actually in active chain by checking height→hash mapping.
-          if block_height and rpc.storage then
-            -- check if canonical hash at this height matches.
-            local canon_hash_data = rpc.storage.get and
-              rpc.storage.get("height", string.char(
-                math.floor(block_height / 16777216) % 256,
-                math.floor(block_height / 65536) % 256,
-                math.floor(block_height / 256) % 256,
-                block_height % 256
-              ))
-            -- If we can verify, do so; otherwise default true (Core does not emit
-            -- in_active_chain=false unless called with wrong blockhash context).
-            if canon_hash_data then
-              local canon_hash_hex = M.hex_encode(canon_hash_data):sub(1, 64)
-              result.in_active_chain = (canon_hash_hex == found_blockhash)
-            end
+    -- Resolve the block height for the containing block (for confirmations and
+    -- the in_active_chain check) if we did not already learn it above.  Prefer
+    -- the cheap height-index reverse scan only as a fallback.
+    if found_blockhash and not block_height and rpc.storage then
+      local block_hash = types.hash256_from_hex(found_blockhash)
+      local iter = rpc.storage.iterator("height")
+      if iter then
+        iter.seek_to_first()
+        while iter.valid() do
+          local k = iter.key()
+          local v = iter.value()
+          if v and #v == 32 and v == block_hash.bytes then
+            -- Decode height from key (4-byte big-endian)
+            block_height = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
+            break
           end
+          iter.next()
+        end
+        iter.destroy()
+      end
+    end
+
+    -- in_active_chain: Core emits this for ANY verbosity >= 1 whenever an
+    -- explicit "blockhash" argument was supplied (rpc/rawtransaction.cpp:337-340).
+    -- It is true iff the named block is on the active chain.
+    if blockhash_hex then
+      local in_chain = true
+      if block_height and rpc.storage and rpc.storage.get_hash_by_height then
+        local canon = rpc.storage.get_hash_by_height(block_height)
+        if canon then
+          in_chain = (types.hash256_hex(canon) == found_blockhash)
         end
       end
+      result.in_active_chain = in_chain
+    end
 
+    -- Add confirmed-block info (blockhash / time / blocktime / confirmations).
+    -- Core only attaches confirmations + time when the block is in the active
+    -- chain; mempool transactions (found_blockhash == nil) get none of these.
+    if found_blockhash then
       result.blockhash = found_blockhash
       if block_time then
         result.time = block_time
         result.blocktime = block_time
       end
 
-      -- Calculate confirmations
+      -- Calculate confirmations = 1 + tipHeight - txHeight.
       if rpc.chain_state and rpc.chain_state.tip_height then
         local tip_height = rpc.chain_state.tip_height
-        -- Try to get block height from storage
-        if not block_height and rpc.storage then
-          local block_hash = types.hash256_from_hex(found_blockhash)
-          -- Look up height from height_index in reverse
-          -- This is expensive - in production, store height in tx_index
-          local iter = rpc.storage.iterator("height")
-          if iter then
-            iter.seek_to_first()
-            while iter.valid() do
-              local k = iter.key()
-              local v = iter.value()
-              if v and #v == 32 and v == block_hash.bytes then
-                -- Decode height from key (4-byte big-endian)
-                block_height = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
-                break
-              end
-              iter.next()
-            end
-            iter.destroy()
-          end
-        end
-
         if block_height then
           result.confirmations = tip_height - block_height + 1
         else
