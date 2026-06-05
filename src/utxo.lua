@@ -1839,6 +1839,9 @@ function ChainState:connect_genesis()
   self.tip_hash = block_hash
   self.tip_height = 0
   self.storage.set_chain_tip(block_hash, 0, true)
+  -- Seed cumulative tx count (m_chain_tx_count analogue): genesis has exactly
+  -- one transaction (the coinbase).  Read by getchaintxstats.
+  self.storage.put_chaintx_at_height(0, #block.transactions, true)
 end
 
 --- Reindex the chainstate from on-disk blocks. Used to recover from a
@@ -1931,6 +1934,10 @@ function ChainState:reindex_chainstate(header_tip_height, progress_fn)
     w.write_hash256(gen_hash)
     w.write_u32le(0)
     batch.put(storage_mod.CF.META, "chain_tip", w.result())
+    -- Reseed cumulative tx count for genesis (replayed blocks 1..tip rewrite
+    -- their own chaintx entries inside connect_block below).
+    batch.put(storage_mod.CF.META, self.storage.chaintx_meta_key(0),
+              self.storage.encode_chaintx_count(#gen_block.transactions))
   end, true)
   self.tip_hash = gen_hash
   self.tip_height = 0
@@ -2266,6 +2273,13 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     if types.hash256_eq(block_hash, gen_hash) then
       self.tip_hash = block_hash
       self.tip_height = height
+      -- Seed the cumulative tx count for genesis (m_chain_tx_count analogue):
+      -- 1 transaction (the unspendable coinbase) at height 0.  Direct write —
+      -- the genesis path bypasses the per-block atomic batch.
+      if self.storage.put_chaintx_at_height then
+        local gtx = block.transactions and #block.transactions or 1
+        self.storage.put_chaintx_at_height(height, gtx, true)
+      end
       return true, 0
     end
   end
@@ -3034,6 +3048,34 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- Reusing it avoids per-tx string allocation overhead.
   local txindex_value = block_txid_bytes and tip_data or nil
 
+  -- m_chain_tx_count analogue: cumulative number of transactions in the chain
+  -- from genesis up to and including this block.  O(1) running counter —
+  -- prev_cumulative (at height-1, on the active chain) + #block.transactions.
+  -- Written into the SAME atomic batch as chain_tip so the cumulative count
+  -- can never be ahead of (or behind) the tip it describes.  Read by the
+  -- getchaintxstats RPC.  See bitcoin-core/src/chain.h m_chain_tx_count and
+  -- rpc/blockchain.cpp getchaintxstats.
+  local chaintx_key = nil
+  local chaintx_value = nil
+  do
+    local prev_cumulative
+    if height <= 0 then
+      prev_cumulative = 0
+    else
+      prev_cumulative = self.storage.get_chaintx_at_height(height - 1)
+      -- Genesis was seeded with chaintx:0 = 1; if the prev entry is somehow
+      -- absent (e.g. a node that connected genesis before this counter
+      -- existed), fall back so we still record a monotonic, correct-shape
+      -- value at this height (txcount stays consistent from here forward).
+      if not prev_cumulative then
+        prev_cumulative = height  -- height blocks before this one (genesis..height-1)
+      end
+    end
+    local block_tx_count = block.transactions and #block.transactions or 0
+    chaintx_key = self.storage.chaintx_meta_key(height)
+    chaintx_value = self.storage.encode_chaintx_count(prev_cumulative + block_tx_count)
+  end
+
   -- BIP-157 Phase 2: build the basic block filter and chain its header
   -- onto the previous block's filter header, all OUTSIDE the batch
   -- closure (filter construction is pure CPU work; only the resulting
@@ -3134,6 +3176,13 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
                 ffi.string(hbuf, 4))
       batch.put(storage_mod.CF.META, "filterindex_last_header",
                 filter_header_bytes)
+    end
+    -- Cumulative chain tx count (m_chain_tx_count analogue) keyed by height.
+    -- Folded into the same atomic batch as chain_tip; overwritten on reorg
+    -- by the next connect at this height, so an active-chain height always
+    -- maps to the active-chain block's cumulative count.
+    if chaintx_key then
+      batch.put(storage_mod.CF.META, chaintx_key, chaintx_value)
     end
     -- Include caller's extra operations (e.g. block body / height index from
     -- the IBD path, or block/header/height_index from submitblock) in the
