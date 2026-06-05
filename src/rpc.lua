@@ -821,6 +821,124 @@ local function bits_to_target_hex(bits)
   return table.concat(hex)
 end
 
+--- EXACT per-block proof-of-work = floor(2^256 / (target + 1)), as a 32-byte
+--- big-endian binary string. Mirrors Bitcoin Core's GetBlockProof
+--- (src/chain.cpp). Unlike consensus.get_block_work (a float approximation
+--- used for header-chain comparison) this is a pure big-integer long division
+--- so the accumulated chainwork is byte-identical to Core's nChainWork.GetHex().
+-- @param bits number: compact nBits
+-- @return string: 32-byte big-endian work value
+local function exact_block_proof(bits)
+  -- divisor = target + 1, as a base-256 big-endian byte array (may be 33 bytes
+  -- after a carry out of the top, e.g. powLimit + 1).
+  local target = consensus.bits_to_target(bits)
+  local dv = {}
+  for i = 1, 32 do dv[i] = target:byte(i) end
+  local carry = 1
+  for i = 32, 1, -1 do
+    local s = dv[i] + carry
+    dv[i] = s % 256
+    carry = math.floor(s / 256)
+  end
+  if carry > 0 then table.insert(dv, 1, carry) end
+
+  -- Strip leading zeros from the divisor (GetBlockProof returns 0 when target
+  -- is 0; Core never hits that on a valid block but guard anyway).
+  do
+    local norm, started = {}, false
+    for i = 1, #dv do
+      if started or dv[i] ~= 0 then started = true; norm[#norm + 1] = dv[i] end
+    end
+    if #norm == 0 then return string.rep("\0", 32) end
+    dv = norm
+  end
+
+  -- compare big-endian arrays a vs b -> -1/0/1
+  local function cmp(a, b)
+    local function strip(x)
+      local r, s = {}, false
+      for i = 1, #x do if s or x[i] ~= 0 then s = true; r[#r + 1] = x[i] end end
+      return r
+    end
+    a, b = strip(a), strip(b)
+    if #a ~= #b then return (#a < #b) and -1 or 1 end
+    for i = 1, #a do if a[i] ~= b[i] then return (a[i] < b[i]) and -1 or 1 end end
+    return 0
+  end
+  -- a - b (a >= b), big-endian arrays -> big-endian array
+  local function sub(a, b)
+    local la, lb, borrow, r = #a, #b, 0, {}
+    for i = 0, la - 1 do
+      local d = a[la - i] - (b[lb - i] or 0) - borrow
+      if d < 0 then d = d + 256; borrow = 1 else borrow = 0 end
+      r[i + 1] = d
+    end
+    local out = {}
+    for i = #r, 1, -1 do out[#out + 1] = r[i] end
+    return out
+  end
+  -- dv * q (0<=q<=255), big-endian array -> big-endian array
+  local function mul_digit(arr, q)
+    if q == 0 then return { 0 } end
+    local prod, c = {}, 0
+    for j = #arr, 1, -1 do
+      local p = arr[j] * q + c
+      prod[#prod + 1] = p % 256
+      c = math.floor(p / 256)
+    end
+    while c > 0 do prod[#prod + 1] = c % 256; c = math.floor(c / 256) end
+    local out = {}
+    for k = #prod, 1, -1 do out[#out + 1] = prod[k] end
+    return out
+  end
+
+  -- dividend = 2^256 = digit 1 followed by 32 zero bytes (33 base-256 digits).
+  local dividend = { 1 }
+  for _ = 1, 32 do dividend[#dividend + 1] = 0 end
+
+  local quotient = {}
+  local rem = { 0 }
+  for i = 1, #dividend do
+    rem[#rem + 1] = dividend[i]          -- rem = rem*256 + next digit
+    local lo, hi, q = 0, 255, 0
+    while lo <= hi do                      -- largest q with dv*q <= rem
+      local mid = math.floor((lo + hi) / 2)
+      if cmp(mul_digit(dv, mid), rem) <= 0 then q = mid; lo = mid + 1 else hi = mid - 1 end
+    end
+    quotient[#quotient + 1] = q
+    if q > 0 then rem = sub(rem, mul_digit(dv, q)) end
+  end
+
+  -- Take the low 32 quotient digits as the 32-byte big-endian result.
+  local out, n = {}, #quotient
+  for i = 1, 32 do out[i] = string.char(quotient[n - 32 + i] or 0) end
+  return table.concat(out)
+end
+
+--- Cumulative chainwork at a block, computed natively (no external node).
+--- Walks the active-chain HEIGHT_INDEX from genesis to block_height, summing
+--- exact_block_proof for each block's nBits. Returns a 64-char big-endian hex
+--- string byte-identical to Bitcoin Core's nChainWork.GetHex(). Returns nil if
+--- the chain cannot be walked (caller falls back to zeros).
+-- @param storage table: storage object
+-- @param block_height number: target block height (inclusive)
+-- @return string|nil: 64-char hex chainwork, or nil on failure
+local function compute_chainwork(storage, block_height)
+  if not storage or not storage.get_hash_by_height or not storage.get_header then
+    return nil
+  end
+  if type(block_height) ~= "number" or block_height < 0 then return nil end
+  local work = string.rep("\0", 32)
+  for h = 0, block_height do
+    local hh = storage.get_hash_by_height(h)
+    if not hh then return nil end
+    local hdr = storage.get_header(hh)
+    if not hdr then return nil end
+    work = consensus.work_add(work, exact_block_proof(hdr.bits))
+  end
+  return consensus.work_to_hex(work)
+end
+
 --- Minimal base64 encoder used for HTTP Basic auth when calling
 -- the local Bitcoin Core node.  Only ASCII-safe input (cookie strings).
 local _b64_alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -7426,9 +7544,16 @@ function RPCServer:register_methods()
       end
     end
 
-    local confirmations = 1
+    -- confirmations: ComputeNextBlockAndDepth (blockchain.cpp:116) ->
+    --   in-active-chain block: tip_height - height + 1
+    --   not-in-active-chain (known header off the best chain): -1
+    -- block_height is non-nil only for blocks found in the active HEIGHT_INDEX.
+    local confirmations
     if block_height and rpc.chain_state and rpc.chain_state.tip_height then
       confirmations = rpc.chain_state.tip_height - block_height + 1
+    else
+      -- Known header but not on the active chain.
+      confirmations = -1
     end
 
     -- difficulty: use Core's exact algorithm formatted with 16 sig-digits
@@ -7442,24 +7567,23 @@ function RPCServer:register_methods()
     -- target: 64-char lowercase hex from compact bits (Core 27+ field).
     local target_hex = bits_to_target_hex(header.bits)
 
-    -- chainwork + nTx: query local Bitcoin Core as authoritative source.
-    -- lunarblock does not persist per-block chainwork or nTx counts.
+    -- chainwork: computed natively (exact big-integer cumulative block proof,
+    -- byte-identical to Core's nChainWork.GetHex()). lunarblock does not persist
+    -- per-block chainwork, so it is summed from genesis to this height. Falls
+    -- back to zeros only if the chain cannot be walked.
     local chainwork_hex = string.rep("0", 64)
-    local ntx = 0
+    if block_height then
+      local cw = compute_chainwork(rpc.storage, block_height)
+      if cw then chainwork_hex = cw end
+    end
 
-    -- First try to get nTx from the stored block body (fast path).
+    -- nTx: number of transactions in the block. Prefer the stored block body;
+    -- fall back to 1 (every connected block has at least the coinbase) when the
+    -- body is absent (header-only / pruned). No external node is consulted.
+    local ntx = 1
     local blk = rpc.storage.get_block(hash)
     if blk and blk.transactions then
       ntx = #blk.transactions
-    end
-
-    -- Query local Core for chainwork (always needed) and nTx if still 0.
-    local core_chainwork, core_ntx = query_local_core_header(blockhash)
-    if core_chainwork then
-      chainwork_hex = core_chainwork
-    end
-    if ntx == 0 and core_ntx then
-      ntx = core_ntx
     end
 
     local nextblockhash = nil
