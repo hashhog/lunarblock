@@ -2125,6 +2125,31 @@ local function main()
     end
   end
 
+  -- Peer disconnected callback: release the header-sync latch (LIVENESS FIX).
+  --
+  -- Header sync is a single in-memory latch (header_chain.syncing +
+  -- header_chain.sync_peer).  It is only ever cleared by a headers message
+  -- from the active sync peer, stop_sync(), or clear().  Without wiring this
+  -- callback, a sync-peer disconnect leaves syncing=true pinned to a dead
+  -- peer forever and header sync wedges permanently — every re-engagement
+  -- point (on_peer_established above, the inv handler) is gated on
+  -- `not header_chain.syncing`, so no surviving peer can take over.
+  --
+  -- HeaderChain:on_peer_disconnected resets the latch (and drops the peer's
+  -- presync/unconnecting state) IFF the disconnected peer was the sync peer.
+  -- Mirrors Bitcoin Core FinalizeNode (net_processing.cpp:1675) which
+  -- decrements nSyncStarted so SendMessages re-arms StartHeadersSync on a
+  -- surviving peer the next tick.  The tick-level re-engagement below is our
+  -- equivalent of that SendMessages re-arm.
+  peer_manager.callbacks.on_peer_disconnected = function(peer, reason)
+    local was_sync_peer = header_chain:on_peer_disconnected(peer)
+    if was_sync_peer then
+      print(string.format(
+        "Header sync peer %s:%d disconnected (%s); released sync latch",
+        peer.ip or "?", peer.port or 0, tostring(reason)))
+    end
+  end
+
   -- Initialize wallet manager (multi-wallet support)
   local wallet_manager = wallet_mod.new_manager(datadir, network, db)
   wallet_manager:ensure_wallets_dir()
@@ -2311,6 +2336,26 @@ local function main()
     local p2p_ok, p2p_err = pcall(function() peer_manager:tick() end)
     if not p2p_ok then
       print(string.format("P2P tick error: %s", tostring(p2p_err)))
+    end
+
+    -- Header-sync re-engagement (LIVENESS FIX, mirrors Core SendMessages
+    -- StartHeadersSync re-arm at net_processing.cpp).  on_peer_disconnected
+    -- releases the sync latch when the active sync peer drops; this tick-level
+    -- check is what actually re-fires start_sync on a SURVIVING peer.  The
+    -- event-driven re-engagement points (on_peer_established fires only on a
+    -- NEW handshake; the inv handler fires only on a fresh block announcement)
+    -- do NOT cover the common case where the sync peer dropped but other
+    -- already-established peers remain — without this, header sync stays idle
+    -- until a new peer connects or a block is announced, which may never
+    -- happen on a -connect-pinned or otherwise-quiet node.
+    if not header_chain.syncing then
+      local peers = peer_manager:get_established_peers()
+      for _, p in ipairs(peers) do
+        if (p.start_height or 0) > (header_chain.header_tip_height or -1) then
+          header_chain:start_sync(p)
+          break
+        end
+      end
     end
 
     -- Schedule block downloads — both during IBD and at tip.
