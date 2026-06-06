@@ -1967,6 +1967,43 @@ function HeaderChain:clear_peer_sync_state(peer)
   self.peer_sync_states[peer_id] = nil
 end
 
+--- Release any header-sync state held against a peer that has just
+--- disconnected.
+--
+-- LIVENESS FIX: header sync is a single in-memory latch (self.syncing +
+-- self.sync_peer), set once by start_sync() and cleared ONLY by a headers
+-- message FROM the current sync peer (handle_headers), stop_sync(), or
+-- clear().  If the sync peer disconnects, none of those paths fire, so
+-- self.syncing stays true forever pinned to a dead sync_peer and header
+-- sync is permanently stranded — no other peer can take over because the
+-- on_peer_established / inv re-engagement points are all gated on
+-- `not self.syncing`.  main.lua must call this from
+-- peer_manager.callbacks.on_peer_disconnected.
+--
+-- Mirrors Bitcoin Core PeerManagerImpl::FinalizeNode
+-- (net_processing.cpp:1675): on peer teardown it decrements nSyncStarted
+-- when state->fSyncStarted (so SendMessages re-arms StartHeadersSync on a
+-- surviving peer next tick) and erases the peer's m_headers_presync_stats
+-- entry (net_processing.cpp:1694-1695, 1740-1741).
+-- @param peer table: peer that just disconnected
+-- @return boolean: true if this peer was the active sync peer (latch reset)
+function HeaderChain:on_peer_disconnected(peer)
+  if not peer then return false end
+
+  -- Always drop any low-work (PRESYNC/REDOWNLOAD) state + the unconnecting-
+  -- headers counter for this peer (Core: m_headers_presync_stats.erase).
+  self:clear_peer_sync_state(peer)
+  self:reset_unconnecting_headers(peer)
+
+  -- If this peer owned the single header-sync latch, release it so another
+  -- peer can be picked up by the re-engagement paths (Core: nSyncStarted--).
+  if self.sync_peer == peer then
+    self:stop_sync()
+    return true
+  end
+  return false
+end
+
 -- Export the HeaderChain class for direct access if needed
 M.HeaderChain = HeaderChain
 
