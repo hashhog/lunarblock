@@ -2158,19 +2158,87 @@ local function main()
   local wallet = nil
   local default_wallet_path = datadir .. "/wallet.json"
   if not args.nowalletcreate then
-    -- Try to load existing default wallet
+    -- Try to load existing default wallet. A missing / corrupt / partially
+    -- written wallet file MUST NOT crash node startup: M.load is internally
+    -- fault-tolerant (quarantines a bad file to .bak, recovers from a
+    -- crashed-save .tmp), and we additionally pcall here so even an unexpected
+    -- error in the post-decode key-rehydration path degrades to "create a fresh
+    -- wallet" instead of aborting the node.
     if wallet_mod.exists(default_wallet_path) then
-      wallet = wallet_manager:load_wallet("")
-      if wallet then
+      local lok, lwallet, lerr = pcall(function()
+        return wallet_manager:load_wallet("")
+      end)
+      if lok and lwallet then
+        wallet = lwallet
         print("Loaded default wallet")
+      else
+        local why = lok and tostring(lerr) or tostring(lwallet)
+        print("Warning: could not load default wallet (" .. why ..
+          "); a fresh wallet will be created. The previous file (if any) was " ..
+          "moved aside to wallet.json.bak.")
       end
     end
-    -- Create new wallet if none exists
+    -- Create new wallet if none exists / load failed.
     if not wallet then
       print("Creating new wallet...")
-      wallet = wallet_manager:create_wallet("", {})
-      if wallet then
+      local cok, cwallet = pcall(function()
+        return wallet_manager:create_wallet("", {})
+      end)
+      if cok and cwallet then
+        wallet = cwallet
         print("Wallet created. First address: " .. (wallet.addresses[1] or "none"))
+      else
+        print("Warning: failed to create wallet (non-fatal): " ..
+          tostring(cwallet))
+      end
+    end
+  end
+
+  -- Make sure the default wallet knows where it persists, so save-on-mutation
+  -- (getnewaddress keypool advance, ScanBlock credit/debit, periodic flush) can
+  -- re-flush without re-supplying the path, and the shutdown save() can't pass
+  -- a nil path. create_wallet/load go through the manager's own paths; the
+  -- legacy default wallet lives at <datadir>/wallet.json.
+  if wallet then
+    wallet._save_path = wallet._save_path or default_wallet_path
+    -- Bring the wallet's ledger up to the current chain tip on startup. If the
+    -- chain advanced while we were down (or we crashed mid-IBD), this reconciles
+    -- the gap using the persisted last_synced_height; cheap no-op when at tip.
+    local rok, rerr = pcall(function()
+      wallet:reconcile_to_tip(chain_state, mempool)
+    end)
+    if not rok then
+      print("Warning: wallet startup reconcile failed (non-fatal): " .. tostring(rerr))
+    end
+
+    -- Feed the wallet from the LIVE block-connect loop (P2P/IBD), not just the
+    -- mining/RPC path. Wrap the existing on_block_connected callback (fee
+    -- estimator / ZMQ / orphan-drain) so the wallet credits/debits per block and
+    -- persists progress. Errors are isolated under pcall — a wallet hiccup must
+    -- never wedge chain connection. A periodic flush (every WALLET_FLUSH_BLOCKS
+    -- blocks) bounds fsync cost on the hot IBD path; a clean shutdown flushes the
+    -- rest. last_synced_height is advanced every block so a SIGKILL loses at
+    -- most WALLET_FLUSH_BLOCKS blocks of reconcile progress, never any keys.
+    local WALLET_FLUSH_BLOCKS = 50
+    local wallet_blocks_since_flush = 0
+    local prev_cb_for_wallet = chain_state.callbacks.on_block_connected
+    chain_state.callbacks.on_block_connected = function(block_hash, block)
+      if prev_cb_for_wallet then
+        prev_cb_for_wallet(block_hash, block)
+      end
+      local ok, err = pcall(function()
+        local height = chain_state.tip_height
+        wallet:scan_block(chain_state, block, height, mempool)
+        wallet_blocks_since_flush = wallet_blocks_since_flush + 1
+        if wallet_blocks_since_flush >= WALLET_FLUSH_BLOCKS then
+          wallet_blocks_since_flush = 0
+          wallet:save_if_dirty()
+        end
+      end)
+      if not ok then
+        -- Best-effort: log once, keep connecting blocks.
+        io.stderr:write("wallet block-connect hook error (non-fatal): " ..
+          tostring(err) .. "\n")
       end
     end
   end
@@ -2502,7 +2570,17 @@ local function main()
   peer_manager:stop()
   rpc_server:stop()
   if rest_server then rest_server:stop() end
-  if wallet then wallet:save(wallet_path) end
+  -- Final wallet flush on clean shutdown. The variable `wallet_path` was never
+  -- defined in this scope (latent bug: a nil path made save() a silent no-op),
+  -- so persist to the wallet's remembered path (set at load/create) and fall
+  -- back to the default path. save() is atomic+durable; save_if_dirty avoids a
+  -- redundant write when the periodic flush already caught everything.
+  if wallet then
+    local sok, serr = wallet:save(wallet._save_path or default_wallet_path)
+    if not sok then
+      print("Warning: failed to save wallet on shutdown: " .. tostring(serr))
+    end
+  end
   -- Persist fee estimation data
   local save_ok, save_err = fee_estimator:save(fee_est_path)
   if save_ok then
