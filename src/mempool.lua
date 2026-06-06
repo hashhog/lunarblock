@@ -930,9 +930,19 @@ end
 --- Accept a transaction into the mempool.
 -- @param tx transaction: The transaction to accept
 -- @param allow_rbf boolean: Whether to allow RBF replacement (default true)
+-- @param opts table|nil: optional admission options.
+--   opts.package_member (boolean): when true this tx is being admitted as a
+--     member of a package whose AGGREGATE feerate already met the relay floor
+--     (CPFP semantics). In that case we skip ONLY the two per-tx fee-floor
+--     gates (absolute min-relay-fee + rolling-min-fee) so a low-fee parent
+--     bailed out by a high-fee child still enters; EVERY other PreCheck
+--     (standardness, dust, sigops, sequence locks, TRUC, PolicyScriptChecks)
+--     still runs. Mirrors Core's AcceptMultipleTransactions, which runs full
+--     PreChecks per member but applies the relay-fee floor at package level.
 -- @return boolean, string, number: success, txid_hex or error message, fee
-function Mempool:accept_transaction(tx, allow_rbf)
+function Mempool:accept_transaction(tx, allow_rbf, opts)
   if allow_rbf == nil then allow_rbf = true end
+  local package_member = opts and opts.package_member == true
   local txid = validation.compute_txid(tx)
   local txid_hex = types.hash256_hex(txid)
 
@@ -1307,7 +1317,11 @@ function Mempool:accept_transaction(tx, allow_rbf)
   local weight = validation.get_tx_weight(tx)
   local vsize = validation.get_virtual_tx_size(weight, tx_sigop_cost, M.DEFAULT_BYTES_PER_SIGOP)
   local fee_rate_per_kb = fee * 1000 / vsize
-  if fee_rate_per_kb < self.min_relay_fee then
+  -- Package members bypass the per-tx absolute relay-fee floor: the package
+  -- aggregate feerate was already validated by accept_package, so a low-fee
+  -- parent paid for by a high-fee child must still enter (CPFP). All the
+  -- standardness/script gates above still ran.
+  if (not package_member) and fee_rate_per_kb < self.min_relay_fee then
     return false, string.format("fee rate too low: %.2f < %d sat/KB",
       fee_rate_per_kb, self.min_relay_fee)
   end
@@ -1319,7 +1333,7 @@ function Mempool:accept_transaction(tx, allow_rbf)
   -- each block is connected, approaching zero when the pool is well below max.
   -- Reference: CTxMemPool::GetMinFee (txmempool.cpp:829-851);
   --             validation.cpp:703-705 (CheckFeeRate).
-  do
+  if not package_member then
     local min_fee_rate_kvb = self:get_min_fee()  -- sat/kvB
     if min_fee_rate_kvb > 0 then
       -- fee_rate_per_kb is in sat/kvB (fee*1000/vsize = sat*1000/(virtual-bytes) = sat/kvB)
@@ -2716,124 +2730,80 @@ function Mempool:accept_package(txns, test_accept)
       package_fee_rate_per_kb, self.min_relay_fee)
   end
 
-  -- 7. Accept each transaction into the mempool
-  -- For individual transactions that don't meet min fee rate,
-  -- we accept them anyway because the package as a whole does.
+  -- 7. Accept each transaction into the mempool by routing it through the
+  --    SAME single-tx admission pipeline (accept_transaction) the P2P/RPC
+  --    single-tx path uses.  This is the DoS fix: the previous inline loop
+  --    inserted entries directly into self.entries after running only
+  --    check_transaction + a per-tx weight cap, silently bypassing every
+  --    other PreCheck — IsStandardTx (version/dust/scriptSig/scriptPubKey),
+  --    IsWitnessStandard, ValidateInputsStandardness, sigop cap, anchor
+  --    policy, BIP-68 sequence locks, TRUC inheritance, and PolicyScriptChecks
+  --    (input-script verification).  An attacker could smuggle non-standard /
+  --    invalid-script / TRUC-violating txs into the mempool (and thus into
+  --    relay) by wrapping them in a submitpackage call.  Core runs full
+  --    PreChecks for every package member (validation.cpp
+  --    AcceptMultipleTransactionsInternal:1447-1449 + PolicyScriptChecks:1538);
+  --    we now do the same.  Members are admitted in package (topological)
+  --    order so an intra-package parent is already in self.entries by the time
+  --    its child resolves its inputs.  The per-tx fee-floor gates are bypassed
+  --    via {package_member=true} because the package aggregate feerate was
+  --    already validated in step 6 (CPFP semantics); all other gates run.
   local accepted_txids = {}
+  -- Track which members WE inserted (for test_accept rollback and for undo on
+  -- a mid-package rejection).  Reverse order on undo so children come out
+  -- before parents.
+  local inserted = {}
+
+  local function undo_inserted()
+    for k = #inserted, 1, -1 do
+      self:remove_transaction(inserted[k], "package-rollback")
+    end
+  end
 
   for i, tx in ipairs(txns) do
     local txid = validation.compute_txid(tx)
     local txid_hex = types.hash256_hex(txid)
 
-    -- Skip if already in mempool
+    -- Skip if already in mempool (Core: already-in-mempool members are not
+    -- re-validated; they count as part of the package).
     if self.entries[txid_hex] then
       accepted_txids[#accepted_txids + 1] = txid_hex
-      goto continue
-    end
-
-    local weight = validation.get_tx_weight(tx)
-    local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
-    local fee = fees[i]
-
-    -- Compute ancestors (including intra-package parents already accepted)
-    local ancestors = {}
-    local direct_parents = {}
-
-    for _, inp in ipairs(tx.inputs) do
-      local prev_hex = types.hash256_hex(inp.prev_out.hash)
-      local parent = self.entries[prev_hex]
-      if parent then
-        direct_parents[prev_hex] = parent
-        ancestors[prev_hex] = true
-        for anc_hex in pairs(parent.ancestors) do
-          ancestors[anc_hex] = true
-        end
+    else
+      -- allow_rbf=false: a package member that conflicts with an existing
+      -- mempool tx is a package error, not a silent RBF (matches the original
+      -- step-4 "conflict with existing mempool tx" reject).  package_member
+      -- bypasses ONLY the per-tx fee floor.
+      local ok_add, txid_or_err = self:accept_transaction(tx, false,
+        { package_member = true })
+      if not ok_add then
+        -- Roll back any members we already inserted so the package is atomic.
+        undo_inserted()
+        return false, string.format("%s (package tx at index %d)",
+          tostring(txid_or_err), i)
       end
+      inserted[#inserted + 1] = txid_or_err
+      accepted_txids[#accepted_txids + 1] = txid_or_err
     end
-
-    -- Count ancestors and sum sizes/fees
-    local ancestor_count = 1  -- include self
-    local ancestor_size = vsize
-    local ancestor_fees = fee
-
-    for anc_hex in pairs(ancestors) do
-      local anc_entry = self.entries[anc_hex]
-      if anc_entry then
-        ancestor_count = ancestor_count + 1
-        ancestor_size = ancestor_size + anc_entry.vsize
-        ancestor_fees = ancestor_fees + anc_entry.fee
-      end
-    end
-
-    -- Check ancestor limits
-    if ancestor_count > M.MAX_ANCESTORS then
-      return false, "too many ancestors for transaction at index " .. i
-    end
-    if ancestor_size > M.MAX_ANCESTOR_SIZE then
-      return false, "ancestor size too large for transaction at index " .. i
-    end
-
-    -- Check descendant limits for all ancestors
-    for anc_hex in pairs(ancestors) do
-      local anc_entry = self.entries[anc_hex]
-      if anc_entry then
-        if anc_entry.descendant_count + 1 > M.MAX_DESCENDANTS then
-          return false, "too many descendants for ancestor"
-        end
-        if anc_entry.descendant_size + vsize > M.MAX_DESCENDANT_SIZE then
-          return false, "descendant size too large for ancestor"
-        end
-      end
-    end
-
-    -- Create mempool entry (always built for vsize/fee tracking; only inserted
-    -- into self.entries when test_accept is false).
-    local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time())
-    entry.ancestor_count = ancestor_count - 1
-    entry.ancestor_size = ancestor_size - vsize
-    entry.ancestor_fees = ancestor_fees - fee
-    entry.ancestors = ancestors
-
-    if not test_accept then
-      -- Real insertion: mutate mempool state.
-      self.entries[txid_hex] = entry
-      self.tx_count = self.tx_count + 1
-      self.total_size = self.total_size + entry.size
-
-      -- Track outpoint spending and parent relationships
-      for _, inp in ipairs(tx.inputs) do
-        local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
-        self.outpoint_to_tx[outpoint_key] = txid_hex
-
-        local prev_hex = types.hash256_hex(inp.prev_out.hash)
-        if direct_parents[prev_hex] then
-          entry.spends_from[outpoint_key] = prev_hex
-        end
-      end
-
-      -- Update all ancestors with descendant info
-      for anc_hex in pairs(ancestors) do
-        local anc_entry = self.entries[anc_hex]
-        if anc_entry then
-          anc_entry.descendants[txid_hex] = true
-          anc_entry.descendant_count = anc_entry.descendant_count + 1
-          anc_entry.descendant_size = anc_entry.descendant_size + vsize
-          anc_entry.descendant_fees = anc_entry.descendant_fees + fee
-        end
-      end
-    end
-
-    accepted_txids[#accepted_txids + 1] = txid_hex
-    ::continue::
   end
 
-  -- 8. Trim mempool if needed (skip when test_accept — no state was mutated)
-  if not test_accept then
-    self:trim()
+  -- 8. test_accept (dry-run): roll back everything we inserted so the mempool
+  --    is left unchanged, mirroring Core's m_test_accept early-return after
+  --    the checks pass.  Snapshot/restore the rolling-fee state so the dry-run
+  --    is fully side-effect-free.  accept_transaction already ran expire()/
+  --    trim() per member on the real path, so no extra trim is needed here.
+  if test_accept then
+    local saved_rolling = self.rolling_minimum_fee_rate
+    local saved_last_update = self.last_rolling_fee_update
+    local saved_since_bump = self.block_since_last_rolling_fee_bump
+    undo_inserted()
+    self.rolling_minimum_fee_rate = saved_rolling
+    self.last_rolling_fee_update = saved_last_update
+    self.block_since_last_rolling_fee_bump = saved_since_bump
   end
 
   return true, {
     txids = accepted_txids,
+    fees = fees,
     package_fee_rate = package_fee_rate,
     total_fees = total_fees,
     total_vsize = total_vsize,

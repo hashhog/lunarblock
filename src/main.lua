@@ -1212,6 +1212,16 @@ local function main()
     max_mempool_size = 300 * 1024 * 1024,
     min_relay_fee = 1000,
     fullrbf = args.mempool_fullrbf,  -- nil => mempool uses DEFAULT_MEMPOOL_FULL_RBF
+    -- W96/DoS: run PolicyScriptChecks (STANDARD flags) at relay time so that
+    -- invalid-script txs are caught on mempool admission and NOT relayed to
+    -- peers. Bitcoin Core's MemPoolAccept always runs PolicyScriptChecks +
+    -- ConsensusScriptChecks (validation.cpp:1382-1384); without this the P2P
+    -- `tx` handler (accept_transaction) admits and re-announces txs whose
+    -- input scripts never executed — a relay-time DoS / invalid-tx-propagation
+    -- vector. The flag defaults OFF only to keep mock-script test fixtures
+    -- green; the production node MUST set it. Witness-path verification is
+    -- still left to block-connect (see accept_transaction step 8e comment).
+    verify_input_scripts = true,
   })
 
   -- Orphan tx pool (Core txorphanage parity).  Buffers up to 100 txs that
@@ -2147,6 +2157,24 @@ local function main()
       print(string.format(
         "Header sync peer %s:%d disconnected (%s); released sync latch",
         peer.ip or "?", peer.port or 0, tostring(reason)))
+    end
+
+    -- DoS: erase all orphans contributed by the departing peer (Core's
+    -- TxOrphanage::EraseForPeer, called from FinalizeNode →
+    -- m_txdownloadman.DisconnectedPeer, net_processing.cpp:1710). The orphan
+    -- pool is keyed by the same "ip:port" pid the `tx` handler uses when it
+    -- buffers an orphan (orphan_pool:add(..., pid, ...) above). Without this,
+    -- orphans from a disconnected peer linger until ORPHAN_TX_EXPIRE_TIME
+    -- (5 min) or get globally evicted — a malicious peer can connect, flood up
+    -- to MAX_ORPHANS_PER_PEER orphans, disconnect, reconnect, and repeat to
+    -- pin memory and starve the global orphan cap for honest peers.
+    if orphan_pool and peer and peer.ip and peer.port then
+      local pid = peer.ip .. ":" .. peer.port
+      local removed = orphan_pool:remove_for_peer(pid)
+      if removed > 0 then
+        print(string.format(
+          "Erased %d orphan tx(s) from disconnected peer %s", removed, pid))
+      end
     end
   end
 
