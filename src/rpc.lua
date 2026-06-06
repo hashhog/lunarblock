@@ -6145,6 +6145,13 @@ function RPCServer:register_methods()
     -- moved the coins on-chain but then crashed (-32603) computing its return
     -- value and the caller never received the txid.
     local txid = validation.compute_txid(tx)
+    -- Persist after a send: the change-index advance + spent-pending state must
+    -- survive an unclean restart. save_if_dirty no-ops if nothing changed; the
+    -- address helpers already flushed the index advance, this catches the rest.
+    if wallet.save_if_dirty then
+      wallet:mark_dirty()
+      wallet:save_if_dirty()
+    end
     return types.hash256_hex(txid)
   end
 

@@ -997,6 +997,18 @@ function M.new(network, storage)
   -- mutating wallet op — generatetoaddress / sendtoaddress — which implies the
   -- wallet is live) flips it true.
   self.scanned = false
+  -- How far this wallet's ledger has been reconciled against the chain. Persisted
+  -- across restarts (serialize / load) so startup re-scans only the gap to the
+  -- current tip rather than from genesis, and a crash mid-IBD can resume.
+  -- Mirrors Bitcoin Core CWallet::m_last_block_processed_height.
+  self.last_synced_height = 0
+  -- Set true by any in-memory mutation that must survive an unclean restart
+  -- (keypool advance, label, imported key, ScanBlock credit/debit). save_if_dirty
+  -- flushes only when this is set, so the hot block-connect path is cheap.
+  self._dirty = false
+  -- Remembered persistence path (set by save()/load()); lets save-on-mutation
+  -- re-flush without the caller re-supplying the path.
+  self._save_path = nil
   self.pending_utxos = {}          -- Unconfirmed UTXOs (in mempool)
   self.spent_pending = {}          -- Outpoints spent in pending transactions
   self.transactions = {}           -- txid_hex -> {tx, height, time, fee}
@@ -1393,12 +1405,24 @@ end
 function Wallet:get_new_address()
   local addr = self:generate_address(0, self.next_external_index)
   self.next_external_index = self.next_external_index + 1
+  -- Keypool advance MUST survive a crash: if we hand this address out, take a
+  -- payment to it, then lose the index on an unclean restart, the wallet would
+  -- re-derive the SAME index for the next request and the prior payment becomes
+  -- unrecoverable. Persist immediately (Core flushes the keypool on every
+  -- top-up). save_if_dirty no-ops when no path is remembered (e.g. unit tests).
+  self:mark_dirty()
+  self:save_if_dirty()
   return addr
 end
 
 function Wallet:get_change_address()
   local addr = self:generate_address(1, self.next_internal_index)
   self.next_internal_index = self.next_internal_index + 1
+  -- A change address is just as crash-sensitive as a receive address: losing
+  -- the internal index on an unclean restart means the next send re-derives the
+  -- same change script, so persist the advance immediately.
+  self:mark_dirty()
+  self:save_if_dirty()
   return addr
 end
 
@@ -1748,6 +1772,10 @@ end
 --- the wallet is live. Once set, scan_utxos / scan_history credit normally.
 function Wallet:mark_scanned()
   self.scanned = true
+  -- Persist the live flag so a reload does not regress to "balance 0 until
+  -- rescan". Cheap and crash-safe.
+  self:mark_dirty()
+  self:save_if_dirty()
 end
 
 --- Rescan the connected chain for this wallet's own funds.
@@ -1805,7 +1833,116 @@ function Wallet:rescan(chain_state, mempool, start_height, stop_height)
     self:scan_mempool(mempool)
   end
 
+  -- A from-tip rescan has reconciled the ledger up to `stop_height`.
+  self.last_synced_height = stop_height
+  self:mark_dirty()
+
   return {start_height = start_height, stop_height = stop_height}
+end
+
+--- Is any output of this tx paid to a wallet-owned script, or does any input
+--- spend one of our coins? Used by scan_block to decide whether a connected
+--- block touches the wallet at all (cheap relevance filter before the heavier
+--- ledger refresh). Mirrors Bitcoin Core CWallet::AddToWalletIfInvolvingMe.
+function Wallet:_block_tx_is_mine(tx)
+  -- Outputs paying us.
+  for _, out in ipairs(tx.outputs) do
+    if self:_owned_addr_for_spk(out.script_pubkey) then
+      return true
+    end
+  end
+  -- Inputs spending our coins (recognised via our current UTXO ledger).
+  for _, inp in ipairs(tx.inputs) do
+    if inp.prev_out and inp.prev_out.hash then
+      local k = inp.prev_out.hash.bytes .. string.char(
+        bit.band(inp.prev_out.index, 0xFF),
+        bit.band(bit.rshift(inp.prev_out.index, 8), 0xFF),
+        bit.band(bit.rshift(inp.prev_out.index, 16), 0xFF),
+        bit.band(bit.rshift(inp.prev_out.index, 24), 0xFF))
+      if self.utxos[k] then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+--- Per-block wallet hook, called from the live block-connect loop (and the
+--- IBD/P2P path), NOT just the mining/RPC path. Mirrors Bitcoin Core
+--- CWallet::blockConnected / ScanBlock: for each connected block, credit
+--- outputs paying us and debit inputs spending our coins, then advance the
+--- last-synced height so a restart resumes from here.
+--
+-- Implementation note: lunarblock's ledger is derived from the chainstate UTXO
+-- set (scan_utxos) + connected-block history (scan_history), both idempotent
+-- and cheap relative to a network round-trip. So rather than maintaining a
+-- second, drift-prone incremental accounting path, scan_block re-derives the
+-- ledger from the (already-updated) chainstate whenever the block is relevant.
+-- The relevance filter keeps the common "block has nothing for us" case O(txs).
+--
+-- @param chain_state ChainState (already advanced to include this block)
+-- @param block table   the just-connected block
+-- @param height number  the height this block was connected at
+-- @param mempool table|nil
+function Wallet:scan_block(chain_state, block, height, mempool)
+  if type(height) ~= "number" then
+    height = (chain_state and chain_state.tip_height) or self.last_synced_height
+  end
+
+  -- A wallet that has never been scanned stays at balance 0 until an explicit
+  -- rescan (Core parity); but we still track how far the chain has advanced so
+  -- a later rescanblockchain / mark_scanned knows the tip. Don't credit yet.
+  local relevant = false
+  if self.scanned and block and block.transactions then
+    for _, tx in ipairs(block.transactions) do
+      if self:_block_tx_is_mine(tx) then
+        relevant = true
+        break
+      end
+    end
+    if relevant then
+      -- Re-derive the ledger from the updated chainstate + block history.
+      self:scan_utxos(chain_state)
+      self:scan_history(chain_state, mempool)
+      if mempool then self:scan_mempool(mempool) end
+    end
+  end
+
+  -- Always advance the reconciled height + mark dirty so the periodic flush
+  -- persists progress (a relevant block changes balances; an irrelevant one
+  -- still moves last_synced_height forward).
+  if height and height > (self.last_synced_height or 0) then
+    self.last_synced_height = height
+  end
+  self:mark_dirty()
+  return relevant
+end
+
+--- Bring the wallet up to the chain tip on startup. Persisted last_synced_height
+--- tells us how far we already reconciled; if the tip moved ahead while we were
+--- down (or we crashed mid-IBD), re-derive the ledger and record the new tip.
+--- Cheap no-op when already at tip. Called once from main.lua after load.
+-- @param chain_state ChainState
+-- @param mempool table|nil
+function Wallet:reconcile_to_tip(chain_state, mempool)
+  if not chain_state then return end
+  local tip = chain_state.tip_height or 0
+  if tip < 0 then tip = 0 end
+  local from = self.last_synced_height or 0
+  if from >= tip then
+    -- Already reconciled; still refresh confirmations against the current tip.
+    if self.scanned then self:scan_utxos(chain_state) end
+    return
+  end
+  -- We are behind the tip: reconcile the gap. scan_utxos/scan_history rebuild
+  -- the whole ledger from chainstate (idempotent), which closes the gap exactly.
+  if self.scanned then
+    self:scan_utxos(chain_state)
+    self:scan_history(chain_state, mempool)
+    if mempool then self:scan_mempool(mempool) end
+  end
+  self.last_synced_height = tip
+  self:mark_dirty()
 end
 
 --- Best-effort destination address for an arbitrary scriptPubKey (recipient of
@@ -3174,6 +3311,9 @@ ffi.cdef[[
   long long write(int fd, const void *buf, unsigned long count);
   long long read(int fd, void *buf, unsigned long count);
   long long lseek(int fd, long long offset, int whence);
+  int fsync(int fd);
+  int rename(const char *oldpath, const char *newpath);
+  int unlink(const char *pathname);
 ]]
 
 -- fcntl constants
@@ -3182,8 +3322,12 @@ local F_SETLKW = 7
 local F_WRLCK = 1
 local F_UNLCK = 2
 local O_RDWR = 2
+local O_RDONLY = 0
 local O_CREAT = 64
 local O_TRUNC = 512
+-- O_DIRECTORY (Linux): require the opened path to be a directory; used to get a
+-- handle for fsync()-ing the parent dir so a rename() is itself durable.
+local O_DIRECTORY = 0x10000
 local SEEK_SET = 0
 local SEEK_END = 2
 
@@ -3208,6 +3352,28 @@ local function unlock_file(fd)
   lock.l_start = 0
   lock.l_len = 0
   ffi.C.fcntl(fd, F_SETLK, lock)
+end
+
+--- Return the directory part of a path ("/a/b/c.json" -> "/a/b"; "x" -> ".").
+local function dir_of(path)
+  local d = path:match("^(.*)/[^/]*$")
+  if not d or d == "" then return "." end
+  return d
+end
+
+--- fsync the directory containing `path` so a rename() into it is durable.
+-- Mirrors Bitcoin Core's FileCommit + the directory fsync it performs after
+-- a rename (src/util/fs_helpers.cpp / walletdb.cpp). Best-effort: a failure to
+-- open the directory (e.g. unusual filesystem) is non-fatal — the data file
+-- itself was already fsync'd, so we never lose the bytes, only the rename's
+-- crash-durability guarantee.
+local function fsync_dir(path)
+  local dir = dir_of(path)
+  local dfd = ffi.C.open(dir, bit.bor(O_RDONLY, O_DIRECTORY), 0)
+  if dfd < 0 then return false end
+  ffi.C.fsync(dfd)
+  ffi.C.close(dfd)
+  return true
 end
 
 -- Simple JSON encoding (for wallet data which has simple structure)
@@ -3279,6 +3445,13 @@ function Wallet:serialize()
     -- Persist whether the wallet has scanned the chain, so a reload does not
     -- regress a live wallet back to the "balance 0 until rescan" state.
     scanned = self.scanned and true or false,
+    -- Persist how far the wallet's ledger has been reconciled against the
+    -- chain. On startup main.lua reads this back and only has to re-scan the
+    -- gap (last_synced_height .. tip) instead of a full from-genesis rescan,
+    -- and a wallet that crashed mid-IBD knows where to resume. Mirrors
+    -- Bitcoin Core's m_last_block_processed_height (CWallet) persisted in
+    -- the wallet DB so a restart reconciles forward from there.
+    last_synced_height = self.last_synced_height or 0,
   }
 
   -- Persist imported keys (importprivkey). These are NOT derivable from the HD
@@ -3338,30 +3511,139 @@ end
 -- @return boolean: true on success
 -- @return string|nil: Error message on failure
 function Wallet:save(filepath)
+  -- Remember where we persist so save-on-mutation (mark_dirty / save_if_dirty)
+  -- and the block-connect hook can re-flush without the caller re-supplying it.
+  if filepath then self._save_path = filepath end
+  filepath = filepath or self._save_path
+  if not filepath then
+    return false, "Wallet:save called with no path and no remembered path"
+  end
+
   local data = self:serialize()
 
-  -- Open file with exclusive lock
-  local fd = ffi.C.open(filepath, bit.bor(O_RDWR, O_CREAT, O_TRUNC), 0x180)  -- 0600
+  -- ATOMIC + DURABLE write (mirror mempool_persist.dump / fee:save and Bitcoin
+  -- Core walletdb.cpp): never truncate the live file in place — a crash between
+  -- truncate and the final write would leave a zero-length / partial wallet that
+  -- the loader would then choke on. Instead write to <path>.tmp, fsync it, then
+  -- atomically rename over the destination, and fsync the parent directory so
+  -- the rename itself survives a power loss.
+  local tmp = filepath .. ".tmp"
+
+  -- O_CREAT|O_TRUNC on the TEMP file only (safe: it is not the live wallet).
+  -- NB: the mode arg is VARIADIC in open(2). LuaJIT passes a bare Lua number as
+  -- a C double through the `...`, which the kernel then reads as garbage → the
+  -- file lands with 0000 perms (unreadable even by its owner; M.exists / load
+  -- via io.open then can't see it). Cast to a real C int so we get 0600.
+  local fd = ffi.C.open(tmp, bit.bor(O_RDWR, O_CREAT, O_TRUNC), ffi.cast("int", 0x180))  -- 0600
   if fd < 0 then
-    return false, "Cannot open wallet file for writing"
+    return false, "Cannot open temp wallet file for writing: " .. tmp
   end
 
   if not lock_file(fd) then
     ffi.C.close(fd)
-    return false, "Cannot acquire lock on wallet file"
+    return false, "Cannot acquire lock on temp wallet file"
   end
 
-  -- Write data
-  local written = ffi.C.write(fd, data, #data)
-  if written ~= #data then
-    unlock_file(fd)
-    ffi.C.close(fd)
-    return false, "Failed to write wallet data"
+  -- Write the full payload (handle partial writes from a single write() call).
+  local total = #data
+  local off = 0
+  while off < total do
+    local chunk = data:sub(off + 1)
+    local n = tonumber(ffi.C.write(fd, chunk, #chunk))
+    if n <= 0 then
+      unlock_file(fd)
+      ffi.C.close(fd)
+      ffi.C.unlink(tmp)
+      return false, "Failed to write wallet data"
+    end
+    off = off + n
   end
 
+  -- fsync the data to stable storage BEFORE the rename, so the rename can never
+  -- expose a name pointing at unflushed bytes.
+  ffi.C.fsync(fd)
   unlock_file(fd)
   ffi.C.close(fd)
+
+  -- Atomic publish: rename(2) over the destination is atomic on POSIX, so a
+  -- reader either sees the old complete file or the new complete file — never a
+  -- torn one.
+  if ffi.C.rename(tmp, filepath) ~= 0 then
+    ffi.C.unlink(tmp)
+    return false, "Failed to rename temp wallet file into place"
+  end
+
+  -- Make the rename itself durable.
+  fsync_dir(filepath)
+
+  -- A successful flush clears the dirty flag.
+  self._dirty = false
   return true
+end
+
+--- Mark the in-memory wallet state as changed since the last successful save.
+-- Cheap; pairs with save_if_dirty() for a debounced periodic flush so the hot
+-- block-connect path does not fsync on every single block.
+function Wallet:mark_dirty()
+  self._dirty = true
+end
+
+--- Flush to disk only if there are unsaved mutations. Returns true if a save
+-- was performed (or nothing needed saving), false + err on a real failure.
+-- Uses the remembered _save_path; a no-op (and success) when no path is known.
+function Wallet:save_if_dirty()
+  if not self._dirty then return true end
+  if not self._save_path then return true end
+  return self:save(self._save_path)
+end
+
+--- Read the full raw bytes of a wallet file, locking while we read.
+-- Returns the raw string, or nil + err. Never raises (callers run under pcall
+-- already, but this keeps the failure mode a clean nil).
+local function read_wallet_raw(filepath)
+  local fd = ffi.C.open(filepath, O_RDWR, 0)
+  if fd < 0 then
+    -- A file that exists but isn't writable still needs reading; retry RDONLY.
+    fd = ffi.C.open(filepath, O_RDONLY, 0)
+    if fd < 0 then
+      return nil, "Wallet file not found"
+    end
+  end
+  if not lock_file(fd) then
+    ffi.C.close(fd)
+    return nil, "Cannot acquire lock on wallet file"
+  end
+  local size = ffi.C.lseek(fd, 0, SEEK_END)
+  ffi.C.lseek(fd, 0, SEEK_SET)
+  if size <= 0 then
+    unlock_file(fd)
+    ffi.C.close(fd)
+    return nil, "Wallet file is empty"
+  end
+  local buf = ffi.new("char[?]", size + 1)
+  local bytes_read = ffi.C.read(fd, buf, size)
+  unlock_file(fd)
+  ffi.C.close(fd)
+  if bytes_read ~= size then
+    return nil, "Failed to read wallet file"
+  end
+  return ffi.string(buf, size)
+end
+
+--- Try to read AND decode a wallet file into a plain data table.
+-- Both the read and the JSON decode run under pcall so a missing / truncated /
+-- corrupt file becomes nil + err, NEVER a raised error that crashes startup.
+local function try_load_data(filepath, decode)
+  local raw, rerr = read_wallet_raw(filepath)
+  if not raw then return nil, rerr end
+  local ok, data = pcall(decode, raw)
+  if not ok then
+    return nil, "JSON decode failed: " .. tostring(data)
+  end
+  if type(data) ~= "table" then
+    return nil, "wallet file did not decode to an object"
+  end
+  return data
 end
 
 --- Load wallet from file with locking.
@@ -3374,33 +3656,41 @@ end
 function M.load(filepath, network, storage, passphrase)
   local _, decode = get_json()
 
-  -- Open and lock file
-  local fd = ffi.C.open(filepath, O_RDWR, 0)
-  if fd < 0 then
-    return nil, "Wallet file not found"
+  -- FAULT-TOLERANT LOAD. A missing / corrupt / partially-written wallet file
+  -- must NEVER crash node startup. Try the live file first; if it is unreadable
+  -- or fails to decode, fall back to the crashed-save temp file (<path>.tmp),
+  -- which may hold the freshest *complete* state if the crash happened after the
+  -- temp was fully written but before the rename. Whatever we recover from, the
+  -- corrupt original is quarantined to <path>.bak so the operator can inspect it
+  -- and the next save() can overwrite the live name cleanly.
+  local data, derr = try_load_data(filepath, decode)
+  if not data then
+    -- Quarantine the bad live file (best-effort).
+    local bad_exists = ffi.C.open(filepath, O_RDONLY, 0)
+    if bad_exists >= 0 then
+      ffi.C.close(bad_exists)
+      ffi.C.rename(filepath, filepath .. ".bak")
+      io.stderr:write(string.format(
+        "WARNING: wallet file %s unreadable (%s); moved aside to %s.bak\n",
+        filepath, tostring(derr), filepath))
+    end
+    -- Attempt recovery from a left-over atomic-save temp file.
+    local tmp = filepath .. ".tmp"
+    local tdata, terr = try_load_data(tmp, decode)
+    if tdata then
+      io.stderr:write(string.format(
+        "Recovered wallet state from crashed-save temp file %s\n", tmp))
+      data = tdata
+      -- Promote the recovered temp into place so subsequent reads are clean.
+      ffi.C.rename(tmp, filepath)
+    else
+      -- Nothing recoverable. Surface a clean error; the caller (load_wallet /
+      -- main.lua) must treat this as non-fatal and continue (e.g. create a
+      -- fresh wallet) rather than aborting node startup.
+      return nil, "wallet load failed (" .. tostring(derr) ..
+        "; temp recovery: " .. tostring(terr) .. ")"
+    end
   end
-
-  if not lock_file(fd) then
-    ffi.C.close(fd)
-    return nil, "Cannot acquire lock on wallet file"
-  end
-
-  -- Get file size
-  local size = ffi.C.lseek(fd, 0, SEEK_END)
-  ffi.C.lseek(fd, 0, SEEK_SET)
-
-  -- Read data
-  local buf = ffi.new("char[?]", size + 1)
-  local bytes_read = ffi.C.read(fd, buf, size)
-  unlock_file(fd)
-  ffi.C.close(fd)
-
-  if bytes_read ~= size then
-    return nil, "Failed to read wallet file"
-  end
-
-  local raw = ffi.string(buf, size)
-  local data = decode(raw)
 
   -- Use network from file if not provided
   if not network and data.network then
@@ -3525,6 +3815,13 @@ function M.load(filepath, network, storage, passphrase)
   -- Restore the scanned flag (a reloaded live wallet stays live).
   wallet.scanned = data.scanned and true or false
 
+  -- Restore how far the ledger was reconciled, so startup can scan only the gap.
+  wallet.last_synced_height = tonumber(data.last_synced_height) or 0
+
+  -- Remember the path so save-on-mutation / save_if_dirty can re-flush without
+  -- the caller re-supplying it.
+  wallet._save_path = filepath
+
   return wallet
 end
 
@@ -3641,8 +3938,9 @@ function WalletManager:acquire_lock(name)
   local wallet_dir = self:get_wallet_dir(name)
   local lock_path = wallet_dir .. "/.lock"
 
-  -- Create lock file if it doesn't exist
-  local fd = ffi.C.open(lock_path, bit.bor(O_RDWR, O_CREAT), 0x180)  -- 0600
+  -- Create lock file if it doesn't exist. Cast the variadic mode to a C int so
+  -- it lands with real 0600 perms (a bare Lua number yields 0000 — see save()).
+  local fd = ffi.C.open(lock_path, bit.bor(O_RDWR, O_CREAT), ffi.cast("int", 0x180))  -- 0600
   if fd < 0 then
     return false, "Cannot open lock file: " .. lock_path
   end
