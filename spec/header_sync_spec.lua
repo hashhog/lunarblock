@@ -602,6 +602,89 @@ describe("header sync", function()
       assert.is_false(chain:is_syncing())
       assert.is_nil(chain:get_sync_peer())
     end)
+
+    -- LIVENESS-WEDGE regression: when the active header-sync peer disconnects,
+    -- the sync latch (syncing + sync_peer) MUST be released so another peer
+    -- can take over.  Pre-fix, nothing cleared the latch on disconnect and
+    -- header sync wedged forever pinned to a dead sync_peer.
+    -- Mirrors Bitcoin Core FinalizeNode (net_processing.cpp:1675) decrementing
+    -- nSyncStarted when the sync peer is torn down.
+    it("releases the sync latch when the active sync peer disconnects", function()
+      local peer = helpers.mock_peer({ ip = "10.0.0.1", port = 8333 })
+      chain:start_sync(peer)
+      assert.is_true(chain:is_syncing())
+      assert.equals(peer, chain:get_sync_peer())
+
+      local was_sync_peer = chain:on_peer_disconnected(peer)
+
+      assert.is_true(was_sync_peer)
+      assert.is_false(chain:is_syncing(),
+        "sync latch must reset so another peer can take over (LIVENESS-WEDGE)")
+      assert.is_nil(chain:get_sync_peer())
+    end)
+
+    -- A disconnect from a peer that is NOT the active sync peer must NOT
+    -- disturb the ongoing sync (Core only decrements nSyncStarted for the
+    -- node whose state->fSyncStarted is set).
+    it("leaves sync intact when a non-sync peer disconnects", function()
+      local sync_peer = helpers.mock_peer({ ip = "10.0.0.1", port = 8333 })
+      local other_peer = helpers.mock_peer({ ip = "10.0.0.2", port = 8333 })
+      chain:start_sync(sync_peer)
+      assert.is_true(chain:is_syncing())
+
+      local was_sync_peer = chain:on_peer_disconnected(other_peer)
+
+      assert.is_false(was_sync_peer)
+      assert.is_true(chain:is_syncing(),
+        "an unrelated peer's disconnect must not wedge or reset sync")
+      assert.equals(sync_peer, chain:get_sync_peer())
+    end)
+
+    -- After the sync peer drops, a surviving peer must be able to (re)start
+    -- header sync — the whole point of releasing the latch.  This is what the
+    -- main-loop tick-level re-engagement does; here we assert the latch state
+    -- permits it directly.
+    it("permits a surviving peer to take over after a sync-peer disconnect", function()
+      local peer_a = helpers.mock_peer({ ip = "10.0.0.1", port = 8333 })
+      local peer_b = helpers.mock_peer({ ip = "10.0.0.2", port = 8333 })
+      chain:start_sync(peer_a)
+      chain:on_peer_disconnected(peer_a)
+
+      -- Latch is free → peer_b can take over.
+      assert.is_false(chain:is_syncing())
+      chain:start_sync(peer_b)
+      assert.is_true(chain:is_syncing())
+      assert.equals(peer_b, chain:get_sync_peer())
+    end)
+
+    -- on_peer_disconnected must also drop the disconnected peer's low-work
+    -- (PRESYNC) state + unconnecting-headers counter, mirroring Core's
+    -- m_headers_presync_stats.erase(nodeid).
+    it("clears the disconnected peer's presync/unconnecting state", function()
+      local peer = helpers.mock_peer({ ip = "10.0.0.1", port = 8333 })
+      peer.id = "peer-presync"
+      chain:start_sync(peer)
+      -- Seed per-peer low-work + unconnecting state.
+      chain.peer_sync_states = chain.peer_sync_states or {}
+      chain.peer_sync_states[peer.id] = { fake = true }
+      chain:note_unconnecting_headers(peer)
+      assert.is_not_nil(chain:get_peer_sync_state(peer))
+      assert.is_true(chain:get_unconnecting_headers_count(peer) > 0)
+
+      chain:on_peer_disconnected(peer)
+
+      assert.is_nil(chain:get_peer_sync_state(peer))
+      assert.equals(0, chain:get_unconnecting_headers_count(peer))
+    end)
+
+    -- A nil peer must be tolerated (defensive: callbacks may fire with a
+    -- partially-torn-down peer object).
+    it("tolerates a nil peer in on_peer_disconnected", function()
+      assert.has_no.errors(function()
+        local r = chain:on_peer_disconnected(nil)
+        assert.is_false(r)
+      end)
+    end)
   end)
 
   describe("work calculation", function()
