@@ -819,8 +819,11 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
   -- package.  lunarblock's accept_package runs only check_transaction +
   -- weight cap, never single_truc_checks.
   ---------------------------------------------------------------------------
-  describe("G24 BUG: accept_package skips TRUC inheritance checks", function()
-    it("DOCUMENTS: non-TRUC child of TRUC parent accepted via accept_package (wrong)", function()
+  -- G24 (FIXED, audit w14z8m3zc): accept_package now routes every member
+  -- through accept_transaction, which runs single_truc_checks.  A non-TRUC
+  -- (v1) child of a TRUC (v3) parent violates TRUC Gate 1 and MUST be rejected.
+  describe("G24: accept_package enforces TRUC inheritance checks", function()
+    it("rejects a non-TRUC child of a TRUC parent via accept_package (Gate 1)", function()
       local cs = make_chain()
       local coin = random_txid()
       add_utxo(cs, coin, 0, 300000)
@@ -836,16 +839,13 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
         { make_input(p_txid, 0) },
         { make_output(100000) }, 0)
 
-      local ok, _ = mp:accept_package({ truc_par, non_truc_child })
-      -- Should fail (TRUC Gate 1), but BUG: accept_package skips TRUC checks
-      if ok then
-        assert.is_true(true,
-          "BUG-G24 CONFIRMED: TRUC Gate-1 violation accepted via accept_package " ..
-          "(PackageTRUCChecks / single_truc_checks never called in accept_package)")
-      else
-        -- If it fails for some other reason, that's also acceptable
-        assert.is_false(ok)
-      end
+      local ok = mp:accept_package({ truc_par, non_truc_child })
+      assert.is_false(ok,
+        "TRUC Gate-1 violation (v1 child of v3 parent) MUST be rejected by " ..
+        "accept_package now that members run single_truc_checks")
+      -- Atomic: neither member may linger.
+      assert.are_equal(0, mp.tx_count,
+        "rejected package must leave the mempool empty (atomic rollback)")
     end)
   end)
 
@@ -980,37 +980,39 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
   -- lunarblock's accept_package only runs check_transaction + weight cap,
   -- silently admitting non-standard txs (wrong version, dust outputs, etc.).
   ---------------------------------------------------------------------------
-  describe("G30 BUG: accept_package skips per-tx standardness gates", function()
-    it("DOCUMENTS: version=0 (non-standard) tx accepted via accept_package", function()
+  -- G30 (FIXED, audit w14z8m3zc): accept_package now applies the SAME per-tx
+  -- standardness gates single-tx admission applies, because every member is
+  -- routed through accept_transaction.
+  describe("G30: accept_package enforces per-tx standardness gates", function()
+    it("rejects a version=0 (non-standard) tx via accept_package", function()
       local cs = make_chain()
       local coin_single = random_txid()
       add_utxo(cs, coin_single, 0, 200000)
 
       local mp = mempool.new(cs)
 
-      -- Confirm version=0 is correctly rejected by accept_transaction
+      -- version=0 is rejected by accept_transaction (IsStandardTx).
       local tx_v0 = types.transaction(0,
         { make_input(coin_single, 0) },
         { make_output(100000) }, 0)
       local ok_single, err_single = mp:accept_transaction(tx_v0)
       assert.is_false(ok_single,
         "version=0 correctly rejected by accept_transaction (IsStandardTx)")
+      assert.is_truthy(string.find(tostring(err_single), "version"))
 
-      -- Now try the same tx via accept_package
+      -- The SAME tx via accept_package must now also be rejected.
       local coin2 = random_txid()
       add_utxo(cs, coin2, 0, 200000)
       local tx_v0b = types.transaction(0,
         { make_input(coin2, 0) },
         { make_output(100000) }, 0)
-      local ok_pkg, pkg_result = mp:accept_package({ tx_v0b })
-      if ok_pkg then
-        assert.is_true(true,
-          "BUG-G30 CONFIRMED: version=0 non-standard tx accepted via accept_package " ..
-          "(accept_package skips IsStandardTx version check, step 2b missing)")
-      else
-        -- May fail for other reasons; either outcome documents the gap
-        assert.is_false(ok_pkg)
-      end
+      local ok_pkg, pkg_err = mp:accept_package({ tx_v0b })
+      assert.is_false(ok_pkg,
+        "version=0 non-standard tx MUST be rejected via accept_package now " ..
+        "that members run IsStandardTx")
+      assert.is_truthy(string.find(tostring(pkg_err), "version"),
+        "reject reason must reference the version gate, got: " .. tostring(pkg_err))
+      assert.are_equal(0, mp.tx_count)
     end)
   end)
 
