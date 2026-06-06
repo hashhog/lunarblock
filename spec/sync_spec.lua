@@ -575,6 +575,62 @@ describe("sync", function()
       assert.is_false(chain:is_syncing())
     end)
 
+    -- Regression: peer.start_height must be kept fresh from received
+    -- headers (Core's pindexBestKnownBlock / UpdateBlockAvailability).
+    -- A peer that delivers headers connecting to our chain provably has a
+    -- chain at least as tall as the resulting header tip; freezing
+    -- start_height at the handshake value is what stranded the block
+    -- downloader once next_connect_height passed the handshake height.
+    it("bumps peer.start_height from delivered headers", function()
+      local peer = create_mock_peer()
+      peer.start_height = 0  -- stale/under-reported handshake height
+      chain:start_sync(peer)
+
+      local headers = {}
+      local parent_hash = chain:get_tip_hash()
+      local timestamp = consensus.networks.regtest.genesis.timestamp
+      for i = 1, 5 do
+        timestamp = timestamp + 600
+        local header = create_valid_header(parent_hash, timestamp)
+        assert.is_true(find_valid_nonce(header))
+        headers[i] = header
+        parent_hash = validation.compute_block_hash(header)
+      end
+
+      local payload = p2p.serialize_headers(headers)
+      local accepted = chain:handle_headers(peer, payload)
+
+      assert.equals(5, accepted)
+      -- After accepting 5 headers above genesis, the header tip is height 5
+      -- and the peer's recorded height must have been bumped to match.
+      assert.equals(5, chain.header_tip_height)
+      assert.equals(5, peer.start_height)
+    end)
+
+    it("does not lower a peer.start_height that is already higher", function()
+      local peer = create_mock_peer()
+      peer.start_height = 1000  -- already ahead of what it just delivered
+      chain:start_sync(peer)
+
+      local headers = {}
+      local parent_hash = chain:get_tip_hash()
+      local timestamp = consensus.networks.regtest.genesis.timestamp
+      for i = 1, 3 do
+        timestamp = timestamp + 600
+        local header = create_valid_header(parent_hash, timestamp)
+        assert.is_true(find_valid_nonce(header))
+        headers[i] = header
+        parent_hash = validation.compute_block_hash(header)
+      end
+
+      local payload = p2p.serialize_headers(headers)
+      chain:handle_headers(peer, payload)
+
+      -- We only ratchet up, never down: a partial-batch delivery must not
+      -- shrink a peer's known height below its prior value.
+      assert.equals(1000, peer.start_height)
+    end)
+
     it("stops sync on invalid headers", function()
       local peer = create_mock_peer()
       chain:start_sync(peer)
@@ -837,6 +893,81 @@ describe("sync", function()
         downloader:schedule_downloads({peer})
 
         assert.equals(0, #peer.messages_sent)
+      end)
+
+      -- Regression: stale-start_height block-download stall.
+      -- The peer filter used `(p.start_height or 0) >= next_connect_height`.
+      -- peer.start_height is the handshake-time height and was never bumped
+      -- as the peer's chain grew, so once our connect cursor passed the
+      -- peer's handshake height the ONLY peer was filtered out -> 0 eligible
+      -- peers -> permanent download stall. The fallback now keeps any
+      -- free-slot peer eligible rather than stranding the scheduler.
+      it("does not strand the only peer when start_height is stale", function()
+        -- Build a 5-header chain.
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp
+        for _ = 1, 5 do
+          timestamp = timestamp + 600
+          local header = create_valid_header(parent_hash, timestamp)
+          assert.is_true(find_valid_nonce(header))
+          chain:accept_header(header)
+          parent_hash = validation.compute_block_hash(header)
+        end
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        -- Cursor at height 3; peer reports a STALE handshake height of 2,
+        -- i.e. below next_connect_height. Pre-fix this peer was excluded.
+        downloader.next_connect_height = 3
+        downloader.next_download_height = 3
+        local peer = create_mock_peer(1, 2)
+
+        downloader:schedule_downloads({peer})
+
+        -- The fallback must keep the only peer eligible: a getdata is sent.
+        local sent_getdata = false
+        for _, msg in ipairs(peer.messages_sent) do
+          if msg.command == "getdata" then sent_getdata = true end
+        end
+        assert.is_true(sent_getdata)
+      end)
+
+      it("still uses the height gate when a healthy peer exists", function()
+        -- Two free-slot peers: one passes the gate, one is stale. The
+        -- healthy peer must be picked WITHOUT the fallback being consulted,
+        -- i.e. normal selection is unchanged on the happy path.
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp
+        for _ = 1, 5 do
+          timestamp = timestamp + 600
+          local header = create_valid_header(parent_hash, timestamp)
+          assert.is_true(find_valid_nonce(header))
+          chain:accept_header(header)
+          parent_hash = validation.compute_block_hash(header)
+        end
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 3
+        downloader.next_download_height = 3
+        local stale = create_mock_peer(1, 1)    -- below cursor, excluded by gate
+        local healthy = create_mock_peer(2, 100) -- above cursor, passes gate
+
+        downloader:schedule_downloads({stale, healthy})
+
+        local stale_items, healthy_items = 0, 0
+        for _, msg in ipairs(stale.messages_sent) do
+          if msg.command == "getdata" then
+            stale_items = stale_items + #p2p.deserialize_inv(msg.payload)
+          end
+        end
+        for _, msg in ipairs(healthy.messages_sent) do
+          if msg.command == "getdata" then
+            healthy_items = healthy_items + #p2p.deserialize_inv(msg.payload)
+          end
+        end
+        -- All requests go to the healthy peer; the stale one is not used
+        -- because at least one peer passed the gate (fallback not triggered).
+        assert.is_true(healthy_items > 0)
+        assert.equals(0, stale_items)
       end)
     end)
 
