@@ -1811,6 +1811,11 @@ function HeaderChain:handle_headers(peer, payload)
 
     if accepted_count > 0 then
       self:set_header_tip(self.header_tip_hash, self.header_tip_height, false)
+      -- Keep the peer's known height fresh on the low-work/REDOWNLOAD path
+      -- too (see the detailed comment on the normal-sync path below).
+      if self.header_tip_height and (peer.start_height or 0) < self.header_tip_height then
+        peer.start_height = self.header_tip_height
+      end
     end
 
     return accepted_count
@@ -1890,6 +1895,29 @@ function HeaderChain:handle_headers(peer, payload)
   -- the success path of ProcessHeadersMessage).
   if accepted and accepted > 0 then
     self:reset_unconnecting_headers(peer)
+  end
+
+  -- Keep the peer's known height fresh (Core parity).
+  --
+  -- peer.start_height is the peer's claimed height at the version
+  -- handshake (set ONCE in peer.lua:handle_version, init 0). It is never
+  -- updated as the peer's chain grows.  Bitcoin Core does not freeze a
+  -- peer's height at the handshake: it tracks pindexBestKnownBlock, the
+  -- best header the peer has demonstrably announced to us
+  -- (net_processing.cpp UpdateBlockAvailability, called from the headers
+  -- handler).  We mirror that here: a peer that just delivered headers
+  -- which connected to our chain provably has a chain at least as tall as
+  -- our resulting header tip, so bump its recorded height to match.
+  --
+  -- Without this, BlockDownloader:schedule_downloads (the
+  -- `start_height >= self.next_connect_height` peer filter) permanently
+  -- excludes our only/best peer the moment our connect cursor catches up
+  -- to its stale handshake height, yielding 0 eligible peers and a block-
+  -- download stall that recurs every time we catch up.
+  if accepted and accepted > 0 and self.header_tip_height then
+    if (peer.start_height or 0) < self.header_tip_height then
+      peer.start_height = self.header_tip_height
+    end
   end
 
   -- If we got a full batch (2000 headers), request more
@@ -2169,13 +2197,34 @@ function BlockDownloader:schedule_downloads(peers)
   -- (peers advertising height=0 or very low height cannot serve IBD blocks)
   local min_useful_height = self.next_connect_height
   local available_peers = {}
+  -- Peers that have a free slot but flunk the height gate. Kept as a
+  -- fallback so a stale/under-reported start_height can never strand the
+  -- scheduler at 0 eligible peers.
+  local slot_free_peers = {}
   for _, p in ipairs(peers) do
     local peer_count = self.peer_inflight[p] or 0
-    if peer_count < self.blocks_per_peer and (p.start_height or 0) >= min_useful_height then
-      available_peers[#available_peers + 1] = p
+    if peer_count < self.blocks_per_peer then
+      slot_free_peers[#slot_free_peers + 1] = p
+      if (p.start_height or 0) >= min_useful_height then
+        available_peers[#available_peers + 1] = p
+      end
     end
   end
-  if #available_peers == 0 then return end
+  -- Safety net: the height gate above relies on peer.start_height, which is
+  -- the peer's claimed height at the handshake. handle_headers now keeps it
+  -- fresh as the peer's chain grows, but a peer that connected before that
+  -- code ran, or that simply under-reported at handshake, could still fail
+  -- the gate. Rather than return with 0 eligible peers and stall the entire
+  -- block download (the recurring "0 eligible peers" wedge), fall back to
+  -- any peer with a free slot. These peers fed us the headers we are now
+  -- trying to fetch the blocks for, so they demonstrably have the chain;
+  -- worst case they reply notfound and the normal stall/re-request path
+  -- retries elsewhere. This does NOT change peer selection on the happy
+  -- path (when >=1 peer passes the gate, the fallback is never consulted).
+  if #available_peers == 0 then
+    if #slot_free_peers == 0 then return end
+    available_peers = slot_free_peers
+  end
 
   -- Build requests per peer (batch multiple inv items per getdata)
   local peer_requests = {}
