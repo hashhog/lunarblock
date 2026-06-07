@@ -9317,6 +9317,17 @@ function RPCServer:setup_w47b_methods()
             local txid_display = types.hash256_hex(types.hash256(txid_internal))
             local v0, v1, v2, v3 = k:byte(33, 36)
             local vout = v0 + v1 * 256 + v2 * 65536 + v3 * 16777216
+            local coin_height = entry.height or 0
+            -- blockhash: hash of the block at the coin's height, big-endian
+            -- display hex. Mirrors Core's coinb_block.GetBlockHash().GetHex()
+            -- (tip->GetAncestor(coin.nHeight)). Guard for a missing index entry.
+            local coin_block_hash = rpc.storage.get_hash_by_height(coin_height)
+            local blockhash_hex
+            if coin_block_hash then
+              blockhash_hex = types.hash256_hex(coin_block_hash)
+            else
+              blockhash_hex = string.rep("0", 64)
+            end
             unspents[#unspents + 1] = {
               txid = txid_display,
               vout = vout,
@@ -9330,7 +9341,12 @@ function RPCServer:setup_w47b_methods()
               desc = desc,
               amount = btc_sentinel(entry.value or 0),
               coinbase = entry.is_coinbase and true or false,
-              height = entry.height or 0,
+              height = coin_height,
+              blockhash = blockhash_hex,
+              -- confirmations = active tip height - coin height + 1
+              -- (Core: tip->nHeight - coin.nHeight + 1). Plain integer count,
+              -- not a BTC amount, so no btc_sentinel wrapping.
+              confirmations = tip_height - coin_height + 1,
             }
           end
         end
