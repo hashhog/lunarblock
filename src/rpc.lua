@@ -1080,6 +1080,10 @@ function M.new(config)
   self.methods = {}        -- method_name -> handler function
   self.chain_state = config.chain_state
   self.mempool = config.mempool
+  -- Orphan tx pool (lunarblock.mempool.OrphanPool). Buffers txs whose parents
+  -- have not yet arrived. Exposed read-only via getorphantxs (Core v28
+  -- rpc/mempool.cpp getorphantxs -> PeerManager::GetOrphanTransactions).
+  self.orphan_pool = config.orphan_pool
   self.peer_manager = config.peer_manager
   self.storage = config.storage
   self.network = config.network or consensus.networks.mainnet
@@ -2356,6 +2360,116 @@ function RPCServer:register_methods()
       end
     end
     return result
+  end
+
+  -- getorphantxs: show transactions in the tx orphanage (Core v28).
+  -- Mirrors bitcoin-core/src/rpc/mempool.cpp::getorphantxs +
+  -- node/txorphanage.cpp::GetOrphanTransactions / OrphanToJSON.
+  --   verbosity 0 (default): array of TXID hex strings (orphan.tx->GetHash(),
+  --                the non-witness txid; may contain duplicates).
+  --   verbosity 1: array of {txid, wtxid, bytes, vsize, weight, from}.
+  --   verbosity 2: verbosity-1 objects PLUS `hex` (serialized tx, like Core's
+  --                EncodeHexTx(*orphan.tx) appended under "hex").
+  -- Invalid verbosity (outside 0..2) -> RPC_INVALID_PARAMETER (-8) with Core's
+  -- exact message ("Invalid verbosity value <n>").
+  self.methods["getorphantxs"] = function(rpc, params)
+    -- ParseVerbosity(request.params[0], default=0, allow_bool=false): the arg is
+    -- an integer (alias `verbose`). Core does NOT accept booleans here. Treat a
+    -- missing/null arg as the default 0; anything non-integer is an error, same
+    -- as Core's ParseVerbosity (throws RPC_TYPE_ERROR for non-numbers).
+    local vp = params[1]
+    local verbosity
+    if vp == nil or vp == cjson.null then
+      verbosity = 0
+    elseif type(vp) == "number" and vp == math.floor(vp) then
+      verbosity = vp
+    else
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " ..
+                       (type(vp) == "number" and "number" or type(vp)) ..
+                       " is not of expected type number"})
+    end
+
+    -- Enumerate the orphan pool. Iterate in insertion order (pool.order) so the
+    -- output is stable; fall back to entries if order is unavailable.
+    local pool = rpc.orphan_pool
+    local wtxids = {}
+    if pool then
+      if pool.order then
+        for _, w in ipairs(pool.order) do
+          if pool.entries[w] then wtxids[#wtxids + 1] = w end
+        end
+      else
+        for w in pairs(pool.entries or {}) do wtxids[#wtxids + 1] = w end
+      end
+    end
+
+    -- The non-witness txid for an orphan entry (Core: orphan.tx->GetHash()).
+    -- Prefer the cached secondary-index txid; recompute from the tx if absent.
+    local function orphan_txid(entry)
+      return entry.txid_hex
+        or types.hash256_hex(validation.compute_txid(entry.tx))
+    end
+
+    -- Build a verbosity-1 object for one orphan entry (shared by 1 and 2).
+    -- Core OrphanToJSON (rpc/mempool.cpp): EXACTLY txid, wtxid,
+    -- bytes (ComputeTotalSize = full witness-serialized size), vsize (BIP141),
+    -- weight (BIP141), from (announcer peer ids). No `expiration` field exists
+    -- in Core; do not emit one.
+    local function orphan_to_json(wtxid_hex, entry)
+      local tx = entry.tx
+      local weight = validation.get_tx_weight(tx)
+      -- bytes = total serialized (witness-included) size; matches the value the
+      -- pool already cached at add() and what getrawtransaction reports as size.
+      local bytes = entry.size or #serialize.serialize_transaction(tx, true)
+      local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+      -- from: the announcing peer id(s). The pool tracks a single announcer per
+      -- entry (entry.peer_id), so emit a 1-element array; empty array if none.
+      local from = setmetatable({}, cjson.array_mt)
+      if entry.peer_id ~= nil then
+        from[1] = entry.peer_id
+      end
+      local o = {
+        txid   = orphan_txid(entry),
+        wtxid  = wtxid_hex,
+        bytes  = bytes,
+        vsize  = vsize,
+        weight = weight,
+        from   = from,
+      }
+      return o
+    end
+
+    local ret = setmetatable({}, cjson.array_mt)
+
+    if verbosity == 0 then
+      -- Core pushes orphan.tx->GetHash().ToString() (the non-witness TXID).
+      for _, w in ipairs(wtxids) do
+        ret[#ret + 1] = orphan_txid(pool.entries[w])
+      end
+    elseif verbosity == 1 then
+      for _, w in ipairs(wtxids) do
+        ret[#ret + 1] = orphan_to_json(w, pool.entries[w])
+      end
+    elseif verbosity == 2 then
+      for _, w in ipairs(wtxids) do
+        local entry = pool.entries[w]
+        local o = orphan_to_json(w, entry)
+        o.hex = M.hex_encode(serialize.serialize_transaction(entry.tx, true))
+        ret[#ret + 1] = o
+      end
+    else
+      -- Core: throw JSONRPCError(RPC_INVALID_PARAMETER,
+      --   "Invalid verbosity value " + ToString(verbosity));
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Invalid verbosity value " .. tostring(verbosity)})
+    end
+
+    -- Empty pool: ensure [] (not {}) regardless of the array metatable above.
+    if #ret == 0 then
+      return setmetatable({}, cjson.empty_array_mt)
+    end
+    return ret
   end
 
   -- Bitcoin Core-compatible mempool.dat dump/load.
