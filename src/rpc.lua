@@ -9370,6 +9370,259 @@ function RPCServer:setup_w47b_methods()
     return {_raw_json = json}
   end
 
+  -- scanblocks: locate blocks whose BIP-157 basic block filter MATCHES any of
+  -- the given scanobjects' scriptPubKeys, over a height range.
+  -- Bitcoin Core: src/rpc/blockchain.cpp::scanblocks (action start/status/abort).
+  --
+  -- This is the index-side counterpart to scantxoutset (which walks the live
+  -- UTXO set): scanblocks walks the per-block compact filters, so it can locate
+  -- the block a script was funded/spent in even after the coin is gone. Because
+  -- GCS filters have FALSE POSITIVES (~1/M, M=784931), relevant_blocks may
+  -- contain extra blocks — every genuine match is guaranteed present, but the
+  -- list is a SUPERSET of the true-positive set.
+  --
+  --   SIGNATURE: scanblocks "action" ( [scanobjects] start_height stop_height
+  --              "filtertype" options ). filtertype default "basic".
+  --   action=status -> null  (no background scan tracked; lunarblock scans
+  --                           synchronously, so nothing is ever in progress);
+  --   action=abort  -> false (nothing running to abort);
+  --   action=start  -> { from_height:int, to_height:int,
+  --                      relevant_blocks:[blockhash...], completed:bool }.
+  --   ERRORS (Core):
+  --     unknown action      -> RPC_INVALID_PARAMETER (-8)
+  --     unknown filtertype  -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+  --     index disabled      -> RPC_MISC_ERROR (-1) "Index is not enabled ..."
+  --     bad start/stop hght -> RPC_MISC_ERROR (-1) "Invalid start_height/stop_height"
+  --
+  -- lunarblock stores the per-block filter blob in CF.BLOCK_FILTER as
+  --   filter_hash(32) || filter_header(32) || varstr(encoded GCS filter)
+  -- (written inline in utxo.lua connect_block, BIP-157 Phase 2). For each height
+  -- in the range we resolve the active-chain block hash (CF.HEIGHT_INDEX), read
+  -- the filter blob, slice out the encoded GCS filter (the same varstr
+  -- getblockfilter returns), and run GCSFilter::MatchAny against the needle set.
+  self.methods["scanblocks"] = function(rpc, params)
+    local blockfilter_mod = require("lunarblock.blockfilter")
+
+    -- (1) Action dispatch (Core: status -> null, abort -> false, start -> work).
+    local action = (params and params[1]) or "start"
+    if type(action) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "action must be a string"})
+    end
+    if action == "status" then
+      -- No background scan is tracked in this synchronous impl; Core's
+      -- reserver-not-held branch returns JSON null when nothing is running.
+      return cjson.null
+    end
+    if action == "abort" then
+      -- Nothing running -> abort returns false (Core: reserve was possible).
+      return false
+    end
+    if action ~= "start" then
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Invalid action '" .. action .. "'"})
+    end
+
+    -- (2) filtertype validation (Core resolves it FIRST). Default "basic".
+    local filtertype = params and params[5]
+    if filtertype == nil or filtertype == cjson.null then
+      filtertype = "basic"
+    end
+    if type(filtertype) ~= "string" or filtertype ~= "basic" then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Unknown filtertype"})
+    end
+
+    -- (3) options.filter_false_positives (default false). Reading it must never
+    -- error when absent / null / non-object. A re-scan to drop false positives
+    -- can only REMOVE positives, never a genuine match — the funded-block
+    -- contract holds with or without it. (lunarblock has no per-block raw store
+    -- to re-derive elements here, so we honor the flag as a no-op: the GCS
+    -- MatchAny result is already the canonical filter answer.)
+    local _filter_false_positives = false
+    do
+      local opts = params and params[6]
+      if type(opts) == "table" and opts.filter_false_positives == true then
+        _filter_false_positives = true
+      end
+    end
+
+    -- (4) scanobjects required for the start action (Core get_array on params[1]).
+    local scanobjects = params and params[2]
+    if type(scanobjects) ~= "table" or #scanobjects == 0 then
+      error({code = M.ERROR.MISC_ERROR,
+             message = "scanobjects argument is required for the start action"})
+    end
+
+    -- (5) Index-enabled gate (Core: GetBlockFilterIndex(BASIC)==null ->
+    -- RPC_MISC_ERROR "Index is not enabled for filtertype <name>").
+    if not (rpc.chain_state and rpc.chain_state.filterindex_enabled) then
+      error({code = M.ERROR.MISC_ERROR,
+             message = "Index is not enabled for filtertype " .. filtertype})
+    end
+    if not (rpc.storage and rpc.storage.get and rpc.storage.get_hash_by_height
+            and rpc.storage.CF) then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    -- (6) Height range (Core: RPC_MISC_ERROR (-1) for bad heights here, NOT
+    -- -8 like scantxoutset). Default start=genesis(0), default stop=tip.
+    local tip = rpc.chain_state and rpc.chain_state.tip_height or 0
+    local start = params and params[3]
+    if start == nil or start == cjson.null then
+      start = 0
+    end
+    if type(start) ~= "number" then
+      error({code = M.ERROR.MISC_ERROR, message = "Invalid start_height"})
+    end
+    start = math.floor(start)
+    if start < 0 or start > tip then
+      error({code = M.ERROR.MISC_ERROR, message = "Invalid start_height"})
+    end
+    local stop = params and params[4]
+    if stop == nil or stop == cjson.null then
+      stop = tip
+    end
+    if type(stop) ~= "number" then
+      error({code = M.ERROR.MISC_ERROR, message = "Invalid stop_height"})
+    end
+    stop = math.floor(stop)
+    if stop < start or stop > tip then
+      error({code = M.ERROR.MISC_ERROR, message = "Invalid stop_height"})
+    end
+
+    -- (7) Build the needle set: each scanobject -> a scriptPubKey (bytes). We
+    -- reuse the SAME descriptor resolution scantxoutset uses, so addr()/raw()/
+    -- pkh()/wpkh()/tr()/bare-hex parity is already proven by the scantxoutset
+    -- differential. Dedup identical scripts.
+    local network_name = rpc.network and rpc.network.name or "mainnet"
+    local crypto_mod = require("lunarblock.crypto")
+    local function hex_to_bytes(h)
+      h = h:gsub("%s", "")
+      if #h % 2 ~= 0 or h:match("[^0-9a-fA-F]") then
+        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid hex in scan object"})
+      end
+      return (h:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+    end
+    local function spk_for_addr(addr)
+      local addr_type, addr_data = address_mod.decode_address(addr, network_name)
+      if not addr_type then
+        error({code = M.ERROR.INVALID_ADDRESS,
+               message = "Invalid address in addr(): " .. tostring(addr_data)})
+      end
+      if addr_type == "p2pkh" then
+        return script_mod.make_p2pkh_script(addr_data)
+      elseif addr_type == "p2sh" then
+        return script_mod.make_p2sh_script(addr_data)
+      elseif addr_type == "p2wpkh" then
+        return script_mod.make_p2wpkh_script(addr_data)
+      elseif addr_type == "p2wsh" then
+        return script_mod.make_p2wsh_script(addr_data)
+      elseif addr_type == "p2tr" then
+        return script_mod.make_p2tr_script(addr_data)
+      else
+        error({code = M.ERROR.INVALID_ADDRESS,
+               message = "Unsupported address type in addr(): " .. addr_type})
+      end
+    end
+    local needle_set = {}
+    local needles = {}
+    local function add_needle(spk)
+      if spk and not needle_set[spk] then
+        needle_set[spk] = true
+        needles[#needles + 1] = spk
+      end
+    end
+    for _, obj in ipairs(scanobjects) do
+      local spec
+      if type(obj) == "table" then
+        spec = obj.desc
+      else
+        spec = obj
+      end
+      if type(spec) ~= "string" then
+        error({code = M.ERROR.INVALID_PARAMS,
+               message = "Scan object must be a descriptor string"})
+      end
+      spec = spec:gsub("^%s+", ""):gsub("%s+$", "")
+      local hash_pos = spec:find("#", 1, true)
+      if hash_pos then spec = spec:sub(1, hash_pos - 1) end
+
+      local inner = spec:match("^addr%((.+)%)$")
+      if inner then
+        add_needle(spk_for_addr(inner))
+      else
+        inner = spec:match("^raw%((.+)%)$")
+        if inner then
+          add_needle(hex_to_bytes(inner))
+        else
+          inner = spec:match("^pkh%((.+)%)$")
+          if inner then
+            add_needle(script_mod.make_p2pkh_script(crypto_mod.hash160(hex_to_bytes(inner))))
+          else
+            inner = spec:match("^wpkh%((.+)%)$")
+            if inner then
+              add_needle(script_mod.make_p2wpkh_script(crypto_mod.hash160(hex_to_bytes(inner))))
+            else
+              inner = spec:match("^tr%((.+)%)$")
+              if inner then
+                local xonly = hex_to_bytes(inner)
+                if #xonly ~= 32 then
+                  error({code = M.ERROR.INVALID_PARAMS,
+                         message = "tr() expects a 32-byte x-only output key"})
+                end
+                add_needle(script_mod.make_p2tr_script(xonly))
+              elseif spec:match("^[0-9a-fA-F]+$") and #spec % 2 == 0 then
+                add_needle(hex_to_bytes(spec))  -- bare hex == Core raw() shorthand
+              else
+                error({code = M.ERROR.INVALID_PARAMS,
+                       message = "Unsupported scan object: " .. spec})
+              end
+            end
+          end
+        end
+      end
+    end
+
+    -- (8) Scan loop (Core: walk [start,stop], MatchAny each block's filter).
+    -- For each height: active-chain hash -> filter blob -> encoded GCS filter ->
+    -- GCSFilter::MatchAny(needles). Display-order block hash on a match.
+    local relevant = {}
+    for h = start, stop do
+      local block_hash = rpc.storage.get_hash_by_height(h)
+      if not block_hash then
+        -- A height in range lacks a chain entry: the index is lagging the
+        -- chain. Raise a clear error rather than return a misleadingly
+        -- incomplete list (matches getblockfilter's tri-state behavior).
+        error({code = M.ERROR.MISC_ERROR,
+               message = "Filter not found. Block filters are still in the process of being indexed."})
+      end
+      local data = rpc.storage.get(rpc.storage.CF.BLOCK_FILTER, block_hash.bytes)
+      if not data or #data < 64 then
+        error({code = M.ERROR.MISC_ERROR,
+               message = "Filter not found. Block filters are still in the process of being indexed."})
+      end
+      local r = serialize.buffer_reader(data)
+      r.read_hash256()                       -- filter_hash   (bytes  0..32)
+      r.read_hash256()                       -- filter_header (bytes 32..64)
+      local encoded_filter = r.read_varstr()  -- CompactSize(N) || GCS stream
+      local matched = blockfilter_mod.match_any_gcs_filter(encoded_filter, needles, block_hash)
+      if matched then
+        relevant[#relevant + 1] = types.hash256_hex(block_hash)
+      end
+    end
+
+    -- (9) Return. The synchronous scan is never aborted -> completed=true.
+    -- Empty relevant_blocks must serialize as a JSON array ([]), not an object.
+    if #relevant == 0 then
+      relevant = setmetatable({}, cjson.empty_array_mt)
+    end
+    return {
+      from_height = start,
+      to_height = stop,
+      relevant_blocks = relevant,
+      completed = true,
+    }
+  end
+
   -- getnetworkhashps: estimate network hash rate over last nblocks
   self.methods["getnetworkhashps"] = function(rpc, params)
     local nblocks = (params and type(params[1]) == "number") and math.floor(params[1]) or 120
