@@ -2285,6 +2285,8 @@ local function main()
     rpc_tls_key  = args.rpc_tls_key,
     chain_state = chain_state,
     mempool = mempool,
+    -- Orphan tx pool — read-only exposure via getorphantxs (Core v28).
+    orphan_pool = orphan_pool,
     peer_manager = peer_manager,
     storage = db,
     network = network,
