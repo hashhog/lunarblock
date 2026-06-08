@@ -1687,6 +1687,24 @@ function M.new_chain_state(storage, network)
   -- the connect/disconnect atomic batch (and the multi-block reorg
   -- batch via Pattern D) is the smallest correct fix.
   self.filterindex_enabled = false
+  -- coinstatsindex (2026-06-08): per-height MuHash3072 + cumulative stats.
+  -- Mirrors bitcoin-core/src/index/coinstatsindex.cpp (CustomAppend /
+  -- RevertBlock).  When enabled, connect_block writes a per-height snapshot
+  --   CF.COIN_STATS[height (4B BE)] -> CoinStatsRecord (serialised below)
+  -- and disconnect_block removes that snapshot and rolls the running
+  -- accumulator back to the H-1 snapshot's persisted state.  gettxoutsetinfo
+  -- with a hash_or_height arg reads the snapshot directly.
+  -- Off by default (DEFAULT_COINSTATSINDEX = false in Core).
+  self.coinstatsindex_enabled = false
+  -- In-memory un-finalized MuHash3072 accumulator.  nil when
+  -- coinstatsindex_enabled is false or before the first connect_block.
+  -- After :init() it is restored from the on-disk snapshot at tip height
+  -- (or initialised as a fresh empty accumulator for genesis-synced nodes).
+  self._csi_mh = nil
+  -- Running cumulative totals (mirrors Core's DBVal fields).
+  self._csi_txouts    = 0
+  self._csi_bogosize  = 0
+  self._csi_total_amt = 0
   -- W77-CB: rolling-window sub-phase breakdown of connect_block.  W75-CONN
   -- in sync.lua measures the callback as a black box (cb_avg ≈ 700–850ms
   -- during IBD, dominating the ~900ms/block budget).  This inner window
@@ -1713,6 +1731,180 @@ end
 -- unless the operator passes --blockfilterindex on next restart.
 function ChainState:set_filterindex_enabled(enabled)
   self.filterindex_enabled = enabled and true or false
+end
+
+-- Late toggle for the coinstatsindex.  Off by default (matches Core's
+-- DEFAULT_COINSTATSINDEX = false).  Must be called BEFORE :init() so the
+-- in-memory accumulator is seeded from the tip snapshot.
+function ChainState:set_coinstatsindex_enabled(enabled)
+  self.coinstatsindex_enabled = enabled and true or false
+end
+
+-- ── CoinStatsRecord helpers ─────────────────────────────────────────────────
+-- Per-height record persisted in CF.COIN_STATS under a 4-byte big-endian
+-- height key.  Mirrors clearbit's CoinStats / index/coinstatsindex.cpp DBVal.
+--
+-- On-disk layout (all little-endian integers unless noted):
+--   block_hash  : 32 bytes (raw)
+--   height      : uint32 LE
+--   mu_num      : 384 bytes (MuHash3072 numerator, LE Num3072)
+--   mu_den      : 384 bytes (MuHash3072 denominator, LE Num3072)
+--   txouts      : uint64 LE
+--   bogosize    : uint64 LE
+--   total_amount: int64 LE  (satoshis)
+--
+-- Total: 32 + 4 + 384 + 384 + 8 + 8 + 8 = 828 bytes.
+
+local CSI_MUHASH_BYTES = 384  -- one Num3072
+
+local function _csi_encode_height(h)
+  return string.char(
+    math.floor(h / 16777216) % 256,
+    math.floor(h / 65536) % 256,
+    math.floor(h / 256) % 256,
+    h % 256
+  )
+end
+
+local function _csi_serialize(block_hash_bytes, height, mu, txouts, bogosize, total_amount)
+  -- mu:serialize() returns num||den (768 bytes)
+  local mu_bytes = mu:serialize()
+  local w = serialize.buffer_writer()
+  w.write_bytes(block_hash_bytes)          -- 32
+  w.write_u32le(height)                    -- 4
+  w.write_bytes(mu_bytes)                  -- 768
+  w.write_u64le(txouts)                    -- 8
+  w.write_u64le(bogosize)                  -- 8
+  w.write_i64le(total_amount)              -- 8
+  return w.result()
+end
+
+-- Returns: block_hash_bytes(32), height, mu, txouts, bogosize, total_amount
+-- or nil on error.
+local function _csi_deserialize(data)
+  if not data or #data < 820 then return nil end
+  local r = serialize.buffer_reader(data)
+  local hash_bytes = r.read_bytes(32)
+  local height     = r.read_u32le()
+  local mu_bytes   = r.read_bytes(768)
+  local txouts     = r.read_u64le()
+  local bogosize   = r.read_u64le()
+  local total_amt  = r.read_i64le()
+  local muhash_mod = require("lunarblock.muhash")
+  local mu = muhash_mod.deserialize(mu_bytes)
+  return hash_bytes, height, mu, txouts, bogosize, total_amt
+end
+
+-- bogosize contribution for one coin (Core kernel/coinstats.cpp:35-43).
+-- 32 (txid) + 4 (vout) + 4 (height<<1|cb code) + 8 (value)
+-- + 2 (CompactSize len field) + scriptPubKey.size()
+local function _csi_bogosize(script_len)
+  return 32 + 4 + 4 + 8 + 2 + script_len
+end
+
+--- Serialize one (outpoint, coin) tuple in Bitcoin Core's TxOutSer format
+-- (bitcoin-core/src/kernel/coinstats.cpp:46).  This is the per-element
+-- payload that ApplyCoinHash feeds into HashWriter (HASH_SERIALIZED) or
+-- MuHash3072::Insert (MUHASH).
+--
+-- Layout (all little-endian):
+--   txid    : 32 bytes (raw, on-disk byte order)
+--   vout    : uint32 LE (4 bytes)
+--   code    : uint32 LE = (nHeight << 1) | fCoinBase   (4 bytes)
+--   value   : int64 LE  (8 bytes)
+--   scriptPubKey : CompactSize len || raw bytes
+--
+-- The on-disk UTXO key already encodes (txid || vout LE), so we hand that
+-- back unchanged for the first 36 bytes.
+--
+-- NOTE: forward-declared here (before connect_block) so the coinstatsindex
+-- step in connect_block can reference it.  M.serialize_txoutser is set
+-- at the original site below so callers that import via M still work.
+local function _serialize_txoutser(key, entry)
+  -- key is exactly 36 bytes: 32 raw txid + 4 vout LE.
+  assert(#key == 36, "txoutser: expected 36-byte UTXO key")
+  local code = entry.height * 2 + (entry.is_coinbase and 1 or 0)
+  local w = serialize.buffer_writer()
+  w.write_bytes(key)
+  w.write_u32le(code)
+  w.write_i64le(entry.value)
+  w.write_varint(#entry.script_pubkey)
+  w.write_bytes(entry.script_pubkey)
+  return w.result()
+end
+
+-- Restore in-memory accumulators from the on-disk snapshot at `height`.
+-- Called by :init() when coinstatsindex is enabled and the chain has blocks.
+function ChainState:_csi_load_at_height(height)
+  local key = _csi_encode_height(height)
+  local data = self.storage.get(storage_mod.CF.COIN_STATS, key)
+  if data then
+    local _h, _ht, mu, txouts, bogosize, total_amt = _csi_deserialize(data)
+    if mu then
+      self._csi_mh         = mu
+      self._csi_txouts     = txouts
+      self._csi_bogosize   = bogosize
+      self._csi_total_amt  = total_amt
+      return true
+    end
+  end
+  return false
+end
+
+-- Initialise the in-memory accumulator after :init().  If no snapshot exists
+-- at the current tip we do a full UTXO walk (only happens the first time
+-- coinstatsindex is enabled on an existing node, and is equivalent to Core's
+-- "backfill" on startup with -coinstatsindex on an already-synced node — but
+-- for regtest with 150 blocks it is fast).
+function ChainState:_csi_bootstrap()
+  if not self.coinstatsindex_enabled then return end
+  local tip_h = self.tip_height or 0
+  if tip_h <= 0 then
+    -- Genesis / empty chain: start with a fresh empty accumulator.
+    local muhash_mod = require("lunarblock.muhash")
+    self._csi_mh        = muhash_mod.new()
+    self._csi_txouts    = 0
+    self._csi_bogosize  = 0
+    self._csi_total_amt = 0
+    return
+  end
+  if self:_csi_load_at_height(tip_h) then
+    return  -- found persisted snapshot at tip: done
+  end
+  -- No snapshot at tip — walk the UTXO set from scratch.
+  -- This handles the "first run with --coinstatsindex on existing node" case.
+  local muhash_mod = require("lunarblock.muhash")
+  local mh = muhash_mod.new()
+  local txouts = 0
+  local bogosize = 0
+  local total_amt = 0
+  local iter = self.storage.iterator(storage_mod.CF.UTXO)
+  iter.seek_to_first()
+  while iter.valid() do
+    local key  = iter.key()
+    local data = iter.value()
+    if key and #key == 36 and data then
+      local ok, entry = pcall(M.deserialize_utxo_entry, data)
+      if ok and entry then
+        local ser = _serialize_txoutser(key, entry)
+        mh:insert(ser)
+        txouts    = txouts + 1
+        bogosize  = bogosize + _csi_bogosize(#entry.script_pubkey)
+        total_amt = total_amt + (entry.value or 0)
+      end
+    end
+    iter.next()
+  end
+  iter.destroy()
+  self._csi_mh        = mh
+  self._csi_txouts    = txouts
+  self._csi_bogosize  = bogosize
+  self._csi_total_amt = total_amt
+  -- Persist so future restarts are instant.
+  local tip_hash_bytes = self.tip_hash and self.tip_hash.bytes or string.rep("\0", 32)
+  local rec = _csi_serialize(tip_hash_bytes, tip_h, mh, txouts, bogosize, total_amt)
+  local key = _csi_encode_height(tip_h)
+  self.storage.put(storage_mod.CF.COIN_STATS, key, rec)
 end
 
 -- Read (and cache) the assumeUTXO snapshot base height persisted by
@@ -1753,6 +1945,10 @@ function ChainState:init()
   end
   -- Load invalid blocks set from storage
   self:load_invalid_blocks()
+  -- Seed the coinstatsindex in-memory accumulator from the tip snapshot
+  -- (or do a full UTXO walk if coinstatsindex is freshly enabled on an
+  -- existing node — equivalent to Core's backfill on startup).
+  self:_csi_bootstrap()
 end
 
 --- Build and connect the genesis block to initialize the chain.
@@ -3186,6 +3382,87 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     self._filterindex_pending_header = filter_header
   end
 
+  -- coinstatsindex: compute the per-block delta BEFORE the flush so we can
+  -- write the snapshot inside the same atomic batch as chain_tip.
+  -- Mirrors bitcoin-core/src/index/coinstatsindex.cpp::CustomAppend.
+  --
+  -- Approach:
+  --   1. For every spendable output CREATED by this block (all tx outputs
+  --      that are not OP_RETURN / over-size): Insert(TxOutSer) into _csi_mh,
+  --      add to txouts/bogosize/total_amount.
+  --   2. For every coin SPENT by this block (from block_undo.tx_undo, which
+  --      holds the pre-spend coin state): Remove(TxOutSer) from _csi_mh,
+  --      subtract from txouts/bogosize/total_amount.
+  -- Then serialize the updated accumulator into a CoinStatsRecord and
+  -- include the write in the batch.
+  local csi_rec_bytes = nil
+  if self.coinstatsindex_enabled and self._csi_mh then
+    local mh = self._csi_mh
+    -- Build the per-output UTXO key the same way connect_block stores it:
+    -- txid(32) || vout(4 LE), as a 36-byte string (the CF.UTXO key prefix).
+    local function make_utxo_key(txid_bytes, vout)
+      local w = serialize.buffer_writer()
+      w.write_bytes(txid_bytes)
+      w.write_u32le(vout)
+      return w.result()
+    end
+    -- Step 1: add created spendable outputs.
+    for tx_idx, tx in ipairs(block.transactions) do
+      local is_cb = (tx_idx == 1)
+      local txid = validation.compute_txid(tx)
+      local txid_bytes = txid.bytes
+      for vout_idx = 1, #tx.outputs do
+        local out = tx.outputs[vout_idx]
+        if not is_unspendable(out.script_pubkey) then
+          local coin_height = height
+          local coin_cb    = is_cb
+          local key = make_utxo_key(txid_bytes, vout_idx - 1)
+          -- Construct a minimal entry for _serialize_txoutser
+          local entry = {
+            height       = coin_height,
+            is_coinbase  = coin_cb,
+            value        = out.value,
+            script_pubkey = out.script_pubkey,
+          }
+          local ser = _serialize_txoutser(key, entry)
+          mh:insert(ser)
+          self._csi_txouts    = self._csi_txouts + 1
+          self._csi_bogosize  = self._csi_bogosize + _csi_bogosize(#out.script_pubkey)
+          self._csi_total_amt = self._csi_total_amt + out.value
+        end
+      end
+    end
+    -- Step 2: remove spent coins (from undo data).
+    -- block_undo.tx_undo[i] = undo for block.transactions[i+1] (coinbase has none).
+    for tx_idx = 2, #block.transactions do
+      local tx = block.transactions[tx_idx]
+      local undo_entry_set = block_undo.tx_undo[tx_idx - 1]
+      if undo_entry_set then
+        for inp_idx, inp in ipairs(tx.inputs) do
+          local prev_coin = undo_entry_set.prev_outputs[inp_idx]
+          if prev_coin and not is_unspendable(prev_coin.script_pubkey) then
+            local key = make_utxo_key(inp.prev_out.hash.bytes, inp.prev_out.index)
+            local entry = {
+              height       = prev_coin.height,
+              is_coinbase  = prev_coin.is_coinbase,
+              value        = prev_coin.value,
+              script_pubkey = prev_coin.script_pubkey,
+            }
+            local ser = _serialize_txoutser(key, entry)
+            mh:remove(ser)
+            self._csi_txouts    = self._csi_txouts - 1
+            self._csi_bogosize  = self._csi_bogosize - _csi_bogosize(#prev_coin.script_pubkey)
+            self._csi_total_amt = self._csi_total_amt - prev_coin.value
+          end
+        end
+      end
+    end
+    -- Serialize the snapshot for this height.
+    csi_rec_bytes = _csi_serialize(
+      block_hash.bytes, height, mh,
+      self._csi_txouts, self._csi_bogosize, self._csi_total_amt)
+  end
+
   self.coin_view:flush(false, function(batch)
     -- Undo data into the same atomic batch (was a separate put before
     -- 2026-04-30; see comment block above).
@@ -3228,6 +3505,14 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     -- maps to the active-chain block's cumulative count.
     if chaintx_key then
       batch.put(storage_mod.CF.META, chaintx_key, chaintx_value)
+    end
+    -- coinstatsindex: write per-height snapshot (MuHash + cumulative stats).
+    -- Keyed by 4-byte big-endian height, same encoding as HEIGHT_INDEX.
+    -- Atomic with chain_tip so a crash can never leave chain_tip ahead of
+    -- the coinstatsindex snapshot.  Mirrors Core CustomAppend + WriteBatch.
+    if csi_rec_bytes then
+      local csi_height_key = _csi_encode_height(height)
+      batch.put(storage_mod.CF.COIN_STATS, csi_height_key, csi_rec_bytes)
     end
     -- Include caller's extra operations (e.g. block body / height index from
     -- the IBD path, or block/header/height_index from submitblock) in the
@@ -3991,6 +4276,14 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     end
   end
 
+  -- coinstatsindex: pre-compute the height key for this block's snapshot
+  -- (for deletion inside the batch).  The in-memory accumulator is restored
+  -- from H-1's persisted snapshot AFTER the batch commits (below).
+  local csi_height_key_self = nil
+  if self.coinstatsindex_enabled then
+    csi_height_key_self = _csi_encode_height(height)
+  end
+
   -- Flush dirty UTXO entries and update chain tip atomically.
   local new_tip_height = height - 1
   local new_tip_hash = prev_hash
@@ -4034,6 +4327,12 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
       batch.put(storage_mod.CF.META, "filterindex_last_header",
                 filter_prev_header_bytes)
     end
+    -- coinstatsindex: delete snapshot at this height atomically with the
+    -- chain_tip rewind.  Mirrors Core's RevertBlock / BaseIndex::BlockDisconnected.
+    -- The in-memory accumulator is restored from H-1 AFTER flush (below).
+    if csi_height_key_self then
+      batch.delete(storage_mod.CF.COIN_STATS, csi_height_key_self)
+    end
     -- Update chain tip to the previous block
     if new_tip_hash then
       local w = serialize.buffer_writer()
@@ -4050,6 +4349,35 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
   -- See the connect_block side for the cache-or-disk read.
   if self.filterindex_enabled and filter_prev_header_bytes then
     self._filterindex_pending_header = types.hash256(filter_prev_header_bytes)
+  end
+
+  -- coinstatsindex: restore in-memory accumulator from H-1's snapshot.
+  -- On a multi-block reorg (Pattern D shared batch) this runs after each
+  -- individual disconnect_block call, so by the time the last
+  -- disconnect_block returns, _csi_mh reflects the fork-point state;
+  -- subsequent connect_block calls then build forward on top of that.
+  if self.coinstatsindex_enabled then
+    local prev_h = height - 1
+    if prev_h <= 0 then
+      -- Rewinding all the way to genesis: reset to empty accumulator.
+      local muhash_mod = require("lunarblock.muhash")
+      self._csi_mh        = muhash_mod.new()
+      self._csi_txouts    = 0
+      self._csi_bogosize  = 0
+      self._csi_total_amt = 0
+    else
+      local loaded = self:_csi_load_at_height(prev_h)
+      if not loaded then
+        -- Snapshot missing for H-1 (can happen if the coinstatsindex was just
+        -- enabled after the chain already passed that height; bootstrap from
+        -- the UTXO set at tip so subsequent connects stay correct).
+        local muhash_mod = require("lunarblock.muhash")
+        self._csi_mh        = muhash_mod.new()
+        self._csi_txouts    = 0
+        self._csi_bogosize  = 0
+        self._csi_total_amt = 0
+      end
+    end
   end
 
   -- Update in-memory tip
@@ -4415,33 +4743,7 @@ end
 -- AssumeUTXO Snapshot Operations
 --------------------------------------------------------------------------------
 
---- Serialize one (outpoint, coin) tuple in Bitcoin Core's TxOutSer format
--- (bitcoin-core/src/kernel/coinstats.cpp:46).  This is the per-element
--- payload that ApplyCoinHash feeds into HashWriter (HASH_SERIALIZED) or
--- MuHash3072::Insert (MUHASH).
---
--- Layout (all little-endian):
---   txid    : 32 bytes (raw, on-disk byte order)
---   vout    : uint32 LE (4 bytes)
---   code    : uint32 LE = (nHeight << 1) | fCoinBase   (4 bytes)
---   value   : int64 LE  (8 bytes)
---   scriptPubKey : CompactSize len || raw bytes
---
--- The on-disk UTXO key already encodes (txid || vout LE), so we hand that
--- back unchanged for the first 36 bytes.
-local function _serialize_txoutser(key, entry)
-  -- key is exactly 36 bytes: 32 raw txid + 4 vout LE.
-  assert(#key == 36, "txoutser: expected 36-byte UTXO key")
-
-  local code = entry.height * 2 + (entry.is_coinbase and 1 or 0)
-  local w = serialize.buffer_writer()
-  w.write_bytes(key)
-  w.write_u32le(code)
-  w.write_i64le(entry.value)
-  w.write_varint(#entry.script_pubkey)
-  w.write_bytes(entry.script_pubkey)
-  return w.result()
-end
+-- _serialize_txoutser is forward-declared above (before connect_block).
 M.serialize_txoutser = _serialize_txoutser
 
 -- Reusable scratch buffer for streaming one (outpoint, coin) TxOutSer record

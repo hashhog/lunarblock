@@ -305,12 +305,31 @@ function MuHash3072:finalize()
   return crypto.sha256(packed)
 end
 
---- Encode the current Num3072 numerator (after mixing in the denominator
---  the way Finalize does) as Core's serialization: numerator || denominator,
---  each 384 LE bytes.  Useful for cross-impl reproduction tests.
+--- Encode the un-finalized accumulator as numerator || denominator,
+--  each 384 LE bytes (768 bytes total).  Used by coinstatsindex to persist
+--  the running ratio across restarts so it can keep growing on connect and
+--  be reversed exactly on disconnect without a full UTXO-set walk.
 -- @return string: 768 bytes.
 function MuHash3072:serialize()
   return bn_to_le_bytes(self.numerator) .. bn_to_le_bytes(self.denominator)
+end
+
+--- Reconstruct an un-finalized accumulator from 768 bytes written by
+--  serialize().  The first 384 bytes are the numerator, the next 384 are
+--  the denominator — both in little-endian byte order (same as Core's
+--  Num3072 on-disk layout).
+-- @param bytes string: exactly 768 bytes.
+-- @return MuHash3072 (or error on wrong length).
+function M.deserialize(bytes)
+  assert(type(bytes) == "string" and #bytes == M.NUM3072_BYTE_SIZE * 2,
+    string.format("muhash.deserialize: expected %d bytes, got %d",
+      M.NUM3072_BYTE_SIZE * 2, type(bytes) == "string" and #bytes or 0))
+  local num_bytes = bytes:sub(1, M.NUM3072_BYTE_SIZE)
+  local den_bytes = bytes:sub(M.NUM3072_BYTE_SIZE + 1, M.NUM3072_BYTE_SIZE * 2)
+  local self = setmetatable({}, MuHash3072)
+  self.numerator   = bn_from_le_bytes(num_bytes, M.NUM3072_BYTE_SIZE)
+  self.denominator = bn_from_le_bytes(den_bytes, M.NUM3072_BYTE_SIZE)
+  return self
 end
 
 M.MuHash3072 = MuHash3072

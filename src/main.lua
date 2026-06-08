@@ -125,6 +125,7 @@ local function parse_args(argv)
       print("      --asmap PATH                Path to ASMap file for ASN-based IP bucketing")
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --txindex                   Maintain a full transaction index (txid → blockhash) for getrawtransaction")
+      print("      --coinstatsindex            Maintain a per-height MuHash3072 UTXO-set stats index (enables gettxoutsetinfo at historical heights)")
       print("      --blockfilterindex          Maintain a BIP-157/158 basic block-filter index (compact filters per block)")
       print("      --peerblockfilters BOOL     Advertise NODE_COMPACT_FILTERS service bit (default: 0; requires --blockfilterindex AND BIP-157 P2P dispatch)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
@@ -249,6 +250,19 @@ local function parse_args(argv)
         args.txindex = true
       else
         args.txindex = (v == "1" or v == "true" or v == "yes" or v == "on")
+      end
+    elseif arg == "--coinstatsindex" or arg:match("^%-%-coinstatsindex=") then
+      -- coinstatsindex (2026-06-08): per-height MuHash3072 UTXO accumulator.
+      -- Enables gettxoutsetinfo "muhash" <height> for historical queries and
+      -- reports in getindexinfo.  Accepts "--coinstatsindex" (bare) or
+      -- "--coinstatsindex=BOOL".  Mirrors bitcoin-core's -coinstatsindex flag
+      -- (DEFAULT_COINSTATSINDEX = false in Core).  Default off; fully inert
+      -- when disabled (no extra work in connect/disconnect path).
+      local v = arg:match("^%-%-coinstatsindex=(.*)$")
+      if v == nil then
+        args.coinstatsindex = true
+      else
+        args.coinstatsindex = (v == "1" or v == "true" or v == "yes" or v == "on")
       end
     elseif arg == "--blockfilterindex" or arg:match("^%-%-blockfilterindex=") then
       -- BIP-157 Phase 2 (2026-05-07): enable inline block-filter index
@@ -894,6 +908,14 @@ local function main()
   if args.blockfilterindex then
     chain_state:set_filterindex_enabled(true)
     io.stdout:write("blockfilterindex enabled (BIP-157 Phase 2).\n")
+    io.stdout:flush()
+  end
+  -- coinstatsindex (2026-06-08): per-height MuHash3072 UTXO accumulator.
+  -- Must be enabled BEFORE :init() so _csi_bootstrap() seeds the
+  -- in-memory accumulator from the tip snapshot on startup.
+  if args.coinstatsindex then
+    chain_state:set_coinstatsindex_enabled(true)
+    io.stdout:write("coinstatsindex enabled (per-height MuHash3072 UTXO stats).\n")
     io.stdout:flush()
   end
   chain_state:init()

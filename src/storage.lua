@@ -175,6 +175,11 @@ M.CF = {
   UNDO = "undo",             -- block_hash -> serialized undo data (spent UTXOs)
   BLOCK_FILTER = "block_filter",         -- block_hash -> {filter_hash, filter_header, filter_pos}
   BLOCK_FILTER_HEIGHT = "filter_height", -- height (4B BE) -> block_hash (for filter lookups by height)
+  -- coinstatsindex: per-height un-finalized MuHash3072 accumulator +
+  -- cumulative UTXO-set statistics (txouts/total_amount/bogosize).
+  -- Height key: 4-byte big-endian (same encoding as HEIGHT_INDEX).
+  -- Only written when coinstatsindex_enabled; fully inert otherwise.
+  COIN_STATS = "coin_stats",
 }
 
 -- List of all column families in order
@@ -189,6 +194,7 @@ local CF_LIST = {
   M.CF.UNDO,
   M.CF.BLOCK_FILTER,
   M.CF.BLOCK_FILTER_HEIGHT,
+  M.CF.COIN_STATS,
 }
 
 -- Helper: check error and throw if set
