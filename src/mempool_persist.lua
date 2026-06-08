@@ -161,7 +161,11 @@ function M.decode_dump(data)
     return nil, "dump too small"
   end
   local r = serialize.buffer_reader(data)
-  local version = r.read_u64le()
+  -- read_u64le may return an FFI uint64_t cdata (serialize.lua uses FFI to
+  -- avoid >2^53 precision loss).  The version/count fields are small, so
+  -- coerce to a plain Lua number for == comparisons and `for` bounds; a cdata
+  -- limit makes `for i = 1, count` and the type guard below misbehave.
+  local version = tonumber(r.read_u64le())
   local payload
   if version == M.VERSION_NO_XOR_KEY then
     payload = data:sub(r.position())
@@ -177,7 +181,11 @@ function M.decode_dump(data)
   end
 
   local pr = serialize.buffer_reader(payload)
-  local count = pr.read_u64le()
+  -- tonumber() coerces the FFI uint64_t cdata back to a Lua number (tx counts
+  -- are far below 2^53).  On a truncated payload read_u64le throws inside the
+  -- reader (assert), which decode_dump's pcall caller treats as "skip the
+  -- mempool"; a nil here would also be caught by the guard below.
+  local count = tonumber(pr.read_u64le())
   -- A truncated/malformed payload makes read_u64le return nil; `for i = 1, nil` then
   -- crashes the whole node at startup ("'for' limit must be a number"). Guard it.
   if type(count) ~= "number" then
@@ -217,21 +225,40 @@ function M.decode_dump(data)
   }
 end
 
---- Walk a Mempool object and pull (tx, time, fee_delta=0) tuples ready
--- for encode_dump.  Skips entries with no `tx` field defensively.
+--- Walk a Mempool object and pull (tx, time, fee_delta) tuples ready for
+-- encode_dump.  Skips entries with no `tx` field defensively.  Each in-mempool
+-- entry's per-tx nFeeDelta is pulled from the live map_deltas (Core writes the
+-- delta inline for every tx in the dump — mempool_persist.cpp DumpMempool).
 function M.snapshot(mempool)
+  local map_deltas = mempool.map_deltas or {}
   local entries = {}
-  for _, entry in pairs(mempool.entries) do
+  for txid_hex, entry in pairs(mempool.entries) do
     if entry and entry.tx then
       entries[#entries + 1] = {
         tx = entry.tx,
         time = entry.time or 0,
-        fee_delta = entry.fee_delta or 0,
+        fee_delta = map_deltas[txid_hex] or 0,
       }
     end
   end
   return entries
 end
+
+--- Standalone deltas: map_deltas entries whose txid is NOT in the mempool.
+-- Core writes these in the mapDeltas tail block (the inline per-tx nFeeDelta
+-- above already covers in-mempool txids), so we exclude in-mempool keys here
+-- to avoid double-counting on reload.
+local function standalone_deltas(mempool)
+  local out = {}
+  local entries = mempool.entries or {}
+  for txid_hex, delta in pairs(mempool.map_deltas or {}) do
+    if delta ~= 0 and not entries[txid_hex] then
+      out[txid_hex] = delta
+    end
+  end
+  return out
+end
+M.standalone_deltas = standalone_deltas
 
 --- Dump a Mempool to disk in Bitcoin Core's mempool.dat format.
 -- Writes to <path>.new and renames over <path>, matching Core.
@@ -240,7 +267,7 @@ end
 -- @return boolean, string: ok, written_count_or_err
 function M.dump(mempool, path)
   local entries = M.snapshot(mempool)
-  local data = M.encode_dump(entries)
+  local data = M.encode_dump(entries, { map_deltas = standalone_deltas(mempool) })
   local tmp = path .. ".new"
   local f, err = io.open(tmp, "wb")
   if not f then return false, err or "cannot open " .. tmp end
@@ -303,9 +330,30 @@ function M.load(mempool, path, opts)
             local entry = mempool.entries[txid_hex]
             if entry then entry.time = nTime end
           end
+          -- Restore the per-tx priority delta (Core: pool.PrioritiseTransaction
+          -- for each loaded entry's nFeeDelta).  prioritise_transaction is
+          -- additive, so apply only when the tx actually entered and the
+          -- delta is non-zero, and only when no delta is already present
+          -- (avoid double-applying when a standalone tail delta also names it).
+          if e.fee_delta and e.fee_delta ~= 0
+              and mempool.entries[txid_hex]
+              and (mempool.map_deltas[txid_hex] or 0) == 0 then
+            mempool:prioritise_transaction(txid_hex, e.fee_delta)
+          end
         else
           stats.failed = stats.failed + 1
         end
+      end
+    end
+  end
+
+  -- Restore standalone deltas (Core: mapDeltas tail — deltas for txids that are
+  -- NOT in the mempool, kept so the tx is prioritised if it later arrives).
+  -- prioritisetransaction.cpp restores each via PrioritiseTransaction.
+  if parsed.map_deltas then
+    for txid_hex, delta in pairs(parsed.map_deltas) do
+      if delta ~= 0 and (mempool.map_deltas[txid_hex] or 0) == 0 then
+        mempool:prioritise_transaction(txid_hex, delta)
       end
     end
   end
