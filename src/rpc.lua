@@ -2336,6 +2336,9 @@ function RPCServer:register_methods()
       local entry = rpc.mempool:get_entry(txid_hex)
       if entry then
         local fee_btc = entry.fee / consensus.COIN
+        -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee).
+        local modified_sats = rpc.mempool:get_modified_fee(txid_hex)
+        local modified_btc = modified_sats / consensus.COIN
         -- FIX-68 (W120 BUG-9): bip125-replaceable per Bitcoin Core
         -- policy/rbf.cpp IsRBFOptIn — walks tx + unconfirmed ancestors.
         -- Was hardcoded `true`, lying to wallets when neither the tx nor
@@ -2345,7 +2348,7 @@ function RPCServer:register_methods()
           vsize = entry.vsize,
           weight = entry.weight,
           fee = fee_btc,
-          modifiedfee = fee_btc,
+          modifiedfee = modified_btc,
           time = entry.time,
           height = entry.height,
           descendantcount = entry.descendant_count or 1,
@@ -2357,7 +2360,7 @@ function RPCServer:register_methods()
           wtxid = entry.wtxid or txid_hex,
           fees = {
             base = fee_btc,
-            modified = fee_btc,
+            modified = modified_btc,
             ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
             descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
           },
@@ -3693,11 +3696,16 @@ function RPCServer:register_methods()
   -- to wallets for non-signaling, no-signaling-ancestor mempool entries.
   local function format_mempool_entry(entry, txid_hex, mp)
     local fee_btc = entry.fee / consensus.COIN
+    -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee = nFee +
+    -- delta).  Fall back to base fee when no mempool ref is available.
+    local modified_sats = mp and mp.get_modified_fee
+      and mp:get_modified_fee(txid_hex) or entry.fee
+    local modified_btc = modified_sats / consensus.COIN
     return {
       vsize = entry.vsize,
       weight = entry.weight,
       fee = fee_btc,
-      modifiedfee = fee_btc,
+      modifiedfee = modified_btc,
       time = entry.time,
       height = entry.height,
       descendantcount = entry.descendant_count or 1,
@@ -3709,7 +3717,7 @@ function RPCServer:register_methods()
       wtxid = entry.wtxid or txid_hex,
       fees = {
         base = fee_btc,
-        modified = fee_btc,
+        modified = modified_btc,
         ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
         descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
       },
@@ -3791,6 +3799,75 @@ function RPCServer:register_methods()
       if desc_entry then
         out[desc_hex] = format_mempool_entry(desc_entry, desc_hex, rpc.mempool)
       end
+    end
+    return out
+  end
+
+  -- prioritisetransaction: bump (or lower) a tx's effective fee for mining.
+  -- Bitcoin Core: src/rpc/mining.cpp::prioritisetransaction +
+  -- src/txmempool.cpp::PrioritiseTransaction.
+  --   params[1] txid       (hex, display order — REQUIRED)
+  --   params[2] dummy       (legacy priority arg — MUST be 0 or null/absent)
+  --   params[3] fee_delta   (int64 satoshis, signed — REQUIRED; added to delta)
+  -- The delta STACKS onto any existing delta; a net delta of 0 erases the
+  -- stored entry.  Returns true.  Persists in mempool.dat.
+  self.methods["prioritisetransaction"] = function(rpc, params)
+    params = params or {}
+    local txid_hex = params[1]
+    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
+    end
+
+    -- dummy: Core throws RPC_INVALID_PARAMETER if present and non-zero
+    -- (mining.cpp:529-531).  Absent / null / 0 / 0.0 are all accepted.
+    local dummy = params[2]
+    if dummy ~= nil and dummy ~= cjson.null and dummy ~= 0 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."})
+    end
+
+    -- fee_delta: required, integer satoshis (may be negative).
+    local fee_delta = params[3]
+    if type(fee_delta) ~= "number" then
+      error({code = M.ERROR.TYPE_ERROR,
+        message = "Expected type number for fee_delta"})
+    end
+    if fee_delta ~= math.floor(fee_delta) then
+      error({code = M.ERROR.TYPE_ERROR,
+        message = "Expected integer satoshis for fee_delta"})
+    end
+
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+
+    rpc.mempool:prioritise_transaction(txid_hex, fee_delta)
+    return true
+  end
+
+  -- getprioritisedtransactions: map of all user-set fee deltas keyed by txid.
+  -- Bitcoin Core: src/rpc/mining.cpp::getprioritisedtransactions +
+  -- src/txmempool.cpp::GetPrioritisedTransactions.
+  -- Returns an OBJECT keyed by display-order txid hex; each value:
+  --   { fee_delta: <i64 signed, ALWAYS present>,
+  --     in_mempool: <bool>,
+  --     modified_fee: <i64, present ONLY when in_mempool == true> }.
+  self.methods["getprioritisedtransactions"] = function(rpc, _params)
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+    -- An empty Lua table serialises as a JSON object {} under lua-cjson, which
+    -- is the correct empty shape here (Core returns an empty OBJ_DYN).
+    local out = {}
+    for _, info in ipairs(rpc.mempool:get_prioritised_transactions()) do
+      local inner = {
+        fee_delta = info.fee_delta,
+        in_mempool = info.in_mempool,
+      }
+      if info.in_mempool then
+        inner.modified_fee = info.modified_fee
+      end
+      out[info.txid_hex] = inner
     end
     return out
   end

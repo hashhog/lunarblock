@@ -841,7 +841,12 @@ function M.mempool_entry(tx, txid, fee, vsize, height, time)
     tx = tx,
     txid = txid,               -- hash256
     wtxid = validation.compute_wtxid(tx),
-    fee = fee,                  -- satoshis
+    fee = fee,                  -- satoshis (base fee, never mutated)
+    -- Core CTxMemPoolEntry::m_modified_fee — starts at nFee, bumped by
+    -- prioritisetransaction.  GetModifiedFee() returns this.  Kept in sync by
+    -- Mempool:prioritise_transaction; also reconciled from map_deltas on
+    -- block-connect / re-entry so a prior delta carries over.
+    modified_fee = fee,         -- satoshis (base + accumulated priority delta)
     vsize = vsize,              -- virtual size (weight / 4)
     weight = validation.get_tx_weight(tx),
     size = #serialize.serialize_transaction(tx, true),
@@ -891,6 +896,14 @@ function M.new(chain_state, config)
     self.fullrbf = M.DEFAULT_MEMPOOL_FULL_RBF
   end
   self.entries = {}            -- txid_hex -> MempoolEntry
+  -- map_deltas: user-set fee-priority deltas, keyed by display-order txid_hex
+  -- (same key space as self.entries and the persist layer).  Mirrors Core's
+  -- CTxMemPool::mapDeltas (std::map<Txid, CAmount>).  A delta may exist for a
+  -- txid NOT currently in self.entries (Core keeps it so the tx is prioritised
+  -- if it later arrives); an accumulated delta of 0 erases the key entirely.
+  -- Populated by prioritise_transaction and survives restart via mempool.dat
+  -- (mempool_persist.lua).  Reference: bitcoin-core/src/txmempool.{h,cpp}.
+  self.map_deltas = {}         -- txid_hex -> int64 fee delta (satoshis, signed)
   self.outpoint_to_tx = {}    -- outpoint_key -> txid_hex (tracks which tx spends each output)
   self.total_size = 0          -- Current memory usage estimate
   self.tx_count = 0
@@ -1721,6 +1734,16 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   self.tx_count = self.tx_count + 1
   self.total_size = self.total_size + entry.size
 
+  -- If a priority delta was set for this txid before it entered the mempool
+  -- (e.g. prioritisetransaction on a not-yet-arrived tx, or a delta restored
+  -- from mempool.dat), apply it to the entry's modified fee now.  Mirrors
+  -- Core CTxMemPool::addUnchecked → ApplyDelta + UpdateModifiedFee
+  -- (txmempool.cpp:1014-1023).
+  local pending_delta = self.map_deltas[txid_hex]
+  if pending_delta and pending_delta ~= 0 then
+    entry.modified_fee = entry.fee + pending_delta
+  end
+
   -- Track outpoint spending and parent relationships
   for _, inp in ipairs(tx.inputs) do
     local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
@@ -1931,12 +1954,19 @@ function Mempool:on_block_connected(block)
     if self.entries[txid_hex] then
       self:remove_transaction(txid_hex, "confirmed")
     end
+    -- A confirmed tx's priority delta is dropped (Core removeForBlock →
+    -- ClearPrioritisation, txmempool.cpp:420) so it isn't re-applied to a
+    -- future tx that reuses the txid.  Other removal reasons (REPLACED,
+    -- EXPIRY, SIZELIMIT, REORG) deliberately preserve the delta.
+    self:clear_prioritisation(txid_hex)
     -- Also remove conflicting transactions
     for _, inp in ipairs(tx.inputs) do
       local outpoint_key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
       local conflict = self.outpoint_to_tx[outpoint_key]
       if conflict and conflict ~= txid_hex then
         self:remove_transaction(conflict, "conflict")
+        -- removeConflicts → ClearPrioritisation (txmempool.cpp:398).
+        self:clear_prioritisation(conflict)
       end
     end
   end
@@ -2129,7 +2159,18 @@ function Mempool:trim()
       -- Guard against zero-size (should not happen but prevents /0)
       local total_vsize = entry.vsize + entry.descendant_size
       if total_vsize > 0 then
-        local rate = (entry.fee + entry.descendant_fees) / total_vsize
+        -- FIX-72 (mirrors rustoshi trim_to_size + get_modified_fee, mempool.rs
+        -- :3061-3097 / :3372): the lowest-feerate eviction pick must consult
+        -- the entry's MODIFIED fee (base + prioritisetransaction delta), not the
+        -- raw base fee — Core's TrimToSize evicts by GetWorstMainChunk over the
+        -- modified-fee ordering (txmempool.cpp:861-911).  So an operator-
+        -- prioritised low-base-fee tx is protected from eviction in place.
+        -- No-descendant case: the entry's own modified fee drives the rate.
+        -- Multi-descendant case keeps raw descendant_fees aggregation (delta
+        -- propagation across the cluster is the W106 G8 follow-up, not built
+        -- here).  Un-prioritised entries (modified_fee == fee) pick identically.
+        local own_fee = entry.modified_fee or entry.fee
+        local rate = (own_fee + entry.descendant_fees) / total_vsize
         if rate < worst_rate then
           worst_rate = rate
           worst_hex = hex
@@ -2156,16 +2197,38 @@ end
 
 --- Get all entries sorted by ancestor fee rate for block template construction.
 -- Higher ancestor fee rate = better candidate for inclusion.
+--
+-- FIX-72 (mirrors rustoshi get_sorted_for_mining, mempool.rs:2379-2404): the
+-- entry's OWN fee contribution to its mining rank is its modified fee
+-- (base + prioritisetransaction delta = entry.modified_fee, kept in sync by
+-- prioritise_transaction / accept_transaction), NOT the raw base fee.  Core
+-- (txmempool.cpp:636-643 UpdateModifiedFee + the mining selector reading
+-- GetModifiedFee) ranks an operator-prioritised tx by its modified fee in
+-- place, so a low-base-fee tx bumped above its peers surfaces ahead of them.
+--
+-- For a tx with no further in-mempool ancestors the rank is purely its own
+-- modified feerate.  For a multi-ancestor tx the ancestor aggregation still
+-- folds in raw ancestor_fees — delta propagation across the ancestor set is an
+-- ACCEPTED separate follow-up (rustoshi W106 G8), deliberately NOT built here.
+-- Un-prioritised txs (delta 0 ⇒ modified_fee == fee) sort byte-identically to
+-- the prior base-fee behaviour.
 -- @return table: Array of mempool entries sorted by ancestor fee rate (descending)
 function Mempool:get_sorted_entries()
   local sorted = {}
   for _, entry in pairs(self.entries) do
     sorted[#sorted + 1] = entry
   end
+  local function mining_rate(e)
+    -- Multi-ancestor: keep raw ancestor aggregation (W106 G8 deferred).
+    if e.ancestor_count and e.ancestor_count > 1 then
+      return (e.fee + e.ancestor_fees) / (e.vsize + e.ancestor_size)
+    end
+    -- No further ancestors: rank by this entry's own modified fee.
+    local mfee = e.modified_fee or e.fee
+    return (mfee + e.ancestor_fees) / (e.vsize + e.ancestor_size)
+  end
   table.sort(sorted, function(a, b)
-    local rate_a = (a.fee + a.ancestor_fees) / (a.vsize + a.ancestor_size)
-    local rate_b = (b.fee + b.ancestor_fees) / (b.vsize + b.ancestor_size)
-    return rate_a > rate_b
+    return mining_rate(a) > mining_rate(b)
   end)
   return sorted
 end
@@ -2265,6 +2328,103 @@ end
 -- @return boolean: True if transaction is in mempool
 function Mempool:has(txid_hex)
   return self.entries[txid_hex] ~= nil
+end
+
+--------------------------------------------------------------------------------
+-- Prioritisation (mapDeltas) — prioritisetransaction / getprioritisedtransactions
+--
+-- Mirrors Bitcoin Core's CTxMemPool::{PrioritiseTransaction, ApplyDelta,
+-- ClearPrioritisation, GetPrioritisedTransactions} (txmempool.cpp:630-687) and
+-- CTxMemPoolEntry::GetModifiedFee (kernel/mempool_entry.h:120).  A delta is a
+-- signed satoshi amount added to a tx's base fee when ranking it for mining;
+-- the fee is not actually paid.  Keys are display-order txid_hex, identical to
+-- the keys used by self.entries and the mempool.dat persist layer.
+--------------------------------------------------------------------------------
+
+-- int64 bounds, used to clamp accumulated deltas the way Core's
+-- SaturatingAdd<int64_t> does (util/overflow.h).  Satoshi-scale deltas are far
+-- inside LuaJIT's 2^53 exact-integer range, so the double arithmetic below is
+-- lossless in practice; the clamp only matters for pathological inputs.
+local INT64_MAX = 9223372036854775807
+local INT64_MIN = -9223372036854775808
+
+local function saturating_add_i64(a, b)
+  local sum = a + b
+  if sum > INT64_MAX then return INT64_MAX end
+  if sum < INT64_MIN then return INT64_MIN end
+  return sum
+end
+
+--- Apply a fee-priority delta for a transaction (Core PrioritiseTransaction).
+-- Accumulates ONTO any existing delta (saturating int64 add).  When the
+-- resulting accumulated delta becomes 0 the key is erased from map_deltas
+-- (Core txmempool.cpp:644-646).  When the tx is currently in the mempool, the
+-- entry's modified fee is updated in lockstep so getmempoolentry / mining see
+-- the new ranking immediately (Core UpdateModifiedFee, txmempool.cpp:640).
+-- The delta is stored even for a txid NOT in the mempool, so it applies if the
+-- tx later arrives.
+-- @param txid_hex string: display-order txid hex (64 chars)
+-- @param delta_sats number: satoshis to add (may be negative)
+function Mempool:prioritise_transaction(txid_hex, delta_sats)
+  delta_sats = delta_sats or 0
+  local current = self.map_deltas[txid_hex] or 0
+  local new_delta = saturating_add_i64(current, delta_sats)
+  -- Update the in-mempool entry's modified fee (if present) by the increment
+  -- applied this call, exactly like Core's it->UpdateModifiedFee(nFeeDelta).
+  local entry = self.entries[txid_hex]
+  if entry then
+    entry.modified_fee = saturating_add_i64(entry.modified_fee or entry.fee, delta_sats)
+  end
+  if new_delta == 0 then
+    self.map_deltas[txid_hex] = nil
+  else
+    self.map_deltas[txid_hex] = new_delta
+  end
+end
+
+--- Return entry.fee + map_deltas[txid] (Core CTxMemPoolEntry::GetModifiedFee).
+-- Accepts either a display-order txid_hex (string) or a mempool entry table.
+-- For a txid not in the mempool, returns the bare stored delta (0 if none).
+-- @param txid_or_entry string|table
+-- @return number: modified fee in satoshis
+function Mempool:get_modified_fee(txid_or_entry)
+  local entry, txid_hex
+  if type(txid_or_entry) == "string" then
+    txid_hex = txid_or_entry
+    entry = self.entries[txid_hex]
+  else
+    entry = txid_or_entry
+    txid_hex = entry and entry.txid and types.hash256_hex(entry.txid) or nil
+  end
+  local base = entry and entry.fee or 0
+  local delta = (txid_hex and self.map_deltas[txid_hex]) or 0
+  return base + delta
+end
+
+--- Drop a txid's stored delta (Core ClearPrioritisation, txmempool.cpp:667).
+-- Called when a tx confirms in / is conflicted out by a block so its delta is
+-- not re-applied to an unrelated future tx that reuses the txid.
+-- @param txid_hex string
+function Mempool:clear_prioritisation(txid_hex)
+  self.map_deltas[txid_hex] = nil
+end
+
+--- Per-tx delta info for getprioritisedtransactions (Core GetPrioritisedTransactions).
+-- @return array of { txid_hex, fee_delta, in_mempool, modified_fee|nil }
+function Mempool:get_prioritised_transactions()
+  local result = {}
+  for txid_hex, delta in pairs(self.map_deltas) do
+    local entry = self.entries[txid_hex]
+    local in_mempool = entry ~= nil
+    result[#result + 1] = {
+      txid_hex = txid_hex,
+      fee_delta = delta,
+      in_mempool = in_mempool,
+      -- Only meaningful when in mempool (Core sets modified_fee only then).
+      modified_fee = in_mempool and (entry.fee + delta) or nil,
+    }
+  end
+  return result
 end
 
 --- Check if a transaction is in the mempool by wtxid.
