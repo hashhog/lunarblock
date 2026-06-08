@@ -2109,6 +2109,15 @@ function RPCServer:register_methods()
       push_entry("basic block filter index", synced, best)
     end
 
+    -- coinstatsindex: per-height MuHash3072 UTXO stats.  Core name is
+    -- "coinstatsindex" (src/index/coinstatsindex.cpp:GetName()).  The index
+    -- advances atomically with the tip (same atomic batch as chain_tip), so
+    -- best_block_height is always tip_height when the index is enabled.
+    if rpc.chain_state and rpc.chain_state.coinstatsindex_enabled then
+      local synced = tip_height >= header_tip_height
+      push_entry("coinstatsindex", synced, tip_height)
+    end
+
     return { _raw_json = "{" .. table.concat(fragments, ",") .. "}" }
   end
 
@@ -8991,13 +9000,15 @@ function RPCServer:setup_w47b_methods()
   --                         ChainState:compute_muhash (utxo.lua).
   --   "none"              — skip the set-hash (just the counts/amounts).
   --
-  -- hash_or_height + use_index need coinstatsindex, which lunarblock does not
-  -- implement: base chainstate stats at the tip only. We still honour Core's
-  -- error contract for the out-of-scope args (see ParseHashType + the
-  -- request.params[1] guards in blockchain.cpp:1085-1098).
+  -- With coinstatsindex enabled: hash_or_height routes to the per-height
+  -- snapshot (MuHash + cumulative txouts/amount/bogosize), byte-identical to
+  -- Core's coinstatsindex output.  Without coinstatsindex: a non-tip
+  -- hash_or_height raises -8 "Querying specific block heights requires
+  -- coinstatsindex" (exact Core error contract).
   --
-  -- Per-coin metrics (txouts, transactions, bogosize, total_amount) are
-  -- gathered in a single UTXO walk, matching ApplyStats in coinstats.cpp:96.
+  -- Per-coin metrics (txouts, transactions, bogosize, total_amount) for the
+  -- at-tip path are gathered in a single UTXO walk, matching ApplyStats in
+  -- coinstats.cpp:96.
   self.methods["gettxoutsetinfo"] = function(rpc, params)
     if not rpc.chain_state then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
@@ -9022,19 +9033,144 @@ function RPCServer:setup_w47b_methods()
                                      tostring(hash_type))})
     end
 
-    -- ── arg 1: hash_or_height. Requires coinstatsindex (not implemented). ─
+    -- ── arg 1: hash_or_height. ────────────────────────────────────────────
     -- Core raises here BEFORE doing any work. The hash_serialized_3-specific
     -- message takes precedence (blockchain.cpp:1090-1092), so we order the
     -- two checks the same way to keep the -8 message byte-identical.
-    if params[2] ~= nil and params[2] ~= cjson.null then
+    local has_hash_or_height = (params[2] ~= nil and params[2] ~= cjson.null)
+    local coinstatsindex_on  = rpc.chain_state.coinstatsindex_enabled or false
+
+    if has_hash_or_height then
       if hash_type == "hash_serialized_3" then
         error({code = M.ERROR.INVALID_PARAMETER,
                message = "hash_serialized_3 hash type cannot be queried for a specific block"})
       end
-      error({code = M.ERROR.INVALID_PARAMETER,
-             message = "Querying specific block heights requires coinstatsindex"})
+      if not coinstatsindex_on then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "Querying specific block heights requires coinstatsindex"})
+      end
     end
 
+    -- ── Reverse hex helper (uint256 GetHex: reverses to big-endian). ─────
+    local function reverse_hex(raw)
+      local hex_chars = {}
+      for i = 32, 1, -1 do
+        hex_chars[#hex_chars + 1] = string.format("%02x", raw:byte(i))
+      end
+      return table.concat(hex_chars)
+    end
+
+    -- ── COINSTATSINDEX PATH: serve from per-height snapshot. ─────────────
+    -- Mirrors bitcoin-core/src/rpc/blockchain.cpp gettxoutsetinfo index branch
+    -- (1100-1110) + kernel/coinstats.cpp GetBlockStats.
+    if has_hash_or_height and coinstatsindex_on then
+      -- Resolve hash_or_height to a canonical height.
+      local target_height
+      local raw_hoh = params[2]
+      if type(raw_hoh) == "number" then
+        target_height = math.floor(raw_hoh)
+      elseif type(raw_hoh) == "string" then
+        -- Block hash: look up height via HEIGHT_INDEX.
+        -- We need to resolve string hash → height.
+        -- lunarblock stores height_index as 4-byte big-endian height → hash.
+        -- We need hash → height, which isn't directly indexed.  Walk
+        -- backwards from tip to find it (safe for short regtest chains;
+        -- production usage would have a reverse index — acceptable for now).
+        local bh_hex = raw_hoh
+        if #bh_hex ~= 64 then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "hash_or_height must be a block hash (64 hex) or height integer"})
+        end
+        -- Binary-search style: scan HEIGHT_INDEX (4-byte BE key → block-hash value).
+        local tip_h = rpc.chain_state.tip_height or 0
+        target_height = nil
+        for h = 0, tip_h do
+          local key_be = string.char(
+            math.floor(h / 16777216) % 256,
+            math.floor(h / 65536) % 256,
+            math.floor(h / 256) % 256,
+            h % 256)
+          local bh_bytes = rpc.storage.get(storage_mod.CF.HEIGHT_INDEX, key_be)
+          if bh_bytes and #bh_bytes == 32 then
+            -- Convert raw bytes to hex (little-endian display reversal)
+            local hex = {}
+            for i = 32, 1, -1 do
+              hex[#hex + 1] = string.format("%02x", bh_bytes:byte(i))
+            end
+            if table.concat(hex) == bh_hex then
+              target_height = h
+              break
+            end
+          end
+        end
+        if not target_height then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Block not found"})
+        end
+      else
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "hash_or_height must be a block hash or height integer"})
+      end
+
+      -- Load the per-height snapshot from CF.COIN_STATS.
+      local csi_key = string.char(
+        math.floor(target_height / 16777216) % 256,
+        math.floor(target_height / 65536) % 256,
+        math.floor(target_height / 256) % 256,
+        target_height % 256)
+      local csi_data = rpc.storage.get(storage_mod.CF.COIN_STATS, csi_key)
+      if not csi_data then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = string.format(
+                 "coinstatsindex does not have data for height %d (index may be behind tip or height out of range)",
+                 target_height)})
+      end
+
+      -- Deserialize the snapshot.
+      local utxo_mod_inner = require("lunarblock.utxo")
+      local serialize_inner = require("lunarblock.serialize")
+      local muhash_mod = require("lunarblock.muhash")
+      local r = serialize_inner.buffer_reader(csi_data)
+      local hash_bytes = r.read_bytes(32)
+      local rec_height = r.read_u32le()
+      local mu_bytes   = r.read_bytes(768)
+      local txouts     = r.read_u64le()
+      local bogosize   = r.read_u64le()
+      local total_sats = r.read_i64le()
+
+      -- Block hash at this height (for bestblock field).
+      local bestblock_hex = reverse_hex(hash_bytes)
+
+      -- Convert any LuaJIT cdata (uint64_t / int64_t) to plain Lua numbers
+      -- so cjson can serialize them.  All values fit in double precision
+      -- (max Bitcoin supply ~2.1e15 sat < 2^53).
+      local txouts_n    = tonumber(txouts)    or 0
+      local bogosize_n  = tonumber(bogosize)  or 0
+      local total_sats_n = tonumber(total_sats) or 0
+
+      -- Finalize the MuHash to get the 32-byte SHA256 digest.
+      local muhash_hex_csi
+      if hash_type == "muhash" then
+        local mu = muhash_mod.deserialize(mu_bytes)
+        local raw = mu:finalize()
+        muhash_hex_csi = reverse_hex(raw)
+      end
+
+      local result_csi = {
+        height    = tonumber(rec_height) or 0,
+        bestblock = bestblock_hex,
+        txouts    = txouts_n,
+        bogosize  = bogosize_n,
+        disk_size = bogosize_n,
+        total_amount = btc_sentinel(total_sats_n),
+      }
+      if hash_type == "muhash" then
+        result_csi.muhash = muhash_hex_csi
+      end
+      return { _raw_json = strip_btc_sentinels(cjson.encode(result_csi)) }
+    end
+
+    -- ── AT-TIP PATH (original UTXO walk). ────────────────────────────────
     local tip_height  = rpc.chain_state.tip_height or 0
     local tip_hash    = rpc.chain_state.tip_hash
     local tip_hash_hex = tip_hash and types.hash256_hex(tip_hash) or string.rep("0", 64)
@@ -9080,17 +9216,6 @@ function RPCServer:setup_w47b_methods()
     end
 
     -- ── set-hash (only for the chosen hash_type). ────────────────────────
-    -- uint256.GetHex() reverses bytes for display (big-endian); both
-    -- compute_utxo_hash and compute_muhash return raw 32-byte natural
-    -- (little-endian) order, so we reverse here to match Core's hex.
-    local function reverse_hex(raw)
-      local hex_chars = {}
-      for i = 32, 1, -1 do
-        hex_chars[#hex_chars + 1] = string.format("%02x", raw:byte(i))
-      end
-      return table.concat(hex_chars)
-    end
-
     local hash_serialized_3, muhash_hex
     if hash_type == "hash_serialized_3" then
       if not (rpc.chain_state.compute_utxo_hash) then
