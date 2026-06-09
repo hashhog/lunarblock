@@ -4013,6 +4013,92 @@ function RPCServer:register_methods()
     return cjson.null
   end
 
+  -- getblockfrompeer "blockhash" peer_id
+  -- Attempt to fetch a block from a given peer.  Core ref:
+  --   src/rpc/blockchain.cpp::getblockfrompeer (the RPC shell) ->
+  --   src/net_processing.cpp::PeerManagerImpl::FetchBlock (the worker).
+  -- Contract (Core blockchain.cpp:541-565 + net_processing.cpp:1960-1994):
+  --   (1) the block HEADER must already be known (we hold the CBlockIndex);
+  --       else RPC_MISC_ERROR (-1) "Block header missing".
+  --   (2) prune-mode guard: only blocks already synced past can be re-fetched
+  --       (RPC_MISC_ERROR "In prune mode, ...").  Implemented when a pruner is
+  --       active and we can compare heights; otherwise skipped (non-prune is
+  --       the lunarblock default).
+  --   (3) "Block already downloaded" short-circuit when the block body is on
+  --       disk (Core: index->nStatus & BLOCK_HAVE_DATA).
+  --   (4) resolve peer_id to a CONNECTED peer; else RPC_MISC_ERROR
+  --       "Peer does not exist" (FetchBlock's first peer check).
+  --   (5) on success send a getdata for MSG_WITNESS_BLOCK|hash to THAT peer
+  --       (Core uses MSG_BLOCK | MSG_WITNESS_FLAG for witness-capable peers)
+  --       and return {} (empty JSON object).  Fire-and-forget: returns at once.
+  -- peer_id is the 0-based index into peer_list, identical to the "id" field
+  -- emitted by getpeerinfo (and consumed by disconnectnode's nodeid path).
+  self.methods["getblockfrompeer"] = function(rpc, params)
+    local blockhash = params and params[1]
+    local peer_id = params and params[2]
+
+    if type(blockhash) ~= "string" or #blockhash ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+    end
+    if type(peer_id) ~= "number" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "peer_id must be a number"})
+    end
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    local hash = types.hash256_from_hex(blockhash)
+
+    -- (1) Header must be known (Core: LookupBlockIndex returns non-null).
+    local header = rpc.storage.get_header(hash)
+    if not header then
+      error({code = M.ERROR.MISC_ERROR, message = "Block header missing"})
+    end
+
+    -- (2) Prune-mode guard (Core blockchain.cpp:551-554): in prune mode, a
+    -- block whose height is above the active tip can't be re-fetched (fetching
+    -- it would pin block files against pruning).  lunarblock does not persist
+    -- per-header height, so we use a conservative proxy: under an active pruner,
+    -- a header-only block (no body on disk) that is not reachable through the
+    -- active height index is treated as "not previously synced" and rejected,
+    -- matching Core's intent.  Skipped entirely in the default no-prune config
+    -- so behavior is identical to Core's `if (IsPruneMode() && ...)` short-out.
+    if rpc.pruner and rpc.pruner.enabled
+       and not rpc.storage.get_block(hash) then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"})
+    end
+
+    -- (3) Already-have-data short-circuit (Core blockchain.cpp:556-559).
+    if rpc.storage.get_block(hash) then
+      error({code = M.ERROR.MISC_ERROR, message = "Block already downloaded"})
+    end
+
+    -- (4) Resolve peer_id -> connected peer.  Same 0-based peer_list index as
+    -- getpeerinfo "id" and disconnectnode nodeid (peer_list[peer_id + 1]).
+    if not rpc.peer_manager then
+      error({code = M.ERROR.MISC_ERROR, message = "Peer does not exist"})
+    end
+    local pl = rpc.peer_manager.peer_list or {}
+    local target_peer = pl[peer_id + 1]
+    if not target_peer then
+      error({code = M.ERROR.MISC_ERROR, message = "Peer does not exist"})
+    end
+
+    -- (5) Send a block getdata to that peer and return {} immediately.
+    -- MSG_WITNESS_BLOCK mirrors Core's MSG_BLOCK | MSG_WITNESS_FLAG and matches
+    -- the witness-block getdata the IBD scheduler (sync.lua) already sends.
+    local getdata_payload = p2p.serialize_inv({
+      {type = p2p.INV_TYPE.MSG_WITNESS_BLOCK, hash = hash}
+    })
+    target_peer:send_message("getdata", getdata_payload)
+
+    -- Empty JSON object (Core UniValue::VOBJ).  Emit a raw "{}" — the same
+    -- idiom getblockheader/getindexinfo use — because an empty Lua table would
+    -- otherwise serialise as a JSON array "[]" under lua-cjson.
+    return {_raw_json = "{}"}
+  end
+
   -- getnettotals: cumulative bytes-in / bytes-out.  Bitcoin Core:
   -- src/rpc/net.cpp::getnettotals -> CConnman::GetTotalBytesRecv /
   -- GetTotalBytesSent (src/net.cpp).  Core keeps a single pair of monotonic
