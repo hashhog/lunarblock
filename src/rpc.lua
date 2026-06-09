@@ -2047,8 +2047,15 @@ function RPCServer:register_methods()
       index_name = ""
     end
     if type(index_name) ~= "string" then
-      error({code = M.ERROR.INVALID_PARAMS,
-             message = "index_name must be a string"})
+      -- Core checks arg types via RPCHelpMan and throws RPC_TYPE_ERROR (-3)
+      -- with the message "JSON value of type <X> is not of expected type
+      -- string" (rpc/util.cpp RPCArg::MatchesType). Map the Lua type to
+      -- Core's uvTypeName spelling (notably "boolean" -> "bool").
+      local lt = type(index_name)
+      local core_type = (lt == "boolean") and "bool" or lt
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_type ..
+                       " is not of expected type string"})
     end
 
     -- Chain tip height (== inline-index best height when enabled).  Header
