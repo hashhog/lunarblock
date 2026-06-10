@@ -1016,15 +1016,27 @@ function PeerManager:get_anchors()
 end
 
 --- Connect to anchor peers.
--- Called during startup to establish anchor connections first.
+-- Called once at startup (after the listener is up, before the first
+-- maintain_connections tick) to re-establish last session's block-relay-only
+-- peers FIRST — Core's CConnman::Start dials the anchors ahead of any addrman
+-- outbound, the eclipse-mitigation "reconnect the peers we trusted last time"
+-- guarantee. Folding anchors into ordinary maintenance (gated by
+-- outbound < max_outbound) loses that ordering if faster addrman peers saturate
+-- the slots first, so this front-loads them; maintain_connections still drains
+-- any leftover as a fallback.
 function PeerManager:_connect_to_anchors()
-  for _, anchor in ipairs(self._anchors) do
-    if not self.peers[anchor.ip .. ":" .. anchor.port] then
-      -- Try to connect to anchor
-      self:connect_peer(anchor.ip, anchor.port)
+  for _, anchor in ipairs(self._anchors or {}) do
+    if not self.peers[anchor.ip .. ":" .. anchor.port]
+       and not self:is_banned(anchor.ip) then
+      -- skip_diversity=true: anchors are trusted from the previous session and
+      -- must not be dropped by the /16 outbound-diversity check (the maintenance
+      -- drain at maintain_connections passes the same flag — without it, a
+      -- same-/16 anchor is silently diversity-rejected here).
+      self:connect_peer(anchor.ip, anchor.port, true)
     end
   end
-  -- Clear anchors after attempting connections
+  -- Clear anchors after attempting connections (maintain_connections then has
+  -- nothing left to drain; the upfront dial subsumes it).
   self._anchors = {}
 end
 
