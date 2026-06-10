@@ -2203,6 +2203,12 @@ local function main()
   -- Initialize wallet manager (multi-wallet support)
   local wallet_manager = wallet_mod.new_manager(datadir, network, db)
   wallet_manager:ensure_wallets_dir()
+  -- Wire chain context so load_wallet (e.g. a named watch-only wallet pulled in
+  -- via /wallet/<name> or loadwallet after a restart) can reconcile the loaded
+  -- wallet's ledger up to the current tip. Named wallets are not fed by the
+  -- per-block hook below, so this is what keeps a reloaded watch-only wallet's
+  -- balance / listunspent live without an explicit rescanblockchain.
+  wallet_manager:set_chain_context(chain_state, mempool)
 
   -- Load or create default wallet (backward compatible)
   local wallet = nil
@@ -2398,6 +2404,22 @@ local function main()
     print(string.format("P2P listening on port %d", args.port))
   else
     print(string.format("WARNING: P2P listener failed on port %d: %s", args.port, tostring(listen_err)))
+  end
+
+  -- Dial last session's anchor peers FIRST (Core CConnman::Start), right after
+  -- the listener is up and BEFORE the first maintain_connections tick. Anchors
+  -- were loaded at PeerManager init (_load_anchors reads + deletes anchors.dat);
+  -- _connect_to_anchors was dead code until now, so the eclipse-mitigation
+  -- "reconnect block-relay peers first" guarantee was lost — addrman peers could
+  -- saturate max_outbound before maintenance got around to draining the anchors.
+  -- Skipped under -connect (max_outbound forced to 0: the manual pin is the only
+  -- allowed peer). Isolated under pcall: an anchor-dial hiccup must not abort boot.
+  if not args.connect then
+    local aok, aerr = pcall(function() peer_manager:_connect_to_anchors() end)
+    if not aok then
+      io.stderr:write("anchor reconnect failed (non-fatal): " ..
+        tostring(aerr) .. "\n")
+    end
   end
   print(string.format("RPC listening on port %d", args.rpcport))
   if rest_server then

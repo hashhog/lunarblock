@@ -985,6 +985,21 @@ function M.new(network, storage)
   -- (which rebuilds self.keys from the master key) can re-merge them and never
   -- silently wipe them. Maps address -> {privkey, pubkey, compressed, type, label}.
   self.imported_keys = {}
+  -- WATCH-ONLY descriptors (importdescriptors on a disable_private_keys wallet).
+  -- Maps a classified address -> {desc, label, internal, spk_hex, kind, ts}. The
+  -- wallet owns these scripts for crediting (scan_utxos / _owned_addr_for_spk
+  -- consult this set alongside self.keys) but holds NO private key for them, so
+  -- they are unspendable (sendtoaddress refuses). Mirrors Bitcoin Core's
+  -- DescriptorScriptPubKeyMan for a watch-only descriptor wallet. Persisted in
+  -- serialize() / reinstalled in M.load() so the watch set round-trips a restart.
+  self.watch_addrs = {}
+  -- WALLET_FLAG_DISABLE_PRIVATE_KEYS, derived purely from createwallet's
+  -- disable_private_keys (Core rpc/wallet.cpp:381-383). private_keys_enabled =
+  -- NOT this flag (getwalletinfo private_keys_enabled, rpc/wallet.cpp:98). Kept
+  -- as an explicit field — independent of lock state / master_key presence — so
+  -- a reloaded watch-only wallet can still tell it is watch-only (an unlocked
+  -- keyed wallet and a watch-only wallet both have a usable key set otherwise).
+  self.private_keys_enabled = true
   self.addresses = {}              -- ordered list of addresses
   self.utxos = {}                  -- outpoint_key -> {value, script_pubkey, address, txid, vout}
   -- Has this wallet ever scanned the chain for its own funds?  A wallet
@@ -1482,7 +1497,7 @@ function Wallet:scan_utxos(chain_state)
       addr = address.base58check_encode(version, hash_or_program)
     end
 
-    if addr and self.keys[addr] then
+    if addr and (self.keys[addr] or self.watch_addrs[addr]) then
       -- Parse outpoint from key (32 bytes txid + 4 bytes vout)
       local txid = types.hash256(key:sub(1, 32))
       local reader = serialize.buffer_reader(key:sub(33, 36))
@@ -1620,8 +1635,33 @@ function Wallet:_owned_addr_for_spk(script_pubkey)
     local version = self.network.pubkey_address_prefix
     addr = address.base58check_encode(version, hash_or_program)
   end
-  if addr and self.keys[addr] then return addr end
+  if addr and (self.keys[addr] or self.watch_addrs[addr]) then return addr end
   return nil
+end
+
+--- Register a watch-only descriptor's classified address into the owned-script
+--- view. The wallet credits funds paid to this address (scan_utxos /
+--- _owned_addr_for_spk) but holds no private key, so it cannot spend them.
+--- Mirrors DescriptorScriptPubKeyMan::AddDescriptorKey for a watch-only desc.
+-- @param addr string  the classified address the descriptor resolves to
+-- @param info table   {desc, label, internal, spk_hex, kind, ts}
+function Wallet:add_watch_descriptor(addr, info)
+  self.watch_addrs[addr] = info
+  local seen = false
+  for _, a in ipairs(self.addresses) do
+    if a == addr then seen = true; break end
+  end
+  if not seen then
+    self.addresses[#self.addresses + 1] = addr
+  end
+  self:mark_dirty()
+end
+
+--- Is this address watched (watch-only descriptor) by the wallet?
+-- @param addr string
+-- @return boolean
+function Wallet:is_watch_addr(addr)
+  return self.watch_addrs[addr] ~= nil
 end
 
 --- Rebuild the wallet transaction history by walking the connected chain.
@@ -3452,7 +3492,33 @@ function Wallet:serialize()
     -- Bitcoin Core's m_last_block_processed_height (CWallet) persisted in
     -- the wallet DB so a restart reconciles forward from there.
     last_synced_height = self.last_synced_height or 0,
+    -- WALLET_FLAG_DISABLE_PRIVATE_KEYS, persisted so a reloaded watch-only
+    -- wallet still knows it is watch-only (getwalletinfo private_keys_enabled
+    -- + the -4 key-op guards key off THIS flag, not lock state / master_key
+    -- presence). Default true for legacy wallet files lacking the field.
+    private_keys_enabled = self.private_keys_enabled ~= false,
   }
+
+  -- Persist WATCH-ONLY descriptors (importdescriptors on a dpk wallet). The
+  -- wallet holds no private key for these scripts, so unlike HD/imported keys
+  -- there is nothing to re-derive — the descriptor + its classified address +
+  -- metadata IS the whole record, and it MUST round-trip the wallet file or a
+  -- restart loses the watched funds (the historical wallet-fragility footgun).
+  -- Symmetric with the reinstall in M.load(). Mirrors the imported_keys block.
+  if self.watch_addrs and next(self.watch_addrs) ~= nil then
+    local wd = {}
+    for addr, info in pairs(self.watch_addrs) do
+      wd[addr] = {
+        desc = info.desc,
+        label = info.label,
+        internal = info.internal and true or false,
+        spk_hex = info.spk_hex,
+        kind = info.kind,
+        ts = info.ts or 0,
+      }
+    end
+    data.watch_descriptors = wd
+  end
 
   -- Persist imported keys (importprivkey). These are NOT derivable from the HD
   -- master key, so unlike HD keys they MUST be serialized or they are lost on
@@ -3812,6 +3878,36 @@ function M.load(filepath, network, storage, passphrase)
     end
   end
 
+  -- Restore the WALLET_FLAG_DISABLE_PRIVATE_KEYS-derived flag. Default true for
+  -- legacy wallet files written before the field existed (a real keyed wallet).
+  wallet.private_keys_enabled = data.private_keys_enabled ~= false
+
+  -- Reinstall WATCH-ONLY descriptors AFTER the imported-key re-merge and BEFORE
+  -- any startup rescan, so the watch set is present when the ledger is rebuilt.
+  -- Symmetric with the serialize() block. A watch-only descriptor carries no
+  -- private key, so there is nothing to re-derive — the persisted record IS the
+  -- whole entry. This is the round-trip that keeps a reloaded watch-only wallet's
+  -- funds visible (the wallet-fragility guard the watch-only family warns about).
+  if data.watch_descriptors then
+    for addr, info in pairs(data.watch_descriptors) do
+      wallet.watch_addrs[addr] = {
+        desc = info.desc,
+        label = info.label,
+        internal = info.internal and true or false,
+        spk_hex = info.spk_hex,
+        kind = info.kind,
+        ts = tonumber(info.ts) or 0,
+      }
+      local seen = false
+      for _, a in ipairs(wallet.addresses) do
+        if a == addr then seen = true; break end
+      end
+      if not seen then
+        wallet.addresses[#wallet.addresses + 1] = addr
+      end
+    end
+  end
+
   -- Restore the scanned flag (a reloaded live wallet stays live).
   wallet.scanned = data.scanned and true or false
 
@@ -3858,7 +3954,22 @@ function M.new_manager(datadir, network, storage)
   self.wallets = {}       -- name -> wallet instance
   self.wallet_locks = {}  -- name -> file descriptor (for locking)
   self.default_wallet = nil  -- default wallet name
+  -- Chain context, wired by main.lua after chain_state exists. Used by
+  -- load_wallet to reconcile a freshly-loaded (e.g. named watch-only) wallet's
+  -- ledger up to the current tip — otherwise a reloaded named wallet shows an
+  -- empty ledger until an explicit rescanblockchain, because the per-block
+  -- block-connect hook only feeds the DEFAULT wallet (main.lua).
+  self.chain_state = nil
+  self.mempool = nil
   return self
+end
+
+--- Wire the chain context so load_wallet can reconcile a loaded wallet to tip.
+-- @param chain_state ChainState
+-- @param mempool table|nil
+function WalletManager:set_chain_context(chain_state, mempool)
+  self.chain_state = chain_state
+  self.mempool = mempool
 end
 
 --- Ensure wallets directory exists.
@@ -4014,6 +4125,12 @@ function WalletManager:create_wallet(name, options)
     wallet = M.create(self.network, self.storage, options.passphrase)
   end
 
+  -- WALLET_FLAG_DISABLE_PRIVATE_KEYS (Core rpc/wallet.cpp:381-383): a watch-only
+  -- wallet has private keys DISABLED. Drive getwalletinfo.private_keys_enabled +
+  -- the -4 key-op guards off this explicit flag (NOT is_locked / master_key
+  -- presence), and persist it so the flag survives a reload.
+  wallet.private_keys_enabled = not (options.disable_private_keys == true)
+
   -- Save wallet
   local save_ok, save_err = wallet:save(wallet_path)
   if not save_ok then
@@ -4068,6 +4185,20 @@ function WalletManager:load_wallet(name, passphrase)
   -- Set as default if first wallet
   if self.default_wallet == nil then
     self.default_wallet = name
+  end
+
+  -- Reconcile a freshly-loaded wallet to the chain tip so its ledger is rebuilt
+  -- from the (persisted) owned-script + watch-only set. Named wallets are NOT
+  -- fed by the per-block hook (main.lua wires it to the default wallet only), so
+  -- without this a reloaded watch-only wallet shows balance 0 / empty listunspent
+  -- until an explicit rescanblockchain — the restart-survival hole. Cheap no-op
+  -- when not scanned or already at tip. Isolated under pcall (a reconcile hiccup
+  -- must not fail the load). last_synced_height is intentionally NOT forced to 0:
+  -- reconcile_to_tip rebuilds the whole ledger from chainstate idempotently.
+  if self.chain_state and wallet.scanned then
+    pcall(function()
+      wallet:reconcile_to_tip(self.chain_state, self.mempool)
+    end)
   end
 
   return wallet

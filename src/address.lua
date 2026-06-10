@@ -1350,4 +1350,150 @@ function M.get_descriptor_info(desc_str)
   }
 end
 
+--------------------------------------------------------------------------------
+-- Descriptor checksum require-mode + single-key descriptor -> scriptPubKey
+-- resolution, shared by importdescriptors (and reusable by scantxoutset).
+--------------------------------------------------------------------------------
+
+--- Validate a descriptor's checksum in REQUIRE mode (Core require_checksum=true,
+--- backup.cpp:158 -> CheckChecksum, descriptor.cpp:2838-2869). Returns the
+--- checksum-stripped descriptor body on success, or nil + the EXACT Core error
+--- string the caller surfaces as RPC_INVALID_ADDRESS_OR_KEY (-5).
+-- @param desc string  descriptor, with or without a #checksum suffix
+-- @return string|nil stripped_desc, string|nil core_error_message
+function M.require_descriptor_checksum(desc)
+  -- Count '#' separators.
+  local first = desc:find("#", 1, true)
+  if not first then
+    -- No '#' and require_checksum -> "Missing checksum" (descriptor.cpp:2845).
+    return nil, "Missing checksum"
+  end
+  local second = desc:find("#", first + 1, true)
+  if second then
+    return nil, "Multiple '#' symbols"
+  end
+  local body = desc:sub(1, first - 1)
+  local provided = desc:sub(first + 1)
+  if #provided ~= 8 then
+    return nil, string.format(
+      "Expected 8 character checksum, not %u characters", #provided)
+  end
+  local computed, cerr = M.descriptor_checksum(body)
+  if not computed then
+    -- A bad character in the payload (descriptor.cpp:2857).
+    return nil, "Invalid characters in payload"
+  end
+  if provided ~= computed then
+    return nil, string.format(
+      "Provided checksum '%s' does not match computed checksum '%s'",
+      provided, computed)
+  end
+  return body, nil
+end
+
+--- Resolve a SINGLE-KEY descriptor body (checksum already stripped) to its
+--- scriptPubKey. Covers the watch-only import surface: addr(<address>),
+--- wpkh(<hexpub>), pkh(<hexpub>), raw(<hex>), tr(<xonly>) and bare hex (Core
+--- raw() shorthand). Detects the PRIVATE-KEY form wpkh(<WIF>)/pkh(<WIF>) — a
+--- base58 WIF where a hex pubkey is expected — and flags is_private so the
+--- caller can reject it (-4 on a disable_private_keys wallet) WITHOUT needing
+--- the key itself. Ranged xpub descriptors are out of scope (absent today).
+-- @param body string  checksum-stripped descriptor
+-- @param network string  network name ("regtest"/"testnet"/"mainnet"/...)
+-- @return table|nil {spk=<bytes>, addr=<string|nil>, kind=<string>,
+--                    is_private=<bool>}, string|nil error_message
+function M.resolve_descriptor_spk(body, network)
+  local script_mod = require("lunarblock.script")
+  network = network or "mainnet"
+  body = body:gsub("^%s+", ""):gsub("%s+$", "")
+
+  local function is_hex(s)
+    return s:match("^[0-9a-fA-F]+$") and (#s % 2 == 0)
+  end
+  local function hexbytes(h)
+    return (h:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+  end
+  -- A WIF (base58check, 51-52 chars, leading 5/K/L/9/c) is NOT valid hex; if an
+  -- inner key arg is not a hex pubkey we treat it as a private key (Core: the
+  -- descriptor parser produces a key with private material).
+  local function inner_is_private(inner)
+    if is_hex(inner) and (#inner == 66 or #inner == 130 or #inner == 64) then
+      return false  -- compressed/uncompressed pubkey, or x-only
+    end
+    return true
+  end
+
+  -- addr(<address>)
+  local inner = body:match("^addr%((.+)%)$")
+  if inner then
+    local addr_type, addr_data = M.decode_address(inner, network)
+    if not addr_type then
+      return nil, "Invalid address in addr(): " .. tostring(addr_data)
+    end
+    local spk
+    if addr_type == "p2pkh" then spk = script_mod.make_p2pkh_script(addr_data)
+    elseif addr_type == "p2sh" then spk = script_mod.make_p2sh_script(addr_data)
+    elseif addr_type == "p2wpkh" then spk = script_mod.make_p2wpkh_script(addr_data)
+    elseif addr_type == "p2wsh" then spk = script_mod.make_p2wsh_script(addr_data)
+    elseif addr_type == "p2tr" then spk = script_mod.make_p2tr_script(addr_data)
+    else return nil, "Unsupported address type in addr(): " .. tostring(addr_type) end
+    return {spk = spk, addr = inner, kind = "addr", is_private = false}
+  end
+
+  -- wpkh(<key>) / pkh(<key>) — public hex key (watch-only) or WIF (private).
+  for fn, kind in pairs({wpkh = "wpkh", pkh = "pkh"}) do
+    inner = body:match("^" .. fn .. "%((.+)%)$")
+    if inner then
+      if inner_is_private(inner) then
+        -- A private-key descriptor: do NOT resolve a script (we never need the
+        -- key). The caller rejects this on a watch-only wallet (-4).
+        return {spk = nil, addr = nil, kind = kind, is_private = true}
+      end
+      local pub = hexbytes(inner)
+      if #pub ~= 33 and #pub ~= 65 then
+        return nil, fn .. "() expects a 33- or 65-byte public key"
+      end
+      local h = crypto.hash160(pub)
+      local spk, addr
+      if fn == "wpkh" then
+        spk = script_mod.make_p2wpkh_script(h)
+        addr = M.segwit_encode(M.BECH32_HRP[network] or "bc", 0, h)
+      else
+        spk = script_mod.make_p2pkh_script(h)
+        local ver = (network == "mainnet") and M.VERSION.MAINNET_P2PKH
+                                            or M.VERSION.TESTNET_P2PKH
+        addr = M.base58check_encode(ver, h)
+      end
+      return {spk = spk, addr = addr, kind = kind, is_private = false}
+    end
+  end
+
+  -- raw(<hex>)
+  inner = body:match("^raw%((.+)%)$")
+  if inner then
+    if not is_hex(inner) then return nil, "Invalid hex in raw()" end
+    return {spk = hexbytes(inner), addr = nil, kind = "raw", is_private = false}
+  end
+
+  -- tr(<xonly>) — x-only output key (32 bytes).
+  inner = body:match("^tr%((.+)%)$")
+  if inner then
+    if inner_is_private(inner) then
+      return {spk = nil, addr = nil, kind = "tr", is_private = true}
+    end
+    local xonly = hexbytes(inner)
+    if #xonly ~= 32 then return nil, "tr() expects a 32-byte x-only output key" end
+    local spk = script_mod.make_p2tr_script(xonly)
+    local addr = M.xonly_pubkey_to_p2tr(xonly, network)
+    return {spk = spk, addr = addr, kind = "tr", is_private = false}
+  end
+
+  -- bare hex == Core raw() shorthand
+  if is_hex(body) then
+    return {spk = hexbytes(body), addr = nil, kind = "raw", is_private = false}
+  end
+
+  return nil, "Unsupported descriptor: " .. body
+end
+
 return M

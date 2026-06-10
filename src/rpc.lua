@@ -6254,7 +6254,15 @@ function RPCServer:register_methods()
       txcount = 0,  -- TODO: track transactions
       keypoolsize = wallet.gap_limit - wallet.next_external_index,
       keypoolsize_hd_internal = wallet.gap_limit - wallet.next_internal_index,
-      private_keys_enabled = not wallet.is_locked and wallet.master_key ~= nil,
+      -- Core (rpc/wallet.cpp:98): private_keys_enabled = !IsWalletFlagSet(
+      -- WALLET_FLAG_DISABLE_PRIVATE_KEYS) — purely flag-derived, independent of
+      -- lock state or whether a master key exists. Driven off the persisted
+      -- private_keys_enabled flag (set at createwallet, survives reload). The
+      -- old `not is_locked and master_key~=nil` conflated encryption/lock + key
+      -- presence with the dpk flag (a watch-only wallet has no master_key, an
+      -- unlocked keyed wallet does, but a locked-encrypted wallet also looks
+      -- key-disabled — all three were indistinguishable).
+      private_keys_enabled = wallet.private_keys_enabled ~= false,
       avoid_reuse = false,
       scanning = false,
       descriptors = true,
@@ -6271,6 +6279,19 @@ function RPCServer:register_methods()
     local wallet, err = rpc:get_request_wallet()
     if not wallet then
       error({code = M.ERROR.WALLET_ERROR, message = err})
+    end
+
+    -- A watch-only (disable_private_keys) wallet cannot mint keys. Core
+    -- getnewaddress checks CanGetAddresses() first and returns RPC_WALLET_ERROR
+    -- (-4) "Error: This wallet has no available keys" (addresses.cpp:46-48 /
+    -- scriptpubkeyman.cpp:1168-1176): no active+ranged spk_man able to produce
+    -- the requested output type. lunarblock has no ranged descriptors, so a
+    -- watch-only wallet has no key-minting spk_man at all → -4, NEVER falling
+    -- through to wallet:get_new_address (which would nil-deref the absent master
+    -- key). Gated on the persisted dpk flag, BEFORE the is_locked check.
+    if wallet.private_keys_enabled == false then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Error: This wallet has no available keys"})
     end
 
     if wallet.is_locked then
@@ -6389,6 +6410,16 @@ function RPCServer:register_methods()
     local wallet, werr = rpc:get_request_wallet()
     if not wallet then
       error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+
+    -- A watch-only (disable_private_keys) wallet holds no private keys, so it
+    -- cannot sign — Core sendtoaddress fails with RPC_WALLET_ERROR (-4) "Error:
+    -- Private keys are disabled for this wallet". Guard BEFORE building the tx so
+    -- the watch-only nonspend property is a clean -4 rather than a nil-deref on
+    -- the absent master key inside wallet:send_to.
+    if wallet.private_keys_enabled == false then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Error: Private keys are disabled for this wallet"})
     end
 
     if wallet.is_locked then
@@ -7119,6 +7150,278 @@ function RPCServer:register_methods()
       start_height = res.start_height,
       stop_height = res.stop_height,
     }
+  end
+
+  --- importdescriptors: import output descriptors into a (typically watch-only)
+  --- descriptor wallet, registering their scripts into the owned-script view and
+  --- rescanning the chain so pre-import payments are credited.
+  --
+  -- Mirrors bitcoin-core/src/wallet/rpc/backup.cpp::importdescriptors +
+  -- ProcessDescriptorImport. Per Core: the request is an array; the response is a
+  -- SAME-LENGTH array, one element per request, each {success=true} or
+  -- {success=false, error={code,message}}; a single bad element NEVER aborts the
+  -- batch (each body is wrapped in try/catch -> our pcall). After processing,
+  -- the wallet rescans once from the lowest successful timestamp minus the
+  -- 7200s TIMESTAMP_WINDOW (chain.h:37) so funds paid to a descriptor BEFORE the
+  -- import time are credited. timestamp:0 -> clamped to 1 -> whole-chain scan.
+  --
+  -- @param params[1] requests array: [{desc, timestamp, [label], [active],
+  --                                    [internal], [range]}...]
+  -- @return array: per-element {success=...}
+  self.methods["importdescriptors"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+
+    local requests = params[1] or params.requests
+    if type(requests) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMS,
+             message = "Expected an array of descriptor requests"})
+    end
+
+    local privkeys_enabled = wallet.private_keys_enabled ~= false
+    local network_name = (rpc.network and rpc.network.name) or "mainnet"
+
+    -- The "now" timestamp resolves to the chain tip's median-time-past
+    -- (backup.cpp:133-134, FoundBlock().mtpTime). Bypasses pre-import scanning.
+    local function tip_mtp()
+      if rpc.chain_state and rpc.chain_state.tip_hash then
+        return get_median_time_past(rpc.storage, rpc.chain_state.tip_hash)
+      end
+      return os.time()
+    end
+
+    -- Process ONE request element. Returns the result table; on a caller-facing
+    -- failure it RAISES a {code,message} error which the per-element pcall below
+    -- converts to {success=false, error=...} (never propagated out of the batch).
+    -- The boolean second return marks "needs a from-genesis-window rescan".
+    local function process_one(req)
+      if type(req) ~= "table" then
+        error({code = M.ERROR.TYPE_ERROR, message = "Expected an object"})
+      end
+
+      -- desc (required).
+      local desc = req.desc
+      if type(desc) ~= "string" then
+        error({code = M.ERROR.INVALID_PARAMETER, message = "Descriptor not found."})
+      end
+
+      -- timestamp (required; GetImportTimestamp semantics).
+      local ts_field = req.timestamp
+      local timestamp
+      if ts_field == nil then
+        error({code = M.ERROR.TYPE_ERROR,
+               message = "Missing required timestamp field for key"})
+      elseif type(ts_field) == "number" then
+        timestamp = ts_field
+      elseif ts_field == "now" then
+        timestamp = tip_mtp()
+      else
+        error({code = M.ERROR.TYPE_ERROR, message = string.format(
+          "Expected number or \"now\" timestamp value for key. got type %s",
+          type(ts_field))})
+      end
+      -- minimum_timestamp clamp (backup.cpp:390): max(ts, 1).
+      if timestamp < 1 then timestamp = 1 end
+      local does_rescan = (ts_field ~= "now")
+
+      -- Checksum REQUIRE mode (-5 with Core-exact message).
+      local body, csum_err = address_mod.require_descriptor_checksum(desc)
+      if not body then
+        error({code = M.ERROR.INVALID_ADDRESS, message = csum_err})
+      end
+
+      local active = req.active == true
+      local internal = req.internal == true
+      local label = req.label
+
+      -- active && combo -> -4 (combo cannot be active). Single-key forms only.
+      if active and body:match("^combo%(") then
+        error({code = M.ERROR.WALLET_ERROR,
+               message = "Combo descriptors cannot be set to active"})
+      end
+      -- ranged+label is rejected (-8) in Core; lunarblock has no ranged forms,
+      -- so a label on a single (non-ranged) descriptor is fine.
+
+      -- Resolve to a scriptPubKey + detect private-key material.
+      local resolved, rerr = address_mod.resolve_descriptor_spk(body, network_name)
+      if not resolved then
+        error({code = M.ERROR.INVALID_ADDRESS, message = rerr})
+      end
+
+      -- PRIVKEY-INTO-DPK, both directions (backup.cpp:224-226, 259-262).
+      if resolved.is_private and not privkeys_enabled then
+        error({code = M.ERROR.WALLET_ERROR, message =
+          "Cannot import private keys to a wallet with private keys disabled"})
+      end
+      if (not resolved.is_private) and privkeys_enabled then
+        error({code = M.ERROR.WALLET_ERROR, message =
+          "Cannot import descriptor without private keys to a wallet with " ..
+          "private keys enabled"})
+      end
+
+      if not resolved.addr then
+        -- raw()/script-only descriptors classify to no address; lunarblock's
+        -- owned-script view is keyed by address, so these are out of scope here.
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "Only address/key descriptors are importable"})
+      end
+
+      -- Register the watch-only descriptor into the owned-script view.
+      wallet:add_watch_descriptor(resolved.addr, {
+        desc = body .. "#" .. desc:sub(desc:find("#", 1, true) + 1),
+        label = label,
+        internal = internal,
+        spk_hex = M.hex_encode(resolved.spk),
+        kind = resolved.kind,
+        ts = timestamp,
+      })
+
+      return {success = true}, does_rescan
+    end
+
+    local results = setmetatable({}, cjson.empty_array_mt)
+    local any_success = false
+    local need_rescan = false
+    local lowest_ts = nil
+
+    for i = 1, #requests do
+      local ok, res_or_err, does_rescan = pcall(process_one, requests[i])
+      if ok then
+        results[i] = res_or_err
+        any_success = true
+        if does_rescan then
+          need_rescan = true
+          local rts = requests[i].timestamp
+          if type(rts) == "number" then
+            if rts < 1 then rts = 1 end
+            if lowest_ts == nil or rts < lowest_ts then lowest_ts = rts end
+          end
+        end
+      else
+        -- res_or_err is the raised {code,message}; surface it per-element.
+        local e = res_or_err
+        if type(e) ~= "table" then
+          e = {code = M.ERROR.MISC_ERROR, message = tostring(e)}
+        end
+        results[i] = {
+          success = false,
+          error = {code = e.code or M.ERROR.MISC_ERROR, message = e.message},
+        }
+      end
+    end
+
+    -- Rescan once for the whole batch (Core flips a shared rescan flag only if at
+    -- least one element succeeded with a non-"now" timestamp). lunarblock's
+    -- wallet:rescan rebuilds the whole ledger from chainstate idempotently, so a
+    -- from-genesis scan never double-counts; the 7200s window only matters for a
+    -- block-time-vs-import-time race which a full rescan subsumes. Marks scanned.
+    if any_success and need_rescan and rpc.chain_state then
+      local rok, rerr = wallet:rescan(rpc.chain_state, rpc.mempool)
+      if not rok then
+        io.stderr:write("importdescriptors rescan warning: " ..
+          tostring(rerr) .. "\n")
+      end
+    elseif any_success then
+      -- "now"-only import: nothing to scan before tip, but the wallet is live.
+      if wallet.mark_scanned then wallet:mark_scanned() end
+    end
+
+    -- Persist so the watch-only set + scanned flag survive a restart.
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then
+          pcall(function() wallet:save(rpc.wallet_manager:get_wallet_path(name)) end)
+          break
+        end
+      end
+    end
+
+    return results
+  end
+
+  --- getaddressinfo: report wallet-relevant metadata for an address.
+  --
+  -- Mirrors bitcoin-core/src/wallet/rpc/addresses.cpp::getaddressinfo
+  -- (emit order at 444-510). For an imported watch-only descriptor address:
+  -- ismine=true, solvable=true with a desc for key descriptors (false for
+  -- addr()-only), parent_desc echoes the imported descriptor, iswatchonly is
+  -- DEPRECATED + hardcoded false even for watch-only wallets. Field order is
+  -- preserved via an ordered manual-JSON emit so the shape matches Core.
+  -- @param params[1] address string
+  self.methods["getaddressinfo"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+    local addr = params[1] or params.address
+    if type(addr) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "address is required"})
+    end
+
+    local network_name = (rpc.network and rpc.network.name) or "mainnet"
+    local addr_type, addr_data = address_mod.decode_address(addr, network_name)
+    if not addr_type then
+      error({code = M.ERROR.INVALID_ADDRESS,
+             message = "Invalid address: " .. tostring(addr_data)})
+    end
+
+    -- scriptPubKey for the address.
+    local spk
+    if addr_type == "p2pkh" then spk = script_mod.make_p2pkh_script(addr_data)
+    elseif addr_type == "p2sh" then spk = script_mod.make_p2sh_script(addr_data)
+    elseif addr_type == "p2wpkh" then spk = script_mod.make_p2wpkh_script(addr_data)
+    elseif addr_type == "p2wsh" then spk = script_mod.make_p2wsh_script(addr_data)
+    elseif addr_type == "p2tr" then spk = script_mod.make_p2tr_script(addr_data)
+    else spk = "" end
+
+    local key_info = wallet.keys[addr]
+    local watch_info = wallet.watch_addrs and wallet.watch_addrs[addr]
+    local ismine = (key_info ~= nil) or (watch_info ~= nil)
+    -- Core: solvable=true when a SigningProvider can produce the script. A key
+    -- descriptor (wpkh/pkh) is solvable; a bare addr() descriptor (no key) is
+    -- not. Owned HD/imported keys are solvable.
+    local solvable
+    if watch_info then
+      solvable = (watch_info.kind ~= "addr" and watch_info.kind ~= "raw")
+    else
+      solvable = (key_info ~= nil)
+    end
+
+    -- Result fields mirror Core getaddressinfo (addresses.cpp:444-510). cjson
+    -- does not preserve insertion order, so byte-for-byte field order is not
+    -- guaranteed (no callers assert it); the field SET + values are Core-faithful.
+    local result = {
+      address = addr,
+      scriptPubKey = M.hex_encode(spk),
+      ismine = ismine,
+      solvable = solvable,
+      iswatchonly = false,  -- DEPRECATED, hardcoded false (addresses.cpp:478)
+      isscript = (addr_type == "p2sh" or addr_type == "p2wsh"),
+      iswitness = (addr_type == "p2wpkh" or addr_type == "p2wsh"
+                   or addr_type == "p2tr"),
+      ischange = (watch_info and watch_info.internal) or false,
+      labels = setmetatable({}, cjson.empty_array_mt),
+    }
+    if watch_info and watch_info.desc then
+      result.desc = watch_info.desc
+      result.parent_desc = watch_info.desc
+    end
+    if addr_type == "p2wpkh" or addr_type == "p2wsh" then
+      result.witness_version = 0
+      result.witness_program = M.hex_encode(addr_data)
+    elseif addr_type == "p2tr" then
+      result.witness_version = 1
+      result.witness_program = M.hex_encode(addr_data)
+    end
+    if key_info and key_info.pubkey then
+      result.pubkey = M.hex_encode(key_info.pubkey)
+    end
+    if watch_info and watch_info.label and watch_info.label ~= "" then
+      result.labels[1] = watch_info.label
+    end
+    return result
   end
 
   ----------------------------------------------------------------------------
@@ -10365,6 +10668,18 @@ function RPCServer:tick()
   self.request_wallet = nil
   if wallet_name and self.wallet_manager then
     local wallet = self.wallet_manager:get_wallet(wallet_name)
+    -- LAZY-LOAD a named wallet that exists on disk but isn't loaded yet (e.g.
+    -- after a restart: named wallets — unlike the default — are not auto-loaded
+    -- at startup). load_wallet reconciles the loaded ledger up to tip, so a
+    -- reloaded watch-only wallet's funds are visible on first /wallet/<name>
+    -- access without an explicit rescanblockchain. Best-effort: a load failure
+    -- leaves request_wallet nil and the handler returns its usual "no wallet".
+    if not wallet and wallet_name ~= "" then
+      local ok, w = pcall(function()
+        return self.wallet_manager:load_wallet(wallet_name)
+      end)
+      if ok and w then wallet = w end
+    end
     if wallet then
       self.request_wallet = wallet
     end
