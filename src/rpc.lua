@@ -14,6 +14,34 @@ local bit = require("bit")
 local storage_mod = require("lunarblock.storage")
 local M = {}
 
+--- Map a decoded JSON value to Bitcoin Core's uvTypeName spelling.
+-- Core checks RPC arg types via RPCHelpMan/RPCArg::MatchesType (rpc/util.cpp)
+-- and reports the offending type using univalue's uvTypeName: null, bool,
+-- number, string, object, array (univalue.cpp). cjson decodes JSON null to
+-- cjson.null (userdata), bool to boolean, numbers to number, strings to
+-- string, and BOTH JSON objects and arrays to a plain Lua table. Distinguish
+-- array vs object best-effort by sequential integer keys, matching the prompt's
+-- numeric/array cases. Used to build Core-byte-exact RPC_TYPE_ERROR messages.
+local function core_json_type_name(v)
+  if v == nil or v == cjson.null then
+    return "null"
+  end
+  local t = type(v)
+  if t == "boolean" then
+    return "bool"
+  elseif t == "number" then
+    return "number"
+  elseif t == "string" then
+    return "string"
+  elseif t == "table" then
+    -- A non-empty sequence (keys 1..#v) reads as a JSON array; anything else
+    -- (string keys, or empty) reads as a JSON object. Empty {} is ambiguous in
+    -- Lua but is non-string either way, so the type-error still fires.
+    return (#v > 0) and "array" or "object"
+  end
+  return t
+end
+
 --------------------------------------------------------------------------------
 -- Network Name Translation
 --------------------------------------------------------------------------------
@@ -6080,15 +6108,68 @@ function RPCServer:register_methods()
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
     end
 
-    local wallet_name = params[1] or params.wallet_name
+    -- Bitcoin Core validates createwallet arg types via RPCHelpMan before the
+    -- handler body runs (RPCArg::MatchesType, rpc/util.cpp), throwing
+    -- RPC_TYPE_ERROR (-3) "JSON value of type <X> is not of expected type <Y>"
+    -- for any type mismatch. The Core arg types (wallet/rpc/wallet.cpp
+    -- createwallet RPCHelpMan) are: wallet_name STR (required),
+    -- disable_private_keys BOOL, blank BOOL, passphrase STR. A non-string
+    -- wallet_name previously slipped past the bare nil-guard and crashed in
+    -- WalletManager:create_wallet (name:find on a number/table). Enforce the
+    -- types here so bad calls return a clean -3 instead of a 500/Lua error.
+    local wallet_name = params[1]
     if wallet_name == nil then
-      error({code = M.ERROR.INVALID_PARAMS, message = "wallet_name is required"})
+      wallet_name = params.wallet_name
+    end
+    if wallet_name == nil or wallet_name == cjson.null then
+      -- Core marks wallet_name Optional::NO -> missing is a type error against
+      -- the required string arg, surfaced as RPC_TYPE_ERROR.
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type null is not of expected type string"})
+    end
+    if type(wallet_name) ~= "string" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(wallet_name) ..
+                       " is not of expected type string"})
     end
 
-    -- Parse options
-    local disable_private_keys = params[2] or params.disable_private_keys or false
-    local blank = params[3] or params.blank or false
-    local passphrase = params[4] or params.passphrase
+    -- Parse options (Core coerces booleans; reject non-boolean explicitly).
+    local disable_private_keys = params[2]
+    if disable_private_keys == nil then
+      disable_private_keys = params.disable_private_keys
+    end
+    if disable_private_keys == nil or disable_private_keys == cjson.null then
+      disable_private_keys = false
+    elseif type(disable_private_keys) ~= "boolean" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(disable_private_keys) ..
+                       " is not of expected type bool"})
+    end
+
+    local blank = params[3]
+    if blank == nil then
+      blank = params.blank
+    end
+    if blank == nil or blank == cjson.null then
+      blank = false
+    elseif type(blank) ~= "boolean" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(blank) ..
+                       " is not of expected type bool"})
+    end
+
+    local passphrase = params[4]
+    if passphrase == nil then
+      passphrase = params.passphrase
+    end
+    if passphrase == cjson.null then
+      passphrase = nil
+    end
+    if passphrase ~= nil and type(passphrase) ~= "string" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(passphrase) ..
+                       " is not of expected type string"})
+    end
     -- params[5] descriptors (ignored, always true)
     -- params[6] load_on_startup (ignored in our implementation)
 
