@@ -352,6 +352,14 @@ function M.new(network, storage, config)
     on_peer_established = nil,
   }
 
+  -- Fixed-seed last-resort fallback state (Bitcoin Core net.cpp:2606-2645
+  -- ThreadOpenConnections add_fixed_seeds).  _fixed_seeds_added is the
+  -- one-shot guard (Core's add_fixed_seeds = false after firing); _start_ts
+  -- anchors the 60s grace window (Core's `start` timestamp) that gives DNS /
+  -- addnode time to populate addrman before we fall back to curated IPs.
+  self._fixed_seeds_added = false
+  self._start_ts = os.time()
+
   -- Stale tip detection state (Bitcoin Core: CheckForStaleTipAndEvictPeers)
   self._last_tip_update = socket.gettime()
   self._stale_tip_check_time = socket.gettime() + M.STALE_TIP.STALE_CHECK_INTERVAL
@@ -1134,6 +1142,114 @@ function PeerManager:get_known_address_count()
 end
 
 --------------------------------------------------------------------------------
+-- Fixed-Seed Last-Resort Fallback (Bitcoin Core net.cpp:2606-2645)
+--------------------------------------------------------------------------------
+
+--- Inject the curated fixed-seed IPs into the address pool.
+-- Mirrors Core's `addrman.Add(ConvertSeeds(m_params.FixedSeeds()), local)`
+-- with local.SetInternal("fixedseeds").  Each "ip:port" string is split on the
+-- LAST ':' (IPv4 only here, so a single colon, but be defensive), parsed, and
+-- handed to add_known_address + _add_to_new.  The existing _add_to_new path
+-- applies the normal addrman new-table bucketing/dedup; we pre-filter through
+-- _is_routable so only routable IPv4 entries land (Core only adds reachable
+-- networks).  This NEVER replaces DNS — it is a last-resort fallback only.
+-- @return number: count of fixed seeds added (new)
+function PeerManager:add_fixed_seeds()
+  if not self.network or not self.network.fixed_seeds then
+    return 0
+  end
+  local count = 0
+  local now = os.time()
+  for _, entry in ipairs(self.network.fixed_seeds) do
+    -- Split host:port on the LAST ':' so IPv6 literals (if ever added) survive.
+    local colon = entry:match("^.*():")
+    local ip, port
+    if colon then
+      ip = entry:sub(1, colon - 1)
+      port = tonumber(entry:sub(colon + 1))
+    else
+      ip = entry
+      port = self.network.port or 8333
+    end
+    if ip and port and _is_routable(ip) then
+      if self:add_known_address(ip, port, p2p.SERVICES.NODE_NETWORK, now) then
+        count = count + 1
+      end
+      -- Tag the addrman source as "fixed_seed" (Core's SetInternal("fixedseeds")).
+      self:_add_to_new(ip, port, p2p.SERVICES.NODE_NETWORK, now, "fixed_seed")
+    end
+  end
+  return count
+end
+
+--- Maybe inject fixed seeds as a last-resort fallback after DNS.
+-- Implements Core's ThreadOpenConnections add_fixed_seeds predicate
+-- (net.cpp:2606-2645).  Fires the ONE-SHOT injection only when ALL hold:
+--   (1) ENABLED: -fixedseeds default-on AND not in --connect pin mode
+--       (lunarblock folds --connect into max_outbound == 0) AND the network
+--       carries a non-empty fixed_seeds list (mainnet only — testnet/regtest
+--       leave it nil, matching Core clearing vFixedSeeds).
+--   (2) BOOK EMPTY: get_known_address_count() == 0 (the impl-local proxy for
+--       Core's "addrman empty for at least one reachable network").
+--   (3) EITHER (a) > 60s elapsed since _start_ts (Core's GetTime() > start +
+--       1min — gives DNS/addnode time first), OR (b) DNS seeding is disabled
+--       and nothing else will populate the book (Core's cheap !dnsseed &&
+--       !use_seednodes immediate-fire).  lunarblock has no --nodnsseed flag, so
+--       the DNS-disabled branch is: proxy_dns enabled OR onlynet=onion/i2p
+--       (exactly the cases where discover_from_dns returns 0 without querying).
+-- After firing, the one-shot guard (_fixed_seeds_added) makes later ticks
+-- no-ops.  This runs AFTER the untouched DNS bootstrap and never bypasses it.
+-- @return number: count of fixed seeds added (0 if predicate did not fire)
+function PeerManager:maybe_add_fixed_seeds()
+  -- One-shot guard (Core: add_fixed_seeds = false after firing).
+  if self._fixed_seeds_added then
+    return 0
+  end
+
+  -- (1) ENABLED: list must be non-empty and we must not be in --connect pin
+  -- mode.  --connect sets max_outbound == 0 (main.lua), and Core folds
+  -- --connect into the fixed-seed path being off.
+  if not self.network or not self.network.fixed_seeds
+      or #self.network.fixed_seeds == 0 then
+    return 0
+  end
+  if self.max_outbound == 0 then
+    return 0
+  end
+
+  -- (2) BOOK EMPTY: nothing else has populated the address pool yet.
+  if self:get_known_address_count() ~= 0 then
+    return 0
+  end
+
+  -- (3a) DNS-disabled immediate-fire: proxy_dns or onlynet=onion/i2p means
+  -- discover_from_dns() returns 0 without ever querying, so there is nothing
+  -- to wait for (Core's !dnsseed && !use_seednodes shortcut).
+  local dns_disabled = false
+  if self.proxy_config then
+    if self.proxy_config.proxy_dns then
+      dns_disabled = true
+    elseif self.proxy_config.onlynet == "onion"
+        or self.proxy_config.onlynet == "i2p" then
+      dns_disabled = true
+    end
+  end
+
+  -- (3b) 60s grace: otherwise wait a minute so DNS/addnode can populate first.
+  if not dns_disabled and (os.time() - self._start_ts) <= 60 then
+    return 0
+  end
+
+  -- Fire the one-shot injection and arm the guard.
+  self._fixed_seeds_added = true
+  local added = self:add_fixed_seeds()
+  io.stderr:write(string.format(
+    "[fixedseeds] added %d fixed seeds (book empty%s)\n",
+    added, dns_disabled and ", DNS disabled" or ", 60s grace elapsed"))
+  return added
+end
+
+--------------------------------------------------------------------------------
 -- Peer Connection Management
 --------------------------------------------------------------------------------
 
@@ -1389,10 +1505,19 @@ function PeerManager:maintain_connections()
   while outbound < target and attempts_this_tick < 1 do
     local candidate = self:select_peer_to_connect()
     if not candidate then
-      -- No candidates; try DNS discovery
-      if self:discover_from_dns() == 0 then break end
-      candidate = self:select_peer_to_connect()
-      if not candidate then break end
+      -- No candidates; try DNS discovery first (the normal bootstrap path).
+      if self:discover_from_dns() == 0 then
+        -- DNS yielded nothing (suppressed via proxy_dns/onlynet, or resolved
+        -- empty).  Fall THROUGH to the curated fixed-seed last-resort fallback
+        -- (Core net.cpp:2606-2645) — never replacing DNS, only layered after.
+        if self:maybe_add_fixed_seeds() > 0 then
+          candidate = self:select_peer_to_connect()
+        end
+        if not candidate then break end
+      else
+        candidate = self:select_peer_to_connect()
+        if not candidate then break end
+      end
     end
     local ok = self:connect_peer(candidate.ip, candidate.port)
     attempts_this_tick = attempts_this_tick + 1
