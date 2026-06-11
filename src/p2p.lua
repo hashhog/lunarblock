@@ -28,6 +28,13 @@ M.SERVICES = {
   NODE_WITNESS = 8,
   NODE_COMPACT_FILTERS = 64,
   NODE_NETWORK_LIMITED = 1024,
+  -- BIP-324 v2 encrypted transport.  Bitcoin Core protocol.h:
+  --   NODE_P2P_V2 = (1 << 11) = 2048.  Advertised by Core in init.cpp:987-990
+  --   when -v2transport is enabled (DEFAULT_V2_TRANSPORT).  lunarblock runs
+  --   the v2 transport DEFAULT-ON (peer.lua:229 `use_v2 ~= false`), so we
+  --   advertise this bit unconditionally for a full node — honest, since the
+  --   BIP-324 handshake path is wired and active by default.
+  NODE_P2P_V2 = 2048,
 }
 
 -- BIP-157 P2P dispatch presence flag (FIX-71 plumbed, FIX-81 flipped).
@@ -114,13 +121,24 @@ end
 
 --- Compute the service-flags bitfield we advertise to peers.
 -- @param peerbloomfilters boolean: include NODE_BLOOM (BIP-35 mempool support)
--- @param prune_mode boolean: include NODE_NETWORK_LIMITED (BIP-159, 1<<10).
---   When true, signals to peers that we serve only the recent ~288-block
---   window.  Mirrors Core's `init.cpp` (`nLocalServices |=
---   NODE_NETWORK_LIMITED` when `IsPruneMode()` is true).  Core advertises
---   NODE_NETWORK alongside NODE_NETWORK_LIMITED in the auto-prune case
---   (the node still has the recent-288 window), so we keep NODE_NETWORK
---   set as well.
+-- @param prune_mode boolean: (retained for signature compatibility) — does NOT
+--   gate NODE_NETWORK_LIMITED.  CORRECTION: NODE_NETWORK_LIMITED (BIP-159,
+--   1<<10) is advertised by EVERY Bitcoin Core full node UNCONDITIONALLY.
+--   The base local-services value in Core is
+--     `ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);`
+--   (init.cpp:863) — NODE_NETWORK_LIMITED is in the base set regardless of
+--   prune mode.  What prune controls in Core is whether NODE_NETWORK is
+--   *added* (init.cpp ~1950 adds NODE_NETWORK when not pruning), NOT whether
+--   NODE_NETWORK_LIMITED is set.  lunarblock is a full non-pruned node, so we
+--   set BOTH NODE_NETWORK and NODE_NETWORK_LIMITED unconditionally.  The old
+--   comment here wrongly claimed Core only sets NODE_NETWORK_LIMITED when
+--   pruned; that was backwards.
+-- @param use_v2 boolean: include NODE_P2P_V2 (BIP-324, 1<<11).  Defaults to
+--   true (omitted/nil ⇒ advertise) because lunarblock runs the v2 encrypted
+--   transport default-on (peer.lua:229 `use_v2 ~= false`).  Mirrors Core
+--   init.cpp:987-990 which ORs NODE_P2P_V2 when -v2transport is enabled
+--   (DEFAULT_V2_TRANSPORT).  Pass false only if the caller disabled v2 for
+--   this peer, so we never advertise a capability we won't run (honest).
 -- @param compactfilters table|nil: optional gate options for NODE_COMPACT_FILTERS
 --   advertisement.  When provided, the table is passed to
 --   should_advertise_compact_filters() (see above for the 3 conditions —
@@ -133,14 +151,24 @@ end
 --   module-level BIP157_P2P_DISPATCH_PRESENT flag flips to true.
 -- @return number: services bitfield (NODE_NETWORK|NODE_WITNESS
 --   [|NODE_BLOOM] [|NODE_NETWORK_LIMITED] [|NODE_COMPACT_FILTERS])
-function M.our_services(peerbloomfilters, prune_mode, compactfilters)
+function M.our_services(peerbloomfilters, prune_mode, compactfilters, use_v2)
   local bit = require("bit")
-  local s = bit.bor(M.SERVICES.NODE_NETWORK, M.SERVICES.NODE_WITNESS)
+  -- Base full-node set: NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED.
+  -- NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY (matches Core's base
+  -- g_local_services = NODE_NETWORK_LIMITED | NODE_WITNESS, init.cpp:863).
+  -- prune_mode is intentionally NOT consulted here — see the doc-comment for
+  -- the correction of the old (backwards) prune-gating comment.
+  local s = bit.bor(M.SERVICES.NODE_NETWORK, M.SERVICES.NODE_WITNESS,
+                    M.SERVICES.NODE_NETWORK_LIMITED)
   if peerbloomfilters then
     s = bit.bor(s, M.SERVICES.NODE_BLOOM)
   end
-  if prune_mode then
-    s = bit.bor(s, M.SERVICES.NODE_NETWORK_LIMITED)
+  -- NODE_P2P_V2 (BIP-324): advertised when the v2 transport runs (default-on
+  -- for lunarblock).  use_v2 omitted/nil ⇒ default true; pass false to
+  -- suppress (honest — never claim v2 if it won't run).  Mirrors Core
+  -- init.cpp:987-990 (OR when -v2transport enabled, DEFAULT_V2_TRANSPORT).
+  if use_v2 ~= false then
+    s = bit.bor(s, M.SERVICES.NODE_P2P_V2)
   end
   -- BIP-157 NODE_COMPACT_FILTERS gate.  Plumbed through the gate
   -- function rather than a raw boolean so the 3 AND'd conditions
