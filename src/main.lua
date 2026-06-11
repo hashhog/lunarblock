@@ -1364,6 +1364,43 @@ local function main()
     end
   end
 
+  -- Wire the live mempool block-connect eviction into the block-connected
+  -- callback chain, mirroring Bitcoin Core's CTxMemPool::removeForBlock from
+  -- Chainstate::ConnectTip (validation.cpp:3073-3074: run after
+  -- FlushStateToDisk, before SetTip). Without this, the only callers of
+  -- Mempool:on_block_connected were the four RPC mining methods in rpc.lua
+  -- (generateblock/generatetoaddress/submitblock) — the LIVE P2P/IBD
+  -- block-connect path (ChainState:connect_block, utxo.lua:2502, which fires
+  -- this callback at utxo.lua:3533 after the atomic chainstate batch commits
+  -- and the tip advances) never evicted the now-confirmed txs, so a
+  -- syncing/at-tip node's mempool grew without bound (the camlcoin
+  -- 26,079-stuck-tx bug; camlcoin fix 72a372a). Installed unconditionally
+  -- here (not gated on a wallet) right after the fee/orphan layer, in the
+  -- lexical scope where both chain_state.callbacks and the live `mempool`
+  -- upvalue are bound. Wrapped under pcall (best-effort): a mempool-side
+  -- hiccup must never roll back an already-validated, already-connected
+  -- block (Core runs removeForBlock after the chainstate flush). The four
+  -- rpc.lua mempool:on_block_connected sites are deliberately left in place
+  -- (generate*/submitblock stay self-sufficient); with this live wiring the
+  -- submitblock-after-reorg case becomes a harmless idempotent double-evict
+  -- (Mempool:on_block_connected guards each removal with
+  -- `if self.entries[txid_hex]`, mempool.lua:1954, so a second pass no-ops).
+  local prev_cb_for_mempool = chain_state.callbacks.on_block_connected
+  chain_state.callbacks.on_block_connected = function(block_hash, block)
+    if prev_cb_for_mempool then
+      prev_cb_for_mempool(block_hash, block)
+    end
+    -- Evict the block's now-confirmed txs (+ in-mempool conflicts), clear
+    -- their prioritisation, and reset the rolling-fee decay clock.
+    local ok, err = pcall(function()
+      mempool:on_block_connected(block)
+    end)
+    if not ok then
+      io.stderr:write("mempool block-connect eviction error (non-fatal): " ..
+        tostring(err) .. "\n")
+    end
+  end
+
   -- Initialize peer manager
   local peer_manager = peerman_mod.new(network, db, {
     maxpeers = args.maxpeers,
