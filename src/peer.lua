@@ -647,7 +647,7 @@ function Peer:start_handshake()
   -- PRESENT=false).  When the future P2P fix wave lands, the gate
   -- evaluates true automatically.
   self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode,
-                                       self.compactfilters_opts)
+                                       self.compactfilters_opts, self.use_v2)
   -- Send version message
   local payload = p2p.serialize_version({
     version = p2p.PROTOCOL_VERSION,
@@ -716,7 +716,7 @@ function Peer:handle_version(payload)
     -- on whether we promised NODE_BLOOM to this specific peer.
     -- FIX-71 W121 BUG-2: third arg is the NODE_COMPACT_FILTERS gate input.
     self.our_services = p2p.our_services(self.peerbloomfilters, self.prune_mode,
-                                         self.compactfilters_opts)
+                                         self.compactfilters_opts, self.use_v2)
     local ver_payload = p2p.serialize_version({
       version = p2p.PROTOCOL_VERSION,
       services = self.our_services,
