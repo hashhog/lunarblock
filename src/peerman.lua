@@ -2690,8 +2690,9 @@ end
 --     could otherwise stamp our addrman via fake addresses and read them back).
 --   * Answer only the FIRST getaddr per connection; ignore repeats
 --     (Core m_getaddr_recvd).
---   * Cap the response at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size))
---     (Core MAX_PCT_ADDR_TO_SEND=23, MAX_ADDR_TO_SEND=1000).  This is the
+--   * Cap the response at min(MAX_ADDR_TO_SEND, floor(0.23 * addrman_size))
+--     (Core MAX_PCT_ADDR_TO_SEND=23, MAX_ADDR_TO_SEND=1000; the percentage
+--     cap is INTEGER division/floor per addrman.cpp:800).  This is the
 --     getaddr-reply cap ONLY; the getnodeaddresses RPC dump path
 --     (rpc.lua) reads known_addresses directly and stays uncapped.
 -- @param peer Peer: peer that requested addresses
@@ -2710,10 +2711,14 @@ function PeerManager:_respond_getaddr(peer)
   if peer then peer.getaddr_recvd = true end
 
   -- Compute the 23%-of-addrman cap (min with the 1000 absolute cap).
-  -- ceil(0.23 * size) so a tiny addrman still yields at least the proportional
-  -- share rather than rounding down to zero.
+  -- Core uses INTEGER division (FLOOR): GetAddr_ computes
+  --   nNodes = max_pct * nNodes / 100   (addrman.cpp:800, size_t division)
+  -- then min()s with MAX_ADDR_TO_SEND. So e.g. an addrman of 10 yields
+  -- floor(23*10/100) = 2 (NOT ceil's 3). Use math.floor to match exactly —
+  -- a previous ceil here over-sent by one whenever 23*size was not a
+  -- multiple of 100.
   local addrman_size = self:get_known_address_count()
-  local pct_cap = math.ceil(addrman_size * M.CONNMAN.MAX_PCT_ADDR_TO_SEND / 100)
+  local pct_cap = math.floor(addrman_size * M.CONNMAN.MAX_PCT_ADDR_TO_SEND / 100)
   local cap = math.min(M.CONNMAN.MAX_ADDR_TO_SEND, pct_cap)
 
   local addr_list = {}

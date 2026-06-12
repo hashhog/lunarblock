@@ -217,6 +217,14 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
   end
 
   -- Erlay (BIP330)
+  -- Master gate for ANNOUNCING txreconciliation support (sending SENDTXRCNCL).
+  -- OFF by default, matching Core's DEFAULT_TXRECONCILIATION_ENABLE = false
+  -- (net_processing.h:40) — Core only constructs its TxReconciliationTracker,
+  -- and thus only sends SENDTXRCNCL, when the DEBUG-ONLY -txreconciliation arg
+  -- is set (net_processing.cpp:2018-2023, send gated on m_txreconciliation at
+  -- :3723). Erlay support is incomplete in Core, so it never advertises by
+  -- default. Operators opt in via main.lua CLI (--txreconciliation 1).
+  self.txreconciliation_enabled = false
   self.erlay_enabled = false      -- True if Erlay was negotiated
   self.erlay_version = 0          -- Negotiated Erlay version
   self.erlay_salt = 0             -- Our Erlay salt
@@ -700,9 +708,13 @@ function Peer:handle_version(payload)
     self:send_message("sendaddrv2", p2p.serialize_sendaddrv2())
   end
 
-  -- SENDTXRCNCL (BIP330): Erlay transaction reconciliation
-  -- Only send to outbound full relay peers (not block-only connections)
-  if not self.inbound and ver.relay then
+  -- SENDTXRCNCL (BIP330): Erlay transaction reconciliation.
+  -- Gated behind txreconciliation_enabled (OFF by default = Core's
+  -- DEFAULT_TXRECONCILIATION_ENABLE false). Core never announces unless
+  -- -txreconciliation is set (net_processing.cpp:3723 send is guarded by the
+  -- presence of m_txreconciliation). Within that: only outbound full-relay
+  -- peers (not block-only / not feeler / tx relay supported per VERSION).
+  if self.txreconciliation_enabled and not self.inbound and ver.relay then
     self.erlay_salt = erlay.generate_salt()
     self:send_message("sendtxrcncl", p2p.serialize_sendtxrcncl(erlay.VERSION, self.erlay_salt))
   end
