@@ -218,7 +218,10 @@ describe("mempool DoS-vector gaps (audit w14z8m3zc)", function()
       local cs = make_chain()
       local coin = random_txid()
       add_utxo(cs, coin, 0, 100000000)
-      local mp = mempool.new(cs)
+      -- CPFP-LOGIC test: pin min_relay_fee to 1000 sat/kvB so the 20-sat parent
+      -- is below the floor independent of the (Core-correct 100 sat/kvB)
+      -- default, keeping the "parent rejected alone, package accepted" scenario.
+      local mp = mempool.new(cs, { min_relay_fee = 1000 })
 
       local parent = types.transaction(1,
         { make_input(coin, 0) }, { make_output(99999980) }, 0)  -- 20-sat fee, below floor

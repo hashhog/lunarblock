@@ -1231,8 +1231,18 @@ local function main()
   -- module-level default (Mempool.fullrbf = DEFAULT_MEMPOOL_FULL_RBF = true)
   -- applies.  getmempoolinfo.fullrbf then mirrors the actual relay policy.
   local mempool = mempool_mod.new(chain_state, {
-    max_mempool_size = 300 * 1024 * 1024,
-    min_relay_fee = 1000,
+    -- Read the POLICY CONSTANTS, never hardcoded literals, so the live
+    -- admission floor stays coupled to the values getmempoolinfo /
+    -- getnetworkinfo display (HONEST FEE POLICY):
+    --   max_mempool_size = DEFAULT_MAX_MEMPOOL_SIZE = 300*1000*1000 (metric MB,
+    --     not the binary 300*1024*1024 = 314572800 the old literal produced);
+    --   min_relay_fee    = DEFAULT_MIN_RELAY_FEE   = 100 sat/kvB (Core
+    --     policy.h:70). This is the floor accept() ENFORCES at mempool.lua:1337
+    --     (fee_rate_per_kb < self.min_relay_fee). Passing nil here would also
+    --     fall through to the same defaults; we pass them explicitly to make the
+    --     coupling obvious.
+    max_mempool_size = mempool_mod.DEFAULT_MAX_MEMPOOL_SIZE,
+    min_relay_fee = mempool_mod.DEFAULT_MIN_RELAY_FEE,
     fullrbf = args.mempool_fullrbf,  -- nil => mempool uses DEFAULT_MEMPOOL_FULL_RBF
     -- W96/DoS: run PolicyScriptChecks (STANDARD flags) at relay time so that
     -- invalid-script txs are caught on mempool admission and NOT relayed to

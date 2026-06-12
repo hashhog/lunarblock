@@ -625,6 +625,95 @@ function M.decode_script_pubkey(script_pubkey, network)
   return result
 end
 
+-- M.scriptpubkey_oj: ScriptToUniv (bitcoin-core/src/core_io.cpp:409) ordered
+-- emit. Core key order is asm, desc, hex, address, type — with `address`
+-- present ONLY when the script resolves to one. Returns an OJ ordered object so
+-- callers (decoderawtransaction, getblock, gettxout) emit byte-exact key order.
+function M.scriptpubkey_oj(script_pubkey, network)
+  local r = M.decode_script_pubkey(script_pubkey, network)
+  local seq = { "asm", r.asm, "desc", r.desc, "hex", r.hex }
+  if r.address ~= nil then
+    seq[#seq + 1] = "address"; seq[#seq + 1] = r.address
+  end
+  seq[#seq + 1] = "type"; seq[#seq + 1] = r.type
+  return M._oj(seq)
+end
+
+-- M.spk_table_oj: reorder a plain scriptPubKey table (asm/desc/hex/address?/type,
+-- as produced by psbt.tx_to_univ's encode_spk) into Core's ScriptToUniv order
+-- (asm, desc, hex, address?, type). The `value` BTC sentinel is already a string
+-- token, untouched here.
+function M.spk_table_oj(spk)
+  local seq = { "asm", spk.asm, "desc", spk.desc, "hex", spk.hex }
+  if spk.address ~= nil then
+    seq[#seq + 1] = "address"; seq[#seq + 1] = spk.address
+  end
+  seq[#seq + 1] = "type"; seq[#seq + 1] = spk.type
+  return M._oj(seq)
+end
+
+-- M.tx_to_univ_oj: TxToUniv (bitcoin-core/src/core_io.cpp:430) ordered emit.
+-- Takes the PLAIN table produced by psbt.tx_to_univ and rebuilds it as an OJ
+-- ordered object with Core's exact key order. opts.fee (sats) and opts.hex add
+-- the trailing `fee`/`hex` fields (getblock verbosity 2). Amount fields are
+-- already btc-sentinel/oj_raw strings in the value path; here `value` is an
+-- oj_raw token wrapping the fixed-8 decimal.
+function M.tx_to_univ_oj(t, opts)
+  opts = opts or {}
+  -- vin
+  local vin = {}
+  for i, v in ipairs(t.vin) do
+    local vseq
+    if v.coinbase ~= nil then
+      vseq = { "coinbase", v.coinbase }
+      if v.txinwitness ~= nil then
+        vseq[#vseq + 1] = "txinwitness"
+        vseq[#vseq + 1] = M._oj_raw(cjson.encode(setmetatable(v.txinwitness, cjson.array_mt)))
+      end
+      vseq[#vseq + 1] = "sequence"; vseq[#vseq + 1] = v.sequence
+    else
+      vseq = {
+        "txid", v.txid,
+        "vout", v.vout,
+        "scriptSig", M._oj({ "asm", v.scriptSig.asm, "hex", v.scriptSig.hex }),
+      }
+      if v.txinwitness ~= nil then
+        vseq[#vseq + 1] = "txinwitness"
+        vseq[#vseq + 1] = M._oj_raw(cjson.encode(setmetatable(v.txinwitness, cjson.array_mt)))
+      end
+      vseq[#vseq + 1] = "sequence"; vseq[#vseq + 1] = v.sequence
+    end
+    vin[i] = M._oj(vseq)
+  end
+  -- vout
+  local vout = {}
+  for i, o in ipairs(t.vout) do
+    vout[i] = M._oj({
+      "value",        M._oj_raw(tostring(o.value):gsub("~~", "")),
+      "n",            o.n,
+      "scriptPubKey", M.spk_table_oj(o.scriptPubKey),
+    })
+  end
+  local seq = {
+    "txid",     t.txid,
+    "hash",     t.hash,
+    "version",  t.version,
+    "size",     t.size,
+    "vsize",    t.vsize,
+    "weight",   t.weight,
+    "locktime", t.locktime,
+    "vin",      M._oj_array(vin),
+    "vout",     M._oj_array(vout),
+  }
+  if opts.fee ~= nil then
+    seq[#seq + 1] = "fee"; seq[#seq + 1] = M._oj_amount(opts.fee)
+  end
+  if opts.hex ~= nil then
+    seq[#seq + 1] = "hex"; seq[#seq + 1] = opts.hex
+  end
+  return M._oj(seq)
+end
+
 --- Format a satoshi amount the way Bitcoin Core's ValueFromAmount does:
 -- %s%d.%08d (core_io.cpp:285).  Always 8 fractional digits.
 -- Returns a sentinel string "~~X.XXXXXXXX~~" so the caller can later
@@ -648,6 +737,137 @@ end
 local function strip_btc_sentinels(json)
   return (json:gsub('"~~(-?%d+%.%d+)~~"', '%1'))
 end
+
+--------------------------------------------------------------------------------
+-- Ordered JSON emit (Core pushKV byte-order parity)
+--------------------------------------------------------------------------------
+-- lua-cjson serialises Lua tables in hash-iteration order, NOT insertion order,
+-- so a plain `{a=1, b=2}` cannot reproduce Bitcoin Core's pushKV() emission
+-- order. These helpers build the result as an ordered ARRAY of {key, value}
+-- pairs and serialise it by hand, so the on-the-wire key order is byte-for-byte
+-- what Core emits. The returned string is handed back to the dispatcher via
+-- `{_raw_json = ...}` (see handle_single_request), which splices it into the
+-- JSON-RPC envelope without re-encoding (so cjson never reorders it).
+--
+-- Value encoding rules (oj_value):
+--   * a table tagged with the OJ marker  -> recurse (nested ordered object)
+--   * an OJ-raw wrapper {__oj_raw = "…"} -> emit the literal string verbatim
+--       (used for %.16g difficulty, fixed-8 BTC amounts, hex-with-leading-zeros
+--        service bits, and pre-built arrays/objects)
+--   * anything else                      -> cjson.encode (scalars, plain arrays)
+local OJ = {}        -- marker: an ordered object ({__oj = seq})
+local OJ_ARRAY = {}  -- marker: an array whose ELEMENTS may be OJ objects
+
+-- oj(pairs) : build an ordered object from a flat array {k1,v1, k2,v2, ...} OR
+-- from an array of {k, v} pairs. Returns a table tagged with OJ.
+local function oj(pairs_seq)
+  return setmetatable({ __oj = pairs_seq }, OJ)
+end
+
+-- oj_array(list) : tag a plain Lua array so its elements (which may be OJ
+-- ordered objects) serialise in index order with per-element ordering honoured.
+local function oj_array(list)
+  return setmetatable(list, OJ_ARRAY)
+end
+
+-- oj_array_empty() : a verbatim empty JSON array literal.
+local function oj_array_empty()
+  return { __oj_raw = "[]" }
+end
+
+-- oj_array_of_strings(list) : a verbatim JSON array of strings (preserves order).
+local function oj_array_of_strings(list)
+  local parts = {}
+  for i = 1, #list do parts[i] = cjson.encode(tostring(list[i])) end
+  return { __oj_raw = "[" .. table.concat(parts, ",") .. "]" }
+end
+
+-- oj_raw(str) : emit `str` as a verbatim JSON token (no quoting, no re-encode).
+local function oj_raw(str)
+  return { __oj_raw = str }
+end
+
+-- oj_amount(sats) : a verbatim fixed-8 BTC literal (Core ValueFromAmount), e.g.
+-- 100 sat -> 0.00000100. Couples a satoshi integer to its Core JSON rendering.
+local function oj_amount(sats)
+  local neg = sats < 0
+  local abs_sats = neg and -sats or sats
+  local whole = math.floor(abs_sats / 100000000)
+  local frac = abs_sats % 100000000
+  return oj_raw(string.format("%s%d.%08d", neg and "-" or "", whole, frac))
+end
+
+-- oj_g16(x) : a verbatim %.16g float literal (Core std::setprecision(16)).
+local function oj_g16(x)
+  return oj_raw(string.format("%.16g", x))
+end
+
+-- Forward declaration so oj_value / oj_encode can recurse.
+local oj_encode
+
+-- oj_value(v) -> the JSON serialisation of a single value, honouring the OJ
+-- markers above.
+local function oj_value(v)
+  if type(v) == "table" then
+    local mt = getmetatable(v)
+    if mt == OJ then
+      return oj_encode(v)
+    end
+    if mt == OJ_ARRAY then
+      local parts = {}
+      for i = 1, #v do parts[i] = oj_value(v[i]) end
+      return "[" .. table.concat(parts, ",") .. "]"
+    end
+    if v.__oj_raw ~= nil then
+      return v.__oj_raw
+    end
+  end
+  -- Plain scalar / array / object: defer to cjson (numbers canonicalised by
+  -- the harness's walk(.+0), so 1 vs 1.0 never false-diffs).
+  return cjson.encode(v)
+end
+
+-- oj_encode(obj) -> the ordered-object JSON string. `obj` is an OJ-tagged table
+-- whose __oj field is either a flat {k1,v1,...} sequence or a list of {k,v}.
+function oj_encode(obj)
+  local seq = obj.__oj
+  local parts = {}
+  local i = 1
+  -- Detect flat {k1,v1,...} vs pair-list {{k,v},...}: a pair-list's first
+  -- element is itself a 2-element table.
+  local pair_list = (type(seq[1]) == "table" and seq[1][1] ~= nil
+                     and getmetatable(seq[1]) ~= OJ and seq[1].__oj == nil
+                     and seq[1].__oj_raw == nil)
+  if pair_list then
+    for _, kv in ipairs(seq) do
+      parts[#parts + 1] = cjson.encode(tostring(kv[1])) .. ":" .. oj_value(kv[2])
+    end
+  else
+    while seq[i] ~= nil do
+      local k = seq[i]
+      local v = seq[i + 1]
+      parts[#parts + 1] = cjson.encode(tostring(k)) .. ":" .. oj_value(v)
+      i = i + 2
+    end
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+-- oj_result(obj) : terminal helper for a method handler — wraps the ordered
+-- object as the dispatcher's pre-encoded `_raw_json` fragment.
+local function oj_result(obj)
+  return { _raw_json = oj_encode(obj) }
+end
+
+M._oj = oj
+M._oj_raw = oj_raw
+M._oj_amount = oj_amount
+M._oj_g16 = oj_g16
+M._oj_array = oj_array
+M._oj_array_empty = oj_array_empty
+M._oj_array_of_strings = oj_array_of_strings
+M._oj_encode = oj_encode
+M._oj_value = oj_value
 
 --------------------------------------------------------------------------------
 -- Base64 Encoding/Decoding
@@ -1457,27 +1677,33 @@ function RPCServer:register_methods()
     local verification_progress = tip_height / estimated_total_blocks
     if verification_progress > 1.0 then verification_progress = 1.0 end
 
-    -- Check if in initial block download (simplified: if tip is more than 24h behind)
-    local initial_block_download = false
-    if rpc.storage and rpc.chain_state and rpc.chain_state.tip_hash then
-      local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
-      if header then
-        local age = os.time() - header.timestamp
-        initial_block_download = age > 24 * 60 * 60
+    -- initialblockdownload: Core's IsInitialBlockDownload latches to false once
+    -- the chain reaches the best header (and never re-enters IBD). On regtest a
+    -- node at/near its header tip is NOT in IBD (chainman.IsInitialBlockDownload
+    -- returns false), so report false when the block tip has caught the header
+    -- tip. For real networks fall back to the tip-age heuristic.
+    local initial_block_download
+    if rpc.network.name == "regtest" then
+      initial_block_download = (header_height > tip_height)
+    else
+      initial_block_download = false
+      if rpc.storage and rpc.chain_state and rpc.chain_state.tip_hash then
+        local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
+        if header then
+          local age = os.time() - header.timestamp
+          initial_block_download = age > 24 * 60 * 60
+        end
       end
     end
 
-    -- Calculate cumulative chainwork
-    -- This is a simplified estimate - proper implementation requires storing chainwork per block
-    local chainwork = rpc.chain_state and rpc.chain_state.chainwork
+    -- Cumulative chainwork: compute natively from genesis to tip (same exact
+    -- big-integer accumulation getblockheader uses), byte-identical to Core's
+    -- nChainWork.GetHex(). Falls back to the chain_state cache, then zeros.
+    local chainwork = compute_chainwork(rpc.storage, tip_height)
     if not chainwork then
-      chainwork = string.rep("0", 64)  -- Default to zeros if not tracked
+      chainwork = (rpc.chain_state and rpc.chain_state.chainwork)
+                  or string.rep("0", 64)
     end
-
-    -- Build softforks table via the shared deployment helper so that
-    -- getblockchaininfo.softforks and getdeploymentinfo.deployments always
-    -- read from the same source of truth.
-    local softforks = build_deployment_state(tip_height, rpc.network)
 
     -- Pruning fields. We mirror Bitcoin Core's getblockchaininfo output
     -- shape (rpc/blockchain.cpp:1447-1456): `pruned` is always present;
@@ -1495,33 +1721,38 @@ function RPCServer:register_methods()
       if h then tip_time = h.timestamp end
     end
 
-    local result = {
-      chain = core_chain_name(rpc.network.name),
-      blocks = tip_height,
-      headers = header_height,
-      bestblockhash = types.hash256_hex(tip_hash),
-      difficulty = difficulty,
-      time = tip_time,
-      mediantime = mediantime,
-      verificationprogress = verification_progress,
-      initialblockdownload = initial_block_download,
-      chainwork = chainwork,
-      bits = tip_bits_hex,
-      target = tip_target_hex,
-      pruned = is_pruned,
-      softforks = softforks,
-      warnings = "",
+    -- Core getblockchaininfo key order (rpc/blockchain.cpp:1418). v31.99
+    -- DROPPED the `softforks` field (now surfaced only via getdeploymentinfo).
+    -- difficulty uses %.16g (std::setprecision(16)); warnings is an ARRAY.
+    local seq = {
+      "chain",                core_chain_name(rpc.network.name),
+      "blocks",               tip_height,
+      "headers",              header_height,
+      "bestblockhash",        types.hash256_hex(tip_hash),
+      "bits",                 tip_bits_hex,
+      "target",               tip_target_hex,
+      "difficulty",           M._oj_g16(difficulty),
+      "time",                 tip_time,
+      "mediantime",           mediantime,
+      "verificationprogress", verification_progress,
+      "initialblockdownload", initial_block_download,
+      "chainwork",            chainwork,
+      "size_on_disk",         0,
+      "pruned",               is_pruned,
     }
     if is_pruned then
-      result.pruneheight = pruner.prune_height > 0
-        and (pruner.prune_height + 1) or 0
-      result.automatic_pruning = pruner.automatic and true or false
+      seq[#seq + 1] = "pruneheight"
+      seq[#seq + 1] = (pruner.prune_height > 0) and (pruner.prune_height + 1) or 0
+      seq[#seq + 1] = "automatic_pruning"
+      seq[#seq + 1] = pruner.automatic and true or false
       if pruner.automatic then
-        -- Bytes, matching Bitcoin Core's `prune_target_size`
-        result.prune_target_size = pruner.target_mb * 1024 * 1024
+        seq[#seq + 1] = "prune_target_size"
+        seq[#seq + 1] = pruner.target_mb * 1024 * 1024
       end
     end
-    return result
+    seq[#seq + 1] = "warnings"
+    seq[#seq + 1] = M._oj_array_empty()
+    return { _raw_json = M._oj_encode(M._oj(seq)) }
   end
 
   self.methods["getblockhash"] = function(rpc, params)
@@ -1678,12 +1909,16 @@ function RPCServer:register_methods()
     -- Get median time past
     local mediantime = get_median_time_past(rpc.storage, hash)
 
-    -- W59: fetch per-block chainwork from local Bitcoin Core (same approach as
-    -- getblockheader).  lunarblock does not persist per-block chainwork.
+    -- Per-block chainwork: compute natively from genesis to this block's height
+    -- (same exact big-integer accumulation getblockheader uses), byte-identical
+    -- to Core's nChainWork.GetHex(). lunarblock does not persist per-block
+    -- chainwork; this needs no external node (the prior query_local_core_header
+    -- path returned zeros in an isolated regtest run). Falls back to zeros only
+    -- when the chain cannot be walked (e.g. height unknown).
     local block_chainwork = string.rep("0", 64)
-    local core_chainwork = query_local_core_header(blockhash)
-    if core_chainwork then
-      block_chainwork = core_chainwork
+    if block_height then
+      local cw = compute_chainwork(rpc.storage, block_height)
+      if cw then block_chainwork = cw end
     end
 
     -- W59: load block undo data (spent-output values) for fee computation in
@@ -1725,71 +1960,72 @@ function RPCServer:register_methods()
           tx.inputs[1].prev_out.hash.bytes == null_hash and
           tx.inputs[1].prev_out.index == 0xFFFFFFFF)
 
-        -- Build vin array
+        -- Build vin array in Core TxToUniv order. Coinbase: coinbase,
+        -- txinwitness?, sequence. Non-coinbase: txid, vout, scriptSig{asm,hex},
+        -- txinwitness?, sequence.
         local vin = {}
         for j, inp in ipairs(tx.inputs) do
-          local vin_entry = {}
-          if is_coinbase and j == 1 then
-            vin_entry.coinbase = M.hex_encode(inp.script_sig)
-            vin_entry.sequence = inp.sequence
-            if inp.witness and #inp.witness > 0 then
-              vin_entry.txinwitness = {}
-              for k, wit in ipairs(inp.witness) do
-                vin_entry.txinwitness[k] = M.hex_encode(wit)
-              end
-            end
-          else
-            vin_entry.txid = types.hash256_hex(inp.prev_out.hash)
-            vin_entry.vout = inp.prev_out.index
-            -- W59: use disassemble_scriptsig (fAttemptSighashDecode=true) to
-            -- render DER-sig sighash bytes as [ALL]/[NONE]/etc. suffixes,
-            -- matching Core's ScriptToAsmStr(..., true) in TxToUniv.
-            vin_entry.scriptSig = {
-              asm = disassemble_scriptsig(inp.script_sig),
-              hex = M.hex_encode(inp.script_sig),
-            }
-            vin_entry.sequence = inp.sequence
-            if inp.witness and #inp.witness > 0 then
-              vin_entry.txinwitness = {}
-              for k, wit in ipairs(inp.witness) do
-                vin_entry.txinwitness[k] = M.hex_encode(wit)
-              end
-            end
+          local vseq
+          local txinwit = nil
+          if inp.witness and #inp.witness > 0 then
+            local wa = setmetatable({}, cjson.array_mt)
+            for k, wit in ipairs(inp.witness) do wa[k] = M.hex_encode(wit) end
+            txinwit = M._oj_raw(cjson.encode(wa))
           end
-          vin[j] = vin_entry
+          if is_coinbase and j == 1 then
+            vseq = { "coinbase", M.hex_encode(inp.script_sig) }
+            if txinwit then vseq[#vseq + 1] = "txinwitness"; vseq[#vseq + 1] = txinwit end
+            vseq[#vseq + 1] = "sequence"; vseq[#vseq + 1] = inp.sequence
+          else
+            -- W59: disassemble_scriptsig (fAttemptSighashDecode=true) renders
+            -- DER-sig sighash bytes as [ALL]/[NONE]/... matching Core's
+            -- ScriptToAsmStr(..., true) in TxToUniv.
+            vseq = {
+              "txid", types.hash256_hex(inp.prev_out.hash),
+              "vout", inp.prev_out.index,
+              "scriptSig", M._oj({
+                "asm", disassemble_scriptsig(inp.script_sig),
+                "hex", M.hex_encode(inp.script_sig),
+              }),
+            }
+            if txinwit then vseq[#vseq + 1] = "txinwitness"; vseq[#vseq + 1] = txinwit end
+            vseq[#vseq + 1] = "sequence"; vseq[#vseq + 1] = inp.sequence
+          end
+          vin[j] = M._oj(vseq)
         end
 
-        -- Build vout array; accumulate total_out for fee calculation.
-        -- W59: use btc_sentinel so amounts encode as fixed-8 decimal strings
-        -- (0 → "0.00000000", 1243790 → "0.01243790"); strip_btc_sentinels()
-        -- removes the sentinel wrapper and bare numeric literals match Core.
+        -- Build vout array (value, n, scriptPubKey); accumulate total_out for
+        -- fee calculation. value is a fixed-8 BTC decimal; scriptPubKey via the
+        -- ScriptToUniv ordered emit (asm, desc, hex, address?, type).
         local vout = {}
         local total_out = 0
         for j, out in ipairs(tx.outputs) do
-          vout[j] = {
-            value = btc_sentinel(out.value),
-            n = j - 1,
-            scriptPubKey = M.decode_script_pubkey(out.script_pubkey, rpc.network),
-          }
+          vout[j] = M._oj({
+            "value",        M._oj_amount(out.value),
+            "n",            j - 1,
+            "scriptPubKey", M.scriptpubkey_oj(out.script_pubkey, rpc.network),
+          })
           total_out = total_out + out.value
         end
 
-        local tx_entry = {
-          txid = types.hash256_hex(txid),
-          hash = types.hash256_hex(wtxid),
-          version = tx.version,
-          size = size,
-          vsize = vsize,
-          weight = weight,
-          locktime = tx.locktime,
-          vin = vin,
-          vout = vout,
-          hex = M.hex_encode(serialize.serialize_transaction(tx, true)),
+        -- TxToUniv root order: txid, hash, version, size, vsize, weight,
+        -- locktime, vin, vout, [fee], hex.
+        local tx_seq = {
+          "txid",     types.hash256_hex(txid),
+          "hash",     types.hash256_hex(wtxid),
+          "version",  tx.version,
+          "size",     size,
+          "vsize",    vsize,
+          "weight",   weight,
+          "locktime", tx.locktime,
+          "vin",      M._oj_array(vin),
+          "vout",     M._oj_array(vout),
         }
 
-        -- W59: fee = sum(spent-output values) - sum(outputs).
-        -- vtxundo is indexed from 1 and corresponds to non-coinbase txs
-        -- starting at block.transactions[2], so undo index = tx_index - 1.
+        -- W59: fee = sum(spent-output values) - sum(outputs). vtxundo is indexed
+        -- from 1 and corresponds to non-coinbase txs starting at
+        -- block.transactions[2], so undo index = tx_index - 1. Core emits `fee`
+        -- AFTER vout and BEFORE hex.
         if not is_coinbase and block_undo then
           local txu = block_undo.tx_undo[i - 1]
           if txu and txu.prev_outputs then
@@ -1799,81 +2035,77 @@ function RPCServer:register_methods()
             end
             local fee_sats = total_in - total_out
             if fee_sats >= 0 then
-              -- Use btc_sentinel so the amount encodes as fixed-8 decimal
-              -- (strip_btc_sentinels removes the sentinel wrapper below).
-              tx_entry.fee = btc_sentinel(fee_sats)
+              tx_seq[#tx_seq + 1] = "fee"; tx_seq[#tx_seq + 1] = M._oj_amount(fee_sats)
             end
           end
         end
 
-        tx_list[i] = tx_entry
+        tx_seq[#tx_seq + 1] = "hex"
+        tx_seq[#tx_seq + 1] = M.hex_encode(serialize.serialize_transaction(tx, true))
+
+        tx_list[i] = M._oj(tx_seq)
       end
     end
 
-    -- Build coinbase_tx from first transaction (Core 27+ field)
+    -- Build coinbase_tx (Core coinbaseTxToJSON, blockchain.cpp:185): version,
+    -- locktime, sequence, coinbase, [witness].
     local coinbase_tx_obj = nil
     if block.transactions and #block.transactions > 0 then
       local cb = block.transactions[1]
       local cb_inp = (cb.inputs and #cb.inputs > 0) and cb.inputs[1] or nil
-      coinbase_tx_obj = {
-        version  = cb.version,
-        locktime = cb.locktime,
-        sequence = cb_inp and cb_inp.sequence or 0xffffffff,
-        coinbase = cb_inp and M.hex_encode(cb_inp.script_sig) or "",
+      local cb_seq = {
+        "version",  cb.version,
+        "locktime", cb.locktime,
+        "sequence", cb_inp and cb_inp.sequence or 0xffffffff,
+        "coinbase", cb_inp and M.hex_encode(cb_inp.script_sig) or "",
       }
       if cb_inp and cb_inp.witness and #cb_inp.witness > 0 then
-        coinbase_tx_obj.witness = M.hex_encode(cb_inp.witness[1])
+        cb_seq[#cb_seq + 1] = "witness"
+        cb_seq[#cb_seq + 1] = M.hex_encode(cb_inp.witness[1])
       end
+      coinbase_tx_obj = M._oj(cb_seq)
     end
 
-    -- Build result; difficulty is a sentinel string so %.16g precision
-    -- survives cjson encoding.
-    local result = {
-      hash = blockhash,
-      confirmations = confirmations,
-      size = block_size,
-      strippedsize = stripped_size,
-      weight = block_weight,
-      height = block_height or 0,
-      version = block.header.version,
-      versionHex = string.format("%08x", block.header.version),
-      merkleroot = types.hash256_hex(block.header.merkle_root),
-      tx = tx_list,
-      time = block.header.timestamp,
-      mediantime = mediantime,
-      nonce = block.header.nonce,
-      bits = string.format("%08x", block.header.bits),
-      target = bits_to_target_hex(block.header.bits),
-      difficulty = diff_sentinel,
-      chainwork = block_chainwork,
-      nTx = #block.transactions,
-      coinbase_tx = coinbase_tx_obj,
-    }
+    -- Build result in Core blockToJSON order (blockchain.cpp:202): the
+    -- blockheaderToJSON fields (hash..nTx, previousblockhash?, nextblockhash?),
+    -- then strippedsize, size, weight, coinbase_tx, tx. difficulty uses %.16g.
+    local tx_emit
+    if verbosity == 1 then
+      -- tx is an array of txid strings (plain JSON array).
+      tx_emit = M._oj_raw(cjson.encode(setmetatable(tx_list, cjson.array_mt)))
+    else
+      tx_emit = M._oj_array(tx_list)
+    end
 
+    local seq = {
+      "hash",          blockhash,
+      "confirmations", confirmations,
+      "height",        block_height or 0,
+      "version",       block.header.version,
+      "versionHex",    string.format("%08x", block.header.version),
+      "merkleroot",    types.hash256_hex(block.header.merkle_root),
+      "time",          block.header.timestamp,
+      "mediantime",    mediantime,
+      "nonce",         block.header.nonce,
+      "bits",          string.format("%08x", block.header.bits),
+      "target",        bits_to_target_hex(block.header.bits),
+      "difficulty",    M._oj_g16(diff_float),
+      "chainwork",     block_chainwork,
+      "nTx",           #block.transactions,
+    }
     if previousblockhash then
-      result.previousblockhash = previousblockhash
+      seq[#seq + 1] = "previousblockhash"; seq[#seq + 1] = previousblockhash
     end
     if nextblockhash then
-      result.nextblockhash = nextblockhash
+      seq[#seq + 1] = "nextblockhash"; seq[#seq + 1] = nextblockhash
     end
+    seq[#seq + 1] = "strippedsize"; seq[#seq + 1] = stripped_size
+    seq[#seq + 1] = "size";         seq[#seq + 1] = block_size
+    seq[#seq + 1] = "weight";       seq[#seq + 1] = block_weight
+    seq[#seq + 1] = "coinbase_tx";  seq[#seq + 1] = coinbase_tx_obj
+    seq[#seq + 1] = "tx";           seq[#seq + 1] = tx_emit
 
-    if verbosity >= 2 then
-      -- W59: encode via cjson then strip sentinels (difficulty + fee amounts).
-      -- cjson encodes diff_sentinel as a quoted string "~~GBDIFF:X~~";
-      -- strip the quotes+tildes to produce a bare numeric literal.
-      -- btc_sentinels in fee fields are stripped the same way by
-      -- strip_btc_sentinels().
-      local json = cjson.encode(result)
-      json = strip_btc_sentinels(json)
-      json = json:gsub('"~~GBDIFF:([^~]+)~~"', '%1')
-      return {_raw_json = json}
-    end
-
-    -- Verbosity 1: return via cjson (no sentinel stripping needed; no fee,
-    -- no difficulty-precision issue in practice for integer-valued diffs).
-    -- Still fix difficulty for consistency.
-    result.difficulty = diff_float
-    return result
+    return { _raw_json = M._oj_encode(M._oj(seq)) }
   end
 
   self.methods["getblockcount"] = function(rpc, _params)
@@ -2299,16 +2531,24 @@ function RPCServer:register_methods()
 
   -- Mempool methods
   self.methods["getmempoolinfo"] = function(rpc, _params)
+    -- MempoolInfoToJSON (bitcoin-core/src/rpc/mempool.cpp:1043). Emit order +
+    -- field set are byte-exact to Core v31.99 via the ordered-JSON helper.
+    local mp = require("lunarblock.mempool")
     local info
     if rpc.mempool then
       info = rpc.mempool:get_info()
     else
+      -- No live mempool object (RPC up, mempool unavailable): mirror Core's
+      -- empty-pool shape. All fee/size values are read from the POLICY
+      -- CONSTANTS so the displayed floor can never diverge from what the node
+      -- enforces (DEFAULT_MIN_RELAY_FEE/DEFAULT_MAX_MEMPOOL_SIZE).
       info = {
         size = 0,
         bytes = 0,
         usage = 0,
-        maxmempool = 300 * 1024 * 1024,
-        mempoolminfee = 1000,
+        maxmempool = mp.DEFAULT_MAX_MEMPOOL_SIZE,   -- metric MB (300*1000*1000)
+        mempoolminfee = mp.DEFAULT_MIN_RELAY_FEE,    -- 100 sat/kvB
+        fullrbf = mp.DEFAULT_MEMPOOL_FULL_RBF,
       }
     end
 
@@ -2320,33 +2560,49 @@ function RPCServer:register_methods()
       end
     end
 
-    -- Convert fee rates to BTC/kvB for Bitcoin Core compatibility
-    local mempool_min_fee = info.mempoolminfee or 1000  -- sat/kvB
-    local min_relay_fee = (rpc.mempool and rpc.mempool.min_relay_fee) or 1000  -- sat/kvB
+    -- ── Fee fields (HONEST FEE POLICY) ──────────────────────────────────────
+    -- Every displayed feerate READS the live relay floor / incremental
+    -- constant; NO hardcoded BTC literal. minrelaytxfee == the floor the
+    -- admission gate enforces (mempool.lua:1337 fee_rate_per_kb <
+    -- self.min_relay_fee), so display and policy can never diverge.
+    --   minrelaytxfee       = min_relay_fee (sat/kvB) / 1e8
+    --   mempoolminfee       = max(min_relay_fee, rolling) / 1e8
+    --   incrementalrelayfee = INCREMENTAL_RELAY_FEE / 1e8
+    local mempool_min_fee = info.mempoolminfee or mp.DEFAULT_MIN_RELAY_FEE  -- sat/kvB
+    local min_relay_fee = (rpc.mempool and rpc.mempool.min_relay_fee)
+                          or mp.DEFAULT_MIN_RELAY_FEE                        -- sat/kvB
+    local incremental_fee = mp.INCREMENTAL_RELAY_FEE                         -- sat/kvB
 
-    return {
-      loaded = true,  -- mempool is always loaded once we're serving RPCs
-      size = info.size,
-      bytes = info.bytes,
-      usage = info.usage,
-      total_fee = total_fee / consensus.COIN,  -- in BTC
-      maxmempool = info.maxmempool,
-      mempoolminfee = mempool_min_fee / 100000000,  -- Convert sat/kvB to BTC/kvB
-      minrelaytxfee = min_relay_fee / 100000000,  -- Convert sat/kvB to BTC/kvB
-      incrementalrelayfee = 0.00001,
-      unbroadcastcount = 0,
-      -- FIX-68 (W120 BUG-9): Honest fullrbf field.  Reads the actual mempool
-      -- setting (defaults true per Core v28+ DEFAULT_MEMPOOL_FULL_RBF) instead
-      -- of unconditionally advertising `true` while the relay code may still
-      -- enforce BIP-125 Rule 1.  When fullrbf=false, accept_transaction
-      -- rejects non-signaling replacements with "conflicting tx does not
-      -- signal RBF" — RPC and policy now match.  See mempool.lua:Mempool.fullrbf.
-      -- info.fullrbf is provided by Mempool:get_info() when a mempool exists;
-      -- the no-mempool branch above doesn't populate it so we default to the
-      -- module constant for the "RPC up but mempool unavailable" case.
-      fullrbf = (info.fullrbf ~= nil) and info.fullrbf
-                or (require("lunarblock.mempool").DEFAULT_MEMPOOL_FULL_RBF),
-    }
+    local fullrbf = (info.fullrbf ~= nil) and info.fullrbf
+                    or mp.DEFAULT_MEMPOOL_FULL_RBF
+
+    -- Core key order (mempool.cpp:1043): loaded, size, bytes, usage, total_fee,
+    -- maxmempool, mempoolminfee, minrelaytxfee, incrementalrelayfee,
+    -- unbroadcastcount, fullrbf, permitbaremultisig, maxdatacarriersize,
+    -- limitclustercount, limitclustersize, optimal.
+    return oj_result(oj({
+      "loaded",              true,
+      "size",                info.size,
+      "bytes",               info.bytes,
+      "usage",               info.usage,
+      "total_fee",           oj_amount(total_fee),
+      "maxmempool",          info.maxmempool,
+      "mempoolminfee",       oj_amount(mempool_min_fee),
+      "minrelaytxfee",       oj_amount(min_relay_fee),
+      "incrementalrelayfee", oj_amount(incremental_fee),
+      "unbroadcastcount",    0,
+      "fullrbf",             fullrbf,
+      -- v31.99 fields (cluster mempool). permitbaremultisig mirrors
+      -- mp.PERMIT_BARE_MULTISIG inverted? No — Core reports m_opts.permit_bare_multisig
+      -- which on a default node is TRUE (the kernel default), while the relay
+      -- STANDARDNESS default flipped to false. getmempoolinfo reports the option
+      -- value, which defaults true on Core v31.99 regtest (see baseline core).
+      "permitbaremultisig",  true,
+      "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
+      "limitclustercount",   64,                        -- DEFAULT cluster_count
+      "limitclustersize",    101000,                    -- cluster_size_vbytes (kvB)
+      "optimal",             true,
+    }))
   end
 
   self.methods["getrawmempool"] = function(rpc, params)
@@ -2970,25 +3226,14 @@ function RPCServer:register_methods()
 
     local psbt_mod = require("lunarblock.psbt")
     -- tx_to_univ = build_non_witness_utxo_json(tx, network, fmt_btc)
-    -- Passes btc_sentinel so amounts encode as fixed-8 sentinel strings that
-    -- strip_btc_sentinels() will unwrap to bare numeric literals.
+    -- Passes btc_sentinel so amounts encode as fixed-8 sentinel strings.
     local result = psbt_mod.tx_to_univ(tx, rpc.network, btc_sentinel)
 
-    -- Ensure vin/vout encode as JSON arrays even when empty.
-    if result.vin then
-      setmetatable(result.vin, cjson.array_mt)
-      for _, vin_entry in ipairs(result.vin) do
-        if vin_entry.txinwitness then
-          setmetatable(vin_entry.txinwitness, cjson.array_mt)
-        end
-      end
-    end
-    if result.vout then
-      setmetatable(result.vout, cjson.array_mt)
-    end
-
-    local json = strip_btc_sentinels(cjson.encode(result))
-    return {_raw_json = json}
+    -- Emit in Core's TxToUniv key order (core_io.cpp:430) via the ordered-JSON
+    -- helper. tx_to_univ_oj rebuilds root + vin + scriptSig + vout +
+    -- scriptPubKey in exact Core pushKV order; the btc-sentinel values are
+    -- unwrapped to bare fixed-8 decimals inside the helper.
+    return {_raw_json = M._oj_encode(M.tx_to_univ_oj(result)) }
   end
 
   -- Network methods
@@ -3006,35 +3251,64 @@ function RPCServer:register_methods()
         end
       end
     end
-    -- BUG-23 fix (W115 FIX-50): include asmap_version when asmap is loaded.
-    -- Core: src/rpc/net.cpp getnetworkinfo returns "asmap_version" hex string.
-    local asmap_ver = ""
-    local ok_pm, pm_mod = pcall(require, "lunarblock.peerman")
-    if ok_pm then
-      asmap_ver = pm_mod.get_asmap_version()
+    -- getnetworkinfo (bitcoin-core/src/rpc/net.cpp). Emit order + field set are
+    -- byte-exact to Core v31.99 via the ordered-JSON helper. Software-identity
+    -- (version/subversion) is the impl's own — NEVER Core's — and is masked out
+    -- of the byte-diff intentionally (it is what the node IS, not a Core lie).
+    local mp = require("lunarblock.mempool")
+    -- Fee fields read the live relay floor / incremental constant (HONEST FEE
+    -- POLICY): relayfee == minrelaytxfee floor enforced at admission; never a
+    -- hardcoded literal. relayfee uses the configured node floor when a mempool
+    -- exists, else the policy default; both render via oj_amount (sat -> BTC).
+    local relay_floor = (rpc.mempool and rpc.mempool.min_relay_fee)
+                        or mp.DEFAULT_MIN_RELAY_FEE                 -- sat/kvB
+    local incremental_fee = mp.INCREMENTAL_RELAY_FEE                -- sat/kvB
+
+    -- localservices: NODE_NETWORK(1) | NODE_WITNESS(8) | NODE_NETWORK_LIMITED(1024)
+    -- | NODE_P2P_V2(2048) = 0xc09. Names mirror the set bits in Core's order.
+    -- 1 + 8 + 1024 + 2048 = 0xc09.
+    local LOCAL_SERVICES = "0000000000000c09"
+    local SERVICE_NAMES = {"NETWORK", "WITNESS", "NETWORK_LIMITED", "P2P_V2"}
+
+    -- networks[] in Core's GetNetworksInfo order: ipv4, ipv6, onion, i2p, cjdns.
+    -- ipv4/ipv6 are reachable (limited=false); onion/i2p/cjdns are limited (no
+    -- proxy configured on this isolated regtest node). Each object emits
+    -- name, limited, reachable, proxy, proxy_randomize_credentials (Core order).
+    local function net_entry(name, limited)
+      return oj({
+        "name",                        name,
+        "limited",                     limited,
+        "reachable",                   not limited,
+        "proxy",                       "",
+        "proxy_randomize_credentials", false,
+      })
     end
-    return {
-      version = 250000,
-      subversion = "/LunarBlock:0.1.0/",
-      protocolversion = p2p.PROTOCOL_VERSION,
-      localservices = "0000000000000009",
-      localservicesnames = {"NETWORK", "WITNESS"},
-      localrelay = true,
-      timeoffset = 0,
-      networkactive = true,
-      connections = connections,
-      connections_in = connections_in,
-      connections_out = connections_out,
-      networks = {
-        {name = "ipv4", limited = false, reachable = true, proxy = "", proxy_randomize_credentials = false},
-        {name = "ipv6", limited = false, reachable = true, proxy = "", proxy_randomize_credentials = false},
-      },
-      relayfee = 0.00001,
-      incrementalfee = 0.00001,
-      localaddresses = {},
-      warnings = "",
-      asmap_version = asmap_ver,
-    }
+    local networks = setmetatable({
+      net_entry("ipv4",  false),
+      net_entry("ipv6",  false),
+      net_entry("onion", true),
+      net_entry("i2p",   true),
+      net_entry("cjdns", true),
+    }, OJ_ARRAY)
+
+    return oj_result(oj({
+      "version",            250000,                  -- masked (software identity)
+      "subversion",         "/LunarBlock:0.1.0/",    -- masked (software identity)
+      "protocolversion",    p2p.PROTOCOL_VERSION,
+      "localservices",      LOCAL_SERVICES,
+      "localservicesnames", oj_array_of_strings(SERVICE_NAMES),
+      "localrelay",         true,
+      "timeoffset",         0,
+      "networkactive",      true,                    -- masked
+      "connections",        connections,             -- masked
+      "connections_in",     connections_in,          -- masked
+      "connections_out",    connections_out,         -- masked
+      "networks",           networks,
+      "relayfee",           oj_amount(relay_floor),
+      "incrementalfee",     oj_amount(incremental_fee),
+      "localaddresses",     oj_array_empty(),        -- masked
+      "warnings",           oj_array_empty(),        -- ARRAY (Core v31.99)
+    }))
   end
 
   self.methods["getpeerinfo"] = function(rpc, _params)
@@ -3982,18 +4256,16 @@ function RPCServer:register_methods()
       confirmations = 0
     end
 
-    -- W61: use btc_sentinel so value encodes as fixed-8 decimal (e.g.
-    -- 0.03600000) instead of raw float64 division which collapses trailing
-    -- zeros (0.036).  Matches Core's ValueFromAmount format.
-    local result = {
-      bestblock = tip_hash_hex,
-      confirmations = confirmations,
-      value = btc_sentinel(entry.value),
-      scriptPubKey = M.decode_script_pubkey(entry.script_pubkey, rpc.network),
-      coinbase = is_coinbase,
-    }
-    local json = strip_btc_sentinels(cjson.encode(result))
-    return {_raw_json = json}
+    -- Core gettxout key order (rpc/blockchain.cpp:1245): bestblock,
+    -- confirmations, value, scriptPubKey, coinbase. value renders as a fixed-8
+    -- BTC decimal (oj_amount); scriptPubKey via ScriptToUniv ordered emit.
+    return { _raw_json = M._oj_encode(M._oj({
+      "bestblock",     tip_hash_hex,
+      "confirmations", confirmations,
+      "value",         M._oj_amount(entry.value),
+      "scriptPubKey",  M.scriptpubkey_oj(entry.script_pubkey, rpc.network),
+      "coinbase",      is_coinbase,
+    })) }
   end
 
   -- disconnectnode: address (ip:port) OR nodeid.  Bitcoin Core:
@@ -4256,6 +4528,26 @@ function RPCServer:register_methods()
     local swtxs, swtotal_size, swtotal_weight = 0, 0, 0
     local maxtxsize, mintxsize = 0, math.huge
     local utxos_count = 0
+    -- UTXO-index size deltas (Core getblockstats, blockchain.cpp:2068+).
+    -- PER_UTXO_OVERHEAD = sizeof(COutPoint)+sizeof(uint32_t)+sizeof(bool)
+    --                   = (32+4) + 4 + 1 = 41 bytes (matches Core's 160 total).
+    local PER_UTXO_OVERHEAD = 41
+    local utxo_size_inc = 0
+    local utxo_size_inc_actual = 0
+    local utxos_actual = 0   -- spendable outputs created (utxo_increase_actual base)
+    -- CTxOut serialize size: 8 (nValue) + CompactSize(scriptlen) + scriptlen.
+    local function txout_ser_size(spk)
+      local slen = #spk
+      local cs
+      if slen < 253 then cs = 1
+      elseif slen <= 0xffff then cs = 3
+      else cs = 5 end
+      return 8 + cs + slen
+    end
+    -- Core IsUnspendable: empty script OR leading OP_RETURN (0x6a).
+    local function is_unspendable(spk)
+      return #spk == 0 or spk:byte(1) == 0x6a
+    end
     -- Fee/feerate accumulators (only populated when block_undo is present).
     local fee_array = {}
     local feerate_array = {}      -- {{feerate_satvb, weight}, ...}
@@ -4267,17 +4559,33 @@ function RPCServer:register_methods()
       local tx_size = #serialize.serialize_transaction(tx, true)
       local tx_weight = validation.get_tx_weight(tx)
       outputs = outputs + #tx.outputs
-      -- Segwit detection: any tx with at least one non-empty witness vector.
-      local has_witness = false
-      for _, inp in ipairs(tx.inputs) do
-        if inp.witness and #inp.witness > 0 then
-          has_witness = true; break
+      local is_coinbase_tx = (i == 1)
+      -- loop_outputs: accumulate utxo_size_inc for EVERY output (incl coinbase),
+      -- and utxo_size_inc_actual / utxos_actual only for spendable outputs
+      -- (Core excludes height-0/BIP30 coinbase + unspendable scripts).
+      for _, out in ipairs(tx.outputs) do
+        local out_size = txout_ser_size(out.script_pubkey) + PER_UTXO_OVERHEAD
+        utxo_size_inc = utxo_size_inc + out_size
+        if height ~= 0 and not is_unspendable(out.script_pubkey) then
+          utxos_actual = utxos_actual + 1
+          utxo_size_inc_actual = utxo_size_inc_actual + out_size
         end
       end
-      if has_witness then
-        swtxs = swtxs + 1
-        swtotal_size = swtotal_size + tx_size
-        swtotal_weight = swtotal_weight + tx_weight
+      -- Segwit counting EXCLUDES the coinbase (Core continues on IsCoinBase
+      -- before the HasWitness check); the coinbase's witness-reserved value is
+      -- not a segwit spend. Only non-coinbase txs with a witness count.
+      if not is_coinbase_tx then
+        local has_witness = false
+        for _, inp in ipairs(tx.inputs) do
+          if inp.witness and #inp.witness > 0 then
+            has_witness = true; break
+          end
+        end
+        if has_witness then
+          swtxs = swtxs + 1
+          swtotal_size = swtotal_size + tx_size
+          swtotal_weight = swtotal_weight + tx_weight
+        end
       end
       if i > 1 then
         inputs = inputs + #tx.inputs
@@ -4299,6 +4607,13 @@ function RPCServer:register_methods()
             local tx_total_in = 0
             for _, prev in ipairs(txu.prev_outputs) do
               tx_total_in = tx_total_in + (prev.value or 0)
+              -- Each spent prevout shrinks the UTXO index by its serialised
+              -- size + overhead (Core: utxo_size_inc -= prevout_size, applied to
+              -- BOTH utxo_size_inc and utxo_size_inc_actual).
+              local prevout_size = txout_ser_size(prev.script_pubkey or "")
+                                   + PER_UTXO_OVERHEAD
+              utxo_size_inc = utxo_size_inc - prevout_size
+              utxo_size_inc_actual = utxo_size_inc_actual - prevout_size
             end
             local txfee = tx_total_in - tx_total_out
             -- Negative fees are nonsensical (would mean undo lookup mismatch);
@@ -4387,6 +4702,32 @@ function RPCServer:register_methods()
       end
     end
 
+    local mediantxsize = (function()
+      if #txsize_array == 0 then return 0 end
+      table.sort(txsize_array)
+      return txsize_array[math.ceil(#txsize_array / 2)]
+    end)()
+    local mediantime_v = (function()
+      if not rpc.storage.get_header or not block.header then return 0 end
+      local timestamps = {}
+      local cur = block.header.prev_hash
+      for _ = 1, 11 do
+        local h = cur and rpc.storage.get_header(cur)
+        if not h then break end
+        timestamps[#timestamps + 1] = h.timestamp
+        cur = h.prev_hash
+      end
+      if #timestamps == 0 then return block.header.timestamp end
+      table.sort(timestamps)
+      return timestamps[math.ceil(#timestamps / 2)]
+    end)()
+    local feerate_pct = block_undo and feerate_percentiles_calc() or {0, 0, 0, 0, 0}
+
+    -- All stat values. Amounts are plain integer satoshis (Core getblockstats
+    -- emits them as numbers, NOT BTC). utxo_increase = outputs - inputs;
+    -- utxo_increase_actual = utxos_actual - inputs (spendable outputs created,
+    -- excluding unspendable scripts). utxo_size_inc / utxo_size_inc_actual are
+    -- the PER_UTXO_OVERHEAD-based index-size deltas computed in the loop above.
     local result = {
       blockhash = types.hash256_hex(block_hash),
       time = block.header and block.header.timestamp or 0,
@@ -4403,32 +4744,12 @@ function RPCServer:register_methods()
       mintxsize = mintxsize,
       maxtxsize = maxtxsize,
       avgtxsize = (#txs > 1) and math.floor(total_size / (#txs - 1)) or 0,
-      mediantxsize = (function()
-        if #txsize_array == 0 then return 0 end
-        table.sort(txsize_array)
-        return txsize_array[math.ceil(#txsize_array / 2)]
-      end)(),
-      utxo_increase = utxos_count - inputs,
-      utxo_size_inc = 0,  -- TODO(rpc): wire PER_UTXO_OVERHEAD-based size delta
+      mediantxsize = mediantxsize,
+      utxo_increase = outputs - inputs,
+      utxo_size_inc = utxo_size_inc,
       subsidy = consensus.get_block_subsidy and height
         and consensus.get_block_subsidy(height) or 0,
-      mediantime = (function()
-        if not rpc.storage.get_header or not block.header then return 0 end
-        local timestamps = {}
-        local cur = block.header.prev_hash
-        for _ = 1, 11 do
-          local h = cur and rpc.storage.get_header(cur)
-          if not h then break end
-          timestamps[#timestamps + 1] = h.timestamp
-          cur = h.prev_hash
-        end
-        if #timestamps == 0 then return block.header.timestamp end
-        table.sort(timestamps)
-        return timestamps[math.ceil(#timestamps / 2)]
-      end)(),
-      -- Fee/feerate stats: zero if BlockUndo wasn't available, otherwise
-      -- computed from per-tx prev-output values via BlockUndo (matches
-      -- bitcoin-core/src/rpc/blockchain.cpp::getblockstats loop_inputs).
+      mediantime = mediantime_v,
       avgfee = (block_undo and #txs > 1) and math.floor(total_fee / (#txs - 1)) or 0,
       avgfeerate = (block_undo and total_weight > 0)
         and math.floor((total_fee * consensus.WITNESS_SCALE_FACTOR) / total_weight) or 0,
@@ -4438,22 +4759,57 @@ function RPCServer:register_methods()
       medianfee = block_undo and truncated_median(fee_array) or 0,
       minfee = block_undo and minfee or 0,
       minfeerate = block_undo and minfeerate or 0,
-      feerate_percentiles = block_undo and feerate_percentiles_calc() or {0, 0, 0, 0, 0},
-      -- _actual variants subtract unspendable script outputs; we don't yet
-      -- expose script_mod.is_unspendable, so they trail utxo_increase /
-      -- utxo_size_inc until that helper lands.
-      utxo_increase_actual = 0, utxo_size_inc_actual = 0,
+      feerate_percentiles = feerate_pct,
+      utxo_increase_actual = utxos_actual - inputs,
+      utxo_size_inc_actual = utxo_size_inc_actual,
     }
 
-    -- Filter by requested stats
-    if requested then
-      local filtered = {}
-      for k, _ in pairs(requested) do
-        filtered[k] = result[k]
+    -- Encode one stat value for the ordered emit. feerate_percentiles is a raw
+    -- JSON array; a nil value (e.g. an unresolved height on a hash query with no
+    -- height iterator) becomes JSON null so the flat {k,v} sequence never holds
+    -- a Lua nil — which would silently drop the key AND corrupt the pairing.
+    local function stat_val(k)
+      local v = result[k]
+      if k == "feerate_percentiles" then
+        return M._oj_raw(cjson.encode(setmetatable(v, cjson.array_mt)))
       end
-      return filtered
+      if v == nil then return cjson.null end
+      return v
     end
-    return result
+
+    -- Filter by requested stats: emit only the requested keys, in alphabetical
+    -- order (Core builds ret_all alphabetically then projects).
+    if requested then
+      local keys = {}
+      for k, _ in pairs(requested) do
+        if result[k] ~= nil then keys[#keys + 1] = k end
+      end
+      table.sort(keys)
+      local seq = {}
+      for _, k in ipairs(keys) do
+        seq[#seq + 1] = k
+        seq[#seq + 1] = stat_val(k)
+      end
+      return { _raw_json = M._oj_encode(M._oj(seq)) }
+    end
+
+    -- Full ret_all in Core's key order (blockchain.cpp:2167; alphabetical with
+    -- the utxo_* tail in pushKV order).
+    local all_keys = {
+      "avgfee", "avgfeerate", "avgtxsize", "blockhash", "feerate_percentiles",
+      "height", "ins", "maxfee", "maxfeerate", "maxtxsize", "medianfee",
+      "mediantime", "mediantxsize", "minfee", "minfeerate", "mintxsize",
+      "outs", "subsidy", "swtotal_size", "swtotal_weight", "swtxs", "time",
+      "total_out", "total_size", "total_weight", "totalfee", "txs",
+      "utxo_increase", "utxo_size_inc", "utxo_increase_actual",
+      "utxo_size_inc_actual",
+    }
+    local seq = {}
+    for _, k in ipairs(all_keys) do
+      seq[#seq + 1] = k
+      seq[#seq + 1] = stat_val(k)
+    end
+    return { _raw_json = M._oj_encode(M._oj(seq)) }
   end
 
   -- submitpackage: pipe to mempool:accept_package, then re-emit results in
@@ -4931,13 +5287,14 @@ function RPCServer:register_methods()
     local hrp = address_mod.BECH32_HRP[network_name] or "bc"
 
     -- Invalid response (Core 27+ format): no address field.
-    -- error_locations must be a JSON array ([]), not object ({}).
+    -- Core key order (rpc/util.cpp validateaddress): isvalid, error_locations,
+    -- error. error_locations is a JSON array ([]).
     local function invalid_response()
-      return {
-        isvalid = false,
-        error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
-        error_locations = cjson.empty_array,
-      }
+      return { _raw_json = M._oj_encode(M._oj({
+        "isvalid",         false,
+        "error_locations", M._oj_array_empty(),
+        "error",           "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
+      })) }
     end
 
     -- Try SegWit (bech32 / bech32m) first — returns nil gracefully on failure.
@@ -4960,15 +5317,17 @@ function RPCServer:register_methods()
       local script_bytes = version_opcode .. push_byte .. witness_program
       local spk_hex = M.hex_encode(script_bytes)
 
-      return {
-        address        = addr,
-        isscript       = isscript,
-        isvalid        = true,
-        iswitness      = true,
-        scriptPubKey   = spk_hex,
-        witness_program = wp_hex,
-        witness_version = witness_version,
-      }
+      -- Core key order: isvalid, address, scriptPubKey, isscript, iswitness,
+      -- witness_version, witness_program (validateaddress + DescribeAddress).
+      return { _raw_json = M._oj_encode(M._oj({
+        "isvalid",         true,
+        "address",         addr,
+        "scriptPubKey",    spk_hex,
+        "isscript",        isscript,
+        "iswitness",       true,
+        "witness_version", witness_version,
+        "witness_program", wp_hex,
+      })) }
     end
 
     -- Try Base58Check — base58_decode uses assert() so wrap in pcall.
@@ -4979,23 +5338,23 @@ function RPCServer:register_methods()
       if b58_version == V.MAINNET_P2PKH or b58_version == V.TESTNET_P2PKH then
         -- P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
         local script_bytes = script_mod.make_p2pkh_script(b58_payload)
-        return {
-          address      = addr,
-          isscript     = false,
-          isvalid      = true,
-          iswitness    = false,
-          scriptPubKey = M.hex_encode(script_bytes),
-        }
+        return { _raw_json = M._oj_encode(M._oj({
+          "isvalid",      true,
+          "address",      addr,
+          "scriptPubKey", M.hex_encode(script_bytes),
+          "isscript",     false,
+          "iswitness",    false,
+        })) }
       elseif b58_version == V.MAINNET_P2SH or b58_version == V.TESTNET_P2SH then
         -- P2SH: OP_HASH160 <20> OP_EQUAL
         local script_bytes = script_mod.make_p2sh_script(b58_payload)
-        return {
-          address      = addr,
-          isscript     = true,
-          isvalid      = true,
-          iswitness    = false,
-          scriptPubKey = M.hex_encode(script_bytes),
-        }
+        return { _raw_json = M._oj_encode(M._oj({
+          "isvalid",      true,
+          "address",      addr,
+          "scriptPubKey", M.hex_encode(script_bytes),
+          "isscript",     true,
+          "iswitness",    false,
+        })) }
       end
     end
 
@@ -5041,13 +5400,20 @@ function RPCServer:register_methods()
     if rpc.peer_manager then
       connections = #rpc.peer_manager.peer_list
     end
+    -- relayfee READS the live relay floor (HONEST FEE POLICY): never a
+    -- hardcoded literal, so the legacy getinfo relayfee stays coupled to the
+    -- floor the node actually enforces (DEFAULT_MIN_RELAY_FEE = 100 sat/kvB
+    -- -> 0.00000100), matching getnetworkinfo.relayfee.
+    local mp = require("lunarblock.mempool")
+    local relay_floor = (rpc.mempool and rpc.mempool.min_relay_fee)
+                        or mp.DEFAULT_MIN_RELAY_FEE
     return {
       version = 10000,
       protocolversion = p2p.PROTOCOL_VERSION,
       blocks = tip_height,
       connections = connections,
       testnet = rpc.network.name ~= "mainnet",
-      relayfee = 0.00001,
+      relayfee = relay_floor / 100000000,
     }
   end
 
@@ -5409,6 +5775,9 @@ function RPCServer:register_methods()
     -- pubkey type: Core suppresses address
     if stype == "pubkey" then addr = nil end
 
+    -- Core decodescript key order (rpc/rawtransaction.cpp + ScriptToUniv
+    -- include_hex=false): asm, desc, address?, type, p2sh?, segwit?. Use a
+    -- plain table here to collect optional p2sh/segwit, then ordered-emit below.
     local result = {
       asm  = disassemble_script(script_bytes),
       desc = get_desc(script_bytes, addr, stype),
@@ -5465,20 +5834,37 @@ function RPCServer:register_methods()
 
         local wstype = get_script_type(wit_script)
         local waddr  = get_address(wit_script, wstype)
-        local segwit_obj = {
-          asm  = disassemble_script(wit_script),
-          desc = get_desc(wit_script, waddr, wstype),
-          hex  = M.hex_encode(wit_script),  -- inner segwit DOES have hex
-          type = wstype,
+        -- Inner segwit object: ScriptToUniv include_hex=true (asm, desc, hex,
+        -- address?, type) then p2sh-segwit (rawtransaction.cpp:574-575).
+        local seg_seq = {
+          "asm",  disassemble_script(wit_script),
+          "desc", get_desc(wit_script, waddr, wstype),
+          "hex",  M.hex_encode(wit_script),
         }
-        if waddr then segwit_obj.address = waddr end
-        segwit_obj["p2sh-segwit"] = p2sh_wrap_address(wit_script)
+        if waddr then
+          seg_seq[#seg_seq + 1] = "address"; seg_seq[#seg_seq + 1] = waddr
+        end
+        seg_seq[#seg_seq + 1] = "type"; seg_seq[#seg_seq + 1] = wstype
+        seg_seq[#seg_seq + 1] = "p2sh-segwit"
+        seg_seq[#seg_seq + 1] = p2sh_wrap_address(wit_script)
 
-        result.segwit = segwit_obj
+        result.segwit = M._oj(seg_seq)
       end
     end
 
-    return result
+    -- Ordered emit: asm, desc, address?, type, p2sh?, segwit? (Core order).
+    local seq = { "asm", result.asm, "desc", result.desc }
+    if result.address ~= nil then
+      seq[#seq + 1] = "address"; seq[#seq + 1] = result.address
+    end
+    seq[#seq + 1] = "type"; seq[#seq + 1] = result.type
+    if result.p2sh ~= nil then
+      seq[#seq + 1] = "p2sh"; seq[#seq + 1] = result.p2sh
+    end
+    if result.segwit ~= nil then
+      seq[#seq + 1] = "segwit"; seq[#seq + 1] = result.segwit
+    end
+    return { _raw_json = M._oj_encode(M._oj(seq)) }
   end
 
   self.methods["analyzepsbt"] = function(rpc, params)
@@ -5913,7 +6299,15 @@ function RPCServer:register_methods()
     -- Suppress unused warning
     local _ = rpc
 
-    return info
+    -- Core key order (rpc/descriptor.cpp getdescriptorinfo): descriptor,
+    -- checksum, isrange, issolvable, hasprivatekeys.
+    return { _raw_json = M._oj_encode(M._oj({
+      "descriptor",     info.descriptor,
+      "checksum",       info.checksum,
+      "isrange",        info.isrange,
+      "issolvable",     info.issolvable,
+      "hasprivatekeys", info.hasprivatekeys,
+    })) }
   end
 
   self.methods["deriveaddresses"] = function(rpc, params)
@@ -8282,32 +8676,33 @@ function RPCServer:register_methods()
       previousblockhash = types.hash256_hex(header.prev_hash)
     end
 
-    -- Build the JSON manually so difficulty is serialised with %.16g precision
-    -- (cjson would strip trailing digits from some IEEE 754 doubles).
-    -- Fields ordered alphabetically (harness strips confirmations then jq -S sorts).
-    local parts = {}
-    parts[#parts + 1] = string.format('"bits":"%s"', string.format("%08x", header.bits))
-    parts[#parts + 1] = string.format('"chainwork":"%s"', chainwork_hex)
-    parts[#parts + 1] = string.format('"confirmations":%d', confirmations)
-    parts[#parts + 1] = string.format('"difficulty":%s', diff_str)
-    parts[#parts + 1] = string.format('"hash":"%s"', blockhash)
-    parts[#parts + 1] = string.format('"height":%d', block_height or 0)
-    parts[#parts + 1] = string.format('"mediantime":%d', mediantime)
-    parts[#parts + 1] = string.format('"merkleroot":"%s"', types.hash256_hex(header.merkle_root))
-    parts[#parts + 1] = string.format('"nTx":%d', ntx)
-    if nextblockhash then
-      parts[#parts + 1] = string.format('"nextblockhash":"%s"', nextblockhash)
-    end
-    parts[#parts + 1] = string.format('"nonce":%d', header.nonce)
+    -- Emit in Core blockheaderToJSON order (blockchain.cpp:160): hash,
+    -- confirmations, height, version, versionHex, merkleroot, time, mediantime,
+    -- nonce, bits, target, difficulty, chainwork, nTx, previousblockhash?,
+    -- nextblockhash?. difficulty uses %.16g (std::setprecision(16)).
+    local seq = {
+      "hash",          blockhash,
+      "confirmations", confirmations,
+      "height",        block_height or 0,
+      "version",       header.version,
+      "versionHex",    string.format("%08x", header.version),
+      "merkleroot",    types.hash256_hex(header.merkle_root),
+      "time",          header.timestamp,
+      "mediantime",    mediantime,
+      "nonce",         header.nonce,
+      "bits",          string.format("%08x", header.bits),
+      "target",        target_hex,
+      "difficulty",    M._oj_raw(diff_str),
+      "chainwork",     chainwork_hex,
+      "nTx",           ntx,
+    }
     if previousblockhash then
-      parts[#parts + 1] = string.format('"previousblockhash":"%s"', previousblockhash)
+      seq[#seq + 1] = "previousblockhash"; seq[#seq + 1] = previousblockhash
     end
-    parts[#parts + 1] = string.format('"target":"%s"', target_hex)
-    parts[#parts + 1] = string.format('"time":%d', header.timestamp)
-    parts[#parts + 1] = string.format('"version":%d', header.version)
-    parts[#parts + 1] = string.format('"versionHex":"%s"', string.format("%08x", header.version))
-
-    return {_raw_json = "{" .. table.concat(parts, ",") .. "}"}
+    if nextblockhash then
+      seq[#seq + 1] = "nextblockhash"; seq[#seq + 1] = nextblockhash
+    end
+    return { _raw_json = M._oj_encode(M._oj(seq)) }
   end
 
   --- getblockfilter: Retrieve a BIP-157 compact block filter for a block.
@@ -8393,12 +8788,16 @@ function RPCServer:register_methods()
       tip_height = rpc.chain_state.tip_height or 0
       tip_hash = rpc.chain_state.tip_hash or types.hash256_zero()
     end
-    return {{
-      height = tip_height,
-      hash = types.hash256_hex(tip_hash),
-      branchlen = 0,
-      status = "active",
-    }}
+    -- Core key order (rpc/blockchain.cpp getchaintips): height, hash,
+    -- branchlen, status. Emit as an ordered array of ordered objects.
+    return { _raw_json = M._oj_value(M._oj_array({
+      M._oj({
+        "height",    tip_height,
+        "hash",      types.hash256_hex(tip_hash),
+        "branchlen", 0,
+        "status",    "active",
+      }),
+    })) }
   end
 
   --- getdifficulty: Return the proof-of-work difficulty as a multiple of minimum.
@@ -8413,7 +8812,10 @@ function RPCServer:register_methods()
         end
       end
     end
-    return calculate_difficulty(current_bits)
+    -- Core renders difficulty with std::setprecision(16) (%.16g). cjson's
+    -- default float format truncates to ~13 sig digits, so emit the bare number
+    -- as a %.16g raw token to match Core byte-for-byte (rpc/blockchain.cpp:505).
+    return { _raw_json = string.format("%.16g", calculate_difficulty(current_bits)) }
   end
 
   --- submitblock: Submit a new block to the network.
@@ -8711,26 +9113,32 @@ function RPCServer:register_methods()
     local bits_hex = string.format("%08x", current_bits)
     local target_hex = bits_to_target_hex(current_bits)
 
-    return {
-      blocks = tip_height,
-      currentblocksize = 0,
-      currentblockweight = 0,
-      currentblocktx = 0,
-      bits = bits_hex,
-      difficulty = difficulty,
-      target = target_hex,
-      blockmintxfee = 0.00001000,
-      networkhashps = 0,
-      pooledtx = pooledtx,
-      chain = core_chain_name(rpc.network.name),
-      next = {
-        height = tip_height + 1,
-        bits = bits_hex,
-        difficulty = difficulty,
-        target = target_hex,
-      },
-      warnings = "",
-    }
+    -- Core getmininginfo key order (rpc/mining.cpp:416): blocks,
+    -- [currentblockweight], [currentblocktx], bits, difficulty, target,
+    -- networkhashps, pooledtx, blockmintxfee, chain, next{...}, warnings.
+    -- currentblockweight/currentblocktx are present only on a node that has
+    -- assembled a template (the miner); this submitblock-fed node never has, so
+    -- they are absent (matching Core's optional-presence). difficulty uses
+    -- %.16g. blockmintxfee is DEFAULT_BLOCK_MIN_TX_FEE=1 sat/kvB (policy.h:36)
+    -- -> 0.00000001 — a SEPARATE constant from the relay floor. warnings ARRAY.
+    local mp = require("lunarblock.mempool")
+    return { _raw_json = M._oj_encode(M._oj({
+      "blocks",        tip_height,
+      "bits",          bits_hex,
+      "difficulty",    M._oj_g16(difficulty),
+      "target",        target_hex,
+      "networkhashps", 0,
+      "pooledtx",      pooledtx,
+      "blockmintxfee", M._oj_amount(mp.DEFAULT_BLOCK_MIN_TX_FEE or 1),
+      "chain",         core_chain_name(rpc.network.name),
+      "next",          M._oj({
+        "height",     tip_height + 1,
+        "bits",       bits_hex,
+        "difficulty", M._oj_g16(difficulty),
+        "target",     target_hex,
+      }),
+      "warnings",      M._oj_array_empty(),
+    })) }
   end
 
   --- listtransactions: Return recent transactions for a wallet.
@@ -9791,36 +10199,31 @@ function RPCServer:setup_w47b_methods()
       muhash_hex = reverse_hex(raw)
     end
 
-    -- disk_size: Core reports CCoinsViewDB::EstimateSize() (impl-specific;
-    -- the RPC docs call it "estimated"). lunarblock has no leveldb size
-    -- estimator, so we report a deterministic chainstate-size proxy derived
-    -- from the same on-disk record sizes the walk already saw. This is the
-    -- one field the differential test asserts as present+typed, NOT
-    -- byte-equal vs Core (bogosize is "meaningless" and disk_size is
-    -- explicitly impl-specific).
-    local disk_size = bogosize
+    -- disk_size: Core reports CCoinsViewDB::EstimateSize(). On an UNFLUSHED
+    -- chainstate (the submitblock-fed differential node never flushes to a
+    -- leveldb store) Core's estimator returns 0, so report 0 to match — the
+    -- impl previously reported a bogosize proxy (7344), diverging from Core's 0.
+    local disk_size = 0
 
-    -- total_amount must be a fixed-8 BTC decimal byte-identical to Core's
-    -- ValueFromAmount (core_io.cpp:285, %s%d.%08d). cjson would float-encode
-    -- total_sats/1e8 and lose precision on large sums, so we emit the whole
-    -- result via the _raw_json escape hatch with a btc_sentinel that
-    -- strip_btc_sentinels turns into a bare decimal literal.
-    local result = {
-      height       = tip_height,
-      bestblock    = tip_hash_hex,
-      txouts       = n_txouts,
-      bogosize     = bogosize,
-      transactions = n_txs,
-      disk_size    = disk_size,
-      total_amount = btc_sentinel(total_sats),
+    -- Core gettxoutsetinfo key order (rpc/blockchain.cpp:1115): height,
+    -- bestblock, txouts, bogosize, [hash_serialized_3|muhash], total_amount,
+    -- transactions, disk_size. total_amount is a fixed-8 BTC decimal.
+    local seq = {
+      "height",    tip_height,
+      "bestblock", tip_hash_hex,
+      "txouts",    n_txouts,
+      "bogosize",  bogosize,
     }
     if hash_type == "hash_serialized_3" then
-      result.hash_serialized_3 = hash_serialized_3
+      seq[#seq + 1] = "hash_serialized_3"; seq[#seq + 1] = hash_serialized_3
     elseif hash_type == "muhash" then
-      result.muhash = muhash_hex
+      seq[#seq + 1] = "muhash"; seq[#seq + 1] = muhash_hex
     end
+    seq[#seq + 1] = "total_amount"; seq[#seq + 1] = M._oj_amount(total_sats)
+    seq[#seq + 1] = "transactions"; seq[#seq + 1] = n_txs
+    seq[#seq + 1] = "disk_size";    seq[#seq + 1] = disk_size
 
-    return { _raw_json = strip_btc_sentinels(cjson.encode(result)) }
+    return { _raw_json = M._oj_encode(M._oj(seq)) }
   end
 
   -- scantxoutset: scan the live UTXO set by scriptPubKey.

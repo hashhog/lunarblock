@@ -1799,7 +1799,11 @@ describe("rpc", function()
       assert.is_true(decoded.result.difficulty <= 1.1)
     end)
 
-    it("returns softforks table", function()
+    it("omits softforks (Core v31.99 dropped getblockchaininfo.softforks)", function()
+      -- Bitcoin Core v31.99 removed the `softforks` object from
+      -- getblockchaininfo; the buried-deployment state is now surfaced ONLY
+      -- via getdeploymentinfo. getblockchaininfo must NOT carry softforks (it
+      -- was an EXTRA-ON-IMPL byte-diff vs the Core oracle).
       local server = rpc.new({
         chain_state = {
           tip_height = 800000,
@@ -1808,12 +1812,18 @@ describe("rpc", function()
         network = consensus.networks.mainnet
       })
 
-      local request = '{"method":"getblockchaininfo","params":[],"id":1}'
-      local response = server:handle_request(request)
-      local decoded = cjson.decode(response)
+      -- handle_request returns (body, status); bind body to a local first so
+      -- the optional status value is not forwarded to cjson.decode.
+      local gbc_body = server:handle_request(
+        '{"method":"getblockchaininfo","params":[],"id":1}')
+      local gbc = cjson.decode(gbc_body)
+      assert.is_nil(gbc.result.softforks)
 
-      -- Should have softforks table
-      assert.is_table(decoded.result.softforks)
+      -- The deployment state still exists, now via getdeploymentinfo.
+      local gdi_body = server:handle_request(
+        '{"method":"getdeploymentinfo","params":[],"id":1}')
+      local gdi = cjson.decode(gdi_body)
+      assert.is_table(gdi.result.deployments)
     end)
 
     it("correctly identifies initial block download", function()
@@ -2969,27 +2979,31 @@ describe("rpc", function()
         network = network,
       })
 
-      local gbc_body = server:handle_request(
-        '{"method":"getblockchaininfo","params":[],"id":1}')
+      -- Core v31.99 removed getblockchaininfo.softforks; the canonical
+      -- buried-deployment state is the shared build_deployment_state helper,
+      -- surfaced via getdeploymentinfo.deployments. Validate that
+      -- getdeploymentinfo agrees with build_deployment_state (the single source
+      -- of truth) for every buried deployment.
       local gdi_body = server:handle_request(
         '{"method":"getdeploymentinfo","params":[],"id":1}')
-      local gbc_resp = cjson.decode(gbc_body)
       local gdi_resp = cjson.decode(gdi_body)
 
-      assert.equal(cjson.null, gbc_resp.error,
-        label .. ": getblockchaininfo returned error")
       assert.equal(cjson.null, gdi_resp.error,
         label .. ": getdeploymentinfo returned error")
 
-      local softforks  = gbc_resp.result.softforks
-      local deployments = gdi_resp.result.deployments
+      -- getblockchaininfo must NOT carry softforks anymore (Core v31.99).
+      -- Bind body first (handle_request returns body, status).
+      local gbc_body = server:handle_request(
+        '{"method":"getblockchaininfo","params":[],"id":1}')
+      local gbc_resp = cjson.decode(gbc_body)
+      assert.is_nil(gbc_resp.result.softforks,
+        label .. ": getblockchaininfo must not emit softforks (v31.99)")
 
-      assert.is_table(softforks,   label .. ": softforks must be a table")
+      local deployments = gdi_resp.result.deployments
       assert.is_table(deployments, label .. ": deployments must be a table")
 
-      -- Every key present in softforks must appear in deployments with
-      -- identical type, active, and height values.
-      for name, sf in pairs(softforks) do
+      local expected = rpc.build_deployment_state(tip_height, network)
+      for name, sf in pairs(expected) do
         local dep = deployments[name]
         assert.is_table(dep,
           label .. ": deployment '" .. name .. "' missing from getdeploymentinfo")
@@ -2999,22 +3013,6 @@ describe("rpc", function()
           label .. ": " .. name .. ".active mismatch")
         assert.equal(sf.height, dep.height,
           label .. ": " .. name .. ".height mismatch")
-      end
-
-      -- Every key in deployments (excluding testdummy, which is absent from
-      -- the getblockchaininfo softforks projection) must appear in softforks.
-      for name, dep in pairs(deployments) do
-        if name ~= "testdummy" then
-          local sf = softforks[name]
-          assert.is_table(sf,
-            label .. ": softfork '" .. name .. "' missing from getblockchaininfo")
-          assert.equal(dep.type, sf.type,
-            label .. ": " .. name .. ".type mismatch (reverse)")
-          assert.equal(dep.active, sf.active,
-            label .. ": " .. name .. ".active mismatch (reverse)")
-          assert.equal(dep.height, sf.height,
-            label .. ": " .. name .. ".height mismatch (reverse)")
-        end
       end
     end
 
