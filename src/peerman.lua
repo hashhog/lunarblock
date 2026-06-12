@@ -86,6 +86,32 @@ M.STALE_TIP = {
   TARGET_OUTBOUND_FULL_RELAY = 8,
   -- Target block-relay-only connections
   TARGET_BLOCK_RELAY_ONLY = 2,
+  -- Minimum time before the next feeler connection (Core net.h:61 FEELER_INTERVAL = 2min = 120s).
+  -- A feeler is a short-lived probe to ONE address from the NEW table: on a
+  -- successful handshake the address is promoted NEW->TRIED (keeping the TRIED
+  -- table fresh = Core's primary eclipse-attack mitigation), then disconnected.
+  FEELER_INTERVAL = 120,
+}
+
+--------------------------------------------------------------------------------
+-- connman anti-eclipse / addr anti-DoS constants
+-- Reference: Bitcoin Core src/net.h + src/net_processing.cpp
+--------------------------------------------------------------------------------
+
+M.CONNMAN = {
+  -- At most one in-flight feeler at a time (Core net.h:75 MAX_FEELER_CONNECTIONS = 1).
+  MAX_FEELER_CONNECTIONS = 1,
+  -- getaddr response cap: at most 23% of the addrman, hard-capped at 1000
+  -- (Core net_processing.cpp:188 MAX_PCT_ADDR_TO_SEND, :190 MAX_ADDR_TO_SEND).
+  MAX_PCT_ADDR_TO_SEND = 23,
+  MAX_ADDR_TO_SEND = 1000,
+  -- Inbound-addr token bucket (Core net_processing.cpp:193/197):
+  -- refill rate 0.1 token/s, capped at 1000 tokens, one token spent per
+  -- processed address. Shared by the addr AND addrv2 handlers (Core routes
+  -- both through the same ProcessAddrs bucket, net_processing.cpp:4022/5625)
+  -- so an attacker cannot bypass the limit by switching to addrv2.
+  MAX_ADDR_RATE_PER_SECOND = 0.1,
+  MAX_ADDR_PROCESSING_TOKEN_BUCKET = 1000,
 }
 
 --------------------------------------------------------------------------------
@@ -885,6 +911,87 @@ function PeerManager:_select_address(new_only)
   end
 
   return nil
+end
+
+--- Select ONE address from the NEW table for a feeler probe.
+-- Mirrors Core net.cpp ThreadOpenConnections feeler branch: a feeler always
+-- selects from the NEW table (addrman.Select(newOnly=true)) so that probing
+-- promotes unverified NEW entries into TRIED on success.  Skips addresses we
+-- are already connected to (Core AlreadyConnectedToAddress).  Returns nil when
+-- the NEW table is empty (no-op feeler).
+-- @return table|nil: {ip, port, services} from the NEW table, or nil
+function PeerManager:_select_for_feeler()
+  if self._new_count <= 0 then return nil end
+  -- Core's feeler loop tries up to 100 candidate addresses before giving up
+  -- (net.cpp ThreadOpenConnections nTries cap).  _select_address probes random
+  -- bucket slots, so a single call can miss a sparse NEW table; retry on a nil
+  -- result too (not only on an already-connected hit) so that a non-empty NEW
+  -- table reliably yields a candidate.
+  local attempts = 0
+  while attempts < 100 do
+    attempts = attempts + 1
+    -- new_only = true: never falls through to the TRIED table.
+    local addr = self:_select_address(true)
+    if addr and not self.peers[addr.ip .. ":" .. addr.port] then
+      return addr
+    end
+  end
+  return nil
+end
+
+--- Maybe open a feeler connection (Core net.cpp ThreadOpenConnections FEELER arm).
+--
+-- A feeler is OFF the regular outbound slot budget (MAX_FEELER_CONNECTIONS = 1,
+-- relay-less, short-lived).  It selects ONE address from the NEW table, opens a
+-- connection, and lets the normal disconnect path promote NEW->TRIED -- but
+-- ONLY if the handshake reached ESTABLISHED (disconnect_peer calls
+-- _move_to_tried solely for ESTABLISHED outbound peers, so a dial-fail or a
+-- handshake-fail feeler never promotes; that is Core's promote-on-success-only
+-- semantics).  No-op in -connect mode, when a feeler is already in flight, or
+-- when the NEW table is empty.
+-- @return boolean: true if a feeler connection was opened this call
+function PeerManager:maybe_open_feeler()
+  -- -connect mode: only connect to the explicitly configured peers, never feel.
+  if self.config and self.config.connect then return false end
+
+  -- Honor the 120s feeler interval (Core's exp-jittered FEELER_INTERVAL timer).
+  local now = os.time()
+  if self._next_feeler and now < self._next_feeler then return false end
+
+  -- Bound to MAX_FEELER_CONNECTIONS in-flight feelers.
+  local in_flight = 0
+  for _, p in ipairs(self.peer_list) do
+    if p.is_feeler then in_flight = in_flight + 1 end
+  end
+  if in_flight >= M.CONNMAN.MAX_FEELER_CONNECTIONS then return false end
+
+  -- Select strictly from the NEW table.  No NEW entry -> no feeler this tick;
+  -- do NOT advance the timer so we retry promptly once NEW fills.
+  local addr = self:_select_for_feeler()
+  if not addr then return false end
+
+  -- Arm the next feeler window now that we have a real candidate.
+  self._next_feeler = now + M.STALE_TIP.FEELER_INTERVAL
+
+  -- Open the probe.  skip_diversity=true: feelers are exempt from the /16
+  -- outbound-netgroup diversity rule (Core only applies the netgroup check to
+  -- non-feeler outbound connections, net.cpp ThreadOpenConnections).
+  local ok = self:connect_peer(addr.ip, addr.port, true)
+  if not ok then
+    -- Dial failed: NO promotion (the address stays NEW).  connect_peer already
+    -- bumped its attempt counter via known_addresses.
+    return false
+  end
+
+  -- Mark the freshly opened peer as a feeler so maintain_connections /
+  -- get_outbound_counts exclude it from the full-relay budget, and so tick()
+  -- can disconnect it once the probe handshake completes.
+  local key = addr.ip .. ":" .. addr.port
+  local p = self.peers[key]
+  if p then
+    p.is_feeler = true
+  end
+  return true
 end
 
 --- Get address manager statistics.
@@ -1749,10 +1856,12 @@ end
 -- Prioritizes anchor connections on startup for eclipse attack mitigation.
 -- Also opens extra outbound connection when tip is stale (to find better chain).
 function PeerManager:maintain_connections()
-  -- Count current outbound connections
+  -- Count current outbound connections.  Feelers are OFF the budget (Core
+  -- net.cpp: a FEELER does not hold a full-relay/block-relay semaphore grant),
+  -- so they must not count toward max_outbound or we would starve real slots.
   local outbound = 0
   for _, p in ipairs(self.peer_list) do
-    if not p.inbound then outbound = outbound + 1 end
+    if not p.inbound and not p.is_feeler then outbound = outbound + 1 end
   end
 
   -- First, try to connect to any remaining anchor peers (eclipse mitigation)
@@ -1975,11 +2084,76 @@ end
 -- Addr/Addrv2 Message Handling (BIP155)
 --------------------------------------------------------------------------------
 
+--- Apply Core's inbound-addr rate limiting to a freshly received address list.
+--
+-- Mirrors net_processing.cpp ProcessAddrs (~5625): a per-peer token bucket
+-- starting at 1.0, refilled by elapsed_seconds * MAX_ADDR_RATE_PER_SECOND(0.1)
+-- and capped at MAX_ADDR_PROCESSING_TOKEN_BUCKET(1000); one token is spent per
+-- admitted address, and the excess is DROPPED for rate-limited (non-whitelist)
+-- peers.  This ONE helper is shared by both handle_addr and handle_addrv2 so an
+-- attacker cannot bypass the limit by switching to the addrv2 message -- Core
+-- routes ADDR and ADDRV2 through the same ProcessAddrs bucket
+-- (net_processing.cpp:4022).
+--
+-- DIVERGENCE FROM CORE (documented per task): Core initialises the bucket to
+-- 1.0 and tops it up by +MAX_ADDR_TO_SEND(1000) once when WE send a getaddr
+-- (net_processing.cpp:3767).  lunarblock NEVER sends getaddr (no getaddr-send
+-- path exists anywhere in src/), so that +1000 top-up has no trigger and is
+-- intentionally not wired.  We init to 1.0 exactly as Core does -- we do NOT
+-- claim Core inits to 1000.
+--
+-- @param peer Peer: source peer (carries the shared bucket state)
+-- @param addresses table: list of decoded address entries
+-- @return table: the admitted sublist (excess dropped for rate-limited peers)
+function PeerManager:_rate_limit_addrs(peer, addresses)
+  if not peer then return addresses end
+
+  -- Initialise the shared bucket on first use (Core: m_addr_token_bucket = 1.0).
+  local mono = socket.gettime()
+  if peer.addr_token_bucket == nil then
+    peer.addr_token_bucket = 1.0
+    peer.addr_token_timestamp = mono
+  end
+
+  -- Refill: elapsed * 0.1, capped at 1000.  Don't refill past the cap.
+  if peer.addr_token_bucket < M.CONNMAN.MAX_ADDR_PROCESSING_TOKEN_BUCKET then
+    local elapsed = mono - (peer.addr_token_timestamp or mono)
+    if elapsed < 0 then elapsed = 0 end
+    local increment = elapsed * M.CONNMAN.MAX_ADDR_RATE_PER_SECOND
+    peer.addr_token_bucket = math.min(
+      peer.addr_token_bucket + increment,
+      M.CONNMAN.MAX_ADDR_PROCESSING_TOKEN_BUCKET)
+  end
+  peer.addr_token_timestamp = mono
+
+  -- Whitelisted (NoBan/manual) peers are exempt from the limit -- closest
+  -- analogue to Core's NetPermissionFlags::Addr exemption.
+  local rate_limited = not (peer.noban or peer.is_manual)
+
+  local admitted = {}
+  for _, addr in ipairs(addresses) do
+    if peer.addr_token_bucket < 1.0 then
+      if rate_limited then
+        -- Out of tokens: drop the rest for a rate-limited peer.
+        goto continue
+      end
+      -- Non-rate-limited peer: admit without spending (bucket may stay <1).
+    else
+      peer.addr_token_bucket = peer.addr_token_bucket - 1.0
+    end
+    admitted[#admitted + 1] = addr
+    ::continue::
+  end
+  return admitted
+end
+
 --- Handle received addr message.
 -- @param peer Peer: peer that sent the message
 -- @param payload string: addr message payload
 function PeerManager:handle_addr(peer, payload)
   local addresses = p2p.deserialize_addr(payload)
+  -- Rate-limit BEFORE processing (shared bucket; see _rate_limit_addrs).
+  addresses = self:_rate_limit_addrs(peer, addresses)
   local now = os.time()
   local src_ip = peer and peer.ip or "unknown"
   for _, addr in ipairs(addresses) do
@@ -2014,6 +2188,9 @@ end
 -- @param payload string: addrv2 message payload
 function PeerManager:handle_addrv2(peer, payload)
   local addresses = p2p.deserialize_addrv2(payload)
+  -- Rate-limit BEFORE processing, sharing the SAME per-peer bucket as
+  -- handle_addr so an addrv2 flood cannot bypass the addr rate limit.
+  addresses = self:_rate_limit_addrs(peer, addresses)
   local now = os.time()
   local src_ip = peer and peer.ip or "unknown"
   for _, addr in ipairs(addresses) do
@@ -2250,21 +2427,35 @@ function PeerManager:tick()
       -- Check if state became ESTABLISHED (newly completed handshake)
       if p.state == peer_mod.STATE.ESTABLISHED and not p._established_notified then
         p._established_notified = true
-        -- Initialize trickling state for newly established peer
-        self:_init_peer_trickle(p)
-        if self.callbacks.on_peer_established then
-          self.callbacks.on_peer_established(p)
+        -- Feeler: the handshake SUCCEEDED -> mark for disconnect.  The promotion
+        -- NEW->TRIED happens in disconnect_peer (_move_to_tried for ESTABLISHED
+        -- outbound peers), so a feeler that reaches ESTABLISHED is promoted and
+        -- one that never does (dial/handshake fail) is not -- Core's
+        -- promote-on-success-only semantics.  Feelers carry no relay, so we do
+        -- NOT init trickling for them.
+        if p.is_feeler then
+          p._feeler_done = true
+        else
+          -- Initialize trickling state for newly established peer
+          self:_init_peer_trickle(p)
+          if self.callbacks.on_peer_established then
+            self.callbacks.on_peer_established(p)
+          end
         end
       end
     end
     if p.state == peer_mod.STATE.DISCONNECTED then
+      disconnected[#disconnected + 1] = p
+    elseif p._feeler_done then
+      -- Feeler probe finished its handshake: tear it down (which promotes the
+      -- address NEW->TRIED via disconnect_peer/_move_to_tried).
       disconnected[#disconnected + 1] = p
     end
   end
 
   -- Clean up disconnected peers
   for _, p in ipairs(disconnected) do
-    self:disconnect_peer(p, "disconnected")
+    self:disconnect_peer(p, p._feeler_done and "feeler" or "disconnected")
   end
 
   -- Process transaction trickling (batched, randomized inv sending)
@@ -2275,6 +2466,12 @@ function PeerManager:tick()
 
   -- Maintain outbound connections
   self:maintain_connections()
+
+  -- Periodically open a short-lived feeler to a NEW-table address to keep the
+  -- TRIED table fresh (Core net.cpp ThreadOpenConnections FEELER arm,
+  -- FEELER_INTERVAL=120s).  Off the regular outbound budget; promotes on
+  -- handshake-success only.
+  self:maybe_open_feeler()
 
   -- Periodic ASMap health check every 3600s (1 hour).
   -- FIX-52 / W115 G16: mirrors Core's init.cpp ASMapHealthCheck() call after
@@ -2486,13 +2683,43 @@ function PeerManager:_relay_addr_to_random_peers(source)
   end
 end
 
---- Respond to a getaddr message by sending up to 1000 known addresses.
+--- Respond to a getaddr message with our addresses, applying Core's anti-DoS
+--- guards (net_processing.cpp GETADDR handler, ~4816).
+--
+--   * Ignore getaddr from OUTBOUND peers (anti-fingerprinting: an attacker
+--     could otherwise stamp our addrman via fake addresses and read them back).
+--   * Answer only the FIRST getaddr per connection; ignore repeats
+--     (Core m_getaddr_recvd).
+--   * Cap the response at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size))
+--     (Core MAX_PCT_ADDR_TO_SEND=23, MAX_ADDR_TO_SEND=1000).  This is the
+--     getaddr-reply cap ONLY; the getnodeaddresses RPC dump path
+--     (rpc.lua) reads known_addresses directly and stays uncapped.
 -- @param peer Peer: peer that requested addresses
 function PeerManager:_respond_getaddr(peer)
+  -- Ignore getaddr from outbound connections.  peer.inbound is true only for
+  -- accepted (inbound) connections; outbound peers (including feelers) have
+  -- inbound=false.
+  if peer and peer.inbound == false then
+    return
+  end
+
+  -- Only one getaddr response per connection.
+  if peer and peer.getaddr_recvd then
+    return
+  end
+  if peer then peer.getaddr_recvd = true end
+
+  -- Compute the 23%-of-addrman cap (min with the 1000 absolute cap).
+  -- ceil(0.23 * size) so a tiny addrman still yields at least the proportional
+  -- share rather than rounding down to zero.
+  local addrman_size = self:get_known_address_count()
+  local pct_cap = math.ceil(addrman_size * M.CONNMAN.MAX_PCT_ADDR_TO_SEND / 100)
+  local cap = math.min(M.CONNMAN.MAX_ADDR_TO_SEND, pct_cap)
+
   local addr_list = {}
   local count = 0
   for _, info in pairs(self.known_addresses) do
-    if count >= 1000 then break end
+    if count >= cap then break end
     if info.ip then
       addr_list[#addr_list + 1] = info
       count = count + 1
@@ -2824,8 +3051,10 @@ function PeerManager:get_outbound_counts()
   local full_relay = 0
   local block_only = 0
   for _, p in ipairs(self.peer_list) do
-    if not p.inbound then
-      -- For now, treat all outbound as full-relay
+    -- Feelers are off-budget (Core net.cpp: FEELER holds no outbound slot);
+    -- exclude them from both the full-relay and block-relay counts.
+    if not p.inbound and not p.is_feeler then
+      -- For now, treat all (non-feeler) outbound as full-relay
       -- A full implementation would track block-relay-only separately
       full_relay = full_relay + 1
     end
