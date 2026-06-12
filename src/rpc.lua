@@ -2385,7 +2385,227 @@ function RPCServer:register_methods()
       push_entry("coinstatsindex", synced, tip_height)
     end
 
+    -- txospenderindex: spent-outpoint -> spending-tx index.  Core name is
+    -- "txospenderindex" (src/index/txospenderindex.cpp GetName()).  Advances
+    -- atomically with the tip (same atomic batch as chain_tip), so best height
+    -- is always tip_height when enabled.
+    if rpc.chain_state and rpc.chain_state.txospenderindex_enabled then
+      local synced = tip_height >= header_tip_height
+      push_entry("txospenderindex", synced, tip_height)
+    end
+
     return { _raw_json = "{" .. table.concat(fragments, ",") .. "}" }
+  end
+
+  --- gettxspendingprevout ( [{"txid":...,"vout":...}, ...] options? )
+  -- Scans the mempool (and the txospenderindex, if available) to find the
+  -- transactions spending any of the given outputs.  Byte-exact port of
+  -- bitcoin-core/src/rpc/mempool.cpp::gettxspendingprevout, INCLUDING error
+  -- codes:
+  --   empty outputs       -> RPC_INVALID_PARAMETER (-8) "Invalid parameter, outputs are missing"
+  --   negative vout       -> RPC_INVALID_PARAMETER (-8) "Invalid parameter, vout cannot be negative"
+  --   strict unknown key  -> RPC_TYPE_ERROR (-3)
+  --   index unavailable   -> RPC_MISC_ERROR (-1) "Mempool lacks a relevant spend, and txospenderindex is unavailable."
+  -- options (named/object, positional 1):
+  --   mempool_only       (default: true iff txospenderindex unavailable)
+  --   return_spending_tx (default: false)
+  -- Output per entry, pushKV order: txid, vout, spendingtxid (if spent),
+  -- spendingtx (iff return_spending_tx), blockhash (CONFIRMED / index path ONLY).
+  -- Unspent -> bare {txid, vout}.
+  self.methods["gettxspendingprevout"] = function(rpc, params)
+    -- Local raise helper (the codebase's structured-error idiom is
+    -- error({code, message}); handle_single_request maps it to the JSON-RPC
+    -- error object with the exact code).
+    local function throw_rpc(code, message)
+      error({code = code, message = message})
+    end
+    -- ── Arg 0: the outputs array (required, NON-empty). ──────────────────────
+    local outputs = params[1]
+    if type(outputs) ~= "table" or (#outputs == 0 and next(outputs) == nil) then
+      -- Empty (or missing) array -> Core's RPC_INVALID_PARAMETER.  Core reaches
+      -- this after get_array() succeeds; a non-array would be a -3 type error,
+      -- but the diff corpus only exercises the documented empty / negative-vout
+      -- / strict-key paths.  Treat a non-table as the same missing-outputs case
+      -- shape Core lands on for [] (the common falsification call).
+      throw_rpc(M.ERROR.INVALID_PARAMETER, "Invalid parameter, outputs are missing")
+    end
+    if #outputs == 0 then
+      throw_rpc(M.ERROR.INVALID_PARAMETER, "Invalid parameter, outputs are missing")
+    end
+
+    -- ── Arg 1: options object (strict named-param type-check). ───────────────
+    local options = params[2]
+    if options == nil or options == cjson.null then
+      options = {}
+    end
+    if type(options) ~= "table" then
+      throw_rpc(M.ERROR.TYPE_ERROR,
+        "JSON value of type " .. core_json_type_name(options) ..
+        " is not of expected type object")
+    end
+    -- Strict: reject unknown keys (Core RPCTypeCheckObj fStrict=true -> -3).
+    for k, _ in pairs(options) do
+      if k ~= "mempool_only" and k ~= "return_spending_tx" then
+        throw_rpc(M.ERROR.TYPE_ERROR, "Unexpected key " .. tostring(k))
+      end
+    end
+    if options.mempool_only ~= nil and type(options.mempool_only) ~= "boolean" then
+      throw_rpc(M.ERROR.TYPE_ERROR,
+        "JSON value of type " .. core_json_type_name(options.mempool_only) ..
+        " is not of expected type bool")
+    end
+    if options.return_spending_tx ~= nil and type(options.return_spending_tx) ~= "boolean" then
+      throw_rpc(M.ERROR.TYPE_ERROR,
+        "JSON value of type " .. core_json_type_name(options.return_spending_tx) ..
+        " is not of expected type bool")
+    end
+
+    local txospender_available = rpc.chain_state
+      and rpc.chain_state.txospenderindex_enabled and true or false
+    -- Default mempool_only = !g_txospenderindex (Core mempool.cpp:950).
+    local mempool_only
+    if options.mempool_only ~= nil then
+      mempool_only = options.mempool_only
+    else
+      mempool_only = not txospender_available
+    end
+    local return_spending_tx = options.return_spending_tx == true
+
+    -- ── Parse each {txid, vout}; strict per-entry type-check (Core -3). ───────
+    -- Worklist of {outpoint = {hash, index}, txid_hex, vout} entries, mirroring
+    -- Core's prevouts_to_process.
+    local prevouts = {}
+    for i = 1, #outputs do
+      local o = outputs[i]
+      if type(o) ~= "table" then
+        throw_rpc(M.ERROR.TYPE_ERROR,
+          "JSON value of type " .. core_json_type_name(o) ..
+          " is not of expected type object")
+      end
+      -- Strict object: only txid + vout permitted (Core RPCTypeCheckObj
+      -- fStrict=true).
+      for k, _ in pairs(o) do
+        if k ~= "txid" and k ~= "vout" then
+          throw_rpc(M.ERROR.TYPE_ERROR, "Unexpected key " .. tostring(k))
+        end
+      end
+      local txid = o.txid
+      if type(txid) ~= "string" then
+        throw_rpc(M.ERROR.TYPE_ERROR,
+          "JSON value of type " .. core_json_type_name(txid) ..
+          " is not of expected type string")
+      end
+      local vout = o.vout
+      if type(vout) ~= "number" then
+        throw_rpc(M.ERROR.TYPE_ERROR,
+          "JSON value of type " .. core_json_type_name(vout) ..
+          " is not of expected type number")
+      end
+      -- ParseHashO equivalent: 64-hex, reversed to internal byte order.
+      if #txid ~= 64 or txid:match("[^0-9a-fA-F]") then
+        throw_rpc(M.ERROR.INVALID_ADDRESS,
+          txid .. " is not a valid txid")
+      end
+      -- getInt<int>(): truncates toward zero; then Core checks < 0.
+      local nOutput = (vout >= 0) and math.floor(vout) or math.ceil(vout)
+      if nOutput < 0 then
+        throw_rpc(M.ERROR.INVALID_PARAMETER, "Invalid parameter, vout cannot be negative")
+      end
+      prevouts[#prevouts + 1] = {
+        hash = types.hash256_from_hex(txid:lower()),
+        index = nOutput,
+        txid_hex = txid:lower(),
+        vout = nOutput,
+      }
+    end
+
+    -- ── Build one result entry.  pushKV order matches Core make_output. ──────
+    -- spending_tx is a tx OBJECT (with .tx / .txid_hex), or nil for unspent.
+    -- block_hash_hex is set only on the CONFIRMED index path.
+    local function make_output(prevout, spending_txid_hex, spending_tx_hex, block_hash_hex)
+      local frags = {}
+      frags[#frags + 1] = string.format('"txid":%s', cjson.encode(prevout.txid_hex))
+      frags[#frags + 1] = string.format('"vout":%d', prevout.vout)
+      if spending_txid_hex then
+        frags[#frags + 1] = string.format('"spendingtxid":%s',
+          cjson.encode(spending_txid_hex))
+        if return_spending_tx and spending_tx_hex then
+          frags[#frags + 1] = string.format('"spendingtx":%s',
+            cjson.encode(spending_tx_hex))
+        end
+      end
+      if block_hash_hex then
+        frags[#frags + 1] = string.format('"blockhash":%s',
+          cjson.encode(block_hash_hex))
+      end
+      return "{" .. table.concat(frags, ",") .. "}"
+    end
+
+    local result_frags = {}
+
+    -- ── Pass 1: search the mempool reverse-spend index first. ────────────────
+    -- rpc.mempool.outpoint_to_tx[outpoint_key] -> spending txid_hex; the tx
+    -- object lives at rpc.mempool.entries[txid_hex].tx.  Mirrors Core's
+    -- mempool.GetConflictTx(outpoint).
+    local mp = require("lunarblock.mempool")
+    local remaining = {}
+    for _, prevout in ipairs(prevouts) do
+      local spending_txid_hex, spending_tx_hex
+      if rpc.mempool and rpc.mempool.outpoint_to_tx then
+        local okey = mp.outpoint_key(prevout.hash, prevout.index)
+        local stxid_hex = rpc.mempool.outpoint_to_tx[okey]
+        if stxid_hex then
+          spending_txid_hex = stxid_hex
+          local entry = rpc.mempool.entries and rpc.mempool.entries[stxid_hex]
+          if entry and entry.tx then
+            -- Core uses the tx's own GetHash() for spendingtxid; the mempool's
+            -- map key IS that txid_hex, so they agree.
+            if return_spending_tx then
+              spending_tx_hex = M.hex_encode(
+                serialize.serialize_transaction(entry.tx, true))
+            end
+          end
+        end
+      end
+      if spending_txid_hex then
+        -- Mempool spend: NO blockhash (unconfirmed).  Matches Core (make_output
+        -- pushes blockhash only on the index path).
+        result_frags[#result_frags + 1] =
+          make_output(prevout, spending_txid_hex, spending_tx_hex, nil)
+      elseif mempool_only then
+        -- mempool_only and not spent in mempool -> bare {txid, vout} (unspent).
+        result_frags[#result_frags + 1] = make_output(prevout, nil, nil, nil)
+      else
+        -- Defer to the index pass.
+        remaining[#remaining + 1] = prevout
+      end
+    end
+
+    -- ── Return early if the mempool pass handled everything. ─────────────────
+    if #remaining == 0 then
+      return { _raw_json = "[" .. table.concat(result_frags, ",") .. "]" }
+    end
+
+    -- ── Pass 2: consult the txospenderindex for the unresolved outpoints. ────
+    if not txospender_available then
+      throw_rpc(M.ERROR.MISC_ERROR,
+        "Mempool lacks a relevant spend, and txospenderindex is unavailable.")
+    end
+    for _, prevout in ipairs(remaining) do
+      local rec = rpc.chain_state:find_spender({ hash = prevout.hash, index = prevout.index })
+      if rec then
+        local stxid_hex = types.hash256_hex(rec.spending_txid)
+        local stx_hex = return_spending_tx and M.hex_encode(rec.spending_tx_bytes) or nil
+        local bhash_hex = types.hash256_hex(rec.block_hash)
+        result_frags[#result_frags + 1] =
+          make_output(prevout, stxid_hex, stx_hex, bhash_hex)
+      else
+        -- Unspent on-chain -> bare {txid, vout}.
+        result_frags[#result_frags + 1] = make_output(prevout, nil, nil, nil)
+      end
+    end
+
+    return { _raw_json = "[" .. table.concat(result_frags, ",") .. "]" }
   end
 
   -- W70: canonical sync-state RPC. See spec/getsyncstate.md in the

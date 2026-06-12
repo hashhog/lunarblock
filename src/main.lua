@@ -126,6 +126,7 @@ local function parse_args(argv)
       print("      --peerbloomfilters BOOL     Advertise NODE_BLOOM and service BIP-35 mempool requests (default: 0)")
       print("      --txindex                   Maintain a full transaction index (txid → blockhash) for getrawtransaction")
       print("      --coinstatsindex            Maintain a per-height MuHash3072 UTXO-set stats index (enables gettxoutsetinfo at historical heights)")
+      print("      --txospenderindex           Maintain a spent-outpoint -> spending-tx index (backs gettxspendingprevout confirmed-spend lookups)")
       print("      --blockfilterindex          Maintain a BIP-157/158 basic block-filter index (compact filters per block)")
       print("      --peerblockfilters BOOL     Advertise NODE_COMPACT_FILTERS service bit (default: 0; requires --blockfilterindex AND BIP-157 P2P dispatch)")
       print("      --import-blocks FILE        Import blocks from framed file (or - for stdin)")
@@ -263,6 +264,19 @@ local function parse_args(argv)
         args.coinstatsindex = true
       else
         args.coinstatsindex = (v == "1" or v == "true" or v == "yes" or v == "on")
+      end
+    elseif arg == "--txospenderindex" or arg:match("^%-%-txospenderindex=") then
+      -- txospenderindex (2026-06-12): inline "spent outpoint -> spending tx"
+      -- index.  Backs the CONFIRMED-spend path of gettxspendingprevout and is
+      -- reported in getindexinfo.  Accepts "--txospenderindex" (bare) or
+      -- "--txospenderindex=BOOL".  Mirrors bitcoin-core's -txospenderindex flag
+      -- (DEFAULT_TXOSPENDERINDEX = false in Core).  Default off; fully inert
+      -- when disabled (no extra work in connect/disconnect path).
+      local v = arg:match("^%-%-txospenderindex=(.*)$")
+      if v == nil then
+        args.txospenderindex = true
+      else
+        args.txospenderindex = (v == "1" or v == "true" or v == "yes" or v == "on")
       end
     elseif arg == "--blockfilterindex" or arg:match("^%-%-blockfilterindex=") then
       -- BIP-157 Phase 2 (2026-05-07): enable inline block-filter index
@@ -916,6 +930,14 @@ local function main()
   if args.coinstatsindex then
     chain_state:set_coinstatsindex_enabled(true)
     io.stdout:write("coinstatsindex enabled (per-height MuHash3072 UTXO stats).\n")
+    io.stdout:flush()
+  end
+  -- txospenderindex (2026-06-12): inline spent-outpoint -> spending-tx index.
+  -- Backs the confirmed-spend path of gettxspendingprevout.  Off by default
+  -- (Core DEFAULT_TXOSPENDERINDEX = false).
+  if args.txospenderindex then
+    chain_state:set_txospenderindex_enabled(true)
+    io.stdout:write("txospenderindex enabled (spent-outpoint -> spending-tx index).\n")
     io.stdout:flush()
   end
   chain_state:init()
