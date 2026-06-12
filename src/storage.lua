@@ -180,6 +180,15 @@ M.CF = {
   -- Height key: 4-byte big-endian (same encoding as HEIGHT_INDEX).
   -- Only written when coinstatsindex_enabled; fully inert otherwise.
   COIN_STATS = "coin_stats",
+  -- txospenderindex (default-off, mirrors bitcoin-core's TxoSpenderIndex):
+  -- maps a SPENT outpoint -> the on-chain tx that spent it.
+  --   key   = spent outpoint: txid(32) || vout(4 LE)  (36 bytes, same layout
+  --           as the CF.UTXO key)
+  --   value = spending_txid(32) || block_hash(32) || u32 LE tx_len || tx_bytes
+  -- Written inline in connect_block's atomic batch when txospenderindex_enabled
+  -- and re-derived + deleted in disconnect_block (reorg / invalidateblock).
+  -- Fully inert otherwise.  See utxo.lua + rpc.lua gettxspendingprevout.
+  TXO_SPENDER = "txo_spender",
 }
 
 -- List of all column families in order
@@ -195,6 +204,7 @@ local CF_LIST = {
   M.CF.BLOCK_FILTER,
   M.CF.BLOCK_FILTER_HEIGHT,
   M.CF.COIN_STATS,
+  M.CF.TXO_SPENDER,
 }
 
 -- Helper: check error and throw if set

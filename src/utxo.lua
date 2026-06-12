@@ -1705,6 +1705,17 @@ function M.new_chain_state(storage, network)
   self._csi_txouts    = 0
   self._csi_bogosize  = 0
   self._csi_total_amt = 0
+  -- txospenderindex (2026-06-12): inline "spent outpoint -> spending tx" index.
+  -- Mirrors bitcoin-core/src/index/txospenderindex.cpp (CustomAppend /
+  -- CustomRemove).  When enabled, connect_block writes, for every non-coinbase
+  -- input of every tx in the block, CF.TXO_SPENDER[spent_outpoint] ->
+  -- (spending_txid || block_hash || tx_len || tx_bytes), inside the same atomic
+  -- batch as chain_tip.  disconnect_block RE-DERIVES those keys from the
+  -- disconnected block's OWN inputs and deletes them (reorg-safe, no undo data
+  -- needed — exactly Core's CustomRemove(BuildSpenderPositions(block))).  Off by
+  -- default (Core DEFAULT_TXOSPENDERINDEX = false).  Data source for the
+  -- CONFIRMED-spend path of the gettxspendingprevout RPC.
+  self.txospenderindex_enabled = false
   -- W77-CB: rolling-window sub-phase breakdown of connect_block.  W75-CONN
   -- in sync.lua measures the callback as a black box (cb_avg ≈ 700–850ms
   -- during IBD, dominating the ~900ms/block budget).  This inner window
@@ -1738,6 +1749,46 @@ end
 -- in-memory accumulator is seeded from the tip snapshot.
 function ChainState:set_coinstatsindex_enabled(enabled)
   self.coinstatsindex_enabled = enabled and true or false
+end
+
+-- Late toggle for the txospenderindex.  Off by default (matches Core's
+-- DEFAULT_TXOSPENDERINDEX = false).  Like txindex/filterindex, the index is
+-- maintained inline inside connect_block / disconnect_block, so it advances
+-- atomically with the chain tip; no separate background catch-up is needed for
+-- a from-genesis IBD.  (A backfill on an already-synced node would walk the
+-- block store the same way reindex_chainstate does, but the default flow is to
+-- enable it before sync.)
+function ChainState:set_txospenderindex_enabled(enabled)
+  self.txospenderindex_enabled = enabled and true or false
+end
+
+-- txospenderindex query: return the on-chain tx that spent `outpoint`, or nil
+-- when the outpoint is unspent on-chain (or the index is disabled).  Mirrors
+-- Core TxoSpenderIndex::FindSpender (std::nullopt when unspent).
+--   outpoint = { hash = <hash256>, index = <uint32> }
+-- Returns, on a hit:
+--   { spending_txid = <hash256>, block_hash = <hash256>, spending_tx_bytes = <string> }
+function ChainState:find_spender(outpoint)
+  if not self.txospenderindex_enabled then
+    return nil
+  end
+  local kw = serialize.buffer_writer()
+  kw.write_bytes(outpoint.hash.bytes)
+  kw.write_u32le(outpoint.index)
+  local data = self.storage.get(storage_mod.CF.TXO_SPENDER, kw.result())
+  if not data or #data < 32 + 32 + 4 then
+    return nil
+  end
+  local r = serialize.buffer_reader(data)
+  local spending_txid = types.hash256(r.read_bytes(32))
+  local block_hash    = types.hash256(r.read_bytes(32))
+  local tx_len        = r.read_u32le()
+  local spending_tx_bytes = r.read_bytes(tx_len)
+  return {
+    spending_txid = spending_txid,
+    block_hash = block_hash,
+    spending_tx_bytes = spending_tx_bytes,
+  }
 end
 
 -- ── CoinStatsRecord helpers ─────────────────────────────────────────────────
@@ -3463,6 +3514,40 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       self._csi_txouts, self._csi_bogosize, self._csi_total_amt)
   end
 
+  -- txospenderindex: build the (spent_outpoint -> spending tx record) pairs for
+  -- every NON-coinbase input in this block, OUTSIDE the batch closure (pure CPU
+  -- work; only the resulting bytes go into the atomic batch).  Mirrors Core
+  -- BuildSpenderPositions(block) — the coinbase's null prevout is skipped.
+  -- Each record holds the spending txid, the confirming block hash, and the
+  -- full wire-serialized spending tx (so return_spending_tx can be answered
+  -- without a second DB trip).  Empty list when the index is disabled costs
+  -- nothing.  Skipped at genesis (height 0): coinbase-only, no spends.
+  local txospender_writes = nil
+  if self.txospenderindex_enabled and height > 0 then
+    txospender_writes = {}
+    for tx_idx, tx in ipairs(block.transactions) do
+      if tx_idx ~= 1 then  -- skip coinbase (tx[1]); its input has a null prevout
+        local sp_txid = validation.compute_txid(tx)
+        local sp_tx_bytes = serialize.serialize_transaction(tx, true)  -- with witness
+        -- Serialize the value once per tx; all of this tx's inputs share it.
+        local vw = serialize.buffer_writer()
+        vw.write_bytes(sp_txid.bytes)        -- spending txid (32B, internal order)
+        vw.write_bytes(block_hash.bytes)     -- confirming block hash (32B)
+        vw.write_u32le(#sp_tx_bytes)         -- tx length (4B LE)
+        vw.write_bytes(sp_tx_bytes)          -- full wire tx (witness)
+        local value_bytes = vw.result()
+        for _, inp in ipairs(tx.inputs) do
+          -- Key = spent outpoint: txid(32) || vout(4 LE) — same 36-byte layout
+          -- as the CF.UTXO key.
+          local kw = serialize.buffer_writer()
+          kw.write_bytes(inp.prev_out.hash.bytes)
+          kw.write_u32le(inp.prev_out.index)
+          txospender_writes[#txospender_writes + 1] = { kw.result(), value_bytes }
+        end
+      end
+    end
+  end
+
   self.coin_view:flush(false, function(batch)
     -- Undo data into the same atomic batch (was a separate put before
     -- 2026-04-30; see comment block above).
@@ -3513,6 +3598,27 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     if csi_rec_bytes then
       local csi_height_key = _csi_encode_height(height)
       batch.put(storage_mod.CF.COIN_STATS, csi_height_key, csi_rec_bytes)
+    end
+    -- txospenderindex: write every (spent_outpoint -> spending tx record) pair
+    -- atomically with chain_tip so a crash can never leave the tip ahead of
+    -- (or behind) the spender entries it describes.  Symmetrical with the
+    -- re-derive-and-delete in disconnect_block; reverts cleanly on reorg.
+    -- Mirrors Core CustomAppend(BuildSpenderPositions) + WriteBatch.
+    if txospender_writes then
+      for i = 1, #txospender_writes do
+        batch.put(storage_mod.CF.TXO_SPENDER,
+                  txospender_writes[i][1], txospender_writes[i][2])
+      end
+      -- Persist best-indexed height (4B LE) so getindexinfo can report it and a
+      -- restart knows where the index reached.  Folded into the same atomic
+      -- batch; overwritten by the next connect at this height on a reorg.
+      local hbuf = ffi.new("uint8_t[4]")
+      hbuf[0] = band(height, 0xFF)
+      hbuf[1] = band(rshift(height, 8), 0xFF)
+      hbuf[2] = band(rshift(height, 16), 0xFF)
+      hbuf[3] = band(rshift(height, 24), 0xFF)
+      batch.put(storage_mod.CF.META, "txospenderindex_height",
+                ffi.string(hbuf, 4))
     end
     -- Include caller's extra operations (e.g. block body / height index from
     -- the IBD path, or block/header/height_index from submitblock) in the
@@ -4284,6 +4390,30 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     csi_height_key_self = _csi_encode_height(height)
   end
 
+  -- txospenderindex: RE-DERIVE this block's spend keys from its OWN inputs (the
+  -- exact same keys connect_block wrote) so we can delete them inside the
+  -- disconnect atomic batch.  No undo data is consulted: the keys are a pure
+  -- function of the disconnected block's inputs.  Mirrors Core
+  -- CustomRemove(BuildSpenderPositions(block)).  Skip the coinbase (tx[1]) and
+  -- genesis (height 0, which has no spends to undo).  Because disconnect_block
+  -- is the SINGLE unified disconnect path — invoked by BOTH invalidate_block AND
+  -- rollback_chain_to (the live submitblock/P2P reorg via Pattern D's shared
+  -- reorg_batch) — wiring the erase here covers BOTH reorg paths, exactly like
+  -- the txindex / coinstatsindex / filterindex rewinds above and below.
+  local txospender_deletes = nil
+  if self.txospenderindex_enabled and height > 0 then
+    txospender_deletes = {}
+    for tx_idx = 2, #block.transactions do  -- skip coinbase
+      local tx = block.transactions[tx_idx]
+      for _, inp in ipairs(tx.inputs) do
+        local kw = serialize.buffer_writer()
+        kw.write_bytes(inp.prev_out.hash.bytes)
+        kw.write_u32le(inp.prev_out.index)
+        txospender_deletes[#txospender_deletes + 1] = kw.result()
+      end
+    end
+  end
+
   -- Flush dirty UTXO entries and update chain tip atomically.
   local new_tip_height = height - 1
   local new_tip_hash = prev_hash
@@ -4332,6 +4462,24 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     -- The in-memory accumulator is restored from H-1 AFTER flush (below).
     if csi_height_key_self then
       batch.delete(storage_mod.CF.COIN_STATS, csi_height_key_self)
+    end
+    -- txospenderindex: erase this block's spend keys atomically with the
+    -- chain_tip rewind.  After this commits, gettxspendingprevout for an
+    -- outpoint that was spent only in this (now-orphaned) block reports it
+    -- unspent again.  Mirrors Core CustomRemove + WriteBatch.  Also rewind the
+    -- persisted best height to height-1 (4B LE).
+    if txospender_deletes then
+      for i = 1, #txospender_deletes do
+        batch.delete(storage_mod.CF.TXO_SPENDER, txospender_deletes[i])
+      end
+      local rewind_h = new_tip_height
+      local hbuf = ffi.new("uint8_t[4]")
+      hbuf[0] = band(rewind_h, 0xFF)
+      hbuf[1] = band(rshift(rewind_h, 8), 0xFF)
+      hbuf[2] = band(rshift(rewind_h, 16), 0xFF)
+      hbuf[3] = band(rshift(rewind_h, 24), 0xFF)
+      batch.put(storage_mod.CF.META, "txospenderindex_height",
+                ffi.string(hbuf, 4))
     end
     -- Update chain tip to the previous block
     if new_tip_hash then
