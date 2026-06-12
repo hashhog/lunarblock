@@ -200,7 +200,14 @@ M.interpolate_fee = interpolate_fee
 -- DEFAULT_MAX_MEMPOOL_SIZE_MB = 300, but Core uses metric MB (1,000,000 bytes),
 -- not binary MiB (1,048,576 bytes).  Reference: kernel/mempool_options.h:19.
 M.DEFAULT_MAX_MEMPOOL_SIZE = 300 * 1000 * 1000  -- 300 MB (metric, not MiB)
-M.DEFAULT_MIN_RELAY_FEE = 1000    -- 1 sat/vB in sat/KB
+-- DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB (Bitcoin Core policy/policy.h:70).
+-- This is the absolute relay floor enforced at the admission gate (see
+-- Mempool:add at "fee rate too low" below).  Core lowered the historical
+-- 1000 sat/kvB default to 100 sat/kvB; lunarblock now matches.  Every fee
+-- DISPLAY (getmempoolinfo/getnetworkinfo/...) reads this same constant via
+-- self.min_relay_fee so the displayed minrelaytxfee can never diverge from
+-- the value the node actually enforces.
+M.DEFAULT_MIN_RELAY_FEE = 100     -- 100 sat/kvB (policy/policy.h:70)
 M.DEFAULT_MAX_TX_FEE = 1000000    -- 0.01 BTC max fee (policy, not consensus)
 -- DEFAULT_BYTES_PER_SIGOP: each sigop "costs" this many virtual bytes.
 -- When a tx has many sigops, its effective vsize is raised to
@@ -269,6 +276,13 @@ M.MAX_P2SH_SIGOPS = 15
 -- Dust relay fee rate used for GetDustThreshold (Core policy/policy.h:68).
 -- Units: satoshis per kilobyte.  Default: 3000 sat/kvB.
 M.DUST_RELAY_FEE_RATE = 3000
+
+-- DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB (Bitcoin Core policy/policy.h:36).
+-- This is the BLOCK-assembly minimum feerate (getmininginfo.blockmintxfee),
+-- a SEPARATE policy knob from the relay floor (DEFAULT_MIN_RELAY_FEE). It must
+-- NOT be coupled to the relay floor: blockmintxfee renders as 0.00000001 BTC/kvB
+-- while the relay floor renders as 0.00000100 BTC/kvB.
+M.DEFAULT_BLOCK_MIN_TX_FEE = 1
 
 -- Maximum datacarrier (OP_RETURN) script size in bytes (policy/policy.h:84).
 -- Default = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 100000 bytes.

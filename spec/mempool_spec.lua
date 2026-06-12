@@ -1808,7 +1808,12 @@ describe("mempool", function()
       local base_txid_hex = types.hash256_hex(base_txid)
       add_utxo(chain_state, base_txid_hex, 0, 100000000)
 
-      local mp = mempool.new(chain_state)
+      -- This test exercises CPFP package LOGIC (a below-floor parent admitted
+      -- via a high-fee child), not the floor VALUE. Pin min_relay_fee to 1000
+      -- sat/kvB so the scenario is independent of the (now Core-correct 100
+      -- sat/kvB) default floor — otherwise the 20-sat parent clears the floor
+      -- on its own and the package path is never exercised.
+      local mp = mempool.new(chain_state, { min_relay_fee = 1000 })
 
       -- Parent with LOW fee (would be rejected individually)
       -- ~85 vB tx needs 85 sat for 1 sat/vB (1000 sat/KB), use 20 sat
@@ -1844,7 +1849,12 @@ describe("mempool", function()
       local base_txid_hex = types.hash256_hex(base_txid)
       add_utxo(chain_state, base_txid_hex, 0, 100000000)
 
-      local mp = mempool.new(chain_state)
+      -- Pin min_relay_fee to 1000 sat/kvB: this test asserts a below-floor
+      -- PACKAGE is rejected, independent of the (Core-correct 100 sat/kvB)
+      -- default. At ~20 sat / ~200 vB the package is ~100 sat/kvB — on the
+      -- new default floor it would clear; pinning 1000 keeps the rejection
+      -- scenario meaningful.
+      local mp = mempool.new(chain_state, { min_relay_fee = 1000 })
 
       -- Both parent and child have very low fees
       local parent = make_tx(1, {}, {}, 0)
