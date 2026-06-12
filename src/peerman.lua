@@ -402,6 +402,13 @@ function M.new(network, storage, config)
   -- Initialize address manager (eclipse attack mitigation)
   self:_init_addrman()
 
+  -- Restore the persisted bucketed addrman (peers.dat-equivalent, BUG-17) so
+  -- the address book survives restart instead of cold-starting empty.  A
+  -- missing/corrupt file falls back to the empty addrman + DNS seeds.
+  self:_load_addrman()
+  -- Periodic-dump cadence state (Core CConnman::DumpAddresses every 15min).
+  self._last_addrman_save = os.time()
+
   -- Load persisted bans from disk
   self:_load_bans()
 
@@ -890,6 +897,276 @@ function PeerManager:get_addrman_stats()
     tried_bucket_count = M.ADDRMAN.TRIED_BUCKET_COUNT,
     bucket_size = M.ADDRMAN.BUCKET_SIZE,
   }
+end
+
+--------------------------------------------------------------------------------
+-- Address Manager Persistence (peers.dat-equivalent — BUG-17, asmap BUG-14)
+--
+-- Reference: Bitcoin Core addrman.cpp Serialize/Unserialize (lines 112-379) and
+-- CConnman::DumpAddresses / DumpPeerAddresses (every DUMP_PEERS_INTERVAL = 15min
+-- and on shutdown).  Core serialises the new + tried tables plus nKey so the
+-- bucket layout survives restart; on load it recomputes tried placement and
+-- restores new placement from the stored bucket-index lists unless the asmap
+-- changed (then it re-buckets from source).
+--
+-- This implementation uses an impl-native cjson file (peers.dat is a LOCAL file,
+-- not wire/RPC, so byte-identical Core format is not required).  We store each
+-- entry WITH its bucket+position so placement is restored verbatim (strategy (a)
+-- in the assess plan) — a clean first landing for a local file.  The salt
+-- (_addrman_key) and the asmap version are also persisted so a future Core-style
+-- recompute-on-load (strategy (b)) remains possible without a format bump.
+--------------------------------------------------------------------------------
+
+-- Serialised peers.dat version.  Bump only on an incompatible schema change.
+M.ADDRMAN.PERSIST_VERSION = 1
+-- Hard ceiling on persisted entries (matches the in-memory addrman capacity:
+-- NEW_BUCKET_COUNT*BUCKET_SIZE + TRIED_BUCKET_COUNT*BUCKET_SIZE = 256*64+64*64).
+-- The file cannot drive unbounded growth past this — load stops at the cap.
+M.ADDRMAN.PERSIST_MAX_ENTRIES =
+  M.ADDRMAN.NEW_BUCKET_COUNT * M.ADDRMAN.BUCKET_SIZE +
+  M.ADDRMAN.TRIED_BUCKET_COUNT * M.ADDRMAN.BUCKET_SIZE
+
+--- Path to the peers.dat-equivalent file in the datadir.
+-- @return string
+function PeerManager:_get_addrman_file_path()
+  return self.data_dir .. "/peers.dat"
+end
+
+--- Build a serialisable snapshot of the bucketed addrman.
+-- Walks _new_buckets / _tried_buckets and emits one flat record per occupied
+-- (bucket,pos) slot, carrying the source, classification, and per-entry stats
+-- needed to round-trip placement (Core stores CAddress+source+last_success+
+-- nAttempts per AddrInfo; we mirror that and additionally pin bucket+pos so a
+-- local-file load can restore verbatim).
+-- @return table: { version, nkey(hex), asmap_version, new=[...], tried=[...] }
+function PeerManager:_serialize_addrman()
+  local function hex(s)
+    if type(s) ~= "string" then return "" end
+    return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+  end
+
+  local snap = {
+    version = M.ADDRMAN.PERSIST_VERSION,
+    nkey = hex(self._addrman_key),
+    asmap_version = self._serialized_asmap_version or "",
+    new = {},
+    tried = {},
+  }
+
+  for bucket = 0, M.ADDRMAN.NEW_BUCKET_COUNT - 1 do
+    for pos, e in pairs(self._new_buckets[bucket]) do
+      snap.new[#snap.new + 1] = {
+        ip = e.ip,
+        port = e.port,
+        services = e.services,
+        timestamp = e.timestamp,
+        src_ip = e.src_ip,
+        bucket = bucket,
+        pos = pos,
+      }
+    end
+  end
+
+  for bucket = 0, M.ADDRMAN.TRIED_BUCKET_COUNT - 1 do
+    for pos, e in pairs(self._tried_buckets[bucket]) do
+      snap.tried[#snap.tried + 1] = {
+        ip = e.ip,
+        port = e.port,
+        services = e.services,
+        timestamp = e.timestamp,
+        last_success = e.last_success,
+        -- src_ip is not stored on the tried slot in memory; default to the addr
+        -- itself (Core re-derives source from the addr on tried eviction too).
+        src_ip = e.src_ip or e.ip,
+        bucket = bucket,
+        pos = pos,
+      }
+    end
+  end
+
+  return snap
+end
+
+--- Restore the bucketed addrman from a deserialised snapshot.
+-- Resets the in-memory tables, restores _addrman_key (so subsequent inserts
+-- bucket consistently with the persisted layout), and re-populates the
+-- new/tried slots.  Placement strategy (a): bucket+pos are restored verbatim
+-- when present; entries with a bad/missing slot are re-bucketed from source via
+-- the existing _add_to_new / _move_to_tried API (never written blindly, so the
+-- collision/refcount guards still hold).  Bounded at PERSIST_MAX_ENTRIES.
+-- @param snap table: deserialised peers.dat snapshot
+-- @return boolean: true on success
+function PeerManager:_deserialize_addrman(snap)
+  local function unhex(h)
+    if type(h) ~= "string" or #h == 0 or (#h % 2) ~= 0 then return nil end
+    return (h:gsub("%x%x", function(b) return string.char(tonumber(b, 16)) end))
+  end
+
+  -- Restore the salt FIRST so any fall-back re-bucketing matches the file.
+  local key = unhex(snap.nkey)
+  if key and #key == 32 then
+    self._addrman_key = key
+  end
+  self._serialized_asmap_version = snap.asmap_version or ""
+
+  -- Start from a clean, fully-formed empty addrman.
+  self._new_buckets = {}
+  for i = 0, M.ADDRMAN.NEW_BUCKET_COUNT - 1 do self._new_buckets[i] = {} end
+  self._tried_buckets = {}
+  for i = 0, M.ADDRMAN.TRIED_BUCKET_COUNT - 1 do self._tried_buckets[i] = {} end
+  self._addr_info = {}
+  self._new_count = 0
+  self._tried_count = 0
+
+  local loaded = 0
+  local cap = M.ADDRMAN.PERSIST_MAX_ENTRIES
+
+  local function in_range(b, p, nbuckets)
+    return type(b) == "number" and type(p) == "number"
+      and b >= 0 and b < nbuckets
+      and p >= 0 and p < M.ADDRMAN.BUCKET_SIZE
+  end
+
+  -- Restore tried entries first (mirrors Core: tried placement is authoritative
+  -- and a new-table entry for the same addr is suppressed by in_tried).
+  for _, e in ipairs(snap.tried or {}) do
+    if loaded >= cap then break end
+    if type(e.ip) == "string" and type(e.port) == "number" then
+      local key2 = e.ip .. ":" .. e.port
+      local b, p = e.bucket, e.pos
+      if in_range(b, p, M.ADDRMAN.TRIED_BUCKET_COUNT)
+          and not self._tried_buckets[b][p]
+          and not (self._addr_info[key2] and self._addr_info[key2].in_tried) then
+        self._tried_buckets[b][p] = {
+          ip = e.ip,
+          port = e.port,
+          services = e.services or p2p.SERVICES.NODE_NETWORK,
+          timestamp = e.timestamp or os.time(),
+          last_success = e.last_success or 0,
+          src_ip = e.src_ip or e.ip,
+        }
+        self._tried_count = self._tried_count + 1
+        self._addr_info[key2] = {
+          in_tried = true,
+          tried_bucket = b,
+          tried_pos = p,
+          new_ref_count = 0,
+          new_refs = {},
+        }
+        loaded = loaded + 1
+      end
+    end
+  end
+
+  -- Restore new entries.  Honour the stored slot when valid + free + not already
+  -- occupied by a tried entry for this addr; otherwise fall back to the normal
+  -- _add_to_new path (re-buckets from source, respects all guards).
+  for _, e in ipairs(snap.new or {}) do
+    if loaded >= cap then break end
+    if type(e.ip) == "string" and type(e.port) == "number" then
+      local key2 = e.ip .. ":" .. e.port
+      local info = self._addr_info[key2]
+      if not (info and info.in_tried) then
+        local b, p = e.bucket, e.pos
+        if in_range(b, p, M.ADDRMAN.NEW_BUCKET_COUNT)
+            and not self._new_buckets[b][p] then
+          self._new_buckets[b][p] = {
+            ip = e.ip,
+            port = e.port,
+            services = e.services or p2p.SERVICES.NODE_NETWORK,
+            timestamp = e.timestamp or os.time(),
+            src_ip = e.src_ip or e.ip,
+          }
+          self._new_count = self._new_count + 1
+          if not info then
+            info = { in_tried = false, new_ref_count = 0, new_refs = {} }
+            self._addr_info[key2] = info
+          end
+          info.new_ref_count = info.new_ref_count + 1
+          info.new_refs[b] = p
+          loaded = loaded + 1
+        else
+          -- Slot unusable (asmap drift, corruption, or collision) — re-bucket.
+          if self:_add_to_new(e.ip, e.port, e.services, e.timestamp, e.src_ip) then
+            loaded = loaded + 1
+          end
+        end
+      end
+    end
+  end
+
+  return true
+end
+
+--- Persist the bucketed addrman to peers.dat (atomic temp-file + rename).
+-- Mirrors the fee.lua / banned.dat save pattern.  Never raises — a failed write
+-- leaves the in-memory addrman untouched and is logged, not fatal.
+-- @return boolean, string|nil
+function PeerManager:_save_addrman()
+  local ok_enc, encoded = pcall(function()
+    local cjson = require("cjson")
+    return cjson.encode(self:_serialize_addrman())
+  end)
+  if not ok_enc or type(encoded) ~= "string" then
+    return false, "encode failed"
+  end
+
+  local path = self:_get_addrman_file_path()
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "w")
+  if not f then return false, "cannot open " .. tmp end
+  f:write(encoded)
+  f:close()
+  os.rename(tmp, path)
+  return true
+end
+
+--- Load the bucketed addrman from peers.dat, replacing the empty cold start.
+-- Graceful on every failure mode (missing / unreadable / corrupt JSON / wrong
+-- version / wrong shape): falls back to the already-initialised empty addrman
+-- and returns false, so the caller proceeds to DNS seeds.  NEVER crashes — a
+-- truncated file from an unclean shutdown must not hard-down boot.
+-- @return boolean: true if a valid snapshot was loaded
+function PeerManager:_load_addrman()
+  local path = self:_get_addrman_file_path()
+  local f = io.open(path, "r")
+  if not f then
+    return false  -- missing file → cold start (normal first boot)
+  end
+  local data = f:read("*a")
+  f:close()
+
+  local ok, snap = pcall(function()
+    local cjson = require("cjson")
+    return cjson.decode(data)
+  end)
+  if not ok or type(snap) ~= "table" then
+    io.stderr:write("[addrman] peers.dat corrupt/unreadable — cold start\n")
+    return false
+  end
+  if snap.version ~= M.ADDRMAN.PERSIST_VERSION then
+    io.stderr:write(string.format(
+      "[addrman] peers.dat version %s != %d — cold start\n",
+      tostring(snap.version), M.ADDRMAN.PERSIST_VERSION))
+    return false
+  end
+  if type(snap.new) ~= "table" or type(snap.tried) ~= "table" then
+    io.stderr:write("[addrman] peers.dat malformed (missing tables) — cold start\n")
+    return false
+  end
+
+  local ok_de = pcall(function() return self:_deserialize_addrman(snap) end)
+  if not ok_de then
+    -- Deserialise blew up mid-way: reset to a clean empty addrman, never crash.
+    io.stderr:write("[addrman] peers.dat deserialize error — cold start\n")
+    self:_init_addrman()
+    return false
+  end
+
+  io.stderr:write(string.format(
+    "[addrman] loaded peers.dat: %d new + %d tried addresses\n",
+    self._new_count, self._tried_count))
+  return true
 end
 
 --------------------------------------------------------------------------------
@@ -2012,6 +2289,18 @@ function PeerManager:tick()
     end
   end
 
+  -- Periodic addrman dump every 900s (15 min).  Mirrors Core's
+  -- CConnman::DumpAddresses() / DUMP_PEERS_INTERVAL so a crash/kill (no clean
+  -- stop()) still leaves a recent peers.dat to restore on the next boot.
+  do
+    local now_s = os.time()
+    if not self._last_addrman_save
+        or (now_s - self._last_addrman_save) >= 900 then
+      self._last_addrman_save = now_s
+      self:_save_addrman()
+    end
+  end
+
   -- Reconnect dropped manual peers last, AFTER stale-tip eviction has
   -- had its chance.  Running every tick is cheap — the per-entry
   -- throttle (manual_reconnect_interval) gates actual connect attempts.
@@ -2691,7 +2980,10 @@ end
 --- Stop the peer manager and disconnect all peers.
 -- Saves anchor connections for eclipse attack mitigation.
 function PeerManager:stop()
-  -- Save anchors before disconnecting peers
+  -- Persist the bucketed addrman (peers.dat) and anchors before tear-down so
+  -- the address book + bucket layout survive the restart (Core dumps addresses
+  -- on shutdown via DumpAddresses()).
+  self:_save_addrman()
   self:_save_anchors()
 
   for _, p in ipairs(self.peer_list) do
