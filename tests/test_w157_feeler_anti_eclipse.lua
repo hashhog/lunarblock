@@ -12,8 +12,9 @@
 --   net_processing.cpp GETADDR handler (~4816): ignore getaddr from OUTBOUND
 --                      peers, answer only the FIRST getaddr per connection
 --                      (m_getaddr_recvd), cap reply at
---                      min(1000, ceil(0.23*addrman_size)) (MAX_PCT_ADDR_TO_SEND
---                      =23, MAX_ADDR_TO_SEND=1000).
+--                      min(1000, floor(0.23*addrman_size)) (MAX_PCT_ADDR_TO_SEND
+--                      =23, MAX_ADDR_TO_SEND=1000).  The percentage cap is
+--   addrman.cpp:800    INTEGER division (FLOOR): nNodes = max_pct*nNodes/100.
 --   net_processing.cpp ProcessAddrs token bucket (~5625): per-peer bucket init
 --                      1.0, refill elapsed*0.1 cap 1000, spend 1/addr, drop
 --                      excess for rate-limited peers.  BOTH addr AND addrv2 go
@@ -380,9 +381,9 @@ test("4-b: only the FIRST getaddr per connection is answered", function()
   rm_dir(d)
 end)
 
-test("4-c: reply capped at min(1000, ceil(0.23*size))", function()
+test("4-c: reply capped at min(1000, floor(0.23*size))", function()
   local pm, d = make_pm()
-  -- 100 addresses -> ceil(0.23*100) = 23 cap.
+  -- 100 addresses -> floor(23*100/100) = 23 cap (here floor==ceil).
   for i = 1, 100 do
     pm.known_addresses["203.0.114." .. i .. ":8333"] = {
       ip = "203.0.114." .. i, port = 8333, services = 1,
@@ -393,13 +394,16 @@ test("4-c: reply capped at min(1000, ceil(0.23*size))", function()
   pm:_respond_getaddr(p)
   expect_eq(#p._sent, 1, "one reply")
   local addrs = p2p.deserialize_addr(p._sent[1])
-  expect_eq(#addrs, 23, "ceil(0.23*100)=23 addresses returned")
+  expect_eq(#addrs, 23, "floor(23*100/100)=23 addresses returned")
   rm_dir(d)
 end)
 
-test("4-d: cap honors the 1000 absolute floor of the min()", function()
+test("4-d: DISTINGUISHING — cap uses INTEGER FLOOR, not ceil (Core addrman.cpp:800)", function()
+  -- N=10 is the canonical distinguisher: Core's integer division gives
+  --   floor(23*10/100) = floor(2.3) = 2,  whereas ceil(2.3) = 3.
+  -- This test FAILS against a ceil/rounding-up implementation and PASSES only
+  -- with Core-faithful integer floor.  (Flipped from the old ceil=3 assertion.)
   local pm, d = make_pm()
-  -- 10 addresses -> ceil(0.23*10)=3; min(1000,3)=3.
   for i = 1, 10 do
     pm.known_addresses["203.0.115." .. i .. ":8333"] = {
       ip = "203.0.115." .. i, port = 8333, services = 1,
@@ -409,7 +413,24 @@ test("4-d: cap honors the 1000 absolute floor of the min()", function()
   local p = capture_peer(true, false)
   pm:_respond_getaddr(p)
   local addrs = p2p.deserialize_addr(p._sent[1])
-  expect_eq(#addrs, 3, "ceil(0.23*10)=3")
+  expect_eq(#addrs, 2, "floor(23*10/100)=2 (NOT ceil's 3)")
+  rm_dir(d)
+end)
+
+test("4-e: DISTINGUISHING — N=13 -> floor(23*13/100)=floor(2.99)=2 (not 3)", function()
+  -- A second distinguisher right at the floor/ceil boundary: 23*13/100 = 2.99,
+  -- floor = 2, ceil = 3.  Proves the floor truncates a near-integer too.
+  local pm, d = make_pm()
+  for i = 1, 13 do
+    pm.known_addresses["203.0.116." .. i .. ":8333"] = {
+      ip = "203.0.116." .. i, port = 8333, services = 1,
+      timestamp = os.time(), attempts = 0, last_try = 0,
+    }
+  end
+  local p = capture_peer(true, false)
+  pm:_respond_getaddr(p)
+  local addrs = p2p.deserialize_addr(p._sent[1])
+  expect_eq(#addrs, 2, "floor(23*13/100)=floor(2.99)=2")
   rm_dir(d)
 end)
 
@@ -505,6 +526,82 @@ test("5-d: whitelisted (noban) peer is NOT rate-limited", function()
   expect_eq(after - before, 30,
     "noban peer bypasses the rate limit (all 30 stored)")
   rm_dir(d)
+end)
+
+-- ---------------------------------------------------------------------------
+-- 6: SENDTXRCNCL (BIP330 Erlay) OFF BY DEFAULT
+-- ---------------------------------------------------------------------------
+-- Core gates txreconciliation behind the DEBUG-ONLY -txreconciliation arg,
+-- default DEFAULT_TXRECONCILIATION_ENABLE=false (net_processing.h:40). The
+-- TxReconciliationTracker is only constructed when opts.reconcile_txs is set
+-- (net_processing.cpp:2018-2023), and SENDTXRCNCL is only announced when that
+-- tracker exists (net_processing.cpp:3723). So a default Core node NEVER sends
+-- SENDTXRCNCL. lunarblock must match: peer.txreconciliation_enabled = false by
+-- default; an outbound full-relay handshake must NOT emit sendtxrcncl unless the
+-- operator opts in.
+print("\n--- 6: sendtxrcncl off by default (BIP330 -txreconciliation) ---")
+
+-- Build an outbound peer and drive handle_version with a captured send queue.
+-- relay=true (full relay), version>=70016 so the gate's other conditions
+-- (not inbound, ver.relay) are satisfied — leaving txreconciliation_enabled
+-- as the sole discriminator.
+local function drive_outbound_handshake(enable_recon)
+  local p = peer_mod.new("198.51.100.30", 8333, consensus.networks.regtest, 0)
+  p.inbound = false
+  p.txreconciliation_enabled = enable_recon and true or false
+  local sent = {}
+  p.send_message = function(_, cmd, _payload) sent[#sent + 1] = cmd end
+  local ver_payload = p2p.serialize_version({
+    version = 70016,
+    services = p2p.SERVICES.NODE_NETWORK + p2p.SERVICES.NODE_WITNESS,
+    relay = true,
+  })
+  p:handle_version(ver_payload)
+  return sent
+end
+
+local function sent_has(sent, cmd)
+  for _, c in ipairs(sent) do if c == cmd then return true end end
+  return false
+end
+
+test("6-a: default Peer has txreconciliation_enabled = false (Core DEFAULT_TXRECONCILIATION_ENABLE)", function()
+  local p = peer_mod.new("198.51.100.31", 8333, consensus.networks.regtest, 0)
+  expect_false(p.txreconciliation_enabled,
+    "txreconciliation must default OFF to match Core")
+end)
+
+test("6-b: default outbound handshake does NOT send sendtxrcncl", function()
+  local sent = drive_outbound_handshake(false)
+  expect_false(sent_has(sent, "sendtxrcncl"),
+    "no sendtxrcncl announced by default")
+  -- Sanity: the handshake DID run (sendaddrv2 + verack were emitted) so the
+  -- absence of sendtxrcncl is a real gate, not a dead code path.
+  expect_true(sent_has(sent, "sendaddrv2"), "sendaddrv2 still announced (handshake ran)")
+  expect_true(sent_has(sent, "verack"), "verack still sent (handshake ran)")
+end)
+
+test("6-c: FALSIFICATION — when txreconciliation IS enabled, sendtxrcncl IS announced", function()
+  -- Proves 6-b's negative is driven by the flag (and not by some other guard
+  -- always suppressing the message): flip the gate ON and it must appear.
+  local sent = drive_outbound_handshake(true)
+  expect_true(sent_has(sent, "sendtxrcncl"),
+    "sendtxrcncl announced once the operator opts in (-txreconciliation)")
+end)
+
+test("6-d: even with txreconciliation ON, an INBOUND peer does not announce", function()
+  -- Core only announces on non-inbound (outbound) full-relay peers; verify the
+  -- other gate conditions still hold when the master flag is on.
+  local p = peer_mod.new("198.51.100.32", 8333, consensus.networks.regtest, 0)
+  p.inbound = true
+  p.txreconciliation_enabled = true
+  local sent = {}
+  p.send_message = function(_, cmd, _payload) sent[#sent + 1] = cmd end
+  -- An inbound handshake re-sends version then verack; relay=true.
+  p.state = peer_mod.STATE.CONNECTED
+  p:handle_version(p2p.serialize_version({ version = 70016, relay = true }))
+  expect_false(sent_has(sent, "sendtxrcncl"),
+    "inbound peer must not announce sendtxrcncl even when enabled")
 end)
 
 -- ---------------------------------------------------------------------------
