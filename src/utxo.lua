@@ -5573,114 +5573,244 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
 end
 
 --------------------------------------------------------------------------------
--- Snapshot Chainstate Manager (for AssumeUTXO dual-chainstate)
+-- AssumeUTXO dual-chainstate (real background validation)
+--
+-- Core reference: bitcoin-core/src/validation.cpp.
+--   * ActivateSnapshot (5588) loads the snapshot coins into a NEW chainstate
+--     which becomes the active/tip-serving chainstate.
+--   * AddChainstate (6170) DEMOTES the original genesis-validated chainstate to
+--     a BACKGROUND chainstate by setting its m_target_blockhash to the snapshot
+--     base.  The background chainstate keeps its OWN coins DB and connects
+--     blocks genesis -> base independently.
+--   * MaybeValidateSnapshot (5967) runs once the background chainstate reaches
+--     the base (ReachedTarget): it computes the HASH_SERIALIZED UTXO-set hash of
+--     the background chainstate's OWN coins and compares it to the assumeutxo
+--     hash (au_data.hash_serialized).  MATCH -> the snapshot chainstate's
+--     m_assumeutxo flips to VALIDATED and the background chainstate is retired.
+--     MISMATCH -> the snapshot chainstate is marked INVALID and Core does a
+--     fatal AbortNode (handle_invalid_snapshot).
+--
+-- The load-time hash gate (load_snapshot, expected_hash) already authenticates
+-- the snapshot bytes.  This background pass is the trustless re-verification by
+-- INDEPENDENT re-computation: it never trusts the loaded coins, it rebuilds the
+-- UTXO set from genesis in a separate store and checks that an honest replay
+-- arrives at the same committed hash.
 --------------------------------------------------------------------------------
 
--- SnapshotChainstate wraps a ChainState with additional state for background validation
+-- m_assumeutxo enum analogue (validation.h Assumeutxo).  The ACTIVE (snapshot)
+-- chainstate starts UNVALIDATED; the background pass flips it to VALIDATED or
+-- INVALID.  A non-snapshot chainstate is implicitly VALIDATED.
+M.ASSUMEUTXO = {
+  VALIDATED   = "VALIDATED",
+  UNVALIDATED = "UNVALIDATED",
+  INVALID     = "INVALID",
+}
+
+-- SnapshotChainstate wraps the ACTIVE (snapshot-loaded) ChainState together with
+-- the AssumeUTXO validation state that getchainstates surfaces.  Core analogue:
+-- a Chainstate carrying m_from_snapshot_blockhash + m_assumeutxo.
 local SnapshotChainstate = {}
 SnapshotChainstate.__index = SnapshotChainstate
 
---- Create a new snapshot chainstate for AssumeUTXO.
--- @param storage table: database handle
--- @param network table: network configuration
--- @param snapshot_height number: height of snapshot base block
--- @param snapshot_hash hash256: hash of snapshot base block
+--- Create a snapshot chainstate descriptor for AssumeUTXO.
+--
+-- Two call forms (the second is backward-compatible with pre-dual-chainstate
+-- callers / specs):
+--   new_snapshot_chainstate(chain_state, height, hash)         -- preferred
+--   new_snapshot_chainstate(storage, network, height, hash)    -- legacy
+-- In the legacy form a fresh ChainState is built around `storage`; in the
+-- preferred form the ALREADY-loaded active ChainState is wrapped directly (the
+-- snapshot coins live in the live chainstate, Core ActivateSnapshot).
 -- @return SnapshotChainstate
-function M.new_snapshot_chainstate(storage, network, snapshot_height, snapshot_hash)
+function M.new_snapshot_chainstate(first, a, b, c)
   local self = setmetatable({}, SnapshotChainstate)
-  self.chain_state = M.new_chain_state(storage, network)
-  self.snapshot_height = snapshot_height
-  self.snapshot_hash = snapshot_hash
+  if first ~= nil and getmetatable(first) == ChainState then
+    -- Preferred form: (chain_state, snapshot_height, snapshot_hash).
+    self.chain_state = first
+    self.snapshot_height = a
+    self.snapshot_hash = b
+  else
+    -- Legacy form: (storage, network, snapshot_height, snapshot_hash).
+    self.chain_state = M.new_chain_state(first, a)
+    self.snapshot_height = b
+    self.snapshot_hash = c
+  end
   self.is_snapshot = true
-  self.background_validated = false
+  -- Core: m_assumeutxo == UNVALIDATED until the background pass completes.
+  self.assumeutxo = M.ASSUMEUTXO.UNVALIDATED
   return self
 end
 
---- Check if background validation is complete.
+--- Is the snapshot fully (trustlessly) validated yet?  getchainstates.validated.
 -- @return boolean
 function SnapshotChainstate:is_validated()
-  return self.background_validated
+  return self.assumeutxo == M.ASSUMEUTXO.VALIDATED
 end
 
---- Mark background validation as complete.
+--- Has the snapshot been proven INVALID by the background pass?
+-- @return boolean
+function SnapshotChainstate:is_invalid()
+  return self.assumeutxo == M.ASSUMEUTXO.INVALID
+end
+
+--- Mark the snapshot fully validated (background pass matched the hash).
+-- Core: unvalidated_cs.m_assumeutxo = Assumeutxo::VALIDATED (validation.cpp:6072).
 function SnapshotChainstate:set_validated()
-  self.background_validated = true
+  self.assumeutxo = M.ASSUMEUTXO.VALIDATED
 end
 
---- Get the underlying chain state.
+--- Mark the snapshot INVALID (background pass mismatched the hash).
+-- Core: unvalidated_cs.m_assumeutxo = Assumeutxo::INVALID (validation.cpp:6010).
+function SnapshotChainstate:set_invalid()
+  self.assumeutxo = M.ASSUMEUTXO.INVALID
+end
+
+--- Get the underlying active chain state.
 -- @return ChainState
 function SnapshotChainstate:get_chain_state()
   return self.chain_state
 end
 
--- Background validation coroutine state
+--------------------------------------------------------------------------------
+-- BackgroundValidator: the genesis -> base independent re-validation pass.
+--
+-- It owns a SEPARATE ChainState backed by a SEPARATE coins store (an in-memory
+-- storage by default — storage_mod.new_memory_storage — so it never shares the
+-- active snapshot chainstate's UTXO table).  Its ChainState is genesis-seeded
+-- (Core: the background chainstate is the original genesis-validated one), then
+-- :step() connects blocks 1..target into its OWN coins.  At the target it
+-- recomputes the HASH_SERIALIZED UTXO hash and compares it to the assumeutxo
+-- commitment.
+--------------------------------------------------------------------------------
 local BackgroundValidator = {}
 BackgroundValidator.__index = BackgroundValidator
 
 --- Create a background validator for AssumeUTXO.
--- Validates the chain from genesis to snapshot height using a separate UTXO view.
--- @param storage table: database handle
+-- @param storage table|nil: coins-DB handle for the BACKGROUND chainstate. MUST
+--                           be a different object from the active chainstate's
+--                           storage.  When nil, a fresh in-memory store is
+--                           created (storage_mod.new_memory_storage) — the
+--                           normal path, giving a genuinely independent UTXO set.
 -- @param network table: network configuration
--- @param target_height number: snapshot height to validate up to
--- @param target_hash string: expected UTXO hash at target height
--- @param get_block function: fn(height) -> block, hash
+-- @param target_height number: snapshot base height to validate up to
+-- @param target_hash string: 32 raw bytes — the assumeutxo HASH_SERIALIZED
+--                            commitment at the base (au_data.hash_serialized,
+--                            in natural compute_utxo_hash byte order).
+-- @param get_block function: fn(height) -> block, block_hash. Reads canonical
+--                            blocks from the node's block store (the active
+--                            chainstate's storage); the bg chainstate only owns
+--                            its coins, not the block bodies (Core shares
+--                            BlockManager across chainstates).
 -- @return BackgroundValidator
 function M.new_background_validator(storage, network, target_height, target_hash, get_block)
   local self = setmetatable({}, BackgroundValidator)
-  self.chain_state = M.new_chain_state(storage, network)
+  -- Own coins DB: a SEPARATE object from the active snapshot chainstate's store.
+  self.owns_storage = (storage == nil)
+  self.storage = storage or storage_mod.new_memory_storage()
+  self.chain_state = M.new_chain_state(self.storage, network)
+  -- Genesis-seed the background chainstate (Core: it is the genesis-validated
+  -- chainstate).  init() connects genesis when no tip is stored, leaving the bg
+  -- coins set EMPTY at height 0 (genesis coinbase is unspendable / not in the
+  -- UTXO set — connect_genesis intentionally adds nothing).
   self.chain_state:init()
   self.target_height = target_height
   self.target_hash = target_hash
   self.get_block = get_block
-  self.current_height = 0
+  -- current_height = height of the bg chainstate tip (0 after genesis seed).
+  self.current_height = self.chain_state.tip_height >= 0 and self.chain_state.tip_height or 0
   self.validated = false
   self.error = nil
-  self.blocks_per_yield = 100  -- Process 100 blocks per coroutine resume
+  self.blocks_per_yield = 100  -- blocks connected per :step() resume
+  -- Optional callbacks fired exactly once when the pass terminates.
+  self.on_validated = nil  -- fn() -> ()   : hash matched
+  self.on_invalid   = nil  -- fn(reason)   : hash mismatched (fatal/abort)
+  self._finalized = false
   return self
 end
 
+-- Internal: recompute the bg coins hash at the target and apply the verdict.
+function BackgroundValidator:_finalize_at_target()
+  if self._finalized then return end
+  -- Core MaybeValidateSnapshot: ComputeUTXOStats(HASH_SERIALIZED) over the
+  -- background chainstate's OWN coins DB, compared to au_data.hash_serialized.
+  local computed_hash, _ = self.chain_state:compute_utxo_hash()
+  if computed_hash == self.target_hash then
+    self.validated = true
+    self._finalized = true
+    if self.on_validated then self.on_validated() end
+  else
+    -- MISMATCH: Core marks the snapshot INVALID and AbortNodes.  Surface a
+    -- hard error (and fire on_invalid so the caller can mark the snapshot
+    -- chainstate INVALID + abort); never silently pass.
+    self.error = "background validation UTXO hash mismatch (assumeutxo)"
+    self._finalized = true
+    if self.on_invalid then self.on_invalid(self.error) end
+  end
+end
+
 --- Run one iteration of background validation.
--- Processes blocks_per_yield blocks and returns progress.
--- @return number, number, boolean, string|nil: current_height, target_height, complete, error
+-- Connects up to blocks_per_yield blocks (genesis+1 .. target) into the bg
+-- chainstate's OWN coins, then — when the target is reached — recomputes the
+-- bg UTXO hash and compares to the assumeutxo commitment.
+-- @return number, number, boolean, string|nil: current_height, target_height,
+--                                              complete(validated), error
 function BackgroundValidator:step()
   if self.validated or self.error then
     return self.current_height, self.target_height, self.validated, self.error
   end
 
+  -- Empty target (base == genesis): nothing to connect, validate immediately.
+  if self.current_height >= self.target_height then
+    self:_finalize_at_target()
+    return self.current_height, self.target_height, self.validated, self.error
+  end
+
   local blocks_processed = 0
   while self.current_height < self.target_height and blocks_processed < self.blocks_per_yield do
-    local block, block_hash = self.get_block(self.current_height)
+    local next_height = self.current_height + 1
+    local block, block_hash = self.get_block(next_height)
     if not block then
-      self.error = string.format("failed to get block at height %d", self.current_height)
+      self.error = string.format("failed to get block at height %d", next_height)
       return self.current_height, self.target_height, false, self.error
     end
 
-    -- Connect block (skip script validation for performance during background sync)
+    -- REAL block connection into the bg chainstate's OWN coins: spends inputs,
+    -- adds outputs, enforces BIP30 etc.  skip_script_validation=true (Core's
+    -- background chainstate connects with the same as-validated semantics the
+    -- snapshot was built under; the trust anchor is the UTXO-hash compare, not
+    -- per-input script re-execution — and the active chain already script-
+    -- validated post-base).  This is NOT a counter bump: connect_block mutates
+    -- self.chain_state.coin_view, which flushes to the bg store.
     local ok, err = pcall(function()
-      self.chain_state:connect_block(block, self.current_height, block_hash, nil, nil, true)
+      self.chain_state:connect_block(block, next_height, block_hash, nil, nil, true)
     end)
 
     if not ok then
-      self.error = string.format("failed to connect block %d: %s", self.current_height, err)
+      self.error = string.format("failed to connect block %d: %s", next_height, tostring(err))
       return self.current_height, self.target_height, false, self.error
     end
 
-    self.current_height = self.current_height + 1
+    self.current_height = next_height
     blocks_processed = blocks_processed + 1
   end
 
-  -- Check if we reached target
   if self.current_height >= self.target_height then
-    -- Compute UTXO hash and validate
-    local computed_hash, _ = self.chain_state:compute_utxo_hash()
-    if computed_hash == self.target_hash then
-      self.validated = true
-    else
-      self.error = "background validation UTXO hash mismatch"
-    end
+    self:_finalize_at_target()
   end
 
   return self.current_height, self.target_height, self.validated, self.error
+end
+
+--- Drive the validator to completion synchronously (connect every block to the
+-- target then validate).  Returns validated, error.  Used by the in-process
+-- regtest path and the functional test; the live node can instead tick :step()
+-- from its maintenance loop.
+-- @return boolean, string|nil
+function BackgroundValidator:run_to_completion()
+  while not self.validated and not self.error do
+    self:step()
+  end
+  return self.validated, self.error
 end
 
 --- Get validation progress as percentage.
@@ -5690,16 +5820,117 @@ function BackgroundValidator:progress()
   return math.floor(self.current_height / self.target_height * 100)
 end
 
---- Check if validation is complete.
+--- Check if validation is complete (hash matched).
 -- @return boolean
 function BackgroundValidator:is_complete()
   return self.validated
 end
 
---- Check if validation encountered an error.
+--- Check if validation encountered an error (including hash mismatch).
 -- @return string|nil: error message or nil
 function BackgroundValidator:get_error()
   return self.error
+end
+
+--- Release the background chainstate's resources.  Closes the owned in-memory
+-- (or caller-supplied) store.  Called when retiring the bg chainstate after a
+-- successful validation, mirroring Core's ValidatedSnapshotCleanup which
+-- destructs + deletes the background chainstate's coins DB (validation.cpp:6280).
+function BackgroundValidator:retire()
+  if self.storage and self.storage.close then
+    pcall(function() self.storage.close() end)
+  end
+  self.storage = nil
+  self.chain_state = nil
+end
+
+--------------------------------------------------------------------------------
+-- Orchestrator: activate a snapshot WITH a real background chainstate.
+--
+-- 1. Loads the snapshot into `active_chain_state` (the live, tip-serving
+--    chainstate) — Core ActivateSnapshot: the snapshot chainstate becomes the
+--    active one.  Uses the existing per-coin load_snapshot gates.
+-- 2. Constructs a BACKGROUND chainstate with its OWN separate coins store,
+--    genesis-seeded, targeting the snapshot base — Core AddChainstate demotion.
+-- 3. Returns { snapshot = SnapshotChainstate, background = BackgroundValidator }.
+--    The snapshot starts UNVALIDATED (getchainstates.validated == false); the
+--    background validator's on_validated/on_invalid callbacks flip it.
+--
+-- The caller drives `background:step()` (or run_to_completion); on the final
+-- step the snapshot flips to VALIDATED (match) or INVALID (mismatch -> abort).
+--
+-- @param active_chain_state ChainState: the live chainstate to load into.
+-- @param snapshot_path string: path to the Core-format snapshot file.
+-- @param au_data table: assumeutxo entry for the base
+--                       ({hash_serialized=<hex>, ...}), from
+--                       consensus.assumeutxo_for_blockhash.
+-- @param base_height number: snapshot base height.
+-- @param get_block function: fn(height) -> block, block_hash for genesis..base
+--                            (reads from the node's block store).
+-- @param opts table|nil: { active_tip_height, mempool, bg_storage }.
+--                        bg_storage overrides the bg coins store (must NOT be
+--                        the active chainstate's storage); default in-memory.
+-- @return table|nil, string|nil: { snapshot, background } or nil, error.
+function M.activate_snapshot_with_background(active_chain_state, snapshot_path,
+                                             au_data, base_height, get_block, opts)
+  opts = opts or {}
+
+  -- assumeutxo HASH_SERIALIZED commitment as 32 raw bytes in compute_utxo_hash
+  -- order.  chainparams store it in uint256.ToString display order (big-endian
+  -- hex), so reverse the bytes (compute_utxo_hash convention, utxo.lua:5553-5557).
+  -- This is the hash the BACKGROUND chainstate re-derives and checks against.
+  local expected_hash = nil
+  if au_data and au_data.hash_serialized then
+    expected_hash = types.hash256_from_hex(au_data.hash_serialized).bytes
+  end
+
+  -- Step 1: load the snapshot into the ACTIVE chainstate (Core ActivateSnapshot).
+  --
+  -- Deliberately do NOT pass expected_hash here: the load-time HASH_SERIALIZED
+  -- gate in loadtxoutset is a separate concern (lunarblock W102 BUG-1, tracked
+  -- independently) and the existing live path loads without it.  The trustless
+  -- guarantee for this pilot is the BACKGROUND re-verification below, which
+  -- never trusts the loaded coins and rebuilds the set from genesis.  A caller
+  -- that wants the load-time gate too can pass opts.enforce_load_hash=true.
+  local load_expected = opts.enforce_load_hash and expected_hash or nil
+  local ok, lerr = active_chain_state:load_snapshot(
+    snapshot_path, load_expected, base_height, opts.active_tip_height, opts.mempool)
+  if not ok then
+    return nil, lerr or "snapshot load failed"
+  end
+  active_chain_state.tip_height = base_height
+
+  local snapshot = M.new_snapshot_chainstate(
+    active_chain_state, base_height, active_chain_state.tip_hash)
+
+  -- Guard: the bg coins store MUST be a different object from the active store.
+  if opts.bg_storage and opts.bg_storage == active_chain_state.storage then
+    return nil, "background storage must be separate from the active chainstate store"
+  end
+
+  -- Step 2: BACKGROUND chainstate (Core AddChainstate demotion).  Separate coins
+  -- store, genesis-seeded, targeting the snapshot base.
+  local background = M.new_background_validator(
+    opts.bg_storage,            -- nil => fresh in-memory store (separate object)
+    active_chain_state.network,
+    base_height,
+    expected_hash,
+    get_block)
+
+  -- Wire the verdict back to the snapshot chainstate's assumeutxo state.
+  background.on_validated = function()
+    snapshot:set_validated()
+    background:retire()
+  end
+  background.on_invalid = function(reason)
+    -- Core handle_invalid_snapshot: mark INVALID + fatal abort.  lunarblock has
+    -- no AbortNode in-process here; we mark INVALID and let the caller surface a
+    -- fatal condition (the validator's error is set and on_invalid fired).
+    snapshot:set_invalid()
+    snapshot.invalid_reason = reason
+  end
+
+  return { snapshot = snapshot, background = background }, nil
 end
 
 return M
