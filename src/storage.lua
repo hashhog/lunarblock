@@ -226,6 +226,272 @@ local function encode_height(height)
   )
 end
 
+--------------------------------------------------------------------------------
+-- High-level helpers shared by the RocksDB-backed store (M.open) and the
+-- in-memory store (M.new_memory_storage).
+--
+-- These build chain-tip / chaintx-count / header / block / height-index / undo
+-- accessors purely in terms of the low-level dbobj.get/put/delete primitives, so
+-- the SAME serialization + key layout is used regardless of whether the bytes
+-- live in RocksDB SSTs or a Lua table.  Factored out of M.open so the AssumeUTXO
+-- background chainstate (utxo.lua BackgroundValidator) can be given a genuinely
+-- separate coins DB without a second RocksDB instance on disk — mirroring Core's
+-- InitCoinsDB(..., in_memory=true) for an in-memory chainstate
+-- (bitcoin-core/src/validation.cpp:5670-5674).
+--------------------------------------------------------------------------------
+local CHAINTX_PREFIX = "chaintx:"
+
+local function attach_high_level_helpers(dbobj)
+  -- High-level helpers: chain tip
+  function dbobj.get_chain_tip()
+    local data = dbobj.get(M.CF.META, "chain_tip")
+    if not data or #data < 36 then
+      return nil, nil
+    end
+    local hash = types.hash256(data:sub(1, 32))
+    local r = serialize.buffer_reader(data:sub(33, 36))
+    local height = r.read_u32le()
+    return hash, height
+  end
+
+  function dbobj.set_chain_tip(hash, height, sync)
+    local w = serialize.buffer_writer()
+    w.write_hash256(hash)
+    w.write_u32le(height)
+    dbobj.put(M.CF.META, "chain_tip", w.result(), sync)
+  end
+
+  -- High-level helpers: cumulative transaction count by height
+  -- (Bitcoin Core's CBlockIndex::m_chain_tx_count analogue).
+  local function chaintx_key(height)
+    return CHAINTX_PREFIX .. encode_height(height)
+  end
+
+  function dbobj.get_chaintx_at_height(height)
+    if type(height) ~= "number" or height < 0 then return nil end
+    local data = dbobj.get(M.CF.META, chaintx_key(height))
+    if not data or #data ~= 8 then return nil end
+    local n = 0
+    for i = 8, 1, -1 do
+      n = n * 256 + data:byte(i)
+    end
+    return n
+  end
+
+  -- Encode an 8-byte little-endian count from a Lua number.
+  local function encode_count8(n)
+    local b = {}
+    local v = n
+    for i = 1, 8 do
+      b[i] = string.char(v % 256)
+      v = math.floor(v / 256)
+    end
+    return table.concat(b)
+  end
+
+  -- Direct (non-batched) write — used by genesis seeding paths.
+  function dbobj.put_chaintx_at_height(height, count, sync)
+    dbobj.put(M.CF.META, chaintx_key(height), encode_count8(count), sync)
+  end
+
+  -- Expose the key + encoder so connect_block can fold the cumulative-count
+  -- write into its existing atomic WriteBatch (chain_tip is the last op).
+  dbobj.chaintx_meta_key = chaintx_key
+  dbobj.encode_chaintx_count = encode_count8
+
+  -- High-level helpers: block headers
+  function dbobj.get_header(block_hash)
+    local data = dbobj.get(M.CF.HEADERS, block_hash.bytes)
+    if not data then return nil end
+    return serialize.deserialize_block_header(data)
+  end
+
+  function dbobj.put_header(block_hash, header)
+    local data = serialize.serialize_block_header(header)
+    dbobj.put(M.CF.HEADERS, block_hash.bytes, data)
+  end
+
+  -- High-level helpers: full blocks
+  function dbobj.get_block(block_hash)
+    local data = dbobj.get(M.CF.BLOCKS, block_hash.bytes)
+    if not data then return nil end
+    return serialize.deserialize_block(data)
+  end
+
+  function dbobj.put_block(block_hash, blk)
+    local data = serialize.serialize_block(blk)
+    dbobj.put(M.CF.BLOCKS, block_hash.bytes, data)
+  end
+
+  -- High-level helpers: height index
+  function dbobj.get_hash_by_height(height)
+    local key = encode_height(height)
+    local data = dbobj.get(M.CF.HEIGHT_INDEX, key)
+    if not data or #data ~= 32 then return nil end
+    return types.hash256(data)
+  end
+
+  function dbobj.put_height_index(height, block_hash)
+    local key = encode_height(height)
+    dbobj.put(M.CF.HEIGHT_INDEX, key, block_hash.bytes)
+  end
+
+  -- High-level helpers: undo data
+  function dbobj.get_undo(block_hash)
+    return dbobj.get(M.CF.UNDO, block_hash.bytes)
+  end
+
+  function dbobj.put_undo(block_hash, undo_data, sync)
+    dbobj.put(M.CF.UNDO, block_hash.bytes, undo_data, sync)
+  end
+
+  function dbobj.delete_undo(block_hash, sync)
+    dbobj.delete(M.CF.UNDO, block_hash.bytes, sync)
+  end
+
+  return dbobj
+end
+
+--------------------------------------------------------------------------------
+-- In-memory storage backend.
+--
+-- Implements the exact same dbobj interface as M.open (get/put/delete/batch/
+-- iterator + the high-level helpers above), but stores values in a per-CF Lua
+-- table instead of RocksDB.  Iteration returns keys in bytewise-ascending order
+-- to match RocksDB's leveldb-comparator semantics, which compute_utxo_hash and
+-- dump_snapshot rely on (utxo.lua:5041, 5197).
+--
+-- This is the lunarblock analog of a Core in-memory CCoinsViewDB.  Its only
+-- production use today is the AssumeUTXO BACKGROUND chainstate, which needs its
+-- OWN coins DB that is a genuinely separate object from the active (snapshot)
+-- chainstate's UTXO store — see utxo.lua activate_snapshot_with_background /
+-- BackgroundValidator and bitcoin-core/src/validation.cpp:6170 AddChainstate
+-- (which demotes the genesis-validated chainstate to a background chainstate
+-- keeping its own m_coins_views).
+--------------------------------------------------------------------------------
+function M.new_memory_storage()
+  -- One sorted-on-iteration map per column family.
+  local cfs = {}
+  for _, cf_name in ipairs(CF_LIST) do
+    cfs[cf_name] = {}
+  end
+
+  local function cf_table(cf)
+    local t = cfs[cf]
+    if not t then
+      error("Unknown column family: " .. tostring(cf))
+    end
+    return t
+  end
+
+  local dbobj = {
+    _memory = true,
+    _cfs = cfs,
+    -- Surfaced by getchainstates as coins_db_cache_bytes; an in-memory store
+    -- has no RocksDB LRU block cache, so report 0 (Core reports the configured
+    -- cache for the chainstate; an in-memory bg chainstate's is negligible).
+    _block_cache_bytes = 0,
+    CF = M.CF,
+  }
+
+  function dbobj.get(cf, key)
+    return cf_table(cf)[key]
+  end
+
+  function dbobj.put(cf, key, value, _sync)
+    cf_table(cf)[key] = value
+  end
+
+  function dbobj.delete(cf, key, _sync)
+    cf_table(cf)[key] = nil
+  end
+
+  function dbobj.batch()
+    -- Buffer ops and apply atomically on write() (RocksDB WriteBatch parity).
+    local ops = {}
+    local batch = {}
+
+    function batch.put(cf, key, value)
+      cf_table(cf)  -- validate CF eagerly, like the RocksDB batch
+      ops[#ops + 1] = { kind = "put", cf = cf, key = key, value = value }
+    end
+
+    function batch.delete(cf, key)
+      cf_table(cf)
+      ops[#ops + 1] = { kind = "del", cf = cf, key = key }
+    end
+
+    function batch.write(_sync)
+      for _, op in ipairs(ops) do
+        if op.kind == "put" then
+          cfs[op.cf][op.key] = op.value
+        else
+          cfs[op.cf][op.key] = nil
+        end
+      end
+    end
+
+    function batch.clear()
+      ops = {}
+    end
+
+    function batch.destroy()
+      ops = nil
+    end
+
+    return batch
+  end
+
+  function dbobj.iterator(cf)
+    local t = cf_table(cf)
+    -- Snapshot the keys in bytewise order at construction (RocksDB iterators
+    -- are point-in-time snapshots; the bg validator never mutates a CF while
+    -- iterating it, so a one-shot sorted key list is faithful and simple).
+    local keys = {}
+    for k in pairs(t) do keys[#keys + 1] = k end
+    table.sort(keys)  -- Lua string '<' is bytewise/lexicographic == leveldb cmp
+    local pos = 0
+    local iter = {}
+
+    function iter.seek_to_first() pos = 1 end
+    function iter.seek_to_last() pos = #keys end
+
+    function iter.seek(key)
+      -- First key >= `key` (RocksDB Seek semantics).
+      pos = #keys + 1
+      for i = 1, #keys do
+        if keys[i] >= key then pos = i; break end
+      end
+    end
+
+    function iter.valid() return pos >= 1 and pos <= #keys end
+    function iter.next() pos = pos + 1 end
+    function iter.prev() pos = pos - 1 end
+
+    function iter.key()
+      if pos < 1 or pos > #keys then return nil end
+      return keys[pos]
+    end
+
+    function iter.value()
+      local k = iter.key()
+      if k == nil then return nil end
+      return t[k]
+    end
+
+    function iter.destroy() keys = nil end
+
+    return iter
+  end
+
+  function dbobj.close()
+    dbobj._cfs = nil
+    for k in pairs(cfs) do cfs[k] = nil end
+  end
+
+  return attach_high_level_helpers(dbobj)
+end
+
 -- Open a RocksDB database
 function M.open(path, cache_size_mb)
   cache_size_mb = cache_size_mb or 2048
@@ -565,123 +831,11 @@ function M.open(path, cache_size_mb)
     return iter
   end
 
-  -- High-level helpers: chain tip
-  function dbobj.get_chain_tip()
-    local data = dbobj.get(M.CF.META, "chain_tip")
-    if not data or #data < 36 then
-      return nil, nil
-    end
-    local hash = types.hash256(data:sub(1, 32))
-    local r = serialize.buffer_reader(data:sub(33, 36))
-    local height = r.read_u32le()
-    return hash, height
-  end
-
-  function dbobj.set_chain_tip(hash, height, sync)
-    local w = serialize.buffer_writer()
-    w.write_hash256(hash)
-    w.write_u32le(height)
-    dbobj.put(M.CF.META, "chain_tip", w.result(), sync)
-  end
-
-  -- High-level helpers: cumulative transaction count by height
-  -- (Bitcoin Core's CBlockIndex::m_chain_tx_count analogue — the total number
-  -- of transactions in the chain from genesis up to and including the block at
-  -- this height).  Stored as an 8-byte little-endian count keyed by the same
-  -- 4-byte big-endian height encoding the HEIGHT_INDEX uses, in CF.META under
-  -- the "chaintx:" prefix.  Maintained as an O(1) running counter in
-  -- connect_block (prev_cumulative + #block.transactions) and read by the
-  -- getchaintxstats RPC.  Because each height key is overwritten by the
-  -- most-recently-connected block at that height, the value for an active-chain
-  -- height always reflects the active-chain block (reorg-safe).
-  local CHAINTX_PREFIX = "chaintx:"
-
-  local function chaintx_key(height)
-    return CHAINTX_PREFIX .. encode_height(height)
-  end
-
-  function dbobj.get_chaintx_at_height(height)
-    if type(height) ~= "number" or height < 0 then return nil end
-    local data = dbobj.get(M.CF.META, chaintx_key(height))
-    if not data or #data ~= 8 then return nil end
-    -- 8-byte little-endian -> Lua number.  Tx counts stay well under 2^53.
-    local n = 0
-    for i = 8, 1, -1 do
-      n = n * 256 + data:byte(i)
-    end
-    return n
-  end
-
-  -- Encode an 8-byte little-endian count from a Lua number.
-  local function encode_count8(n)
-    local b = {}
-    local v = n
-    for i = 1, 8 do
-      b[i] = string.char(v % 256)
-      v = math.floor(v / 256)
-    end
-    return table.concat(b)
-  end
-
-  -- Direct (non-batched) write — used by genesis seeding paths.
-  function dbobj.put_chaintx_at_height(height, count, sync)
-    dbobj.put(M.CF.META, chaintx_key(height), encode_count8(count), sync)
-  end
-
-  -- Expose the key + encoder so connect_block can fold the cumulative-count
-  -- write into its existing atomic WriteBatch (chain_tip is the last op).
-  dbobj.chaintx_meta_key = chaintx_key
-  dbobj.encode_chaintx_count = encode_count8
-
-  -- High-level helpers: block headers
-  function dbobj.get_header(block_hash)
-    local data = dbobj.get(M.CF.HEADERS, block_hash.bytes)
-    if not data then return nil end
-    return serialize.deserialize_block_header(data)
-  end
-
-  function dbobj.put_header(block_hash, header)
-    local data = serialize.serialize_block_header(header)
-    dbobj.put(M.CF.HEADERS, block_hash.bytes, data)
-  end
-
-  -- High-level helpers: full blocks
-  function dbobj.get_block(block_hash)
-    local data = dbobj.get(M.CF.BLOCKS, block_hash.bytes)
-    if not data then return nil end
-    return serialize.deserialize_block(data)
-  end
-
-  function dbobj.put_block(block_hash, blk)
-    local data = serialize.serialize_block(blk)
-    dbobj.put(M.CF.BLOCKS, block_hash.bytes, data)
-  end
-
-  -- High-level helpers: height index
-  function dbobj.get_hash_by_height(height)
-    local key = encode_height(height)
-    local data = dbobj.get(M.CF.HEIGHT_INDEX, key)
-    if not data or #data ~= 32 then return nil end
-    return types.hash256(data)
-  end
-
-  function dbobj.put_height_index(height, block_hash)
-    local key = encode_height(height)
-    dbobj.put(M.CF.HEIGHT_INDEX, key, block_hash.bytes)
-  end
-
-  -- High-level helpers: undo data
-  function dbobj.get_undo(block_hash)
-    return dbobj.get(M.CF.UNDO, block_hash.bytes)
-  end
-
-  function dbobj.put_undo(block_hash, undo_data, sync)
-    dbobj.put(M.CF.UNDO, block_hash.bytes, undo_data, sync)
-  end
-
-  function dbobj.delete_undo(block_hash, sync)
-    dbobj.delete(M.CF.UNDO, block_hash.bytes, sync)
-  end
+  -- High-level helpers (chain tip / chaintx count / headers / blocks / height
+  -- index / undo) are shared with the in-memory backend; see
+  -- attach_high_level_helpers above.  They are defined purely in terms of the
+  -- low-level dbobj.get/put/delete primitives installed just above.
+  attach_high_level_helpers(dbobj)
 
   -- Close the database
   function dbobj.close()
