@@ -413,6 +413,10 @@ function M.open(path, cache_size_mb)
     _options = options,
     _table_options = table_options,
     _cache = cache,
+    -- Configured RocksDB LRU block-cache size in bytes. This is the
+    -- chainstate coins-DB cache budget (Core's
+    -- Chainstate::m_coinsdb_cache_size_bytes), surfaced by getchainstates.
+    _block_cache_bytes = cache_size,
     _read_opts = read_opts,
     _write_opts = write_opts,
     _write_opts_sync = write_opts_sync,
