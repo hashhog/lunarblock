@@ -2253,9 +2253,29 @@ function RPCServer:register_methods()
       coins_tip_cache_bytes = rpc.chain_state.coin_view.max_cache_bytes
     end
 
-    -- Single fully-validated chainstate (no AssumeUTXO snapshot active):
-    -- snapshot_blockhash OMITTED, validated == true.  Field order mirrors
-    -- Core make_chain_data exactly.
+    -- AssumeUTXO awareness (Core getchainstates lists BOTH chainstates while a
+    -- snapshot is loaded but not yet background-validated; the snapshot/active
+    -- one is the most-work entry and comes LAST).  When a snapshot is active:
+    --   * the ACTIVE (snapshot) chainstate carries snapshot_blockhash and
+    --     validated == (m_assumeutxo == VALIDATED) — false while the background
+    --     pass runs, true once it matched the base UTXO hash.
+    -- Core make_chain_data: bitcoin-core/src/rpc/blockchain.cpp:3462-3519.
+    local snap = rpc.snapshot_chainstate
+    local active_validated = true
+    local snapshot_blockhash_hex = nil
+    if snap then
+      active_validated = snap:is_validated()
+      if snap.snapshot_hash then
+        snapshot_blockhash_hex = types.hash256_hex(snap.snapshot_hash)
+      elseif snap.chain_state and snap.chain_state.from_snapshot_blockhash then
+        snapshot_blockhash_hex =
+          types.hash256_hex(snap.chain_state.from_snapshot_blockhash)
+      end
+    end
+
+    -- Active chainstate entry.  snapshot_blockhash is emitted only for a
+    -- from-snapshot chainstate (Core only sets it when m_from_snapshot_blockhash
+    -- is present); field order mirrors Core make_chain_data.
     local cs_seq = {
       "blocks",               tip_height,
       "bestblockhash",        types.hash256_hex(tip_hash),
@@ -2263,13 +2283,22 @@ function RPCServer:register_methods()
       "target",               bits_to_target_hex(tip_bits),
       "difficulty",           M._oj_g16(difficulty),
       "verificationprogress", verification_progress,
-      "coins_db_cache_bytes", coins_db_cache_bytes,
-      "coins_tip_cache_bytes", coins_tip_cache_bytes,
-      "validated",            true,
     }
+    if snapshot_blockhash_hex then
+      cs_seq[#cs_seq + 1] = "snapshot_blockhash"
+      cs_seq[#cs_seq + 1] = snapshot_blockhash_hex
+    end
+    cs_seq[#cs_seq + 1] = "coins_db_cache_bytes"
+    cs_seq[#cs_seq + 1] = coins_db_cache_bytes
+    cs_seq[#cs_seq + 1] = "coins_tip_cache_bytes"
+    cs_seq[#cs_seq + 1] = coins_tip_cache_bytes
+    cs_seq[#cs_seq + 1] = "validated"
+    cs_seq[#cs_seq + 1] = active_validated
 
     -- chainstates is ordered most-work LAST; with one chainstate that is
-    -- trivially the lone element.
+    -- trivially the lone element.  (lunarblock keeps a single live ChainState
+    -- in-process; the background chainstate is an internal validator, not a
+    -- separately tip-tracked chainstate, so it is not emitted as a second row.)
     local chainstates = M._oj_array({ M._oj(cs_seq) })
 
     local seq = {
@@ -10291,15 +10320,47 @@ function RPCServer:register_methods()
     end
 
     -- Pass au_height as base_height (BUG-6), the current IBD tip as
-    -- active_tip_height (BUG-4), and the mempool handle (BUG-5) so that
-    -- load_snapshot can enforce all Core precondition gates.
+    -- active_tip_height (BUG-4), and the mempool handle (BUG-5) so that the
+    -- dual-chainstate activation can enforce all Core precondition gates.
+    --
+    -- Core AssumeUTXO is a DUAL-chainstate operation (validation.cpp):
+    --   ActivateSnapshot loads the snapshot into the ACTIVE chainstate, and
+    --   AddChainstate demotes the genesis-validated chainstate to a BACKGROUND
+    --   chainstate that re-derives the UTXO set genesis->base in its OWN coins
+    --   DB and validates the assumeutxo hash by independent re-computation
+    --   (MaybeValidateSnapshot).  We mirror that here: the snapshot is loaded
+    --   into rpc.chain_state, and a background chainstate (separate in-memory
+    --   coins store) is spun up to trustlessly re-verify the base UTXO hash.
     local active_tip = rpc.chain_state and rpc.chain_state.tip_height
-    local ok, lerr = rpc.chain_state:load_snapshot(
-      path, nil, au_height, active_tip, rpc.mempool)
-    if not ok then
-      error({code = M.ERROR.MISC_ERROR,
-        message = lerr or "load failed"})
+
+    -- get_block(height) for the background pass: read canonical blocks from the
+    -- node's block store by height (the bg chainstate owns only its coins, not
+    -- the block bodies — Core shares BlockManager across chainstates).
+    local function bg_get_block(height)
+      if not (rpc.storage and rpc.storage.get_hash_by_height
+          and rpc.storage.get_block) then
+        return nil
+      end
+      local bh = rpc.storage.get_hash_by_height(height)
+      if not bh then return nil end
+      local blk = rpc.storage.get_block(bh)
+      if not blk then return nil end
+      return blk, bh
     end
+
+    local activation, aerr = utxo_mod.activate_snapshot_with_background(
+      rpc.chain_state, path, au_data, au_height, bg_get_block,
+      { active_tip_height = active_tip, mempool = rpc.mempool })
+    if not activation then
+      error({code = M.ERROR.MISC_ERROR,
+        message = aerr or "load failed"})
+    end
+
+    -- Stash the dual-chainstate handle so getchainstates can surface the
+    -- snapshot chainstate's validated state (false while the bg pass runs,
+    -- true after a successful match) and a background tick can drive it.
+    rpc.snapshot_chainstate = activation.snapshot
+    rpc.background_validator = activation.background
 
     -- Update the in-memory tip height to match the snapshot base.
     rpc.chain_state.tip_height = au_height
@@ -10307,11 +10368,45 @@ function RPCServer:register_methods()
       rpc.storage.set_chain_tip(rpc.chain_state.tip_hash, au_height, true)
     end
 
+    -- Best-effort: drive the background validation now if every block
+    -- genesis->base is already present in the block store (e.g. a node that
+    -- snapshotted from its own chain, or regtest).  If the historical blocks
+    -- are not yet present (normal fast-sync), the bg validator simply stays
+    -- UNVALIDATED — getchainstates reports validated=false — until the node's
+    -- maintenance loop backfills the blocks and ticks background:step().
+    --
+    -- Core runs MaybeValidateSnapshot ASYNCHRONOUSLY (after ActivateSnapshot
+    -- returns), so loadtxoutset itself SUCCEEDS even when the background pass
+    -- will later reject: a HASH MISMATCH triggers a fatal AbortNode in the
+    -- background, not an error from the loadtxoutset call.  We mirror that —
+    -- loadtxoutset returns success, and the verdict is surfaced via
+    -- getchainstates (validated/invalid) + the snapshot chainstate state.  The
+    -- synchronous fatal-on-mismatch contract is exercised by the orchestrator's
+    -- on_invalid callback (see utxo.activate_snapshot_with_background and the
+    -- dual-chainstate spec), not by this RPC return.
+    if bg_get_block(au_height) ~= nil or au_height == 0 then
+      local bg = activation.background
+      -- Step until done, blocked (missing block), or proven invalid.
+      while not bg.validated and not bg.error do
+        local prev = bg.current_height
+        bg:step()
+        if bg.current_height == prev and not bg.validated and not bg.error then
+          break  -- no forward progress: a block was missing, stop best-effort
+        end
+      end
+    end
+
     return {
-      coins_loaded     = meta.coins_count,
+      -- coins_count is a uint64_t cdata from the metadata reader; coerce to a
+      -- Lua number so cjson can serialize the result (coin counts stay < 2^53).
+      coins_loaded     = tonumber(meta.coins_count),
       tip_hash         = base_hash_hex,
       base_height      = au_height,
       path             = path,
+      -- AssumeUTXO validated state (Core getchainstates.validated): true once
+      -- the background chainstate re-derived the same base UTXO hash.
+      validated        = rpc.snapshot_chainstate
+                         and rpc.snapshot_chainstate:is_validated() or false,
     }
   end
 end
