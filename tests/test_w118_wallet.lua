@@ -566,20 +566,23 @@ test("G28: BUG — lockunspent / listlockunspent absent (G28-BUG-11)", function(
       "Core wallet/rpc/coins.cpp.")
 end)
 
--- G29: BUG — importdescriptors / listdescriptors absent (watch-only support)
-test("G29: BUG — importdescriptors / listdescriptors absent (G29-BUG-12)", function()
+-- G29: FIXED — importdescriptors / listdescriptors present (watch-only support).
+-- Originally G29-BUG-12 (both RPCs + the descriptor-import path were absent).
+-- importdescriptors landed first (registers watch-only descriptors into the
+-- owned-script view via Wallet:add_watch_descriptor); listdescriptors now dumps
+-- them in Core shape (wallet/rpc/backup.cpp::listdescriptors). Functional
+-- coverage for the listdescriptors output shape + checksum lives in
+-- tests/test_listdescriptors.lua.
+test("G29: FIXED — importdescriptors / listdescriptors present (G29-BUG-12)", function()
   local rpc_src = io.open("src/rpc.lua", "r"):read("*a")
-  expect_nil(rpc_src:find('self%.methods%["importdescriptors"%]'),
-             "importdescriptors absent")
-  expect_nil(rpc_src:find('self%.methods%["listdescriptors"%]'),
-             "listdescriptors absent")
-  -- The wallet only generates from its master_key — no descriptor import.
+  expect_true(rpc_src:find('self%.methods%["importdescriptors"%]') ~= nil,
+              "importdescriptors present")
+  expect_true(rpc_src:find('self%.methods%["listdescriptors"%]') ~= nil,
+              "listdescriptors present")
+  -- The wallet now has a descriptor-import path (watch-only descriptors).
   local w_src = io.open("src/wallet.lua", "r"):read("*a")
-  expect_nil(w_src:find("function.*import_descriptor"), "no import_descriptor method")
-  bug("G29-BUG-12", "P1",
-      "importdescriptors + listdescriptors RPCs absent and wallet has no " ..
-      "descriptor-import path. Watch-only descriptor wallets (Core's default " ..
-      "since 23.0) are not supported. wallet/rpc/backup.cpp.")
+  expect_true(w_src:find("function Wallet:add_watch_descriptor") ~= nil,
+              "add_watch_descriptor present")
 end)
 
 -- G30: BUG — gettransaction wallet RPC absent (listtransactions IS wired).

@@ -8220,6 +8220,96 @@ function RPCServer:register_methods()
     return results
   end
 
+  --- listdescriptors: dump the descriptors present in a (watch-only) wallet.
+  --
+  -- Mirrors bitcoin-core/src/wallet/rpc/backup.cpp::listdescriptors. Response is
+  -- an object { wallet_name, descriptors=[...] } where descriptors is SORTED by
+  -- the descriptor string (Core sorts wallet_descriptors by `descriptor`). Each
+  -- entry carries:
+  --   desc      — the descriptor string WITH its trailing "#checksum" (the form
+  --               stored at import time; the checksum was REQUIRE-validated then).
+  --   timestamp — the descriptor's creation/import time (info.ts).
+  --   active    — whether this descriptor generates new addresses. lunarblock's
+  --               importdescriptors registers WATCH-ONLY descriptors into the
+  --               owned-script view but never wires them as an active
+  --               ScriptPubKeyMan, so this is always false (Core's
+  --               active_spk_mans.contains() would likewise be false).
+  --   internal  — emitted ONLY for active descriptors (Core gates this on
+  --               IsInternalScriptPubKeyMan, an optional<bool> that has a value
+  --               only for active managers). Watch-only imports are non-active,
+  --               so `internal` is OMITTED here, matching Core.
+  --   range / next / next_index — emitted ONLY for ranged descriptors. The
+  --               watch store holds single (non-ranged) descriptors, so these
+  --               are omitted, matching Core's `is_range ? ... : std::nullopt`.
+  --
+  -- private=true: Core throws RPC_WALLET_ERROR for a watch-only wallet
+  -- (WALLET_FLAG_DISABLE_PRIVATE_KEYS) — "Can't get private descriptor string
+  -- for watch-only wallets". lunarblock's descriptor store is watch-only (it
+  -- only ever holds the public form), so we mirror that throw rather than
+  -- fabricate an xprv. For a keyed wallet there are no stored descriptors, so
+  -- private=true simply yields an empty list.
+  --
+  -- @param params[1] private bool (default false): show private descriptors.
+  -- @return table: { wallet_name = <string>, descriptors = [<obj>...] }
+  self.methods["listdescriptors"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+
+    -- private flag (backup.cpp:499): null/false default; only true shows priv.
+    local priv_field = params[1]
+    if priv_field == nil then priv_field = params["private"] end
+    local priv = priv_field == true
+
+    -- Watch-only wallets cannot produce a private descriptor string
+    -- (backup.cpp:500-502). lunarblock's descriptor store is watch-only.
+    if priv and (wallet.private_keys_enabled == false) then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Can't get private descriptor string for watch-only wallets"})
+    end
+
+    -- Resolve the wallet name the same way getwalletinfo does (key in the
+    -- wallet_manager table; legacy single-wallet mode has no name -> "").
+    local wallet_name = ""
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then
+          wallet_name = name
+          break
+        end
+      end
+    end
+
+    -- Collect the stored watch-only descriptors. info.desc already carries the
+    -- "#checksum" suffix (set at import time). These are non-active, non-ranged
+    -- in this impl, so we emit only desc/timestamp/active (Core omits internal
+    -- + range/next for non-active, non-ranged descriptors).
+    local entries = {}
+    if wallet.watch_addrs then
+      for _, info in pairs(wallet.watch_addrs) do
+        entries[#entries + 1] = {
+          desc = info.desc,
+          timestamp = info.ts or 0,
+          active = false,
+        }
+      end
+    end
+
+    -- Sort by descriptor string (backup.cpp:541-543: a.descriptor < b.descriptor).
+    table.sort(entries, function(a, b) return a.desc < b.desc end)
+
+    local descriptors = setmetatable({}, cjson.empty_array_mt)
+    for i = 1, #entries do
+      descriptors[i] = entries[i]
+    end
+
+    return {
+      wallet_name = wallet_name,
+      descriptors = descriptors,
+    }
+  end
+
   --- getaddressinfo: report wallet-relevant metadata for an address.
   --
   -- Mirrors bitcoin-core/src/wallet/rpc/addresses.cpp::getaddressinfo
