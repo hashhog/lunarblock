@@ -2160,6 +2160,125 @@ function RPCServer:register_methods()
     return types.hash256_hex(types.hash256_zero())
   end
 
+  --- getchainstates
+  -- Return information about chainstates.  Core-shaped:
+  -- bitcoin-core/src/rpc/blockchain.cpp getchainstates (3462-3519) +
+  -- RPCHelpForChainstate (3449-3460).  Output object:
+  --   headers      — best-header height seen so far (-1 if none; Core
+  --                  chainman.m_best_header ? nHeight : -1)
+  --   chainstates  — ARRAY ordered by work with the most-work (ACTIVE)
+  --                  chainstate LAST.  lunarblock has a single fully-validated
+  --                  chainstate (no AssumeUTXO snapshot active), so this is a
+  --                  1-element array.  Each entry:
+  --     blocks                — active chainstate tip height
+  --     bestblockhash         — tip block hash hex
+  --     bits                  — tip nBits, "%08x" (Core strprintf("%08x", nBits))
+  --     target                — tip difficulty target, 64-char hex (Core GetTarget)
+  --     difficulty            — tip difficulty (Core GetDifficulty), %.16g
+  --     verificationprogress  — progress towards the network tip [0..1]
+  --     snapshot_blockhash    — OPTIONAL; emitted only for a from-snapshot
+  --                             chainstate.  OMITTED here (no snapshot active).
+  --     coins_db_cache_bytes  — configured chainstate coins-DB cache (the
+  --                             RocksDB LRU block cache, db._block_cache_bytes;
+  --                             Core cs.m_coinsdb_cache_size_bytes)
+  --     coins_tip_cache_bytes — configured coins-tip (UTXO) cache in bytes
+  --                             (coin_view.max_cache_bytes; Core
+  --                             cs.m_coinstip_cache_size_bytes)
+  --     validated             — true (single fully-validated chainstate; Core
+  --                             cs.m_assumeutxo == Assumeutxo::VALIDATED)
+  self.methods["getchainstates"] = function(rpc, _params)
+    -- headers: best-header height seen so far.  Prefer the header chain's tip
+    -- (Core chainman.m_best_header); fall back to chain_state's header tip,
+    -- then the block tip, then -1 (no headers).
+    local headers = -1
+    if rpc.header_chain and rpc.header_chain.header_tip_height
+        and rpc.header_chain.header_tip_height >= 0 then
+      headers = rpc.header_chain.header_tip_height
+    elseif rpc.chain_state and rpc.chain_state.header_tip_height
+        and rpc.chain_state.header_tip_height >= 0 then
+      headers = rpc.chain_state.header_tip_height
+    elseif rpc.chain_state and rpc.chain_state.tip_height
+        and rpc.chain_state.tip_height >= 0 then
+      headers = rpc.chain_state.tip_height
+    end
+
+    -- Active chainstate tip.
+    local tip_height = -1
+    local tip_hash = types.hash256_zero()
+    if rpc.chain_state then
+      tip_height = rpc.chain_state.tip_height
+      if tip_height == nil then tip_height = -1 end
+      tip_hash = rpc.chain_state.tip_hash or types.hash256_zero()
+    end
+
+    -- Tip nBits drives bits/target/difficulty.  Read the genuine tip header
+    -- (same source getblockchaininfo/getblock use); fall back to the network
+    -- pow-limit bits when the tip header is unavailable (e.g. empty chain).
+    local tip_bits = rpc.network.pow_limit_bits
+    if rpc.storage and rpc.chain_state and rpc.chain_state.tip_hash then
+      local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
+      if header then tip_bits = header.bits end
+    end
+    local difficulty = calculate_difficulty(tip_bits)
+
+    -- verificationprogress: same estimate getblockchaininfo emits (Core
+    -- GuessVerificationProgress; lunarblock approximates against an estimated
+    -- network height per chain).  Clamp to [0,1].
+    local estimated_total_blocks = 880000
+    if rpc.network.name == "testnet" or rpc.network.name == "testnet4" then
+      estimated_total_blocks = 2800000
+    elseif rpc.network.name == "regtest" then
+      estimated_total_blocks = tip_height > 0 and tip_height or 1
+    end
+    local verification_progress = (tip_height > 0 and tip_height or 0) / estimated_total_blocks
+    if verification_progress > 1.0 then verification_progress = 1.0 end
+    if verification_progress < 0.0 then verification_progress = 0.0 end
+
+    -- Genuine cache budgets:
+    --   coins_db_cache_bytes  = chainstate RocksDB LRU block-cache size
+    --                           (storage.open's cache_size; db._block_cache_bytes).
+    --   coins_tip_cache_bytes = UTXO (coins-tip) cache budget
+    --                           (coin_view.max_cache_bytes).
+    -- Both are read from live node state — never fabricated.  If either is
+    -- genuinely untracked, fall back to the configured dbcache default (450MB,
+    -- M.configure_cache_size with no opts == DEFAULT_CACHE_SIZE_MB).
+    local default_cache_bytes = 450 * 1024 * 1024
+    local coins_db_cache_bytes = default_cache_bytes
+    if rpc.storage and rpc.storage._block_cache_bytes then
+      coins_db_cache_bytes = rpc.storage._block_cache_bytes
+    end
+    local coins_tip_cache_bytes = default_cache_bytes
+    if rpc.chain_state and rpc.chain_state.coin_view
+        and rpc.chain_state.coin_view.max_cache_bytes then
+      coins_tip_cache_bytes = rpc.chain_state.coin_view.max_cache_bytes
+    end
+
+    -- Single fully-validated chainstate (no AssumeUTXO snapshot active):
+    -- snapshot_blockhash OMITTED, validated == true.  Field order mirrors
+    -- Core make_chain_data exactly.
+    local cs_seq = {
+      "blocks",               tip_height,
+      "bestblockhash",        types.hash256_hex(tip_hash),
+      "bits",                 string.format("%08x", tip_bits),
+      "target",               bits_to_target_hex(tip_bits),
+      "difficulty",           M._oj_g16(difficulty),
+      "verificationprogress", verification_progress,
+      "coins_db_cache_bytes", coins_db_cache_bytes,
+      "coins_tip_cache_bytes", coins_tip_cache_bytes,
+      "validated",            true,
+    }
+
+    -- chainstates is ordered most-work LAST; with one chainstate that is
+    -- trivially the lone element.
+    local chainstates = M._oj_array({ M._oj(cs_seq) })
+
+    local seq = {
+      "headers",     headers,
+      "chainstates", chainstates,
+    }
+    return { _raw_json = M._oj_encode(M._oj(seq)) }
+  end
+
   --- getchaintxstats ( nblocks "blockhash" )
   -- Compute statistics about the total number and rate of transactions in the
   -- chain.  Core-shaped: bitcoin-core/src/rpc/blockchain.cpp getchaintxstats
