@@ -8750,6 +8750,115 @@ function RPCServer:register_methods()
     return result
   end
 
+  --- fund_transaction_core: shared coin-selection / change engine.
+  --
+  -- This is the single funding engine behind BOTH walletcreatefundedpsbt and
+  -- fundrawtransaction — the same split Core uses, where both RPCs funnel into
+  -- FundTransaction() (bitcoin-core/src/wallet/rpc/spend.cpp:470).  Given a tx
+  -- that already has its outputs (and possibly some user inputs) built, it
+  -- selects wallet UTXOs to cover total-out + fee and appends a change output.
+  --
+  -- @param rpc        the RPC server (for storage fallback)
+  -- @param wallet     the resolved request wallet
+  -- @param st         working state table with:
+  --                     inputs       (array of txin, in/out — appended to)
+  --                     input_utxos  (parallel array of {value,script_pubkey}|nil)
+  --                     outputs      (array of txout, in/out — change spliced in)
+  --                     total_out    (sum of output values, sats)
+  --                     user_total_in(sum of resolvable user-input values, sats)
+  --                     options      (feeRate/conf_target/changeAddress/
+  --                                   changePosition table)
+  -- @return fee (sats), change_pos (int, -1 if none added)
+  local function fund_transaction_core(rpc, wallet, st)
+    local wallet_mod = require("lunarblock.wallet")
+    local options = st.options or {}
+    local inputs = st.inputs
+    local input_utxos = st.input_utxos
+    local outputs = st.outputs
+    local total_out = st.total_out
+    local user_total_in = st.user_total_in
+
+    -- Fee model mirrors walletcreatefundedpsbt: estimate vsize from the segwit
+    -- input/output approximations, charge fee_rate * vsize.
+    local fee_rate = options.feeRate or wallet:estimate_fee_rate(options.conf_target) or 1
+    local est_overhead = 11
+    local est_input_vsize = 68
+    local est_output_vsize = 31
+    local est_vsize = est_overhead + (#inputs + 1) * est_input_vsize
+                      + (#outputs + 1) * est_output_vsize
+    local fee = math.ceil(est_vsize * fee_rate)
+
+    local needed = total_out + fee - user_total_in
+    local change_pos = -1
+    local change = 0
+
+    if needed > 0 then
+      -- Skip user-claimed UTXOs to avoid double-spending.
+      local claimed = {}
+      for _, inp in ipairs(inputs) do
+        local k = inp.prev_out.hash.bytes .. string.char(
+          bit.band(inp.prev_out.index, 0xFF),
+          bit.band(bit.rshift(inp.prev_out.index, 8), 0xFF),
+          bit.band(bit.rshift(inp.prev_out.index, 16), 0xFF),
+          bit.band(bit.rshift(inp.prev_out.index, 24), 0xFF))
+        claimed[k] = true
+      end
+      local available = {}
+      for k, u in pairs(wallet.utxos) do
+        if not claimed[k] then
+          available[#available + 1] = {utxo = u, key = k}
+        end
+      end
+      if #available == 0 then
+        error({code = M.ERROR.WALLET_ERROR, message = "Insufficient funds"})
+      end
+      local selected = wallet_mod.select_coins(available, needed, fee_rate)
+      if not selected then
+        error({code = M.ERROR.WALLET_ERROR, message = "Insufficient funds"})
+      end
+      local extra_in = 0
+      for _, item in ipairs(selected) do
+        inputs[#inputs + 1] = types.txin(
+          types.outpoint(item.utxo.txid, item.utxo.vout), "", 0xFFFFFFFD)
+        input_utxos[#input_utxos + 1] = {
+          value = item.utxo.value, script_pubkey = item.utxo.script_pubkey}
+        extra_in = extra_in + item.utxo.value
+      end
+
+      -- Recompute fee + change with the final input count.
+      est_vsize = est_overhead + #inputs * est_input_vsize
+                  + (#outputs + 1) * est_output_vsize
+      fee = math.ceil(est_vsize * fee_rate)
+      local total_in = user_total_in + extra_in
+      change = total_in - total_out - fee
+      if change > wallet_mod.DUST_THRESHOLD then
+        local change_address = options.changeAddress or wallet:get_change_address()
+        local ct, cp = address_mod.decode_address(change_address,
+          rpc.network and rpc.network.name)
+        local cspk
+        if ct == "p2wpkh" then cspk = script_mod.make_p2wpkh_script(cp)
+        elseif ct == "p2wsh" then cspk = script_mod.make_p2wsh_script(cp)
+        elseif ct == "p2tr" then cspk = script_mod.make_p2tr_script(cp)
+        else cspk = script_mod.make_p2pkh_script(cp)
+        end
+        local cp_idx = options.changePosition
+        if type(cp_idx) == "number" and cp_idx >= 0 and cp_idx <= #outputs then
+          table.insert(outputs, cp_idx + 1, types.txout(change, cspk))
+          change_pos = cp_idx
+        else
+          outputs[#outputs + 1] = types.txout(change, cspk)
+          change_pos = #outputs - 1
+        end
+      else
+        -- Change below dust: roll it into the fee (Core drops the change out).
+        fee = fee + change
+        change = 0
+      end
+    end
+
+    return fee, change_pos
+  end
+
   --- walletcreatefundedpsbt: build a funded PSBT with coin selection.
   -- params: [inputs, outputs, locktime, options, bip32derivs]
   -- Reference: bitcoin-core/src/wallet/rpc/spend.cpp walletcreatefundedpsbt
@@ -8854,80 +8963,16 @@ function RPCServer:register_methods()
     end
 
     -- 3. Coin selection over wallet UTXOs to cover the shortfall + fee.
-    local fee_rate = options.feeRate or wallet:estimate_fee_rate(options.conf_target) or 1
-    local est_overhead = 11
-    local est_input_vsize = 68
-    local est_output_vsize = 31
-    local est_vsize = est_overhead + (#inputs + 1) * est_input_vsize
-                      + (#outputs + 1) * est_output_vsize
-    local fee = math.ceil(est_vsize * fee_rate)
-
-    local needed = total_out + fee - user_total_in
-    local change_pos = -1
-    local change = 0
-
-    if needed > 0 then
-      -- Skip user-claimed UTXOs to avoid double-spending.
-      local claimed = {}
-      for _, inp in ipairs(inputs) do
-        local k = inp.prev_out.hash.bytes .. string.char(
-          bit.band(inp.prev_out.index, 0xFF),
-          bit.band(bit.rshift(inp.prev_out.index, 8), 0xFF),
-          bit.band(bit.rshift(inp.prev_out.index, 16), 0xFF),
-          bit.band(bit.rshift(inp.prev_out.index, 24), 0xFF))
-        claimed[k] = true
-      end
-      local available = {}
-      for k, u in pairs(wallet.utxos) do
-        if not claimed[k] then
-          available[#available + 1] = {utxo = u, key = k}
-        end
-      end
-      if #available == 0 and needed > 0 then
-        error({code = M.ERROR.WALLET_ERROR, message = "Insufficient funds"})
-      end
-      local selected = wallet_mod.select_coins(available, needed, fee_rate)
-      if not selected then
-        error({code = M.ERROR.WALLET_ERROR, message = "Insufficient funds"})
-      end
-      local extra_in = 0
-      for _, item in ipairs(selected) do
-        inputs[#inputs + 1] = types.txin(
-          types.outpoint(item.utxo.txid, item.utxo.vout), "", 0xFFFFFFFD)
-        input_utxos[#input_utxos + 1] = {
-          value = item.utxo.value, script_pubkey = item.utxo.script_pubkey}
-        extra_in = extra_in + item.utxo.value
-      end
-
-      -- Recompute fee + change with the final input count.
-      est_vsize = est_overhead + #inputs * est_input_vsize
-                  + (#outputs + 1) * est_output_vsize
-      fee = math.ceil(est_vsize * fee_rate)
-      local total_in = user_total_in + extra_in
-      change = total_in - total_out - fee
-      if change > wallet_mod.DUST_THRESHOLD then
-        local change_address = options.changeAddress or wallet:get_change_address()
-        local ct, cp = address_mod.decode_address(change_address,
-          rpc.network and rpc.network.name)
-        local cspk
-        if ct == "p2wpkh" then cspk = script_mod.make_p2wpkh_script(cp)
-        elseif ct == "p2wsh" then cspk = script_mod.make_p2wsh_script(cp)
-        elseif ct == "p2tr" then cspk = script_mod.make_p2tr_script(cp)
-        else cspk = script_mod.make_p2pkh_script(cp)
-        end
-        local cp_idx = options.changePosition
-        if type(cp_idx) == "number" and cp_idx >= 0 and cp_idx <= #outputs then
-          table.insert(outputs, cp_idx + 1, types.txout(change, cspk))
-          change_pos = cp_idx
-        else
-          outputs[#outputs + 1] = types.txout(change, cspk)
-          change_pos = #outputs - 1
-        end
-      else
-        fee = fee + change
-        change = 0
-      end
-    end
+    -- Shared with fundrawtransaction via fund_transaction_core (Core's
+    -- FundTransaction()).  Returns fee in sats + change position.
+    local fee, change_pos = fund_transaction_core(rpc, wallet, {
+      inputs = inputs,
+      input_utxos = input_utxos,
+      outputs = outputs,
+      total_out = total_out,
+      user_total_in = user_total_in,
+      options = options,
+    })
 
     -- 4. Build unsigned tx + PSBT.
     local tx = types.transaction(2, inputs, outputs, locktime)
@@ -8942,6 +8987,107 @@ function RPCServer:register_methods()
 
     return {
       psbt = psbt_mod.to_base64(psbt),
+      fee = fee / consensus.COIN,
+      changepos = change_pos,
+    }
+  end
+
+  --- fundrawtransaction: add inputs (and change) to a raw tx so it is funded.
+  -- params: ["hexstring", options, iswitness]
+  -- Reference: bitcoin-core/src/wallet/rpc/spend.cpp fundrawtransaction:706
+  --            (funnels into FundTransaction:470)
+  --
+  -- Raw-tx sibling of walletcreatefundedpsbt: it decodes the supplied raw tx,
+  -- keeps its existing inputs/outputs, runs the SAME funding engine
+  -- (fund_transaction_core) to select wallet UTXOs covering total-out + fee and
+  -- to splice in a change output, then re-serializes the funded tx to hex.
+  -- Inputs added are NOT signed (Core: use signrawtransactionwithwallet after).
+  --
+  -- Result: { hex = <funded raw tx hex>, fee = <BTC>, changepos = <int|-1> }.
+  self.methods["fundrawtransaction"] = function(rpc, params)
+    local hexstring = params[1]
+    local options = params[2]
+    -- Core allows options to be a bare bool (legacy includeWatching shim) — it
+    -- does nothing here; treat any non-table options as "no options".
+    if type(options) ~= "table" then options = {} end
+    -- params[3] iswitness is a decode hint only; deserialize_transaction
+    -- auto-detects the segwit marker, so no separate handling is required.
+
+    if type(hexstring) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS,
+        message = "Usage: fundrawtransaction \"hexstring\" ( options iswitness )"})
+    end
+
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+    if rpc.chain_state then wallet:scan_utxos(rpc.chain_state) end
+
+    -- 1. Decode the raw transaction.
+    local ok_dec, tx = pcall(function()
+      return serialize.deserialize_transaction(M.hex_decode(hexstring))
+    end)
+    if not ok_dec or type(tx) ~= "table" then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "TX decode failed"})
+    end
+
+    local inputs = tx.inputs
+    local outputs = tx.outputs
+
+    -- 2. Tally total-out over the existing outputs (kept as-is).
+    local total_out = 0
+    for _, out in ipairs(outputs) do
+      total_out = total_out + out.value
+    end
+
+    -- 3. Resolve prevout values for any existing inputs (wallet, then UTXO set)
+    --    so they count toward total-in — mirrors walletcreatefundedpsbt step 2.
+    local input_utxos = {}
+    local user_total_in = 0
+    for _, inp in ipairs(inputs) do
+      local vout = inp.prev_out.index
+      local outpoint_key = inp.prev_out.hash.bytes .. string.char(
+        bit.band(vout, 0xFF),
+        bit.band(bit.rshift(vout, 8), 0xFF),
+        bit.band(bit.rshift(vout, 16), 0xFF),
+        bit.band(bit.rshift(vout, 24), 0xFF))
+      local prev = nil
+      if wallet.utxos[outpoint_key] then
+        local u = wallet.utxos[outpoint_key]
+        prev = {value = u.value, script_pubkey = u.script_pubkey}
+        user_total_in = user_total_in + u.value
+      elseif rpc.storage then
+        local utxo_mod = require("lunarblock.utxo")
+        local data = rpc.storage.get(storage_mod.CF.UTXO, outpoint_key)
+        if data then
+          local entry = utxo_mod.deserialize_utxo_entry(data)
+          prev = {value = entry.value, script_pubkey = entry.script_pubkey}
+          user_total_in = user_total_in + entry.value
+        end
+      end
+      input_utxos[#input_utxos + 1] = prev
+    end
+
+    -- 4. Fund: select inputs + add change via the shared engine.
+    local fee, change_pos = fund_transaction_core(rpc, wallet, {
+      inputs = inputs,
+      input_utxos = input_utxos,
+      outputs = outputs,
+      total_out = total_out,
+      user_total_in = user_total_in,
+      options = options,
+    })
+
+    -- 5. Re-serialize the funded tx to hex.  Keep witness serialization on so a
+    --    tx that already carried witnesses round-trips; added inputs are
+    --    unsigned (empty witness) and serialize as empty stacks.
+    tx.inputs = inputs
+    tx.outputs = outputs
+    local funded_hex = M.hex_encode(serialize.serialize_transaction(tx, tx.segwit))
+
+    return {
+      hex = funded_hex,
       fee = fee / consensus.COIN,
       changepos = change_pos,
     }
