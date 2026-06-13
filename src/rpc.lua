@@ -275,6 +275,43 @@ M.ERROR = {
 }
 
 --------------------------------------------------------------------------------
+-- Hash argument parsing (ParseHashV parity)
+--------------------------------------------------------------------------------
+
+--- Validate a txid/blockhash string argument exactly like Bitcoin Core's
+--- ParseHashV (bitcoin-core/src/rpc/util.cpp:117).  A malformed hash (wrong
+--- length OR non-hex characters) is rejected at the PARSE boundary, BEFORE any
+--- lookup, with RPC_INVALID_PARAMETER (-8) and a Core-style message:
+---   wrong length -> "<name> must be of length 64 (not N, for '<hex>')"
+---   right length, bad hex -> "<name> must be hexadecimal string (not '<hex>')"
+--- A well-formed-but-absent 64-hex hash is NOT this function's concern — the
+--- caller's lookup returns RPC_INVALID_ADDRESS_OR_KEY (-5) / null as before.
+--- @param v any:    the raw param value
+-- @param name string: the argument name used in the error message
+-- @return string: the validated 64-char hex string (unchanged)
+local function parse_hash_v(v, name)
+  -- A non-string (or missing) value cannot be a hash; Core's get_str() would
+  -- raise a type error.  Treat it as the wrong-length malformed case so the
+  -- code is -8 either way and the message still names the argument.
+  local s = type(v) == "string" and v or (v == nil and "" or tostring(v))
+  if #s ~= 64 then
+    error({
+      code = M.ERROR.INVALID_PARAMETER,
+      message = string.format("%s must be of length 64 (not %d, for '%s')",
+        name, #s, s),
+    })
+  end
+  if s:match("[^0-9a-fA-F]") then
+    error({
+      code = M.ERROR.INVALID_PARAMETER,
+      message = string.format("%s must be hexadecimal string (not '%s')", name, s),
+    })
+  end
+  return s
+end
+M.parse_hash_v = parse_hash_v
+
+--------------------------------------------------------------------------------
 -- Script Disassembly
 --------------------------------------------------------------------------------
 
@@ -1790,9 +1827,10 @@ function RPCServer:register_methods()
     elseif verbosity == false then verbosity = 0
     end
 
-    if type(blockhash) ~= "string" or #blockhash ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
-    end
+    -- ParseHashV parity: malformed blockhash (wrong length / non-hex) -> -8
+    -- at the parse boundary.  A well-formed-but-absent hash falls through to
+    -- the "Block not found" (-5) lookup path below, unchanged.
+    parse_hash_v(blockhash, "blockhash")
     if not rpc.storage then
       error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
     end
@@ -3085,10 +3123,10 @@ function RPCServer:register_methods()
     end
     local blockhash_hex = params[3]
 
-    -- Validate txid parameter
-    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
-    end
+    -- Validate txid parameter — ParseHashV parity: malformed (wrong length /
+    -- non-hex) -> -8 at the parse boundary, BEFORE any lookup.  A well-formed
+    -- 64-hex txid that simply isn't found falls through to the -5 path below.
+    parse_hash_v(txid_hex, "parameter 1")
 
     -- Genesis-coinbase exception (matches Core rpc/rawtransaction.cpp:290-293):
     -- the genesis block coinbase txid (== genesis block merkle root) is not an
@@ -3112,11 +3150,9 @@ function RPCServer:register_methods()
       end
     end
 
-    -- Validate blockhash if provided
+    -- Validate blockhash if provided — ParseHashV parity (-8 on malformed).
     if blockhash_hex ~= nil and blockhash_hex ~= cjson.null then
-      if type(blockhash_hex) ~= "string" or #blockhash_hex ~= 64 then
-        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid blockhash"})
-      end
+      parse_hash_v(blockhash_hex, "parameter 3")
     else
       blockhash_hex = nil
     end
@@ -4259,9 +4295,9 @@ function RPCServer:register_methods()
 
   self.methods["getmempoolentry"] = function(rpc, params)
     local txid_hex = params and params[1]
-    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
-    end
+    -- ParseHashV parity: malformed txid (wrong length / non-hex) -> -8 at the
+    -- parse boundary.  A well-formed-but-absent txid -> -5 "not in mempool".
+    parse_hash_v(txid_hex, "txid")
     if not rpc.mempool then
       error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
     end
@@ -4415,9 +4451,9 @@ function RPCServer:register_methods()
     if params and params[3] ~= nil and params[3] ~= cjson.null then
       include_mempool = params[3] and true or false
     end
-    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
-    end
+    -- ParseHashV parity: malformed txid (wrong length / non-hex) -> -8 at the
+    -- parse boundary.  A well-formed-but-absent txid returns null below.
+    parse_hash_v(txid_hex, "txid")
     if type(n) ~= "number" or n < 0 or n ~= math.floor(n) then
       error({code = M.ERROR.INVALID_PARAMS, message = "vout must be a non-negative integer"})
     end
@@ -8804,9 +8840,10 @@ function RPCServer:register_methods()
     local verbose = params[2]
     if verbose == nil or verbose == cjson.null then verbose = true end
 
-    if type(blockhash) ~= "string" or #blockhash ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
-    end
+    -- ParseHashV parity: malformed blockhash (wrong length / non-hex) -> -8 at
+    -- the parse boundary.  Core names this arg "hash" (rpc/blockchain.cpp:639).
+    -- A well-formed-but-absent hash -> -5 "Block not found" below, unchanged.
+    parse_hash_v(blockhash, "hash")
     if not rpc.storage then
       error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
     end

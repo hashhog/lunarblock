@@ -316,6 +316,126 @@ test("G10-b: getblock with non-existent hash returns -5", function()
 end)
 
 -- ---------------------------------------------------------------------------
+-- G10-bis: ParseHashV parity (-8) on MALFORMED txid/blockhash arguments
+-- Core: bitcoin-core/src/rpc/util.cpp:117 ParseHashV. A malformed hash
+-- (wrong length OR right-length-but-non-hex) -> RPC_INVALID_PARAMETER (-8)
+-- at the PARSE boundary, BEFORE any lookup, with a Core-style message.
+-- A well-formed-but-absent 64-hex hash must STILL be -5 (or null for gettxout).
+-- ---------------------------------------------------------------------------
+print("\n--- G10-bis: ParseHashV (-8) on malformed txid/blockhash, -5/null when absent ---")
+
+local SHORT_HEX = "abc"                       -- valid hex, wrong length (3)
+local BAD64     = string.rep("z", 64)          -- right length (64), non-hex
+local ZERO64    = string.rep("0", 64)          -- well-formed, will not be found
+
+-- Assert a call raises -8 AND a Core-style message (length or hexadecimal).
+local function expect_parsehash_minus8(method, params, ctx)
+  local server = build_server(ctx)
+  local handler = server.methods[method]
+  if not handler then error("method not registered: " .. method, 2) end
+  local ok, err = pcall(handler, server, params)
+  if ok then error("expected -8 but call succeeded for " .. method, 2) end
+  if type(err) ~= "table" or err.code ~= -8 then
+    error(string.format("wrong code for %s: got %s (%s), expected -8",
+      method, tostring(type(err) == "table" and err.code or err),
+      tostring(type(err) == "table" and err.message or "")), 2)
+  end
+  local m = err.message or ""
+  if not (m:match("must be of length 64") or m:match("must be hexadecimal string")) then
+    error("not a Core ParseHashV message: " .. m, 2)
+  end
+end
+
+-- gettxout's absent case returns null (a value, not an error).
+local function expect_gettxout_null(ctx)
+  local server = build_server(ctx)
+  local handler = server.methods["gettxout"]
+  local ok, res = pcall(handler, server, {ZERO64, 0, false})
+  if not ok then error("gettxout absent should not error: " .. tostring(res), 2) end
+  if res ~= cjson.null then
+    error("gettxout absent should be null, got " .. tostring(res), 2)
+  end
+end
+
+-- A storage mock where every lookup misses (the well-formed-but-absent path).
+local function absent_storage()
+  return {
+    get_block         = function() return nil end,
+    get_header        = function() return nil end,
+    get_hash_by_height = function() return nil end,
+    get_block         = function() return nil end,
+  }
+end
+
+-- getrawtransaction (txid = "parameter 1")
+test("G10-bis-a: getrawtransaction txid too-short hex -> -8", function()
+  expect_parsehash_minus8("getrawtransaction", {SHORT_HEX}, {})
+end)
+test("G10-bis-b: getrawtransaction txid 64-char non-hex -> -8", function()
+  expect_parsehash_minus8("getrawtransaction", {BAD64}, {})
+end)
+test("G10-bis-c: getrawtransaction well-formed-absent txid -> -5", function()
+  expect_err_code("getrawtransaction", {ZERO64}, -5, {
+    storage = absent_storage(),
+    chain_state = {tip_height = 0},
+  })
+end)
+
+-- gettxout (txid = "txid")
+test("G10-bis-d: gettxout txid too-short hex -> -8", function()
+  expect_parsehash_minus8("gettxout", {SHORT_HEX, 0}, {})
+end)
+test("G10-bis-e: gettxout txid 64-char non-hex -> -8", function()
+  expect_parsehash_minus8("gettxout", {BAD64, 0}, {})
+end)
+test("G10-bis-f: gettxout well-formed-absent txid -> null (still -5 family)", function()
+  expect_gettxout_null({
+    chain_state = {tip_height = 0, coin_view = {get = function() return nil end}},
+  })
+end)
+
+-- getblock (blockhash = "blockhash")
+test("G10-bis-g: getblock blockhash too-short hex -> -8", function()
+  expect_parsehash_minus8("getblock", {SHORT_HEX}, {})
+end)
+test("G10-bis-h: getblock blockhash 64-char non-hex -> -8", function()
+  expect_parsehash_minus8("getblock", {BAD64}, {})
+end)
+test("G10-bis-i: getblock well-formed-absent blockhash -> -5", function()
+  expect_err_code("getblock", {ZERO64}, -5, {
+    storage = absent_storage(),
+    chain_state = {tip_height = 0},
+  })
+end)
+
+-- getblockheader (blockhash arg, Core name "hash")
+test("G10-bis-j: getblockheader blockhash too-short hex -> -8", function()
+  expect_parsehash_minus8("getblockheader", {SHORT_HEX}, {})
+end)
+test("G10-bis-k: getblockheader blockhash 64-char non-hex -> -8", function()
+  expect_parsehash_minus8("getblockheader", {BAD64}, {})
+end)
+test("G10-bis-l: getblockheader well-formed-absent blockhash -> -5", function()
+  expect_err_code("getblockheader", {ZERO64}, -5, {
+    storage = absent_storage(),
+    chain_state = {tip_height = 0},
+  })
+end)
+
+-- getmempoolentry (txid = "txid")
+test("G10-bis-m: getmempoolentry txid too-short hex -> -8", function()
+  expect_parsehash_minus8("getmempoolentry", {SHORT_HEX}, {})
+end)
+test("G10-bis-n: getmempoolentry txid 64-char non-hex -> -8", function()
+  expect_parsehash_minus8("getmempoolentry", {BAD64}, {})
+end)
+test("G10-bis-o: getmempoolentry well-formed-absent txid -> -5", function()
+  expect_err_code("getmempoolentry", {ZERO64}, -5, {
+    mempool = {get_entry = function() return nil end},
+  })
+end)
+
+-- ---------------------------------------------------------------------------
 -- G11: RPC_DESERIALIZATION_ERROR (-22) for bad hex / decode failures
 -- Expectation: PARTIAL (BUG-2).  submitblock + decodepsbt ✓;
 -- sendrawtransaction + decoderawtransaction MISS.
