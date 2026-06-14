@@ -832,24 +832,66 @@ local function _is_p2pk_compressed(s)
   return prefix, s:sub(3, 34)
 end
 
+--- Detect an uncompressed-pubkey P2PK: 0x41 <65> OP_CHECKSIG with prefix 0x04.
+-- Core's IsToPubKey (compressor.cpp:47-51) requires pubkey.IsFullyValid() before
+-- compressing; we require the pubkey to be fully on the curve via
+-- crypto.decompress_pubkey to match.  Returns the tag byte (0x04|parity) and the
+-- 32-byte x-coordinate so compress_script can write them directly.
+-- @param s string
+-- @return number|nil tag (0x04 or 0x05), string|nil 32-byte x-coord
+local function _is_p2pk_uncompressed(s)
+  if #s ~= 67 then return nil end
+  if s:byte(1) ~= 65 or s:byte(2) ~= 0x04 or s:byte(67) ~= 0xAC then return nil end
+  -- Extract the 65-byte uncompressed pubkey (bytes 2..66).
+  local pub65 = s:sub(2, 66)
+  -- Verify point validity; invalid points are not compressible (Core parity).
+  -- Build the compressed form from the 32-byte x (bytes 2..33 of pub65) to test.
+  local x = pub65:sub(2, 33)
+  local parity = pub65:byte(65)  -- last byte of y-coordinate, determines even/odd
+  local tag = 0x04 + (parity % 2)  -- 0x04 if y is even, 0x05 if y is odd
+  -- Mirror Core: IsToPubKey uses pubkey.IsFullyValid().  We decompress the
+  -- compressed form to test validity.  Failures leave the script uncompressed
+  -- (falls through to raw path).
+  local compressed_test = string.char(0x02 + (parity % 2)) .. x
+  local ok = crypto.decompress_pubkey(compressed_test)
+  if not ok then return nil end
+  return tag, x
+end
+
 --- Compress a scriptPubKey using ScriptCompression.
--- This emits the OUTPUT BYTES (no length prefix) — the caller has already
--- decided whether to lead with VARINT(size+6) or with one of the special
--- type bytes.
---
--- For Phase 1 we always take the "raw" branch.  Recognized types are
--- TODO; the comment above explains why.
---
+-- Mirrors Bitcoin Core compressor.cpp:CompressScript (all 6 special types).
+-- Emits the compressed form:
+--   P2PKH  (25B): 0x00 + hash160 (20B) — type tag 0
+--   P2SH   (23B): 0x01 + hash160 (20B) — type tag 1
+--   cP2PK  (35B): 0x02/0x03 + x (32B)  — type tag 2 or 3
+--   uP2PK  (67B): 0x04/0x05 + x (32B)  — type tag 4 or 5
+--   other:        VARINT(size+6) + raw bytes
+-- Reference: bitcoin-core/src/compressor.cpp:55-83.
 -- @param script_bytes string
--- @return string serialized form (with size+6 VARINT prefix)
+-- @return string serialized form (special type OR size+6 VARINT prefix + raw)
 function M.compress_script(script_bytes)
-  -- TODO(W-CORE-COMPRESS): emit type-byte forms (0x00..0x05) when
-  -- script_bytes matches a recognized template.  For now always fall
-  -- through to the raw path so the encoding is unambiguous and
-  -- Core-readable.
-  local _ = _is_p2pkh
-  local _2 = _is_p2sh
-  local _3 = _is_p2pk_compressed
+  -- P2PKH: tag 0x00 + hash160 (20B) — 21 bytes total
+  local hash160 = _is_p2pkh(script_bytes)
+  if hash160 then
+    return string.char(0x00) .. hash160
+  end
+  -- P2SH: tag 0x01 + hash160 (20B) — 21 bytes total
+  hash160 = _is_p2sh(script_bytes)
+  if hash160 then
+    return string.char(0x01) .. hash160
+  end
+  -- Compressed P2PK: tag 0x02/0x03 + x (32B) — 33 bytes total
+  local prefix, x = _is_p2pk_compressed(script_bytes)
+  if prefix then
+    return string.char(prefix) .. x
+  end
+  -- Uncompressed P2PK: tag 0x04/0x05 + x (32B) — 33 bytes total
+  local tag
+  tag, x = _is_p2pk_uncompressed(script_bytes)
+  if tag then
+    return string.char(tag) .. x
+  end
+  -- Raw path: VARINT(size + N_SPECIAL_SCRIPTS) + raw bytes
   local w = serialize.buffer_writer()
   M.write_corevarint(w, #script_bytes + M.N_SPECIAL_SCRIPTS)
   w.write_bytes(script_bytes)
@@ -3470,28 +3512,40 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       return w.result()
     end
     -- Step 1: add created spendable outputs.
+    -- Skip the duplicate-coinbase at IsBIP30Unspendable blocks (h=91722 and
+    -- h=91812 on mainnet) — those coinbase outputs were overwritten by later
+    -- blocks and are counted as m_total_unspendables_bip30 in Core, not as
+    -- spendable coins.  Mirrors bitcoin-core/src/index/coinstatsindex.cpp:128-131.
+    local bip30_unspendable_block = is_bip30_unspendable(
+      self.network.name, height, block_hash)
     for tx_idx, tx in ipairs(block.transactions) do
       local is_cb = (tx_idx == 1)
-      local txid = validation.compute_txid(tx)
-      local txid_bytes = txid.bytes
-      for vout_idx = 1, #tx.outputs do
-        local out = tx.outputs[vout_idx]
-        if not is_unspendable(out.script_pubkey) then
-          local coin_height = height
-          local coin_cb    = is_cb
-          local key = make_utxo_key(txid_bytes, vout_idx - 1)
-          -- Construct a minimal entry for _serialize_txoutser
-          local entry = {
-            height       = coin_height,
-            is_coinbase  = coin_cb,
-            value        = out.value,
-            script_pubkey = out.script_pubkey,
-          }
-          local ser = _serialize_txoutser(key, entry)
-          mh:insert(ser)
-          self._csi_txouts    = self._csi_txouts + 1
-          self._csi_bogosize  = self._csi_bogosize + _csi_bogosize(#out.script_pubkey)
-          self._csi_total_amt = self._csi_total_amt + out.value
+      -- BIP30 unspendable: skip the entire coinbase tx (the duplicate
+      -- coinbase outputs were never spendable and must not enter the hash).
+      if is_cb and bip30_unspendable_block then
+        -- (analogous to Core m_total_unspendables_bip30 += block_subsidy; continue)
+      else
+        local txid = validation.compute_txid(tx)
+        local txid_bytes = txid.bytes
+        for vout_idx = 1, #tx.outputs do
+          local out = tx.outputs[vout_idx]
+          if not is_unspendable(out.script_pubkey) then
+            local coin_height = height
+            local coin_cb    = is_cb
+            local key = make_utxo_key(txid_bytes, vout_idx - 1)
+            -- Construct a minimal entry for _serialize_txoutser
+            local entry = {
+              height       = coin_height,
+              is_coinbase  = coin_cb,
+              value        = out.value,
+              script_pubkey = out.script_pubkey,
+            }
+            local ser = _serialize_txoutser(key, entry)
+            mh:insert(ser)
+            self._csi_txouts    = self._csi_txouts + 1
+            self._csi_bogosize  = self._csi_bogosize + _csi_bogosize(#out.script_pubkey)
+            self._csi_total_amt = self._csi_total_amt + out.value
+          end
         end
       end
     end
@@ -4238,11 +4292,14 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
   -- Reference: bitcoin-core/src/validation.cpp:2182 + 2218-2221.
   local fClean = true
 
-  -- Pattern C0: collect txids from this block so we can delete their
-  -- CF.TX_INDEX entries inside the disconnect atomic batch.  Symmetrical
-  -- with the connect path.  Ref: bitcoin-core BaseIndex::BlockDisconnected
-  -- → CTxIndex::CustomRemove.
-  local block_txid_bytes = self.txindex_enabled and {} or nil
+  -- Pattern C0 (REVISED 2026-06-14): Bitcoin Core's TxIndex does NOT override
+  -- CustomRemove, so Core's txindex keeps entries for transactions from orphaned
+  -- blocks — callers can still look them up even after a reorg.  Lunarblock
+  -- previously deleted on disconnect; this was wrong.  We now match Core:
+  -- connect_block writes the entry; disconnect_block leaves it intact.
+  -- Reference: bitcoin-core/src/index/txindex.h (no CustomRemove override) +
+  --            bitcoin-core/src/index/base.h:136 (default CustomRemove = noop).
+  local block_txid_bytes = nil  -- unused; kept for local-variable hygiene
 
   -- BIP-157 Phase 2: when the filter index is on, look up the previous
   -- block's filter header BEFORE we open the batch.  Mirrors
@@ -4307,10 +4364,6 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     -- Gate 2b: is_bip30_exception applies only to the coinbase tx in the
     -- two IsBIP30Unspendable blocks.  Reference: Core:2209.
     local is_bip30_exception = (is_coinbase and not fEnforceBIP30)
-
-    if block_txid_bytes then
-      block_txid_bytes[#block_txid_bytes + 1] = txid.bytes
-    end
 
     -- Gate 3 (Core:2213-2223): check that all spendable outputs exist and
     -- match the block data exactly.  SpendCoin returns the coin; compare
@@ -4436,16 +4489,11 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     if had_undo then
       batch.delete(storage_mod.CF.UNDO, disconnect_hash.bytes)
     end
-    -- Pattern C0: drop txindex entries for every tx in the disconnected
-    -- block, atomically with the UTXO restore + chain_tip rewind.  After
-    -- this commits, getrawtransaction(<txid>) for any tx confirmed only
-    -- in this block returns "no such tx" — matching nimrod's
-    -- correct-PASS behavior in the cross-impl table.
-    if block_txid_bytes then
-      for i = 1, #block_txid_bytes do
-        batch.delete(storage_mod.CF.TX_INDEX, block_txid_bytes[i])
-      end
-    end
+    -- Pattern C0 (revised): txindex entries are NOT deleted on disconnect —
+    -- Core's TxIndex has no CustomRemove, so entries survive reorgs.  The
+    -- former delete loop has been removed; getrawtransaction on an orphaned
+    -- txid will still find the entry (pointing at the orphan block's file
+    -- position), matching Core's post-reorg behaviour.
     -- BIP-157 Phase 2: filter rewind.  Atomic with chain_tip rewind so a
     -- crash mid-reorg cannot leave a filter pointing at a hash that's no
     -- longer on the active chain (or vice versa).  In Pattern D
