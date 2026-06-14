@@ -190,22 +190,20 @@ do
 end
 
 --------------------------------------------------------------------------------
--- Test 3: Pattern C0 — txindex revert on reorg.
+-- Test 3: txindex entries SURVIVE a reorg (revised, 2026-06-14).
 --   genesis  ──►  A1[A1cb] (h=1)
 --      │
 --      └──►  B1 (h=1)  ──►  B2 (h=2)
 --
 -- After A1 connects, A1cb is indexed.  After B2 triggers a reorg
 -- (heavier B-chain), A1 disconnects.  CF.TX_INDEX[A1cb_txid] must be
--- DELETED — symmetric with the connect-time write.  This matches
--- bitcoin-core's BaseIndex::BlockDisconnected → CTxIndex::CustomRemove.
+-- PRESERVED — Bitcoin Core's TxIndex does NOT override CustomRemove
+-- (src/index/txindex.h), so the base-class no-op fires and the entry stays.
+-- This means getrawtransaction on an orphaned txid still returns a result
+-- pointing at the orphan block's file location, exactly as Core behaves.
 --
--- Critically: post-reorg, the diff-test corpus probe
--- getrawtransaction(A1cb_txid, true) must NOT return a positive
--- confirmations field.  Deleting the txindex entry causes the rpc
--- handler to return "no such tx" (Pattern C0 PASS shape — same as
--- nimrod, the only fleet impl besides bitcoin-core that gets this
--- right today).
+-- The former test expected DELETION, which was wrong.  The new canonical
+-- Core-parity assertion is that the entry SURVIVES post-reorg.
 --------------------------------------------------------------------------------
 do
   local dir = tmpdir()
@@ -244,10 +242,12 @@ do
   check("revert: B2 triggers reorg", sb2 == "connected", sb2_err)
   check("revert: tip flipped to B2", types.hash256_eq(cs.tip_hash, hash_b2))
 
-  -- Pattern C0 invariant: A1's coinbase must no longer be in CF.TX_INDEX.
+  -- Core parity: A1's coinbase txindex entry must SURVIVE post-reorg.
+  -- Core's TxIndex has no CustomRemove override (src/index/txindex.h) so the
+  -- base-class no-op fires and the entry is retained even after disconnect.
   local idx_post = stor.get(storage_mod.CF.TX_INDEX, cb_a1_txid.bytes)
-  check("revert: A1.coinbase txindex entry DELETED post-reorg",
-    idx_post == nil, "leaked entry size: " .. tostring(idx_post and #idx_post))
+  check("revert: A1.coinbase txindex entry SURVIVES post-reorg (Core parity)",
+    idx_post ~= nil, "entry was deleted (wrong pre-fix behavior)")
 
   -- And B1+B2's coinbases ARE indexed (they connected during the reorg).
   local cb_b1_post = stor.get(storage_mod.CF.TX_INDEX, cb_b1_txid.bytes)
