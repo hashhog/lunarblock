@@ -2162,23 +2162,28 @@ function PeerManager:handle_addr(peer, payload)
     if not _is_routable(addr.ip) then
       goto continue
     end
-    -- Only accept addresses with recent timestamps (within 3 hours)
-    if addr.timestamp > now - 10800 and addr.timestamp <= now + 600 then
-      local key = addr.ip .. ":" .. addr.port
-      if not self.known_addresses[key] then
-        self.known_addresses[key] = {
-          ip = addr.ip,
-          port = addr.port,
-          services = addr.services,
-          timestamp = addr.timestamp,
-          network_id = p2p.NET_ID.IPV4,  -- Legacy addr is always IPv4/IPv6
-          attempts = 0,
-          last_try = 0,
-        }
-      end
-      -- Add to address manager new table with source tracking
-      self:_add_to_new(addr.ip, addr.port, addr.services, addr.timestamp, src_ip)
+    -- Core net_processing.cpp:5678-5680: clamp timestamps that are pre-2001
+    -- (nTime <= 100000000) or more than 10 minutes in the future to
+    -- (now - 5*24*60*60).  Core does NOT drop these addresses; it clamps and
+    -- stores them.  The previous drop-if-outside-3h guard was wrong.
+    local ts = addr.timestamp
+    if ts <= 100000000 or ts > now + 600 then
+      ts = now - 5 * 24 * 60 * 60
     end
+    local key = addr.ip .. ":" .. addr.port
+    if not self.known_addresses[key] then
+      self.known_addresses[key] = {
+        ip = addr.ip,
+        port = addr.port,
+        services = addr.services,
+        timestamp = ts,
+        network_id = p2p.NET_ID.IPV4,  -- Legacy addr is always IPv4/IPv6
+        attempts = 0,
+        last_try = 0,
+      }
+    end
+    -- Add to address manager new table with source tracking
+    self:_add_to_new(addr.ip, addr.port, addr.services, ts, src_ip)
     ::continue::
   end
 end
@@ -2198,31 +2203,36 @@ function PeerManager:handle_addrv2(peer, payload)
     if not addr.valid then
       goto continue
     end
-    -- Only accept addresses with recent timestamps (within 3 hours)
-    if addr.timestamp > now - 10800 and addr.timestamp <= now + 600 then
-      -- For non-IP network types, use addr_str as the key
-      local addr_key = addr.addr_str or addr.ip
-      if addr_key then
-        local key = addr_key .. ":" .. addr.port
-        if not self.known_addresses[key] then
-          self.known_addresses[key] = {
-            ip = addr.ip,                    -- May be nil for TOR/I2P/CJDNS
-            addr_str = addr.addr_str,        -- Full address string
-            addr_bytes = addr.addr_bytes,    -- Raw address bytes
-            port = addr.port,
-            services = addr.services,
-            timestamp = addr.timestamp,
-            network_id = addr.network_id,
-            attempts = 0,
-            last_try = 0,
-          }
-        end
-        -- Only add to connection pool if it's a routable IP address.
-        -- _is_routable rejects RFC1918/loopback/link-local for IPv4;
-        -- non-IPv4 overlay addresses (Tor/I2P/CJDNS) pass through.
-        if addr.ip and _is_routable(addr.ip) then
-          self:_add_to_new(addr.ip, addr.port, addr.services, addr.timestamp, src_ip)
-        end
+    -- Core net_processing.cpp:5678-5680: clamp timestamps that are pre-2001
+    -- (nTime <= 100000000) or more than 10 minutes in the future to
+    -- (now - 5*24*60*60).  Core does NOT drop these addresses; it clamps and
+    -- stores them.  The previous drop-if-outside-3h guard was wrong.
+    local ts = addr.timestamp
+    if ts <= 100000000 or ts > now + 600 then
+      ts = now - 5 * 24 * 60 * 60
+    end
+    -- For non-IP network types, use addr_str as the key
+    local addr_key = addr.addr_str or addr.ip
+    if addr_key then
+      local key = addr_key .. ":" .. addr.port
+      if not self.known_addresses[key] then
+        self.known_addresses[key] = {
+          ip = addr.ip,                    -- May be nil for TOR/I2P/CJDNS
+          addr_str = addr.addr_str,        -- Full address string
+          addr_bytes = addr.addr_bytes,    -- Raw address bytes
+          port = addr.port,
+          services = addr.services,
+          timestamp = ts,
+          network_id = addr.network_id,
+          attempts = 0,
+          last_try = 0,
+        }
+      end
+      -- Only add to connection pool if it's a routable IP address.
+      -- _is_routable rejects RFC1918/loopback/link-local for IPv4;
+      -- non-IPv4 overlay addresses (Tor/I2P/CJDNS) pass through.
+      if addr.ip and _is_routable(addr.ip) then
+        self:_add_to_new(addr.ip, addr.port, addr.services, ts, src_ip)
       end
     end
     ::continue::
