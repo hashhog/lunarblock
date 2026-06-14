@@ -19,6 +19,18 @@ local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 local MIN_BLOCKS_TO_KEEP = prune_mod.MIN_BLOCKS_TO_KEEP
 local M = {}
 
+-- BIP-68 applies only when version >= 2. Core stores version as uint32_t and
+-- compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
+-- high-bit version (e.g. 0x80000002) STILL enforces BIP-68. lunarblock reads the
+-- version via read_i32le (signed), so a signed >= 2 would treat 0x80000002 as a
+-- negative number (< 2) and SKIP enforcement, false-accepting a tx with an unmet
+-- relative timelock (a chain split). Reinterpret as unsigned 32-bit (% 2^32) before
+-- comparing -- the same unsigned semantics the OP_CSV path already uses.
+local function bip68_version_active(version)
+  return (version % 4294967296) >= 2
+end
+M.bip68_version_active = bip68_version_active
+
 --------------------------------------------------------------------------------
 -- BIP-30: duplicate-coinbase prevention
 --------------------------------------------------------------------------------
@@ -2781,7 +2793,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
       -- BIP68: Check relative lock-times (sequence locks)
       -- Only enforce if BIP68 is active and we have the required MTP information
-      if enforce_bip68 and tx.version >= 2 and prev_block_mtp and get_block_mtp then
+      if enforce_bip68 and bip68_version_active(tx.version) and prev_block_mtp and get_block_mtp then
         -- Helper to get UTXO height for each input
         local function get_utxo_height(inp)
           local idx = inp_to_idx[inp]
