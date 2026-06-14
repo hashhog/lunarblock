@@ -552,6 +552,20 @@ function M.deserialize_transaction(reader)
         inp.witness[j] = reader.read_varstr()
       end
     end
+    -- Bitcoin Core primitives/transaction.h:228-231: reject the extended
+    -- serialization when the segwit marker+flag are present but every
+    -- input's witness stack is empty (tx.HasWitness() == false).
+    -- It is illegal to encode witnesses when all witness stacks are empty.
+    local has_witness = false
+    for _, inp in ipairs(inputs) do
+      if inp.witness and #inp.witness > 0 then
+        has_witness = true
+        break
+      end
+    end
+    if not has_witness then
+      error("Superfluous witness record")
+    end
   end
 
   local locktime = reader.read_u32le()
