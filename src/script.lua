@@ -2447,9 +2447,20 @@ function M.verify_script(script_sig, script_pubkey, flags, checker)
           had_witness = true
           did_witness = true
 
-          -- P2SH-wrapped witness: scriptSig must be exactly a single push of the witness program
-          -- Verify scriptSig is push-only and contains exactly 1 element
-          if #sig_stack_copy ~= 1 then
+          -- P2SH-wrapped witness: scriptSig must be BYTE-FOR-BYTE equal to the
+          -- minimal canonical push of the redeemScript bytes.
+          -- Core interpreter.cpp:2082-2085:
+          --   if (scriptSig != CScript() << std::vector<unsigned char>(pubKey2.begin(), pubKey2.end()))
+          --       return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED_P2SH);
+          --
+          -- A stack-size check (#sig_stack_copy ~= 1) is INSUFFICIENT: a
+          -- non-minimal push (e.g. OP_PUSHDATA1 for a 22-byte redeemScript) is
+          -- push-only and evaluates identically on the stack but its byte
+          -- encoding differs from the minimal direct push (0x16 <W>).
+          -- MINIMALDATA is policy-only (not in GetBlockScriptFlags), so the
+          -- byte-exact malleation check is the only consensus guard.
+          local canonical_sig = serialize_push_bytes(p2sh_redeem)
+          if script_sig ~= canonical_sig then
             return nil, "WITNESS_MALLEATED_P2SH"
           end
 
