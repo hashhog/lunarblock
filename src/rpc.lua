@@ -3817,6 +3817,13 @@ function RPCServer:register_methods()
           services = string.format("%016x", svc),
           servicesnames = svc_names,
           relaytxes = (p.version_info and p.version_info.relay) or true,
+          -- Core src/rpc/net.cpp:243-244 emits last_inv_sequence + inv_to_send
+          -- immediately after relaytxes (before lastsend).  lunarblock does not
+          -- track per-peer mempool inv sequence / queued-inv counts at the
+          -- manager layer, so we emit 0 — the same convention rustoshi (077eb2f)
+          -- and Core (addr_processed/addr_rate_limited when untracked) use.
+          last_inv_sequence = 0,
+          inv_to_send = 0,
           lastsend = math.floor(p.last_send or 0),
           lastrecv = math.floor(p.last_recv or 0),
           last_transaction = 0,
@@ -3834,7 +3841,10 @@ function RPCServer:register_methods()
           inbound = is_inbound,
           bip152_hb_to = false,
           bip152_hb_from = false,
-          startingheight = p.start_height or 0,
+          -- Core v31.99 removed `startingheight` from getpeerinfo output (the
+          -- legacy m_starting_height now lives only inside net_processing's
+          -- version handling and is never surfaced via entryToJSON).  rustoshi
+          -- 528045a dropped it for parity; emitting it is an extra-field bug.
           presynced_headers = -1,
           synced_headers = -1,
           synced_blocks = -1,
