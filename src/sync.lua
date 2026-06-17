@@ -1362,6 +1362,83 @@ function HeaderChain:accept_header(header, opts)
   return true
 end
 
+--- Advance the in-memory header chain to a block WE just produced + connected
+--- locally (generatetoaddress / submitblock tip-extension), WITHOUT re-running
+--- the contextual header gates.
+---
+--- Reorg-drop fix (state-gate).  The mining / submitblock paths call
+--- ChainState:accept_block, which fully validates the block (PoW, MTP, BIP-34,
+--- script, UTXO) and writes the header to CF.HEADERS — but they never touched
+--- the in-memory HeaderChain.  So on a mining node header_tip_height stayed at
+--- 0 while chain_state climbed, which (a) made peer_manager.our_height advertise
+--- 0 in our VERSION — peers never fired their start_sync trigger, never
+--- getheaders'd us, and never learned our chain (the heavier-fork discovery GAP1
+--- relies on) — and (b) inverted main.lua's schedule_downloads trigger
+--- (header_tip vs chain_tip).
+---
+--- We canNOT route these through accept_header: its ContextualCheckBlockHeader
+--- twin (MTP/time/diffbits) recomputes MTP from the in-memory header map, which
+--- on a freshly-mining node lags the storage-backed chain that connect_block
+--- already validated against, producing spurious "time-too-old" / cascading
+--- "unknown parent" rejects (observed: h=2 time-too-old then h=3.. unknown
+--- parent).  The block is ALREADY consensus-valid (accept_block accepted it),
+--- so we only need the success bookkeeping accept_header does on its way out —
+--- the in-memory map entry, the height index, and the more-work tip bump.
+---
+--- Idempotent (no-op if already present) and only advances the tip on strictly
+--- more work, so a re-mine or a submitblock that does not extend the active tip
+--- is harmless.
+-- @param header block_header: the header of the just-connected block
+-- @param height number: the absolute height it was connected at
+-- @return boolean: true on success
+function HeaderChain:add_mined_tip(header, height)
+  local hash = validation.compute_block_hash(header)
+  local hash_hex = types.hash256_hex(hash)
+  if self.headers[hash_hex] then
+    return true  -- already known
+  end
+
+  -- Parent work: prefer the in-memory parent (normal incremental case); fall
+  -- back to a from-storage recompute if the in-memory chain has a gap (e.g.
+  -- the node booted from a snapshot and only now starts mining).
+  local prev_hex = types.hash256_hex(header.prev_hash)
+  local parent = self.headers[prev_hex]
+  local parent_work
+  if parent then
+    parent_work = parent.total_work
+  elseif height and height > 0 then
+    -- Recompute cumulative work for the parent chain from storage.  This is the
+    -- same helper load_from_storage uses to rebuild work on boot.
+    parent_work = self:calculate_total_work_from_storage(height - 1)
+  else
+    parent_work = 0
+  end
+  local work = parent_work + self:work_for_bits(header.bits)
+
+  self.headers[hash_hex] = {
+    header = header,
+    height = height,
+    total_work = work,
+  }
+  self.height_to_hash[height] = hash_hex
+
+  -- Header + height-index are already persisted by the mining/submitblock
+  -- atomic batch; do not double-write here.
+
+  local current_tip_work = 0
+  if self.header_tip_hash then
+    local tip_entry = self.headers[types.hash256_hex(self.header_tip_hash)]
+    if tip_entry then
+      current_tip_work = tip_entry.total_work
+    end
+  end
+  if work > current_tip_work then
+    self.header_tip_hash = hash
+    self.header_tip_height = height
+  end
+  return true
+end
+
 --------------------------------------------------------------------------------
 -- Difficulty Adjustment
 --------------------------------------------------------------------------------
@@ -2042,6 +2119,27 @@ function M.new_block_downloader(header_chain, storage, network)
   self.max_stall_timeout = 120      -- Maximum stall timeout
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
+  -- GAP3 fix — reorg-drop part 2.  Called when a received block does NOT
+  -- extend the active validated tip but IS a genuine competing-fork body
+  -- (its parent is a known header below/beside the active tip).  Routes the
+  -- passive P2P block path through the EXISTING reorg orchestrator
+  -- (ChainState:accept_side_branch_block, utxo.lua) — the SAME path the
+  -- submitblock RPC uses — instead of letting connect_block hard-reject the
+  -- block on a prev_hash mismatch.  fn(block, block_hash) -> (result, err)
+  -- where result is "connected" (reorg fired, active tip switched), "stored"
+  -- (side-branch body persisted, active tip unchanged), or nil (+err) for a
+  -- genuine reject.  Set in main.lua, closing over chain_state + mempool.
+  -- When nil (test scaffolding without a chainstate) the fork-body routing is
+  -- inert and the legacy LATE_ARRIVAL / connect_block behaviour is preserved.
+  self.side_branch_callback = nil
+  -- Reorg-drop fix (part 1/2 gate): returns (active_tip_hash, active_tip_height)
+  -- of the ACTIVE VALIDATED chain (chain_state).  _apply_fork_aware_floor uses
+  -- it to distinguish a genuine competing fork (header tip does NOT descend from
+  -- the validated tip) from ordinary IBD (header tip extends it).  Set in
+  -- main.lua; when nil the fork-aware floor is inert (legacy forward-only walk),
+  -- which is the correct behaviour for the unit tests that drive
+  -- schedule_downloads without a chainstate.
+  self.active_tip_provider = nil
   -- IBD durability: how often to fsync the chainstate to disk. The
   -- per-block flush goes to RocksDB with sync=false (memtable + WAL
   -- in OS page cache); at this cadence we issue a sync write so the
@@ -2095,6 +2193,271 @@ end
 --------------------------------------------------------------------------------
 -- Download Scheduling
 --------------------------------------------------------------------------------
+
+-- Maximum reorg depth the fork-aware download walk will bridge. Mirrors the
+-- MAX_REORG_DEPTH constant in ChainState:accept_side_branch_block (utxo.lua):
+-- a competing fork that forks deeper than this would be refused by the reorg
+-- orchestrator anyway, so there is no point fetching its bridging bodies. The
+-- walk is depth-capped here so a malicious/malformed deep fork can never make
+-- the scheduler enqueue an unbounded set.
+BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH = 100
+
+--- GAP2 fix — fork-aware download floor (Core FindNextBlocksToDownload,
+--- net_processing.cpp; ports the blockbrew/nimrod/hotbuns reorg-drop part 1).
+---
+--- The normal download walk starts at self.next_download_height, which is
+--- floored at the active validated tip (next_connect_height = chain_tip + 1).
+--- When a competing header chain with MORE WORK than the active tip becomes the
+--- header tip (GAP1 already flips header_tip_hash and rewrites height_to_hash
+--- along the fork), its bridging bodies — the blocks from the fork point up to
+--- (and just past) the active tip height — sit BELOW that floor and are never
+--- requested. Without the bodies, the reorg orchestrator can never run and the
+--- node stays stuck on the minority chain.
+---
+--- This walks the header-tip ancestry by prev_hash (NOT height_to_hash, which
+--- is a single linear map) back to the fork point: the deepest ancestor whose
+--- block body we already have on disk (Core BLOCK_HAVE_DATA). If a heavier fork
+--- is pending and any of its bridging bodies are missing, it lowers
+--- self.next_download_height to fork_point+1 so the existing per-peer request
+--- loop fetches the fork bodies by ancestry. Depth-capped at
+--- MAX_FORK_DOWNLOAD_DEPTH. Returns true when it lowered the floor.
+---
+--- INVARIANT: a no-fork header tip (a simple extension of the active chain, the
+--- normal IBD / steady-state case) leaves the floor untouched — the walk's very
+--- first ancestor below the active tip has its body on disk, so fork_point is at
+--- or above the active tip and nothing is lowered. Only a genuine below-tip
+--- heavier fork changes behaviour.
+-- @return boolean: true if the download floor was lowered to a fork point
+function BlockDownloader:_apply_fork_aware_floor()
+  -- GATE 1 — only the live node (with a chainstate) drives the fork floor.
+  -- The unit tests that exercise schedule_downloads do so without a chainstate
+  -- (no active_tip_provider); for them the fork floor is inert and the legacy
+  -- forward-only download walk runs unchanged.
+  if not self.active_tip_provider then return false end
+  local active_tip_hash, active_tip_height = self.active_tip_provider()
+  if not active_tip_hash or not active_tip_height then return false end
+  if active_tip_height < 0 then return false end
+
+  local hc = self.header_chain
+  local tip_hex = hc.header_tip_hash and types.hash256_hex(hc.header_tip_hash) or nil
+  if not tip_hex then return false end
+  local tip_entry = hc.headers[tip_hex]
+  if not tip_entry then return false end
+
+  -- GATE 2 — only a header tip with MORE work than the active validated tip can
+  -- trigger a reorg.  A header tip at/below the active tip height is either our
+  -- own chain or a lighter side branch; either way no rewind is warranted.
+  if (tip_entry.height or 0) <= active_tip_height then return false end
+
+  local active_tip_hex = types.hash256_hex(active_tip_hash)
+
+  -- Walk the header-tip ancestry by prev_hash toward genesis, stopping at the
+  -- fork point: the deepest ancestor whose block body we ALREADY have on disk
+  -- (Core BLOCK_HAVE_DATA).  CRUCIAL DISTINCTION (fixes the early-IBD misfire):
+  -- if the walk passes THROUGH the active validated tip hash, the header tip is
+  -- a straight EXTENSION of our chain (ordinary IBD) — NOT a competing fork —
+  -- and we must NOT rewind the cursors (during early IBD no bodies are on disk
+  -- yet, so the have-body test alone would mistake every header for a missing
+  -- fork body).  We only treat it as a fork when the ancestry diverges from the
+  -- active tip before reaching a shared have-body ancestor.
+  --
+  -- We deliberately do NOT use the persisted height index / in-memory
+  -- height_to_hash to identify the active chain: accept_header overwrites BOTH
+  -- of those along the heavier header fork (sync.lua:1342/1346), so after the
+  -- header tip flips they point at the FORK chain, not the active validated
+  -- chain. CF.BLOCKS + the active tip hash are the only fork-faithful signals.
+  -- Cap the descent depth.
+  local fork_point_height = nil
+  local missing_below_or_at_tip = false
+  local cursor_hex = tip_hex
+  local steps = 0
+  while cursor_hex do
+    local entry = hc.headers[cursor_hex]
+    if not entry then
+      -- Header gap (should not happen for a connected header chain); bail
+      -- rather than guess. The normal cursor logic still runs.
+      return false
+    end
+
+    -- If the ancestry reaches the active validated tip, the header tip EXTENDS
+    -- our chain — ordinary IBD, not a fork.  Leave both cursors untouched.
+    if cursor_hex == active_tip_hex then
+      return false
+    end
+
+    -- Fork point reached when we already have the body on disk. We need not
+    -- fetch it nor anything below it (its ancestors are likewise on disk).
+    local block_hash = validation.compute_block_hash(entry.header)
+    local have_body = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes) ~= nil
+    if have_body then
+      fork_point_height = entry.height
+      break
+    end
+
+    -- Body missing. If it is at or below the active tip height, this is a
+    -- bridging body the normal floor would skip — record that we have work.
+    if entry.height <= active_tip_height then
+      missing_below_or_at_tip = true
+    end
+
+    steps = steps + 1
+    if steps >= BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH then
+      -- Descent hit the depth cap without reaching a have-body ancestor. A
+      -- reorg deeper than this would be refused by accept_side_branch_block,
+      -- so stop here and floor at the deepest height we walked to.
+      fork_point_height = entry.height - 1
+      print(string.format(
+        "[FORK-DL] descent hit MAX_FORK_DOWNLOAD_DEPTH=%d at height %d; capping",
+        BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH, entry.height))
+      break
+    end
+
+    -- Genesis sentinel: prev_hash all zeros — no parent to walk to.
+    local prev = entry.header.prev_hash
+    if prev.bytes == string.rep("\0", 32) then
+      fork_point_height = entry.height - 1
+      break
+    end
+    cursor_hex = types.hash256_hex(prev)
+  end
+
+  -- Only lower the floor when a bridging body at/below the active tip is
+  -- actually missing — i.e. a genuine below-tip fork. A header tip that simply
+  -- extends the active chain has have_body=true at the active tip on the very
+  -- first below-tip step, so missing_below_or_at_tip stays false and we no-op.
+  if not missing_below_or_at_tip or fork_point_height == nil then
+    return false
+  end
+
+  local new_floor = fork_point_height + 1
+  local lowered = false
+  if new_floor < self.next_download_height then
+    print(string.format(
+      "[FORK-DL] heavier fork pending: lowering download floor %d -> %d (fork point %d, header tip h=%d active tip h=%d)",
+      self.next_download_height, new_floor, fork_point_height,
+      hc.header_tip_height, active_tip_height))
+    self.next_download_height = new_floor
+    lowered = true
+  end
+
+  -- Reorg-drop fix part 2 (in-order driver): ALSO lower the CONNECT cursor to
+  -- the fork point so connect_pending_blocks walks the competing fork's bodies
+  -- in ascending height order (B[fork_point+1], B[fork_point+2], ...).  After
+  -- the header flip height_to_hash[fork_point+1 ..] points at the FORK, so the
+  -- cursor processes the fork — NOT the already-connected active chain.  Each
+  -- fork body is routed through accept_side_branch_block and STORED (each is
+  -- lighter than the active chain until the fork's cumulative work overtakes
+  -- it); processing in order guarantees that when the FIRST strictly-heavier
+  -- fork body is reached, ALL of its bridging ancestors are already on disk, so
+  -- the reorg connect loop never hits a missing body (the out-of-order hazard
+  -- that otherwise half-reorgs the active chain down to the fork point and
+  -- wedges).  This mirrors blockbrew's part-2 in-order connectPendingBlocks.
+  if new_floor < self.next_connect_height then
+    print(string.format(
+      "[FORK-DL] lowering connect cursor %d -> %d to walk the fork in order",
+      self.next_connect_height, new_floor))
+    self.next_connect_height = new_floor
+    lowered = true
+  end
+
+  return lowered
+end
+
+--- GAP3 fix — route a received competing-fork body through the EXISTING
+--- side-branch / reorg orchestrator (reorg-drop part 2; ports the
+--- blockbrew ProcessSubmittedBlock / nimrod acceptSideBranchBlock / hotbuns
+--- connectBlock-reorg-dispatch routing).
+---
+--- The passive P2P block path (block / cmpctblock / blocktxn) normally flows
+--- handle_block -> connect_pending_blocks -> connect_callback -> accept_block
+--- -> connect_block, which HARD-REJECTS any block whose parent is not the
+--- active validated tip (utxo.lua connect_block "prev_hash mismatch").  So a
+--- genuine competing-fork body — one whose parent is a known header below or
+--- beside the active tip — could never accumulate, and a heavier fork could
+--- never drive a reorg over a live socket (the runtime-confirmed STUCK).
+---
+--- This delegates that block to self.side_branch_callback, the SAME
+--- ChainState:accept_side_branch_block the submitblock RPC uses.  That
+--- orchestrator stores the side-branch body, compares 256-bit chainwork
+--- against the active chain above the common ancestor, and — once the fork is
+--- strictly heavier and all its bridging bodies are present — disconnects the
+--- active chain down to the common ancestor and connects the fork (switching
+--- the active tip).  On a successful reorg ("connected") we re-anchor the
+--- download/connect cursors past the new tip, exactly as the submitblock RPC
+--- does (rpc.lua), so the scheduler resumes from the reorged chain head.
+---
+--- Returns one of:
+---   "extend"    → the block extends the active validated tip; the caller must
+---                 use its NORMAL connect path (connect_callback).  This is the
+---                 steady-state IBD / extension case — _route_fork_body does
+---                 nothing and the side-branch orchestrator is NOT consulted.
+---   "connected" → reorg fired; chain_state tip is now this fork.  Cursors
+---                 re-anchored to new tip + 1.
+---   "stored"    → side-branch body persisted; active tip unchanged.  The
+---                 fork is not yet heavier (or a bridging body is still
+---                 missing); a later-arriving heavier fork body will retrigger.
+---   nil, err    → not a routable fork body (callback unset, unknown-parent,
+---                 reorg-too-deep, or a genuine connect failure).  Caller
+---                 falls back to its legacy behaviour.
+-- @param block table: deserialized block
+-- @param hash table: hash256 of the block
+-- @param entry table: header-chain entry for the block (has .height)
+-- @return string|nil, string|nil
+function BlockDownloader:_route_fork_body(block, hash, entry)
+  if not self.side_branch_callback then
+    return nil, "no-side-branch-callback"
+  end
+
+  -- Idempotence: if the body is already on disk we have already routed it
+  -- (or connected it on the active chain); do not double-store / re-reorg.
+  if self.storage and self.storage.CF and self.storage.CF.BLOCKS then
+    local have = self.storage.get(self.storage.CF.BLOCKS, hash.bytes)
+    if have then
+      return "stored"  -- already persisted; nothing further to do here
+    end
+  end
+
+  local ok, result, err = pcall(self.side_branch_callback, block, hash, entry and entry.height)
+  if not ok then
+    -- The callback raised (e.g. a Lua error inside the reorg connect loop).
+    -- Treat as a non-fatal reject: the active chain is untouched (the reorg
+    -- orchestrator rolls its in-memory state back on any abort), and the
+    -- legacy path will surface the wedge log if the cursor truly stalls.
+    return nil, tostring(result)
+  end
+
+  if result == "extend" then
+    -- Block extends the active tip — NOT a side branch.  Caller uses its
+    -- normal connect path; the orchestrator was not consulted.
+    return "extend"
+  elseif result == "connected" then
+    -- Reorg fired: chain_state tip is now this fork's tip.  Re-anchor the
+    -- cursors past the new tip so the scheduler/connector resume from the
+    -- reorged chain head (mirrors the submitblock RPC's post-reorg cursor
+    -- bump in rpc.lua).  accept_side_branch_block connects the side chain from
+    -- the common ancestor UP TO the block it was handed — that is exactly the
+    -- `block` whose header entry is `entry`, so entry.height IS the new active
+    -- tip height.  (It is NOT necessarily the header tip: the reorg fires on
+    -- the FIRST fork body whose cumulative work crosses the active tip, which
+    -- may be well below the header tip.  Any still-higher fork bodies are
+    -- connected on their own subsequent connect_pending_blocks iterations,
+    -- each now a plain active-tip extension.)
+    local new_h = entry.height
+    if new_h >= self.next_connect_height then
+      self.next_connect_height = new_h + 1
+      self.next_download_height = new_h + 1
+    end
+    print(string.format(
+      "[FORK-REORG] reorg connected fork up to h=%d; active tip switched, cursors -> %d",
+      entry.height, self.next_connect_height))
+    return "connected"
+  elseif result == "stored" then
+    return "stored"
+  else
+    -- nil + err: unknown-parent / reorg-depth-exceeded / connect failure.
+    return nil, err
+  end
+end
 
 --- Schedule block downloads across available peers.
 -- Uses round-robin assignment with per-peer in-flight tracking.
@@ -2164,6 +2527,16 @@ function BlockDownloader:schedule_downloads(peers)
   if had_stalls or (inflight_count == 0 and self.next_download_height > self.next_connect_height) then
     self.next_download_height = self.next_connect_height
   end
+
+  -- GAP2 fork-aware floor (reorg-drop fix part 1). When a competing header
+  -- chain with more work than the active tip is pending, lower the download
+  -- floor to the fork point so the bridging fork bodies BELOW the active tip
+  -- get requested. Runs AFTER the cursor reset above so it takes precedence
+  -- over the active-tip floor whenever a heavier fork is actually pending; it
+  -- no-ops on the normal IBD / steady-state extension path. Part 2 (routing
+  -- the received fork bodies through accept_side_branch_block) is what then
+  -- drives the reorg once the bodies are present.
+  self:_apply_fork_aware_floor()
 
   -- Detect persistent connection stall: if next_connect_height hasn't advanced
   -- for connect_stall_timeout seconds, force a full reset. This is the
@@ -2535,6 +2908,14 @@ function BlockDownloader:handle_block(peer, block_data)
   -- wedging IBD permanently. Observed on mainnet at height 576466
   -- on 2026-04-18 (2h+ wedge, Pending=1024 pinned, 421 re-requests).
   if entry.height < self.next_connect_height then
+    -- Genuine late-arrival / duplicate for an already-connected height.  A
+    -- competing-fork body does NOT reach this drop: when a heavier below-tip
+    -- fork is pending, _apply_fork_aware_floor (part 1/2 in-order driver) has
+    -- already lowered next_connect_height to the fork point, so every fork body
+    -- has height >= next_connect_height and is buffered into pending_blocks
+    -- below for the in-order connect_pending_blocks walk to route through the
+    -- side-branch orchestrator.  Anything still below the (possibly lowered)
+    -- cursor is therefore a true stale arrival and is dropped as before.
     print(string.format("[BLOCK-DROP] LATE_ARRIVAL height=%d next_connect=%d hash=%s",
       entry.height, self.next_connect_height, hash_hex:sub(1, 16)))
     return true
@@ -2664,6 +3045,80 @@ function BlockDownloader:connect_pending_blocks()
           tostring(header_in_mem), block_in_storage))
       end
       break
+    end
+
+    -- GAP3 fix — reorg-drop part 2.  The connect cursor walks
+    -- height_to_hash[next_connect_height], which accept_header rewrites along
+    -- the HEAVIER header chain (sync.lua:1342/1346).  So once a competing fork
+    -- becomes the header tip, the block at the cursor can be a FORK body whose
+    -- parent is NOT the active validated tip.  The normal path below
+    -- (connect_callback -> accept_block -> connect_block) HARD-REJECTS such a
+    -- block on a prev_hash mismatch and never advances — the runtime-confirmed
+    -- STUCK.  Route it through the SAME accept_side_branch_block the submitblock
+    -- RPC uses: it stores the side-branch body and, once the fork is strictly
+    -- heavier with all bridging bodies present, drives the reorg and switches
+    -- the active tip.  _route_fork_body returns "extend" for the steady-state
+    -- case (block parent == active tip), in which case we fall through to the
+    -- unchanged normal connect below — so IBD / steady-state extension is
+    -- byte-for-byte unaffected.
+    if self.side_branch_callback then
+      local sb_result, sb_err = self:_route_fork_body(
+        pending.block, pending.hash, pending)
+      if sb_result == "connected" then
+        -- Reorg fired; _route_fork_body re-anchored next_connect_height past
+        -- the new tip.  Drop this block from pending and continue the loop
+        -- from the re-anchored cursor (do NOT run the legacy +1 advance).
+        self.pending_blocks[hash_hex] = nil
+        blocks_this_call = blocks_this_call + 1
+        goto continue_loop
+      elseif sb_result == "stored" then
+        -- Side-branch body persisted; active tip unchanged.  This height's
+        -- ACTIVE-chain block is something else (this fork body is below/beside
+        -- the active tip in work).  Advance the connect cursor past it so the
+        -- loop does not re-route the same stored body forever, and stamp the
+        -- stall timer (storing IS forward progress on the fork).  When a later
+        -- fork body crosses the active-tip work the "connected" arm above
+        -- fires and the reorg switches the tip.
+        self.pending_blocks[hash_hex] = nil
+        self.next_connect_height = self.next_connect_height + 1
+        local _sb_sock = require("socket")
+        self.last_connect_advance = _sb_sock.gettime()
+        blocks_this_call = blocks_this_call + 1
+        goto continue_loop
+      elseif sb_result == nil and sb_err and sb_err ~= "no-side-branch-callback"
+          and sb_err ~= "extend" then
+        -- The orchestrator declined to connect this fork body.  Two cases:
+        --   (a) TRANSIENT — the fork is heavier but a bridging body below the
+        --       active tip is not on disk yet (it is still in flight from a
+        --       peer): accept_side_branch_block tried the reorg, found a body
+        --       missing, and rolled back ("reorg-connect-failed: side-branch
+        --       block missing ...").  This is NOT corruption — the missing
+        --       body will arrive via handle_block, be stored, and the NEXT
+        --       connect_pending_blocks pass (every handle_block calls it)
+        --       retries this same fork body and the reorg completes.  Park the
+        --       cursor here (do NOT advance, do NOT route through the normal
+        --       connect_callback — that would prev_hash-mismatch, burn a
+        --       cb_fail_count, and mis-log [CHAINSTATE-CORRUPTION]) and break
+        --       out of the loop to wait for the missing body.
+        --   (b) GENUINE — unknown-parent / reorg-depth-exceeded / a real
+        --       connect failure.  Fall through to the normal connect path so
+        --       connect_block surfaces the real error + bounded-retry/wedge
+        --       logging for this block.
+        if type(sb_err) == "string" and sb_err:find("missing at height") then
+          -- (a) Transient: a bridging fork body is still in flight.  Wait.
+          if not self._last_fork_wait_log or
+              require("socket").gettime() - self._last_fork_wait_log > 30 then
+            self._last_fork_wait_log = require("socket").gettime()
+            print(string.format(
+              "[FORK-DL] heavier fork at h=%d pending a bridging body; waiting (%s)",
+              pending.height, tostring(sb_err)))
+          end
+          break
+        end
+        -- (b) Genuine reject: fall through to the normal connect path below.
+      end
+      -- sb_result == "extend" → block extends the active tip; fall through to
+      -- the unchanged normal connect path below.
     end
 
     -- Validate the full block

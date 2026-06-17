@@ -1130,6 +1130,20 @@ local function main()
   -- Start downloading from after the current chain tip
   block_downloader.next_connect_height = chain_state.tip_height + 1
   block_downloader.next_download_height = chain_state.tip_height + 1
+
+  -- Reorg-drop fix (part 1/2 gate): give the downloader a read-only view of the
+  -- ACTIVE VALIDATED tip (chain_state) so _apply_fork_aware_floor can tell a
+  -- genuine competing fork (header tip does NOT descend from our validated tip)
+  -- apart from ordinary IBD where the header tip simply extends it.  Without
+  -- this the fork walk — which keys off "body present in CF.BLOCKS" — misfires
+  -- during early IBD (no bodies downloaded yet => every header looks like a
+  -- missing fork body) and would wrongly rewind the download/connect cursors.
+  -- The downloader holds chain_state only through callbacks, never directly, so
+  -- this closure is the seam (same pattern as connect_callback / side_branch).
+  block_downloader.active_tip_provider = function()
+    return chain_state.tip_hash, chain_state.tip_height
+  end
+
   -- Build assumevalid callbacks once; they close over header_chain which is
   -- updated in-place as new headers arrive, so the lookup is always current.
   local av_in_index, av_is_ancestor, av_on_best_chain =
@@ -1284,6 +1298,83 @@ local function main()
   -- re-announce.  Bounded by mempool_mod.MAX_ORPHAN_TRANSACTIONS,
   -- MAX_ORPHAN_TX_SIZE and MAX_ORPHANS_PER_PEER (see src/mempool.lua).
   local orphan_pool = mempool_mod.new_orphan_pool()
+
+  -- GAP3 fix — reorg-drop part 2.  Route the passive P2P block path through
+  -- the EXISTING side-branch / reorg orchestrator (the SAME path the
+  -- submitblock RPC uses, rpc.lua) so a heavier competing fork delivered over
+  -- a live socket reorgs the active tip instead of being hard-rejected by
+  -- connect_block's prev_hash check.  The block_downloader has no direct
+  -- chain_state reference (it talks to it only via connect_callback); this
+  -- closure gives it a side-branch entry point that closes over chain_state +
+  -- mempool, mirroring how the connect_callback above closes over chain_state.
+  --
+  -- Contract (consumed by BlockDownloader:_route_fork_body in sync.lua):
+  --   returns "extend"     when block.prev == active tip → caller uses its
+  --                        NORMAL connect path (steady-state IBD/extension is
+  --                        therefore byte-for-byte unaffected; the orchestrator
+  --                        is not even consulted on that path).
+  --   returns "connected"  when the side-branch became strictly heavier and the
+  --                        reorg switched the active tip to this fork.
+  --   returns "stored"     when the side-branch body was persisted but the
+  --                        active chain is unchanged (fork not yet heavier).
+  --   returns nil, err     for unknown-parent / reorg-depth-exceeded /
+  --                        reorg-connect-failed / a malformed candidate.
+  --
+  -- Reference: bitcoin-core/src/validation.cpp ProcessNewBlock → AcceptBlock →
+  -- ActivateBestChain.  Core stores every header-valid block and reorgs once
+  -- cumulative work crosses the active tip; this is the lunarblock analog for
+  -- the P2P entry point, reusing accept_side_branch_block verbatim.
+  block_downloader.side_branch_callback = function(block, block_hash, fork_height)
+    -- Steady-state fast path: the block extends the active validated tip.  This
+    -- is NOT a side branch — tell the caller to use its normal connect path so
+    -- IBD / steady-state extension stays on the unchanged code path and the
+    -- reorg orchestrator is never invoked for ordinary blocks.
+    if chain_state.tip_hash
+        and types.hash256_eq(block.header.prev_hash, chain_state.tip_hash) then
+      return "extend"
+    end
+
+    -- Side-branch path.  Validate the full block BEFORE handing it to the
+    -- orchestrator so we never persist a malformed block (same ordering as the
+    -- submitblock RPC).  Pass the fork body's ABSOLUTE height (from the header
+    -- chain) so the height-dependent contextual gates inside check_block — most
+    -- importantly the BIP-141 witness-commitment activation (segwit_active =
+    -- height >= network.segwit_height) and BIP-34 — evaluate correctly.  The
+    -- submitblock RPC passes nil here and so cannot validate a witness-bearing
+    -- side branch; the P2P fork path always knows the height from the synced
+    -- header chain, so we use it.
+    local val_ok, val_err = pcall(validation.check_block, block, network, fork_height)
+    if not val_ok then
+      return nil, "check_block: " .. tostring(val_err)
+    end
+    if not val_err then
+      return nil, "check_block returned false"
+    end
+
+    -- Hand off to the EXISTING reorg orchestrator (utxo.lua).  Pass the mempool
+    -- so a reorg refills the disconnected-chain txs (Pattern B), exactly like
+    -- the submitblock RPC.  skip_scripts=false: a competing fork delivered over
+    -- P2P is fully script-verified on connect (no assumevalid shortcut for a
+    -- reorg, matching the submitblock path).
+    local result, sb_err = chain_state:accept_side_branch_block(
+      block, block_hash,
+      { skip_scripts = false, nosync = false, mempool = mempool }
+    )
+    if result == "connected" then
+      -- Reorg fired.  Keep the mempool consistent with the new active tip,
+      -- mirroring the submitblock RPC's post-reorg on_block_connected call.
+      if mempool then
+        local ok_mp = pcall(function() mempool:on_block_connected(block) end)
+        if not ok_mp then
+          print("[FORK-REORG] mempool on_block_connected failed (non-fatal)")
+        end
+      end
+      return "connected"
+    end
+    -- "stored" → side-branch persisted, tip unchanged.
+    -- nil, sb_err → unknown-parent / depth / connect failure.
+    return result, sb_err
+  end
 
   -- Bitcoin Core-compatible mempool.dat (kernel/mempool_persist.cpp).
   -- Load any prior dump now; persistence on shutdown is wired into the
@@ -1502,6 +1593,67 @@ local function main()
         accepted, header_chain.header_tip_height))
       peer_manager.our_height = header_chain.header_tip_height
       chain_state.header_tip_height = header_chain.header_tip_height
+    end
+  end)
+
+  -- getheaders responder (Core net_processing.cpp ProcessGetHeaders).
+  --
+  -- Reorg-drop fix (state-gate / trigger): without this, lunarblock could
+  -- only SYNC headers FROM a peer that serves them (Bitcoin Core) but could
+  -- never SERVE its own active chain to a requesting lunarblock peer.  In a
+  -- two-lunarblock topology — exactly the reorg proof, and any localhost fleet
+  -- mesh — the node holding the heavier chain received the getheaders and
+  -- silently dropped it (no handler registered), so the requesting node never
+  -- learned the competing chain, the header tip never flipped, and the PART
+  -- 1+2 reorg machinery (which keys off header_tip > active tip) was never
+  -- triggered.  This serves headers along OUR active chain from the first
+  -- locator hash we recognise, up to MAX_HEADERS_RESULTS or the stop hash —
+  -- the standard full-node responsibility every Core peer already performs.
+  peer_manager:register_handler("getheaders", function(peer, payload)
+    local ok_p, req = pcall(p2p.deserialize_getheaders, payload)
+    if not ok_p or not req then
+      return  -- malformed; ignore (Core also tolerates a bad locator)
+    end
+
+    -- Locate the fork point: the highest active-chain block whose hash appears
+    -- in the locator.  Core walks the locator (ordered tip→genesis) and picks
+    -- the first hash that is on the active chain (CChain::FindFork); we mirror
+    -- that by scanning the locator in order and matching against our in-memory
+    -- header entry's height + the active height_to_hash at that height.
+    local start_height = 1  -- default: peer shares only genesis with us
+    for _, loc_hash in ipairs(req.block_locator_hashes or {}) do
+      local entry = header_chain:get_header(loc_hash)
+      if entry then
+        -- The locator hash must be on OUR ACTIVE chain at its height, not a
+        -- stale fork header we happen to know — check height_to_hash agrees.
+        local active_hex = header_chain.height_to_hash[entry.height]
+        if active_hex == types.hash256_hex(loc_hash) then
+          start_height = entry.height + 1
+          break
+        end
+      end
+    end
+
+    -- Walk our active chain from start_height up to the tip, collecting up to
+    -- MAX_HEADERS_RESULTS headers, stopping early at the requested stop hash.
+    local stop_hash = req.hash_stop
+    local stop_is_zero = stop_hash and stop_hash.bytes == string.rep("\0", 32)
+    local headers = {}
+    local tip_h = header_chain.header_tip_height or 0
+    local h = start_height
+    while h <= tip_h and #headers < p2p.MAX_HEADERS_RESULTS do
+      local entry = header_chain:get_header_at_height(h)
+      if not entry then break end  -- gap (e.g. snapshot base) — stop here
+      headers[#headers + 1] = entry.header
+      if not stop_is_zero and stop_hash then
+        local hh = validation.compute_block_hash(entry.header)
+        if types.hash256_eq(hh, stop_hash) then break end
+      end
+      h = h + 1
+    end
+
+    if #headers > 0 then
+      peer:send_message("headers", p2p.serialize_headers(headers))
     end
   end)
 

@@ -27,6 +27,30 @@ local MAX_CONSECUTIVE_FAILURES       = 1000
 -- Core miner.cpp:285.
 local BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000
 
+-- Median-time-past of the 11 blocks ending at tip_hash (Core GetMedianTimePast).
+-- Mirrors the same helper in utxo.lua (kept local to avoid a module cycle); used
+-- to clamp the mined-block timestamp to MTP+1 so the header is valid under a
+-- peer's ContextualCheckBlockHeader (see create_block_template).
+local function compute_mtp_from_storage(storage, tip_hash)
+  if not storage or not tip_hash then
+    return nil
+  end
+  local timestamps = {}
+  local current_hash = tip_hash
+  for _ = 1, 11 do
+    local header = storage.get_header(current_hash)
+    if not header then break end
+    timestamps[#timestamps + 1] = header.timestamp
+    current_hash = header.prev_hash
+  end
+  if #timestamps == 0 then
+    return nil
+  end
+  table.sort(timestamps)
+  local n = #timestamps
+  return timestamps[math.floor(n / 2) + 1]
+end
+
 --------------------------------------------------------------------------------
 -- Transaction Finality (Locktime Check)
 --------------------------------------------------------------------------------
@@ -377,12 +401,32 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   -- returns VERSIONBITS_TOP_BITS (correct for all-buried-deployment networks).
   local block_version = consensus.compute_block_version(network, height, get_block_info)
 
+  -- Block timestamp = max(MTP + 1, current time) — Core's GetMinimumTime /
+  -- UpdateTime (miner.cpp:36-47, validation UpdateTime).  Reorg-drop fix
+  -- (mining-side consistency): the timestamp was previously raw os.time(),
+  -- which on a fast regtest mine (many blocks in the same wall-clock second)
+  -- produced blocks whose timestamp is NOT strictly greater than the
+  -- median-time-past of the prior 11 blocks.  The local accept_block /
+  -- connect_block path does NOT enforce the header time-too-old rule
+  -- (ContextualCheckBlockHeader), so such blocks were mined + stored fine — but
+  -- a PEER validating them via accept_header (which DOES enforce it) rejected
+  -- the whole header chain as "time-too-old".  That silently broke ALL
+  -- lunarblock-to-lunarblock header sync (the reorg proof's R3 could not feed
+  -- its chain to R1), so the heavier-fork header tip never propagated and the
+  -- reorg machinery never engaged.  Clamping to MTP+1 makes every mined block
+  -- header-MTP-valid, exactly like Core's miner.
+  local real_mtp = compute_mtp_from_storage(chain_state.storage, prev_hash)
+  local block_time = os.time()
+  if real_mtp and block_time <= real_mtp then
+    block_time = real_mtp + 1
+  end
+
   -- Build block header
   local header = types.block_header(
     block_version,
     prev_hash,
     merkle_root,
-    os.time(),
+    block_time,
     bits,
     0  -- nonce starts at 0
   )
