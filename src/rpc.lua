@@ -5769,6 +5769,38 @@ function RPCServer:register_methods()
         error({code = M.ERROR.VERIFY_ERROR, message = "Failed to connect block: " .. tostring(err)})
       end
 
+      -- Reorg-drop fix (state-gate): advance the IN-MEMORY header chain to the
+      -- block we just mined.  accept_block above advanced chain_state and wrote
+      -- the header to CF.HEADERS, but it did NOT touch header_chain — so on a
+      -- mining node header_chain.header_tip_height stayed at 0 while
+      -- chain_state.tip_height climbed.  Two live consequences this fixes:
+      --   (1) peer_manager.our_height is sourced from header_chain.header_tip_
+      --       height (main.lua), so a mining node advertised start_height=0 in
+      --       its VERSION.  A peer therefore never saw our real height, never
+      --       fired its start_sync trigger (peer.start_height > our header tip),
+      --       never getheaders'd us, and so never learned our (possibly heavier)
+      --       chain — the heavier-fork header flip that GAP1 relies on could not
+      --       happen for a locally-mined chain.  This is the analog of the
+      --       nimrod part-3 / hotbuns ibd-latch trigger gap: the reorg machinery
+      --       was correct but the upstream trigger that feeds it was dead.
+      --   (2) main.lua's schedule_downloads trigger compares header_tip_height
+      --       vs chain_state.tip_height; a stale header tip inverts it.
+      -- add_mined_tip records the just-connected block in the in-memory header
+      -- map + advances header_tip_hash/height on more work, WITHOUT re-running
+      -- the contextual header gates (the block is already consensus-valid —
+      -- accept_block accepted it; re-validating via accept_header spuriously
+      -- rejects on an in-memory-MTP mismatch the storage-backed connect path
+      -- already cleared).  Idempotent + incremental.
+      if rpc.header_chain and rpc.header_chain.add_mined_tip then
+        rpc.header_chain:add_mined_tip(block.header, new_height)
+        -- Keep the advertised height in step with our new tip so peers learn it
+        -- on the next handshake / addr exchange (mirrors main.lua's post-sync
+        -- peer_manager.our_height refresh).
+        if rpc.peer_manager and rpc.header_chain.header_tip_height then
+          rpc.peer_manager.our_height = rpc.header_chain.header_tip_height
+        end
+      end
+
       block_hashes[#block_hashes + 1] = types.hash256_hex(block_hash)
 
       -- Evict the block's now-confirmed transactions from the mempool, exactly

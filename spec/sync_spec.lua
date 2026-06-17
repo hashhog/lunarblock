@@ -47,6 +47,7 @@ describe("sync", function()
         META = "meta",
         HEADERS = "headers",
         HEIGHT_INDEX = "height",
+        BLOCKS = "blocks",
       }
     }
 
@@ -895,6 +896,153 @@ describe("sync", function()
         assert.equals(0, #peer.messages_sent)
       end)
 
+      -- GAP2 regression (reorg-drop fix part 1): a competing fork that forks
+      -- BELOW the active validated tip and is heavier MUST have its bridging
+      -- bodies (fork_point+1 .. active_tip and above) requested. Pre-fix the
+      -- download floor sat at the active tip (next_connect_height) so those
+      -- below-tip fork bodies were never enqueued and the reorg could never run.
+      it("requests below-tip bridging bodies of a heavier competing fork", function()
+        -- Active chain A: genesis -> A1..A5. Bodies stored on disk (connected).
+        -- Use a distinct timestamp lineage so chain B's hashes differ.
+        local function build_branch(parent_hash, n, ts0, ts_step, store_bodies)
+          local hashes, headers = {}, {}
+          local parent = parent_hash
+          local ts = ts0
+          for _ = 1, n do
+            ts = ts + ts_step
+            local header = create_valid_header(parent, ts)
+            assert.is_true(find_valid_nonce(header))
+            assert.is_true(chain:accept_header(header))
+            local bh = validation.compute_block_hash(header)
+            hashes[#hashes + 1] = bh
+            headers[#headers + 1] = header
+            if store_bodies then
+              -- Persist a minimal block body so the fork-point walk sees
+              -- have_body=true for the active chain (Core BLOCK_HAVE_DATA).
+              storage.put_block(bh, types.block(header, {}))
+            end
+            parent = bh
+          end
+          return hashes, headers
+        end
+
+        local genesis_hash = chain:get_tip_hash()
+        local genesis_ts = consensus.networks.regtest.genesis.timestamp
+        -- The running node stores the genesis body in CF.BLOCKS via
+        -- connect_genesis; the header-only unit init does not, so seed it here
+        -- so the fork-point walk terminates at genesis (the shared prefix).
+        storage.put_block(genesis_hash,
+          types.block(chain:get_header_at_height(0).header, {}))
+
+        -- Chain A (active, height 5, bodies stored). Active tip = height 5.
+        local a_hashes = build_branch(genesis_hash, 5, genesis_ts, 600, true)
+        local active_tip_height = 5
+
+        -- Chain B (competing fork off genesis, height 9 => heavier).
+        -- Distinct timestamp step so B's block hashes differ from A's.
+        -- NO bodies stored — these are exactly what GAP2 must now request.
+        local b_hashes = build_branch(genesis_hash, 9, genesis_ts, 720, false)
+
+        -- After accept_header, the heavier fork (height 9 > 5) must be the
+        -- header tip, and height_to_hash must reflect chain B along the fork.
+        assert.equals(9, chain.header_tip_height)
+        assert.equals(types.hash256_hex(b_hashes[#b_hashes]),
+          types.hash256_hex(chain.header_tip_hash))
+
+        -- Downloader sits at the active validated tip: next cursor = 6.
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = active_tip_height + 1
+        downloader.next_download_height = active_tip_height + 1
+        -- The active validated tip is chain A's height-5 block (bodies stored).
+        -- The fork floor only engages for a genuine competing fork, which it
+        -- detects via this provider (the header tip's ancestry must NOT pass
+        -- through this hash).  Chain B forks at genesis, so it diverges.
+        downloader.active_tip_provider = function()
+          return a_hashes[active_tip_height], active_tip_height
+        end
+
+        -- A peer that can serve the whole fork.
+        local peer = create_mock_peer(1, 100)
+        downloader:schedule_downloads({peer})
+
+        -- Collect every requested block hash.
+        local requested = {}
+        for _, msg in ipairs(peer.messages_sent) do
+          if msg.command == "getdata" then
+            for _, item in ipairs(p2p.deserialize_inv(msg.payload)) do
+              requested[types.hash256_hex(item.hash)] = true
+            end
+          end
+        end
+
+        -- The download floor must have dropped to the fork point (genesis):
+        -- every chain-B body (heights 1..9) — including the BRIDGING bodies
+        -- 1..5 below/at the active tip — must be requested.
+        for i = 1, #b_hashes do
+          local hx = types.hash256_hex(b_hashes[i])
+          assert.is_true(requested[hx],
+            "fork body at chain-B height " .. i .. " was NOT requested (GAP2 still open)")
+        end
+
+        -- The already-stored active-chain bodies must NOT be re-requested.
+        -- (They are not even in height_to_hash anymore after the fork flip,
+        -- but assert explicitly that we did not re-fetch a have-data block.)
+        for i = 1, #a_hashes do
+          local hx = types.hash256_hex(a_hashes[i])
+          assert.is_falsy(requested[hx],
+            "already-stored active-chain body at height " .. i .. " was wrongly re-requested")
+        end
+      end)
+
+      -- INVARIANT guard: a header tip that simply EXTENDS the active chain
+      -- (normal IBD / steady state, no competing fork) must leave the download
+      -- floor untouched — only blocks above the active tip get requested, never
+      -- already-stored blocks below it.
+      it("does not lower the download floor on a simple extension (no fork)", function()
+        local genesis_hash = chain:get_tip_hash()
+        local ts = consensus.networks.regtest.genesis.timestamp
+        local parent = genesis_hash
+        local hashes = {}
+        -- Single chain genesis -> 1..6. Bodies stored for 1..3 (connected),
+        -- 4..6 are header-only (the normal "headers ahead of blocks" state).
+        for h = 1, 6 do
+          ts = ts + 600
+          local header = create_valid_header(parent, ts)
+          assert.is_true(find_valid_nonce(header))
+          assert.is_true(chain:accept_header(header))
+          local bh = validation.compute_block_hash(header)
+          hashes[h] = bh
+          if h <= 3 then storage.put_block(bh, types.block(header, {})) end
+          parent = bh
+        end
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 4   -- connected tip = height 3
+        downloader.next_download_height = 4
+        -- Active validated tip = height-3 block.  The header tip (h6) EXTENDS
+        -- this chain, so the fork-floor walk must reach this hash and no-op —
+        -- proving the divergence detector does not misfire on a simple
+        -- header-ahead-of-blocks extension (the early-IBD case).
+        downloader.active_tip_provider = function()
+          return hashes[3], 3
+        end
+
+        downloader:schedule_downloads({create_mock_peer(1, 100)})
+
+        -- The floor must NOT have been lowered below the active tip.
+        assert.is_true(downloader.next_download_height >= 4,
+          "download floor was lowered on a no-fork extension")
+
+        -- And the connected bodies 1..3 must never be requested.
+        local requested = {}
+        -- (re-run capture by inspecting inflight, which records every enqueue)
+        for hx in pairs(downloader.inflight) do requested[hx] = true end
+        for h = 1, 3 do
+          assert.is_falsy(requested[types.hash256_hex(hashes[h])],
+            "no-fork: already-stored block at height " .. h .. " was wrongly requested")
+        end
+      end)
+
       -- Regression: stale-start_height block-download stall.
       -- The peer filter used `(p.start_height or 0) >= next_connect_height`.
       -- peer.start_height is the handshake-time height and was never bumped
@@ -1067,6 +1215,194 @@ describe("sync", function()
         assert.equals(1, downloader.next_connect_height)
         -- Block at height 2 should still be pending
         assert.is_not_nil(downloader.pending_blocks[hash2_hex])
+      end)
+    end)
+
+    -- GAP3 regression (reorg-drop fix part 2): the passive P2P block path must
+    -- route a genuine competing-fork body through the EXISTING
+    -- accept_side_branch_block orchestrator (via side_branch_callback) instead
+    -- of dropping it (handle_block LATE_ARRIVAL) or hard-rejecting it
+    -- (connect_block prev_hash mismatch).  These tests inject a MOCK
+    -- side_branch_callback and assert the downloader's routing + cursor
+    -- bookkeeping for each result the orchestrator can return.  The full
+    -- accept_side_branch_block end-to-end (work compare + disconnect/reconnect)
+    -- is covered by chainstate_corruption_spec / bip22_submitblock_spec; here we
+    -- pin the sync-layer routing that part 2 adds.
+    describe("fork-body routing (reorg-drop part 2)", function()
+      -- Build: active chain A genesis -> A1..A5 (bodies stored, tip=5), and a
+      -- heavier competing fork B genesis -> B1..B9 (header-only).  Returns the
+      -- downloader plus the chain-B hash list.
+      local function setup_fork(downloader_cursor)
+        local function build_branch(parent_hash, n, ts0, ts_step, store_bodies)
+          local hashes = {}
+          local parent, ts = parent_hash, ts0
+          for _ = 1, n do
+            ts = ts + ts_step
+            local header = create_valid_header(parent, ts)
+            assert.is_true(find_valid_nonce(header))
+            assert.is_true(chain:accept_header(header))
+            local bh = validation.compute_block_hash(header)
+            hashes[#hashes + 1] = bh
+            if store_bodies then storage.put_block(bh, types.block(header, {})) end
+            parent = bh
+          end
+          return hashes
+        end
+        local genesis_hash = chain:get_tip_hash()
+        local gts = consensus.networks.regtest.genesis.timestamp
+        storage.put_block(genesis_hash,
+          types.block(chain:get_header_at_height(0).header, {}))
+        local a_hashes = build_branch(genesis_hash, 5, gts, 600, true)
+        local b_hashes = build_branch(genesis_hash, 9, gts, 720, false)
+        local downloader = sync.new_block_downloader(chain, storage,
+          consensus.networks.regtest)
+        downloader.next_connect_height = downloader_cursor or 6
+        downloader.next_download_height = downloader_cursor or 6
+        -- Active validated tip = chain A's height-5 block (bodies stored).
+        -- The fork-floor divergence detector uses this to recognise chain B as
+        -- a genuine competing fork (its ancestry does NOT pass through A5).
+        downloader.active_tip_provider = function()
+          return a_hashes[5], 5
+        end
+        return downloader, a_hashes, b_hashes
+      end
+
+      it("schedule_downloads lowers BOTH cursors to the fork point so the "
+        .. "competing fork's bridging bodies are walked in order", function()
+        -- The in-order driver (part 1 + 2): when a heavier fork below the active
+        -- tip is pending, _apply_fork_aware_floor (called by schedule_downloads)
+        -- must rewind next_download_height AND next_connect_height to the fork
+        -- point (genesis here) so connect_pending_blocks walks B1, B2, ... in
+        -- ascending order — guaranteeing every bridging ancestor is on disk
+        -- before the first strictly-heavier fork body triggers the reorg.
+        local downloader, _, b_hashes = setup_fork(6)  -- active tip 5, cursor 6
+        downloader:schedule_downloads({create_mock_peer(1, 100)})
+        -- Fork point is genesis (h0).  The CONNECT cursor is rewound to 1 (the
+        -- request walk never advances it) so connect_pending_blocks will process
+        -- the fork in order.  The DOWNLOAD cursor is also rewound to 1, then the
+        -- per-peer request walk consumes it forward as it enqueues each body —
+        -- so after the call it sits past the requested span, NOT at 1.  We
+        -- therefore assert on the connect cursor + the actual requests enqueued.
+        assert.equals(1, downloader.next_connect_height,
+          "connect cursor was not lowered to the fork point (part 2 in-order driver)")
+        -- Every chain-B body (incl. the below-tip bridging heights 1..5) must be
+        -- requested — proving the download floor dropped to the fork point first.
+        local requested = {}
+        for hx in pairs(downloader.inflight) do requested[hx] = true end
+        for i = 1, #b_hashes do
+          assert.is_true(requested[types.hash256_hex(b_hashes[i])],
+            "fork body at chain-B height " .. i .. " was not requested")
+        end
+      end)
+
+      it("does NOT rewind the cursors on a simple active-chain extension "
+        .. "(divergence detector recognises the header tip extends our tip)",
+        function()
+        -- Single chain genesis -> 1..8: bodies stored for 1..5 (connected),
+        -- 6..8 header-only (normal headers-ahead-of-blocks IBD state).  The
+        -- header tip (h8) EXTENDS the active tip (h5), so the fork floor must
+        -- NOT rewind — the divergence walk reaches the active tip hash and bails.
+        local genesis_hash = chain:get_tip_hash()
+        local gts = consensus.networks.regtest.genesis.timestamp
+        storage.put_block(genesis_hash,
+          types.block(chain:get_header_at_height(0).header, {}))
+        local parent, ts, hashes = genesis_hash, gts, {}
+        for h = 1, 8 do
+          ts = ts + 600
+          local header = create_valid_header(parent, ts)
+          assert.is_true(find_valid_nonce(header))
+          assert.is_true(chain:accept_header(header))
+          hashes[h] = validation.compute_block_hash(header)
+          if h <= 5 then storage.put_block(hashes[h], types.block(header, {})) end
+          parent = hashes[h]
+        end
+        local downloader = sync.new_block_downloader(chain, storage,
+          consensus.networks.regtest)
+        downloader.next_connect_height = 6
+        downloader.next_download_height = 6
+        downloader.active_tip_provider = function() return hashes[5], 5 end
+
+        downloader:schedule_downloads({create_mock_peer(1, 100)})
+
+        assert.is_true(downloader.next_connect_height >= 6,
+          "connect cursor wrongly rewound on a simple extension")
+        assert.is_true(downloader.next_download_height >= 6,
+          "download cursor wrongly rewound on a simple extension")
+      end)
+
+      it("on a 'connected' result re-anchors both cursors past the new tip",
+        function()
+        local downloader, _, b_hashes = setup_fork(6)
+        -- Simulate the fork tip B9 arriving via the connect cursor and the
+        -- orchestrator firing a reorg.  Drive _route_fork_body directly with
+        -- the B9 header entry so we test the cursor re-anchor in isolation.
+        downloader.side_branch_callback = function() return "connected" end
+        local b9_hex = types.hash256_hex(b_hashes[9])
+        local b9_entry = chain.headers[b9_hex]
+        local result = downloader:_route_fork_body(
+          types.block(b9_entry.header, {}), b_hashes[9], b9_entry)
+        assert.equals("connected", result)
+        -- New active tip is B9 (height 9); cursors must move to 10.
+        assert.equals(10, downloader.next_connect_height)
+        assert.equals(10, downloader.next_download_height)
+      end)
+
+      it("on a 'stored' result in connect_pending_blocks advances the cursor "
+        .. "by one (without connecting the active chain)", function()
+        -- Cursor at 6, the block at height_to_hash[6] is chain-B B6 (the fork
+        -- is the header tip so height_to_hash follows it).  B6 is lighter than
+        -- the active chain at this point, so the orchestrator stores it and the
+        -- connect loop must advance the cursor by one and keep going.
+        local downloader, _, b_hashes = setup_fork(6)
+        local b6_hex = chain.height_to_hash[6]
+        assert.equals(types.hash256_hex(b_hashes[6]), b6_hex)
+        local b6_entry = chain.headers[b6_hex]
+        downloader.pending_blocks[b6_hex] = {
+          block = types.block(b6_entry.header, {}),
+          height = 6,
+          hash = b_hashes[6],
+        }
+        local stored_calls = 0
+        downloader.side_branch_callback = function()
+          stored_calls = stored_calls + 1
+          return "stored"
+        end
+        -- No connect_callback: a "stored" result must NEVER reach it.
+        local connect_called = false
+        downloader.connect_callback = function() connect_called = true end
+
+        downloader:connect_pending_blocks()
+
+        assert.is_true(stored_calls >= 1,
+          "fork body at the cursor was not routed to the side-branch path")
+        assert.is_false(connect_called,
+          "a stored side-branch body wrongly fell through to connect_callback")
+        -- Cursor advanced past the stored fork body; pending entry cleared.
+        assert.is_true(downloader.next_connect_height >= 7)
+        assert.is_nil(downloader.pending_blocks[b6_hex])
+      end)
+
+      it("INVARIANT: an 'extend' result is a pure pass-through — no store, no "
+        .. "cursor change (steady-state extension is deferred to connect_callback)",
+        function()
+        -- For an active-tip-extending block the side_branch_callback reports
+        -- "extend" (its real main.lua impl checks prev_hash == active tip).
+        -- _route_fork_body must NOT touch the cursors and must NOT mark the
+        -- block stored — the caller then uses its UNCHANGED normal connect path
+        -- (connect_callback -> accept_block -> connect_block).  This pins that
+        -- the side-branch routing is inert on the steady-state extension path.
+        local downloader, _, b_hashes = setup_fork(6)
+        local before_connect = downloader.next_connect_height
+        local before_download = downloader.next_download_height
+        downloader.side_branch_callback = function() return "extend" end
+        local b1_entry = chain.headers[types.hash256_hex(b_hashes[1])]
+        local result = downloader:_route_fork_body(
+          types.block(b1_entry.header, {}), b_hashes[1], b1_entry)
+        assert.equals("extend", result,
+          "an active-tip-extending block was not passed through as 'extend'")
+        -- Cursors untouched: the normal connect path owns the advance.
+        assert.equals(before_connect, downloader.next_connect_height)
+        assert.equals(before_download, downloader.next_download_height)
       end)
     end)
 
