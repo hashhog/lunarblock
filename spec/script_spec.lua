@@ -216,6 +216,61 @@ describe("script", function()
       assert.equals("nonstandard", script_type)
       assert.is_nil(hash)
     end)
+
+    -- WITNESS_UNKNOWN: a witness program with version >= 1 that is NOT the
+    -- canonical v1+32 Taproot shape (e.g. v1 16-byte) is classified
+    -- WITNESS_UNKNOWN by Core Solver (solver.cpp:172-175: witnessversion != 0),
+    -- NOT nonstandard.  Relay-standardness only.  Regression: the pre-fix
+    -- version range started at OP_2 (0x52), dropping all non-Taproot v1
+    -- programs through to NONSTANDARD.
+    it("classifies a v1 non-Taproot witness program as witness_unknown", function()
+      -- OP_1 push(16 bytes): 0x51 0x10 <16> -- v1 witness program, 16-byte program
+      local v1_16 = "\x51\x10" .. string.rep("\xab", 16)
+      local script_type, hash = script.classify_script(v1_16)
+      assert.equals("witness_unknown", script_type)
+      assert.is_nil(hash)
+    end)
+
+    it("classifies a v2 witness program as witness_unknown", function()
+      -- OP_2 push(32 bytes): 0x52 0x20 <32>
+      local v2_32 = "\x52\x20" .. string.rep("\xab", 32)
+      assert.equals("witness_unknown", script.classify_script(v2_32))
+    end)
+
+    it("keeps a v1+32 Taproot output as p2tr (not witness_unknown)", function()
+      local p2tr = "\x51\x20" .. string.rep("\x42", 32)
+      assert.equals("p2tr", script.classify_script(p2tr))
+    end)
+
+    it("keeps P2A (51 02 4e 73) as p2a, not witness_unknown", function()
+      assert.equals("p2a", script.classify_script("\x51\x02\x4e\x73"))
+    end)
+
+    -- Bare multisig with a PUSHDATA-prefixed pubkey push.  Core MatchMultisig
+    -- reads each key via GetScriptOp (decodes OP_PUSHDATA1/2/4) and accepts iff
+    -- CPubKey::ValidSize (33 or 65).  Relay-standardness only.  Regression: the
+    -- pre-fix walk only accepted direct pushes + OP_PUSHDATA1.
+    it("classifies bare multisig with an OP_PUSHDATA2-prefixed pubkey", function()
+      local pk = string.rep("\x03", 33)
+      -- OP_1 OP_PUSHDATA2 <33,0> <33B pk> OP_1 OP_CHECKMULTISIG
+      local ms = "\x51" .. "\x4d\x21\x00" .. pk .. "\x51\xae"
+      local script_type, meta = script.classify_script(ms)
+      assert.equals("multisig", script_type)
+      assert.equals("1_1", meta)
+    end)
+
+    it("classifies bare multisig with an OP_PUSHDATA4-prefixed pubkey", function()
+      local pk = string.rep("\x03", 33)
+      -- OP_1 OP_PUSHDATA4 <33,0,0,0> <33B pk> OP_1 OP_CHECKMULTISIG
+      local ms = "\x51" .. "\x4e\x21\x00\x00\x00" .. pk .. "\x51\xae"
+      assert.equals("multisig", script.classify_script(ms))
+    end)
+
+    it("rejects a PUSHDATA-prefixed non-pubkey-size push as multisig (ValidSize gate)", function()
+      -- OP_1 OP_PUSHDATA1 <32> <32 bytes> OP_1 OP_CHECKMULTISIG -- 32 != 33/65
+      local ms = "\x51" .. "\x4c\x20" .. string.rep("\x03", 32) .. "\x51\xae"
+      assert.equals("nonstandard", script.classify_script(ms))
+    end)
   end)
 
   describe("execute_script arithmetic", function()

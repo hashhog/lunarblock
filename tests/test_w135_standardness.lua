@@ -512,6 +512,45 @@ function()
   expect_eq(meta, "1_4", "m_n string for 1-of-4")
 end)
 
+-- G9-e/f/g: PUSHDATA-prefixed pubkey pushes in a bare multisig.  Core's
+-- MatchMultisig (solver.cpp:97) reads each key via GetScriptOp, which decodes
+-- OP_PUSHDATA1/2/4 (script.cpp GetScriptOp), then accepts iff
+-- CPubKey::ValidSize(data) (payload 33 or 65; pubkey.h:77).  So a pubkey pushed
+-- with an OP_PUSHDATA2/4 prefix is a valid bare-multisig key for relay
+-- standardness.  The pre-fix walk only accepted direct + OP_PUSHDATA1, dropping
+-- PUSHDATA2/4-prefixed bare multisig to NONSTANDARD.  De-staled real tests
+-- (mutation: restore the direct+PUSHDATA1-only walk -> these flip to
+-- nonstandard).  Relay standardness only -- NEVER consensus.
+test("G9-e: classify_script accepts OP_PUSHDATA2-prefixed pubkey in bare multisig",
+function()
+  if not script_mod_ok then error("script module unavailable") end
+  local pk = string.rep("\x03", 33)
+  -- OP_1 OP_PUSHDATA2 <33,0> <33B pk> OP_1 OP_CHECKMULTISIG
+  local ms = "\x51" .. "\x4d\x21\x00" .. pk .. "\x51\xae"
+  local stype, meta = script_mod.classify_script(ms)
+  expect_eq(stype, "multisig", "PUSHDATA2-prefixed pubkey classified multisig")
+  expect_eq(meta, "1_1", "m_n string for PUSHDATA2 1-of-1")
+end)
+
+test("G9-f: classify_script accepts OP_PUSHDATA4-prefixed pubkey in bare multisig",
+function()
+  if not script_mod_ok then error("script module unavailable") end
+  local pk = string.rep("\x03", 33)
+  -- OP_1 OP_PUSHDATA4 <33,0,0,0> <33B pk> OP_1 OP_CHECKMULTISIG
+  local ms = "\x51" .. "\x4e\x21\x00\x00\x00" .. pk .. "\x51\xae"
+  expect_eq(script_mod.classify_script(ms), "multisig",
+    "PUSHDATA4-prefixed pubkey classified multisig")
+end)
+
+test("G9-g: PUSHDATA-prefixed non-pubkey-size push is NOT multisig (ValidSize gate)",
+function()
+  if not script_mod_ok then error("script module unavailable") end
+  -- OP_1 OP_PUSHDATA1 <32> <32 bytes> OP_1 OP_CHECKMULTISIG -- 32 != 33/65
+  local ms = "\x51" .. "\x4c\x20" .. string.rep("\x03", 32) .. "\x51\xae"
+  expect_eq(script_mod.classify_script(ms), "nonstandard",
+    "32-byte (non-pubkey-size) PUSHDATA push -> nonstandard, not multisig")
+end)
+
 test("G9-c: accept_transaction rejects n > 3 with reason 'scriptpubkey'",
 function()
   expect_true(file_contains("src/mempool.lua",
@@ -718,6 +757,39 @@ function()
   expect_true(file_contains("src/mempool.lua",
     "witness program is undefined"),
     "reason text matches Core")
+end)
+
+-- G21-b/c/d: classify_script returns WITNESS_UNKNOWN for any witness program
+-- with version >= 1 that is not the canonical v1+32 Taproot shape (e.g. v1
+-- 16-byte, v2 32-byte), matching Core Solver (solver.cpp:172-175,
+-- witnessversion != 0 -> WITNESS_UNKNOWN).  The pre-fix version range started
+-- at OP_2 (0x52), dropping all non-Taproot v1 witness programs through to
+-- NONSTANDARD.  De-staled real tests (mutation: restore 0x52 lower bound ->
+-- the v1 case flips to nonstandard).  P2A and v1+32 Taproot are ruled out
+-- earlier and must stay p2a / p2tr.  Relay standardness only -- NEVER consensus.
+test("G21-b: classify_script returns 'witness_unknown' for a v1 non-Taproot program",
+function()
+  if not script_mod_ok then error("script module unavailable") end
+  -- OP_1 push(16 bytes): v1 witness program, 16-byte program (not 32 == taproot)
+  local v1_16 = "\x51\x10" .. string.rep("\xab", 16)
+  expect_eq(script_mod.classify_script(v1_16), "witness_unknown",
+    "v1 16-byte witness program classified witness_unknown")
+end)
+
+test("G21-c: classify_script keeps v1+32 Taproot as p2tr and P2A as p2a",
+function()
+  if not script_mod_ok then error("script module unavailable") end
+  local p2tr = "\x51\x20" .. string.rep("\x42", 32)
+  expect_eq(script_mod.classify_script(p2tr), "p2tr", "v1+32 stays p2tr")
+  expect_eq(script_mod.classify_script("\x51\x02\x4e\x73"), "p2a", "P2A stays p2a")
+end)
+
+test("G21-d: classify_script returns 'witness_unknown' for a v2 program",
+function()
+  if not script_mod_ok then error("script module unavailable") end
+  local v2_32 = "\x52\x20" .. string.rep("\xab", 32)
+  expect_eq(script_mod.classify_script(v2_32), "witness_unknown",
+    "v2 32-byte witness program classified witness_unknown")
 end)
 
 -- ---------------------------------------------------------------------------
