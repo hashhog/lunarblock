@@ -140,6 +140,29 @@ describe("wallet", function()
 
       assert.equals(expected_fp, child.parent_fingerprint)
     end)
+
+    -- BIP-32 depth-byte guard (Core key.cpp:483 / pubkey.cpp:416:
+    -- `if (nDepth == 0xFF) return false;`). The depth field is one byte, so
+    -- deriving from a depth-255 parent would emit a wrong depth-255 child.
+    it("rejects derivation from a depth-255 parent", function()
+      -- Build a parent at the max depth byte (key material is valid; only the
+      -- depth field matters for the guard).
+      local at_max = wallet.extended_key(
+        master.key, master.chain_code, 0xFF,
+        master.parent_fingerprint, 0, master.is_private)
+      assert.equals(0xFF, at_max.depth)
+      assert.has_error(function()
+        wallet.derive_child(at_max, 0)
+      end)
+    end)
+
+    it("still derives from a depth-254 parent (boundary)", function()
+      local near_max = wallet.extended_key(
+        master.key, master.chain_code, 0xFE,
+        master.parent_fingerprint, 0, master.is_private)
+      local child = wallet.derive_child(near_max, 0)
+      assert.equals(0xFF, child.depth)
+    end)
   end)
 
   describe("BIP44 path derivation", function()
