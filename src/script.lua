@@ -756,14 +756,22 @@ function M.classify_script(script)
   -- program with version != 0 (and not v1+32 Taproot, not P2A) it returns
   -- WITNESS_UNKNOWN.  IsStandard() accepts WITNESS_UNKNOWN as standard
   -- (only NONSTANDARD triggers a false return).  We must do the same so
-  -- that forward-compat segwit outputs (v2-v16, 2-40 byte programs) are
+  -- that forward-compat segwit outputs (v1-v16, 2-40 byte programs) are
   -- not rejected at the relay gate with "scriptpubkey".
+  -- This branch is reached only AFTER the canonical witness types are ruled
+  -- out earlier: v0 P2WPKH/P2WSH (len 22/34), v1+32 Taproot (P2TR), and P2A
+  -- (51 02 4e 73).  So v1 here is a v1 witness program whose size is NOT the
+  -- 32-byte Taproot shape (e.g. a v1 16-byte or 2-byte program) -- Core still
+  -- classifies that as WITNESS_UNKNOWN (witnessversion=1 != 0), NOT
+  -- nonstandard.  The version range must therefore start at OP_1 (0x51, v1),
+  -- not OP_2 (0x52); the pre-fix 0x52..0x60 range dropped all non-Taproot v1
+  -- programs through to NONSTANDARD, over-rejecting them at the relay gate.
   -- Note: v0 with wrong size (not 20 or 32) is NONSTANDARD in Core and
   -- should remain "nonstandard" here (handled by fallthrough below).
   do
     local vbyte = script:byte(1)
     local version
-    if vbyte >= 0x52 and vbyte <= 0x60 then  -- OP_2..OP_16 (v2-v16)
+    if vbyte >= 0x51 and vbyte <= 0x60 then  -- OP_1..OP_16 (v1-v16)
       version = vbyte - 0x50
     end
     if version then
@@ -850,27 +858,46 @@ function M.classify_script(script)
         local n = n_op - 0x50
         if m >= 1 and m <= n and n <= 16 then
           -- Walk the n pubkey pushes from index 2 to len-2.
+          -- Core's MatchMultisig (solver.cpp:97) reads each key via GetScriptOp,
+          -- which decodes direct pushes AND OP_PUSHDATA1/2/4 (script.cpp
+          -- GetScriptOp), then accepts iff CPubKey::ValidSize(data) (pushed
+          -- payload length 33 or 65; pubkey.h:77).  So a pubkey pushed with a
+          -- PUSHDATA2/4 prefix is a valid bare-multisig key for relay
+          -- standardness.  The pre-fix walk only accepted direct + PUSHDATA1,
+          -- over-rejecting PUSHDATA2/4-prefixed pubkeys that Core relays as
+          -- MULTISIG.  We mirror GetScriptOp's PUSHDATA decoding here and keep
+          -- the 33/65 ValidSize length gate.
           local j = 2
           local pk_count = 0
           local ok_parse = true
           while j <= len - 2 do
             local op = script:byte(j)
+            local plen, hdr
             if op >= 0x01 and op <= 0x4b then
-              -- push of `op` bytes — must be a 33 or 65-byte pubkey
-              if op ~= 33 and op ~= 65 then ok_parse = false; break end
-              if j + op > len - 2 then ok_parse = false; break end
-              j = j + 1 + op
-              pk_count = pk_count + 1
+              -- direct push of `op` bytes
+              plen = op
+              hdr = 1
             elseif op == 0x4c then  -- OP_PUSHDATA1
               if j + 1 > len - 2 then ok_parse = false; break end
-              local plen = script:byte(j + 1)
-              if plen ~= 33 and plen ~= 65 then ok_parse = false; break end
-              if j + 1 + plen > len - 2 then ok_parse = false; break end
-              j = j + 2 + plen
-              pk_count = pk_count + 1
+              plen = script:byte(j + 1)
+              hdr = 2
+            elseif op == 0x4d then  -- OP_PUSHDATA2 (little-endian length)
+              if j + 2 > len - 2 then ok_parse = false; break end
+              plen = script:byte(j + 1) + script:byte(j + 2) * 256
+              hdr = 3
+            elseif op == 0x4e then  -- OP_PUSHDATA4 (little-endian length)
+              if j + 4 > len - 2 then ok_parse = false; break end
+              plen = script:byte(j + 1) + script:byte(j + 2) * 256 +
+                     script:byte(j + 3) * 65536 + script:byte(j + 4) * 16777216
+              hdr = 5
             else
               ok_parse = false; break
             end
+            -- CPubKey::ValidSize: payload must be 33 or 65 bytes
+            if plen ~= 33 and plen ~= 65 then ok_parse = false; break end
+            if j + hdr - 1 + plen > len - 2 then ok_parse = false; break end
+            j = j + hdr + plen
+            pk_count = pk_count + 1
           end
           if ok_parse and j == len - 1 and pk_count == n then
             -- Pass m,n via the second return as a string "m_n" so callers can
