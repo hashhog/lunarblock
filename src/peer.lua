@@ -699,29 +699,16 @@ function Peer:handle_version(payload)
   -- Check for self-connection via nonce
   -- (caller should check nonce against known connections)
 
-  -- Send feature negotiation messages BEFORE verack (BIP155, BIP330, BIP339)
-  -- SENDADDRV2 (BIP155): signal addrv2 support so peer relays Tor/I2P/CJDNS to us.
-  -- Per Bitcoin Core net_processing.cpp (ProcessMessage VERSION handler), this is
-  -- sent right after VERSION is received, only when peer's protocol >= 70016.
-  -- BIP155: empty payload; must be sent before VERACK to be valid.
-  if ver.version >= 70016 then
-    self:send_message("sendaddrv2", p2p.serialize_sendaddrv2())
-  end
-
-  -- SENDTXRCNCL (BIP330): Erlay transaction reconciliation.
-  -- Gated behind txreconciliation_enabled (OFF by default = Core's
-  -- DEFAULT_TXRECONCILIATION_ENABLE false). Core never announces unless
-  -- -txreconciliation is set (net_processing.cpp:3723 send is guarded by the
-  -- presence of m_txreconciliation). Within that: only outbound full-relay
-  -- peers (not block-only / not feeler / tx relay supported per VERSION).
-  if self.txreconciliation_enabled and not self.inbound and ver.relay then
-    self.erlay_salt = erlay.generate_salt()
-    self:send_message("sendtxrcncl", p2p.serialize_sendtxrcncl(erlay.VERSION, self.erlay_salt))
-  end
-
   -- Inbound peers must send their own version message back (both sides send
   -- version in the Bitcoin protocol).  Outbound peers already sent version via
   -- start_handshake(), so only do this for inbound connections.
+  --
+  -- ORDERING FIX: the inbound VERSION must go out BEFORE the feature-negotiation
+  -- messages (sendaddrv2/sendtxrcncl). Previously they were sent first, so an
+  -- inbound lunarblock peer emitted `sendaddrv2` before its `version` — which a
+  -- strict peer (including another lunarblock) rejects as "non-version message
+  -- before version" and disconnects. The Bitcoin protocol requires version to be
+  -- the first message; feature negotiation follows after version, before verack.
   if self.inbound and self.state == M.STATE.CONNECTED then
     self.nonce = math.random(1, 2^52)
     -- Track the services we advertise so the BIP-35 mempool handler can gate
@@ -746,6 +733,21 @@ function Peer:handle_version(payload)
     })
     self:send_message("version", ver_payload)
     self.state = M.STATE.VERSION_SENT
+  end
+
+  -- Feature negotiation AFTER version, BEFORE verack (BIP155, BIP330).
+  -- SENDADDRV2 (BIP155): signal addrv2 support so the peer relays Tor/I2P/CJDNS;
+  -- empty payload; only when peer protocol >= 70016 (Core net_processing.cpp).
+  if ver.version >= 70016 then
+    self:send_message("sendaddrv2", p2p.serialize_sendaddrv2())
+  end
+
+  -- SENDTXRCNCL (BIP330): Erlay tx reconciliation. Gated behind
+  -- txreconciliation_enabled (OFF by default = Core DEFAULT_TXRECONCILIATION_ENABLE
+  -- false); only outbound full-relay peers with tx relay per VERSION.
+  if self.txreconciliation_enabled and not self.inbound and ver.relay then
+    self.erlay_salt = erlay.generate_salt()
+    self:send_message("sendtxrcncl", p2p.serialize_sendtxrcncl(erlay.VERSION, self.erlay_salt))
   end
 
   -- Send verack
