@@ -578,6 +578,15 @@ function M.derive_child(parent, index)
     assert(parent.is_private, "Cannot derive hardened child from public key")
   end
 
+  -- BIP-32 depth-byte guard (Core key.cpp:483 CExtKey::Derive /
+  -- pubkey.cpp:416 CExtPubKey::Derive: `if (nDepth == 0xFF) return false;`).
+  -- The depth field is a single byte; deriving from a depth-255 parent would
+  -- produce a child whose serialized depth byte no longer reflects its tree
+  -- position. Core refuses the derivation rather than emit a wrong depth-255
+  -- child (a saturating/wrapping +1 would do exactly that).
+  assert(parent.depth < 0xFF,
+    "BIP-32 derivation past max depth 255 (parent already at depth 255)")
+
   local data
   local index_bytes = string.char(
     bit.band(bit.rshift(index, 24), 0xFF),
