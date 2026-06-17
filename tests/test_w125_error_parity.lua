@@ -614,6 +614,46 @@ test_xfail_pre_fix("G19-a: setban duplicate raises -23 not -1",
     })
   end)
 
+-- G19-b: addnode "add" of an already-added node raises -23
+-- (Core: bitcoin-core/src/rpc/net.cpp addnode -> CConnman::AddNode returns
+-- false -> RPC_CLIENT_NODE_ALREADY_ADDED).  lunarblock's manual_peers table
+-- is the added-node list; a node already present there is the duplicate case.
+-- This de-stales the port of rustoshi 7b94ef1's -23 addnode-add branch.
+test_xfail_pre_fix("G19-b: addnode add already-added raises -23",
+  "BUG-7", function()
+    expect_err_code("addnode", {"127.0.0.1:8333", "add"}, -23, {
+      peer_manager = {
+        -- node already on the added-node list (key = "ip:port").
+        manual_peers = {["127.0.0.1:8333"] = {ip = "127.0.0.1", port = 8333}},
+        peers        = {},
+        network      = {port = 8333},
+        connect_peer = function() return true end,
+        disconnect_peer = function() end,
+      },
+    })
+  end)
+
+-- G19-c (success-path guard): a FIRST-TIME addnode "add" must NOT error —
+-- the duplicate check only fires on the second add of the same key.
+test("G19-c: addnode add fresh node succeeds (no false -23)", function()
+  local pm = {
+    manual_peers = {},  -- empty: fresh add
+    peers        = {},
+    network      = {port = 8333},
+    connect_calls = 0,
+    disconnect_peer = function() end,
+  }
+  pm.connect_peer = function(self) self.connect_calls = self.connect_calls + 1; return true end
+  local server = build_server({peer_manager = pm})
+  local ok, err = pcall(server.methods["addnode"], server, {"127.0.0.1:8333", "add"})
+  if not ok then
+    error("fresh addnode add should succeed; got error: " .. tostring(
+      type(err) == "table" and (err.code .. " " .. tostring(err.message)) or err), 2)
+  end
+  expect_eq(pm.manual_peers["127.0.0.1:8333"] ~= nil, true,
+    "fresh add must persist the node in manual_peers")
+end)
+
 -- ---------------------------------------------------------------------------
 -- G20: RPC_CLIENT_NODE_NOT_ADDED (-24) for addnode remove on missing (BUG-8)
 -- Expectation: MISSING.  addnode remove silently no-ops.

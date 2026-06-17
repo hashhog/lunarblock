@@ -1891,7 +1891,10 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+      -- Core's getblockhash throws RPC_INVALID_PARAMETER (-8) "Block height out
+      -- of range" for an out-of-range height (blockchain.cpp getblockhash),
+      -- NOT the JSON-RPC transport code -32602.
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
       assert.truthy(decoded.error.message:match("out of range"))
     end)
 
@@ -1914,7 +1917,9 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+      -- Above-tip height -> RPC_INVALID_PARAMETER (-8), matching Core
+      -- (blockchain.cpp getblockhash: nHeight > active_chain.Height()).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
     end)
 
     it("returns correct hash for valid height", function()

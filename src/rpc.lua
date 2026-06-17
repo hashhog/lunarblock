@@ -266,6 +266,14 @@ M.ERROR = {
   INSUFFICIENT_FUNDS = -6,
   OUT_OF_MEMORY = -7,
   INVALID_PARAMETER = -8,  -- RPC_INVALID_PARAMETER (Core: protocol.h)
+  -- P2P client-side error codes (Core protocol.h:60-63).  These mirror
+  -- bitcoin-core/src/rpc/net.cpp's addnode/disconnectnode/setban handlers
+  -- exactly: a duplicate `addnode "add"` -> -23, a stale `addnode "remove"`
+  -- -> -24, a `disconnectnode` for a peer that is not connected -> -29, and a
+  -- `setban` for an unparseable IP/subnet -> -30.
+  CLIENT_NODE_ALREADY_ADDED   = -23,  -- RPC_CLIENT_NODE_ALREADY_ADDED
+  CLIENT_NODE_NOT_ADDED       = -24,  -- RPC_CLIENT_NODE_NOT_ADDED
+  CLIENT_NODE_NOT_CONNECTED   = -29,  -- RPC_CLIENT_NODE_NOT_CONNECTED
   CLIENT_INVALID_IP_OR_SUBNET = -30,  -- RPC_CLIENT_INVALID_IP_OR_SUBNET
   DESERIALIZATION_ERROR = -22,
   VERIFY_ERROR = -25,
@@ -310,6 +318,62 @@ local function parse_hash_v(v, name)
   return s
 end
 M.parse_hash_v = parse_hash_v
+
+--------------------------------------------------------------------------------
+-- IP / subnet validation (setban LookupSubNet / LookupHost parity)
+--------------------------------------------------------------------------------
+
+--- Validate a setban "subnet" argument the way Bitcoin Core's setban does.
+--- Core (bitcoin-core/src/rpc/net.cpp::setban) resolves the argument via
+--- LookupSubNet (when it contains a '/') or LookupHost, then throws
+--- RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) "Error: Invalid IP/Subnet" when the
+--- result is !IsValid().  lunarblock's ban table is keyed by the textual
+--- form, so we don't need a full parse — we only need to REJECT strings that
+--- are not a well-formed IPv4/IPv6 address or CIDR subnet, matching Core's
+--- accept/reject boundary for the cases an operator can actually hit (empty,
+--- garbage, out-of-range octets).  Accepts: dotted IPv4 ("1.2.3.4"), IPv4
+--- CIDR ("1.2.3.0/24"), and IPv6 / IPv6 CIDR (contains ':').  Returns true
+--- when the string is a plausibly-valid IP/subnet, false otherwise.
+-- @param s string: the subnet/IP argument (already known to be a string)
+-- @return boolean
+local function is_valid_ip_or_subnet(s)
+  if type(s) ~= "string" or s == "" then return false end
+  -- Split off an optional CIDR prefix length.
+  local addr, prefix = s, nil
+  local slash = s:find("/", 1, true)
+  if slash then
+    addr = s:sub(1, slash - 1)
+    prefix = s:sub(slash + 1)
+    -- Prefix must be a non-empty run of digits in a sane range.
+    if prefix == "" or prefix:match("[^0-9]") then return false end
+    local p = tonumber(prefix)
+    if not p or p < 0 or p > 128 then return false end
+  end
+  if addr == "" then return false end
+  -- IPv6 is recognised by the presence of a colon; lunarblock stores it
+  -- verbatim.  Validate the minimal shape (hex groups / "::") so plain
+  -- garbage with a colon is still rejected, but legitimate IPv6 forms pass.
+  if addr:find(":", 1, true) then
+    if addr:match("^[0-9a-fA-F:%.]+$") then return true end
+    return false
+  end
+  -- IPv4: exactly four dotted decimal octets, each 0..255.
+  local o1, o2, o3, o4 = addr:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+  if not o1 then return false end
+  for _, oct in ipairs({o1, o2, o3, o4}) do
+    local n = tonumber(oct)
+    -- Reject leading-zero-padded or out-of-range octets (Lookup* rejects
+    -- out-of-range; padded forms like "01" are atypical and safest rejected).
+    if not n or n > 255 then return false end
+  end
+  -- For an IPv4 CIDR the prefix must be 0..32.
+  if prefix then
+    local p = tonumber(prefix)
+    if p > 32 then return false end
+  end
+  return true
+end
+M.is_valid_ip_or_subnet = is_valid_ip_or_subnet
 
 --------------------------------------------------------------------------------
 -- Script Disassembly
@@ -1797,8 +1861,16 @@ function RPCServer:register_methods()
     if type(height) ~= "number" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Height must be a number"})
     end
+    -- Out-of-range height (negative or beyond tip): Core's getblockhash
+    -- throws RPC_INVALID_PARAMETER (-8) with the static message
+    -- "Block height out of range" (bitcoin-core/src/rpc/blockchain.cpp
+    -- getblockhash: `if (nHeight < 0 || nHeight > active_chain.Height())`).
+    -- Previously lunarblock collapsed this into the JSON-RPC transport code
+    -- RPC_INVALID_PARAMS (-32602); the negative and above-tip arms below now
+    -- both emit -8, matching Core and the -8 convention already used by
+    -- parse_hash_v / getblockheader elsewhere in this file.
     if height < 0 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Block height out of range"})
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Block height out of range"})
     end
     if not rpc.storage then
       error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
@@ -1806,7 +1878,7 @@ function RPCServer:register_methods()
     -- Check if height is beyond current tip
     local tip_height = rpc.chain_state and rpc.chain_state.tip_height or 0
     if height > tip_height then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Block height out of range"})
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Block height out of range"})
     end
     local hash = rpc.storage.get_hash_by_height(height)
     if not hash then
@@ -3826,6 +3898,17 @@ function RPCServer:register_methods()
     local use_v2_override = nil
     local key = ip .. ":" .. port
     if command == "add" then
+      -- Core's addnode "add" raises RPC_CLIENT_NODE_ALREADY_ADDED (-23) with
+      -- the exact message "Error: Node already added" when the node is already
+      -- on the added-node list (bitcoin-core/src/rpc/net.cpp addnode ->
+      -- CConnman::AddNode returns false; protocol.h:60).  lunarblock's
+      -- manual_peers table IS that added-node list (keyed by "ip:port"), so a
+      -- repeated add of the same key is the duplicate case.  Checked BEFORE
+      -- mutating manual_peers so a first-time add still succeeds unchanged.
+      if rpc.peer_manager.manual_peers[key] then
+        error({code = M.ERROR.CLIENT_NODE_ALREADY_ADDED,
+               message = "Error: Node already added"})
+      end
       -- Persist: register in manual_peers so the tick-level
       -- _reconnect_manual_peers() keeps reconnecting after remote-side
       -- eviction.  Failure here is non-fatal — the reconnect loop will
@@ -3853,6 +3936,16 @@ function RPCServer:register_methods()
       end
       return nil
     elseif command == "remove" then
+      -- Core's addnode "remove" raises RPC_CLIENT_NODE_NOT_ADDED (-24) with
+      -- the exact message "Error: Node could not be removed. It has not been
+      -- added previously." when the node was never added
+      -- (bitcoin-core/src/rpc/net.cpp addnode -> CConnman::RemoveAddedNode
+      -- returns false; protocol.h:61).  Membership is the manual_peers list,
+      -- matching the "add" path above; a stale remove must error, not no-op.
+      if not rpc.peer_manager.manual_peers[key] then
+        error({code = M.ERROR.CLIENT_NODE_NOT_ADDED,
+               message = "Error: Node could not be removed. It has not been added previously."})
+      end
       rpc.peer_manager.manual_peers[key] = nil
       local p = rpc.peer_manager.peers and rpc.peer_manager.peers[key]
       if p then
@@ -3895,7 +3988,7 @@ function RPCServer:register_methods()
     local bantime = params and params[3]
     local absolute = params and params[4]
 
-    if type(subnet) ~= "string" or subnet == "" then
+    if type(subnet) ~= "string" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Error: subnet (string) is required"})
     end
     if type(command) ~= "string" or (command ~= "add" and command ~= "remove") then
@@ -3903,10 +3996,20 @@ function RPCServer:register_methods()
              message = "Error: command (string, \"add\" or \"remove\") is required"})
     end
 
-    -- Strip a trailing /N if present and remember it; we store the full
-    -- subnet string for visibility but ban_peer uses the bare ip key.
-    -- Core's CSubNet validates here; we accept any non-empty token to
-    -- avoid rejecting legitimate IPv6 forms.
+    -- Validate the IP/subnet like Core's setban (net.cpp): LookupSubNet /
+    -- LookupHost reject an empty or malformed argument, and Core then throws
+    -- RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) "Error: Invalid IP/Subnet".
+    -- lunarblock previously accepted any non-empty token (collapsing the
+    -- empty case into -32602 and never rejecting garbage); now it matches
+    -- Core's -30 boundary for unparseable IP/subnet input.
+    if not is_valid_ip_or_subnet(subnet) then
+      error({code = M.ERROR.CLIENT_INVALID_IP_OR_SUBNET,
+             message = "Error: Invalid IP/Subnet"})
+    end
+
+    -- We store the full subnet string verbatim as the ban-table key so
+    -- listbanned echoes Core's input; is_banned() does exact-string match
+    -- in peerman.lua, so a "/32" entry behaves identically to a bare IP.
     local key = subnet  -- keep verbatim so listbanned echoes Core's input
 
     if command == "add" then
