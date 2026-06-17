@@ -228,6 +228,34 @@ describe("address", function()
     end)
   end)
 
+  describe("Bech32 90-char CharLimit (BIP-173/350, Core bech32.cpp:378)", function()
+    it("rejects a valid-checksum string longer than 90 chars", function()
+      -- Build a *valid-checksum* bech32 string longer than the 90-char
+      -- CharLimit. Without the limit it would decode cleanly; Core rejects
+      -- it regardless of checksum because past 89 chars the BCH 4-error
+      -- detection guarantee no longer holds.
+      local data = {}
+      for i = 1, 85 do data[i] = (i - 1) % 32 end
+      local over = address.bech32_encode("bc", data, "bech32")
+      assert.is_true(#over > 90)
+      local hrp, payload, spec, err = address.bech32_decode(over)
+      assert.is_nil(hrp)
+      assert.is_nil(payload)
+      assert.is_nil(spec)
+      assert.is_not_nil(err)
+    end)
+
+    it("accepts a valid string at the 90-char boundary", function()
+      -- A standard-length address (<= 90) must still decode.
+      local program = hex_to_bin("751e76e8199196d454941c45d1b3a323f1433bd6")
+      local ok = address.segwit_encode("bc", 0, program)
+      assert.is_true(#ok <= 90)
+      local hrp, _, spec = address.bech32_decode(ok)
+      assert.equals("bc", hrp)
+      assert.equals("bech32", spec)
+    end)
+  end)
+
   describe("Public key to address generation", function()
     -- Test with known private key = 1
     local privkey = hex_to_bin("0000000000000000000000000000000000000000000000000000000000000001")

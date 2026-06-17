@@ -138,6 +138,11 @@ end
 -- Bech32 constants
 local BECH32_CONST = 1       -- for Bech32 (witness v0)
 local BECH32M_CONST = 0x2bc830a3  -- for Bech32m (witness v1+)
+-- BIP-173/350 character limit (Core bech32.h:38-40 CharLimit::BECH32 = 90):
+-- beyond 89 chars the BCH code's 4-error-detection guarantee no longer holds,
+-- so over-long strings are rejected in Decode regardless of checksum
+-- (Core bech32.cpp:378 `if (str.size() > limit) return {};`).
+local BECH32_MAX_LENGTH = 90
 
 -- Bech32 polymod
 local function bech32_polymod(values)
@@ -207,6 +212,12 @@ end
 -- Bech32 decode: returns hrp, data (5-bit values), spec (or nil, nil, nil, error)
 function M.bech32_decode(str)
   str = str:lower()
+  -- BIP-173/350 90-char CharLimit (Core bech32.cpp:378): reject over-long
+  -- strings regardless of checksum — past 89 chars the 4-error-detection
+  -- guarantee fails. Checked before checksum work, like Core's Decode.
+  if #str > BECH32_MAX_LENGTH then
+    return nil, nil, nil, "Bech32 string too long"
+  end
   local sep_pos = 0
   for i = #str, 1, -1 do
     if str:sub(i, i) == "1" then
