@@ -2594,9 +2594,21 @@ function BlockDownloader:schedule_downloads(peers)
     -- signal of recovery is connect_pending_blocks advancing
     -- next_connect_height, which stamps last_connect_advance afresh.
     self.last_connect_advance = now
-    print(string.format(
-      "STALL RECOVERY: connection stuck at %d for >%ds, cleared %d stuck inflight, evicted %d zombie pending",
-      self.next_connect_height, self.connect_stall_timeout, cleared, evicted))
+    -- Only emit the loud STALL RECOVERY line when we actually cleared a stuck
+    -- inflight or evicted a zombie pending — i.e. something was genuinely
+    -- stuck. With a single peer (mainnet --connect loopback Core) and ~10-min
+    -- block gaps the timer fires on essentially every block while the node
+    -- waits at-tip; cleared==0 and evicted==0 there means nothing was stuck,
+    -- the wait is normal, and printing ~2224 RECOVERY lines per boot is pure
+    -- noise. The timer reset + inflight recount above still run unconditionally
+    -- so watchdog cadence and download behaviour are unchanged; only the no-op
+    -- log line is suppressed (the surgical-clear / zombie-sweep are themselves
+    -- no-ops when there is nothing to clear/evict).
+    if cleared > 0 or evicted > 0 then
+      print(string.format(
+        "STALL RECOVERY: connection stuck at %d for >%ds, cleared %d stuck inflight, evicted %d zombie pending",
+        self.next_connect_height, self.connect_stall_timeout, cleared, evicted))
+    end
     -- Recalculate inflight count after clearing
     inflight_count = 0
     for _ in pairs(self.inflight) do inflight_count = inflight_count + 1 end
