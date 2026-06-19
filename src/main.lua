@@ -1582,12 +1582,45 @@ local function main()
     end
   end
 
+  -- Core MaybePunishNodeForBlock parity (net_processing.cpp): only genuinely
+  -- consensus-INVALID header content is ban-worthy. A header that merely doesn't
+  -- connect, is on a low-work chain, or has a slightly-future timestamp is an
+  -- HONEST peer being ahead/behind or a transient sync state — Core's
+  -- HandleUnconnectingHeaders / BLOCK_HEADER_LOW_WORK / BLOCK_TIME_FUTURE all
+  -- handle these WITHOUT Misbehaving(). lunarblock instead 24h-banned on ANY
+  -- header error (add_ban_score → misbehaving ignores the score and bans
+  -- unconditionally), which filled banned.dat with 97 honest public IPs and
+  -- emptied the addrman — the failure that forced the --connect loopback pin.
+  local HEADERS_BAN_SUBSTRINGS = {
+    "proof of work",          -- insufficient / invalid PoW (normal + presync/redownload)
+    "difficulty transition",  -- invalid difficulty (presync/redownload)
+    "non-continuous header",  -- presync/redownload
+    "commitment",             -- exceeded-max / overrun / mismatch in presync/redownload
+    "time-too-old",
+    "time-timewarp",
+    "bad-diffbits",
+    "bad-version",
+  }
+  local function headers_err_is_banworthy(err)
+    for _, s in ipairs(HEADERS_BAN_SUBSTRINGS) do
+      if string.find(err, s, 1, true) then return true end
+    end
+    return false
+  end
+
   -- Register P2P message handlers
   peer_manager:register_handler("headers", function(peer, payload)
     local accepted, err = header_chain:handle_headers(peer, payload)
     if err then
       print("Invalid headers from " .. peer.ip .. ": " .. err)
-      peer_manager:add_ban_score(peer, 100, err)
+      if headers_err_is_banworthy(err) then
+        -- genuine consensus-invalid header -> ban (Core Misbehaving)
+        peer_manager:add_ban_score(peer, 100, err)
+      else
+        -- unknown parent / too many unconnecting / too-little-chainwork /
+        -- time-too-new: drop the sync slot, NEVER 24h-ban (Core disconnect-only).
+        peer_manager:disconnect_peer(peer, "headers (no-ban): " .. err)
+      end
     elseif accepted and accepted > 0 then
       print(string.format("Accepted %d headers, tip now at height %d",
         accepted, header_chain.header_tip_height))
