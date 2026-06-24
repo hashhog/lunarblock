@@ -263,6 +263,94 @@ function M.parse_debug_cats(spec)
 end
 
 --------------------------------------------------------------------------------
+-- Live category-mask mutation (the `logging` RPC).
+--------------------------------------------------------------------------------
+--
+-- Bitcoin Core's `logging` RPC (rpc/node.cpp:218) mutates the global
+-- BCLog::Logger::m_categories bitmask IN MEMORY, taking effect immediately
+-- with no restart.  These helpers do the equivalent on lunarblock's live
+-- logger: they mutate the SAME `logger.debug_cats` table that `logger:log`
+-- and `logger:enabled` consult on EVERY record.  Nothing is snapshotted, so a
+-- toggle takes effect the instant the table is mutated — this is the trap the
+-- ouroboros reference (f11846a) called out: a filter that snapshots its
+-- category set at construction will NOT honour a runtime toggle.  Here there
+-- is no snapshot to go stale; `self:enabled(cat)` reads `debug_cats[cat]` /
+-- `debug_cats.all` live.
+--
+-- The `all` token is stored as the `debug_cats.all` flag (already understood
+-- by logger:log / logger:enabled as "every category on"), matching Core's
+-- BCLog::ALL.  Enabling a single category does NOT clear `.all`; disabling
+-- `all` clears the whole mask, mirroring Core's DisableCategory(ALL).
+
+--- The live debug-category mask of the running node, or nil if no logger has
+--  been installed yet (e.g. a unit-test harness that never called new_logger).
+-- @return table|nil: the logger's live `debug_cats` table
+function M.get_logger_categories()
+  local logger = package.loaded["lunarblock.logger"]
+  if logger and type(logger.debug_cats) == "table" then
+    return logger.debug_cats
+  end
+  return nil
+end
+
+--- Is `cat` currently being debug-logged on the live logger?  Reads the SAME
+--  predicate logger:enabled uses, so the answer is exactly "would this
+--  category's DEBUG lines emit right now".  `all` flips every category true.
+-- @param cat string
+-- @return boolean
+function M.category_active(cat)
+  local dc = M.get_logger_categories()
+  if not dc then return false end
+  return dc[cat] == true or dc.all == true
+end
+
+--- Enable a single category (or every category for the `all` token) on the
+--  live logger, taking effect immediately.  No-op (returns false) when no
+--  logger is installed.
+-- @param cat string  -- a category name, or "all"/"1"/"" for the full mask
+-- @return boolean: true if a logger was present and mutated
+function M.enable_category(cat)
+  local dc = M.get_logger_categories()
+  if not dc then return false end
+  if cat == "all" or cat == "1" or cat == "" then
+    dc.all = true
+  else
+    dc[cat] = true
+  end
+  return true
+end
+
+--- Disable a single category (or every category for the `all` token) on the
+--  live logger.  Disabling `all` clears the WHOLE mask (Core
+--  DisableCategory(ALL) parity), not just the `.all` flag.  No-op (returns
+--  false) when no logger is installed.
+-- @param cat string  -- a category name, or "all"/"1"/"" for the full mask
+-- @return boolean: true if a logger was present and mutated
+function M.disable_category(cat)
+  local dc = M.get_logger_categories()
+  if not dc then return false end
+  if cat == "all" or cat == "1" or cat == "" then
+    -- Clear every per-category flag AND the all flag: turning "all" off must
+    -- leave nothing logging (Core's m_categories = NONE).
+    for k in pairs(dc) do dc[k] = nil end
+  else
+    dc[cat] = nil
+    -- If the `all` flag was on, an individual disable would be masked by it
+    -- (logger:enabled returns true while .all is set).  Core has no such
+    -- shadowing: DisableCategory(net) under ALL leaves every OTHER category
+    -- on but net off.  Reproduce that by expanding .all into explicit
+    -- per-category flags, then dropping the one being disabled.
+    if dc.all then
+      dc.all = nil
+      for _, name in ipairs(M.LOG_CATEGORIES) do
+        if name ~= cat then dc[name] = true end
+      end
+    end
+  end
+  return true
+end
+
+--------------------------------------------------------------------------------
 -- PID file  (--pid=<path>)
 --------------------------------------------------------------------------------
 --
