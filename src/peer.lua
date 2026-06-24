@@ -154,6 +154,13 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
   self.last_pong_time = 0
   self.ping_nonce = 0
   self.latency_ms = 0
+  -- Running minimum pong round-trip in ms (Core CNode::m_min_ping_time) and the
+  -- monotonic send time of an outstanding ping not yet answered (Core PingStart
+  -- / m_ping_start).  `min_ping_ms` stays nil until the first pong;
+  -- `ping_wait_since` is nil while no ping is in flight.  getpeerinfo surfaces
+  -- these as `minping` / `pingwait`.
+  self.min_ping_ms = nil
+  self.ping_wait_since = nil
   self.ban_score = 0
   self.inbound = false
   -- Connection-type protection flags (mirrors Core NetPermissionFlags::NoBan
@@ -781,6 +788,10 @@ end
 function Peer:send_ping()
   self.ping_nonce = math.random(1, 2^52)
   self.last_ping_time = socket.gettime()
+  -- Mark the ping as outstanding (Core PingStart / m_ping_start).  Cleared when
+  -- the matching pong arrives; getpeerinfo reports the elapsed wait as
+  -- `pingwait` while it is non-nil.
+  self.ping_wait_since = self.last_ping_time
   self:send_message("ping", p2p.serialize_ping(self.ping_nonce))
 end
 
@@ -798,6 +809,12 @@ function Peer:handle_pong(payload)
   if nonce == self.ping_nonce then
     self.last_pong_time = socket.gettime()
     self.latency_ms = (self.last_pong_time - self.last_ping_time) * 1000
+    -- Running minimum round-trip (Core m_min_ping_time) and clear the
+    -- outstanding-ping marker so getpeerinfo's pingwait drops back to nil.
+    if self.min_ping_ms == nil or self.latency_ms < self.min_ping_ms then
+      self.min_ping_ms = self.latency_ms
+    end
+    self.ping_wait_since = nil
   end
 end
 
