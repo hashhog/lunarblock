@@ -1025,6 +1025,85 @@ function PeerManager:get_addrman_stats()
   }
 end
 
+--- Map a stored address literal to Core's GetNetClass network-name string.
+-- Mirrors GetNetworkName(addr.GetNetClass()) (netbase.cpp:114-128):
+-- ipv4 / ipv6 / onion / i2p / cjdns.  Addresses that are valid but not
+-- publicly routable (GetNetClass -> NET_UNROUTABLE) classify as
+-- "not_publicly_routable".  Classification is by the textual address form
+-- (the bucketed addrman stores entries by ip literal, not BIP155 network id);
+-- this matches CNetAddr::GetNetClass().
+-- @param ip string: the stored address literal (no port)
+-- @return string: ipv4|ipv6|onion|i2p|cjdns|not_publicly_routable
+local function _addrman_net_class(ip)
+  if type(ip) ~= "string" or ip == "" then
+    return "not_publicly_routable"
+  end
+  if ip:match("%.onion$") then return "onion" end
+  if ip:match("%.b32%.i2p$") or ip:match("%.i2p$") then return "i2p" end
+  if ip:match("^%d+%.%d+%.%d+%.%d+$") then
+    -- IPv4: Core reports not_publicly_routable for IsLocal/RFC1918/etc.
+    -- (GetNetClass -> NET_UNROUTABLE) so those addresses are never keyed.
+    if _is_routable(ip) then return "ipv4" end
+    return "not_publicly_routable"
+  end
+  if ip:find(":", 1, true) then return "ipv6" end
+  return "not_publicly_routable"
+end
+
+--- Per-network new/tried counts for the getaddrmaninfo RPC.
+--
+-- Reference: Bitcoin Core AddrMan::Size / Size_ (addrman.cpp:1006-1026) and
+-- the per-network m_network_counts {n_new, n_tried} maintained by Add/Good.
+-- Core's Size counts DISTINCT addresses (nNew / nTried), NOT bucket slots — a
+-- single new-table address may occupy several new buckets (new_ref_count) but
+-- counts once.  We therefore iterate the distinct-address index _addr_info
+-- (keyed "ip:port", in_tried flag), recover each entry's address literal from a
+-- live bucket reference, classify its Core network, and bump the matching
+-- (network, table) counter.  This reproduces Core's per-network in_new / in_tried
+-- split exactly.  Addresses that classify as not_publicly_routable (or whose
+-- bucket entry has gone) are skipped, matching Core's loop that never emits
+-- NET_UNROUTABLE / NET_INTERNAL.
+--
+-- Pure read: walks in-memory addrman state only; no params, no side effects.
+-- @return table: { [net_name] = {new=int, tried=int} } for the 5 routable nets
+function PeerManager:get_addrmaninfo_counts()
+  local NET_KEYS = {"ipv4", "ipv6", "onion", "i2p", "cjdns"}
+  local counts = {}
+  for _, name in ipairs(NET_KEYS) do
+    counts[name] = {new = 0, tried = 0}
+  end
+
+  for _key, info in pairs(self._addr_info or {}) do
+    -- Recover the address literal from a live bucket entry (the _addr_info
+    -- key "ip:port" is ambiguous for IPv6, so dereference instead of parsing).
+    local ip
+    if info.in_tried then
+      local entry = self._tried_buckets[info.tried_bucket]
+        and self._tried_buckets[info.tried_bucket][info.tried_pos]
+      if entry then ip = entry.ip end
+    elseif info.new_refs then
+      for b, p in pairs(info.new_refs) do
+        local entry = self._new_buckets[b] and self._new_buckets[b][p]
+        if entry then ip = entry.ip; break end
+      end
+    end
+
+    if ip then
+      local net = _addrman_net_class(ip)
+      local bucketc = counts[net]
+      if bucketc then
+        if info.in_tried then
+          bucketc.tried = bucketc.tried + 1
+        elseif (info.new_ref_count or 0) > 0 then
+          bucketc.new = bucketc.new + 1
+        end
+      end
+    end
+  end
+
+  return counts
+end
+
 --------------------------------------------------------------------------------
 -- Address Manager Persistence (peers.dat-equivalent — BUG-17, asmap BUG-14)
 --
