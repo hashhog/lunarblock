@@ -4053,6 +4053,118 @@ function RPCServer:register_methods()
     end
   end
 
+  -- logging — get and set the per-category debug-logging configuration.
+  -- ────────────────────────────────────────────────────────────────────
+  -- Reference: Bitcoin Core rpc/node.cpp logging (:218) +
+  -- EnableOrDisableLogCategories (:200); logging.cpp LogCategoriesList (:278),
+  -- GetLogCategory (:220), EnableCategory/DisableCategory (:123-145).
+  --
+  -- lunarblock has a REAL category-based logger (ops.new_logger): a live
+  -- `debug_cats` enable-mask that `logger:log(msg, cat)` and `logger:enabled`
+  -- consult on EVERY record, configured at startup by `--debug=<cat>,...`.
+  -- The category set is lunarblock's own M.LOG_CATEGORIES (net, mempool, rpc,
+  -- bench, prune, zmq, validation, leveldb, tor, rand, addrman, ibd,
+  -- consensus, p2p, wallet) — the names legitimately differ per node; only the
+  -- SHAPE, param-semantics, and the -8 error match Core.  This RPC reads and
+  -- mutates that LIVE mask via ops.enable_category / ops.disable_category, so
+  -- a toggle here makes the category start/stop emitting immediately with no
+  -- restart — exactly like Core's in-memory m_categories mutation, and with no
+  -- snapshot trap (the logger never caches the mask).
+  --
+  -- Params (both OPTIONAL, positional, Core order: include THEN exclude):
+  --   include (array of category strings): categories to ENABLE.
+  --   exclude (array of category strings): categories to DISABLE.
+  -- A param is acted on ONLY if it is an array (Core isArray() guard);
+  -- null/omitted is a no-op for that slot, so `logging` with no args is a pure
+  -- read-and-report.  include is applied first, then exclude — a category in
+  -- both ends up DISABLED ("exclude wins").
+  --
+  -- Special input-only tokens (never emitted as output keys): "all" / "1" / ""
+  -- expand to the full mask; in the exclude slot they clear the whole mask
+  -- (Core DisableCategory(ALL): logging [], ["all"] disables everything).
+  --
+  -- Returns: a JSON object mapping every real category name -> bool (whether
+  -- it is currently being debug logged), in ascending ALPHABETICAL key order
+  -- (Core iterates a std::map; alphabetical makes the output byte-stable).
+  --
+  -- Errors:
+  --   Unknown category in either array -> RPC_INVALID_PARAMETER (-8),
+  --     message "unknown logging category <cat>" (Core node.cpp:213).  Thrown
+  --     as soon as the bad name is hit, after scanning include fully then
+  --     exclude in order; categories BEFORE the bad one in the SAME call have
+  --     ALREADY been applied (partial application, no rollback — Core parity).
+  --   Non-string array element -> RPC_TYPE_ERROR (-3) (Core get_str()).
+  --
+  -- Scope: mutates the running node's in-memory mask immediately; NOT persisted
+  -- to config, resets on restart to the `--debug` startup flags.  Idempotent.
+  self.methods["logging"] = function(_rpc, params)
+    local ops = require("lunarblock.ops")
+    local known = {}
+    for _, name in ipairs(ops.LOG_CATEGORIES) do known[name] = true end
+    -- Core's special input-only tokens (logging.cpp:222): map to the full mask.
+    -- Accepted as inputs in either slot; NEVER emitted as output keys.
+    local all_tokens = { ["all"] = true, ["1"] = true, [""] = true }
+
+    -- EnableOrDisableLogCategories parity (node.cpp:200): for an array param,
+    -- iterate elements, get_str() each, then EnableCategory/DisableCategory.
+    -- A non-array param is silently ignored at the call site (only isArray()
+    -- triggers processing) — so nil / null / non-array is a no-op for that slot.
+    local function apply(cats, enable)
+      if type(cats) ~= "table" then
+        -- nil, cjson.null, or any non-array scalar: not isArray() -> skip.
+        return
+      end
+      -- A JSON object (string keys) is not isArray() in Core either; only a
+      -- positional array is processed.  An empty Lua table {} reads as an empty
+      -- array (zero elements) -> harmless no-op, matching Core's empty-array.
+      for i = 1, #cats do
+        local item = cats[i]
+        if type(item) ~= "string" then
+          -- Core get_str() raises a JSON type error on a non-string element.
+          error({
+            code = M.ERROR.TYPE_ERROR,
+            message = "JSON value of type " .. core_json_type_name(item) ..
+                      " is not of expected type string",
+          })
+        end
+        if all_tokens[item] then
+          -- all/1/"" -> whole mask (enable: everything on; disable: everything off).
+          if enable then ops.enable_category(item) else ops.disable_category(item) end
+        elseif not known[item] then
+          -- Core node.cpp:213 — EnableCategory/DisableCategory return false for
+          -- an unknown name -> -8 "unknown logging category <cat>".  Thrown
+          -- HERE, after any earlier valid names in this call already applied
+          -- (partial application, no rollback).
+          error({
+            code = M.ERROR.INVALID_PARAMETER,
+            message = "unknown logging category " .. item,
+          })
+        else
+          if enable then ops.enable_category(item) else ops.disable_category(item) end
+        end
+      end
+    end
+
+    -- Core order: include first (params[0]), then exclude (params[1]).
+    apply(params and params[1], true)
+    apply(params and params[2], false)
+
+    -- Emit the full {category: active} map, alphabetically sorted, for every
+    -- REAL category (all/1/"" are never keys).  `active` reads the SAME live
+    -- predicate logger:enabled uses, so each bool is literally "would this
+    -- category's debug lines emit right now".  Built by hand (oj) so the key
+    -- order is byte-stable — cjson does not preserve table key order.
+    local names = {}
+    for _, name in ipairs(ops.LOG_CATEGORIES) do names[#names + 1] = name end
+    table.sort(names)
+    local seq = {}
+    for _, name in ipairs(names) do
+      seq[#seq + 1] = name
+      seq[#seq + 1] = ops.category_active(name)
+    end
+    return oj_result(oj(seq))
+  end
+
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
     -- BUG-22 fix (W115 FIX-50): include mapped_as field per peer.
