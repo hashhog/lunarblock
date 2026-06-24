@@ -4189,6 +4189,122 @@ function RPCServer:register_methods()
     end
   end
 
+  -- getaddednodeinfo ( "node" )
+  -- Reference: bitcoin-core/src/rpc/net.cpp getaddednodeinfo (:486-558) +
+  -- CConnman::GetAddedNodeInfo (net.cpp:2914).  Returns information about the
+  -- persistent added-node list (addnode "add", NOT "onetry"), joined against
+  -- the live peer table.  Mirrors Core's exact shape:
+  --
+  --   [
+  --     {
+  --       "addednode": <str>,               -- node as provided to addnode
+  --       "connected": <bool>,              -- a current peer matches
+  --       "addresses": [                    -- ALWAYS present; [] when not connected
+  --         {"address":   <str ip:port>,
+  --          "connected": "inbound" | "outbound"}   -- at most ONE entry
+  --       ]
+  --     },
+  --     ...
+  --   ]
+  --
+  -- lunarblock's `peer_manager.manual_peers` IS Core's added-node registry
+  -- (keyed by "ip:port", populated by `addnode add`, NOT `onetry` — see the
+  -- addnode handler above and peerman.lua:365).  `onetry` adds are therefore
+  -- never listed (Core parity, net.cpp GetAddedNodeInfo excludes them).
+  --
+  -- Params:
+  --   node (str, OPTIONAL): if provided, return only the matching added node;
+  --     if it is NOT on the added list, raise -24 RPC_CLIENT_NODE_NOT_ADDED
+  --     "Error: Node has not been added." (net.cpp:534 — leading "Error: ",
+  --     trailing period, byte-exact).  Matching is exact-string equality
+  --     against the key the addnode handler stores ("ip:port", with the
+  --     default port appended for a bare host, mirroring the addnode path).
+  --     If omitted, all added nodes are returned ([] when none).
+  --
+  -- The INNER "connected" is the bare direction string "inbound"/"outbound"
+  -- (net.cpp:548), NOT a connection-type label like "manual"/"feeler".  Pure
+  -- read — no side effects.
+  self.methods["getaddednodeinfo"] = function(rpc, params)
+    local node = params and params[1]
+    if node ~= nil and node ~= cjson.null and type(node) ~= "string" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. type(node) .. " is not of expected type string"})
+    end
+
+    local pm = rpc.peer_manager
+
+    -- Normalize a "host[:port]" string to the same "ip:port" key form the
+    -- addnode handler stores, so the registry and the optional `node` filter
+    -- compare apples to apples (a bare host gets the default port appended).
+    local function normalize_key(addr)
+      local ip, port_str = addr:match("^([^:]+):?(%d*)$")
+      if not ip or ip == "" then
+        return addr  -- malformed; leave as-is so it simply won't match
+      end
+      local port = tonumber(port_str)
+      if not port or port == 0 then
+        port = (pm and pm.network and pm.network.port) or 8333
+      end
+      return ip .. ":" .. port
+    end
+
+    -- Snapshot the persistent added-node list (manual_peers).  A Lua table has
+    -- no defined iteration order; sort for deterministic, reproducible output.
+    -- (Core preserves insertion order; manual_peers does not record it.)
+    local added_keys = {}
+    if pm and pm.manual_peers then
+      for key in pairs(pm.manual_peers) do
+        added_keys[#added_keys + 1] = key
+      end
+    end
+    table.sort(added_keys)
+
+    -- Build a lookup of currently-connected peers keyed by "ip:port" ->
+    -- inbound?.  Covers every peer the manager tracks (inbound + outbound).
+    local connected = {}  -- "ip:port" -> inbound(bool)
+    if pm and pm.peer_list then
+      for _, p in ipairs(pm.peer_list) do
+        connected[p.ip .. ":" .. p.port] = p.inbound or false
+      end
+    end
+
+    -- Optional `node` filter: exact-string match against the normalized added
+    -- list.  Miss -> -24 "Error: Node has not been added." (net.cpp:534).
+    if type(node) == "string" then
+      local want = normalize_key(node)
+      local found = false
+      for _, key in ipairs(added_keys) do
+        if key == want then found = true; break end
+      end
+      if not found then
+        error({code = M.ERROR.CLIENT_NODE_NOT_ADDED,
+               message = "Error: Node has not been added."})
+      end
+      added_keys = { want }
+    end
+
+    local ret = setmetatable({}, cjson.empty_array_mt)
+    for _, key in ipairs(added_keys) do
+      local is_connected = connected[key] ~= nil
+      local addresses
+      if is_connected then
+        addresses = setmetatable({
+          { address = key,
+            connected = connected[key] and "inbound" or "outbound" },
+        }, cjson.array_mt)
+      else
+        addresses = setmetatable({}, cjson.empty_array_mt)
+      end
+      ret[#ret + 1] = {
+        addednode = key,
+        connected = is_connected,
+        addresses = addresses,
+      }
+    end
+    setmetatable(ret, cjson.array_mt)
+    return ret
+  end
+
   -- Bitcoin Core setban / listbanned / clearbanned RPC.
   -- Reference: bitcoin-core/src/rpc/net.cpp::setban (ban handler).
   -- Lunarblock's PeerManager.banned[ip] map already persists to
