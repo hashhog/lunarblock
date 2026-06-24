@@ -386,6 +386,20 @@ function M.new(network, storage, config)
   self._fixed_seeds_added = false
   self._start_ts = os.time()
 
+  -- Node-global "P2P network active" flag (Bitcoin Core CConnman.fNetworkActive,
+  -- net.h:1164 / CConnman::SetNetworkActive net.cpp:3361, default true).  Toggled
+  -- by the `setnetworkactive` RPC and surfaced read-only as `networkactive` in
+  -- getnetworkinfo.  When false we suppress NEW connection establishment ONLY —
+  -- existing/established peers are NOT force-dropped (Core's contract): three
+  -- gates active only when this is false — (a) inbound accepts are refused
+  -- (accept_inbound, Core net.cpp:1786), (b) the outbound auto-dial refill is
+  -- skipped (maintain_connections, Core net.cpp:2351/3022/3219), (c) DNS / fixed-
+  -- seed re-seeding AND the --connect manual-peer reconnect loop are skipped
+  -- (discover_from_dns / maybe_add_fixed_seeds / _reconnect_manual_peers).  The
+  -- health / timeout / disconnect sweeps in tick() run unconditionally.  Not
+  -- persisted; resets to enabled on restart.
+  self.network_active = true
+
   -- Stale tip detection state (Bitcoin Core: CheckForStaleTipAndEvictPeers)
   self._last_tip_update = socket.gettime()
   self._stale_tip_check_time = socket.gettime() + M.STALE_TIP.STALE_CHECK_INTERVAL
@@ -951,6 +965,11 @@ end
 -- when the NEW table is empty.
 -- @return boolean: true if a feeler connection was opened this call
 function PeerManager:maybe_open_feeler()
+  -- Network-active gate (Core net.cpp:3022, the FEELER arm of ThreadOpenConnections
+  -- spins on fNetworkActive): while networking is disabled (`setnetworkactive
+  -- false`) open no new feeler probe — feelers are NEW outbound establishment.
+  if not self.network_active then return false end
+
   -- -connect mode: only connect to the explicitly configured peers, never feel.
   if self.config and self.config.connect then return false end
 
@@ -1864,6 +1883,17 @@ function PeerManager:maintain_connections()
     if not p.inbound and not p.is_feeler then outbound = outbound + 1 end
   end
 
+  -- Network-active gate (Core net.cpp:2351/3022/3219): while networking is
+  -- disabled (`setnetworkactive false`) the outbound connect loop holds off
+  -- establishing ANY new connection — anchor dials AND addrman auto-outbound
+  -- refill alike.  Existing peers stay up (the health / timeout / disconnect
+  -- sweeps in tick() run unconditionally); only NEW establishment is suppressed.
+  -- DNS / fixed-seed re-seeding is reached only from inside this block, so it is
+  -- gated too.
+  if not self.network_active then
+    return
+  end
+
   -- First, try to connect to any remaining anchor peers (eclipse mitigation)
   if self._anchors and #self._anchors > 0 then
     while #self._anchors > 0 and outbound < self.max_outbound do
@@ -2316,6 +2346,27 @@ function PeerManager:start_listener(bind_ip, port)
 end
 
 --- Accept inbound connections.
+--- Enable/disable all NEW P2P network activity (Bitcoin Core CConnman::SetNetworkActive,
+-- net.cpp:3361).  Idempotent: when the flag already equals *state* this logs and
+-- early-returns with no notification (Core's `if (fNetworkActive == active) return;`).
+-- Otherwise it flips the flag.  Does NOT disconnect existing/established peers —
+-- only suppresses establishing NEW connections (inbound accept, outbound auto-dial
+-- refill, DNS/fixed-seed re-seeding, and the --connect manual reconnect loop).
+-- Returns the read-back value (Core's `GetNetworkActive()`), which absent a race
+-- equals *state*.  Not persisted; resets to enabled on restart.
+-- @param state boolean
+-- @return boolean: the network-active flag after the toggle
+function PeerManager:set_network_active(state)
+  state = state and true or false
+  if self.network_active == state then
+    io.stderr:write(string.format("[net] SetNetworkActive: %s (unchanged)\n", tostring(state)))
+    return self.network_active
+  end
+  self.network_active = state
+  io.stderr:write(string.format("[net] SetNetworkActive: %s\n", tostring(state)))
+  return self.network_active
+end
+
 function PeerManager:accept_inbound()
   if not self.listen_socket then return end
   local client, err = self.listen_socket:accept()
@@ -2327,6 +2378,14 @@ function PeerManager:accept_inbound()
 
   local ip, port = client:getpeername()
   if self.banned[ip] and self.banned[ip] > os.time() then
+    client:close()
+    return
+  end
+
+  -- Network-active gate (Core net.cpp:1786): while networking is disabled
+  -- (`setnetworkactive false`) refuse NEW inbound connections.  Existing peers
+  -- are untouched — only new establishment is suppressed.
+  if not self.network_active then
     client:close()
     return
   end
@@ -2398,6 +2457,13 @@ end
 -- Core ThreadOpenConnections periodic manual-peer reconnect.  onetry peers
 -- are NOT in manual_peers, so they stay one-shot.
 function PeerManager:_reconnect_manual_peers()
+  -- Network-active gate (Core net.cpp:2351/3022/3219): while networking is
+  -- disabled (`setnetworkactive false`) hold off re-establishing dropped manual
+  -- / --connect pinned peers too — only NEW establishment is suppressed; the
+  -- still-connected manual peers are left untouched.
+  if not self.network_active then
+    return
+  end
   local now = os.time()
   for key, entry in pairs(self.manual_peers) do
     -- Already connected?  Nothing to do.
