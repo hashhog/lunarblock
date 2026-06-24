@@ -1455,6 +1455,16 @@ function M.new(config)
   -- nil/disabled is the historical default.
   self.pruner = config.pruner
   self.running = false
+  -- Tip-change notifier + main-loop pump for the wait-family RPCs
+  -- (waitfornewblock / waitforblock / waitforblockheight).  tip_notifier is a
+  -- lunarblock.tip_notifier instance (generation counter bumped on every tip
+  -- advance); tip_pump is a closure — set by main.lua AFTER construction (the
+  -- main-loop work it drives is not in scope here) — that runs one slice of
+  -- P2P/block-connect/nested-RPC work so the tip can advance while a wait RPC
+  -- blocks.  Either being nil makes the wait handlers return the current tip
+  -- immediately (degraded fallback), so the node never hangs.
+  self.tip_notifier = config.tip_notifier
+  self.tip_pump = nil
   self.request_wallet = nil  -- Current request's wallet context
   -- NetworkDisable flag: when true, `submitblock` and any P2P
   -- block-handler callsite that consults this flag must refuse new
@@ -2233,6 +2243,221 @@ function RPCServer:register_methods()
       return types.hash256_hex(rpc.chain_state.tip_hash or types.hash256_zero())
     end
     return types.hash256_hex(types.hash256_zero())
+  end
+
+  --------------------------------------------------------------------------------
+  -- wait-family RPCs: waitfornewblock / waitforblock / waitforblockheight
+  --------------------------------------------------------------------------------
+  --
+  -- Core reference: bitcoin-core/src/rpc/blockchain.cpp:290-471.  These RPCs
+  -- block until the active-chain tip satisfies a predicate (any new tip / a
+  -- specific hash / a height >=), OR a millisecond timeout elapses, and return
+  -- the CURRENT tip {hash, height} in BOTH cases.  timeout is in MILLISECONDS;
+  -- 0 = no timeout.
+  --
+  -- lunarblock concurrency model: the RPC server runs synchronously inside the
+  -- single-threaded main loop (main.lua: peer_manager:tick() then
+  -- rpc_server:tick(), one connection per tick).  A naive blocking sleep here
+  -- would freeze P2P + block-connect, so the tip could NEVER advance and the
+  -- wait would deadlock.  Instead the wait loop PUMPS the node's main-loop work
+  -- (rpc.tip_pump, wired from main.lua) on every slice so blocks can connect
+  -- and a concurrent miner / submitblock connection can be served WHILE this
+  -- request is "blocked".  Correctness under races comes from the generation
+  -- counter on rpc.tip_notifier (see src/tip_notifier.lua): the waiter
+  -- snapshots the generation, re-reads the AUTHORITATIVE tip
+  -- (chain_state.tip_hash / .tip_height), checks its predicate, and only sleeps
+  -- a slice when the generation is unchanged AND the predicate is unmet — so a
+  -- notify() that races in (block connected / reorg) is never lost.
+
+  --- Read the authoritative chain tip as (display_hash_hex, height).
+  -- Always the live ChainState values, never a value cached in the notifier.
+  local function wait_current_tip(rpc)
+    local cs = rpc.chain_state
+    local h = (cs and cs.tip_hash) or types.hash256_zero()
+    return types.hash256_hex(h), (cs and cs.tip_height) or 0
+  end
+
+  --- Parse the wait-family `timeout` argument (Core getInt<int> + negative
+  -- check).  Missing / JSON null -> 0 (Core's RPCArg::Default{0}).  A non-number
+  -- -> RPC_TYPE_ERROR (-3) "JSON value of type <X> is not of expected type
+  -- number"; a non-integral number -> -3 "JSON integer out of range"; a
+  -- negative value -> RPC_MISC_ERROR (-1) "Negative timeout".
+  -- @return number: timeout in milliseconds (>= 0)
+  local function parse_wait_timeout(v)
+    if v == nil or v == cjson.null then
+      return 0
+    end
+    if type(v) ~= "number" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(v) ..
+                       " is not of expected type number"})
+    end
+    -- Core getInt<int>: a non-integral JSON number fails std::from_chars on the
+    -- fractional part -> "JSON integer out of range".
+    if v ~= math.floor(v) then
+      error({code = M.ERROR.TYPE_ERROR, message = "JSON integer out of range"})
+    end
+    if v < 0 then
+      error({code = M.ERROR.MISC_ERROR, message = "Negative timeout"})
+    end
+    return v
+  end
+
+  --- Shared Core wait-tip loop (blockchain.cpp waitfornewblock/-block/-height).
+  -- @param rpc        the RPCServer
+  -- @param predicate  function(display_hash_hex, height) -> bool; true once the
+  --                   desired tip condition holds.
+  -- @param timeout_ms number; 0 = wait indefinitely.
+  -- Returns the current tip {hash, height} once the predicate holds OR the
+  -- timeout elapses (Core returns the current block in both cases).
+  local function wait_for_tip(rpc, predicate, timeout_ms)
+    local display, height = wait_current_tip(rpc)
+    if predicate(display, height) then
+      return {hash = display, height = height}
+    end
+
+    local notifier = rpc.tip_notifier
+    local pump = rpc.tip_pump
+    if notifier == nil or pump == nil then
+      -- No notifier / pump wired (degraded boot, or a nested wait reached from
+      -- inside the pump — re-entrancy guard below).  We cannot drive the loop
+      -- to advance the tip, so return the current tip rather than hang.  Core
+      -- always has its kernel notification source; this is a defensive
+      -- fallback only, mirroring the ouroboros pilot's notifier==None branch.
+      return {hash = display, height = height}
+    end
+
+    -- Re-entrancy guard: the pump runs a nested rpc_server:tick(), which could
+    -- dispatch ANOTHER wait RPC.  A nested wait must NOT recurse into the pump
+    -- (unbounded recursion / re-entrant accept loop); it falls into the
+    -- degraded branch above by seeing tip_pump cleared for its duration.
+    rpc.tip_pump = nil
+
+    -- Absolute deadline for the bounded case (Core uses a steady-clock deadline
+    -- and re-derives the remaining slice after each wake).  socket.gettime() is
+    -- wall-clock seconds; sufficient here (Core's RPC uses steady_clock, but the
+    -- only observable difference is behaviour across a clock step, which does
+    -- not occur on regtest in the verification window).
+    local deadline = nil
+    if timeout_ms and timeout_ms > 0 then
+      deadline = socket.gettime() + (timeout_ms / 1000.0)
+    end
+
+    local ok_loop, result = pcall(function()
+      while true do
+        local gen = notifier:generation()
+        -- Re-check AFTER snapshotting the generation so a notify that raced in
+        -- between the predicate check and the pump/sleep is not lost.
+        display, height = wait_current_tip(rpc)
+        if predicate(display, height) then
+          return {hash = display, height = height}
+        end
+
+        if deadline ~= nil then
+          local remaining = deadline - socket.gettime()
+          if remaining <= 0 then
+            -- Timed out — return the current tip (Core's behaviour).
+            return {hash = display, height = height}
+          end
+        end
+
+        -- Pump one slice of main-loop work so the tip can advance and a
+        -- concurrent miner / submitblock / P2P block connection is serviced.
+        -- Best-effort: a pump fault must not abort the wait — we still
+        -- re-check the predicate and the deadline.
+        pcall(pump)
+
+        -- If the pump advanced the tip (generation bumped), loop immediately
+        -- without sleeping so the response is prompt (sub-second wake).  Only
+        -- sleep when nothing changed, to avoid a hot spin.
+        if notifier:generation() == gen then
+          -- Bound the sleep by any remaining deadline so the timeout fires on
+          -- time (never overshoot the deadline by a full slice).
+          local slice = 0.02  -- 20 ms; ~50 Hz pump rate keeps wake latency low
+          if deadline ~= nil then
+            local remaining = deadline - socket.gettime()
+            if remaining <= 0 then
+              display, height = wait_current_tip(rpc)
+              return {hash = display, height = height}
+            end
+            if remaining < slice then slice = remaining end
+          end
+          socket.sleep(slice)
+        end
+      end
+    end)
+
+    -- Restore the pump for the next top-level wait request.
+    rpc.tip_pump = pump
+
+    if not ok_loop then
+      error(result)
+    end
+    return result
+  end
+
+  --- waitfornewblock(timeout=0, current_tip=optional)
+  -- Core rpc/blockchain.cpp:290.  Waits until the tip hash differs from
+  -- `current_tip` (or, if omitted, from the tip observed at call entry), then
+  -- returns {hash, height}.  timeout is in milliseconds; 0 = no timeout.  On
+  -- timeout returns the current tip.  A malformed current_tip -> -8 (ParseHashV).
+  self.methods["waitfornewblock"] = function(rpc, params)
+    local timeout_ms = parse_wait_timeout(params[1])
+
+    -- Determine the reference hash the new tip must differ from.  Core reads
+    -- the live tip via getTip() FIRST, then overrides with current_tip when the
+    -- caller supplied one.  When current_tip is supplied it is parsed as a
+    -- 64-hex uint256 (ParseHashV -> -8 on malformed).
+    local ref_hash
+    if params[2] == nil or params[2] == cjson.null then
+      ref_hash = (select(1, wait_current_tip(rpc)))
+    else
+      -- parse_hash_v returns the validated 64-hex string unchanged; lowercase
+      -- so it compares case-insensitively against the lowercase display hash.
+      ref_hash = parse_hash_v(params[2], "current_tip"):lower()
+    end
+
+    return wait_for_tip(rpc, function(h, _ht)
+      return h ~= ref_hash
+    end, timeout_ms)
+  end
+
+  --- waitforblock(blockhash, timeout=0)
+  -- Core rpc/blockchain.cpp:349.  blockhash is parsed FIRST (ParseHashV -> -8 on
+  -- malformed), BEFORE timeout is read — so a malformed blockhash errors -8 even
+  -- when a negative timeout is also supplied.  Waits until the tip hash equals
+  -- blockhash; returns {hash, height}.  On timeout returns the current tip.
+  self.methods["waitforblock"] = function(rpc, params)
+    -- Parse blockhash FIRST (Core order), then timeout.
+    local target = parse_hash_v(params[1], "blockhash"):lower()
+    local timeout_ms = parse_wait_timeout(params[2])
+
+    return wait_for_tip(rpc, function(h, _ht)
+      return h == target
+    end, timeout_ms)
+  end
+
+  --- waitforblockheight(height, timeout=0)
+  -- Core rpc/blockchain.cpp:410.  height is read as an int (getInt<int> -> -3 on
+  -- non-integral / non-number).  Waits until the tip height >= height; returns
+  -- {hash, height}.  On timeout returns the current tip.
+  self.methods["waitforblockheight"] = function(rpc, params)
+    -- height: getInt<int> semantics — Core reads it with no NULL guard, so a
+    -- missing/null height is a type error (-3), same as a non-number.
+    local h = params[1]
+    if type(h) ~= "number" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(h) ..
+                       " is not of expected type number"})
+    end
+    if h ~= math.floor(h) then
+      error({code = M.ERROR.TYPE_ERROR, message = "JSON integer out of range"})
+    end
+    local timeout_ms = parse_wait_timeout(params[2])
+
+    return wait_for_tip(rpc, function(_h, ht)
+      return ht >= h
+    end, timeout_ms)
   end
 
   --- getchainstates
