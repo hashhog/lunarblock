@@ -3796,6 +3796,50 @@ function RPCServer:register_methods()
     }))
   end
 
+  -- ping
+  -- Request that a ping be sent to all connected peers, to measure ping time.
+  -- ────────────────────────────────────────────────────────────────────
+  -- Reference: Bitcoin Core rpc/net.cpp ping (:84-107) ->
+  -- PeerManager::SendPings (net_processing.cpp).
+  --
+  -- Params: NONE.  Output: JSON null (Core UniValue::VNULL — the result field
+  -- must be literally `null`, not {} / "" / omitted).
+  --
+  -- Behaviour: side-effect-only control method.  Iterates every connected peer
+  -- and fires a BIP-31 PING (fresh nonce) via the per-peer send_ping primitive
+  -- — it does NOT measure latency synchronously or wait for the PONGs.  Core
+  -- only QUEUES the ping per peer (m_ping_queued) and returns immediately; the
+  -- actual round-trip results surface LATER via getpeerinfo's pingtime /
+  -- minping, and an in-flight ping transiently as pingwait.  With zero peers it
+  -- is a successful no-op (loops over an empty list) and still returns null.
+  -- A per-peer send error must NOT fail the RPC (dropped peers tolerated),
+  -- matching Core's loop-over-the-map-and-return.
+  self.methods["ping"] = function(rpc, _params)
+    -- EnsurePeerman parity (server_util.cpp): a missing peer manager is
+    -- RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.
+    local pm = rpc.peer_manager
+    if not pm then
+      error({
+        code = M.ERROR.CLIENT_P2P_DISABLED,
+        message = "Error: Peer-to-peer functionality missing or disabled",
+      })
+    end
+
+    -- Fire a PING to every connected peer (the same set getpeerinfo reports).
+    -- send_ping stamps ping_wait_since and emits the wire PING; we do not block
+    -- on the pong.  Guard each send so one bad peer can't fail the whole RPC.
+    for _, p in ipairs(pm.peer_list or {}) do
+      if type(p.send_ping) == "function" then
+        pcall(function() p:send_ping() end)
+      end
+    end
+
+    -- Core returns UniValue::VNULL -> JSON null.  Return the cjson.null sentinel
+    -- (NOT Lua nil, which the dispatcher would drop from the result table) so
+    -- the response is `"result":null`.
+    return cjson.null
+  end
+
   -- setnetworkactive state
   -- Disable/enable all NEW p2p network activity.
   -- Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
@@ -4027,6 +4071,16 @@ function RPCServer:register_methods()
         if bit.band(svc, 1024) ~= 0 then svc_names[#svc_names + 1] = "NETWORK_LIMITED" end
         local is_inbound = p.inbound or false
         local ping_sec = (p.latency_ms or 0) / 1000
+        -- Ping stats mirror Core rpc/net.cpp (:253-260): pingtime is the last
+        -- pong RTT, minping the running minimum (Core m_min_ping_time), pingwait
+        -- the elapsed time of an in-flight ping (Core m_ping_start).  `send_ping`
+        -- stamps `ping_wait_since`; `handle_pong` updates `min_ping_ms` and
+        -- clears `ping_wait_since`.
+        local minping_sec = (p.min_ping_ms and p.min_ping_ms / 1000) or ping_sec
+        local pingwait_sec = nil
+        if p.ping_wait_since then
+          pingwait_sec = math.max(0, socket.gettime() - p.ping_wait_since)
+        end
         -- Compute ASN for this peer's IP (0 if no asmap or not mapped).
         local peer_mapped_as = 0
         if ok_asmap and loaded_asmap then
@@ -4057,7 +4111,10 @@ function RPCServer:register_methods()
             and (p.version_info.timestamp - math.floor(p.version_recv_time))
             or 0,
           pingtime = ping_sec,
-          minping = ping_sec,
+          minping = minping_sec,
+          -- Core omits pingwait when no ping is outstanding; emit it only while
+          -- a ping is in flight (Core entryToJSON: pushKV only if m_ping_wait).
+          pingwait = pingwait_sec,
           version = (p.version_info and p.version_info.version) or 0,
           subver = p.user_agent or "",
           inbound = is_inbound,
