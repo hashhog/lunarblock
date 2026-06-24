@@ -3715,6 +3715,188 @@ function RPCServer:register_methods()
     return {_raw_json = M._oj_encode(M.tx_to_univ_oj(result)) }
   end
 
+  --- combinerawtransaction ( ["hexstring", ...] )
+  -- Combine multiple partially-signed versions of the SAME transaction into one
+  -- carrying the union of their signature data.  Byte-exact port of
+  -- bitcoin-core/src/rpc/rawtransaction.cpp::combinerawtransaction (body
+  -- 605-668).  Each array element is a hex-encoded raw tx with the SAME
+  -- inputs/outputs/version/locktime but DIFFERENT partial signatures.  The first
+  -- variant is the structural template (version/locktime/vin/vout); per input we
+  -- pick, across all variants, the one carrying signature data (non-empty
+  -- scriptSig or witness), tie-broken by total sig-data length, and write it
+  -- back.  Re-serialise WITNESS-AWARE: emit the segwit marker/flag iff ANY input
+  -- has a non-empty witness (Core CTransaction::HasWitness drives the marker).
+  --
+  -- SCOPE = single-sig parity (the dominant case, same as the ouroboros
+  -- reference f4c98ee).  For the common case where each variant carries a
+  -- complete single-key signature for a DIFFERENT subset of inputs (or is
+  -- unsigned), the per-input non-empty pick is BYTE-IDENTICAL to Core for
+  -- P2PKH / P2WPKH / P2SH-P2WPKH, because Core's DataFromTransaction returns the
+  -- variant's scriptSig + scriptWitness verbatim once VerifyScript marks the
+  -- input complete and MergeSignatureData adopts that complete sigdata wholesale.
+  --
+  -- KNOWN LIMITATION (flagged, NOT faked): the full Core behaviour also merges
+  -- PARTIAL multisig signatures WITHIN a single input (two variants each holding
+  -- one of M sigs for a bare/P2SH/P2WSH M-of-N) via SignatureData::Merge over the
+  -- extracted (pubkey -> sig) map.  That needs Solver / VerifyScript-with-a-
+  -- signature-extracting-checker / sighash validation, which this handler does
+  -- NOT implement; for an input partially signed in BOTH variants (neither alone
+  -- complete) we keep the longer (more-sig) scriptSig/witness rather than
+  -- splicing the two sig sets — that input is therefore NOT guaranteed
+  -- byte-identical to Core.  The single-sig pick IS, and is what is verified.
+  --
+  -- DEVIATION (flagged): Core resolves every input's prevout from its UTXO +
+  -- mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found or
+  -- already spent" when a coin is missing/spent.  This handler does NOT consult
+  -- chainstate — combine is a pure function of the provided variants here — so it
+  -- does NOT raise -25 for unresolvable prevouts (the byte-identical SUCCESS
+  -- vector is run against a Core oracle whose UTXO resolves the prevouts).  The
+  -- -22 empty / -22 decode-failure / -3 type-error paths DO match Core.
+  self.methods["combinerawtransaction"] = function(rpc, params)
+    local _ = rpc
+    local txs = params[1]
+
+    -- Core: request.params[0].get_array().  A non-array (string/number/bool/
+    -- object/null) is a -3 type error with Core's univalue message.  cjson
+    -- decodes a JSON array to a sequence (keys 1..#v); core_json_type_name
+    -- reports "array" for a non-empty sequence and "object" for {}.  An empty
+    -- JSON array [] is ambiguous in Lua ({}), but it is the legitimate
+    -- empty-array case handled below (-> "Missing transactions"), so we only
+    -- reject genuine non-tables here.
+    if type(txs) ~= "table" then
+      error({
+        code = M.ERROR.TYPE_ERROR,
+        message = "Expected type array, got " .. core_json_type_name(txs),
+      })
+    end
+
+    -- 1. Decode every variant (witness-aware), in order.  Core: DecodeHexTx per
+    --    idx; on failure -> -22 "TX decode failed for tx %d. Make sure the tx
+    --    has at least one input." (0-based idx).  DecodeHexTx first rejects
+    --    non-hex / odd-length, then requires the stream to fully consume to a
+    --    tx with >=1 input.
+    local variants = {}
+    local n = #txs
+    for idx = 1, n do
+      local item = txs[idx]
+      -- Core reads each element with .get_str() -> a non-string is a type error.
+      if type(item) ~= "string" then
+        error({
+          code = M.ERROR.TYPE_ERROR,
+          message = "JSON value of type " .. core_json_type_name(item) ..
+            " is not of expected type string",
+        })
+      end
+      local function decode_fail()
+        error({
+          code = M.ERROR.DESERIALIZATION_ERROR,
+          message = string.format(
+            "TX decode failed for tx %d. Make sure the tx has at least one input.",
+            idx - 1),  -- Core uses a 0-based index
+        })
+      end
+      -- IsHex parity: even length and all [0-9a-fA-F].
+      if #item % 2 ~= 0 or not item:match("^[0-9a-fA-F]*$") then
+        decode_fail()
+      end
+      local raw = M.hex_decode(item)
+      local reader = serialize.buffer_reader(raw)
+      local ok, tx = pcall(serialize.deserialize_transaction, reader)
+      -- Decode must succeed, fully consume the stream (no trailing bytes), and
+      -- the tx must have at least one input (Core's "at least one input").
+      if not ok or not reader.is_eof() or #tx.inputs == 0 then
+        decode_fail()
+      end
+      variants[#variants + 1] = tx
+    end
+
+    -- 2. Empty array -> -22 "Missing transactions".  Core checks
+    --    txVariants.empty() AFTER the (empty) decode loop.
+    if #variants == 0 then
+      error({
+        code = M.ERROR.DESERIALIZATION_ERROR,
+        message = "Missing transactions",
+      })
+    end
+
+    -- 3. mergedTx starts as a clone of the first variant (the template: its
+    --    version / locktime / vin / vout define the result; only each input's
+    --    scriptSig + witness get rebuilt below).
+    local template = variants[1]
+    local merged_inputs = {}
+    local any_witness = false
+
+    for i = 1, #template.inputs do
+      local base = template.inputs[i]
+      local best_script_sig = ""
+      local best_witness = {}
+      local best_score = -1  -- rank candidates; higher = more complete
+
+      for _, variant in ipairs(variants) do
+        local vin = variant.inputs[i]
+        if vin then
+          local ss = vin.script_sig or ""
+          local wit = vin.witness or {}
+          local wit_len = 0
+          local wit_nonempty = false
+          for _, w in ipairs(wit) do
+            wit_len = wit_len + #w
+            if #w > 0 then wit_nonempty = true end
+          end
+          local ss_nonempty = #ss > 0
+
+          -- Score the candidate so we deterministically prefer the variant that
+          -- actually carries signature data for this input.  Tie-break by total
+          -- signature-data length (longer = more sigs, matching the partial-
+          -- multisig fallback note above).  Equal length keeps the earliest
+          -- variant (strict >; Core's merge is order-stable for the complete
+          -- single-sig case).
+          local score
+          if not ss_nonempty and not wit_nonempty then
+            score = 0
+          else
+            score = 1000000 + #ss + wit_len
+          end
+
+          if score > best_score then
+            best_score = score
+            best_script_sig = ss
+            best_witness = wit
+          end
+        end
+      end
+
+      for _, w in ipairs(best_witness) do
+        if #w > 0 then any_witness = true; break end
+      end
+
+      -- Rebuild the input: prevout + sequence from the template, scriptSig +
+      -- witness from the best (signed) variant.
+      local merged_in = types.txin(
+        types.outpoint(base.prev_out.hash, base.prev_out.index),
+        best_script_sig,
+        base.sequence
+      )
+      merged_in.witness = best_witness
+      merged_inputs[#merged_inputs + 1] = merged_in
+    end
+
+    -- Copy the template's outputs verbatim (constant part of the tx).
+    local merged_outputs = {}
+    for _, out in ipairs(template.outputs) do
+      merged_outputs[#merged_outputs + 1] = types.txout(out.value, out.script_pubkey)
+    end
+
+    local merged = types.transaction(
+      template.version, merged_inputs, merged_outputs, template.locktime)
+    -- Core re-encodes WITH witness (TX_WITH_WITNESS); serialize_transaction only
+    -- emits the marker/flag when tx.segwit is set, so mirror Core's HasWitness:
+    -- witness-serialise iff any input carries a non-empty witness stack.
+    merged.segwit = any_witness
+
+    return M.hex_encode(serialize.serialize_transaction(merged, true))
+  end
+
   -- Network methods
   self.methods["getnetworkinfo"] = function(rpc, _params)
     local connections = 0
