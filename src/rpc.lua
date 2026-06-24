@@ -3839,6 +3839,76 @@ function RPCServer:register_methods()
     return pm:set_network_active(state)
   end
 
+  -- getaddrmaninfo — addrman new/tried table sizes per network.
+  -- ────────────────────────────────────────────────────────────────────
+  -- Reference: Bitcoin Core rpc/net.cpp getaddrmaninfo (:1080-1117) +
+  -- AddrMan::Size / Size_ (addrman.cpp:1006-1026).  Params: NONE.
+  --
+  -- Returns a JSON object keyed by network name.  The key set is FIXED and
+  -- ALWAYS present (every routable network emitted unconditionally, even at
+  -- count 0), in Core's enum order:
+  --   ipv4, ipv6, onion, i2p, cjdns, all_networks
+  -- Each value is an object with exactly three integer keys in order:
+  --   { "new":   <count in new table for this network>,
+  --     "tried": <count in tried table for this network>,
+  --     "total": <new + tried> }
+  -- all_networks is the global sum (new=Σnew, tried=Σtried, total=new+tried).
+  -- Core's loop skips NET_UNROUTABLE / NET_INTERNAL, so not_publicly_routable
+  -- and internal are NEVER emitted as keys.
+  --
+  -- Invariants (oracle-free, hold by construction):
+  --   per network:  total == new + tried
+  --   all_networks: new   == Σ networks.new
+  --                 tried == Σ networks.tried
+  --                 total == Σ networks.total == new + tried
+  --
+  -- Pure read-only snapshot of the addrman: no params, no side effects, no
+  -- peers / sockets / disk touched.  The new/tried split comes from
+  -- lunarblock's bucketed addrman (_new_buckets / _tried_buckets), counted as
+  -- DISTINCT addresses to match Core's nNew / nTried.
+  --
+  -- The 6-key shape and per-key {new,tried,total} order are emitted by hand
+  -- (cjson does not preserve table key order).
+  self.methods["getaddrmaninfo"] = function(rpc, _params)
+    local NET_KEYS = {"ipv4", "ipv6", "onion", "i2p", "cjdns"}
+
+    -- Pre-seed all routable networks at zero so the key set is always
+    -- complete (an IPv4-only node still reports onion/i2p/cjdns as 0/0/0).
+    local counts = {}
+    for _, name in ipairs(NET_KEYS) do
+      counts[name] = {new = 0, tried = 0}
+    end
+
+    local pm = rpc.peer_manager
+    if pm and type(pm.get_addrmaninfo_counts) == "function" then
+      local c = pm:get_addrmaninfo_counts()
+      for _, name in ipairs(NET_KEYS) do
+        if c[name] then
+          counts[name].new = c[name].new or 0
+          counts[name].tried = c[name].tried or 0
+        end
+      end
+    end
+
+    -- Build the object by hand to lock Core's key order.
+    local function obj(n, t)
+      return string.format('{"new":%d,"tried":%d,"total":%d}', n, t, n + t)
+    end
+
+    local parts = {}
+    local total_new, total_tried = 0, 0
+    for _, name in ipairs(NET_KEYS) do
+      local n, t = counts[name].new, counts[name].tried
+      parts[#parts + 1] = string.format('%s:%s', cjson.encode(name), obj(n, t))
+      total_new = total_new + n
+      total_tried = total_tried + t
+    end
+    parts[#parts + 1] = string.format('%s:%s',
+      cjson.encode("all_networks"), obj(total_new, total_tried))
+
+    return { _raw_json = "{" .. table.concat(parts, ",") .. "}" }
+  end
+
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
     -- BUG-22 fix (W115 FIX-50): include mapped_as field per peer.
@@ -4299,8 +4369,12 @@ function RPCServer:register_methods()
     local p2p = require("lunarblock.p2p")
     local addr = params and params[1]
     local port = params and params[2]
-    -- params[3] = tried (bool) — we have no separate tried table; accepted
-    -- and treated as advisory (the address still lands in known_addresses).
+    -- params[3] = tried (bool).  When true Core attempts to promote the entry
+    -- into the tried table (addrman.Good); see below.
+    local tried = params and params[3]
+    if tried ~= nil and tried ~= cjson.null and type(tried) ~= "boolean" then
+      error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type is not of expected type bool"})
+    end
     if type(addr) ~= "string" or addr == "" then
       error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type null is not of expected type string"})
     end
@@ -4327,7 +4401,19 @@ function RPCServer:register_methods()
 
     -- Mirror Core: services = NODE_NETWORK | NODE_WITNESS, nTime = now.
     local services = bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS)
-    local added = rpc.peer_manager:add_known_address(addr, port, services, os.time())
+    local now = os.time()
+    local added = rpc.peer_manager:add_known_address(addr, port, services, now)
+
+    -- Core's addpeeraddress calls addrman.Add (-> NEW table) and, when
+    -- tried=true, addrman.Good (-> TRIED table).  Feed lunarblock's bucketed
+    -- addrman the same way so getaddrmaninfo / getnodeaddresses reflect the
+    -- injection (source = self, "peer announcing itself").  _add_to_new is
+    -- idempotent on an existing entry; _move_to_tried promotes it.
+    rpc.peer_manager:_add_to_new(addr, port, services, now, addr)
+    if tried == true then
+      rpc.peer_manager:_move_to_tried(addr, port)
+    end
+
     -- If the entry already existed add_known_address returns false; Core's
     -- addrman would still report success on a duplicate insert path
     -- (Add returns true when the addr is present/refreshed).  Treat a
