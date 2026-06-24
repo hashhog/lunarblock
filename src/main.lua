@@ -903,6 +903,15 @@ local function main()
   -- Initialize chain state
   io.stdout:write("Initializing chain state...\n"); io.stdout:flush()
   local chain_state = utxo_mod.new_chain_state(db, network)
+
+  -- Tip-change notifier for the wait-family RPCs (waitfornewblock /
+  -- waitforblock / waitforblockheight).  Mirrors Bitcoin Core's WaitTipChanged
+  -- kernel notification (KernelNotifications::blockTip).  notify() is wired
+  -- below into ChainState's on_block_connected (IBD + post-IBD + submitblock/
+  -- generate accept + reorg connect-half) and on_block_disconnected (reorg
+  -- disconnect-half) callbacks; the RPC wait handlers poll its generation
+  -- counter while pumping the main loop.  See src/tip_notifier.lua.
+  local tip_notifier = require("lunarblock.tip_notifier").new()
   -- Pattern C0 (2026-05-06): enable txindex if requested.  Off by default
   -- so the live mainnet IBD path (which is intentionally not restarted in
   -- this fix wave) keeps the same hot loop.  When on, connect_block writes
@@ -2553,6 +2562,29 @@ local function main()
     end
   end
 
+  -- Wire the wait-family tip notifier into the connect / disconnect chokepoints
+  -- (Core WaitTipChanged fires on EVERY active-chain tip update).  These are the
+  -- OUTERMOST wrappers so notify() fires after every tip advance regardless of
+  -- the other hooks (fee/ZMQ/orphan/mempool/wallet) chained above:
+  --   * on_block_connected  -> block-connect during IBD AND post-IBD, the
+  --     submitblock / generate accept path, AND the reorg connect-new-branch
+  --     half (accept_side_branch_block routes each reconnected block through
+  --     connect_block, which fires this callback).
+  --   * on_block_disconnected -> the reorg disconnect-to-fork half.
+  -- Best-effort: a notifier fault must never wedge chain connection.
+  do
+    local prev_conn = chain_state.callbacks.on_block_connected
+    chain_state.callbacks.on_block_connected = function(block_hash, block)
+      if prev_conn then prev_conn(block_hash, block) end
+      pcall(function() tip_notifier:notify() end)
+    end
+    local prev_disc = chain_state.callbacks.on_block_disconnected
+    chain_state.callbacks.on_block_disconnected = function(block_hash)
+      if prev_disc then prev_disc(block_hash) end
+      pcall(function() tip_notifier:notify() end)
+    end
+  end
+
   -- Initialize RPC server
   local rpc_server = rpc_mod.new({
     host = "127.0.0.1",
@@ -2587,6 +2619,9 @@ local function main()
     -- Pruner: enables `pruned`, `pruneheight`, `automatic_pruning` in
     -- getblockchaininfo and gates getblock with the right error code.
     pruner = pruner,
+    -- Tip-change notifier for the wait-family RPCs.  The pump (tip_pump) is
+    -- wired below, after the main-loop closures it drives are in scope.
+    tip_notifier = tip_notifier,
   })
   rpc_server:start()
 
@@ -2711,6 +2746,52 @@ local function main()
       io.stderr:write("log reopen failed: " .. tostring(rerr) .. "\n")
     end
   end)
+
+  -- tip_pump: one slice of main-loop work, driven by the wait-family RPC
+  -- handlers (waitfornewblock / waitforblock / waitforblockheight) while they
+  -- are "blocked".  In lunarblock's single-threaded cooperative model the RPC
+  -- server runs synchronously inside this same loop, so a wait RPC must itself
+  -- pump the work that advances the tip — otherwise P2P + block-connect would be
+  -- frozen for the duration of the wait and the tip could never change.  This
+  -- runs exactly the tip-advancing steps of the main loop (P2P tick, header
+  -- re-sync re-engagement, block-download scheduling) plus a NESTED
+  -- rpc_server:tick() so a concurrent miner / submitblock / second client
+  -- connection is accepted and serviced (its connect_block -> on_block_connected
+  -- -> tip_notifier:notify() is what wakes the waiting handler).  Every step is
+  -- pcall-isolated so a fault in one cannot abort the wait.  The wait handler
+  -- clears rpc.tip_pump for the duration of its loop (re-entrancy guard), so the
+  -- nested tick() here cannot recurse into another pumping wait.
+  local function tip_pump()
+    pcall(function() ops.poll_signals() end)
+    pcall(function() peer_manager:tick() end)
+    -- Header-sync re-engagement (mirror of the main loop's StartHeadersSync
+    -- re-arm) so a quiet/-connect-pinned node keeps requesting headers.
+    pcall(function()
+      if not header_chain.syncing then
+        local peers = peer_manager:get_established_peers()
+        for _, p in ipairs(peers) do
+          if (p.start_height or 0) > (header_chain.header_tip_height or -1) then
+            header_chain:start_sync(p)
+            break
+          end
+        end
+      end
+    end)
+    -- Schedule block downloads (IBD and at-tip) so a newly-announced block is
+    -- fetched and connected while the wait RPC blocks.
+    pcall(function()
+      if header_chain.header_tip_height > chain_state.tip_height then
+        local peers = peer_manager:get_established_peers()
+        if #peers > 0 then
+          block_downloader:schedule_downloads(peers)
+        end
+      end
+    end)
+    -- Nested RPC accept: serve the concurrent connection (e.g. the miner's
+    -- generatetoaddress / submitblock) that actually advances the tip.
+    pcall(function() rpc_server:tick() end)
+  end
+  rpc_server.tip_pump = tip_pump
 
   -- Main event loop
   print("Entering main loop...")
