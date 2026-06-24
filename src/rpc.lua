@@ -3909,6 +3909,106 @@ function RPCServer:register_methods()
     return { _raw_json = "{" .. table.concat(parts, ",") .. "}" }
   end
 
+  -- getmemoryinfo — secure locked-memory-pool statistics (NOT heap/process mem).
+  -- ────────────────────────────────────────────────────────────────────
+  -- Reference: Bitcoin Core rpc/node.cpp getmemoryinfo (:145-198) +
+  -- RPCLockedMemoryInfo (:113-124) + RPCMallocInfo (:126-143).  Backing struct
+  -- LockedPool::Stats (support/lockedpool.h:145-153).
+  --
+  -- IMPORTANT SEMANTICS: this RPC reports Core's SECURE LOCKED-MEMORY POOL
+  -- (LockedPoolManager — the mlock()-backed allocator that keeps sensitive data
+  -- such as wallet private keys OFF swap), NOT general process or heap memory,
+  -- and NOT the transaction memory pool (mempool).  Core's own comment warns
+  -- against using the word "pool" in this interface to avoid that confusion.
+  --
+  -- Param:
+  --   mode (str, OPTIONAL, default "stats"): what kind of information is returned.
+  --     - "stats"      : general statistics about the locked-memory manager.
+  --     - "mallocinfo" : a glibc malloc_info(3) XML string (Core: only when
+  --                      built with glibc / HAVE_MALLOC_INFO).
+  --
+  -- Returns (mode-dependent, matching Core exactly):
+  --   mode == "stats" (default) -> OBJECT:
+  --     { "locked": { "used": int, "free": int, "total": int,
+  --                   "locked": int, "chunks_used": int, "chunks_free": int } }
+  --     All six inner values are non-negative integers (Core size_t) in this
+  --     exact pushKV order.  lunarblock is a pure-LuaJIT port with NO Core-style
+  --     mlock()-backed secure allocator (verified: no mlock/LockedPool/VirtualLock
+  --     in the source — LuaJIT's GC is not a secure allocator, see bip324.lua),
+  --     so the honest answer is all zeros.  The keys/structure are ALWAYS present
+  --     and identical to Core: a node with an empty/absent locked pool legitimately
+  --     reports zeros and shape-match parity holds.  We do NOT fabricate nonzero
+  --     values.
+  --
+  --   mode == "mallocinfo" -> Core returns a glibc malloc_info(3) XML string ONLY
+  --     when built with glibc (HAVE_MALLOC_INFO); on every other build it raises
+  --     -8 "mallocinfo mode not available".  A LuaJIT port has no glibc
+  --     malloc_info equivalent, so we faithfully take Core's non-glibc path —
+  --     the exact -8 error — rather than fabricate a stub XML string Core never
+  --     emits.
+  --
+  -- Errors:
+  --   non-string mode -> RPC_TYPE_ERROR (-3), checked BEFORE handler logic to
+  --     mirror Core's Arg<std::string_view> type coercion.
+  --   "mallocinfo" (non-glibc) -> RPC_INVALID_PARAMETER (-8)
+  --     "mallocinfo mode not available" (node.cpp).
+  --   any other mode -> RPC_INVALID_PARAMETER (-8) "unknown mode <mode>"
+  --     (Core node.cpp tfm::format("unknown mode %s", mode)).
+  --
+  -- Pure read-only introspection of the daemon's own memory accounting; no side
+  -- effects, no chain/mempool/peer locks.  Safe at any lifecycle stage.
+  self.methods["getmemoryinfo"] = function(_rpc, params)
+    -- Core resolves mode via self.Arg<std::string_view>("mode"); a non-string
+    -- value is a JSON type error BEFORE any handler logic runs.  Omitted (nil)
+    -- or JSON null falls back to the "stats" default.
+    local mode = params and params[1]
+    if mode == nil or mode == cjson.null then
+      mode = "stats"
+    end
+    if type(mode) ~= "string" then
+      error({
+        code = M.ERROR.TYPE_ERROR,
+        message = string.format(
+          "JSON value of type %s is not of expected type string",
+          core_json_type_name(mode)),
+      })
+    end
+
+    if mode == "stats" then
+      -- Core RPCLockedMemoryInfo() reads LockedPoolManager::Instance().stats()
+      -- and pushes the six counters under "locked" in this exact order.
+      -- lunarblock has no mlock'd secure allocator, so every counter is an
+      -- honest 0; the keys are always present.  Built by hand (oj) so the
+      -- pushKV order is byte-stable (cjson does not preserve key order).
+      return oj_result(oj({
+        "locked", oj({
+          "used", 0,
+          "free", 0,
+          "total", 0,
+          "locked", 0,
+          "chunks_used", 0,
+          "chunks_free", 0,
+        }),
+      }))
+    elseif mode == "mallocinfo" then
+      -- Core returns glibc malloc_info(3) XML ONLY when built with glibc
+      -- (HAVE_MALLOC_INFO); otherwise it raises -8 "mallocinfo mode not
+      -- available".  A LuaJIT port has no glibc malloc_info equivalent, so we
+      -- take Core's non-glibc path — the exact -8 error.
+      error({
+        code = M.ERROR.INVALID_PARAMETER,
+        message = "mallocinfo mode not available",
+      })
+    else
+      -- Core node.cpp: throw JSONRPCError(RPC_INVALID_PARAMETER,
+      --   tfm::format("unknown mode %s", mode)).
+      error({
+        code = M.ERROR.INVALID_PARAMETER,
+        message = "unknown mode " .. mode,
+      })
+    end
+  end
+
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
     -- BUG-22 fix (W115 FIX-50): include mapped_as field per peer.
