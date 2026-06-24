@@ -275,6 +275,9 @@ M.ERROR = {
   CLIENT_NODE_NOT_ADDED       = -24,  -- RPC_CLIENT_NODE_NOT_ADDED
   CLIENT_NODE_NOT_CONNECTED   = -29,  -- RPC_CLIENT_NODE_NOT_CONNECTED
   CLIENT_INVALID_IP_OR_SUBNET = -30,  -- RPC_CLIENT_INVALID_IP_OR_SUBNET
+  CLIENT_P2P_DISABLED         = -31,  -- RPC_CLIENT_P2P_DISABLED (Core protocol.h:64;
+                                      -- EnsureConnman throws this when the connection
+                                      -- manager is unavailable, e.g. setnetworkactive)
   DESERIALIZATION_ERROR = -22,
   VERIFY_ERROR = -25,
   VERIFY_REJECTED = -26,
@@ -3717,6 +3720,9 @@ function RPCServer:register_methods()
     local connections = 0
     local connections_in = 0
     local connections_out = 0
+    -- networkactive mirrors the connman global P2P-active flag toggled by the
+    -- `setnetworkactive` RPC (Core CConnman.fNetworkActive, default true).
+    local network_active = true
     if rpc.peer_manager then
       connections = #rpc.peer_manager.peer_list
       for _, p in ipairs(rpc.peer_manager.peer_list) do
@@ -3725,6 +3731,9 @@ function RPCServer:register_methods()
         else
           connections_out = connections_out + 1
         end
+      end
+      if rpc.peer_manager.network_active ~= nil then
+        network_active = rpc.peer_manager.network_active
       end
     end
     -- getnetworkinfo (bitcoin-core/src/rpc/net.cpp). Emit order + field set are
@@ -3775,7 +3784,7 @@ function RPCServer:register_methods()
       "localservicesnames", oj_array_of_strings(SERVICE_NAMES),
       "localrelay",         true,
       "timeoffset",         0,
-      "networkactive",      true,                    -- masked
+      "networkactive",      network_active,          -- masked (live connman flag)
       "connections",        connections,             -- masked
       "connections_in",     connections_in,          -- masked
       "connections_out",    connections_out,         -- masked
@@ -3785,6 +3794,49 @@ function RPCServer:register_methods()
       "localaddresses",     oj_array_empty(),        -- masked
       "warnings",           oj_array_empty(),        -- ARRAY (Core v31.99)
     }))
+  end
+
+  -- setnetworkactive state
+  -- Disable/enable all NEW p2p network activity.
+  -- Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
+  -- CConnman::SetNetworkActive (net.cpp:3361).
+  -- Param: state (bool, REQUIRED) — true to enable networking, false to disable.
+  -- Returns the bare JSON boolean that was passed in, read back from the peer
+  -- manager after the toggle (Core returns GetNetworkActive(), which absent a
+  -- race equals state).  Setting false suppresses NEW connection establishment
+  -- only — existing peers are NOT disconnected.  getnetworkinfo.networkactive
+  -- mirrors this flag.
+  self.methods["setnetworkactive"] = function(rpc, params)
+    local state = params and params[1]
+    -- Required positional bool.  Core reads request.params[0].get_bool(); a
+    -- missing arg is RPC_INVALID_PARAMETER (-8), a non-bool a RPC_TYPE_ERROR (-3).
+    -- cjson decodes JSON true/false to Lua booleans and JSON numbers to Lua
+    -- numbers, so type(state) == "boolean" cleanly rejects ints/floats to match
+    -- Core's get_bool() strictness.
+    if state == nil or state == cjson.null then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Missing required argument: state"})
+    end
+    if type(state) ~= "boolean" then
+      error({
+        code = M.ERROR.TYPE_ERROR,
+        message = string.format(
+          "JSON value of type %s is not of expected type bool",
+          core_json_type_name(state)),
+      })
+    end
+
+    -- EnsureConnman parity (server_util.cpp:100): a missing connection manager
+    -- is RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.
+    local pm = rpc.peer_manager
+    if not pm or type(pm.set_network_active) ~= "function" then
+      error({
+        code = M.ERROR.CLIENT_P2P_DISABLED,
+        message = "Error: Peer-to-peer functionality missing or disabled",
+      })
+    end
+
+    -- SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+    return pm:set_network_active(state)
   end
 
   self.methods["getpeerinfo"] = function(rpc, _params)
