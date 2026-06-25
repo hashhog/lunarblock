@@ -4122,6 +4122,245 @@ function RPCServer:register_methods()
     return M.hex_encode(serialize.serialize_transaction(merged, true))
   end
 
+  --- createrawtransaction ( [{txid,vout,sequence?},...] {address:amount,...|data:hex}
+  ---                        ( locktime replaceable ) )
+  -- Build an UNSIGNED raw transaction and return its hex.  Byte-exact port of
+  -- bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction, which calls
+  -- ConstructTransaction (rawtransaction_util.cpp:147) -> AddInputs +
+  -- AddOutputs.  Reuses the same address->scriptPubKey + tx-serialization
+  -- machinery as the walletcreatefundedpsbt / generateblock paths:
+  --   • address_mod.decode_address + script_mod.make_p2*_script
+  --   • script_mod.build_script(OP_RETURN, <push>)   for `data` outputs
+  --   • serialize.serialize_transaction (the same encoder
+  --     sendrawtransaction/decoderawtransaction round-trip through)
+  --
+  -- Core semantics that this MUST match for byte-parity:
+  --   version  = CTransaction::CURRENT_VERSION = 2.
+  --   locktime defaults 0; range [0, 0xFFFFFFFF] (LOCKTIME_MAX) else -8.
+  --   replaceable defaults TRUE (RPCArg::Default{true}) -> rbf.value_or(true)
+  --     in ConstructTransaction; the per-input nSequence is then:
+  --       explicit `sequence`                 -> that value (range-checked)
+  --       replaceable                         -> MAX_BIP125_RBF_SEQUENCE 0xFFFFFFFD
+  --       !replaceable && locktime != 0       -> MAX_SEQUENCE_NONFINAL  0xFFFFFFFE
+  --       !replaceable && locktime == 0       -> SEQUENCE_FINAL         0xFFFFFFFF
+  --   outputs accepts EITHER an array of single-key objects OR a dict
+  --     (NormalizeOutputs); a `data` key -> OP_RETURN output (amount 0); any
+  --     other key is an address -> scriptPubKey with AmountFromValue(amount).
+  --   duplicate `data`            -> -8 "Invalid parameter, duplicate key: data"
+  --   duplicate address           -> -8 "Invalid parameter, duplicated address: <a>"
+  --   invalid address             -> -5 "Invalid Bitcoin address: <a>"
+  self.methods["createrawtransaction"] = function(rpc, params)
+    local SEQUENCE_FINAL        = 0xFFFFFFFF
+    local MAX_SEQUENCE_NONFINAL = 0xFFFFFFFE
+    local MAX_BIP125_RBF_SEQ    = 0xFFFFFFFD
+    local LOCKTIME_MAX          = 0xFFFFFFFF
+
+    local inputs_in  = params and params[1]
+    local outputs_in = params and params[2]
+    local locktime_in = params and params[3]
+    local replaceable_in = params and params[4]
+
+    -- locktime (Core ConstructTransaction): default 0, range-checked.
+    local locktime = 0
+    if locktime_in ~= nil and locktime_in ~= cjson.null then
+      if type(locktime_in) ~= "number" then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "Invalid parameter, locktime out of range"})
+      end
+      locktime = math.floor(locktime_in)
+      if locktime < 0 or locktime > LOCKTIME_MAX then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "Invalid parameter, locktime out of range"})
+      end
+    end
+
+    -- replaceable (Core RPCArg::Default{true} -> rbf.value_or(true)).
+    local replaceable = true
+    if replaceable_in ~= nil and replaceable_in ~= cjson.null then
+      replaceable = replaceable_in and true or false
+    end
+
+    -- ---- AddInputs (rawtransaction_util.cpp:25) ----
+    if type(inputs_in) ~= "table" then
+      -- Core: request.params[0].get_array() -> a non-array is a type error.
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "Expected type array, got " .. core_json_type_name(inputs_in)})
+    end
+    local tx_inputs = {}
+    for idx = 1, #inputs_in do
+      local o = inputs_in[idx]
+      if type(o) ~= "table" then
+        error({code = M.ERROR.TYPE_ERROR,
+               message = "Expected type object, got " .. core_json_type_name(o)})
+      end
+      -- txid: ParseHashO -> ParseHashV (-8 on malformed length / non-hex).
+      parse_hash_v(o.txid, "txid")
+      local prev_hash = types.hash256_from_hex(o.txid)
+
+      local vout = o.vout
+      if type(vout) ~= "number" then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "Invalid parameter, missing vout key"})
+      end
+      vout = math.floor(vout)
+      if vout < 0 then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "Invalid parameter, vout cannot be negative"})
+      end
+
+      -- nSequence (Core AddInputs:47-66).
+      local sequence
+      if replaceable then
+        sequence = MAX_BIP125_RBF_SEQ
+      elseif locktime ~= 0 then
+        sequence = MAX_SEQUENCE_NONFINAL
+      else
+        sequence = SEQUENCE_FINAL
+      end
+      if o.sequence ~= nil and o.sequence ~= cjson.null then
+        if type(o.sequence) ~= "number" then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, sequence number is out of range"})
+        end
+        local seq = math.floor(o.sequence)
+        if seq < 0 or seq > SEQUENCE_FINAL then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, sequence number is out of range"})
+        end
+        sequence = seq
+      end
+
+      tx_inputs[#tx_inputs + 1] =
+        types.txin(types.outpoint(prev_hash, vout), "", sequence)
+    end
+
+    -- ---- AddOutputs (rawtransaction_util.cpp:133 -> NormalizeOutputs +
+    --      ParseOutputs).  outputs may be an array of single-key objects OR a
+    --      dict.  We normalise to an ordered list of {key, value} pairs so the
+    --      output ordering is byte-stable (Core processes getKeys() in
+    --      insertion order; the array form preserves it exactly). ----
+    if outputs_in == nil or outputs_in == cjson.null then
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Invalid parameter, output argument must be non-null"})
+    end
+    if type(outputs_in) ~= "table" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "Expected type array, got " .. core_json_type_name(outputs_in)})
+    end
+
+    local out_pairs = {}  -- ordered list of {k, v}
+    local n_out = #outputs_in
+    if n_out > 0 then
+      -- Array form: each element is a single-key object (Core NormalizeOutputs
+      -- translates an array of key-value pairs into a dict, rejecting any
+      -- element that is not a one-key object).
+      for i = 1, n_out do
+        local entry = outputs_in[i]
+        if type(entry) ~= "table" then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, key-value pair not an object as expected"})
+        end
+        local cnt, kk, vv = 0, nil, nil
+        for k, v in pairs(entry) do cnt = cnt + 1; kk = k; vv = v end
+        if cnt ~= 1 then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, key-value pair must contain exactly one key"})
+        end
+        out_pairs[#out_pairs + 1] = {kk, vv}
+      end
+    else
+      -- Dict form: {address: amount, ...} (and/or "data": hex).
+      for k, v in pairs(outputs_in) do
+        out_pairs[#out_pairs + 1] = {k, v}
+      end
+    end
+
+    -- ParseOutputs (rawtransaction_util.cpp:100): duplicate-checking + build.
+    local tx_outputs = {}
+    local seen_addr = {}
+    local has_data = false
+    for _, kv in ipairs(out_pairs) do
+      local key, val = kv[1], kv[2]
+      if key == "data" then
+        if has_data then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, duplicate key: data"})
+        end
+        has_data = true
+        local ok_hex, data = pcall(M.hex_decode, tostring(val))
+        if not ok_hex then
+          error({code = M.ERROR.INVALID_PARAMETER, message = "Invalid Data"})
+        end
+        -- Core: CScript() << OP_RETURN << data (amount 0).  CScript::operator<<
+        -- emits the MINIMAL push: empty -> OP_0(0x00); len<=0x4b -> direct push;
+        -- <=0xff -> OP_PUSHDATA1; <=0xffff -> OP_PUSHDATA2; else OP_PUSHDATA4.
+        -- build_script reproduces this byte-for-byte from the op descriptors
+        -- (build the data-push op inline; script.make_push is module-local).
+        local push_op
+        local dlen = #data
+        if dlen == 0 then
+          push_op = {opcode = script_mod.OP.OP_0, data = nil}          -- 0x00
+        elseif dlen <= 0x4b then
+          push_op = {opcode = dlen, data = data}                       -- direct
+        elseif dlen <= 0xff then
+          push_op = {opcode = 0x4c, data = data}                       -- OP_PUSHDATA1
+        elseif dlen <= 0xffff then
+          push_op = {opcode = 0x4d, data = data}                       -- OP_PUSHDATA2
+        else
+          push_op = {opcode = 0x4e, data = data}                       -- OP_PUSHDATA4
+        end
+        local spk = script_mod.build_script({
+          {opcode = script_mod.OP.OP_RETURN, data = nil},
+          push_op,
+        })
+        tx_outputs[#tx_outputs + 1] = types.txout(0, spk)
+      else
+        local addr_type, program = address_mod.decode_address(
+          key, rpc.network and rpc.network.name)
+        if not addr_type then
+          error({code = M.ERROR.INVALID_ADDRESS,
+                 message = "Invalid Bitcoin address: " .. key})
+        end
+        if seen_addr[key] then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, duplicated address: " .. key})
+        end
+        seen_addr[key] = true
+        local spk
+        if addr_type == "p2pkh" then
+          spk = script_mod.make_p2pkh_script(program)
+        elseif addr_type == "p2sh" then
+          spk = script_mod.make_p2sh_script(program)
+        elseif addr_type == "p2wpkh" then
+          spk = script_mod.make_p2wpkh_script(program)
+        elseif addr_type == "p2wsh" then
+          spk = script_mod.make_p2wsh_script(program)
+        elseif addr_type == "p2tr" then
+          spk = script_mod.make_p2tr_script(program)
+        else
+          error({code = M.ERROR.INVALID_ADDRESS,
+                 message = "Invalid Bitcoin address: " .. key})
+        end
+        -- AmountFromValue parity: fixed-point BTC -> satoshis.
+        local amt_btc = tonumber(val)
+        if amt_btc == nil then
+          error({code = M.ERROR.TYPE_ERROR, message = "Invalid amount"})
+        end
+        local sats = math.floor(amt_btc * consensus.COIN + 0.5)
+        if sats < 0 or sats > 21000000 * consensus.COIN then
+          error({code = M.ERROR.TYPE_ERROR, message = "Amount out of range"})
+        end
+        tx_outputs[#tx_outputs + 1] = types.txout(sats, spk)
+      end
+    end
+
+    local tx = types.transaction(2, tx_inputs, tx_outputs, locktime)
+    -- Unsigned: no witness data, emit the legacy (non-segwit) serialization,
+    -- exactly as Core's EncodeHexTx(CTransaction(rawTx)) does for a tx with no
+    -- witness stacks.
+    return M.hex_encode(serialize.serialize_transaction(tx, false))
+  end
+
   -- Network methods
   self.methods["getnetworkinfo"] = function(rpc, _params)
     local connections = 0
