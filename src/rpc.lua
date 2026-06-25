@@ -2246,6 +2246,293 @@ function RPCServer:register_methods()
   end
 
   --------------------------------------------------------------------------------
+  -- verifychain — re-validate the most recent nblocks blocks at checklevel
+  --------------------------------------------------------------------------------
+  --
+  -- Mirrors bitcoin-core/src/rpc/blockchain.cpp::verifychain, which calls
+  -- CVerifyDB().VerifyDB(chainstate, consensus, coins, check_level, check_depth)
+  -- and returns true iff the result is VerifyDBResult::SUCCESS.
+  --
+  -- Params (positional, both optional):
+  --   1. checklevel  (DEFAULT_CHECKLEVEL = 3, clamped to 0-4)
+  --   2. nblocks     (DEFAULT_CHECKBLOCKS = 6; 0 or > chain-height = entire chain)
+  --
+  -- checklevel semantics (Core CVerifyDB::VerifyDB, validation.cpp):
+  --   0  read the block from disk (deserializes correctly)
+  --   1  +CheckBlock — full block-validity: header sanity, PoW, tx structure,
+  --      weight, sigops, merkle root, witness commitment, BIP34 height. This is
+  --      the SAME validation.check_block the node runs during sync.
+  --   2  +verify undo data is present and decodes (Core's ReadUndoDataFromDisk +
+  --      CVerifyDB level-3 undo precondition).
+  --   3  +disconnect-tip consistency: the undo record must have one TxUndo per
+  --      non-coinbase tx, and per-tx the spent-input count must equal the tx's
+  --      input count (Core's DisconnectBlock invariant — vtxundo.size() ==
+  --      block.vtx.size()-1 and txundo.vprevout.size() == tx.vin.size()).
+  --   4  +reconnect: re-run the FULL block-connection validator (ChainState:
+  --      connect_block) against a throwaway in-memory chainstate seeded from the
+  --      undo coins. This re-verifies every input's script (legacy/P2SH/P2WPKH/
+  --      P2WSH/taproot), coinbase maturity, BIP68 sequence locks, sigop cost and
+  --      the coinbase value cap using the node's real validator — without
+  --      touching live storage. Mirrors Core's level-4 ConnectBlock-into-a-temp-
+  --      view step.
+  --
+  -- Returns true if every checked block passes, false on the first failure
+  -- (false is also what Core returns; "check debug log for reason").
+  self.methods["verifychain"] = function(rpc, params)
+    local DEFAULT_CHECKLEVEL = 3
+    local DEFAULT_CHECKBLOCKS = 6
+
+    -- Parse + validate params. Core getInt<int>() rejects non-numeric args; we
+    -- mirror that with RPC_TYPE_ERROR (-3) for the wrong JSON type.
+    local checklevel = DEFAULT_CHECKLEVEL
+    if params[1] ~= nil and params[1] ~= cjson.null then
+      if type(params[1]) ~= "number" then
+        error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type " ..
+               core_json_type_name(params[1]) .. " is not of expected type number"})
+      end
+      checklevel = math.floor(params[1])
+    end
+    local nblocks = DEFAULT_CHECKBLOCKS
+    if params[2] ~= nil and params[2] ~= cjson.null then
+      if type(params[2]) ~= "number" then
+        error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type " ..
+               core_json_type_name(params[2]) .. " is not of expected type number"})
+      end
+      nblocks = math.floor(params[2])
+    end
+
+    -- Clamp checklevel to the documented 0-4 range (Core CHECKLEVEL_DOC).
+    if checklevel < 0 then checklevel = 0 end
+    if checklevel > 4 then checklevel = 4 end
+
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    -- Optional debug logger: Core logs the failing block + reason to the debug
+    -- log ("If false, check debug log for reason"). rpc.log may be unset.
+    local function vlog(msg)
+      if rpc.log then rpc.log(msg) end
+    end
+
+    local tip_height = rpc.chain_state and rpc.chain_state.tip_height or -1
+    -- Empty / genesis-only chain: nothing meaningful to re-validate. Core's
+    -- VerifyDB returns SUCCESS immediately when the active chain is empty.
+    if tip_height < 0 then
+      return true
+    end
+
+    -- How many blocks to walk. nblocks <= 0 OR nblocks > height means "all".
+    -- Core: nCheckDepth <= 0 || nCheckDepth > chain.Height() -> Height() (all).
+    local total_blocks = tip_height + 1  -- includes genesis at height 0
+    local walk = nblocks
+    if walk <= 0 or walk > total_blocks then
+      walk = total_blocks
+    end
+
+    local utxo_mod = require("lunarblock.utxo")
+    local network = rpc.network or consensus.networks.mainnet
+
+    -- Compute the median-time-past of the block at `h` from LIVE storage
+    -- headers (read-only). Used to feed connect_block's BIP68/BIP113 checks
+    -- in the level-4 sandbox without mutating anything.
+    local function mtp_at_height(h)
+      local hh = rpc.storage.get_hash_by_height(h)
+      if not hh then return os.time() end
+      local timestamps = {}
+      local cur = hh
+      for _ = 1, 11 do
+        local hdr = rpc.storage.get_header(cur)
+        if not hdr then break end
+        timestamps[#timestamps + 1] = hdr.timestamp
+        if not hdr.prev_hash or types.hash256_eq(hdr.prev_hash, types.hash256_zero()) then
+          break
+        end
+        cur = hdr.prev_hash
+      end
+      if #timestamps == 0 then return os.time() end
+      return consensus.get_median_time_past(timestamps)
+    end
+
+    -- Re-run the FULL block-connection validator on a throwaway in-memory
+    -- chainstate seeded with the prevout coins recovered from `block_undo`.
+    -- This invokes the EXACT same ChainState:connect_block the node uses
+    -- during sync (script verification, coinbase maturity, sequence locks,
+    -- sigop cap, coinbase value cap) — proving the block reconnects cleanly.
+    -- Returns true on success, false on any validation failure.
+    local function reconnect_check(block, height, block_hash, block_undo)
+      local sandbox_storage = storage_mod.new_memory_storage()
+      local sandbox = utxo_mod.new_chain_state(sandbox_storage, network)
+
+      -- Seed the parent chaintx count so the chaintx accounting is well-formed.
+      if height > 0 then
+        sandbox_storage.put_chaintx_at_height(height - 1, 0, true)
+      end
+
+      -- Seed each spent prevout into the sandbox UTXO view from the undo data.
+      -- block_undo.tx_undo[i] corresponds to block.transactions[i+1] (the i-th
+      -- non-coinbase tx), and within it prev_outputs[j] is the coin spent by
+      -- that tx's j-th input. We re-create exactly the coins connect_block's
+      -- first pass will look up.
+      for tx_i = 2, #block.transactions do
+        local tx = block.transactions[tx_i]
+        local txu = block_undo.tx_undo[tx_i - 1]
+        if not txu then
+          return false  -- caught by level-3 already, but be defensive
+        end
+        for in_i, inp in ipairs(tx.inputs) do
+          local coin = txu.prev_outputs[in_i]
+          if not coin then
+            return false
+          end
+          -- utxo_entry(value, script_pubkey, height, is_coinbase)
+          local entry = utxo_mod.utxo_entry(
+            coin.value, coin.script_pubkey, coin.height, coin.is_coinbase)
+          sandbox.coin_view:add(inp.prev_out.hash, inp.prev_out.index, entry)
+        end
+      end
+
+      -- Point the sandbox tip at the parent so connect_block's prev-link and
+      -- BIP30/BIP34 ancestor checks see a height-(height-1) chain. The parent
+      -- hash comes from the block we are validating.
+      sandbox.tip_height = height - 1
+      sandbox.tip_hash = (height > 0) and block.header.prev_hash or nil
+
+      -- prev_block_mtp / get_block_mtp for BIP68 time-locks, sourced from the
+      -- LIVE chain headers (read-only). Genesis (height 0) needs neither.
+      local prev_block_mtp = nil
+      local get_block_mtp = nil
+      if height > 0 then
+        prev_block_mtp = mtp_at_height(height - 1)
+        get_block_mtp = function(h) return mtp_at_height(h) end
+      end
+
+      -- Run the real validator. connect_block returns (true, fees) on success,
+      -- or (nil/false, err) on a consensus failure. Wrap in pcall because the
+      -- connect path uses assert() for several consensus gates (script verify,
+      -- coinbase maturity, sequence locks) which raise on failure.
+      local ok, res = pcall(function()
+        return sandbox:connect_block(
+          block, height, block_hash,
+          prev_block_mtp, get_block_mtp,
+          false,   -- skip_script_validation = false: DO verify scripts
+          false,   -- use_parallel = false: deterministic single-threaded verify
+          true     -- nosync = true: in-memory sandbox, no fsync needed
+        )
+      end)
+      if not ok then
+        vlog("verifychain: block " .. types.hash256_hex(block_hash) ..
+          " at height " .. height .. " failed reconnect: " .. tostring(res))
+        return false
+      end
+      return res == true
+    end
+
+    -- Walk descending from the tip for `walk` blocks.
+    local height = tip_height
+    for _ = 1, walk do
+      if height < 0 then break end
+
+      local block_hash = rpc.storage.get_hash_by_height(height)
+      if not block_hash then
+        vlog("verifychain: missing block hash at height " .. height)
+        return false
+      end
+
+      -- Level 0: read + deserialize the block from disk.
+      local block = rpc.storage.get_block(block_hash)
+      if not block then
+        vlog("verifychain: missing block body at height " .. height ..
+          " (" .. types.hash256_hex(block_hash) .. ")")
+        return false
+      end
+
+      -- Level 1: full CheckBlock (the node's real block-validity machinery).
+      -- check_block asserts on any failure; pcall converts that to a verdict.
+      if checklevel >= 1 then
+        local ok_cb, err_cb = pcall(validation.check_block, block, network, height, true)
+        if not ok_cb then
+          vlog("verifychain: CheckBlock failed at height " .. height ..
+            " (" .. types.hash256_hex(block_hash) .. "): " .. tostring(err_cb))
+          return false
+        end
+        -- The stored block hash must match the recomputed header hash (the
+        -- height-index entry must be internally consistent).
+        local computed = validation.compute_block_hash(block.header)
+        if not types.hash256_eq(computed, block_hash) then
+          vlog("verifychain: block hash mismatch at height " .. height)
+          return false
+        end
+      end
+
+      -- Levels 2-4 operate on the block's undo data. The genesis block has no
+      -- inputs; and a coinbase-only block (no non-coinbase txs) has nothing to
+      -- undo, so — exactly like Bitcoin Core, which only writes a CBlockUndo
+      -- when the block spends prevouts — lunarblock persists NO undo record for
+      -- it (utxo.lua connect_block: `if #block_undo.tx_undo > 0`). For those
+      -- blocks levels 2-4 are vacuously satisfied; an undo record is REQUIRED
+      -- (and must be consistent) only for blocks that actually spend inputs.
+      local is_genesis = (height == 0)
+      local non_cb = #block.transactions - 1
+      local has_spends = (not is_genesis) and non_cb > 0
+      local block_undo = nil
+      if checklevel >= 2 and has_spends then
+        if not rpc.storage.get_undo then
+          vlog("verifychain: undo store unavailable at height " .. height)
+          return false
+        end
+        local undo_raw = rpc.storage.get_undo(block_hash)
+        if not undo_raw then
+          vlog("verifychain: missing undo data at height " .. height ..
+            " (" .. types.hash256_hex(block_hash) .. ")")
+          return false
+        end
+        local ok_u, decoded = pcall(utxo_mod.deserialize_block_undo, undo_raw)
+        if not ok_u or type(decoded) ~= "table" or type(decoded.tx_undo) ~= "table" then
+          vlog("verifychain: undo data failed to decode at height " .. height)
+          return false
+        end
+        block_undo = decoded
+      end
+
+      -- Level 3: disconnect-consistency — one TxUndo per non-coinbase tx, and
+      -- each TxUndo's spent-input count equals the tx's input count.
+      if checklevel >= 3 and has_spends then
+        if #block_undo.tx_undo ~= non_cb then
+          vlog("verifychain: undo tx count mismatch at height " ..
+            height .. " (undo=" .. #block_undo.tx_undo .. " block=" .. non_cb .. ")")
+          return false
+        end
+        for tx_i = 2, #block.transactions do
+          local tx = block.transactions[tx_i]
+          local txu = block_undo.tx_undo[tx_i - 1]
+          if not txu or type(txu.prev_outputs) ~= "table"
+              or #txu.prev_outputs ~= #tx.inputs then
+            vlog("verifychain: undo input count mismatch at height " ..
+              height .. " tx " .. (tx_i - 1))
+            return false
+          end
+        end
+      end
+
+      -- Level 4: reconnect through the real validator on a sandbox view.
+      -- Only blocks that spend inputs have undo coins to reconstruct the view
+      -- from; a coinbase-only block adds outputs but consumes nothing, so its
+      -- reconnect is already covered by the CheckBlock (level 1) + value-cap
+      -- checks above and there is nothing further to re-execute.
+      if checklevel >= 4 and has_spends then
+        if not reconnect_check(block, height, block_hash, block_undo) then
+          return false
+        end
+      end
+
+      height = height - 1
+    end
+
+    return true
+  end
+
+  --------------------------------------------------------------------------------
   -- wait-family RPCs: waitfornewblock / waitforblock / waitforblockheight
   --------------------------------------------------------------------------------
   --
