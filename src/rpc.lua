@@ -10804,6 +10804,112 @@ function RPCServer:register_methods()
   -- Alias for compatibility with feed-sequential.py
   self.methods["submitblockbatch"] = self.methods["submitblocks"]
 
+  --- submitheader: Decode the given hexdata as a header and submit it as a
+  --- candidate chain tip if valid.  Throws when the header is invalid.
+  ---
+  --- Mirrors Bitcoin Core rpc/mining.cpp submitheader() byte-for-byte on the
+  --- error surface:
+  ---   * bad hex / non-80-byte payload / undecodable
+  ---       -> RPC_DESERIALIZATION_ERROR (-22) "Block header decode failed"
+  ---   * parent (prev block) unknown to this node
+  ---       -> RPC_VERIFY_ERROR (-25)
+  ---          "Must submit previous header (<prevhash>) first"
+  ---          where <prevhash> is the big-endian DISPLAY hex (GetHex()).
+  ---   * PoW / contextual validation failure
+  ---       -> RPC_VERIFY_ERROR (-25) with the reject-reason string.
+  ---   * success / already-known
+  ---       -> JSON null.
+  ---
+  --- REUSES the existing headers-first validation+store path
+  --- (HeaderChain:accept_header in src/sync.lua) — the same
+  --- AcceptBlockHeader-equivalent the P2P headers handler drives.  No parallel
+  --- validator: accept_header runs PoW + ContextualCheckBlockHeader (MTP,
+  --- time-too-old/new, BIP94 timewarp, diffbits, bad-version, checkpoints,
+  --- min_pow_checked) and inserts the validated header into the in-memory block
+  --- index (self.headers) + storage (CF.HEADERS + height index), exactly as for
+  --- a header arriving over the wire.
+  --- @param params array: params[1] = hex-encoded 80-byte block header
+  self.methods["submitheader"] = function(rpc, params)
+    -- Core: DecodeHexBlockHeader(h, request.params[0].get_str()).
+    -- Bad hex, odd length, or non-80-byte payload -> -22.
+    local hexdata = params[1]
+    if type(hexdata) ~= "string" then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block header decode failed"})
+    end
+    -- A serialized header is exactly 80 bytes => 160 hex chars; the string
+    -- must be pure hex (even length, [0-9a-fA-F] only).  M.hex_decode does NOT
+    -- validate its input (an FFI LUT decode that silently maps non-hex to
+    -- garbage and truncates odd lengths), so we gate the format here to match
+    -- Core's strict IsHex() + 80-byte length check.
+    if #hexdata ~= 160 or hexdata:find("[^0-9a-fA-F]") then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block header decode failed"})
+    end
+
+    local raw = M.hex_decode(hexdata)
+    if type(raw) ~= "string" or #raw ~= 80 then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block header decode failed"})
+    end
+
+    local ok_deser, header = pcall(serialize.deserialize_block_header, raw)
+    if not ok_deser or not header then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Block header decode failed"})
+    end
+
+    -- prevhash in big-endian DISPLAY hex, matching Core's
+    -- h.hashPrevBlock.GetHex() (uint256 reverses the bytes).  types.hash256_hex
+    -- reverses the internal byte order for display.
+    local prev_hash_display = types.hash256_hex(header.prev_hash)
+
+    -- Core requires header_chain (block index) to answer the parent-known
+    -- check and to run the validation path.  Without it we cannot honor the
+    -- contract; surface a verify error rather than silently accepting.
+    local chain = rpc.header_chain
+    if not chain then
+      error({code = M.ERROR.VERIFY_ERROR, message = "Header chain not available"})
+    end
+
+    -- Core: LOCK(cs_main); if (!chainman.m_blockman.LookupBlockIndex(
+    --   h.hashPrevBlock)) throw RPC_VERIFY_ERROR "Must submit previous
+    --   header (<prevhash>) first".
+    -- lunarblock's block index is HeaderChain.headers, keyed by the same
+    -- display hex.  (accept_header itself ALSO performs this parent check, but
+    -- we do it up front so we can emit Core's EXACT message — accept_header's
+    -- internal miss returns "unknown parent: <hex>" instead.)
+    local parent = chain.headers[prev_hash_display]
+    if not parent then
+      error({
+        code = M.ERROR.VERIFY_ERROR,
+        message = "Must submit previous header (" .. prev_hash_display .. ") first",
+      })
+    end
+
+    -- Core: ProcessNewBlockHeaders({{h}}, min_pow_checked=true, state).
+    --   state valid           -> return null
+    --   state error/reject    -> throw RPC_VERIFY_ERROR with reject reason
+    -- Reuse HeaderChain:accept_header — the SAME PoW + ContextualCheckBlock-
+    -- Header pipeline the P2P path uses.  Core passes min_pow_checked=true
+    -- (submitheader is an RPC, the caller asserts sufficient work), so we set
+    -- it here too; this skips the anti-DoS MinimumChainWork gate exactly as
+    -- Core does and avoids a spurious "too-little-chainwork" reject for a
+    -- single tip-extending header on a node not yet past min_chain_work.
+    local accepted, accept_err = chain:accept_header(header, { min_pow_checked = true })
+    if accepted then
+      -- Validated + stored, or already-known (accept_header returns true for
+      -- both) -> Core returns UniValue::VNULL.
+      return cjson.null
+    end
+
+    -- accept_header should not reach its own parent-miss branch here (we
+    -- checked the parent above), but translate it to Core's wording if it
+    -- somehow does (e.g. a parent present in storage but not the in-memory
+    -- index) so the error surface stays Core-faithful.
+    local reason = tostring(accept_err or "header invalid")
+    if reason:find("^unknown parent") then
+      reason = "Must submit previous header (" .. prev_hash_display .. ") first"
+    end
+    error({code = M.ERROR.VERIFY_ERROR, message = reason})
+  end
+
   --- getmininginfo: Return mining-related information.
   self.methods["getmininginfo"] = function(rpc, _params)
     local tip_height = 0
