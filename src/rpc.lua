@@ -285,6 +285,25 @@ M.ERROR = {
   IN_WARMUP = -28,
 }
 
+--- Strip the leaked internal Lua source location ("./.../src/foo.lua:NNN: ")
+--- that pcall prepends to a runtime error message.  Bitcoin Core never leaks
+--- internal file paths in user-facing JSON-RPC error messages (it surfaces only
+--- the human-readable reason, e.g. "invalid base64" / "Invalid PSBT magic bytes:
+--- iostream error" — see DecodeBase64PSBT/DecodeRawPSBT, bitcoin-core/src/psbt.cpp).
+--- Reduces a Lua error value to just its reason text.
+local function strip_internal_location(err)
+  local s = tostring(err)
+  -- Lua error prefix form: "<chunkname>:<line>: <message>"; chunkname may itself
+  -- contain colons-free path segments. Repeatedly peel a leading
+  -- "<non-space-run>:<digits>: " location prefix.
+  while true do
+    local rest = s:match("^%S-:%d+:%s(.+)$")
+    if rest and rest ~= s then s = rest else break end
+  end
+  return s
+end
+M.strip_internal_location = strip_internal_location
+
 --------------------------------------------------------------------------------
 -- Hash argument parsing (ParseHashV parity)
 --------------------------------------------------------------------------------
@@ -8025,7 +8044,10 @@ function RPCServer:register_methods()
 
     local ok, psbt = pcall(psbt_mod.from_base64, psbt_b64)
     if not ok then
-      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Invalid PSBT: " .. tostring(psbt)})
+      -- Core: DecodeBase64PSBT failure -> "TX decode failed <reason>" with NO
+      -- internal path (bitcoin-core/src/rpc/rawtransaction.cpp:1546).
+      error({code = M.ERROR.DESERIALIZATION_ERROR,
+        message = "TX decode failed " .. strip_internal_location(psbt)})
     end
 
     -- Look up UTXOs from storage
@@ -8240,8 +8262,15 @@ function RPCServer:register_methods()
     local psbt_mod = require("lunarblock.psbt")
     local psbts_b64 = params[1]
 
-    if type(psbts_b64) ~= "table" or #psbts_b64 < 1 then
+    if type(psbts_b64) ~= "table" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Array of PSBTs required"})
+    end
+
+    -- Core requires at least two PSBTs to join (rawtransaction.cpp:1803):
+    -- RPC_INVALID_PARAMETER (-8), "At least two PSBTs are required to join PSBTs."
+    if #psbts_b64 < 2 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "At least two PSBTs are required to join PSBTs."})
     end
 
     -- Suppress unused warning
@@ -8249,10 +8278,13 @@ function RPCServer:register_methods()
 
     -- Parse all PSBTs
     local psbts = {}
-    for i, b64 in ipairs(psbts_b64) do
+    for _i, b64 in ipairs(psbts_b64) do
       local ok, psbt = pcall(psbt_mod.from_base64, b64)
       if not ok then
-        error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Invalid PSBT at index " .. (i - 1)})
+        -- Core: DecodeBase64PSBT failure -> "TX decode failed <reason>" with NO
+        -- internal path (bitcoin-core/src/rpc/rawtransaction.cpp:1812).
+        error({code = M.ERROR.DESERIALIZATION_ERROR,
+          message = "TX decode failed " .. strip_internal_location(psbt)})
       end
       psbts[#psbts + 1] = psbt
     end
@@ -10217,8 +10249,10 @@ function RPCServer:register_methods()
     local raw = M.hex_decode(hex_tx)
     local ok, tx = pcall(serialize.deserialize_transaction, raw)
     if not ok then
+      -- Core: DecodeHexTx failure -> fixed message, NO internal path/reason
+      -- (bitcoin-core/src/rpc/rawtransaction.cpp:742).
       error({code = M.ERROR.DESERIALIZATION_ERROR,
-        message = "TX decode failed: " .. tostring(tx)})
+        message = "TX decode failed. Make sure the tx has at least one input."})
     end
 
     local errors = {}
