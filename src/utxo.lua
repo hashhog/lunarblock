@@ -4048,8 +4048,23 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- lighter side branch does not unconditionally consume disk on every call.
   -- Storing is idempotent (overwrite OK).  Earlier side-branch blocks
   -- (e.g. B1, B2 when B3 arrives) were stored on their own submitblock calls.
-  if consensus.work_compare(side_work, active_work) <= 0 then
-    -- Side branch is not strictly heavier; store it as a side-branch and
+  -- Tie-break threshold.  Normally a side branch must be STRICTLY heavier to
+  -- win (work_compare <= 0 → store, no reorg).  When this call is driven by
+  -- preciousblock (opts.precious), an EQUAL-work branch also wins: we only
+  -- store-without-reorg when the branch is strictly LIGHTER (work_compare < 0).
+  -- This reproduces Bitcoin Core's preciousblock tiebreak, where the precious
+  -- block is given a more-favorable (decreasing) nSequenceId so the
+  -- CBlockIndexWorkComparator sorts it ahead of equal-work peers that were
+  -- received earlier (validation.cpp Chainstate::PreciousBlock).
+  local work_cmp = consensus.work_compare(side_work, active_work)
+  local store_without_reorg
+  if opts.precious then
+    store_without_reorg = (work_cmp < 0)
+  else
+    store_without_reorg = (work_cmp <= 0)
+  end
+  if store_without_reorg then
+    -- Side branch is not (strictly) heavier; store it as a side-branch and
     -- leave the active chain alone.  We DO still store it so that when a
     -- follow-up block arrives and makes this branch heavier we have the
     -- block body available for the reorg connect loop.
@@ -4233,6 +4248,93 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   reorg_batch.destroy()
 
   return "connected"
+end
+
+--------------------------------------------------------------------------------
+-- PreciousBlock — Bitcoin Core Chainstate::PreciousBlock (validation.cpp:3490)
+--------------------------------------------------------------------------------
+-- Marks a block as "precious" so it WINS chain-selection ties against
+-- equal-work blocks that were received earlier, then re-activates the best
+-- chain (driving a reorg onto it if it is a valid competitor with work >= the
+-- active tip).
+--
+-- Core mechanism: preciousblock gives the block a decreasing nSequenceId
+-- (nBlockReverseSequenceId) so the CBlockIndexWorkComparator sorts it ahead of
+-- equal-work peers in setBlockIndexCandidates, then calls ActivateBestChain.
+-- lunarblock has no persistent candidate set; its chain-selection hook is the
+-- event-driven accept_side_branch_block reorg orchestrator (the analog of
+-- ActivateBestChain).  We reproduce the tiebreak by re-running that
+-- orchestrator for the precious block's branch with opts.precious=true, which
+-- flips the reorg threshold from "strictly heavier" to "heavier-or-equal" —
+-- exactly the effect of the favorable sequence id.  No precious marker is
+-- persisted, so the effect is not retained across restarts (matching Core's
+-- "effects of preciousblock are not retained across restarts").
+--
+-- Returns:
+--   "connected" → a reorg fired; the precious block is now the active tip.
+--   "noop"      → nothing to do (already the active tip / not at the tip /
+--                 header-only / strictly-lighter branch).  Core also returns
+--                 success (null) in all of these cases.
+--   nil, err    → a genuine reorg execution failure (Core: ActivateBestChain
+--                 returned false → RPC_DATABASE_ERROR).
+--------------------------------------------------------------------------------
+function ChainState:precious_block(block_hash, opts)
+  opts = opts or {}
+
+  -- Unknown block → caller raises RPC_INVALID_ADDRESS_OR_KEY (-5).
+  local header = self.storage.get_header(block_hash)
+  if not header then
+    return nil, "Block not found"
+  end
+
+  -- Already the active tip: ActivateBestChain would find nothing better, so
+  -- this is a no-op.  (An INTERIOR active-chain block has strictly less work
+  -- than the tip; Core short-circuits it via pindex->nChainWork < Tip work —
+  -- here that case is handled below by accept_side_branch_block returning
+  -- "stored", since the active chain above the common ancestor outweighs the
+  -- single block.)
+  if self.tip_hash and types.hash256_eq(self.tip_hash, block_hash) then
+    return "noop"
+  end
+
+  -- Header-only (no block body in storage): Core requires
+  -- pindex->IsValid(BLOCK_VALID_TRANSACTIONS) && HaveNumChainTxs() before
+  -- inserting into setBlockIndexCandidates, so ActivateBestChain is a no-op
+  -- without the transaction data.  We have no body to drive the reorg connect
+  -- loop → no-op.
+  local block = self.storage.get_block(block_hash)
+  if not block then
+    return "noop"
+  end
+
+  -- Re-activate best chain for the precious branch with the equal-work
+  -- tiebreak enabled.  accept_side_branch_block computes the branch-vs-active
+  -- work over the common ancestor and (with precious=true) reorgs when the
+  -- branch is heavier OR equal; it returns "stored" only when the branch is
+  -- strictly lighter (Core: "this block is not at the tip" → no-op).
+  local result, err = self:accept_side_branch_block(
+    block, block_hash,
+    { precious = true, skip_scripts = false, nosync = false, mempool = opts.mempool }
+  )
+
+  if result == "connected" then
+    return "connected"
+  elseif result == "stored" then
+    -- Branch strictly lighter than the active chain: no tip flip.  Core
+    -- returns success/null in this "block is not at the tip" case.
+    return "noop"
+  end
+
+  -- accept_side_branch_block returned nil + err.  "Cannot currently become the
+  -- tip" conditions (parent/ancestor unreachable, reorg too deep, descends
+  -- from an invalidated block) are no-ops under Core semantics — preciousblock
+  -- never fabricates a chain.  Only a genuine disconnect/connect execution
+  -- failure maps to an error (Core: ActivateBestChain returned false →
+  -- RPC_DATABASE_ERROR).
+  if err and (err:find("^reorg%-connect%-failed") or err:find("^reorg%-disconnect%-failed")) then
+    return nil, err
+  end
+  return "noop"
 end
 
 --------------------------------------------------------------------------------
