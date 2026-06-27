@@ -3541,6 +3541,66 @@ function RPCServer:register_methods()
     return cjson.null
   end
 
+  -- preciousblock "blockhash" — Bitcoin Core Chainstate::PreciousBlock
+  -- (validation.cpp) + the preciousblock RPC (rpc/blockchain.cpp).  Treats the
+  -- block as if it were received before others with the same work: it wins
+  -- equal-work chain-selection ties and (if it is a valid competitor with
+  -- work >= the active tip) a reorg is triggered onto it via the same
+  -- accept_side_branch_block path the submitblock RPC uses.  Returns null on
+  -- success (including the no-op cases); errors -5 if the block is unknown.
+  self.methods["preciousblock"] = function(rpc, params)
+    local blockhash = params[1]
+    if type(blockhash) ~= "string" or #blockhash ~= 64 then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
+    end
+    if not rpc.chain_state then
+      error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
+    end
+    if not rpc.storage then
+      error({code = M.ERROR.MISC_ERROR, message = "Storage not available"})
+    end
+
+    local hash = types.hash256_from_hex(blockhash)
+
+    -- Unknown block → RPC_INVALID_ADDRESS_OR_KEY (-5) "Block not found"
+    -- (bitcoin-core/src/rpc/blockchain.cpp:1700).
+    local header = rpc.storage.get_header(hash)
+    if not header then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+    end
+
+    -- Mark precious + re-activate best chain (Chainstate::PreciousBlock).
+    local result, err = rpc.chain_state:precious_block(hash, { mempool = rpc.mempool })
+    if not result then
+      -- Genuine ActivateBestChain failure.  Core throws RPC_DATABASE_ERROR;
+      -- lunarblock has no distinct -25 code in M.ERROR, so it surfaces via the
+      -- same MISC_ERROR idiom invalidateblock/reconsiderblock use.
+      error({code = M.ERROR.MISC_ERROR, message = err or "Failed to mark block as precious"})
+    end
+
+    if result == "connected" then
+      -- A reorg fired onto the precious block.  Re-anchor the block-downloader
+      -- cursors and refresh the mempool exactly as the submitblock post-reorg
+      -- path does, so the scheduler resumes from the new (precious) chain head.
+      if rpc.block_downloader and rpc.block_downloader.next_connect_height then
+        local new_h = rpc.chain_state.tip_height or 0
+        if new_h >= rpc.block_downloader.next_connect_height then
+          rpc.block_downloader.next_connect_height = new_h + 1
+          rpc.block_downloader.next_download_height = new_h + 1
+        end
+      end
+      if rpc.mempool then
+        local new_block = rpc.storage.get_block(hash)
+        if new_block then
+          rpc.mempool:on_block_connected(new_block)
+        end
+      end
+    end
+
+    -- Core returns null on success (including all the no-op cases).
+    return cjson.null
+  end
+
   -- Mempool methods
   self.methods["getmempoolinfo"] = function(rpc, _params)
     -- MempoolInfoToJSON (bitcoin-core/src/rpc/mempool.cpp:1043). Emit order +
