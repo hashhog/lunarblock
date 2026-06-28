@@ -11,3 +11,7 @@ lib/libsecp256k1*
 
 banned.dat
 anchors.dat
+
+# Project-meta audit artifacts live in the meta-repo (audit-archive/).
+audit/
+CORE-PARITY-AUDIT/
