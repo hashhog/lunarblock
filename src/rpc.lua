@@ -6402,9 +6402,9 @@ function RPCServer:register_methods()
     local blockhash = params and params[1]
     local peer_id = params and params[2]
 
-    if type(blockhash) ~= "string" or #blockhash ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
-    end
+    -- ParseHashV: a malformed blockhash (non-string / wrong-length / non-hex)
+    -- -> -8 RPC_INVALID_PARAMETER before lookup (was -32602 / raw -32603).
+    parse_hash_v(blockhash, "blockhash")
     if type(peer_id) ~= "number" then
       error({code = M.ERROR.INVALID_PARAMS, message = "peer_id must be a number"})
     end
@@ -13303,12 +13303,17 @@ function RPCServer:setup_w47b_methods()
 
     -- Find the block
     local block
-    if params[2] and type(params[2]) == "string" and #params[2] == 64 then
+    if params[2] ~= nil and type(params[2]) == "string" then
+      -- ParseHashV: a malformed blockhash -> -8 before lookup (was: a
+      -- wrong-length hash fell to the txindex else as -1, a 64-char non-hex
+      -- raised -32603).
+      parse_hash_v(params[2], "blockhash")
       local bh = types.hash256_from_hex(params[2])
       block = rpc.storage.get_block(bh)
       if not block then
-        error({code = M.ERROR.MISC_ERROR,
-               message = "Block not found: " .. params[2]})
+        -- Core gettxoutproof: an unknown block -> -5 RPC_INVALID_ADDRESS_OR_KEY
+        -- "Block not found" (was -1 RPC_MISC_ERROR).
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
       end
     else
       -- Require blockhash: lunarblock txindex stores file offsets, not block hashes
