@@ -3485,9 +3485,11 @@ function RPCServer:register_methods()
   -- Block invalidation methods
   self.methods["invalidateblock"] = function(rpc, params)
     local blockhash = params[1]
-    if type(blockhash) ~= "string" or #blockhash ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
-    end
+    -- ParseHashV parity (bitcoin-core/src/rpc/util.cpp:117): a malformed
+    -- blockhash (non-string / wrong-length / non-hex) is -8 RPC_INVALID_PARAMETER
+    -- at the parse boundary (was -32602 on wrong length / a raw -32603 on a
+    -- 64-char non-hex). A well-formed-but-absent hash stays -5 below.
+    parse_hash_v(blockhash, "blockhash")
     if not rpc.chain_state then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
     end
@@ -3514,9 +3516,11 @@ function RPCServer:register_methods()
 
   self.methods["reconsiderblock"] = function(rpc, params)
     local blockhash = params[1]
-    if type(blockhash) ~= "string" or #blockhash ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
-    end
+    -- ParseHashV parity (bitcoin-core/src/rpc/util.cpp:117): a malformed
+    -- blockhash (non-string / wrong-length / non-hex) is -8 RPC_INVALID_PARAMETER
+    -- at the parse boundary (was -32602 on wrong length / a raw -32603 on a
+    -- 64-char non-hex). A well-formed-but-absent hash stays -5 below.
+    parse_hash_v(blockhash, "blockhash")
     if not rpc.chain_state then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
     end
@@ -3550,9 +3554,11 @@ function RPCServer:register_methods()
   -- success (including the no-op cases); errors -5 if the block is unknown.
   self.methods["preciousblock"] = function(rpc, params)
     local blockhash = params[1]
-    if type(blockhash) ~= "string" or #blockhash ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
-    end
+    -- ParseHashV parity (bitcoin-core/src/rpc/util.cpp:117): a malformed
+    -- blockhash (non-string / wrong-length / non-hex) is -8 RPC_INVALID_PARAMETER
+    -- at the parse boundary (was -32602 on wrong length / a raw -32603 on a
+    -- 64-char non-hex). A well-formed-but-absent hash stays -5 below.
+    parse_hash_v(blockhash, "blockhash")
     if not rpc.chain_state then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
     end
@@ -6530,9 +6536,8 @@ function RPCServer:register_methods()
           message = "Block not found at height " .. height})
       end
     elseif type(hash_or_height) == "string" then
-      if #hash_or_height ~= 64 then
-        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid block hash"})
-      end
+      -- ParseHashV parity: malformed hash_or_height -> -8 at the parse boundary.
+      parse_hash_v(hash_or_height, "hash_or_height")
       block_hash = types.hash256_from_hex(hash_or_height)
     else
       error({code = M.ERROR.INVALID_PARAMS,
