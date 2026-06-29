@@ -3716,17 +3716,16 @@ function RPCServer:register_methods()
         result[txid_hex] = {
           vsize = entry.vsize,
           weight = entry.weight,
-          fee = fee_btc,
-          modifiedfee = modified_btc,
           time = entry.time,
           height = entry.height,
           descendantcount = entry.descendant_count or 1,
           descendantsize = entry.descendant_size or entry.vsize,
-          descendantfees = entry.descendant_fees or entry.fee,
           ancestorcount = entry.ancestor_count or 1,
           ancestorsize = entry.ancestor_size or entry.vsize,
-          ancestorfees = entry.ancestor_fees or entry.fee,
           wtxid = entry.wtxid or txid_hex,
+          -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
+          -- descendantfees/ancestorfees at the top level (removed to match
+          -- Bitcoin Core rpc/mempool.cpp entryToJSON).
           fees = {
             base = fee_btc,
             modified = modified_btc,
@@ -5183,6 +5182,26 @@ function RPCServer:register_methods()
     return oj_result(oj(seq))
   end
 
+  -- Classify a live peer's network from its address string.
+  -- Active peers carry only an IP/hostname string (p.ip) — no BIP155
+  -- network_id field.  Mirrors CNetAddr::GetNetClass() string-based
+  -- fallback used by _classify_network (defined later, for known_addresses
+  -- with an explicit network_id).
+  -- CJDNS: IPv6 fc00::/8 — first two hex chars are "fc" (RFC 4193 / CJDNS).
+  local function _peer_network_from_ip(ip)
+    if type(ip) ~= "string" then return "not_publicly_routable" end
+    if ip:match("%.onion$")                          then return "onion" end
+    if ip:match("%.b32%.i2p$") or ip:match("%.i2p$") then return "i2p"  end
+    if ip:match("^%d+%.%d+%.%d+%.%d+$")              then return "ipv4"  end
+    if ip:find(":", 1, true) then
+      -- Strip optional surrounding brackets (e.g. "[fc01::1]").
+      local bare = ip:gsub("^%[", ""):gsub("%]$", "")
+      if bare:lower():sub(1, 2) == "fc" then return "cjdns" end
+      return "ipv6"
+    end
+    return "not_publicly_routable"
+  end
+
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
     -- BUG-22 fix (W115 FIX-50): include mapped_as field per peer.
@@ -5219,7 +5238,7 @@ function RPCServer:register_methods()
         peers[#peers + 1] = {
           id = i - 1,
           addr = p.ip .. ":" .. p.port,
-          network = "ipv4",
+          network = _peer_network_from_ip(p.ip),
           services = string.format("%016x", svc),
           servicesnames = svc_names,
           relaytxes = (p.version_info and p.version_info.relay) or true,
@@ -6071,17 +6090,16 @@ function RPCServer:register_methods()
     return {
       vsize = entry.vsize,
       weight = entry.weight,
-      fee = fee_btc,
-      modifiedfee = modified_btc,
       time = entry.time,
       height = entry.height,
       descendantcount = entry.descendant_count or 1,
       descendantsize = entry.descendant_size or entry.vsize,
-      descendantfees = entry.descendant_fees or entry.fee,
       ancestorcount = entry.ancestor_count or 1,
       ancestorsize = entry.ancestor_size or entry.vsize,
-      ancestorfees = entry.ancestor_fees or entry.fee,
       wtxid = entry.wtxid or txid_hex,
+      -- Core shape: fees is a NESTED object; flat fee/modifiedfee/
+      -- descendantfees/ancestorfees are NOT top-level fields in Core's
+      -- entryToJSON (bitcoin-core/src/rpc/mempool.cpp:508-568).
       fees = {
         base = fee_btc,
         modified = modified_btc,

@@ -3424,7 +3424,8 @@ describe("rpc", function()
       assert.equal(cjson.null, resp.error)
       assert.is_number(resp.result.vsize)
       assert.is_number(resp.result.weight)
-      assert.is_number(resp.result.fee)
+      -- fees is now a nested object per Core entryToJSON (flat `fee` field removed).
+      assert.is_number(resp.result.fees.base)
     end)
 
     it("getmempoolentry rejects unknown txid", function()
