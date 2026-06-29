@@ -3937,22 +3937,21 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   --     should not have accepted A1+A2 if the active chain is malformed).
   --
   -- Pattern D (multi-block atomicity, 2026-05-05): cap lowered from
-  -- 1000 → 100.  The reorg now wraps the entire disconnect+connect
+  -- 1000 → 100 → 288.  The reorg now wraps the entire disconnect+connect
   -- sequence in ONE RocksDB WriteBatch (committed once at the end),
   -- and the in-memory dirty-UTXO set grows linearly with reorg depth
-  -- before commit.  100 is the audit-mandated ceiling
-  -- (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md)
-  -- and bounds peak memory while still spanning the deepest plausible
-  -- reorg.
-  local MAX_REORG_DEPTH = 100
+  -- before commit.  Implementation-specific memory-safety bound; Bitcoin
+  -- Core has NO reorg depth cap (follows the most-work chain, bounded
+  -- only by prune/undo retention).  288 = MIN_BLOCKS_TO_KEEP aligns
+  -- with Core's pruned-node undo-block retention window.
+  local MAX_REORG_DEPTH = 288
 
   -- Pre-build active-chain hash → height map for the most-recent
   -- MAX_REORG_DEPTH heights.  We use this to cheaply identify the common
   -- ancestor as we walk the side-branch backwards.  Going deeper than
   -- MAX_REORG_DEPTH is treated as a fatal "reorg too deep" error rather
-  -- than looping forever — Core also caps reorg depth in practice via
-  -- the headers-first work threshold but we use a fixed numeric guard
-  -- here for simplicity.
+  -- than looping forever (implementation guard; Core has no numeric cap —
+  -- see comment above).
   local active_hash_to_height = {}
   do
     local lo = math.max(0, self.tip_height - MAX_REORG_DEPTH)
