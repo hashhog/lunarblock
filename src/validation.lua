@@ -341,20 +341,54 @@ end
 -- @param accurate boolean: If true, use accurate counting for OP_CHECKMULTISIG
 -- @return number: The sigops count
 function M.count_script_sigops(script_bytes, accurate)
-  -- Gracefully handle unparseable scripts (e.g. coinbase scriptSig with arbitrary data)
-  local ok, ops = pcall(script.parse_script, script_bytes)
-  if not ok then return 0 end
+  -- Mirror Bitcoin Core CScript::GetSigOpCount (script/script.cpp:158-180):
+  -- walk the script opcode-by-opcode and, on a malformed/truncated push (where
+  -- Core's GetOp returns false), STOP and return the count accumulated SO FAR
+  -- -- NOT 0.  The previous `pcall(parse_script); if not ok then return 0`
+  -- undercounted any script that fails to fully parse (e.g. leading OP_CHECKSIGs
+  -- before a truncated push), which let an attacker craft a block whose true
+  -- (Core) sigop cost exceeds MAX_BLOCK_SIGOPS_COST pass this node's check
+  -- (false-accept -> chain split).  This counts the partial prefix exactly as
+  -- Core does.  Unparseable trailing bytes simply end the walk.
   local count = 0
   local prev_opcode = nil
+  local pos = 1
+  local len = #script_bytes
+  local OP = script.OP
 
-  for _, op in ipairs(ops) do
-    local opcode = op.opcode
+  while pos <= len do
+    local opcode = script_bytes:byte(pos)
+    pos = pos + 1
 
-    if opcode == script.OP.OP_CHECKSIG or opcode == script.OP.OP_CHECKSIGVERIFY then
+    -- Skip push data, mirroring GetOp: if the script is truncated mid-push
+    -- (not enough bytes for the length prefix or the data), GetOp would return
+    -- false, so we break and return what we have counted so far.
+    if opcode >= 0x01 and opcode <= 0x4b then          -- direct push of N bytes
+      pos = pos + opcode
+      if pos - 1 > len then break end
+    elseif opcode == 0x4c then                          -- OP_PUSHDATA1
+      if pos > len then break end
+      local data_len = script_bytes:byte(pos)
+      pos = pos + 1 + data_len
+      if pos - 1 > len then break end
+    elseif opcode == 0x4d then                          -- OP_PUSHDATA2
+      if pos + 1 > len then break end
+      local data_len = script_bytes:byte(pos) + script_bytes:byte(pos + 1) * 256
+      pos = pos + 2 + data_len
+      if pos - 1 > len then break end
+    elseif opcode == 0x4e then                          -- OP_PUSHDATA4
+      if pos + 3 > len then break end
+      local b1, b2, b3, b4 = script_bytes:byte(pos, pos + 3)
+      local data_len = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+      pos = pos + 4 + data_len
+      if pos - 1 > len then break end
+    end
+
+    if opcode == OP.OP_CHECKSIG or opcode == OP.OP_CHECKSIGVERIFY then
       count = count + 1
-    elseif opcode == script.OP.OP_CHECKMULTISIG or opcode == script.OP.OP_CHECKMULTISIGVERIFY then
-      if accurate and prev_opcode and prev_opcode >= script.OP.OP_1 and prev_opcode <= script.OP.OP_16 then
-        count = count + (prev_opcode - script.OP.OP_1 + 1)
+    elseif opcode == OP.OP_CHECKMULTISIG or opcode == OP.OP_CHECKMULTISIGVERIFY then
+      if accurate and prev_opcode and prev_opcode >= OP.OP_1 and prev_opcode <= OP.OP_16 then
+        count = count + (prev_opcode - OP.OP_1 + 1)
       else
         count = count + consensus.MAX_PUBKEYS_PER_MULTISIG
       end
