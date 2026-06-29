@@ -750,7 +750,7 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
     self.headers[hash_hex] = {
       header = header,
       height = current_height,
-      total_work = 0,  -- placeholder, filled in forward pass below
+      total_work = consensus.work_zero(),  -- placeholder, filled in forward pass below
     }
     self.height_to_hash[current_height] = hash_hex
     loaded = loaded + 1
@@ -795,21 +795,23 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
   -- assumeutxo cumulative chain_work (which already includes the base block's
   -- own work, matching inject_snapshot_base's total_work argument).  All
   -- blocks above the base then accumulate normally on top of the real seed.
-  local seed_cumulative_work = 0
+  local seed_cumulative_work = consensus.work_zero()
   local base_height = self.snapshot_base_height
   if base_height and base_height > 0 then
     local au_data = consensus.assumeutxo_for_height(self.network, base_height)
     if au_data and au_data.chain_work then
-      local base_chain_work = consensus.work_float_from_hex(au_data.chain_work)
+      -- Exact 256-bit parse — no float intermediates (B1 fix).
+      local base_chain_work = consensus.work_from_hex(au_data.chain_work)
       local base_hex = self.height_to_hash[base_height]
       local base_entry = base_hex and self.headers[base_hex]
       if base_entry and base_entry.header then
         -- Pre-subtract the base block's own work so that when the forward
         -- pass adds it back, base_entry.total_work == base_chain_work.
-        seed_cumulative_work = base_chain_work - self:work_for_bits(base_entry.header.bits)
+        seed_cumulative_work = consensus.work_sub(
+          base_chain_work, self:work_for_bits(base_entry.header.bits))
         io.stdout:write(string.format(
-          "  [snapshot-seed] base height=%d seeded with assumeutxo chain_work (=%.4e)\n",
-          base_height, base_chain_work))
+          "  [snapshot-seed] base height=%d seeded with assumeutxo chain_work (%s)\n",
+          base_height, consensus.work_to_hex(base_chain_work)))
         io.stdout:flush()
       end
     end
@@ -817,13 +819,14 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
 
   -- Forward pass: compute total_work incrementally from the chain start
   -- (genesis, or the snapshot base when bootstrapped) to tip.
+  -- All arithmetic is exact 256-bit (work_add on 32-byte strings).
   local cumulative_work = seed_cumulative_work
   for h = 0, tip_height do
     local hash_hex = self.height_to_hash[h]
     if hash_hex then
       local entry = self.headers[hash_hex]
       if entry and entry.header then
-        cumulative_work = cumulative_work + self:work_for_bits(entry.header.bits)
+        cumulative_work = consensus.work_add(cumulative_work, self:work_for_bits(entry.header.bits))
         entry.total_work = cumulative_work
       end
     end
@@ -834,28 +837,25 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
 end
 
 --- Calculate total work from genesis to a given height.
--- This is called during load_from_storage.
+-- This is called during load_from_storage and add_mined_tip.
 -- @param height number: target height
--- @return number: total accumulated work
+-- @return string: 32-byte big-endian accumulated work
 function HeaderChain:calculate_total_work_from_storage(height)
-  -- For efficiency during loading, we calculate work incrementally
-  -- This simplified version returns a placeholder; real impl would walk chain
-  -- In practice, during load we compute this as we go
-  local total = 0
+  local total = consensus.work_zero()
   for h = 0, height do
     local hash_hex = self.height_to_hash[h]
     if hash_hex then
       local entry = self.headers[hash_hex]
       if entry and entry.header then
-        total = total + self:work_for_bits(entry.header.bits)
+        total = consensus.work_add(total, self:work_for_bits(entry.header.bits))
       end
     else
-      -- Not yet loaded; we'll compute during load
+      -- Not yet loaded into memory; fall back to storage.
       local block_hash = self.storage.get_hash_by_height(h)
       if block_hash then
         local header = self.storage.get_header(block_hash)
         if header then
-          total = total + self:work_for_bits(header.bits)
+          total = consensus.work_add(total, self:work_for_bits(header.bits))
         end
       end
     end
@@ -950,9 +950,10 @@ end
 --
 -- Injecting a connectable base block-index fixes all three:
 --   * LAYER 1: total_work is seeded with the base's REAL cumulative chainwork
---     (passed in as a float from the assumeutxo entry's chain_work), which is
---     by construction above min_chain_work — so header batches built on the
---     base clear the gate (Core: a snapshot node is past nMinimumChainWork).
+--     (passed in as a 32-byte big-endian string from the assumeutxo entry's
+--     chain_work), which is by construction above min_chain_work — so header
+--     batches built on the base clear the gate (Core: a snapshot node is past
+--     nMinimumChainWork).
 --   * LAYER 2: the base header is written to storage (put_header) and to the
 --     in-memory headers/height_to_hash maps, and becomes header_tip — so the
 --     download loop requests base+1 immediately and connect_block resolves the
@@ -969,7 +970,7 @@ end
 -- @param base_height number: snapshot base height
 -- @param base_hash hash256: snapshot base block hash
 -- @param header table: base block header (types.block_header)
--- @param total_work number: base cumulative chainwork as a float
+-- @param total_work string: base cumulative chainwork as a 32-byte big-endian string
 -- @return boolean, string|nil: true if injected, false + reason otherwise
 function HeaderChain:inject_snapshot_base(base_height, base_hash, header, total_work)
   local hash_hex = types.hash256_hex(base_hash)
@@ -1049,27 +1050,9 @@ end
 -- @param bits number: compact difficulty representation
 -- @return number: work value
 function HeaderChain:work_for_bits(bits)
-  local target = consensus.bits_to_target(bits)
-
-  -- Convert target to a number (use first 8 significant bytes)
-  local target_num = 0
-  for i = 1, 32 do
-    if target:byte(i) ~= 0 then
-      for j = i, math.min(i + 7, 32) do
-        target_num = target_num * 256 + target:byte(j)
-      end
-      target_num = target_num * (256 ^ (32 - math.min(i + 7, 32)))
-      break
-    end
-  end
-
-  if target_num == 0 then
-    return math.huge
-  end
-
-  -- Work = 2^256 / (target + 1)
-  -- We use 2^256 ≈ 1.157920892373162e+77
-  return 1.157920892373162e+77 / (target_num + 1)
+  -- Delegate to the exact 256-bit implementation in consensus.lua.
+  -- Returns a 32-byte big-endian string; never a Lua double.
+  return consensus.get_block_work(bits)
 end
 
 --------------------------------------------------------------------------------
@@ -1309,25 +1292,14 @@ function HeaderChain:accept_header(header, opts)
   --    This is the anti-DoS guard that prevents a peer from spamming
   --    low-difficulty headers that connect on top of our current tip but
   --    represent a chain with less work than the mainnet minimum.
-  local candidate_work = parent.total_work + self:work_for_bits(header.bits)
+  -- Exact 256-bit accumulation (B1 fix): work_for_bits returns 32-byte string.
+  local candidate_work = consensus.work_add(parent.total_work, self:work_for_bits(header.bits))
   local _opts = opts or {}
   if not _opts.min_pow_checked then
     local min_work_hex = self.network.min_chain_work or string.rep("00", 64)
     local min_work = consensus.work_from_hex(min_work_hex)
-    -- Reuse get_chain_work() conversion: build a 32-byte big-endian
-    -- representation of candidate_work (float) for comparison.
-    local cw_bytes = {}
-    for i = 1, 32 do cw_bytes[i] = 0 end
-    local remaining = candidate_work
-    for i = 32, 1, -1 do
-      if remaining <= 0 then break end
-      cw_bytes[i] = math.floor(remaining % 256)
-      remaining = math.floor(remaining / 256)
-    end
-    local cw_str_parts = {}
-    for i = 1, 32 do cw_str_parts[i] = string.char(cw_bytes[i]) end
-    local candidate_work_bytes = table.concat(cw_str_parts)
-    if consensus.work_compare(candidate_work_bytes, min_work) < 0 then
+    -- candidate_work is already a 32-byte string; compare directly (no float conversion).
+    if consensus.work_compare(candidate_work, min_work) < 0 then
       return false, "too-little-chainwork"
     end
   end
@@ -1345,8 +1317,8 @@ function HeaderChain:accept_header(header, opts)
   self.storage.put_header(hash, header)
   self.storage.put_height_index(height, hash)
 
-  -- Update tip if this chain has more total work
-  local current_tip_work = 0
+  -- Update tip if this chain has more total work (exact 256-bit comparison, B1 fix).
+  local current_tip_work = consensus.work_zero()
   if self.header_tip_hash then
     local tip_entry = self.headers[types.hash256_hex(self.header_tip_hash)]
     if tip_entry then
@@ -1354,7 +1326,7 @@ function HeaderChain:accept_header(header, opts)
     end
   end
 
-  if work > current_tip_work then
+  if consensus.work_compare(work, current_tip_work) > 0 then
     self.header_tip_hash = hash
     self.header_tip_height = height
   end
@@ -1411,9 +1383,9 @@ function HeaderChain:add_mined_tip(header, height)
     -- same helper load_from_storage uses to rebuild work on boot.
     parent_work = self:calculate_total_work_from_storage(height - 1)
   else
-    parent_work = 0
+    parent_work = consensus.work_zero()
   end
-  local work = parent_work + self:work_for_bits(header.bits)
+  local work = consensus.work_add(parent_work, self:work_for_bits(header.bits))
 
   self.headers[hash_hex] = {
     header = header,
@@ -1425,14 +1397,14 @@ function HeaderChain:add_mined_tip(header, height)
   -- Header + height-index are already persisted by the mining/submitblock
   -- atomic batch; do not double-write here.
 
-  local current_tip_work = 0
+  local current_tip_work = consensus.work_zero()
   if self.header_tip_hash then
     local tip_entry = self.headers[types.hash256_hex(self.header_tip_hash)]
     if tip_entry then
       current_tip_work = tip_entry.total_work
     end
   end
-  if work > current_tip_work then
+  if consensus.work_compare(work, current_tip_work) > 0 then
     self.header_tip_hash = hash
     self.header_tip_height = height
   end
@@ -1637,27 +1609,14 @@ function HeaderChain:is_low_work_chain(total_work)
 end
 
 --- Get the current chain work as a 32-byte big-endian value.
+-- After the B1 fix, total_work IS already a 32-byte string — no conversion needed.
 -- @return string: 32-byte cumulative work
 function HeaderChain:get_chain_work()
   if self.header_tip_hash then
     local tip_hex = types.hash256_hex(self.header_tip_hash)
     local entry = self.headers[tip_hex]
-    if entry then
-      -- Convert floating-point work to approximate 32-byte value
-      -- This is a simplification; for full precision we'd track work as bytes
-      local work_float = entry.total_work
-      local result = {}
-      for i = 1, 32 do result[i] = 0 end
-      -- Approximate conversion (sufficient for comparison with min_chain_work)
-      local remaining = work_float
-      for i = 32, 1, -1 do
-        if remaining <= 0 then break end
-        result[i] = math.floor(remaining % 256)
-        remaining = math.floor(remaining / 256)
-      end
-      local out = {}
-      for i = 1, 32 do out[i] = string.char(result[i]) end
-      return table.concat(out)
+    if entry and entry.total_work then
+      return entry.total_work
     end
   end
   return consensus.work_zero()
@@ -1698,55 +1657,36 @@ function HeaderChain:try_low_work_sync(peer, headers)
     return false  -- Already syncing with this peer
   end
 
-  -- Calculate claimed total work AT THIS BATCH'S TIP using the same
-  -- floating-point work_for_bits that accept_header uses.
+  -- Calculate claimed total work AT THIS BATCH'S TIP.
   --
-  -- Bug-fix: previously the work was computed via consensus.get_block_work
-  -- (32-byte big-endian) and compared against consensus.work_from_hex(
-  -- self.network.min_chain_work).  consensus.get_block_work has a latent
-  -- byte-placement bug that inflates the per-block contribution by many
-  -- orders of magnitude; the byte-compare then incorrectly reported the
-  -- candidate chain as having ENOUGH work, so try_low_work_sync returned
-  -- false ("Chain has sufficient work, use normal sync") and the caller
-  -- fell through to ban the peer for "too-little-chainwork".
+  -- B1 fix: work_for_bits now returns a 32-byte big-endian string (exact
+  -- 256-bit integer arithmetic) and accumulation uses consensus.work_add.
+  -- The 2026-05-28 mainnet stall was caused by an earlier get_block_work
+  -- byte-placement bug; that bug is now fixed and both this gate and
+  -- accept_header step 8 use the same exact-arithmetic path, guaranteeing
+  -- they agree without any float-to-bytes conversion.
   --
-  -- That was the 2026-05-28 mainnet stall: every honest peer banned on
-  -- its first headers batch, because try_low_work_sync claimed the
-  -- 2000-header batch from genesis was already above min_chain_work.
-  -- See src/consensus.lua:1342 (get_block_work).
-  --
-  -- Using the float path keeps this gate consistent with accept_header
-  -- step 8 (sync.lua:1083) — they MUST agree, otherwise accept_header
-  -- rejects on a chain that try_low_work_sync claims is fine.
-  local tip_total_work
+  -- After the B1 fix, both this gate and accept_header step 8 use exact 256-bit
+  -- arithmetic (work_add on 32-byte strings + work_compare), so they always agree.
+  -- The old comment about needing "the float path for consistency" is obsolete.
+  local tip_total_work = consensus.work_zero()
   if self.header_tip_hash then
     local tip_hex = types.hash256_hex(self.header_tip_hash)
     local tip_entry = self.headers[tip_hex]
-    if tip_entry then
-      tip_total_work = tip_entry.total_work or 0
-    else
-      tip_total_work = 0
+    if tip_entry and tip_entry.total_work then
+      tip_total_work = tip_entry.total_work
     end
-  else
-    tip_total_work = 0
   end
 
-  local claimed_work_float = tip_total_work
+  local claimed_work = tip_total_work
   for _, header in ipairs(headers) do
-    claimed_work_float = claimed_work_float + self:work_for_bits(header.bits)
+    claimed_work = consensus.work_add(claimed_work, self:work_for_bits(header.bits))
   end
 
-  -- Convert min_chain_work hex → float (same byte→float conversion the
-  -- accept_header gate's candidate_work_bytes → comparison effectively
-  -- inverts).  min_chain_work is the cumulative work threshold per
-  -- chainparams; for mainnet ~2^91 today.
-  local min_work_hex = self.network.min_chain_work or string.rep("00", 64)
-  local min_work_float = 0
-  for i = 1, 32 do
-    min_work_float = min_work_float * 256 + tonumber(min_work_hex:sub(2*i-1, 2*i), 16)
-  end
+  local min_work = consensus.work_from_hex(
+    self.network.min_chain_work or string.rep("00", 64))
 
-  if claimed_work_float >= min_work_float then
+  if consensus.work_compare(claimed_work, min_work) >= 0 then
     -- Chain has sufficient work, use normal sync
     return false
   end
