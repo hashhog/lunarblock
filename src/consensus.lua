@@ -1288,6 +1288,49 @@ M.networks.regtest = {
   assumeutxo = {}
 }
 
+--------------------------------------------------------------------------------
+-- Script-flag exception table (Bitcoin Core script_flag_exceptions parity).
+--
+-- Bitcoin Core's GetBlockScriptFlags (validation.cpp:2263-2266) checks this
+-- table first: if the block hash matches, the override FLAGS table completely
+-- REPLACES the default P2SH|WITNESS|TAPROOT base before any by-height soft-fork
+-- additions.  Two historical blocks on mainnet and one on testnet3 violated P2SH
+-- or Taproot rules and required this treatment.
+--
+-- Keyed: network name → display-hex block hash (big-endian, matching
+-- types.hash256_hex / Core uint256.ToString) → override flags table.
+-- Empty table {} = SCRIPT_VERIFY_NONE (BIP16 violators: no flags at all).
+-- {verify_p2sh=true, verify_witness=true} = Core P2SH|WITNESS (taproot violator).
+--
+-- testnet4 and regtest have empty exception tables (no historical violators).
+--
+-- Reference: bitcoin-core/src/kernel/chainparams.cpp:85-88 (mainnet),
+--            bitcoin-core/src/kernel/chainparams.cpp:210-211 (testnet3),
+--            bitcoin-core/src/validation.cpp:2262-2266 (GetBlockScriptFlags).
+--------------------------------------------------------------------------------
+M.SCRIPT_FLAG_EXCEPTIONS = {
+  mainnet = {
+    -- BIP16 violator: block that failed P2SH validation.
+    -- Core: consensusparams.script_flag_exceptions[hash] = SCRIPT_VERIFY_NONE.
+    -- Source: bitcoin-core/src/kernel/chainparams.cpp:85-86.
+    ["00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"] = {},
+    -- Taproot violator: block that failed Taproot validation.
+    -- Core: consensusparams.script_flag_exceptions[hash] = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS.
+    -- Source: bitcoin-core/src/kernel/chainparams.cpp:87-88.
+    ["0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"] = {
+      verify_p2sh = true, verify_witness = true,
+    },
+  },
+  testnet = {
+    -- BIP16 violator on testnet3.
+    -- Core: consensusparams.script_flag_exceptions[hash] = SCRIPT_VERIFY_NONE.
+    -- Source: bitcoin-core/src/kernel/chainparams.cpp:210-211.
+    ["00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"] = {},
+  },
+  testnet4 = {},
+  regtest  = {},
+}
+
 -- Convenience function to get network by name
 function M.get_network(name)
   return M.networks[name]
