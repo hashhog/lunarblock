@@ -1470,82 +1470,112 @@ function M.work_add(a, b)
   return table.concat(out)
 end
 
+--- Subtract two 256-bit work values (big-endian).  Returns zero if a <= b.
+-- Used by load_from_storage to back out the base block's own work from the
+-- assumeutxo seed so the forward pass re-adds it at the correct position.
+-- @param a string: 32-byte work value (minuend)
+-- @param b string: 32-byte work value (subtrahend)
+-- @return string: 32-byte result (a - b), or zero if a < b
+function M.work_sub(a, b)
+  if M.work_compare(a, b) <= 0 then
+    return string.rep("\x00", 32)
+  end
+  local r = {a:byte(1, 32)}
+  local borrow = 0
+  for i = 32, 1, -1 do
+    local d = r[i] - b:byte(i) - borrow
+    if d < 0 then d = d + 256; borrow = 1 else borrow = 0 end
+    r[i] = d
+  end
+  local out = {}
+  for i = 1, 32 do out[i] = string.char(r[i]) end
+  return table.concat(out)
+end
+
 --- Calculate proof-of-work for a given difficulty target.
--- Work = floor(2^256 / (target + 1))
--- Returns 32-byte big-endian work value.
--- Uses floating-point approximation (sufficient for chain comparison).
+-- Work = floor(2^256 / (target + 1)) = (~target / (target + 1)) + 1
+-- Exact 256-bit integer arithmetic — mirrors Bitcoin Core chain.cpp GetBitsProof:
+--   return (~bnTarget / (bnTarget + 1)) + 1;
+-- No floating-point intermediates; safe for near-equal-work chain comparison.
 -- @param bits number: compact difficulty representation
 -- @return string: 32-byte big-endian work value
 function M.get_block_work(bits)
   local target = M.bits_to_target(bits)
 
-  -- Find the first non-zero byte (big-endian)
-  local first_nonzero = 0
+  -- Check for zero target (maximum work)
+  local is_zero = true
   for i = 1, 32 do
-    if target:byte(i) ~= 0 then
-      first_nonzero = i
-      break
-    end
+    if target:byte(i) ~= 0 then is_zero = false; break end
   end
-
-  if first_nonzero == 0 then
-    -- Zero target = maximum work
+  if is_zero then
     return string.rep("\xff", 32)
   end
 
-  -- Extract target value as floating-point (use up to 8 significant bytes)
-  local target_val = 0
-  local sig_bytes = math.min(8, 33 - first_nonzero)
-  for i = first_nonzero, first_nonzero + sig_bytes - 1 do
-    target_val = target_val * 256 + target:byte(i)
+  -- not_target = ~target: flip every bit
+  local not_t = {}
+  for i = 1, 32 do not_t[i] = 255 - target:byte(i) end
+
+  -- target_plus1 = target + 1 (256-bit big-endian)
+  local tp1 = {target:byte(1, 32)}
+  local carry = 1
+  for i = 32, 1, -1 do
+    local s = tp1[i] + carry
+    tp1[i] = s % 256
+    carry = (s >= 256) and 1 or 0
+    if carry == 0 then break end
+  end
+  -- (carry overflow = 2^256; not_t / 2^256 = 0, handled by zero check above)
+
+  -- Binary long division: quotient = floor(not_target / target_plus1)
+  -- Classic shift-subtract algorithm, O(256) iterations.
+  local Q = {}; for i = 1, 32 do Q[i] = 0 end   -- quotient bytes
+  local R = {}; for i = 1, 32 do R[i] = 0 end   -- remainder bytes
+
+  local bit_vals = {128, 64, 32, 16, 8, 4, 2, 1}  -- 2^7 .. 2^0
+
+  for byte_pos = 1, 32 do
+    local n_byte = not_t[byte_pos]
+    for bit_idx = 1, 8 do
+      -- R = R << 1 (left-shift remainder by 1 bit, big-endian)
+      local lc = 0
+      for i = 32, 1, -1 do
+        local v = R[i] * 2 + lc
+        R[i] = v % 256
+        lc = (v >= 256) and 1 or 0
+      end
+      -- Feed the current MSB of not_t into LSB of R
+      local n_bit = (math.floor(n_byte / bit_vals[bit_idx])) % 2
+      R[32] = R[32] + n_bit
+
+      -- Compare R >= tp1 (lexicographic from MSB)
+      local ge = false
+      for i = 1, 32 do
+        if R[i] > tp1[i] then ge = true; break end
+        if R[i] < tp1[i] then break end
+        if i == 32 then ge = true end  -- all equal → R == tp1
+      end
+
+      if ge then
+        -- R = R - tp1
+        local borrow = 0
+        for i = 32, 1, -1 do
+          local d = R[i] - tp1[i] - borrow
+          if d < 0 then d = d + 256; borrow = 1 else borrow = 0 end
+          R[i] = d
+        end
+        -- Set corresponding quotient bit
+        Q[byte_pos] = Q[byte_pos] + bit_vals[bit_idx]
+      end
+    end
   end
 
-  -- target_val represents target >> (8 * remaining_zero_bytes)
-  -- where remaining_zero_bytes = 32 - first_nonzero - sig_bytes + 1
-  local remaining = 32 - first_nonzero - sig_bytes + 1
+  -- Build quotient string
+  local q_parts = {}
+  for i = 1, 32 do q_parts[i] = string.char(Q[i]) end
+  local q_str = table.concat(q_parts)
 
-  -- Work = 2^256 / (target + 1)
-  -- = 2^256 / ((target_val * 2^(8*remaining)) + 1)
-  -- ≈ 2^(256 - 8*remaining) / target_val   (for large targets)
-  -- = 2^(8*(32 - remaining)) / target_val
-  -- = 2^(8*(first_nonzero + sig_bytes - 1)) / target_val
-
-  local work_bits = 8 * (first_nonzero + sig_bytes - 1)
-  local work_float = math.pow(2, work_bits) / (target_val + 1)
-
-  -- Work result goes into the big-endian position that is "inverse" of target
-  -- If target is small (starts late), work is large (starts early)
-  -- work_position = 32 - first_nonzero + 1 = 33 - first_nonzero
-  local work_start = 33 - first_nonzero - sig_bytes + 1
-  if work_start < 1 then work_start = 1 end
-
-  -- Build result array (big-endian)
-  local result = {}
-  for i = 1, 32 do result[i] = 0 end
-
-  -- Fill in work bytes from work_start position
-  local remaining_work = work_float
-  local pos = work_start
-  while remaining_work >= 1 and pos <= 32 do
-    local byte_val = math.floor(remaining_work) % 256
-    result[pos] = byte_val
-    remaining_work = math.floor(remaining_work / 256)
-    pos = pos + 1
-  end
-
-  -- Handle any overflow into earlier positions
-  while remaining_work >= 1 and work_start > 1 do
-    work_start = work_start - 1
-    result[work_start] = math.floor(remaining_work) % 256
-    remaining_work = math.floor(remaining_work / 256)
-  end
-
-  -- Convert to string
-  local out = {}
-  for i = 1, 32 do
-    out[i] = string.char(result[i])
-  end
-  return table.concat(out)
+  -- Result = quotient + 1
+  return M.work_add(q_str, string.rep("\x00", 31) .. "\x01")
 end
 
 --- Get the zero work value.
