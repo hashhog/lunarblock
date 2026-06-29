@@ -2922,6 +2922,23 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             -- the mempool/relay path only (see mempool.lua), not here.
           }
 
+          -- Script-flag exception override (GetBlockScriptFlags exception table parity).
+          -- Two historical mainnet blocks violated P2SH rules, and one violated Taproot
+          -- rules; one testnet3 block also violated P2SH rules.  For those specific
+          -- blocks Bitcoin Core returns a hardcoded override instead of the normal
+          -- P2SH|WITNESS|TAPROOT base.  We REPLACE the flags table with the override
+          -- (not OR) matching Core's validation.cpp:2263-2266 behavior.
+          -- Block hash is compared in display (big-endian) hex, mirroring the BIP-30
+          -- exemption pattern at utxo.lua:78 and types.lua:25-31.
+          -- Reference: bitcoin-core/src/validation.cpp:2262-2266 (GetBlockScriptFlags).
+          local _sfe = consensus.SCRIPT_FLAG_EXCEPTIONS[self.network.name]
+          if _sfe then
+            local _override = _sfe[types.hash256_hex(block_hash)]
+            if _override then
+              flags = _override
+            end
+          end
+
           -- W160 BUG-9 fix: cache key must include ALL consensus script-verify
           -- flag bits, not a coarse height-bitmask. Core's SignatureCacheHasher
           -- (sigcache.cpp:39-50) mixes in the FULL `flags` integer. Collapsing
