@@ -2200,7 +2200,7 @@ end
 -- orchestrator anyway, so there is no point fetching its bridging bodies. The
 -- walk is depth-capped here so a malicious/malformed deep fork can never make
 -- the scheduler enqueue an unbounded set.
-BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH = 100
+BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH = 288
 
 --- GAP2 fix — fork-aware download floor (Core FindNextBlocksToDownload,
 --- net_processing.cpp; ports the blockbrew/nimrod/hotbuns reorg-drop part 1).
