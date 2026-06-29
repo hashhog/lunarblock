@@ -984,8 +984,8 @@ M.networks.mainnet = {
 
   -- Minimum chain work required to accept a chain (anti-DoS)
   -- This is a hex string representation of the 256-bit value
-  -- Updated periodically; this value corresponds to Bitcoin Core v27
-  min_chain_work = "000000000000000000000000000000000000000088430067bc7f9c1f8cc40b55",
+  -- Updated periodically; this value corresponds to Bitcoin Core v28 (kernel/chainparams.cpp:109)
+  min_chain_work = "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
 
   -- Assumevalid block hash (skip script validation for ancestors)
   -- Height 938343, from Bitcoin Core v28
@@ -1128,11 +1128,11 @@ M.networks.testnet = {
     redownload_buffer_size = 14460,  -- 14460/673 = ~21.5 commitments
   },
 
-  -- Minimum chain work (low for testnet)
-  min_chain_work = "0000000000000000000000000000000000000000000000000000000100010001",
+  -- Minimum chain work (testnet3, Bitcoin Core kernel/chainparams.cpp:232)
+  min_chain_work = "0000000000000000000000000000000000000000000017dde1c649f3708d14b6",
 
-  -- Assumevalid (disabled for testnet3 as it's deprecated)
-  assumevalid = nil,
+  -- Assumevalid — block 4842348 (Bitcoin Core kernel/chainparams.cpp:233)
+  assumevalid = "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4",
 
   -- BIP9 versionbits parameters
   versionbits_period = 2016,
@@ -1200,8 +1200,8 @@ M.networks.testnet4 = {
     redownload_buffer_size = 16092,  -- 16092/606 = ~26.6 commitments
   },
 
-  -- Minimum chain work (testnet4)
-  min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
+  -- Minimum chain work (testnet4, Bitcoin Core kernel/chainparams.cpp:332)
+  min_chain_work = "0000000000000000000000000000000000000000000009a0fe15d0177d086304",
 
   -- Assumevalid — block 123613
   assumevalid = "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
