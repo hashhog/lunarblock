@@ -1042,7 +1042,8 @@ local function main()
           .. "NOT injecting base block-index (header chain will sync from genesis)\n",
           au_height, computed_hex, tip_hex))
       else
-        local base_work = consensus_mod.work_float_from_hex(au_data.chain_work)
+        -- Exact 256-bit parse (B1 fix): inject_snapshot_base now takes a 32-byte string.
+        local base_work = consensus_mod.work_from_hex(au_data.chain_work)
         local injected, why = header_chain:inject_snapshot_base(
           au_height, chain_state.tip_hash, base_header, base_work)
         if injected then
