@@ -1059,6 +1059,37 @@ end
 -- Header Processing
 --------------------------------------------------------------------------------
 
+--- Walk the in-memory header chain backwards from start_entry to find the
+--- entry at target_height.  Mirrors CBlockIndex::GetAncestor (bitcoin-core
+--- chain.cpp): follows pprev (header.prev_hash) links on the block's OWN
+--- ancestry rather than looking up the active-chain height index.
+---
+--- This is the correct lookup for get_next_work_required: the period's first
+--- block, the BIP94 base, and the min-diff walk-back must be resolved along
+--- the validated block's OWN lineage, not via height_to_hash which always
+--- reflects the last-accepted header at that height (which may be a competing
+--- fork's block — the exact anti-pattern the wave-2 MTP fix resolved for
+--- get_past_timestamps / collect_timestamps in beamchain / nimrod / camlcoin).
+---
+--- Bitcoin Core reference: pow.cpp:44 — pindexLast->GetAncestor(nHeightFirst)
+--- pow.cpp:72 — pindexLast->GetAncestor(nHeightFirst) for BIP94 base
+--- pow.cpp:33-34 — pindex->pprev walk for min-diff walk-back
+---
+--- @param headers table: the HeaderChain.headers map (hash_hex -> entry)
+--- @param start_entry table|nil: entry to start walking from
+--- @param target_height number: desired ancestor height
+--- @return table|nil: the entry at target_height, or nil if not found
+local function get_ancestor_entry(headers, start_entry, target_height)
+  local entry = start_entry
+  while entry do
+    if entry.height == target_height then return entry end
+    if entry.height < target_height then return nil end
+    local prev_hex = types.hash256_hex(entry.header.prev_hash)
+    entry = headers[prev_hex]
+  end
+  return nil
+end
+
 --- Process a batch of headers received from a peer.
 -- @param headers table: list of block_header objects
 -- @param peer table: peer that sent the headers (optional, for banning)
@@ -1202,14 +1233,19 @@ function HeaderChain:accept_header(header, opts)
   end
 
   if not skip_diffbits then
+    -- Ancestor lookup walks the VALIDATED BLOCK'S OWN ancestry via prev_hash
+    -- links (parent -> parent.parent -> ...), matching Core's pindexLast->
+    -- GetAncestor(nHeightFirst) in pow.cpp:44,72.  The old closure used
+    -- chain.height_to_hash[h] which points at the last-accepted header at
+    -- height h — a competing fork's block when two chains have headers at the
+    -- same height — causing wrong expected bits on fork headers (both false-
+    -- reject and false-accept directions depending on which chain is active).
     local expected_bits = consensus.get_next_work_required(
       height,
       header.timestamp,
       self.network,
       function(h)
-        local hex = chain.height_to_hash[h]
-        if hex then return chain.headers[hex] end
-        return nil
+        return get_ancestor_entry(chain.headers, parent, h)
       end
     )
     if header.bits ~= expected_bits then
@@ -1421,14 +1457,16 @@ end
 -- @return number: expected compact bits value
 function HeaderChain:calculate_next_work_required(height, header)
   local chain = self
+  -- Resolve the parent via header.prev_hash so the ancestor walk starts from
+  -- the validated block's own lineage (Core: pindexLast = block's parent).
+  local prev_hex = types.hash256_hex(header.prev_hash)
+  local parent_entry = chain.headers[prev_hex]
   return consensus.get_next_work_required(
     height,
     header.timestamp,
     self.network,
     function(h)
-      local hex = chain.height_to_hash[h]
-      if hex then return chain.headers[hex] end
-      return nil
+      return get_ancestor_entry(chain.headers, parent_entry, h)
     end
   )
 end

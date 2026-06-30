@@ -443,6 +443,113 @@ describe("header sync", function()
       local ok, err = tw_chain:accept_header(tw_header)
       assert.is_true(ok, "boundary (equal) should pass, got: " .. tostring(err))
     end)
+
+    -- W3 (wave-3): difficulty ancestor must walk the validated block's OWN
+    -- prev_hash chain, not height_to_hash (active-chain height index).
+    --
+    -- Bug: both call sites in accept_header and calculate_next_work_required
+    -- resolved get_ancestor(h) via chain.height_to_hash[h], which always
+    -- reflects the last-accepted header at h regardless of which fork the
+    -- validated block is on.  When two forks share a height, height_to_hash[h]
+    -- can point at the OTHER fork's block, yielding wrong expected bits.
+    --
+    -- Fix: get_ancestor_entry() walks backwards via header.prev_hash links from
+    -- the validated block's parent, mirroring Core pow.cpp:44,72
+    -- (pindexLast->GetAncestor(nHeightFirst)).
+    --
+    -- Scenario (min-difficulty walk-back):
+    --   Network: pow_allow_min_difficulty=true, pow_no_retarget=false
+    --   Base timestamp T = regtest genesis timestamp
+    --   BITS_HARD = 0x1e00ffff  (harder than pow_limit_bits=0x207fffff)
+    --   Block A (h=1, injected, BITS_HARD, timestamp=T+10)
+    --   Block B (h=1, injected, BITS_HARD, timestamp=T+1190)
+    --   → height_to_hash[1] = B_hash  (B was injected last)
+    --   Block C (h=2, extending A, bits=pow_limit_bits, timestamp=T+1260)
+    --     C_time - A_time = 1250 > 1200 → 20-min rule fires → expected=pow_limit_bits
+    --     C_time - B_time =   70 < 1200 → no 20-min rule  → expected=BITS_HARD (wrong)
+    --   Pre-fix: bad-diffbits (height_to_hash[1]=B → expected=BITS_HARD ≠ C.bits)
+    --   Post-fix: ACCEPT (walked from A → expected=pow_limit_bits = C.bits)
+    it("EFFECTIVE W3: diffbits uses block's own ancestry, not height_to_hash (fork false-reject)", function()
+      local T = consensus.networks.regtest.genesis.timestamp
+      local BITS_HARD   = 0x1e00ffff   -- harder than min, used for injected A and B
+      local BITS_MIN    = 0x207fffff   -- pow_limit_bits
+
+      -- Custom testnet-like network (min-diff enabled, retarget active, easy PoW).
+      local md_net = {
+        name = "mdtest",
+        magic_bytes = consensus.networks.regtest.magic_bytes,
+        port = 18444, rpc_port = 18443,
+        pubkey_address_prefix = 0x6F, script_address_prefix = 0xC4,
+        wif_prefix = 0xEF, bech32_hrp = "bcrt",
+        genesis = consensus.networks.regtest.genesis,
+        genesis_hash = consensus.networks.regtest.genesis_hash,
+        checkpoints = { [0] = consensus.networks.regtest.genesis_hash },
+        bip34_height = 999999, bip65_height = 999999, bip66_height = 999999,
+        csv_height = 999999, segwit_height = 999999, taproot_height = 999999,
+        pow_limit_bits = BITS_MIN,
+        pow_no_retarget   = false,      -- retarget logic active (so min-diff walk fires)
+        pow_allow_min_difficulty = true, -- testnet-like 20-min special rule
+        enforce_bip94 = false,
+        min_chain_work = "0000000000000000000000000000000000000000000000000000000000000000",
+        assumevalid = nil, versionbits_period = 2016, versionbits_threshold = 1512,
+        dns_seeds = {}, assumeutxo = {},
+        headerssync_params = { commitment_period = 275, redownload_buffer_size = 7017 },
+      }
+
+      local md_storage = helpers.mock_storage()
+      local md_chain = sync.new_header_chain(md_net, md_storage)
+      md_chain:init()
+
+      -- Retrieve the actual genesis hash from the in-memory chain.
+      local genesis_hash_hex = md_chain.height_to_hash[0]
+      local genesis_entry    = md_chain.headers[genesis_hash_hex]
+      local genesis_hash_obj = validation.compute_block_hash(genesis_entry.header)
+
+      -- Inject block A (h=1, BITS_HARD, timestamp=T+10, parent=genesis).
+      -- A is injected directly so the diffbits check does not run for A.
+      local A_header = types.block_header(4, genesis_hash_obj,
+        types.hash256_zero(), T + 10, BITS_HARD, 0)
+      local A_hash   = validation.compute_block_hash(A_header)
+      local A_hex    = types.hash256_hex(A_hash)
+      md_chain.headers[A_hex] = {
+        header     = A_header,
+        height     = 1,
+        total_work = consensus.work_zero(),
+      }
+      -- Do NOT update height_to_hash for A — we want B to be the "active" h=1.
+
+      -- Inject block B (h=1, BITS_HARD, timestamp=T+1190, parent=genesis).
+      -- B.timestamp is 1190s after genesis — just under the 1200s (20-min) threshold,
+      -- so the 20-min rule does NOT fire when B is the prev block of anything.
+      local B_header = types.block_header(4, genesis_hash_obj,
+        types.hash256_zero(), T + 1190, BITS_HARD, 1)  -- nonce=1 to get a different hash
+      local B_hash   = validation.compute_block_hash(B_header)
+      local B_hex    = types.hash256_hex(B_hash)
+      md_chain.headers[B_hex] = {
+        header     = B_header,
+        height     = 1,
+        total_work = consensus.work_zero(),
+      }
+      -- height_to_hash[1] = B  (active-chain has B at h=1)
+      md_chain.height_to_hash[1] = B_hex
+
+      -- Build block C (h=2, bits=BITS_MIN, timestamp=T+1260, parent=A).
+      -- C_time - A_time = 1250 > 1200 → 20-min rule fires when using A as prev.
+      -- C_time - B_time =   70 < 1200 → 20-min rule does NOT fire when using B.
+      local C_header = types.block_header(4, A_hash,
+        types.hash256_zero(), T + 1260, BITS_MIN, 0)
+
+      -- Accept C.  skip_pow bypasses the hash<=target gate (which C cannot pass
+      -- at the real BITS_MIN target without mining); the diffbits gate is NOT
+      -- skipped and is exactly what we are testing.
+      local ok, err = md_chain:accept_header(C_header, { skip_pow = true })
+
+      -- Post-fix: expected=BITS_MIN (from 20-min rule via A's ancestry) = C.bits → ACCEPT.
+      -- Pre-fix:  expected=BITS_HARD (via B, no 20-min) ≠ C.bits → REJECT bad-diffbits.
+      assert.is_true(ok,
+        "EFFECTIVE W3: fork block C must be accepted using block's own ancestry; got: "
+        .. tostring(err))
+    end)
   end)
 
   describe("block locator", function()
