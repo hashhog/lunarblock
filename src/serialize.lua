@@ -511,15 +511,34 @@ function M.deserialize_transaction(reader)
     segwit = true
     input_count = reader.read_varint()
   else
-    -- marker was actually the first byte of varint for input count
+    -- marker is the first byte of the input-count CompactSize.
+    -- Apply the same non-canonical + MAX_SIZE guards as read_varint
+    -- (Core serialize.h:343-359). The raw read_u16/read_u32/read_u64
+    -- calls here did NOT enforce non-canonical encoding or MAX_SIZE.
+    -- A non-canonical encoding (e.g. 0xFD 0x01 0x00 for value 1)
+    -- deserializes to the same input list but compute_txid re-serializes
+    -- canonically, so the wrongly-accepted tx yielded a matching merkle
+    -- leaf — the block was wrongly accepted while Core rejects it.
     if marker < 0xFD then
       input_count = marker
     elseif marker == 0xFD then
       input_count = reader.read_u16le()
+      if input_count < 253 then
+        error("non-canonical ReadCompactSize()")
+      end
     elseif marker == 0xFE then
       input_count = reader.read_u32le()
-    else
+      if input_count < 0x10000 then
+        error("non-canonical ReadCompactSize()")
+      end
+    else  -- 0xFF
       input_count = reader.read_u64le()
+      if input_count < 0x100000000 then
+        error("non-canonical ReadCompactSize()")
+      end
+    end
+    if input_count > MAX_SIZE then
+      error("ReadCompactSize(): size too large")
     end
   end
 
