@@ -1493,7 +1493,7 @@ function M.check_block(block, network, height, check_pow)
       assert(not is_cb, "transaction " .. i .. " is coinbase")
     end
 
-    -- Weight: base_size * 3 + total_size
+    -- Weight: base_size * 3 + total_size (per-transaction contribution only)
     total_weight = total_weight + #base_data * 3 + #total_data
 
     -- Legacy sigops
@@ -1503,6 +1503,29 @@ function M.check_block(block, network, height, check_pow)
     for _, out in ipairs(tx.outputs) do
       total_sigops = total_sigops + M.count_script_sigops(out.script_pubkey, false)
     end
+  end
+  -- Core GetBlockWeight (consensus/validation.h:136) serializes the WHOLE block,
+  -- which includes the 80-byte block header and the tx-count CompactSize varint.
+  -- The per-tx loop above accumulates only the per-transaction weights. Add the
+  -- missing overhead for header + varint so our weight matches Core exactly:
+  --   missing = (80 + varint_len(nTx)) * WITNESS_SCALE_FACTOR
+  -- Both stripped and full block serializations include header+varint identically,
+  -- so the weight contribution is header_bytes * WITNESS_SCALE_FACTOR (not *3+1).
+  -- Mirrors rest.lua:462 full-block formula: stripped_size*3 + block_size where
+  -- stripped_size already includes header + varint.
+  do
+    local nTx = #block.transactions
+    local varint_bytes
+    if nTx < 0xFD then
+      varint_bytes = 1
+    elseif nTx <= 0xFFFF then
+      varint_bytes = 3
+    elseif nTx <= 0xFFFFFFFF then
+      varint_bytes = 5
+    else
+      varint_bytes = 9
+    end
+    total_weight = total_weight + (80 + varint_bytes) * consensus.WITNESS_SCALE_FACTOR
   end
   assert(total_weight <= consensus.MAX_BLOCK_WEIGHT,
          "block weight " .. total_weight .. " exceeds maximum " .. consensus.MAX_BLOCK_WEIGHT)

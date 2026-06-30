@@ -1893,6 +1893,12 @@ function M.execute_script(script_bytes, stack, flags, checker)
 
     -- Taproot
     elseif opcode == M.OP.OP_CHECKSIGADD then
+      -- Core interpreter.cpp:1086-1087: OP_CHECKSIGADD is only available
+      -- in tapscript. Legacy (BASE) and witness-v0 scripts must return
+      -- BAD_OPCODE, before any stack manipulation, matching Core's ordering.
+      if not flags.is_tapscript then
+        return nil, "BAD_OPCODE"
+      end
       -- BIP342 / Core interpreter.cpp:1089:
       --   stack layout (bottom -> top): sig, num, pubkey
       --   Result: push (num + (success ? 1 : 0)) back, popping all three.
