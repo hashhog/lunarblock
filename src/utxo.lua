@@ -3963,20 +3963,47 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- with Core's pruned-node undo-block retention window.
   local MAX_REORG_DEPTH = 288
 
-  -- Pre-build active-chain hash → height map for the most-recent
-  -- MAX_REORG_DEPTH heights.  We use this to cheaply identify the common
-  -- ancestor as we walk the side-branch backwards.  Going deeper than
+  -- Pre-build the ACTIVE VALIDATED chain's hash → height and height → hash
+  -- maps for the most-recent MAX_REORG_DEPTH heights.  We use these to cheaply
+  -- identify the common ancestor as we walk the side-branch backwards, to sum
+  -- the active-chain work above the common ancestor, and to snapshot the blocks
+  -- being disconnected for the mempool refill.  Going deeper than
   -- MAX_REORG_DEPTH is treated as a fatal "reorg too deep" error rather
   -- than looping forever (implementation guard; Core has no numeric cap —
   -- see comment above).
+  --
+  -- CRITICAL (P2P reorg UTXO-corruption fix): we identify the active chain by
+  -- walking back from the REAL active validated tip (self.tip_hash) via each
+  -- ancestor's stored-header prev_hash.  We must NOT use get_hash_by_height /
+  -- CF.HEIGHT_INDEX here.  On the headers-first P2P path, HeaderChain:accept_header
+  -- (sync.lua:1350/1354) eagerly rewrites BOTH the in-memory height_to_hash AND
+  -- the persisted CF.HEIGHT_INDEX along the heavier HEADER fork the moment the
+  -- fork's headers arrive — BEFORE any fork body is validated or connected.  So
+  -- the height index points at the FORK chain, not the connected active chain.
+  -- Building the common-ancestor map from that polluted index made the reorg
+  -- believe the fork was already active: it computed a common ancestor at the
+  -- active tip height, disconnected NOTHING, connected only the single crossing
+  -- block, and left the minority chain's coinbase coins (e.g. A102..A104 / cbA)
+  -- in the UTXO set while never adding the fork's earlier coins (B102..B104).
+  -- Counts/values cancel (equal-work coinbases) so only the MuHash diverges.
+  -- The submitblock path is unaffected — it has no headers-first accept_header
+  -- polluting the index ahead of block connection.  This mirrors the exact
+  -- rationale in BlockDownloader:_apply_fork_aware_floor (sync.lua:2242-2246),
+  -- which already refuses to trust the height index for the same reason.
   local active_hash_to_height = {}
+  local active_height_to_hash = {}
   do
     local lo = math.max(0, self.tip_height - MAX_REORG_DEPTH)
-    for h = self.tip_height, lo, -1 do
-      local h_hash = self.storage.get_hash_by_height(h)
-      if h_hash then
-        active_hash_to_height[h_hash.bytes] = h
-      end
+    local cur_hash = self.tip_hash
+    local cur_height = self.tip_height
+    while cur_hash and cur_height >= lo do
+      active_hash_to_height[cur_hash.bytes] = cur_height
+      active_height_to_hash[cur_height] = cur_hash
+      if cur_height == 0 then break end
+      local cur_header = self.storage.get_header(cur_hash)
+      if not cur_header then break end
+      cur_hash = cur_header.prev_hash
+      cur_height = cur_height - 1
     end
   end
 
@@ -4046,7 +4073,10 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   do
     local h = common_height + 1
     while h <= self.tip_height do
-      local h_hash = self.storage.get_hash_by_height(h)
+      -- Use the fork-faithful active-chain map (walked from the real tip via
+      -- prev_hash), NOT get_hash_by_height — CF.HEIGHT_INDEX is polluted with
+      -- the heavier header fork on the P2P path (see the map-build note above).
+      local h_hash = active_height_to_hash[h]
       if not h_hash then
         return nil, string.format("active-chain-gap at height %d", h)
       end
@@ -4127,7 +4157,10 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     -- with disconnect makes diagnosis easier.
     local h = self.tip_height
     while h > common_height do
-      local h_hash = self.storage.get_hash_by_height(h)
+      -- Fork-faithful active-chain hash (walked from the real tip), NOT
+      -- get_hash_by_height — the persisted height index is polluted with the
+      -- heavier header fork on the P2P path (see the map-build note above).
+      local h_hash = active_height_to_hash[h]
       if h_hash then
         local h_block = self.storage.get_block(h_hash)
         if h_block then
