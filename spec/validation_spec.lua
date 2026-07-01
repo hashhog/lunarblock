@@ -1562,4 +1562,71 @@ describe("validation", function()
       assert.not_equal("\x01\x80", validation.encode_bip34_height(128))
     end)
   end)
+
+  -- Contextual block-version floor (Core ContextualCheckBlockHeader
+  -- validation.cpp:4112-4118 "bad-version"). The submitblock RPC path routes
+  -- through validation.check_block (NOT sync.lua's accept_header), so the
+  -- height-gated nVersion floor must live in check_block too. This is the
+  -- divergence the differential fuzz caught: a v3 block at a height where Core
+  -- mandates v4 (BIP65/CLTV buried) was ACCEPTED via submitblock pre-fix.
+  describe("check_block contextual nVersion floor (bad-version)", function()
+    local mainnet
+
+    setup(function()
+      mainnet = consensus.networks.mainnet
+    end)
+
+    -- Build a minimal, otherwise-valid single-coinbase block at `height` with a
+    -- given header version. PoW/future-time are skipped (check_pow=false, the
+    -- differential harness path), so only the body + contextual gates run. The
+    -- coinbase carries the canonical BIP-34 height prefix so the BIP-34 arm of
+    -- check_block passes and the ONLY thing under test is the version floor.
+    local function build_block(version, height)
+      local cb = types.transaction(1, {}, {}, 0)
+      local null_hash = types.hash256(string.rep("\x00", 32))
+      -- scriptSig = canonical BIP34 height encoding (>= 2 bytes for mainnet
+      -- heights used here, satisfying the coinbase scriptSig length floor).
+      local script_sig = validation.encode_bip34_height(height)
+      cb.inputs[1] = types.txin(
+        types.outpoint(null_hash, 0xFFFFFFFF), script_sig, 0xFFFFFFFF)
+      cb.outputs[1] = types.txout(5000000000, string.rep("\x00", 25))
+
+      local txid = validation.compute_txid(cb)
+      local merkle_root = crypto.compute_merkle_root({txid})
+      local header = types.block_header(
+        version, types.hash256_zero(), merkle_root, os.time(), 0x1d00ffff, 0)
+      return types.block(header, {cb})
+    end
+
+    -- height 388381 = mainnet BIP65 (CLTV) activation, and < segwit_height
+    -- (481824) so no witness commitment is required. Core mandates nVersion>=4.
+    it("REJECTS a v3 block at BIP65 activation height (Core: bad-version)", function()
+      local block = build_block(3, mainnet.bip65_height)
+      local ok, err = pcall(validation.check_block, block, mainnet, mainnet.bip65_height, false)
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("bad%-version"))
+    end)
+
+    it("ACCEPTS a v4 block at BIP65 activation height", function()
+      local block = build_block(4, mainnet.bip65_height)
+      local ok = pcall(validation.check_block, block, mainnet, mainnet.bip65_height, false)
+      assert.is_true(ok)
+    end)
+
+    -- No false-reject below activation: v3 is still fine one block before BIP65.
+    it("ACCEPTS a v3 block one block BELOW BIP65 activation (height-gated)", function()
+      local h = mainnet.bip65_height - 1
+      local block = build_block(3, h)
+      local ok = pcall(validation.check_block, block, mainnet, h, false)
+      assert.is_true(ok)
+    end)
+
+    -- Context-free callers (nil height, e.g. side-branch stage-1 pre-check)
+    -- defer the contextual floor, exactly like the BIP-34 arm.
+    it("SKIPS the floor when height is nil (context-free)", function()
+      local block = build_block(3, mainnet.bip65_height)
+      local ok = pcall(validation.check_block, block, mainnet, nil, false)
+      assert.is_true(ok)
+    end)
+  end)
 end)
