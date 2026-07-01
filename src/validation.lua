@@ -1464,6 +1464,40 @@ function M.check_block(block, network, height, check_pow)
   -- Check header
   M.check_block_header(block.header, network, check_pow)
 
+  -- Contextual block-version floor (Core ContextualCheckBlockHeader,
+  -- validation.cpp:4112-4118 "bad-version"). Reject outdated block versions
+  -- once the corresponding soft fork has buried-activated, height-gated on the
+  -- block's OWN height:
+  --   nVersion < 2  after BIP34 (HEIGHTINCB) activation
+  --   nVersion < 3  after BIP66 (DERSIG)     activation
+  --   nVersion < 4  after BIP65 (CLTV)       activation
+  -- Core gates each arm on DeploymentActiveAfter(pindexPrev, ...), which for a
+  -- buried deployment is (pindexPrev->nHeight + 1) >= DeploymentHeight, i.e. the
+  -- block's own height >= activation_height (deploymentstatus.h:17) — INCLUDING
+  -- the activation height itself. This mirrors sync.lua:1283-1297 (the
+  -- header-first/P2P accept_header path) so the submitblock RPC path (which
+  -- routes through check_block but bypasses accept_header) enforces the SAME
+  -- floor as P2P + Core. Only fires when a height is supplied (context-free
+  -- callers, e.g. the side-branch stage-1 pre-check that passes nil, defer this
+  -- to the height-aware connect/accept path just as the BIP-34 arm below does).
+  if height ~= nil then
+    if block.header.version < 2
+      and network.bip34_height ~= nil
+      and height >= network.bip34_height then
+      error(string.format("bad-version(0x%08x)", block.header.version))
+    end
+    if block.header.version < 3
+      and network.bip66_height ~= nil
+      and height >= network.bip66_height then
+      error(string.format("bad-version(0x%08x)", block.header.version))
+    end
+    if block.header.version < 4
+      and network.bip65_height ~= nil
+      and height >= network.bip65_height then
+      error(string.format("bad-version(0x%08x)", block.header.version))
+    end
+  end
+
   -- Must have at least one transaction
   assert(#block.transactions > 0, "block has no transactions")
 
