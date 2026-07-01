@@ -2879,4 +2879,34 @@ describe("script", function()
       end
     end)
   end)
+
+  describe("OP_CHECKSEQUENCEVERIFY stack preservation (Core parity)", function()
+    -- Regression for glassbox finding 2026-07-01: CSV must leave stacktop(-1)
+    -- byte-for-byte intact (interpreter.cpp:574 reads a const CScriptNum and
+    -- breaks without touching the stack). Pre-fix lunarblock did
+    -- `pop_num(5); push(script_num_encode(sequence))`, replacing the original
+    -- element with its MINIMAL re-encoding. For a non-minimal push "\x05\x00"
+    -- (== 5) that mutated a 2-byte element into a 1-byte one, diverging from
+    -- Core when a downstream OP_SIZE observes the top element.
+    --
+    -- scriptPubKey: PUSH2("\x05\x00") OP_CSV OP_SIZE OP_2 OP_NUMEQUAL
+    -- hex: 02 05 00 b2 82 52 9c
+    it("leaves the non-minimal stacktop untouched so OP_SIZE sees 2 bytes", function()
+      local script_pubkey = hex_to_bin("020500b282529c")
+      local checker = {
+        check_sequence = function(_) return true end,
+      }
+      -- MINIMALDATA not set (consensus/block-connect flags omit it), so the
+      -- non-minimal push "\x05\x00" decodes fine and the CSV check passes.
+      local result, err = script.execute_script(
+        script_pubkey, {}, {verify_checksequenceverify = true}, checker)
+      assert.is_nil(err)
+      assert.is_table(result)
+      -- OP_SIZE does not consume its operand, so the original CSV element
+      -- remains under the boolean result; the accept decision is the top.
+      -- Core: element left as "\x05\x00" -> OP_SIZE=2 -> OP_2 OP_NUMEQUAL TRUE.
+      -- Pre-fix lunarblock: element re-encoded to "\x05" -> OP_SIZE=1 -> FALSE.
+      assert.is_true(script.cast_to_bool(result[#result]))
+    end)
+  end)
 end)
