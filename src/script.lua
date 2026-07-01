@@ -1868,8 +1868,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
     elseif opcode == M.OP.OP_CHECKSEQUENCEVERIFY then
       if flags.verify_checksequenceverify then
         assert(#stack > 0, "CHECKSEQUENCEVERIFY requires stack value")
-        local sequence = pop_num(5)  -- Allow 5-byte numbers
-        push(M.script_num_encode(sequence))  -- Don't consume from stack
+        -- Read top of stack WITHOUT consuming it (Core uses stacktop(-1),
+        -- interpreter.cpp:574). The original element must be left byte-for-byte
+        -- intact — popping + re-pushing the minimal re-encoding mutates it
+        -- (e.g. "\x05\x00" would become "\x05") and diverges from Core.
+        local sequence = M.script_num_decode(peek(), 5, flags and flags.verify_minimaldata)
         -- If the disable flag is set, treat as NOP
         if sequence >= 0 then
           -- Check disable flag (bit 31) using bitwise AND for correctness with 5-byte numbers
