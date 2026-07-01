@@ -11363,12 +11363,33 @@ function RPCServer:register_methods()
           caller_batch_fn  = store_batch_fn,
         })
       local t_connect = os.clock()
+      -- On ANY connect failure the coin_view may hold partial in-memory
+      -- mutations: connect_block calls coin_view:spend()/add() per-tx as it
+      -- walks the block, and a later gate (bad-txns-in-belowout, sigops,
+      -- script-verify, bad-cb-amount, …) can fail AFTER earlier txs already
+      -- spent real coins in the cache.  accept_block does NOT roll those back
+      -- itself — its contract (utxo.lua) is "on failure the caller must call
+      -- coin_view:discard_dirty()".  The P2P/IBD connect path in main.lua
+      -- honours this on both failure arms; the submitblock path historically
+      -- did not.  The leak is severe: the phantom-spent coin stays spent in
+      -- the cache (so the next submitblock spending it false-rejects
+      -- bad-txns-inputs-missingorspent), and the very next SUCCESSFUL block's
+      -- flush writes that spend through to the chainstate DB as a delete —
+      -- permanent, restart-surviving UTXO-set corruption.  Discard on both
+      -- failure arms, mirroring main.lua, so a rejected block leaves the
+      -- coin_view exactly as it found it.
       if not ok_conn then
         -- accept_block threw an error (conn_ret1 is the error message)
+        if rpc.chain_state and rpc.chain_state.coin_view then
+          rpc.chain_state.coin_view:discard_dirty()
+        end
         return bip22_result(conn_ret1)
       end
       if not conn_ret1 then
-        -- accept_block returned (nil, error_string) — normal failure path
+        -- accept_block returned (nil, error_string) — structured failure path
+        if rpc.chain_state and rpc.chain_state.coin_view then
+          rpc.chain_state.coin_view:discard_dirty()
+        end
         return bip22_result(conn_ret2 or "rejected")
       end
 
