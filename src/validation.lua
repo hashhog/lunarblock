@@ -1640,8 +1640,15 @@ function M.calculate_sequence_locks(tx, height, get_utxo_height, get_block_mtp, 
   local min_height = -1
   local min_time = -1
 
-  -- BIP68 only applies to version >= 2 transactions when active
-  if tx.version < 2 or not enforce_bip68 then
+  -- BIP68 only applies to version >= 2 transactions when active.
+  -- Core stores nVersion as uint32_t and compares it UNSIGNED
+  -- (tx_verify.cpp:51 fEnforceBIP68 = tx.version >= 2), so a high-bit
+  -- version (e.g. 0xFFFFFFFF, read here signed as -1 via read_i32le) STILL
+  -- enforces BIP68. Reinterpret as unsigned 32-bit (% 2^32) before comparing,
+  -- matching the connect-block gate bip68_version_active (utxo.lua:29-30).
+  -- A signed `tx.version < 2` check would treat 0xFFFFFFFF as -1 (< 2) and
+  -- SKIP enforcement, false-accepting a non-final tx (a chain split).
+  if (tx.version % 4294967296) < 2 or not enforce_bip68 then
     return min_height, min_time
   end
 
