@@ -74,6 +74,19 @@ local function default_args()
     -- non-signaling replacements are rejected with "conflicting tx does not
     -- signal RBF".  getmempoolinfo.fullrbf reads this value (honest).
     mempool_fullrbf = nil,  -- nil = take mempool.lua default; true/false override
+    -- Full-script-verification parity (mirrors Bitcoin Core's -assumevalid).
+    -- Bitcoin Core ships a hard-coded assumevalid block hash and SKIPS script
+    -- (signature) verification for every block that is an ancestor of it
+    -- (validation.cpp ConnectBlock, GetBlockScriptFlags). Core lets the
+    -- operator turn that optimization OFF with `-assumevalid=0`, forcing full
+    -- signature verification of the ENTIRE chain from genesis. lunarblock
+    -- exposes the same via --noassumevalid (bool) or --assumevalid=0. When set,
+    -- network.assumevalid is cleared to nil so should_skip_script_validation()
+    -- (consensus.lua) can NEVER return true → the script interpreter runs on
+    -- every input of every block. This is the AV=0 full-replay knob the other
+    -- nodes already have; it closes lunarblock's zero replay-coverage gap.
+    noassumevalid = false,   -- true = disable assumevalid entirely (full script verify)
+    assumevalid = nil,       -- optional hex override for the assumevalid hash; "0" == disable
   }
 end
 
@@ -137,6 +150,8 @@ local function parse_args(argv)
       print("      --conf PATH                 Path to bitcoin.conf-style config file")
       print("      --ready-fd N                Write READY token to this FD when listeners are up")
       print("      --mempool-fullrbf BOOL      Mempool full-RBF policy (default: 1 = on, Core v28+ default)")
+      print("      --noassumevalid             Disable assumevalid: verify every script/signature from genesis (AV=0 parity)")
+      print("      --assumevalid HASH          Override assumevalid block hash; 0 disables (full script verification)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -378,6 +393,29 @@ local function parse_args(argv)
         end
       end
       args.mempool_fullrbf = (v == "1" or v == "true" or v == "yes" or v == "on")
+    elseif arg == "--noassumevalid" or arg:match("^%-%-noassumevalid=") then
+      -- Full-script-verification parity with Bitcoin Core's -assumevalid=0.
+      -- Bare "--noassumevalid" enables; "--noassumevalid=BOOL" is explicit.
+      -- Clears network.assumevalid below so should_skip_script_validation()
+      -- always returns false → the script interpreter verifies every input of
+      -- every block (AV=0 full genesis→tip replay, matching the other nodes).
+      local v = arg:match("^%-%-noassumevalid=(.*)$")
+      if v == nil then
+        args.noassumevalid = true
+      else
+        args.noassumevalid = (v == "1" or v == "true" or v == "yes" or v == "on")
+      end
+    elseif arg == "--assumevalid" or arg:match("^%-%-assumevalid=") then
+      -- Bitcoin Core parity: -assumevalid=<hash> overrides the assumevalid
+      -- block; -assumevalid=0 DISABLES the optimization (full script verify).
+      -- We accept both "--assumevalid=VALUE" and "--assumevalid VALUE".
+      local v = arg:match("^%-%-assumevalid=(.*)$")
+      if v == nil then i = i + 1; v = argv[i] end
+      if v == "0" then
+        args.noassumevalid = true
+      else
+        args.assumevalid = v
+      end
     else
       io.stderr:write("Unknown option: " .. arg .. "\n")
       os.exit(1)
@@ -792,6 +830,22 @@ local function main()
   if not network then
     io.stderr:write("Unknown network: " .. args.network .. "\n")
     os.exit(1)
+  end
+
+  -- --noassumevalid / --assumevalid=0 : force full script verification.
+  -- Clearing network.assumevalid to nil makes should_skip_script_validation()
+  -- fail Condition 1 for EVERY block, so the script interpreter runs on every
+  -- input from genesis onward (Bitcoin Core's -assumevalid=0 semantic).
+  -- --assumevalid=<hash> instead overrides which block the shortcut trusts.
+  -- Applied BEFORE make_assumevalid_callbacks() (which closes over
+  -- network.assumevalid) so the callbacks see the effective value.
+  if args.noassumevalid or args.assumevalid == "0" then
+    network.assumevalid = nil
+    print("assumevalid: DISABLED (--noassumevalid) — full script/signature "
+      .. "verification for every block from genesis (AV=0 parity)")
+  elseif args.assumevalid then
+    network.assumevalid = args.assumevalid
+    print("assumevalid: overridden to " .. args.assumevalid)
   end
 
   -- Apply default ports if not specified
@@ -3066,6 +3120,8 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --conf PATH                 Path to bitcoin.conf-style config file")
       print("      --ready-fd N                Write READY token to this FD when listeners are up")
       print("      --mempool-fullrbf BOOL      Mempool full-RBF policy (default: 1 = on, Core v28+ default)")
+      print("      --noassumevalid             Disable assumevalid: verify every script/signature from genesis (AV=0 parity)")
+      print("      --assumevalid HASH          Override assumevalid block hash; 0 disables (full script verification)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
