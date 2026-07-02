@@ -150,6 +150,12 @@ function M.apply_conf_to_args(args, defaults, conf)
     nov2transport = {"nov2transport", "bool"},
     peerbloomfilters = {"peerbloomfilters", "bool"},
     ["ready-fd"]  = {"ready_fd",      "number"},
+    -- Full-script-verification parity (Bitcoin Core -assumevalid).
+    -- noassumevalid=1 (bool) or assumevalid=0 (string) disables the
+    -- assumevalid script-skip; assumevalid=<hash> overrides the trusted block.
+    -- Wired in main.lua right after network selection.
+    noassumevalid = {"noassumevalid", "bool"},
+    assumevalid   = {"assumevalid",   "string"},
   }
   for k, v in pairs(conf) do
     local entry = schema[k]
