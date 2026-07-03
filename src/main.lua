@@ -1189,8 +1189,19 @@ local function main()
       pruner.automatic and pruner:target_blocks_to_keep() or -1))
   end
 
+  -- Reorg-depth parity (2026-07-02): give the chainstate the pruner so its reorg
+  -- orchestrator (accept_side_branch_block) knows whether to follow the most-
+  -- work chain to ANY depth (archive, the default — Core parity) or bound the
+  -- reorg at the retained undo window (pruned).  Archive nodes previously
+  -- refused any >288-deep reorg = a Class-A consensus split.
+  chain_state:set_pruner(pruner)
+
   -- Initialize block downloader for IBD
   local block_downloader = sync_mod.new_block_downloader(header_chain, db, network)
+  -- Same parity concern on the P2P download path: an archive node must fetch a
+  -- deep competing fork's bridging bodies down to the true fork point so the
+  -- reorg can fire (mirrors the orchestrator's unbounded archive walk).
+  block_downloader.pruner = pruner
   -- Start downloading from after the current chain tip
   block_downloader.next_connect_height = chain_state.tip_height + 1
   block_downloader.next_download_height = chain_state.tip_height + 1
