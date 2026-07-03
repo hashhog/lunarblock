@@ -1689,6 +1689,13 @@ function M.new_chain_state(storage, network)
   self.coin_view = M.new_coin_view(storage)
   self.tip_hash = nil
   self.tip_height = -1
+  -- Optional block pruner (lunarblock.prune).  nil ⇒ archive node (pruning
+  -- disabled = the default).  Wired by main.lua via :set_pruner after the
+  -- pruner is built from --prune.  accept_side_branch_block consults it to
+  -- decide the reorg-depth bound: archive nodes follow the most-work chain to
+  -- ANY depth (Core parity — no reorg cap); pruned nodes are bounded by the
+  -- retained undo-block window.
+  self.pruner = nil
   -- Set of invalidated block hashes (keyed by hash bytes for fast lookup)
   self.invalid_blocks = {}
   -- Signature verification cache (avoids re-verifying scripts during IBD/reorg)
@@ -1789,6 +1796,14 @@ end
 -- node (which is intentionally not restarted in the Pattern C0 wave).
 function ChainState:set_txindex_enabled(enabled)
   self.txindex_enabled = enabled and true or false
+end
+
+-- Wire the block pruner (lunarblock.prune) so the reorg orchestrator can tell
+-- an archive node (unbounded reorg, Core parity) from a pruned one (reorg
+-- bounded by the retained undo-block window).  Called by main.lua after the
+-- pruner is constructed from --prune.  nil / disabled pruner ⇒ archive.
+function ChainState:set_pruner(pruner)
+  self.pruner = pruner
 end
 
 -- Late toggle for BIP-157 block-filter index.  Mirrors set_txindex_enabled.
@@ -3953,15 +3968,38 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   --   • genesis / a missing parent (treated as fatal here — submitblock
   --     should not have accepted A1+A2 if the active chain is malformed).
   --
-  -- Pattern D (multi-block atomicity, 2026-05-05): cap lowered from
-  -- 1000 → 100 → 288.  The reorg now wraps the entire disconnect+connect
-  -- sequence in ONE RocksDB WriteBatch (committed once at the end),
-  -- and the in-memory dirty-UTXO set grows linearly with reorg depth
-  -- before commit.  Implementation-specific memory-safety bound; Bitcoin
-  -- Core has NO reorg depth cap (follows the most-work chain, bounded
-  -- only by prune/undo retention).  288 = MIN_BLOCKS_TO_KEEP aligns
-  -- with Core's pruned-node undo-block retention window.
-  local MAX_REORG_DEPTH = 288
+  -- ── Reorg-depth bound (Core-parity fix, 2026-07-02).  Bitcoin Core has NO
+  -- reorg-depth cap: ActivateBestChainStep (validation.cpp) walks unbounded to
+  -- the fork point and follows the most-work VALID chain to ANY depth.  The
+  -- 288 constant (MIN_BLOCKS_TO_KEEP) is a PRUNING artifact — the retained
+  -- undo-block window — NOT a consensus rule.  Enforcing a flat 288 cap on an
+  -- ARCHIVE node (pruning disabled = the default; every block's undo data is on
+  -- disk) gratuitously refuses a >288 reorg to a higher-work valid chain and
+  -- strands the node on the lighter minority chain: a Class-A consensus SPLIT.
+  -- Earlier framing ("implementation-specific memory-safety bound") was wrong —
+  -- the whole disconnect+connect is one atomic RocksDB WriteBatch, so the only
+  -- real bound is undo retention, which is exactly what Core says.  So:
+  --   • archive (pruning OFF, default): NO cap.  math.huge ⇒ lo=0 below ⇒ the
+  --     active-chain map is built to genesis and the side-branch walk runs
+  --     until it meets the common ancestor / genesis / a header gap.  Follows
+  --     the most-work chain at any depth, exactly like Core.
+  --   • pruned (pruning ON): the retained undo window IS the physical bound —
+  --     blocks at heights ≤ pruner.prune_height have had their undo deleted and
+  --     cannot be disconnected.  Bound the walk at tip - prune_height, floored
+  --     at MIN_BLOCKS_TO_KEEP (Core never prunes within 288 of tip, so at least
+  --     that much undo is always retained).  A fork deeper than the retained
+  --     undo is physically un-appliable; we refuse it (below) rather than reorg
+  --     into missing undo.  (Core halts with a FatalError in this case;
+  --     lunarblock refuses-and-continues — a safe, documented deviation on the
+  --     rarely-used pruned config, NOT the archive split this fix closes.)
+  local MAX_REORG_DEPTH
+  local pruning_on = self.pruner ~= nil and self.pruner.enabled and true or false
+  if pruning_on then
+    local retained = self.tip_height - (self.pruner.prune_height or 0)
+    MAX_REORG_DEPTH = math.max(retained, MIN_BLOCKS_TO_KEEP)
+  else
+    MAX_REORG_DEPTH = math.huge
+  end
 
   -- Pre-build the ACTIVE VALIDATED chain's hash → height and height → hash
   -- maps for the most-recent MAX_REORG_DEPTH heights.  We use these to cheaply
@@ -4040,6 +4078,12 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   end
 
   if common_height == nil then
+    -- Post-2026-07-02 this is unreachable on an archive node (MAX_REORG_DEPTH
+    -- is math.huge there, so the walk always terminates at the common ancestor,
+    -- genesis, or a header gap — each with its own return).  It can only fire on
+    -- a PRUNED node whose fork point lies beyond the retained undo window: the
+    -- undo data is physically gone, so the reorg is un-appliable and we refuse
+    -- it (see the MAX_REORG_DEPTH note above).
     return nil, "reorg-depth-exceeded"
   end
 

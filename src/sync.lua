@@ -2110,6 +2110,14 @@ function M.new_block_downloader(header_chain, storage, network)
   -- When nil (test scaffolding without a chainstate) the fork-body routing is
   -- inert and the legacy LATE_ARRIVAL / connect_block behaviour is preserved.
   self.side_branch_callback = nil
+  -- Optional block pruner (lunarblock.prune), set by main.lua.  nil ⇒ archive
+  -- node (pruning disabled = default).  _apply_fork_aware_floor consults it to
+  -- decide how deep to bridge a competing fork's bodies: archive nodes fetch
+  -- the full bridging set to the true fork point (Core parity — mirrors the
+  -- reorg orchestrator's unbounded archive walk in utxo.lua); pruned nodes keep
+  -- the finite MAX_FORK_DOWNLOAD_DEPTH window (a deeper fork is un-appliable —
+  -- its undo is gone — so fetching its bodies would be wasted work).
+  self.pruner = nil
   -- Reorg-drop fix (part 1/2 gate): returns (active_tip_hash, active_tip_height)
   -- of the ACTIVE VALIDATED chain (chain_state).  _apply_fork_aware_floor uses
   -- it to distinguish a genuine competing fork (header tip does NOT descend from
@@ -2244,7 +2252,18 @@ function BlockDownloader:_apply_fork_aware_floor()
   -- of those along the heavier header fork (sync.lua:1342/1346), so after the
   -- header tip flips they point at the FORK chain, not the active validated
   -- chain. CF.BLOCKS + the active tip hash are the only fork-faithful signals.
-  -- Cap the descent depth.
+  -- Cap the descent depth.  Core-parity (2026-07-02): mirror the reorg
+  -- orchestrator's pruning-gated bound (utxo.lua accept_side_branch_block).  On
+  -- an ARCHIVE node (pruning OFF = default) there is NO cap — fetch the full
+  -- bridging-body set down to the true fork point so the deep reorg can actually
+  -- fire (Core FindNextBlocksToDownload follows the most-work header chain
+  -- unbounded; the depth is bounded in practice by the already-PoW-validated
+  -- header chain).  Only a PRUNED node keeps the finite window, because a fork
+  -- deeper than its retained undo is un-appliable anyway.
+  local fork_dl_cap = math.huge
+  if self.pruner ~= nil and self.pruner.enabled then
+    fork_dl_cap = BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH
+  end
   local fork_point_height = nil
   local missing_below_or_at_tip = false
   local cursor_hex = tip_hex
@@ -2279,14 +2298,15 @@ function BlockDownloader:_apply_fork_aware_floor()
     end
 
     steps = steps + 1
-    if steps >= BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH then
-      -- Descent hit the depth cap without reaching a have-body ancestor. A
-      -- reorg deeper than this would be refused by accept_side_branch_block,
-      -- so stop here and floor at the deepest height we walked to.
+    if steps >= fork_dl_cap then
+      -- Descent hit the depth cap without reaching a have-body ancestor. On a
+      -- pruned node a reorg deeper than this is un-appliable (undo gone), so
+      -- stop here and floor at the deepest height we walked to.  (Archive nodes
+      -- never reach this: fork_dl_cap is math.huge.)
       fork_point_height = entry.height - 1
       print(string.format(
-        "[FORK-DL] descent hit MAX_FORK_DOWNLOAD_DEPTH=%d at height %d; capping",
-        BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH, entry.height))
+        "[FORK-DL] descent hit fork-download cap=%d at height %d; capping",
+        fork_dl_cap, entry.height))
       break
     end
 
