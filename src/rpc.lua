@@ -91,7 +91,7 @@ local function bip22_result(err)
   -- Exact-match first for the short form; prefix-match handles the long form.
   local canonical_keys = {
     "duplicate", "inconclusive", "duplicate-invalid",
-    "high-hash", "bad-txnmrklroot",
+    "high-hash", "bad-diffbits", "bad-txnmrklroot",
     "bad-witness-merkle-match", "bad-cb-amount",
     "bad-blk-sigops", "bad-cb-height",
     "bad-txns-nonfinal", "bad-txns-duplicate",
@@ -11250,7 +11250,8 @@ function RPCServer:register_methods()
 
         local result, sb_err = rpc.chain_state:accept_side_branch_block(
           block, block_hash,
-          { skip_scripts = false, nosync = false, mempool = rpc.mempool }
+          { skip_scripts = false, nosync = false, mempool = rpc.mempool,
+            check_diffbits = true }
         )
         if result == "connected" then
           -- Reorg succeeded; B3 is now the active tip.  Sync the
@@ -11277,7 +11278,8 @@ function RPCServer:register_methods()
           -- All of these surface as "inconclusive" except the actual
           -- connect failures, which indicate a malformed candidate and
           -- should map to "rejected".
-          if sb_err and sb_err:find("^reorg%-connect%-failed") then
+          if sb_err and (sb_err:find("^reorg%-connect%-failed")
+                         or sb_err:find("^bad%-diffbits")) then
             return bip22_result(sb_err)
           end
           return "inconclusive"
