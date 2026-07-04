@@ -4162,17 +4162,87 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     entry.height = common_height + (side_len - i + 1)
   end
 
-  -- ── Stage 2b: contextual difficulty (nBits) check for the just-submitted
-  -- block (Core ContextualCheckBlockHeader, validation.cpp:4088-4089).  Only the
-  -- submitblock RPC arm sets opts.check_diffbits; the P2P reorg reuse
-  -- (main.lua accept_side_branch_block) already validated diffbits on the header
-  -- via sync.lua and must NOT re-run it (the snapshot-base relaxation lives only
-  -- there).  side_chain[1] is the newest entry = the block passed in; its height
-  -- was assigned above.  Runs BEFORE any storage write / work comparison / reorg
-  -- so a wrong-nBits block is rejected without being persisted.
+  -- ── Stage 2b: FULL contextual header check for the just-submitted block, run
+  -- at its REAL height — the exact set of gates Core runs in
+  -- ContextualCheckBlockHeader (bitcoin-core/src/validation.cpp:4088-4118) inside
+  -- AcceptBlockHeader, BEFORE a header can enter the block index.  Only the
+  -- submitblock RPC arm sets opts.check_diffbits; the P2P reorg reuse (main.lua
+  -- accept_side_branch_block) already ran the identical gates on the header via
+  -- sync.lua:1167-1297 and must NOT re-run them here (the snapshot-base diffbits
+  -- relaxation + the wall-clock future-time reference live only on that path).
+  -- side_chain[1] is the newest entry = the block passed in; its real height was
+  -- assigned in Stage 2 above.  All gates run BEFORE any storage write / work
+  -- comparison / reorg, so an invalid side-branch header is refused without ever
+  -- being persisted or reorged onto.
+  --
+  -- ROOT CAUSE this closes (round-3 fuzz, live-Core differential).  The
+  -- submitblock side-branch STAGE-1 pre-check (rpc.lua) runs validation.check_block
+  -- with a NIL height.  With nil height check_block is CONTEXT-FREE: it skips the
+  -- BIP34/66/65 nVersion floor (validation.lua gates it on height~=nil) and never
+  -- had any notion of the parent's median-time-past.  accept_side_branch_block then
+  -- re-derived the real heights but — before this fix — only re-checked diffbits
+  -- (158b9c6).  So a side-branch D1 whose timestamp was <= parent MTP, or whose
+  -- nVersion was below the soft-fork floor, was STORED, and a heavier child D2 could
+  -- then reorg the active tip onto that invalid block: a Class-A consensus SPLIT.
+  -- Core refuses such a header in AcceptBlockHeader before it ever enters the index,
+  -- so no reorg is possible.  We now run the SAME gates the tip-extend arm
+  -- (rpc.lua:11299-11304 time-too-old) and the P2P path (sync.lua:1167-1297) run, at
+  -- the real height.  Computing the real height BEFORE these checks (Stage 2) is the
+  -- fix for the nil-height version gap.
   if opts.check_diffbits then
     local new_entry = side_chain[1]
-    local ok_db, db_err = self:check_diffbits(new_entry.header, new_entry.height)
+    local h = new_entry.header
+    local new_height = new_entry.height
+    local net = self.network
+
+    -- (a) time-too-old: timestamp must be strictly greater than the parent's
+    -- median-time-past.  Parent = new_entry.header.prev_hash (== prev_header).
+    -- Core validation.cpp:4092; tip-extend rpc.lua:11299-11304; P2P sync.lua:1173.
+    local parent_mtp = compute_mtp_from_storage(self.storage, h.prev_hash)
+    if h.timestamp <= parent_mtp then
+      return nil, "time-too-old"
+    end
+
+    -- (b) BIP94 timewarp (testnet4 only): the first block of each retarget period
+    -- must not be more than MAX_TIMEWARP earlier than the previous period's last
+    -- block.  Core validation.cpp:4097-4105; P2P sync.lua:1200-1206.  Gated on
+    -- net.enforce_bip94 so mainnet/regtest are unaffected.
+    if net.enforce_bip94
+       and (new_height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0)
+       and prev_header then
+      if h.timestamp < prev_header.timestamp - consensus.MAX_TIMEWARP then
+        return nil, "time-timewarp-attack"
+      end
+    end
+
+    -- (c) time-too-new: timestamp must not exceed wall-clock by
+    -- MAX_FUTURE_BLOCK_TIME.  Core validation.cpp:4108; P2P sync.lua:1192.
+    -- opts.current_time (when set) overrides os.time() for deterministic
+    -- differential/unit testing — default-preserving: production submitblock omits
+    -- it, so the live path uses os.time() byte-identically.
+    local now = opts.current_time or os.time()
+    if h.timestamp > now + consensus.MAX_FUTURE_BLOCK_TIME then
+      return nil, "time-too-new"
+    end
+
+    -- (d) nVersion floor (BIP34/66/65) at the REAL height.  Core validation.cpp:
+    -- 4113-4118; P2P sync.lua:1283-1297; tip-extend routes through
+    -- validation.check_block with a non-nil height (validation.lua:1483-1499).
+    -- The network table stores activation heights as DeploymentHeight, so the gate
+    -- is height >= activation (deploymentstatus.h:17 DeploymentActiveAfter).
+    if h.version < 2 and net.bip34_height and new_height >= net.bip34_height then
+      return nil, string.format("bad-version(0x%08x)", h.version)
+    end
+    if h.version < 3 and net.bip66_height and new_height >= net.bip66_height then
+      return nil, string.format("bad-version(0x%08x)", h.version)
+    end
+    if h.version < 4 and net.bip65_height and new_height >= net.bip65_height then
+      return nil, string.format("bad-version(0x%08x)", h.version)
+    end
+
+    -- (e) contextual difficulty (nBits) — the prior fix (158b9c6).
+    -- Core validation.cpp:4088-4089.
+    local ok_db, db_err = self:check_diffbits(h, new_height)
     if not ok_db then
       return nil, db_err
     end

@@ -58,6 +58,20 @@ local function make_simple_block(height, prev_hash, bits, nonce)
   return types.block(header, {simple_coinbase(height, subsidy(height))})
 end
 
+-- A side block whose contextual header is otherwise VALID (current block
+-- version + a sane timestamp just above the fork parent's MTP) so the diffbits
+-- gate is what's isolated.  `bits` is the field under test; `nonce` only
+-- differentiates the header hash from the active same-height sibling.  Needed
+-- because accept_side_branch_block now runs the FULL ContextualCheckBlockHeader
+-- (time-too-old / time-too-new / bad-version, in addition to diffbits) — a v1 or
+-- far-future header would trip one of those gates before reaching diffbits.
+local function make_side_block(height, prev_hash, bits, nonce)
+  local header = types.block_header(
+    BLOCK_VERSION, prev_hash or types.hash256_zero(), types.hash256_zero(),
+    os.time() + height, bits, nonce or 0)
+  return types.block(header, {simple_coinbase(height, subsidy(height))})
+end
+
 -- Store + connect a prefix tip block directly (bypasses accept_block).
 local function connect_prefix(cs, db, height, prev_hash)
   local block = make_simple_block(height, prev_hash, REQUIRED_BITS, 0)
@@ -136,7 +150,7 @@ describe("submitblock/accept_block bad-diffbits gate (Core parity)", function()
   -- is what's under test and it runs before any storage write.
 
   it("side-branch: REJECTS a wrong-nBits block (bad-diffbits)", function()
-    local sb = make_simple_block(3, fork_hash, WRONG_BITS, 7)
+    local sb = make_side_block(3, fork_hash, WRONG_BITS, 7)
     local sb_hash = validation.compute_block_hash(sb.header)
     local res, err = cs:accept_side_branch_block(sb, sb_hash, {check_diffbits = true})
     assert.is_falsy(res)                                 -- Core rejects; PRE-fix stored/inconclusive
@@ -147,7 +161,7 @@ describe("submitblock/accept_block bad-diffbits gate (Core parity)", function()
   it("side-branch: correct-nBits block is NOT rejected bad-diffbits", function()
     -- Equal-work single block off h2: stored as an inconclusive side branch.
     -- The point: the diffbits gate must NOT fire on correct bits.
-    local sb = make_simple_block(3, fork_hash, REQUIRED_BITS, 7)
+    local sb = make_side_block(3, fork_hash, REQUIRED_BITS, 7)
     local sb_hash = validation.compute_block_hash(sb.header)
     local res, err = cs:accept_side_branch_block(sb, sb_hash, {check_diffbits = true})
     assert.is_falsy(err and tostring(err):find("bad%-diffbits"),

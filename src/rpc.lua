@@ -11274,12 +11274,21 @@ function RPCServer:register_methods()
         else
           -- sb_err in {"unknown-parent", "side-branch-no-common-ancestor",
           -- "side-branch-header-gap", "reorg-depth-exceeded",
-          -- "reorg-disconnect-failed: ...", "reorg-connect-failed: ..."}.
-          -- All of these surface as "inconclusive" except the actual
-          -- connect failures, which indicate a malformed candidate and
-          -- should map to "rejected".
+          -- "reorg-disconnect-failed: ...", "reorg-connect-failed: ...",
+          -- "bad-diffbits: ...", "time-too-old", "time-too-new",
+          -- "time-timewarp-attack", "bad-version(0x...)", "invalid-ancestor"}.
+          -- The parent-missing / depth / inconclusive-store cases surface as
+          -- "inconclusive"; the genuine ContextualCheckBlockHeader rejects
+          -- (Stage 2b: diffbits / time-too-old / time-too-new / timewarp /
+          -- bad-version — the gates Core runs in AcceptBlockHeader) and the
+          -- connect failures indicate an invalid candidate and must surface the
+          -- canonical BIP22 reject reason instead of "inconclusive".
           if sb_err and (sb_err:find("^reorg%-connect%-failed")
-                         or sb_err:find("^bad%-diffbits")) then
+                         or sb_err:find("^bad%-diffbits")
+                         or sb_err:find("^time%-too%-old")
+                         or sb_err:find("^time%-too%-new")
+                         or sb_err:find("^time%-timewarp%-attack")
+                         or sb_err:find("^bad%-version")) then
             return bip22_result(sb_err)
           end
           return "inconclusive"
