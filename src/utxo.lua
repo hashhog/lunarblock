@@ -3841,6 +3841,57 @@ local function compute_mtp_from_storage(storage, tip_hash)
   return timestamps[math.floor(n / 2) + 1]
 end
 
+--- Contextual difficulty (nBits) check — Core ContextualCheckBlockHeader
+-- (bitcoin-core/src/validation.cpp:4088-4089): a block's declared nBits MUST
+-- equal GetNextWorkRequired(pindexPrev) or the block is rejected "bad-diffbits".
+--
+-- This mirrors the header-first / P2P gate in sync.lua:1243-1254.  That gate
+-- was the ONLY place lunarblock enforced diffbits: the submitblock RPC + mining
+-- paths route through accept_block / accept_side_branch_block, which never
+-- compared header.bits to the required work.  A block with valid PoW but the
+-- WRONG nBits (e.g. 0x207ffffe when 0x207fffff is required on a regtest
+-- no-retarget chain) was therefore ACCEPTED here while Bitcoin Core rejects it
+-- — a consensus fork.
+--
+-- get_next_work_required already handles every network mode internally:
+-- regtest fPowNoRetargeting (consensus.lua:425 → prev.header.bits), testnet
+-- min-difficulty walk-back, BIP94/testnet4, and mainnet retargets — so this
+-- check respects the regtest no-retarget branch by construction.
+--
+-- The ancestor lookup walks the block's OWN ancestry via prev_hash (Core
+-- pindexPrev->GetAncestor, pow.cpp) using the stored headers, matching
+-- sync.lua's get_ancestor_entry.  This makes fork blocks compute against their
+-- own chain rather than whatever competing header sits at that height in the
+-- height index.
+-- @return true on match; false, "bad-diffbits: ..." on mismatch.
+function ChainState:check_diffbits(header, height)
+  if not height or height <= 0 then return true end
+  if not self.storage then return true end
+
+  local get_ancestor = function(target_height)
+    if target_height < 0 or target_height >= height then return nil end
+    local cur_hash = header.prev_hash
+    local cur_height = height - 1
+    while cur_height > target_height do
+      local hdr = self.storage.get_header(cur_hash)
+      if not hdr then return nil end
+      cur_hash = hdr.prev_hash
+      cur_height = cur_height - 1
+    end
+    local hdr = self.storage.get_header(cur_hash)
+    if not hdr then return nil end
+    return { header = hdr, height = cur_height }
+  end
+
+  local expected_bits = consensus.get_next_work_required(
+    height, header.timestamp, self.network, get_ancestor)
+  if header.bits ~= expected_bits then
+    return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
+      expected_bits, header.bits)
+  end
+  return true
+end
+
 function ChainState:accept_block(block, height, block_hash, opts)
   opts = opts or {}
 
@@ -3873,6 +3924,20 @@ function ChainState:accept_block(block, height, block_hash, opts)
     -- check_block returns true on success; any non-true value is a bug
     if not val_err then
       return nil, "check_block returned false (unexpected)"
+    end
+
+    -- Stage 1b: contextual difficulty (nBits) check.  Core folds this into
+    -- ContextualCheckBlockHeader (validation.cpp:4088-4089).  Gated on the same
+    -- condition as check_block: the IBD/import callers pass skip_check_block=true
+    -- because sync.lua already enforced diffbits on the HEADER (with the
+    -- snapshot-base relaxation at the first retarget boundary above a UTXO
+    -- snapshot base), so re-checking here would be redundant and could
+    -- false-reject there.  The submitblock tip-extend + mining callers omit
+    -- skip_check_block, so this is exactly the path that previously bypassed the
+    -- diffbits gate.
+    local ok_db, db_err = self:check_diffbits(block.header, height)
+    if not ok_db then
+      return nil, db_err
     end
   end
 
@@ -4095,6 +4160,22 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     -- side_chain[1] is the new block (newest), at common_height + side_len
     -- side_chain[side_len] is at common_height + 1
     entry.height = common_height + (side_len - i + 1)
+  end
+
+  -- ── Stage 2b: contextual difficulty (nBits) check for the just-submitted
+  -- block (Core ContextualCheckBlockHeader, validation.cpp:4088-4089).  Only the
+  -- submitblock RPC arm sets opts.check_diffbits; the P2P reorg reuse
+  -- (main.lua accept_side_branch_block) already validated diffbits on the header
+  -- via sync.lua and must NOT re-run it (the snapshot-base relaxation lives only
+  -- there).  side_chain[1] is the newest entry = the block passed in; its height
+  -- was assigned above.  Runs BEFORE any storage write / work comparison / reorg
+  -- so a wrong-nBits block is rejected without being persisted.
+  if opts.check_diffbits then
+    local new_entry = side_chain[1]
+    local ok_db, db_err = self:check_diffbits(new_entry.header, new_entry.height)
+    if not ok_db then
+      return nil, db_err
+    end
   end
 
   -- ── Stage 3: guard — reject side branches that descend from an
