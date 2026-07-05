@@ -2974,12 +2974,53 @@ end
 -- Block Connection
 --------------------------------------------------------------------------------
 
+--- Connect pending blocks in height order (public entry point).
+--
+-- Wraps the in-order connect walk and CREDITS in-flight request deadlines for
+-- the wall-clock this single-threaded event loop spent blocked in block
+-- validation.
+--
+-- Why this matters: `connect_pending_blocks` runs full-script validation
+-- (connect_callback -> accept_block -> connect_block) synchronously, up to
+-- max_blocks_per_connect blocks per call.  With assumevalid disabled, a single
+-- mainnet block can take 10-25 s to validate, so one call can block the loop
+-- for well over a minute.  During that window the node cannot read the socket,
+-- so in-flight block requests the peer may have ALREADY delivered (or is about
+-- to) sit unread and cross base_stall_timeout.  schedule_downloads then treats
+-- them as peer stalls, clears them, and re-requests the whole window — flooding
+-- a single slow peer with duplicate getdata.  The duplicates arrive, are
+-- deserialized (burning CPU), land below the advanced connect cursor, and are
+-- dropped as LATE_ARRIVAL, starving the one block at the cursor.  Observed on
+-- the Track-B AV=0 replay: wedged for 20+ min at a fixed height, 1200+
+-- LATE_ARRIVAL drops, ~no forward progress.
+--
+-- The stall timeout is meant to measure PEER non-delivery, not time this node
+-- spent busy validating.  So after each batch we push every remaining in-flight
+-- entry's request_time forward by the elapsed validation time — the peer had no
+-- chance to be serviced during it.  On mainnet (fast validation / assumevalid)
+-- the elapsed is negligible and this is a no-op.
+-- @return boolean, string|nil: success flag, error message
+function BlockDownloader:connect_pending_blocks()
+  local socket = require("socket")
+  local t0 = socket.gettime()
+  local ok, err = self:_connect_pending_blocks_inner()
+  local elapsed = socket.gettime() - t0
+  -- Only credit when we actually blocked the loop for a meaningful span; the
+  -- 1 s floor keeps the happy path (fast blocks) a pure no-op.
+  if elapsed > 1.0 then
+    for _, info in pairs(self.inflight) do
+      info.request_time = info.request_time + elapsed
+    end
+  end
+  return ok, err
+end
+
 --- Connect pending blocks in height order.
 -- Processes blocks sequentially starting from next_connect_height.
 -- Limits blocks per call to self.max_blocks_per_connect so the outer main
 -- loop can service RPC requests between batches (prevents event-loop starvation).
 -- @return boolean, string|nil: success flag, error message
-function BlockDownloader:connect_pending_blocks()
+function BlockDownloader:_connect_pending_blocks_inner()
   -- Connect blocks in height order starting from next_connect_height
   local blocks_this_call = 0
   while true do
