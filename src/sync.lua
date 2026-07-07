@@ -2095,6 +2095,15 @@ function M.new_block_downloader(header_chain, storage, network)
   -- 5.75 h. 60 s matches Bitcoin Core's block-download timeout floor.
   self.base_stall_timeout = 60
   self.max_stall_timeout = 120      -- Maximum stall timeout
+  -- Monotonic wall-clock (seconds) this single-threaded event loop has spent
+  -- blocked inside synchronous block validation (connect_callback). Under
+  -- --noassumevalid a single mainnet block costs 10-25 s of full script/sig
+  -- verification, during which the socket is never read. schedule_downloads
+  -- subtracts the growth of this counter since a request was issued from that
+  -- request's peer-stall measurement, so our own validation time is never
+  -- mischarged as peer non-delivery (the false-stall that drove the Track-B
+  -- AV=0 re-request / LATE_ARRIVAL thrash — see the stall scan below).
+  self.validation_time_total = 0
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
   -- GAP3 fix — reorg-drop part 2.  Called when a received block does NOT
@@ -2488,10 +2497,44 @@ function BlockDownloader:schedule_downloads(peers)
   local socket = require("socket")
   local now = socket.gettime()
 
+  -- Prune in-flight requests for heights already connected to the active chain
+  -- (height < next_connect_height). These arise when the connect cursor
+  -- advanced past a block (connected out of pending/storage) while an earlier
+  -- duplicate request for that same height was still outstanding. Left in
+  -- place they (a) permanently occupy the single replay peer's blocks_per_peer
+  -- budget, starving the one block actually at the cursor, and (b) when the
+  -- peer finally delivers them they hit the `entry.height < next_connect_height`
+  -- guard in handle_block, are dropped as [BLOCK-DROP] LATE_ARRIVAL, and — with
+  -- the slot now free — re-requested, producing the drop+re-request loop seen
+  -- on the Track-B AV=0 replay. A genuine reorg does NOT lose bodies here:
+  -- _apply_fork_aware_floor lowers next_connect_height to the fork point before
+  -- the fork bodies are fetched, so every fork body has height >=
+  -- next_connect_height and is never pruned.
+  for hash_hex, info in pairs(self.inflight) do
+    local hentry = self.header_chain.headers[hash_hex]
+    if hentry and hentry.height < self.next_connect_height then
+      self.inflight[hash_hex] = nil
+      if self.peer_inflight[info.peer] then
+        self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+        if self.peer_inflight[info.peer] <= 0 then
+          self.peer_inflight[info.peer] = nil
+        end
+      end
+    end
+  end
+
   -- Check for stalled requests and handle adaptive timeout
   local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
-    if now - info.request_time > info.timeout then
+    -- Measure PEER non-delivery only: subtract the event-loop time this node
+    -- itself spent blocked in synchronous block validation since the request
+    -- was issued (validation_time_total is monotonic; request_vt snapshots it
+    -- at request time). Without this, a 10-25 s connect_callback under
+    -- --noassumevalid is charged against the peer, falsely stalling the whole
+    -- in-flight window and driving the re-request / LATE_ARRIVAL thrash.
+    local self_busy = self.validation_time_total - (info.request_vt or self.validation_time_total)
+    local peer_elapsed = (now - info.request_time) - self_busy
+    if peer_elapsed > info.timeout then
       -- Do NOT score misbehavior for stalling block downloads during IBD.
       -- Old blocks may legitimately be slow to serve (peer rate-limits, pruned
       -- nodes, network congestion). Scoring +N per stalled entry caused mass
@@ -2689,6 +2732,7 @@ function BlockDownloader:schedule_downloads(peers)
               peer = picked,
               request_time = now,
               timeout = self.base_stall_timeout,
+              request_vt = self.validation_time_total,
             }
             available = available - 1
             print(string.format(
@@ -2762,7 +2806,8 @@ function BlockDownloader:schedule_downloads(peers)
               self.inflight[hash_hex] = {
                 peer = p,
                 request_time = now,
-                timeout = self.base_stall_timeout
+                timeout = self.base_stall_timeout,
+                request_vt = self.validation_time_total,
               }
               available = available - 1
               peer_idx = peer_idx + 1
@@ -3005,12 +3050,24 @@ function BlockDownloader:connect_pending_blocks()
   local t0 = socket.gettime()
   local ok, err = self:_connect_pending_blocks_inner()
   local elapsed = socket.gettime() - t0
-  -- Only credit when we actually blocked the loop for a meaningful span; the
-  -- 1 s floor keeps the happy path (fast blocks) a pure no-op.
+  -- Accumulate the wall-clock this single-threaded event loop spent blocked in
+  -- synchronous block validation into a monotonic counter. schedule_downloads'
+  -- stall scan subtracts this counter's growth-since-request from each in-flight
+  -- request's age, so a slow connect_callback (10-25 s/block under
+  -- --noassumevalid) is never mischarged as peer non-delivery.
+  --
+  -- This supersedes the previous per-call `request_time += elapsed` bump, which
+  -- only credited requests that happened to be in-flight at the END of THIS
+  -- call. It could not credit (a) requests issued AFTER a long validate, nor
+  -- (b) time accrued across separate schedule_downloads passes — exactly the
+  -- window in which the false stall fired: a full blocks_per_peer=16 window
+  -- takes ~176 s to connect at ~11 s/block, far past base_stall_timeout=60 s,
+  -- so the tail of every window was re-requested and its duplicates arrived
+  -- below the advanced connect cursor and were dropped as LATE_ARRIVAL
+  -- (Track-B AV=0 wedge at h482128: 15,512 drops, no forward progress). The 1 s
+  -- floor keeps the happy path (fast blocks / assumevalid / mainnet) a no-op.
   if elapsed > 1.0 then
-    for _, info in pairs(self.inflight) do
-      info.request_time = info.request_time + elapsed
-    end
+    self.validation_time_total = self.validation_time_total + elapsed
   end
   return ok, err
 end
