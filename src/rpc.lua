@@ -205,8 +205,27 @@ local function bip22_result(err)
   -- Script / signature verification failures at connect-block stage.
   -- Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
   -- Covers disabled opcodes (OP_CAT 0x7e + 14 peers), signature failures, etc.
+  --
+  -- Raw SCRIPT_ERR_* code tokens: script.lua's witness/tapscript execution
+  -- paths return bare code strings (e.g. "PUSH_SIZE", "BAD_OPCODE",
+  -- "WITNESS_PROGRAM_MISMATCH", "WITNESS_PROGRAM_WITNESS_EMPTY") and the
+  -- P2WPKH/P2WSH asserts in utxo.lua propagate them UNWRAPPED (the "err or
+  -- <fallback>" only uses the human-readable fallback when err is nil).  These
+  -- lowercase to "push_size" / "bad_opcode" / "witness_program_*" which the
+  -- word-based patterns above miss ("witness program" has a space, the raw
+  -- token has an underscore), so pre-fix they fell through to the generic
+  -- "rejected".  Core maps EVERY connect-block script-verification failure to
+  -- the single block-level reason "block-script-verify-flag-failed"
+  -- (validation.cpp ConnectBlock → BLOCK_CONSENSUS), so match the whole raw
+  -- code family here.
   if s:find("script") or s:find("signature") or s:find("checksig") or
-     s:find("tapscript") or s:find("witness program") or s:find("disabled opcode") then
+     s:find("tapscript") or s:find("witness program") or s:find("disabled opcode") or
+     s:find("push_size") or s:find("bad_opcode") or s:find("witness_program") or
+     s:find("witness_malleated") or s:find("witness_unexpected") or
+     s:find("cleanstack") or s:find("stack_size") or s:find("minimalif") or
+     s:find("nullfail") or s:find("eval_false") or s:find("sig_schnorr") or
+     s:find("sig_findanddelete") or s:find("sig_pushonly") or
+     s:find("op_codeseparator") or s:find("taproot_") or s:find("discourage_") then
     return "block-script-verify-flag-failed"
   end
 
@@ -5276,11 +5295,17 @@ function RPCServer:register_methods()
           presynced_headers = -1,
           synced_headers = -1,
           synced_blocks = -1,
-          inflight = {},
+          -- Core src/rpc/net.cpp emits `inflight` as a JSON ARRAY of in-flight
+          -- block heights (UniValue::VARR, net.cpp:273-277) and `permissions`
+          -- as a JSON ARRAY of permission strings (VARR, net.cpp:281-285).
+          -- An empty Lua table encodes as `{}` (object) by default, a
+          -- client-breaking WRONG-TYPE (clients iterate them as arrays).  Tag
+          -- with cjson.array_mt so the empty set serialises as `[]`.
+          inflight = setmetatable({}, cjson.array_mt),
           addr_relay_enabled = true,
           addr_processed = 0,
           addr_rate_limited = 0,
-          permissions = {},
+          permissions = setmetatable({}, cjson.array_mt),
           minfeefilter = 0,
           bytessent_per_msg = {},
           bytesrecv_per_msg = {},
