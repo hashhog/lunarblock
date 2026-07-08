@@ -182,9 +182,12 @@ end
 -- @param tx transaction: The transaction to check
 -- @return boolean, boolean: success flag, is_coinbase flag
 function M.check_transaction(tx)
-  -- Must have at least one input and one output
-  assert(#tx.inputs > 0, "transaction has no inputs")
-  assert(#tx.outputs > 0, "transaction has no outputs")
+  -- Must have at least one input and one output.
+  -- Bare Core tokens (consensus/tx_check.cpp:14-17) so the mempool RPC paths
+  -- (testmempoolaccept / sendrawtransaction) surface the exact reject-reason
+  -- string instead of a collapsed "invalid transaction structure".
+  assert(#tx.inputs > 0, "bad-txns-vin-empty")
+  assert(#tx.outputs > 0, "bad-txns-vout-empty")
 
   -- Check serialized size.
   -- Upper bound (consensus): Bitcoin Core CheckTransaction checks
@@ -192,8 +195,9 @@ function M.check_transaction(tx)
   -- i.e. stripped_size * 4 > 4_000_000, which means stripped_size > 1_000_000.
   -- Reference: bitcoin-core/src/consensus/tx_check.cpp:19.
   local tx_data = tx._cached_base_data or serialize.serialize_transaction(tx, false)
+  -- Core token: consensus/tx_check.cpp:20 "bad-txns-oversize".
   assert(#tx_data * consensus.WITNESS_SCALE_FACTOR <= consensus.MAX_BLOCK_WEIGHT,
-         "transaction stripped size " .. #tx_data .. " * 4 exceeds MAX_BLOCK_WEIGHT")
+         "bad-txns-oversize")
 
   -- Check for duplicate inputs (avoid buffer_writer allocation per input)
   local seen_outpoints = {}
@@ -208,20 +212,21 @@ function M.check_transaction(tx)
     if seen_outpoints[key] then
       -- CVE-2018-17144: duplicate inputs allow inflation in naive UTXO implementations.
       -- Core: state.Invalid(TX_CONSENSUS, "bad-txns-inputs-duplicate")
-      -- tx_check.cpp:44.
-      error("bad-txns-inputs-duplicate")
+      -- tx_check.cpp:44.  level 0 → no "file:line:" prefix, so the bare token
+      -- surfaces intact on the mempool RPC paths.
+      error("bad-txns-inputs-duplicate", 0)
     end
     seen_outpoints[key] = true
   end
 
-  -- Validate outputs: value >= 0, value <= MAX_MONEY, total <= MAX_MONEY
+  -- Validate outputs: value >= 0, value <= MAX_MONEY, total <= MAX_MONEY.
+  -- Core tokens: consensus/tx_check.cpp:28,30,33.
   local total_out = 0
   for i, out in ipairs(tx.outputs) do
-    assert(out.value >= 0, "output " .. i .. " has negative value")
-    assert(out.value <= consensus.MAX_MONEY,
-           "output " .. i .. " value exceeds MAX_MONEY")
+    assert(out.value >= 0, "bad-txns-vout-negative")
+    assert(out.value <= consensus.MAX_MONEY, "bad-txns-vout-toolarge")
     total_out = total_out + out.value
-    assert(total_out <= consensus.MAX_MONEY, "total output value exceeds MAX_MONEY")
+    assert(total_out <= consensus.MAX_MONEY, "bad-txns-txouttotal-toolarge")
   end
 
   -- Detect coinbase: single input with null hash and index 0xFFFFFFFF
@@ -235,15 +240,16 @@ function M.check_transaction(tx)
   end
 
   if is_coinbase then
-    -- Coinbase scriptSig must be between 2 and 100 bytes
+    -- Coinbase scriptSig must be between 2 and 100 bytes.
+    -- Core token: consensus/tx_check.cpp:50 "bad-cb-length".
     local sig_len = #tx.inputs[1].script_sig
-    assert(sig_len >= 2, "coinbase scriptSig too short: " .. sig_len)
-    assert(sig_len <= 100, "coinbase scriptSig too long: " .. sig_len)
+    assert(sig_len >= 2, "bad-cb-length")
+    assert(sig_len <= 100, "bad-cb-length")
   else
-    -- Non-coinbase: no input can have null hash
+    -- Non-coinbase: no input can have null hash.
+    -- Core token: consensus/tx_check.cpp:56 "bad-txns-prevout-null".
     for i, inp in ipairs(tx.inputs) do
-      assert(inp.prev_out.hash.bytes ~= null_hash,
-             "non-coinbase input " .. i .. " has null prevout hash")
+      assert(inp.prev_out.hash.bytes ~= null_hash, "bad-txns-prevout-null")
     end
   end
 

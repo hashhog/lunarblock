@@ -102,6 +102,17 @@ local function bip22_result(err)
     "bad-txns-accumulated-fee-outofrange",
     "bad-txns-in-belowout",
     "bad-txns-premature-spend-of-coinbase",
+    -- CheckTransaction family bare tokens (consensus/tx_check.cpp).  check_transaction
+    -- now raises these verbatim (shared block + mempool consensus tokens), so the
+    -- block-level submitblock path must pass them through unchanged too.
+    "bad-txns-vin-empty",
+    "bad-txns-vout-empty",
+    "bad-txns-oversize",
+    "bad-txns-vout-negative",
+    "bad-txns-vout-toolarge",
+    "bad-txns-txouttotal-toolarge",
+    "bad-txns-prevout-null",
+    "bad-cb-length",
   }
   for _, key in ipairs(canonical_keys) do
     if s == key or s:sub(1, #key + 1) == key .. ":" then
@@ -11836,7 +11847,14 @@ function RPCServer:register_methods()
           }
         end
       else
-        res["reject-reason"] = atmp.reject_reason or "unknown"
+        -- Core remaps the internal TX_MISSING_INPUTS token to "missing-inputs"
+        -- at the testmempoolaccept RPC layer only (rpc/mempool.cpp:399-400);
+        -- every other reject surfaces the bare state.GetRejectReason().
+        local reason = atmp.reject_reason or "unknown"
+        if reason == "bad-txns-inputs-missingorspent" then
+          reason = "missing-inputs"
+        end
+        res["reject-reason"] = reason
       end
       return results
     end

@@ -990,10 +990,18 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
     end
   end
 
-  -- 2. Basic structure validation
+  -- 2. Basic structure validation.
+  -- check_transaction raises the bare Core CheckTransaction token
+  -- (bad-txns-vin-empty/-vout-empty/-oversize/-vout-negative/-vout-toolarge/
+  -- -txouttotal-toolarge/-inputs-duplicate/-prevout-null; bad-cb-length for a
+  -- malformed coinbase).  Surface it verbatim so testmempoolaccept /
+  -- sendrawtransaction report the exact reject-reason string, instead of the
+  -- old collapsed "invalid transaction structure".  On the rejection path pcall
+  -- returns (false, err); strip any "file:line: " prefix belt-and-suspenders.
   local pcall_ok, check_ok, is_coinbase = pcall(validation.check_transaction, tx)
   if not pcall_ok then
-    return false, "invalid transaction structure"
+    local token = tostring(check_ok):gsub("^.-:%d+:%s*", "")
+    return false, token
   end
   if not check_ok then
     return false, "invalid transaction structure"
@@ -1145,7 +1153,9 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   local tip_mtp = get_tip_mtp(self.chain_state)
   local next_height = tip_height + 1
   if not mining.is_final_tx(tx, next_height, tip_mtp) then
-    return false, "bad-txns-nonfinal"
+    -- Core mempool token is "non-final" (validation.cpp:820); "bad-txns-nonfinal"
+    -- is the block-level token (validation.cpp:4147).
+    return false, "non-final"
   end
 
   -- 3. Check all inputs exist (in UTXO set or mempool)
@@ -1199,7 +1209,8 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       -- Coinbase maturity
       if utxo.is_coinbase then
         if tip_height - utxo.height < consensus.COINBASE_MATURITY then
-          return false, "spending immature coinbase"
+          -- Core token: consensus/tx_verify.cpp:180.
+          return false, "bad-txns-premature-spend-of-coinbase"
         end
       end
       -- Save per-input UTXO height for BIP-68 sequence lock check.
@@ -1289,7 +1300,8 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   end
   local fee = input_total - output_total
   if fee < 0 then
-    return false, "outputs exceed inputs"
+    -- Core token: consensus/tx_verify.cpp:197 "bad-txns-in-belowout".
+    return false, "bad-txns-in-belowout"
   end
 
   -- 5b2. Ephemeral-dust 0-fee gate (Bitcoin Core PreCheckEphemeralTx,
@@ -1349,8 +1361,10 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- parent paid for by a high-fee child must still enter (CPFP). All the
   -- standardness/script gates above still ran.
   if (not package_member) and fee_rate_per_kb < self.min_relay_fee then
-    return false, string.format("fee rate too low: %.2f < %d sat/KB",
-      fee_rate_per_kb, self.min_relay_fee)
+    -- Core reject-reason for the static min-relay floor is "min relay fee not
+    -- met" (validation.cpp:709); the numeric detail is Core's reject-details,
+    -- which this RPC path does not surface.
+    return false, "min relay fee not met"
   end
 
   -- 6b. Rolling minimum fee gate (Bitcoin Core validation.cpp:703-705).

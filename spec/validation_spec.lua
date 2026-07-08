@@ -54,7 +54,7 @@ describe("validation", function()
 
       assert.has_error(function()
         validation.check_transaction(tx)
-      end, "transaction has no inputs")
+      end, "bad-txns-vin-empty")
     end)
 
     it("rejects transaction with no outputs", function()
@@ -64,7 +64,7 @@ describe("validation", function()
 
       assert.has_error(function()
         validation.check_transaction(tx)
-      end, "transaction has no outputs")
+      end, "bad-txns-vout-empty")
     end)
 
     it("detects coinbase transaction", function()
@@ -131,7 +131,7 @@ describe("validation", function()
 
       assert.has_error(function()
         validation.check_transaction(tx)
-      end, "total output value exceeds MAX_MONEY")
+      end, "bad-txns-txouttotal-toolarge")
     end)
 
     it("rejects coinbase with short scriptSig", function()

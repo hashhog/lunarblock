@@ -217,7 +217,7 @@ test("CPFP: child pays for low-fee parent", function()
   -- Parent alone should fail
   local ok_parent, err_parent = mp:accept_transaction(parent)
   assert_false(ok_parent, "Parent should be rejected alone")
-  assert_match("fee rate too low", err_parent)
+  assert_match("min relay fee not met", err_parent)
 
   -- Accept as package
   local ok, result = mp:accept_package({parent, child})
