@@ -228,7 +228,7 @@ describe("mempool", function()
 
       local ok, err = mp:accept_transaction(tx)
       assert.is_false(ok)
-      assert.truthy(err:match("fee rate too low"))
+      assert.truthy(err:match("min relay fee not met"))
     end)
 
     it("rejects transaction spending immature coinbase", function()
@@ -247,7 +247,7 @@ describe("mempool", function()
 
       local ok, err = mp:accept_transaction(tx)
       assert.is_false(ok)
-      assert.equal("spending immature coinbase", err)
+      assert.equal("bad-txns-premature-spend-of-coinbase", err)
     end)
 
     it("accepts transaction spending mature coinbase", function()
@@ -1830,7 +1830,7 @@ describe("mempool", function()
       -- Try accepting parent individually (should fail)
       local ok_parent, err_parent = mp:accept_transaction(parent)
       assert.is_false(ok_parent)
-      assert.truthy(err_parent:match("fee rate too low"))
+      assert.truthy(err_parent:match("min relay fee not met"))
 
       -- Accept as package (should succeed)
       local ok, result = mp:accept_package({parent, child})
