@@ -2446,6 +2446,93 @@ function PeerManager:set_network_active(state)
   return self.network_active
 end
 
+--- Select the least-valuable INBOUND peer to evict, or nil if all are protected.
+-- Reference: Bitcoin Core net.cpp AttemptToEvictConnection (protection ladder)
+-- and the FULL nodes' equivalent (ouroboros p2p.py _select_eviction_candidate).
+-- Called from accept_inbound when the inbound slots are full: rather than
+-- hard-refusing every new peer (which lets an early flood permanently eclipse
+-- the node), Core evicts the least-valuable EXISTING inbound peer to make room
+-- for the newcomer.
+--
+-- The ladder protects, in order, the peers most expensive for an attacker to
+-- fake and most useful to us, then evicts the longest-connected survivor:
+--   1. NoBan / manually-added peers are never candidates (fPreventEviction).
+--   2. Protect the 4 lowest-latency peers (Core: 4 by m_min_ping_time). Peers
+--      with no measured ping (min_ping_ms == nil) sort last and stay evictable.
+--   3. Protect the 4 most-recently-active peers. This stands in for Core's
+--      novel-transaction relay rung (protect nodes by m_last_tx_time); lunarblock
+--      keeps no per-peer novel-tx timestamp, so last_recv activity is the proxy.
+--   4. Protect the 4 most-recent block-relay peers (Core: nodes by m_last_block_time).
+--   5. Protect up to 4 peers from distinct /16 netgroups (eclipse diversity).
+--   6. Protect the 4 most-recently-connected peers.
+--   7. Evict the longest-connected of whoever remains.
+-- If a protection rung consumes every remaining candidate, nobody is evictable
+-- and we return nil (the caller then refuses the new connection, preserving the
+-- pre-fix hard-refuse behaviour only in the fully-protected case).
+function PeerManager:select_inbound_eviction_candidate()
+  local PROTECT = 4
+
+  local candidates = {}
+  for _, p in ipairs(self.peer_list) do
+    if p.inbound and not p.noban and not p.is_manual then
+      candidates[#candidates + 1] = p
+    end
+  end
+  if #candidates == 0 then return nil end
+
+  local function key_ping(p) return p.min_ping_ms or math.huge end
+  local function key_recv(p) return p.last_recv or 0 end
+  local function key_block(p) return self._peer_last_block_ann[p.ip .. ":" .. p.port] or 0 end
+  local function key_conn(p) return p.conn_time or 0 end
+
+  -- Sort by cmp (best first), then drop up to PROTECT best, returning the rest.
+  local function drop_top(list, cmp)
+    table.sort(list, cmp)
+    local rest = {}
+    for i = PROTECT + 1, #list do rest[#rest + 1] = list[i] end
+    return rest
+  end
+
+  -- Rung 2: protect the lowest-latency peers.
+  candidates = drop_top(candidates, function(a, b) return key_ping(a) < key_ping(b) end)
+  if #candidates == 0 then return nil end
+
+  -- Rung 3: protect the most-recently-active peers (novel-tx relay proxy).
+  candidates = drop_top(candidates, function(a, b) return key_recv(a) > key_recv(b) end)
+  if #candidates == 0 then return nil end
+
+  -- Rung 4: protect the most-recent block-relay peers.
+  candidates = drop_top(candidates, function(a, b) return key_block(a) > key_block(b) end)
+  if #candidates == 0 then return nil end
+
+  -- Rung 5: protect up to PROTECT peers from distinct /16 (or ASN) netgroups.
+  local seen_group = {}
+  local n_group_protected = 0
+  local is_protected = {}
+  for _, p in ipairs(candidates) do
+    local group = M.get_addr_group(p.ip)
+    if not seen_group[group] and n_group_protected < PROTECT then
+      seen_group[group] = true
+      n_group_protected = n_group_protected + 1
+      is_protected[p] = true
+    end
+  end
+  local rest = {}
+  for _, p in ipairs(candidates) do
+    if not is_protected[p] then rest[#rest + 1] = p end
+  end
+  candidates = rest
+  if #candidates == 0 then return nil end
+
+  -- Rung 6: protect the most-recently-connected peers.
+  candidates = drop_top(candidates, function(a, b) return key_conn(a) > key_conn(b) end)
+  if #candidates == 0 then return nil end
+
+  -- Rung 7: evict the longest-connected survivor (smallest conn_time).
+  table.sort(candidates, function(a, b) return key_conn(a) < key_conn(b) end)
+  return candidates[1]
+end
+
 function PeerManager:accept_inbound()
   if not self.listen_socket then return end
   local client, err = self.listen_socket:accept()
@@ -2474,8 +2561,20 @@ function PeerManager:accept_inbound()
     if p.inbound then inbound_count = inbound_count + 1 end
   end
   if inbound_count >= self.max_inbound then
-    client:close()
-    return
+    -- Inbound slots are full.  Mirror Bitcoin Core net.cpp
+    -- AttemptToEvictConnection: instead of hard-refusing every newcomer (which
+    -- lets an early flood permanently lock out / eclipse the node), evict the
+    -- least-valuable EXISTING inbound peer to make room.  Only when the whole
+    -- inbound set is protected (no eviction candidate) do we fall back to the
+    -- old behaviour and refuse the new connection.  The cap itself is unchanged.
+    local victim = self:select_inbound_eviction_candidate()
+    if victim then
+      self:disconnect_peer(victim,
+        "evicting inbound peer to make room (AttemptToEvictConnection)")
+    else
+      client:close()
+      return
+    end
   end
 
   local inbound_v2 = not self.config.nov2transport
