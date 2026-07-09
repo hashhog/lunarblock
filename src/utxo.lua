@@ -3082,7 +3082,12 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               -- P2WPKH: witness = {sig, pubkey}, execute synthetic P2PKH
               -- The synthetic script is OP_DUP OP_HASH160 <20> OP_EQUALVERIFY
               -- OP_CHECKSIG — never multisig — so inline_verify=false.
-              assert(#witness_stack == 2, "P2WPKH requires exactly 2 witness items")
+              -- Core interpreter.cpp VerifyWitnessProgram: a v0 20-byte program
+              -- with a witness stack size != 2 is SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH
+              -- (maps to block-script-verify-flag-failed).  Emit the canonical
+              -- code so submitblock's BIP22 reason matches Core rather than the
+              -- generic "rejected".
+              assert(#witness_stack == 2, "WITNESS_PROGRAM_MISMATCH")
               local pkh = utxo.script_pubkey:sub(3, 22)
               local synthetic_script = script.make_p2pkh_script(pkh)
               local stack = {witness_stack[1], witness_stack[2]}
@@ -3105,7 +3110,14 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               local ok, err = script.execute_witness_script(synthetic_script, stack, segwit_flags, segwit_checker)
               assert(ok, err or "P2WPKH script verification failed")
             elseif script_type == "p2wsh" then
-              -- P2WSH: last witness item is the script
+              -- P2WSH: last witness item is the script.
+              -- Core interpreter.cpp VerifyWitnessProgram: an empty witness
+              -- stack for a witness program is SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY
+              -- (maps to block-script-verify-flag-failed), checked BEFORE the
+              -- witnessScript is extracted.  Guard here so an empty stack yields
+              -- the canonical BIP22 reason instead of crashing on sha256(nil)
+              -- (which the classifier would otherwise map to generic "rejected").
+              assert(#witness_stack >= 1, "WITNESS_PROGRAM_WITNESS_EMPTY")
               local witness_script = witness_stack[#witness_stack]
               local script_hash = crypto.sha256(witness_script)
               assert(script_hash == utxo.script_pubkey:sub(3, 34),
