@@ -236,7 +236,19 @@ local function bip22_result(err)
      s:find("cleanstack") or s:find("stack_size") or s:find("minimalif") or
      s:find("nullfail") or s:find("eval_false") or s:find("sig_schnorr") or
      s:find("sig_findanddelete") or s:find("sig_pushonly") or
-     s:find("op_codeseparator") or s:find("taproot_") or s:find("discourage_") then
+     s:find("op_codeseparator") or s:find("taproot") or s:find("discourage_") then
+    -- taproot: match both the raw TAPROOT_* code tokens (lowercased
+    -- "taproot_...") AND the human-readable "taproot ..." assert messages
+    -- raised on the native P2TR connect-block verify path in utxo.lua
+    -- ("taproot invalid hash type with 65-byte sig",
+    -- "taproot invalid control block size", "taproot commitment mismatch",
+    -- "taproot parity mismatch", "taproot sighash failed", …).  All are
+    -- BIP341/342 consensus script-verification failures at ConnectBlock,
+    -- which Core surfaces as the single block-level reason
+    -- "block-script-verify-flag-failed".  Pre-fix the space-form messages
+    -- missed the "taproot_" (underscore) token and fell through to the
+    -- generic "rejected" — the 3-vector reason-parity gap in the
+    -- 2026-07-10 taproot differential report.
     return "block-script-verify-flag-failed"
   end
 
