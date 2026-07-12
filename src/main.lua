@@ -2853,6 +2853,13 @@ local function main()
         end
       end
     end)
+    -- Drain buffered blocks (one per slice, matching the main loop) so a wait RPC
+    -- also drives at-tip block connection when the connect cap is 1.
+    pcall(function()
+      if block_downloader:get_pending_count() > 0 then
+        block_downloader:connect_pending_blocks()
+      end
+    end)
     -- Nested RPC accept: serve the concurrent connection (e.g. the miner's
     -- generatetoaddress / submitblock) that actually advances the tip.
     pcall(function() rpc_server:tick() end)
@@ -2908,6 +2915,22 @@ local function main()
       local peers = peer_manager:get_established_peers()
       if #peers > 0 then
         block_downloader:schedule_downloads(peers)
+      end
+    end
+
+    -- Drive connection of any buffered blocks from the main loop, one block per
+    -- iteration (the at-tip connect cap is 1), so the RPC/P2P tick below runs
+    -- between each ~10-31s block validation instead of being frozen behind a
+    -- multi-block connect batch. connect_pending_blocks is otherwise only invoked
+    -- by handle_block on a fresh block message; this drain-drive guarantees
+    -- buffered / out-of-order bodies still connect (they became connectable after
+    -- their parent, but no new message would arrive to trigger them) and is what
+    -- makes the single-block at-tip cap safe against a drain stall. Cheap no-op
+    -- when nothing is pending (get_pending_count is O(pending)).
+    if block_downloader:get_pending_count() > 0 then
+      local cok, cerr = pcall(function() block_downloader:connect_pending_blocks() end)
+      if not cok then
+        print(string.format("connect-drive error: %s", tostring(cerr)))
       end
     end
 

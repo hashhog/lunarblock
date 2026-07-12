@@ -2154,7 +2154,25 @@ function M.new_block_downloader(header_chain, storage, network)
   self.peer_round_robin = 1         -- Persistent round-robin index across schedule_downloads calls
   self.last_connect_advance = 0     -- Timestamp when next_connect_height last advanced
   self.connect_stall_timeout = 90   -- Seconds without connection progress before forced reset
-  self.max_blocks_per_connect = 8   -- Max blocks to connect per call (prevents RPC starvation)
+  self.max_blocks_per_connect = 8   -- Max blocks to connect per call during IBD (throughput)
+  -- Post-IBD (at tip) cap: connect at most ONE block per call so the cooperative
+  -- event loop returns to service RPC / P2P between each block. At tip a single
+  -- mainnet block's full-script validation blocks this single-threaded loop for
+  -- ~10-31s (see [CONNECT-CALLBACK-SLOW]); with the IBD batch of 8 a burst of
+  -- buffered blocks (catch-up / near-simultaneous blocks) chained up to ~8x that
+  -- (~2-3 min) of frozen RPC in ONE call — the "RPC unresponsive, process in
+  -- state R" symptom. Capping to 1 at tip bounds each frozen window to a single
+  -- block and lets getblockcount/getpeerinfo be answered between blocks. Buffered
+  -- blocks still drain: main.lua's loop (and tip_pump) drive connect_pending_blocks
+  -- whenever any block is pending, one per iteration. This is a scheduling knob
+  -- only — it does NOT change validation/consensus.
+  self.max_blocks_per_connect_tip = 1
+  -- Latches TRUE the first time IBD completes and STAYS true across the
+  -- ibd_complete relatch that fires on every new tip block (see the IBD-RELATCH
+  -- in schedule_downloads). Used to select the at-tip connect cap; keying off
+  -- ibd_complete directly would not work because it is relatched to false while
+  -- the freshly-announced block is still pending.
+  self.reached_tip = false
   -- BUG-REPORT.md fix #4: bound the connect-callback retry loop. When the
   -- same block fails connect_callback this many times in a row, the
   -- chainstate is presumed corrupt and the operator is told to run
@@ -3133,10 +3151,16 @@ end
 function BlockDownloader:_connect_pending_blocks_inner()
   -- Connect blocks in height order starting from next_connect_height
   local blocks_this_call = 0
+  -- At tip (reached_tip) connect ONE block per call so the event loop services
+  -- RPC/P2P between each ~10-31s block validation; during IBD use the larger
+  -- throughput batch. See max_blocks_per_connect_tip.
+  local connect_cap = self.reached_tip
+    and self.max_blocks_per_connect_tip
+    or self.max_blocks_per_connect
   while true do
-    -- Yield back to event loop after max_blocks_per_connect blocks to allow
+    -- Yield back to event loop after connect_cap blocks to allow
     -- RPC and P2P I/O to be serviced (W21 cooperative-loop starvation fix).
-    if blocks_this_call >= self.max_blocks_per_connect then
+    if blocks_this_call >= connect_cap then
       break
     end
     local hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
@@ -3602,8 +3626,17 @@ function BlockDownloader:_connect_pending_blocks_inner()
   if self.next_connect_height > self.header_chain.header_tip_height
       and next(self.pending_blocks) == nil
       and next(self.inflight) == nil then
+    -- Only announce (and latch reached_tip) on the FIRST completion. ibd_complete
+    -- is relatched to false on every new tip block by the IBD-RELATCH in
+    -- schedule_downloads, so without this guard "Initial Block Download complete!"
+    -- reprinted once per block forever (5000+ lines of hot-path log I/O observed
+    -- live). reached_tip is the persistent "we have caught up at least once"
+    -- signal that selects the single-block at-tip connect cap.
+    if not self.reached_tip then
+      self.reached_tip = true
+      print("\nInitial Block Download complete!")
+    end
     self.ibd_complete = true
-    print("\nInitial Block Download complete!")
   end
 
   return true
