@@ -2523,6 +2523,18 @@ function BlockDownloader:schedule_downloads(peers)
     end
   end
 
+  -- Track-B single-peer wedge fix
+  -- (CORE-PARITY-AUDIT/trackb-wedge-diagnosis-2026-07-12.md): with a SINGLE
+  -- serving peer, timing out an in-flight request and re-requesting it is
+  -- useless (there is no alternate peer to try) and actively harmful — it floods
+  -- that one peer's FIFO serve queue with duplicate getdata that, by the time
+  -- they are served, fall below the advanced connect cursor and are dropped
+  -- LATE_ARRIVAL, burying the one block that would advance the cursor. So against
+  -- a lone peer we do NOT prune-and-re-request on timeout; forward progress at the
+  -- cursor is guaranteed instead by the priority next-needed-block request (W46)
+  -- below and the 90 s surgical connect-stall recovery, both of which act only on
+  -- the block actually blocking the cursor. Multi-peer behaviour is unchanged.
+  local single_peer = #peers <= 1
   -- Check for stalled requests and handle adaptive timeout
   local had_stalls = false
   for hash_hex, info in pairs(self.inflight) do
@@ -2534,7 +2546,7 @@ function BlockDownloader:schedule_downloads(peers)
     -- in-flight window and driving the re-request / LATE_ARRIVAL thrash.
     local self_busy = self.validation_time_total - (info.request_vt or self.validation_time_total)
     local peer_elapsed = (now - info.request_time) - self_busy
-    if peer_elapsed > info.timeout then
+    if peer_elapsed > info.timeout and not single_peer then
       -- Do NOT score misbehavior for stalling block downloads during IBD.
       -- Old blocks may legitimately be slow to serve (peer rate-limits, pruned
       -- nodes, network congestion). Scoring +N per stalled entry caused mass
@@ -2703,43 +2715,73 @@ function BlockDownloader:schedule_downloads(peers)
   -- (STALL RECOVERY, had_stalls reset, invalid-block skip) do not fire
   -- because no inflight exists to time out. Rate-limited to once every 30s
   -- per stuck hash so we don't spam peers.
-  if self.next_connect_height < self.next_download_height then
+  --
+  -- Track-B wedge hardening (trackb-wedge-diagnosis-2026-07-12.md): fire whenever
+  -- there IS a next block to fetch and its body is genuinely absent — not only
+  -- when the download cursor has raced ahead. Previously this was gated on
+  -- next_connect_height < next_download_height, so once the had_stalls reset
+  -- pulled next_download_height back down to the cursor the two became equal and
+  -- this path went dead, leaving the stuck cursor block unrequested. And if every
+  -- serving peer is at its per-peer window (the single slow replay peer), grant
+  -- this ONE critical block a priority slot on the least-loaded peer rather than
+  -- letting the cursor starve. We request only the next-needed hash here, never
+  -- the already-connected window.
+  if self.next_connect_height <= (self.header_chain.header_tip_height or -1) then
     local stuck_hash_hex = self.header_chain.height_to_hash[self.next_connect_height]
-    if stuck_hash_hex
+    local entry = stuck_hash_hex and self.header_chain.headers[stuck_hash_hex] or nil
+    -- Don't re-request a block that is already on disk — connect_pending_blocks'
+    -- storage fallback will pick it up; re-requesting only wastes the peer.
+    local stuck_in_storage = false
+    if entry then
+      local sbh = validation.compute_block_hash(entry.header)
+      stuck_in_storage = self.storage.get(self.storage.CF.BLOCKS, sbh.bytes) ~= nil
+    end
+    if entry
       and not self.inflight[stuck_hash_hex]
-      and not self.pending_blocks[stuck_hash_hex] then
+      and not self.pending_blocks[stuck_hash_hex]
+      and not stuck_in_storage then
       self._force_rerequest_last = self._force_rerequest_last or {}
       local last = self._force_rerequest_last[stuck_hash_hex] or 0
       if now - last >= 30 then
-        local entry = self.header_chain.headers[stuck_hash_hex]
-        if entry then
-          local picked = nil
+        -- Prefer a peer with a free window slot; if all are saturated (single
+        -- slow replay peer) give this critical block a priority slot on the
+        -- least-loaded serving peer so the cursor cannot be starved by one peer.
+        local picked = nil
+        for _, p in ipairs(available_peers) do
+          local pc = self.peer_inflight[p] or 0
+          if pc < self.blocks_per_peer then
+            picked = p
+            break
+          end
+        end
+        if not picked then
+          local best_pc = nil
           for _, p in ipairs(available_peers) do
             local pc = self.peer_inflight[p] or 0
-            if pc < self.blocks_per_peer then
+            if best_pc == nil or pc < best_pc then
+              best_pc = pc
               picked = p
-              break
             end
           end
-          if picked then
-            self._force_rerequest_last[stuck_hash_hex] = now
-            local stuck_block_hash = validation.compute_block_hash(entry.header)
-            peer_requests[picked][#peer_requests[picked] + 1] = {
-              type = p2p.INV_TYPE.MSG_WITNESS_BLOCK,
-              hash = stuck_block_hash,
-            }
-            self.inflight[stuck_hash_hex] = {
-              peer = picked,
-              request_time = now,
-              timeout = self.base_stall_timeout,
-              request_vt = self.validation_time_total,
-            }
-            available = available - 1
-            print(string.format(
-              "FORCE-REREQUEST (W46): height=%d hash=%s peer=%s",
-              self.next_connect_height, stuck_hash_hex,
-              tostring(picked.address or picked.ip or "?")))
-          end
+        end
+        if picked then
+          self._force_rerequest_last[stuck_hash_hex] = now
+          local stuck_block_hash = validation.compute_block_hash(entry.header)
+          peer_requests[picked][#peer_requests[picked] + 1] = {
+            type = p2p.INV_TYPE.MSG_WITNESS_BLOCK,
+            hash = stuck_block_hash,
+          }
+          self.inflight[stuck_hash_hex] = {
+            peer = picked,
+            request_time = now,
+            timeout = self.base_stall_timeout,
+            request_vt = self.validation_time_total,
+          }
+          available = available - 1
+          print(string.format(
+            "FORCE-REREQUEST (W46): height=%d hash=%s peer=%s",
+            self.next_connect_height, stuck_hash_hex,
+            tostring(picked.address or picked.ip or "?")))
         end
       end
     end
@@ -2763,6 +2805,16 @@ function BlockDownloader:schedule_downloads(peers)
   -- Don't download too far ahead of connection cursor
   local max_ahead = self.next_connect_height + self.download_window
   while height <= tip and height <= max_ahead and available > 0 do
+    -- Never re-request already-connected blocks (below the connect cursor). The
+    -- storage-skip below only guards heights ABOVE the cursor, so without this an
+    -- out-of-range download cursor (e.g. after a fork-floor / notfound rewind)
+    -- could re-fetch connected blocks that are then dropped LATE_ARRIVAL —
+    -- flooding a single peer and starving the next-needed block (Track-B wedge,
+    -- trackb-wedge-diagnosis-2026-07-12.md).
+    if height < self.next_connect_height then
+      height = height + 1
+      goto sched_continue
+    end
     local hash_hex = self.header_chain.height_to_hash[height]
     if not hash_hex then break end
 
@@ -2831,6 +2883,7 @@ function BlockDownloader:schedule_downloads(peers)
       end
     end
     height = height + 1
+    ::sched_continue::
   end
 
   self.next_download_height = height
