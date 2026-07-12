@@ -85,6 +85,20 @@ local function bip22_result(err)
   if err == nil then return nil end  -- success
   local s = tostring(err):lower()
 
+  -- Strip any leading Lua position prefix ("src/validation.lua:246: ") that
+  -- assert()/error(level>0) prepends. Bare BIP-22 tokens raised via
+  -- assert(cond, "bad-cb-length") arrive as "…/validation.lua:246: bad-cb-length";
+  -- the position prefix defeats the exact/prefix canonical_keys match below (the
+  -- s:find() human-message patterns survive it because they are substring
+  -- searches, but the bare tokens have no matching human pattern and so fell
+  -- through to the generic "rejected"). Removing the innermost position marker
+  -- lets the bare tokens (bad-cb-length, bad-txnmrklroot, bad-txns-vout-negative,
+  -- bad-txns-vout-toolarge, bad-witness-merkle-match, unexpected-witness, …)
+  -- pass through as Core's exact BIP-22 code. Reason-string only: the accept/
+  -- reject DECISION is made upstream by the raising assert and is unchanged.
+  local stripped = s:match("^.*%.lua:%d+:%s*(.+)$")
+  if stripped then s = stripped end
+
   -- Already-canonical strings pass through unchanged (exact match or prefix match).
   -- Error messages may carry a detail suffix after ": " — e.g.
   --   "bad-txns-in-belowout: value in (X) < value out (Y)"
@@ -113,6 +127,10 @@ local function bip22_result(err)
     "bad-txns-txouttotal-toolarge",
     "bad-txns-prevout-null",
     "bad-cb-length",
+    -- Block-mutation witness token (validation.cpp CheckBlock/ConnectBlock).
+    -- Raised as a bare token via assert() in check_block, so the position-prefix
+    -- strip above surfaces it here for exact BIP-22 parity with Core.
+    "unexpected-witness",
   }
   for _, key in ipairs(canonical_keys) do
     if s == key or s:sub(1, #key + 1) == key .. ":" then
@@ -1335,14 +1353,46 @@ end
 --- the chain cannot be walked (caller falls back to zeros).
 -- @param storage table: storage object
 -- @param block_height number: target block height (inclusive)
+-- @param network table|nil: network config (for the AssumeUTXO base seed below)
 -- @return string|nil: 64-char hex chainwork, or nil on failure
-local function compute_chainwork(storage, block_height)
+local function compute_chainwork(storage, block_height, network)
   if not storage or not storage.get_hash_by_height or not storage.get_header then
     return nil
   end
   if type(block_height) ~= "number" or block_height < 0 then return nil end
+
+  -- Starting point of the proof walk. A full-sync node's header chain reaches
+  -- genesis (height 0) so we sum every block's proof from there. An AssumeUTXO
+  -- snapshot-bootstrapped node has NO pre-base headers (get_hash_by_height(h)
+  -- returns nil for h < snapshot base), so a genesis walk returns nil and
+  -- chainwork degrades to zeros. Seed the accumulator from the highest snapshot
+  -- base at/below block_height that is on this node's active chain (its stored
+  -- hash-by-height matches the assumeutxo table's blockhash), using Core's
+  -- cumulative nChainWork at that base, then walk forward from base+1. This is
+  -- byte-identical to a genesis walk (au.chain_work is Core's pindex->nChainWork
+  -- at the base) and also cheaper for full nodes. Reporting-only: no accept/
+  -- reject decision depends on chainwork.
+  local start_h = 0
   local work = string.rep("\0", 32)
-  for h = 0, block_height do
+  if network and network.assumeutxo then
+    local best = nil
+    for au_h, au in pairs(network.assumeutxo) do
+      if type(au_h) == "number" and au_h <= block_height
+         and type(au.chain_work) == "string" and #au.chain_work == 64
+         and (not best or au_h > best) then
+        local hh = storage.get_hash_by_height(au_h)
+        if hh and types.hash256_hex(hh) == au.blockhash then
+          best = au_h
+        end
+      end
+    end
+    if best then
+      start_h = best + 1
+      work = consensus.work_from_hex(network.assumeutxo[best].chain_work)
+    end
+  end
+
+  for h = start_h, block_height do
     local hh = storage.get_hash_by_height(h)
     if not hh then return nil end
     local hdr = storage.get_header(hh)
@@ -1350,6 +1400,33 @@ local function compute_chainwork(storage, block_height)
     work = consensus.work_add(work, exact_block_proof(hdr.bits))
   end
   return consensus.work_to_hex(work)
+end
+
+--- On-disk footprint of the block/chainstate store, in bytes.
+-- Bitcoin Core's getblockchaininfo `size_on_disk` reports CalculateCurrentUsage()
+-- (the persistent block/undo data). lunarblock keeps blocks + the UTXO set in a
+-- single RocksDB store under <datadir>/chainstate, so the honest analog is that
+-- directory's byte total. Uses `du -sb` (apparent size), mirroring the io.popen
+-- pattern already used in wallet.lua. Returns 0 on any failure so the field is
+-- always a valid integer (never crashes getblockchaininfo). Reporting-only.
+local function chainstate_size_on_disk(datadir, network_name)
+  if type(datadir) ~= "string" or datadir == "" then return 0 end
+  -- The RocksDB store lives at <datadir>/chainstate on mainnet, but under a
+  -- per-network subdir on the others — mirror main.lua's rule
+  -- (`if network ~= "mainnet" then datadir = datadir .. "/" .. network`), since
+  -- the rpc server is handed the *base* args.datadir.
+  local base = datadir
+  if type(network_name) == "string" and network_name ~= "" and network_name ~= "mainnet" then
+    base = base .. "/" .. network_name
+  end
+  local dir = base .. "/chainstate"
+  local h = io.popen("du -sb '" .. dir .. "' 2>/dev/null")
+  if not h then return 0 end
+  local out = h:read("*a")
+  h:close()
+  if type(out) ~= "string" then return 0 end
+  local n = out:match("^(%d+)")
+  return n and math.floor(tonumber(n)) or 0
 end
 
 --- Minimal base64 encoder used for HTTP Basic auth when calling
@@ -1874,7 +1951,7 @@ function RPCServer:register_methods()
     -- Cumulative chainwork: compute natively from genesis to tip (same exact
     -- big-integer accumulation getblockheader uses), byte-identical to Core's
     -- nChainWork.GetHex(). Falls back to the chain_state cache, then zeros.
-    local chainwork = compute_chainwork(rpc.storage, tip_height)
+    local chainwork = compute_chainwork(rpc.storage, tip_height, rpc.network)
     if not chainwork then
       chainwork = (rpc.chain_state and rpc.chain_state.chainwork)
                   or string.rep("0", 64)
@@ -1912,7 +1989,7 @@ function RPCServer:register_methods()
       "verificationprogress", verification_progress,
       "initialblockdownload", initial_block_download,
       "chainwork",            chainwork,
-      "size_on_disk",         0,
+      "size_on_disk",         chainstate_size_on_disk(rpc.datadir, rpc.network and rpc.network.name),
       "pruned",               is_pruned,
     }
     if is_pruned then
@@ -2101,7 +2178,7 @@ function RPCServer:register_methods()
     -- when the chain cannot be walked (e.g. height unknown).
     local block_chainwork = string.rep("0", 64)
     if block_height then
-      local cw = compute_chainwork(rpc.storage, block_height)
+      local cw = compute_chainwork(rpc.storage, block_height, rpc.network)
       if cw then block_chainwork = cw end
     end
 
@@ -11058,7 +11135,7 @@ function RPCServer:register_methods()
     -- back to zeros only if the chain cannot be walked.
     local chainwork_hex = string.rep("0", 64)
     if block_height then
-      local cw = compute_chainwork(rpc.storage, block_height)
+      local cw = compute_chainwork(rpc.storage, block_height, rpc.network)
       if cw then chainwork_hex = cw end
     end
 
