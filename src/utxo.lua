@@ -3016,8 +3016,8 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
           -- Scan for OP_CHECKMULTISIG/CHECKMULTISIGVERIFY in any script that
           -- will be executed against the legacy/P2SH `checker` below. The
-          -- script_sig itself is normally push-only sig+pubkey data, but
-          -- two cases reach inner scripts that may contain multisig:
+          -- script_sig is normally push-only sig+pubkey data, but several
+          -- cases reach executed scripts that may contain multisig:
           --   (a) P2SH: the redeem script is the LAST push of script_sig.
           --   (b) P2SH-wrapped witness (P2SH-P2WPKH / P2SH-P2WSH): the
           --       redeem is a witness program; the actual sig-bearing script
@@ -3026,8 +3026,26 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           --       we additionally scan the witness script.
           --   (c) Plain script_pubkey contains the multisig opcode (bare
           --       multisig, sometimes still seen on mainnet).
+          --   (d) The script_sig ITSELF contains OP_CHECKMULTISIG. Pre-P2SH
+          --       (mainnet < 173805) the scriptSig executes sequentially and
+          --       its result stack flows into the scriptPubKey, so a whole
+          --       bare m-of-n check can live in the scriptSig with the
+          --       scriptPubKey doing only a push/no-op/DROP. Block 164676's
+          --       tx bc179baab547… does exactly this (scriptSig:
+          --       0 <sig> OP_CODESEPARATOR OP_1 <pk1> <pk2> OP_2 CHECKMULTISIG,
+          --       spending a `<20> OP_NOP2 OP_DROP` output). If we do not
+          --       detect the multisig here, inline_verify stays false and the
+          --       collecting checker returns `true` optimistically for the
+          --       CHECKMULTISIG trial-pairing loop — pairing the signature
+          --       with the WRONG pubkey and deferring that bad (sig,pubkey)
+          --       pair to the batch verifier, which then rejects a block that
+          --       Bitcoin Core accepts (consensus split). has_multisig_op walks
+          --       pushdata, so a 0xae byte inside a sig/pubkey push is not a
+          --       false positive.
           local legacy_has_multisig = false
-          if script.has_multisig_op(utxo.script_pubkey) then
+          if script.has_multisig_op(inp.script_sig) then
+            legacy_has_multisig = true
+          elseif script.has_multisig_op(utxo.script_pubkey) then
             legacy_has_multisig = true
           elseif flags.verify_p2sh and script_type == "p2sh" then
             local redeem = script.extract_last_push(inp.script_sig)
