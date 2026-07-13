@@ -1015,6 +1015,63 @@ function M.has_multisig_op(script_bytes)
   return false
 end
 
+--- Return true iff `script_bytes` is a simple single-signature template whose
+-- lone, terminal OP_CHECKSIG result IS the whole script's result — i.e. one of
+-- the two canonical forms P2PKH or P2PK. For these, "the signature must
+-- verify" is exactly equivalent to "the script succeeds", which is the ONLY
+-- condition under which the deferred/parallel signature collector is
+-- consensus-correct: that collector returns `true` optimistically from
+-- check_sig during script execution and then batch-verifies EVERY collected
+-- (pubkey, sig, sighash) triple at end-of-block, requiring every one to pass.
+--
+-- Any richer script can legitimately tolerate a CHECKSIG returning false and
+-- still succeed — via boolean logic (OP_BOOLOR / OP_IF / OP_NOTIF) or the
+-- CHECKMULTISIG trial-and-error pairing loop. Bitcoin Core accepts such a
+-- block (the failed CHECKSIG just pushes false; NULLFAIL is not consensus
+-- pre-segwit), but the blind end-of-block batch would reject the
+-- tolerated-false signature and split from Core. Mainnet block 269760 tx
+-- be774942…input 0 spends exactly such a script:
+--   OP_SHA256 <h> OP_EQUAL OP_SWAP <pk1> OP_CHECKSIG OP_BOOLOR
+--                          OP_SWAP <pk2> OP_CHECKSIG OP_BOOLAND
+-- The hash-preimage on the stack makes the first OP_BOOLOR true, so the
+-- (pk1, sig_decoy) CHECKSIG legitimately fails and is irrelevant. Callers use
+-- this predicate to force INLINE verification (real check_sig results, decided
+-- by the interpreter's own boolean logic) for every script that is NOT one of
+-- these templates, keeping the parallel speedup only for the P2PKH/P2PK bulk.
+-- @param script_bytes string: The raw executed script (scriptPubKey / redeem /
+--   witness script) whose CHECKSIG results would be collected.
+-- @return boolean: true if the script is a deferrable single-sig template.
+function M.is_deferrable_sig_template(script_bytes)
+  if not script_bytes then return false end
+  local len = #script_bytes
+
+  -- P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG (25 bytes).
+  if len == 25
+     and script_bytes:byte(1) == 0x76
+     and script_bytes:byte(2) == 0xa9
+     and script_bytes:byte(3) == 0x14
+     and script_bytes:byte(24) == 0x88
+     and script_bytes:byte(25) == 0xac then
+    return true
+  end
+
+  -- P2PK: <pubkey> OP_CHECKSIG — a single direct push of a 33-byte compressed
+  -- (0x21) or 65-byte uncompressed (0x41) pubkey followed by the terminal
+  -- OP_CHECKSIG. Exactly two opcodes; the CHECKSIG is the script's result.
+  if len == 35
+     and script_bytes:byte(1) == 0x21
+     and script_bytes:byte(35) == 0xac then
+    return true
+  end
+  if len == 67
+     and script_bytes:byte(1) == 0x41
+     and script_bytes:byte(67) == 0xac then
+    return true
+  end
+
+  return false
+end
+
 --- Extract the last push payload from a script.
 -- Used to find the P2SH redeem script (which is the last push of the
 -- input's scriptSig). Returns nil if the script ends on a non-push or
