@@ -3073,6 +3073,37 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             end
           end
 
+          -- CONSENSUS: the deferred/parallel collector returns `true`
+          -- optimistically from check_sig, then batch-verifies EVERY collected
+          -- (pubkey,sig,sighash) triple at end-of-block requiring all to pass.
+          -- That is sound ONLY when every CHECKSIG that runs is REQUIRED to
+          -- succeed — i.e. a simple single-signature template (P2PKH / P2PK)
+          -- whose lone terminal CHECKSIG result IS the script result. Any
+          -- richer script can legitimately tolerate a CHECKSIG returning false
+          -- via boolean logic (OP_BOOLOR / OP_IF / OP_NOTIF) or CHECKMULTISIG
+          -- trial-pairing; Core accepts it (a failed CHECKSIG just pushes
+          -- false, NULLFAIL is not consensus pre-segwit) but the blind batch
+          -- would reject the tolerated-false sig and split from Core. Mainnet
+          -- block 269760 tx be774942… input 0 does exactly this (a hash-puzzle
+          -- OP_BOOLOR'd over a decoy CHECKSIG). CHECKMULTISIG is already
+          -- covered by legacy_has_multisig above; here we additionally force
+          -- inline for ANY executed script that is not a deferrable single-sig
+          -- template (and any non-push-only scriptSig, which could itself run a
+          -- tolerated-false CHECKSIG), so the interpreter's own boolean logic —
+          -- not the batch — decides the outcome.
+          local legacy_needs_inline = legacy_has_multisig
+          if not legacy_needs_inline then
+            local exec_script = utxo.script_pubkey
+            if flags.verify_p2sh and script_type == "p2sh" then
+              local redeem = script.extract_last_push(inp.script_sig)
+              if redeem then exec_script = redeem end
+            end
+            if not (script.is_push_only(inp.script_sig)
+                    and script.is_deferrable_sig_template(exec_script)) then
+              legacy_needs_inline = true
+            end
+          end
+
           -- Select checker: collecting (deferred ECDSA) when parallel mode
           -- is active, or immediate when serial.  Taproot (Schnorr) is always
           -- verified immediately — only ECDSA is deferred to the batch pass.
@@ -3082,7 +3113,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           if use_parallel_verify then
             checker = validation.make_collecting_sig_checker(
               tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs,
-              get_tx_prev_outputs(), legacy_has_multisig
+              get_tx_prev_outputs(), legacy_needs_inline
             )
           else
             checker = validation.make_sig_checker(
@@ -3151,13 +3182,18 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               segwit_flags.witness_script = witness_script
               -- Scan the witness script: P2WSH multisig is the canonical place
               -- for modern multisig. CHECKMULTISIG inside witness_script must
-              -- gate inline verify or the m-of-n trial pairing breaks.
-              local p2wsh_has_multisig = script.has_multisig_op(witness_script)
+              -- gate inline verify or the m-of-n trial pairing breaks. Same
+              -- generalization as the legacy path above: force inline for ANY
+              -- witness script that is not a deferrable single-sig template, so
+              -- a tolerated-false CHECKSIG (OP_BOOLOR / OP_IF etc.) is decided
+              -- by the interpreter rather than the blind end-of-block batch.
+              local p2wsh_needs_inline = script.has_multisig_op(witness_script)
+                or not script.is_deferrable_sig_template(witness_script)
               local segwit_checker
               if use_parallel_verify then
                 segwit_checker = validation.make_collecting_sig_checker(
                   tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs,
-                  nil, p2wsh_has_multisig
+                  nil, p2wsh_needs_inline
                 )
               else
                 segwit_checker = validation.make_sig_checker(
