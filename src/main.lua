@@ -768,9 +768,44 @@ local function run_import_utxo(args)
 
   db.close()
 
-  print(string.format(
-    "import-utxo complete: utxos=%d block=%s set_hash=%s load_elapsed=%ds hash_elapsed=%ds",
-    count, tip_hex, set_hash_hex, elapsed, hash_elapsed))
+  -- Actually COMPARE the recomputed set hash against the whitelisted
+  -- assumeutxo entry's hash_serialized, mirroring the RPC loadtxoutset
+  -- strict gate (utxo.lua load_snapshot, "snapshot hash mismatch
+  -- (hash_serialized)") and the background-chainstate re-verification (see
+  -- utxo.lua activate_snapshot_with_background). Previously this CLI path
+  -- only printed set_hash and always exited 0, silently accepting a
+  -- mismatched snapshot -- issue #3.
+  --
+  -- au_data.hash_serialized is display-order hex (uint256.ToString
+  -- convention); hash256_from_hex reverses it to compute_utxo_hash's raw
+  -- byte order for a direct comparison against set_hash.
+  if au_data and au_data.hash_serialized then
+    local expected_hash = types.hash256_from_hex(au_data.hash_serialized).bytes
+    if set_hash == expected_hash then
+      print(string.format(
+        "import-utxo complete: utxos=%d block=%s set_hash=%s MATCHES assumeutxo "
+        .. "height %d (hash_serialized=%s) load_elapsed=%ds hash_elapsed=%ds",
+        count, tip_hex, set_hash_hex, au_height, au_data.hash_serialized,
+        elapsed, hash_elapsed))
+    else
+      io.stderr:write(string.format(
+        "import-utxo FAILED: set_hash=%s MISMATCHES assumeutxo height %d "
+        .. "expected hash_serialized=%s -- snapshot is NOT trustworthy, "
+        .. "refusing to report success (utxos=%d block=%s load_elapsed=%ds "
+        .. "hash_elapsed=%ds)\n",
+        set_hash_hex, au_height, au_data.hash_serialized, count, tip_hex,
+        elapsed, hash_elapsed))
+      os.exit(1)
+    end
+  else
+    -- No whitelist entry for this base block (already warned above at
+    -- load time) -- nothing to verify against, so we can only report the
+    -- computed hash, not confirm it.
+    print(string.format(
+      "import-utxo complete: utxos=%d block=%s set_hash=%s (NOT VERIFIED -- no "
+      .. "assumeutxo entry for this base block) load_elapsed=%ds hash_elapsed=%ds",
+      count, tip_hex, set_hash_hex, elapsed, hash_elapsed))
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -829,6 +864,21 @@ local function main()
   local network = consensus_mod.networks[args.network]
   if not network then
     io.stderr:write("Unknown network: " .. args.network .. "\n")
+    os.exit(1)
+  end
+
+  -- HASHHOG_CAMPAIGN_ASSUMEUTXO: read ONCE at startup, right after network
+  -- selection, appending campaign-only entries to the running network's
+  -- assumeutxo allowlist. Unset -> load_campaign_assumeutxo does a single
+  -- getenv and returns 0; no table is copied or mutated, bit-identical to
+  -- today. Set -> refuses to start (not just warns) on a malformed fixture
+  -- or a collision with a built-in entry -- campaign data may never override
+  -- a whitelisted production hash. Launcher-level refusal on mainnet-P2P
+  -- configs lives in tools/start_mainnet.sh (uniform across all 10 impls,
+  -- zero per-impl code). See receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md.
+  local campaign_count, campaign_err = consensus_mod.load_campaign_assumeutxo(network)
+  if not campaign_count then
+    io.stderr:write("HASHHOG_CAMPAIGN_ASSUMEUTXO error: " .. tostring(campaign_err) .. "\n")
     os.exit(1)
   end
 
