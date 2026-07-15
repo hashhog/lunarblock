@@ -1284,8 +1284,34 @@ M.networks.regtest = {
   versionbits_period = 144,     -- 1 day at 10 min/block
   versionbits_threshold = 108,   -- 75% of 144
 
-  -- AssumeUTXO (dynamic for regtest, populated via RPC)
-  assumeutxo = {}
+  -- AssumeUTXO — Core-parity fixed regtest entries (bitcoin-core
+  -- src/kernel/chainparams.cpp CRegTestParams m_assumeutxo_data, verbatim
+  -- {height, blockhash, hash_serialized, m_chain_tx_count} quadruples; same
+  -- display-order-hex convention as the mainnet table above). These three
+  -- are Core's own fixture heights (110 for unit tests, 200 for
+  -- src/test/fuzz/utxo_snapshot.cpp, 299 for
+  -- test/functional/feature_assumeutxo.py and tool_bitcoin_chainstate.py) —
+  -- boot-smoke's height-299 Core-parity fixture needs the 299 entry present
+  -- so the load-time hash gate has a whitelist entry to check against.
+  -- Additional entries (e.g. from HASHHOG_CAMPAIGN_ASSUMEUTXO, see
+  -- load_campaign_assumeutxo below) are appended at startup on top of these.
+  assumeutxo = {
+    [110] = {
+      hash_serialized = "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327",
+      m_chain_tx_count = 111,
+      blockhash = "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397",
+    },
+    [200] = {
+      hash_serialized = "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a",
+      m_chain_tx_count = 201,
+      blockhash = "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9",
+    },
+    [299] = {
+      hash_serialized = "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2",
+      m_chain_tx_count = 334,
+      blockhash = "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2",
+    },
+  }
 }
 
 --------------------------------------------------------------------------------
@@ -1865,6 +1891,162 @@ function M.get_assumeutxo_heights(network)
   end
   table.sort(heights)
   return heights
+end
+
+--------------------------------------------------------------------------------
+-- Campaign AssumeUTXO Loader (HASHHOG_CAMPAIGN_ASSUMEUTXO)
+--------------------------------------------------------------------------------
+
+--- Load campaign-only assumeutxo entries from HASHHOG_CAMPAIGN_ASSUMEUTXO and
+-- append them to `network`'s assumeutxo allowlist. Read ONCE at startup, after
+-- network-params selection (see main.lua's main()). Unset or empty ⇒ this
+-- function does exactly one os.getenv() and returns -- no table is copied or
+-- mutated, bit-identical to today. See
+-- receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md for the full schema + security
+-- model (launcher-refusal-on-mainnet-P2P lives in tools/start_mainnet.sh,
+-- uniform across all 10 impls, zero per-impl code).
+--
+-- Fixture JSON is an array of entries:
+--   {height, blockhash, hash_serialized, m_chain_tx_count,
+--    base_mtp?, base_header?, chainwork?}
+-- All hex fields are DISPLAY order (Core kernel/chainparams.cpp convention).
+-- lunarblock's built-in tables (mainnet/regtest above) already store
+-- hash_serialized/blockhash verbatim in that same display-order hex -- unlike
+-- impls that key their table by internal byte order, lunarblock needs NO
+-- byte-order conversion here; campaign hex is stored as-is.
+--
+-- Refuses (returns nil, error) on: missing/unreadable file, invalid JSON, a
+-- malformed entry (bad hex length/height), or a collision with an existing
+-- entry (same height or same blockhash already present, built-in or
+-- previously loaded from the same file) -- campaign data may never override
+-- a whitelisted production hash.
+--
+-- @param network table: the network config to append into (the RUNNING
+--                        network's table, already selected by the caller).
+-- @return number|nil, string|nil: count of entries loaded (0 if the flag is
+--                                  unset), or nil, error-message on failure.
+function M.load_campaign_assumeutxo(network)
+  local path = os.getenv("HASHHOG_CAMPAIGN_ASSUMEUTXO")
+  if not path or path == "" then
+    return 0  -- flag unset: no-op, bit-identical to today.
+  end
+
+  local f, ferr = io.open(path, "rb")
+  if not f then
+    return nil, "HASHHOG_CAMPAIGN_ASSUMEUTXO: cannot open " .. path .. ": " .. tostring(ferr)
+  end
+  local data = f:read("*a")
+  f:close()
+
+  local cjson = require("cjson")
+  local decode_ok, entries = pcall(cjson.decode, data)
+  if not decode_ok or type(entries) ~= "table" then
+    return nil, "HASHHOG_CAMPAIGN_ASSUMEUTXO: invalid JSON in " .. path
+  end
+
+  local function is_hex(s, len)
+    return type(s) == "string" and #s == len and s:match("^%x+$") ~= nil
+  end
+
+  if not network.assumeutxo then network.assumeutxo = {} end
+
+  local loaded_heights = {}
+  for i, e in ipairs(entries) do
+    if type(e) ~= "table" then
+      return nil, string.format(
+        "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d is not an object", i)
+    end
+    local height = e.height
+    if type(height) ~= "number" or height <= 0 or height ~= math.floor(height) then
+      return nil, string.format(
+        "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d has invalid height", i)
+    end
+    if not is_hex(e.blockhash, 64) then
+      return nil, string.format(
+        "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) has invalid blockhash",
+        i, height)
+    end
+    if not is_hex(e.hash_serialized, 64) then
+      return nil, string.format(
+        "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) has invalid hash_serialized",
+        i, height)
+    end
+    if type(e.m_chain_tx_count) ~= "number" or e.m_chain_tx_count <= 0 then
+      return nil, string.format(
+        "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) has invalid m_chain_tx_count",
+        i, height)
+    end
+
+    -- Refuse on collision: campaign data may never override a production
+    -- hash. Checks both height (direct key collision) and blockhash (in case
+    -- the campaign fixture disagrees with a built-in entry at a DIFFERENT
+    -- height -- e.g. a stale/wrong fixture).
+    if network.assumeutxo[height] then
+      return nil, string.format(
+        "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d collides with existing height %d "
+        .. "-- refusing to start", i, height)
+    end
+    for existing_height, existing in pairs(network.assumeutxo) do
+      if existing.blockhash == e.blockhash then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d blockhash %s collides with "
+          .. "existing height %d -- refusing to start",
+          i, e.blockhash, existing_height)
+      end
+    end
+
+    local entry = {
+      hash_serialized = e.hash_serialized,
+      m_chain_tx_count = e.m_chain_tx_count,
+      blockhash = e.blockhash,
+    }
+    if e.base_mtp then entry.base_mtp = e.base_mtp end
+    if e.chainwork then entry.chain_work = e.chainwork end
+    if e.base_header then
+      if not is_hex(e.base_header, 160) then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) has invalid base_header "
+          .. "(want 160 hex chars / 80 bytes)", i, height)
+      end
+      -- Decompose the raw 80-byte header into lunarblock's native `.header`
+      -- shape (hex-string sub-fields), matching the hand-filled 944183
+      -- mainnet recovery entry above -- main.lua's snapshot forward-sync
+      -- base-block-index injection (assumeutxo_for_blockhash + `.header` +
+      -- `.chain_work`) reads that same shape regardless of which table
+      -- populated it.
+      local serialize_mod = require("lunarblock.serialize")
+      local types_mod = require("lunarblock.types")
+      local raw = e.base_header:gsub("%x%x",
+        function(byte_hex) return string.char(tonumber(byte_hex, 16)) end)
+      local parse_ok, hdr = pcall(serialize_mod.deserialize_block_header, raw)
+      if not parse_ok then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) base_header failed to "
+          .. "parse: %s", i, height, tostring(hdr))
+      end
+      entry.header = {
+        version     = hdr.version,
+        prev_hash   = types_mod.hash256_hex(hdr.prev_hash),
+        merkle_root = types_mod.hash256_hex(hdr.merkle_root),
+        timestamp   = hdr.timestamp,
+        bits        = hdr.bits,
+        nonce       = hdr.nonce,
+      }
+    end
+
+    network.assumeutxo[height] = entry
+    loaded_heights[#loaded_heights + 1] = height
+  end
+
+  table.sort(loaded_heights)
+  local height_strs = {}
+  for i, h in ipairs(loaded_heights) do height_strs[i] = tostring(h) end
+  io.stdout:write(string.format(
+    "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=[%s]\n",
+    #loaded_heights, path, table.concat(height_strs, ",")))
+  io.stdout:flush()
+
+  return #loaded_heights
 end
 
 return M

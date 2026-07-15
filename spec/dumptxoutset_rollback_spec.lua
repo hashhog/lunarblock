@@ -145,7 +145,17 @@ describe("dumptxoutset rollback mode", function()
   end)
 
   describe("RPC dumptxoutset positional 'rollback' type", function()
-    it("rejects rollback type on regtest (no assumeutxo entries)", function()
+    -- Regtest now carries Core-parity fixed assumeutxo entries (heights
+    -- 110/200/299, bitcoin-core/src/kernel/chainparams.cpp
+    -- CRegTestParams m_assumeutxo_data) so the boot-smoke height-299 fixture
+    -- has a whitelist entry to check against. A 2-block synthetic chain
+    -- (tip=1) sits below ALL of those heights, so this now exercises the
+    -- "tip below every configured height" branch rather than the
+    -- "no entries at all" branch (rpc.lua ~12179 vs ~12190) -- the latter is
+    -- still reachable via a network whose table is genuinely empty (e.g.
+    -- testnet/testnet4, unaffected by the regtest-only Change-1 addition).
+    it("rejects rollback type on regtest when tip is below all assumeutxo heights",
+       function()
       local db, chain_state = build_chain(2)
       local server = rpc.new({
         chain_state = chain_state,
@@ -162,7 +172,7 @@ describe("dumptxoutset rollback mode", function()
 
       assert.is_not_nil(decoded.error)
       assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
-      assert.matches("No assumeutxo snapshots configured",
+      assert.matches("Current tip is below all configured assumeutxo",
         decoded.error.message)
 
       os.remove(snapshot_path)
