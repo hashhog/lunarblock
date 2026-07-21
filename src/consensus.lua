@@ -1067,6 +1067,23 @@ M.networks.mainnet = {
         nonce      = 2918950304,
       },
       chain_work = "00000000000000000000000000000000000000011de68a167d5dad115a96be80",
+    },
+    [481823] = {
+      hash_serialized = "25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4",
+      m_chain_tx_count = 249036369,
+      blockhash = "000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80",
+      -- Track-B WINDOWED replay: last pre-segwit block (segwit activates 481824).
+      -- hash_serialized + m_chain_tx_count from the boundary-snapshot result JSON
+      -- (Core dumptxoutset rollback=481823). Header from bitcoind getblockheader 481823.
+      header = {
+        version     = 536870914,
+        prev_hash   = "0000000000000000003bec88b7ba0bebd8eb3b1c1c599e44a2b270ad3e8203ca",
+        merkle_root = "ff22679f40860900b0928529c6b01e432a943b1ac859dd0485e6038a6e4823c9",
+        timestamp   = 1503539571,
+        bits        = 0x180130e0,
+        nonce       = 940461593,
+      },
+      chain_work = "0000000000000000000000000000000000000000007eb5d786594edfb7192580",
     }
   }
 }
