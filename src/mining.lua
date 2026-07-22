@@ -272,7 +272,14 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
 
   local height = chain_state.tip_height + 1
   local prev_hash = chain_state.tip_hash
-  local subsidy = consensus.get_block_subsidy(height)
+  -- Pass the network's subsidy halving interval so the MINED coinbase claims
+  -- the same subsidy the connect-block validator enforces. Omitting it defaults
+  -- get_block_subsidy to the 210000 mainnet interval, so on regtest (150-block
+  -- interval, Core kernel/chainparams.cpp:535) the template over-claimed 50 BTC
+  -- at height >=150 while validation (utxo.lua:3438, which DOES pass the network
+  -- interval) expected 25 -> self-mined block 150 was rejected "bad-cb-amount".
+  local subsidy = consensus.get_block_subsidy(
+    height, network.subsidy_halving_interval)
 
   -- Get median time past for locktime checks
   -- chain_state.mtp should be provided; fallback to current time - 3600 (1 hour ago)
