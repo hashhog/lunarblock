@@ -7506,6 +7506,31 @@ function RPCServer:register_methods()
       end
     end
 
+    -- Fund-self crediting (Core CWallet::blockConnected parity). The mined
+    -- coinbase pays `address`; Core credits that output to WHICHEVER loaded
+    -- wallet owns the script, independent of the RPC context that drove the
+    -- mine. The request_wallet-only marking above misses the standard
+    -- fund-self pattern the wallet tests use: mine to a loaded wallet's OWN
+    -- getnewaddress from the node ("/") URL (request_wallet == nil), which
+    -- left that wallet unscanned -> getbalance / listunspent = 0 and
+    -- walletcreatefundedpsbt -> "Insufficient funds" despite the coins being
+    -- in the chainstate. Mark every loaded wallet that OWNS the payout address
+    -- scanned; the lazy scan_utxos on the next getbalance/listunspent/PSBT read
+    -- then credits it (with the coinbase-maturity split). Wallets that do NOT
+    -- own the payout are left untouched, preserving the deliberate restore
+    -- "balance 0 until rescan" semantics for unrelated wallets.
+    local function mark_payout_owner(w)
+      if w and w.mark_scanned
+         and ((w.keys and w.keys[address]) or
+              (w.watch_addrs and w.watch_addrs[address])) then
+        w:mark_scanned()
+      end
+    end
+    if rpc.wallet_manager and rpc.wallet_manager.wallets then
+      for _, w in pairs(rpc.wallet_manager.wallets) do mark_payout_owner(w) end
+    end
+    mark_payout_owner(rpc.wallet)
+
     return block_hashes
   end
 
@@ -8312,6 +8337,14 @@ function RPCServer:register_methods()
     local sign = params[2]
     local sighash_type = params[3]  -- "ALL", "NONE", etc.
     local bip32derivs = params[4]
+    -- Core's walletprocesspsbt `finalize` arg (wallet/rpc/spend.cpp) defaults
+    -- to TRUE: after signing, every input that is now fully signed is finalized
+    -- (final_scriptWitness/scriptSig set), so `complete` reflects a finalizable
+    -- PSBT. Without this the ECDSA branch only left a partial_sig and
+    -- is_complete (which checks the FINAL scripts) returned false for an input
+    -- Core would have reported complete=true.
+    local do_finalize = params[5]
+    if do_finalize == nil then do_finalize = true end
 
     -- Suppress unused warnings
     local _ = {sighash_type, bip32derivs}
@@ -8327,8 +8360,19 @@ function RPCServer:register_methods()
       error({code = M.ERROR.DESERIALIZATION_ERROR, message = "Invalid PSBT: " .. tostring(psbt)})
     end
 
+    -- Resolve the REQUEST-CONTEXT wallet, not the legacy single `rpc.wallet`.
+    -- walletcreatefundedpsbt (and every other wallet RPC) already routes via
+    -- rpc:get_request_wallet(), so under the multi-wallet manager (createwallet
+    -- + /wallet/<name>, and the single-loaded-wallet base "/" case) the funded,
+    -- key-bearing wallet lives there. Using rpc.wallet here signed against the
+    -- empty auto-created default wallet -> keys[addr] never matched -> the PSBT
+    -- came back unsigned (complete=false) even for a plain p2wpkh input that
+    -- signrawtransactionwithwallet signs fine. Populate its UTXO ledger too.
+    local wallet = rpc:get_request_wallet() or rpc.wallet
+    if wallet and rpc.chain_state then wallet:scan_utxos(rpc.chain_state) end
+
     -- Update UTXOs from wallet's known UTXOs
-    if rpc.wallet then
+    if wallet then
       for i, tx_input in ipairs(psbt.tx.inputs) do
         local inp = psbt.inputs[i]
 
@@ -8345,7 +8389,7 @@ function RPCServer:register_methods()
           bit.band(bit.rshift(tx_input.prev_out.index, 24), 0xFF)
         )
 
-        local utxo = rpc.wallet.utxos[key]
+        local utxo = wallet.utxos[key]
         if utxo then
           inp.witness_utxo = {
             value = utxo.value,
@@ -8358,9 +8402,9 @@ function RPCServer:register_methods()
     end
 
     -- Sign inputs if requested
-    if sign and rpc.wallet then
+    if sign and wallet then
       -- Check wallet is unlocked
-      if rpc.wallet.is_encrypted and rpc.wallet.is_locked then
+      if wallet.is_encrypted and wallet.is_locked then
         error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
       end
 
@@ -8392,15 +8436,24 @@ function RPCServer:register_methods()
         local addr
 
         if script_type == "p2wpkh" then
-          local hrp = rpc.wallet.network.bech32_hrp or address_mod.BECH32_HRP[rpc.wallet.network.name] or "bc"
+          local hrp = wallet.network.bech32_hrp or address_mod.BECH32_HRP[wallet.network.name] or "bc"
           addr = address_mod.segwit_encode(hrp, 0, hash_or_program)
         elseif script_type == "p2pkh" then
-          local version = rpc.wallet.network.pubkey_address_prefix
+          local version = wallet.network.pubkey_address_prefix
           addr = address_mod.base58check_encode(version, hash_or_program)
+        elseif script_type == "p2tr" then
+          -- BIP-86 P2TR key-path. The wallet stores the key under the TWEAKED
+          -- output address (generate_address()), so re-encode the 32-byte
+          -- output x-only program to its bech32m address and look it up. Only
+          -- this dispatch branch was missing: sign_input already has a full
+          -- BIP-341 taproot path (sign_input_p2tr_keypath applies the correct
+          -- BIP-86 tweak + Schnorr-signs), so an owned p2tr input went unsigned
+          -- purely because walletprocesspsbt never derived its address.
+          addr = address_mod.xonly_pubkey_to_p2tr(hash_or_program, wallet.network.name)
         end
 
-        if addr and rpc.wallet.keys[addr] then
-          local key_info = rpc.wallet.keys[addr]
+        if addr and wallet.keys[addr] then
+          local key_info = wallet.keys[addr]
           if key_info.privkey then
             psbt_mod.sign_input(psbt, i - 1, key_info.privkey, key_info.pubkey)
           end
@@ -8410,8 +8463,17 @@ function RPCServer:register_methods()
       end
     end
 
-    -- Check if complete
-    local complete = psbt_mod.is_complete(psbt)
+    -- Finalize fully-signed inputs (Core walletprocesspsbt finalize=true
+    -- default) so `complete` reports true for a finalizable PSBT and the
+    -- returned PSBT carries the final scripts. finalize_input is idempotent and
+    -- non-fatal on inputs it cannot yet finalize, and handles both the ECDSA
+    -- (partial_sigs) and BIP-371 taproot (tap_key_sig) paths.
+    local complete
+    if do_finalize then
+      complete = psbt_mod.finalize(psbt)
+    else
+      complete = psbt_mod.is_complete(psbt)
+    end
 
     return {
       psbt = psbt_mod.to_base64(psbt),
@@ -10357,7 +10419,7 @@ function RPCServer:register_methods()
   -- caller can supply 1..M cosigner keys at once. The function will degrade
   -- gracefully (return false + complete=false) if a multisig witnessScript
   -- has fewer than M matching keys.
-  local function sign_one_input(tx, i, prev, key_info, sighash_type)
+  local function sign_one_input(tx, i, prev, key_info, sighash_type, prev_outputs)
     local crypto = require("lunarblock.crypto")
     local script_type, hash_or_program = script_mod.classify_script(prev.script_pubkey)
 
@@ -10441,9 +10503,34 @@ function RPCServer:register_methods()
       tx.inputs[i].witness = stack
       tx.segwit = true
       return true
+    elseif script_type == "p2tr" then
+      -- BIP-341 key-path (BIP-86). The raw-signing engine signs input-by-input,
+      -- but the taproot sighash commits to the prevouts of EVERY input, so the
+      -- caller threads the full prev_outputs set through (the ECDSA/segwit-v0
+      -- branches above ignore it). The wallet key stored for a p2tr OUTPUT is
+      -- the INTERNAL keypair; sign_input_p2tr_keypath re-applies the BIP-86
+      -- TapTweak and Schnorr-signs. This branch is dispatch-only — it reuses the
+      -- exact, Core-validated primitive the PSBT path uses; before it, an owned
+      -- p2tr input fell through to complete=false ("write-only" taproot wallet).
+      local wallet_mod = require("lunarblock.wallet")
+      if type(prev_outputs) ~= "table" or #prev_outputs ~= #tx.inputs then
+        return false, "taproot signing requires the prevouts of every input"
+      end
+      -- Core remaps an explicit ECDSA-shaped SIGHASH_ALL to BIP-341
+      -- SIGHASH_DEFAULT (0x00, bare 64-byte sig); other types pass through.
+      local tap_hash = sighash_type
+      if tap_hash == nil or tap_hash == consensus.SIGHASH.ALL then
+        tap_hash = wallet_mod.SIGHASH_DEFAULT
+      end
+      local witness_item, terr = wallet_mod.sign_input_p2tr_keypath(
+        tx, i - 1, prev_outputs, key_info.privkey, tap_hash)
+      if not witness_item then return false, terr end
+      tx.inputs[i].witness = {witness_item}
+      tx.segwit = true
+      return true
     end
-    -- p2tr (Schnorr) and other shapes fall through to "not signed" — Core
-    -- reports `complete=false` plus per-input error in this case.
+    -- Unsupported shapes fall through to "not signed" — Core reports
+    -- `complete=false` plus per-input error in this case.
     return false
   end
 
@@ -10463,10 +10550,29 @@ function RPCServer:register_methods()
         message = "TX decode failed. Make sure the tx has at least one input."})
     end
 
+    -- Pre-resolve EVERY input's prevout first. BIP-341 taproot signing commits
+    -- to the prevouts of all inputs, so sign_one_input needs the full set, not
+    -- just the input it is signing. prev_outputs stays dense (1..n) only when
+    -- all inputs resolve; a hole makes it unusable for taproot (handled by the
+    -- length guard in the p2tr branch), while the ECDSA branches never read it.
+    local resolved = {}
+    local prev_outputs = {}
+    local all_resolved = true
+    for i, tx_input in ipairs(tx.inputs) do
+      local prev = resolve_prevout(rpc, tx_input, prev_lookup)
+      resolved[i] = prev
+      if prev then
+        prev_outputs[i] = {value = prev.value, script_pubkey = prev.script_pubkey}
+      else
+        all_resolved = false
+      end
+    end
+    local tap_prevouts = all_resolved and prev_outputs or nil
+
     local errors = {}
     local complete = true
     for i, tx_input in ipairs(tx.inputs) do
-      local prev = resolve_prevout(rpc, tx_input, prev_lookup)
+      local prev = resolved[i]
       if not prev then
         complete = false
         errors[#errors + 1] = {
@@ -10479,7 +10585,7 @@ function RPCServer:register_methods()
         if not key_info then
           complete = false
         else
-          local signed = sign_one_input(tx, i, prev, key_info, sighash_type)
+          local signed = sign_one_input(tx, i, prev, key_info, sighash_type, tap_prevouts)
           if not signed then
             complete = false
             errors[#errors + 1] = {
@@ -10660,6 +10766,15 @@ function RPCServer:register_methods()
       local script_type, hash_or_program = script_mod.classify_script(spk)
       if script_type == "p2pkh" or script_type == "p2wpkh" then
         return pkh_index[hash_or_program]
+      elseif script_type == "p2tr" then
+        -- BIP-86 P2TR: the wallet keys are indexed by the TWEAKED output
+        -- address, so re-encode the 32-byte output x-only program to its
+        -- bech32m address and return the owned internal keypair (privkey +
+        -- internal pubkey). sign_one_input's p2tr branch re-applies the tweak.
+        local a = address_mod.xonly_pubkey_to_p2tr(hash_or_program, wallet.network.name)
+        local info = a and wallet.keys[a]
+        if info and info.privkey then return info end
+        return nil
       elseif script_type == "p2sh" and prev and prev.redeem_script then
         -- W31: refuse to surface a wallet key when the supplied
         -- redeem_script doesn't commit to the P2SH scriptPubKey.
@@ -10742,7 +10857,14 @@ function RPCServer:register_methods()
 
     -- Fee model mirrors walletcreatefundedpsbt: estimate vsize from the segwit
     -- input/output approximations, charge fee_rate * vsize.
-    local fee_rate = options.feeRate or wallet:estimate_fee_rate(options.conf_target) or 1
+    -- Core exposes the explicit fee control as `fee_rate` (sat/vB, the modern
+    -- walletcreatefundedpsbt/fundrawtransaction option) as well as the legacy
+    -- `feeRate`. Only `feeRate` was read here, so a caller passing `fee_rate`
+    -- (as the wallet tooling / Core CLI do) was silently ignored and the tx was
+    -- built at the 1 sat/vB fallback (effective-feerate ~1 instead of the
+    -- requested rate). Honour `fee_rate` first, then the legacy `feeRate`.
+    local fee_rate = options.fee_rate or options.feeRate
+                     or wallet:estimate_fee_rate(options.conf_target) or 1
     local est_overhead = 11
     local est_input_vsize = 68
     local est_output_vsize = 31
@@ -10767,7 +10889,17 @@ function RPCServer:register_methods()
       end
       local available = {}
       for k, u in pairs(wallet.utxos) do
-        if not claimed[k] then
+        -- Exclude IMMATURE coinbase outputs from coin selection. scan_utxos
+        -- already applies this maturity rule to spendable_balance (coinbase
+        -- spendable only at >= COINBASE_MATURITY+1 confirmations), but the
+        -- funding candidate set did not, so walletcreatefundedpsbt /
+        -- fundrawtransaction could select a freshly-mined coinbase and build a
+        -- tx Core rejects with bad-txns-premature-spend-of-coinbase. Mirror the
+        -- ledger's maturity gate here (Core wallet coin selection skips
+        -- immature coinbases via CWalletTx::IsImmatureCoinBase).
+        local immature = u.is_coinbase
+          and (u.confirmations or 0) < consensus.COINBASE_MATURITY + 1
+        if not claimed[k] and not immature then
           available[#available + 1] = {utxo = u, key = k}
         end
       end
