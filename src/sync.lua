@@ -2264,6 +2264,18 @@ function BlockDownloader:_apply_fork_aware_floor()
 
   local active_tip_hex = types.hash256_hex(active_tip_hash)
 
+  -- Ordinary IBD fast-path: if the active validated tip is ON the header chain's
+  -- linear map at its height, the header tip merely EXTENDS us (no fork). Do NOT
+  -- run the depth-capped fork descent — the normal forward floor
+  -- (next_download_height = active_tip+1) already advances block-by-block.
+  -- Skipping this is what wedged pruned genesis IBD: the 288 cap fired ~310k
+  -- blocks before the descent could reach active_tip_hex and recognise the same
+  -- chain. accept_header only rewrites height_to_hash along a HEAVIER competing
+  -- fork, so height_to_hash[active_tip_height] == active_tip_hex ⇔ no fork.
+  if hc.height_to_hash[active_tip_height] == active_tip_hex then
+    return false
+  end
+
   -- Walk the header-tip ancestry by prev_hash toward genesis, stopping at the
   -- fork point: the deepest ancestor whose block body we ALREADY have on disk
   -- (Core BLOCK_HAVE_DATA).  CRUCIAL DISTINCTION (fixes the early-IBD misfire):
