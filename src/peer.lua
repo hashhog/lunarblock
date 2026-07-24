@@ -776,7 +776,19 @@ function Peer:handle_verack()
     -- Send post-handshake messages
     self:send_message("sendheaders", "")
     self:send_message("sendcmpct", p2p.serialize_sendcmpct(false, 2))
-    self:send_message("feefilter", p2p.serialize_feefilter(100000)) -- 100 sat/vB = 100000 sat/kvB
+    -- BIP-133 feefilter floor, in sat/kvB. MUST match what our mempool actually
+    -- enforces (mempool.lua:210 DEFAULT_MIN_RELAY_FEE = 100, Core
+    -- policy/policy.h:70) — Core seeds its FeeFilterRounder from the very same
+    -- symbol the mempool reads (net_processing.cpp:5565-5567,
+    -- max(rounded mempool min fee, min_relay_feerate)).
+    --
+    -- This used to send a hard-coded 100000 (= 100 sat/vB), 1000x Core's value,
+    -- bypassing the correct constant entirely. Under BIP-133 every Core peer
+    -- withholds transactions below the advertised rate, so we asked the network
+    -- to send us almost nothing: measured 9 transactions in the mempool on 8
+    -- peers at tip. Kept as a literal (not a require of mempool.lua) to avoid
+    -- adding a dependency edge to peer.lua; keep the two in step.
+    self:send_message("feefilter", p2p.serialize_feefilter(100)) -- 100 sat/kvB = 0.1 sat/vB
   end
 end
 
