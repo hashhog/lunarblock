@@ -2734,16 +2734,34 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     end
   end
 
-  -- Flags for sigop counting (depends on height).
-  -- Bitcoin Core validation.cpp GetBlockScriptFlags: P2SH is always enabled
-  -- (Core comment: "For simplicity, always leave P2SH+WITNESS+TAPROOT on
-  -- except for the two violating blocks").  Using bip34_height here was wrong
-  -- — P2SH activated at block 173,805, long before BIP34 (227,931).
-  -- Reference: bitcoin-core/src/validation.cpp:2260-2262.
-  local sigop_flags = {
-    verify_p2sh = true,
-    verify_witness = height >= self.network.segwit_height,
-  }
+  -- ---------------------------------------------------------------------------
+  -- GetBlockScriptFlags — computed ONCE per block, BEFORE anything that could
+  -- skip it.  This single table is the authority for BOTH sigop counting and
+  -- script verification, exactly like Core: ConnectBlock computes
+  --   const auto flags{GetBlockScriptFlags(*pindex, m_chainman)}
+  -- once (validation.cpp:2521) and then feeds the SAME value to
+  -- GetTransactionSigOpCost (:2565) and CheckInputScripts (:2596).
+  --
+  -- Two things this MUST NOT be:
+  --   (a) hash-blind.  Sigops used to be counted with a height-only
+  --       {p2sh=true, witness=height>=segwit} table that never consulted
+  --       script_flag_exceptions.  At mainnet block 170060 the exception value
+  --       is SCRIPT_VERIFY_NONE, so Core does NOT add P2SH sigops
+  --       (tx_verify.cpp:150-152) and CountWitnessSigOps short-circuits to 0
+  --       (interpreter.cpp:2140-2142).  Counting them here inflates the block's
+  --       sigop cost relative to Core — a false-reject risk on a consensus
+  --       counter.
+  --   (b) computed inside the `skip_script_validation` guard.  Sigops are
+  --       counted on EVERY connect (assumevalid IBD, reorg replay, import)
+  --       while scripts are not, so the flag computation is hoisted out here.
+  -- Reference: bitcoin-core/src/validation.cpp:2249-2289, 2521, 2565, 2596;
+  --            consensus/tx_verify.cpp:143-162.
+  local block_script_flags =
+    consensus.get_block_script_flags(self.network, height, block_hash)
+
+  -- Sigop counting consumes the final, exception-aware flags (Core passes the
+  -- identical `flags` value to GetTransactionSigOpCost).
+  local sigop_flags = block_script_flags
 
   -- Determine if we should use parallel verification
   -- Auto-detect: use parallel if available and block has enough inputs
@@ -2905,54 +2923,33 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
         -- Script verification (skip if assumevalid optimization is active)
         if not skip_script_validation then
-          -- Consensus-only script flags (MANDATORY_SCRIPT_VERIFY_FLAGS parity).
-          -- verify_nullfail and verify_witness_pubkeytype are policy-only
-          -- (STANDARD_SCRIPT_VERIFY_FLAGS per Bitcoin Core policy/policy.h:125,128)
-          -- and must NOT be set in the block-connect validation path.
-          -- P2SH: always enabled per GetBlockScriptFlags (Core validation.cpp:2260-2262).
-          -- Using bip34_height here was wrong — P2SH activated at block 173,805,
-          -- long before BIP34 (227,931).
-          local flags = {
-            verify_p2sh = true,
-            verify_dersig = height >= self.network.bip66_height,
-            verify_checklocktimeverify = height >= self.network.bip65_height,
-            verify_checksequenceverify = height >= self.network.csv_height,
-            verify_witness = height >= self.network.segwit_height,
-            verify_nulldummy = height >= self.network.segwit_height,
-            verify_taproot = height >= self.network.taproot_height,
-            -- NOTE: verify_const_scriptcode is INTENTIONALLY NOT set here.
-            -- SCRIPT_VERIFY_CONST_SCRIPTCODE is a relay/standardness flag
-            -- (STANDARD_SCRIPT_VERIFY_FLAGS, Core policy/policy.h:129), NOT a
-            -- block-consensus flag. Core's GetBlockScriptFlags
-            -- (validation.cpp:2250-2289) only enables P2SH, WITNESS, TAPROOT
-            -- (always, modulo two historical exception blocks) plus DERSIG,
-            -- CLTV, CSV, NULLDUMMY when their deployment is active — exactly
-            -- the MANDATORY_SCRIPT_VERIFY_FLAGS set (policy.h:105-111). Setting
-            -- verify_const_scriptcode in the block-connect path OVER-FLAGS:
-            -- Core only returns SCRIPT_ERR_SIG_FINDANDDELETE when the flag is
-            -- set (interpreter.cpp:330-332, 1146-1148), so a legacy script
-            -- whose scriptCode contains the signature push is ACCEPTED by Core
-            -- during block connection but would be FALSE-REJECTED here. That is
-            -- a consensus divergence / chain-split risk. The flag belongs in
-            -- the mempool/relay path only (see mempool.lua), not here.
-          }
-
-          -- Script-flag exception override (GetBlockScriptFlags exception table parity).
-          -- Two historical mainnet blocks violated P2SH rules, and one violated Taproot
-          -- rules; one testnet3 block also violated P2SH rules.  For those specific
-          -- blocks Bitcoin Core returns a hardcoded override instead of the normal
-          -- P2SH|WITNESS|TAPROOT base.  We REPLACE the flags table with the override
-          -- (not OR) matching Core's validation.cpp:2263-2266 behavior.
-          -- Block hash is compared in display (big-endian) hex, mirroring the BIP-30
-          -- exemption pattern at utxo.lua:78 and types.lua:25-31.
-          -- Reference: bitcoin-core/src/validation.cpp:2262-2266 (GetBlockScriptFlags).
-          local _sfe = consensus.SCRIPT_FLAG_EXCEPTIONS[self.network.name]
-          if _sfe then
-            local _override = _sfe[types.hash256_hex(block_hash)]
-            if _override then
-              flags = _override
-            end
-          end
+          -- Consensus-only script flags — the SAME per-block value already
+          -- computed by consensus.get_block_script_flags() above (Core's
+          -- three-step GetBlockScriptFlags: unconditional P2SH|WITNESS|TAPROOT
+          -- base, whole-set replacement on a script_flag_exceptions hash hit,
+          -- then DERSIG/CLTV/CSV/NULLDUMMY OR'd on top by height).
+          --
+          -- A per-input SHALLOW COPY is taken because the interpreter mutates
+          -- the flags table it is handed (script.lua:2460 sets
+          -- `flags.script_code` while descending into a P2SH redeemScript, and
+          -- the tapscript path tracks `validation_weight_left`).  Handing out
+          -- the shared per-block table — or, as the pre-fix code did on an
+          -- exception hit, the SCRIPT_FLAG_EXCEPTIONS module table itself —
+          -- would let one input's execution scribble on every later input's
+          -- flags and permanently corrupt the exception entry for the process.
+          --
+          -- NOTE: no policy flags here. verify_nullfail, verify_witness_pubkeytype
+          -- and verify_const_scriptcode are STANDARD_SCRIPT_VERIFY_FLAGS
+          -- (Core policy/policy.h:125-129), NOT block-consensus flags.  Setting
+          -- verify_const_scriptcode in the block-connect path OVER-FLAGS: Core
+          -- only returns SCRIPT_ERR_SIG_FINDANDDELETE when that flag is set
+          -- (interpreter.cpp:330-332, 1146-1148), so a legacy script whose
+          -- scriptCode contains the signature push is ACCEPTED by Core during
+          -- block connection but would be FALSE-REJECTED here — a chain-split
+          -- risk.  Those flags belong in the mempool/relay path only
+          -- (see mempool.lua).
+          local flags = {}
+          for _k, _v in pairs(block_script_flags) do flags[_k] = _v end
 
           -- W160 BUG-9 fix: cache key must include ALL consensus script-verify
           -- flag bits, not a coarse height-bitmask. Core's SignatureCacheHasher
