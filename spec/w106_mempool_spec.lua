@@ -216,10 +216,15 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
   end)
 
   ---------------------------------------------------------------------------
-  -- G6: ancestor limit MAX_ANCESTORS = 25 enforced
+  -- G6: the 25-ancestor acceptance gate is GONE (Core v31 cluster mempool)
   ---------------------------------------------------------------------------
-  describe("G6: ancestor limit MAX_ANCESTORS = 25 enforced", function()
-    it("rejects a tx that would exceed 25 in-mempool ancestors", function()
+  -- Core v31 replaced ancestor/descendant limits with cluster limits;
+  -- `too-long-mempool-chain` no longer exists in Core's tree.  The surviving
+  -- MemPoolLimits::ancestor_count is consumed only by wallet coin-selection
+  -- (node/interfaces.cpp:709-716 -> wallet/spend.cpp:879-882).  Confirmed by
+  -- diff-test corpus entry `cluster-linear-26`: 26 txs, Core accepts all 26.
+  describe("G6: no 25-ancestor acceptance gate (cluster limits replaced it)", function()
+    it("accepts a tx that would exceed 25 in-mempool ancestors", function()
       local cs = make_chain()
       local coin = random_txid()
       add_utxo(cs, coin, 0, 10000000)
@@ -239,23 +244,42 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
         prev_vout = 0
       end
 
-      -- 26th tx would have 25 in-mempool ancestors: exceeds MAX_ANCESTORS
+      -- 26th tx has 25 in-mempool ancestors — accepted; the 26-tx cluster is
+      -- far under both cluster bounds (64 txs / 404,000 wu).
       local tx26 = types.transaction(1,
         { make_input(prev_txid, 0) },
         { make_output(100000) }, 0)
       local ok26, err26 = accept(mp, tx26)
-      assert.is_false(ok26, "26th tx must be rejected (too many ancestors)")
-      assert.is_string(err26)
-      assert.is_truthy(err26:find("ancestor"))
+      assert.is_true(ok26, "26th tx must be accepted: " .. tostring(err26))
+      assert.are_equal(26, mp.tx_count)
     end)
   end)
 
   ---------------------------------------------------------------------------
-  -- G7: ancestor_size limit constant correct
+  -- G7: cluster size limit expressed in Core's units
   ---------------------------------------------------------------------------
-  describe("G7: MAX_ANCESTOR_SIZE constant = 101000 vbytes", function()
-    it("MAX_ANCESTOR_SIZE is 101000 vbytes (101 kvB)", function()
+  -- policy.h:74 DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101
+  --   -> mempool_limits.h:21 cluster_size_vbytes = 101,000 vB
+  --   -> txmempool.cpp:181   max_cluster_size = 101,000 * WITNESS_SCALE_FACTOR
+  --                                           = 404,000 weight units
+  describe("G7: cluster size limit = 404000 weight units (101 kvB * 4)", function()
+    it("MAX_ANCESTOR_SIZE constant is still 101000 vbytes (wallet-facing)", function()
       assert.are_equal(101000, mempool.MAX_ANCESTOR_SIZE)
+    end)
+
+    it("MAX_CLUSTER_WEIGHT is 404000 weight units", function()
+      assert.are_equal(404000, mempool.MAX_CLUSTER_WEIGHT)
+      assert.are_equal(mempool.MAX_CLUSTER_VSIZE * 4, mempool.MAX_CLUSTER_WEIGHT)
+    end)
+
+    it("cluster size sums sigop-adjusted WEIGHT, with no per-tx rounding", function()
+      -- Core policy.cpp:390 GetSigOpsAdjustedWeight = max(weight, sigops*20).
+      assert.are_equal(1000, mempool.sigops_adjusted_weight(1000, 0))
+      assert.are_equal(1000, mempool.sigops_adjusted_weight(1000, 10))   -- 200 < 1000
+      assert.are_equal(2000, mempool.sigops_adjusted_weight(1000, 100))  -- 2000 > 1000
+      -- Per-entry contribution is that raw weight — NOT ceil(weight/4).
+      assert.are_equal(1001, mempool.entry_cluster_weight({ adjusted_weight = 1001,
+                                                            weight = 1001, vsize = 251 }))
     end)
   end)
 
