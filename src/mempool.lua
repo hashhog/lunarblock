@@ -65,29 +65,145 @@ local function uf_union(a, b)
   if (uf_rank[a] or 0) == (uf_rank[b] or 0) then uf_rank[a] = (uf_rank[a] or 0) + 1 end
 end
 
+-- Snapshot the union-find key set.
+--
+-- LATENT-UB FIX: every cluster walk below calls uf_find() on each key, and
+-- uf_find() can INSERT into uf_parent — the orphan re-root path at the bottom
+-- of uf_find (`uf_parent[x] = x` when uf_parent[x] was nil).  That path is
+-- live, not theoretical: Mempool:remove_transaction does `uf_parent[txid] = nil`
+-- (see "Cluster mempool: remove from union-find" below) WITHOUT re-parenting
+-- that node's children, so any child whose parent pointer still names the
+-- removed txid walks onto a nil-parent node and re-roots it.
+--
+-- The Lua 5.1 / LuaJIT manual is explicit that `next` — and therefore `pairs` —
+-- has UNDEFINED behaviour if the traversal assigns to a field that was not
+-- already present in the table.  (Assigning to EXISTING fields, which is all
+-- uf_find's path-compression step does, is explicitly allowed.)  Iterating
+-- `pairs(uf_parent)` while uf_find may insert into uf_parent was therefore
+-- undefined: LuaJIT can revisit keys, skip keys, or raise
+-- "invalid key to 'next'" once the insert triggers a table rehash.
+--
+-- Fix: snapshot the key set into a plain array FIRST (this loop calls nothing
+-- and so cannot mutate the table), then iterate the array.  Callers must never
+-- iterate uf_parent directly.
+local function uf_snapshot_keys()
+  local keys, n = {}, 0
+  for txid in pairs(uf_parent) do
+    n = n + 1
+    keys[n] = txid
+  end
+  return keys, n
+end
+
 -- Cluster count limit: max transactions in a single cluster.
 -- Bitcoin Core policy/policy.h:72 DEFAULT_CLUSTER_LIMIT = 64.
 local MAX_CLUSTER_COUNT = 64
--- Cluster vsize limit: max total virtual bytes in a single cluster.
--- Bitcoin Core policy/policy.h:74 DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101
--- → 101 * 1000 = 101,000 vbytes.  Core enforces in vbytes (weight/4).
-local MAX_CLUSTER_VSIZE = 101000
+-- Cluster size limit, in WEIGHT UNITS.
+--   policy/policy.h:74        DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101
+--   kernel/mempool_limits.h:21 cluster_size_vbytes = 101 * 1000 = 101,000 vB
+--   txmempool.cpp:181          max_cluster_size = cluster_size_vbytes
+--                                                 * WITNESS_SCALE_FACTOR
+--                              = 404,000 weight units
+--
+-- Core sums the per-transaction SIGOP-ADJUSTED WEIGHT into a cluster's size and
+-- compares that sum against 404,000.  There is NO per-transaction division by 4
+-- and NO per-transaction rounding anywhere on this path: txmempool.cpp:1017
+-- builds FeePerWeight(fee, GetSigOpsAdjustedWeight(GetTransactionWeight(tx),
+-- sigops_cost, nBytesPerSigOp)) and hands that weight to TxGraph, and
+-- txgraph.cpp:2059 does the comparison
+--   total_count > m_max_cluster_count || total_size > m_max_cluster_size
+--
+-- Summing per-tx ceil(wᵢ/4) and comparing against 101,000 is NOT the same rule.
+-- Because Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4 it is systematically STRICTER than Core — always in
+-- the same direction, by up to 3 vB per transaction.  Keep this in weight units
+-- end to end; do NOT "simplify" it back into vbytes.
+local MAX_CLUSTER_VSIZE = 101000  -- retained for reporting/back-compat only
+local MAX_CLUSTER_WEIGHT = MAX_CLUSTER_VSIZE * consensus.WITNESS_SCALE_FACTOR  -- 404000
 
-local function get_cluster_size(root)
-  local count = 0
-  for txid, _ in pairs(uf_parent) do
-    if uf_find(txid) == root then count = count + 1 end
+-- Per-transaction contribution to a cluster's size, in weight units.
+-- Bitcoin Core policy/policy.cpp:390:
+--   int64_t GetSigOpsAdjustedWeight(int64_t weight, int64_t sigop_cost,
+--                                   unsigned int bytes_per_sigop)
+--   { return std::max(weight, sigop_cost * bytes_per_sigop); }
+-- with bytes_per_sigop = DEFAULT_BYTES_PER_SIGOP = 20 (policy/policy.h:50).
+local function sigops_adjusted_weight(weight, sigop_cost)
+  weight = weight or 0
+  local adjusted = (sigop_cost or 0) * M.DEFAULT_BYTES_PER_SIGOP
+  if adjusted > weight then return adjusted end
+  return weight
+end
+
+-- Weight an in-mempool entry contributes to its cluster.
+-- entry.adjusted_weight is stamped at accept time from the transaction's real
+-- sigop cost (see M.mempool_entry).  The fallbacks only fire for hand-built
+-- entry tables (unit-test fixtures): entry.vsize is already
+-- ceil(adjusted_weight / 4), so vsize * 4 is the tightest bound recoverable
+-- from it (within 3 weight units, and never under-counting).
+local function entry_cluster_weight(entry)
+  if entry == nil then return 0 end
+  if entry.adjusted_weight then return entry.adjusted_weight end
+  if entry.vsize then return entry.vsize * consensus.WITNESS_SCALE_FACTOR end
+  return entry.weight or 0
+end
+
+-- Walk the cluster rooted at `root` once and return (count, weight).
+-- Mirrors TxGraphImpl tracking m_cluster_count and total_size together and
+-- checking them in a single expression (txgraph.cpp:2059).
+--
+-- `entries` must be the mempool's current entries table.  Both the count and
+-- the weight are scoped to transactions that are actually resident there,
+-- because Core's TxGraph holds exactly the mempool's transactions and nothing
+-- else.  That scoping matters here and is not cosmetic: uf_find's orphan
+-- re-root path can RESURRECT a removed txid as a union-find root (a removed
+-- parent whose child still points at it gets `uf_parent[y] = y` written back),
+-- so an un-scoped count would charge the cluster for transactions that left the
+-- mempool and would reject at fewer than 64 live transactions.
+--
+-- With `entries` nil the walk degrades to the legacy union-find node count,
+-- which is what the exported get_cluster_size(root) has always reported.
+local function get_cluster_stats(root, entries)
+  local keys, n = uf_snapshot_keys()
+  local count, weight = 0, 0
+  for i = 1, n do
+    local txid = keys[i]
+    if uf_find(txid) == root then
+      if entries == nil then
+        count = count + 1
+      else
+        local e = entries[txid]
+        if e then
+          count = count + 1
+          weight = weight + entry_cluster_weight(e)
+        end
+      end
+    end
   end
+  return count, weight
+end
+
+-- Legacy union-find node count for `root` (no entries scoping).  Kept for
+-- external callers; the acceptance gate uses get_cluster_stats with entries.
+local function get_cluster_size(root)
+  local count = get_cluster_stats(root, nil)
   return count
 end
 
+-- Total cluster size in WEIGHT UNITS.  This is the quantity the acceptance gate
+-- compares against MAX_CLUSTER_WEIGHT.
+local function get_cluster_weight(root, entries)
+  local _, weight = get_cluster_stats(root, entries)
+  return weight
+end
+
 -- Sum the vsize of all in-mempool transactions in the cluster rooted at `root`.
--- `entries` must be the mempool's current entries table so that removed
--- transactions are not counted (union-find nodes linger until explicitly nil'd,
--- but entries are removed immediately).
+-- REPORTING ONLY — the acceptance gate uses get_cluster_weight().  Retained
+-- because Σ⌈vsizeᵢ⌉ is what an operator-facing vbyte figure means; it is
+-- deliberately NOT the value compared against a limit (see MAX_CLUSTER_WEIGHT).
 local function get_cluster_vsize(root, entries)
+  local keys, n = uf_snapshot_keys()
   local vsize_total = 0
-  for txid, _ in pairs(uf_parent) do
+  for i = 1, n do
+    local txid = keys[i]
     if uf_find(txid) == root then
       local e = entries and entries[txid]
       if e then
@@ -99,8 +215,10 @@ local function get_cluster_vsize(root, entries)
 end
 
 local function get_cluster_txids(root)
+  local keys, n = uf_snapshot_keys()
   local txids = {}
-  for txid, _ in pairs(uf_parent) do
+  for i = 1, n do
+    local txid = keys[i]
     if uf_find(txid) == root then txids[#txids + 1] = txid end
   end
   return txids
@@ -179,13 +297,22 @@ M.uf_parent = uf_parent
 M.uf_rank = uf_rank
 M.uf_find = uf_find
 M.uf_union = uf_union
--- Cluster limits (policy/policy.h:72-74, kernel/mempool_limits.h:20-22)
+-- Cluster limits (policy/policy.h:72-74, kernel/mempool_limits.h:20-22,
+-- txmempool.cpp:181).  MAX_CLUSTER_WEIGHT is the ENFORCED size bound;
+-- MAX_CLUSTER_VSIZE is the vbyte figure it is derived from, kept for display
+-- and for callers that predate the weight-unit form.
 M.MAX_CLUSTER_COUNT = MAX_CLUSTER_COUNT
 M.MAX_CLUSTER_VSIZE = MAX_CLUSTER_VSIZE
+M.MAX_CLUSTER_WEIGHT = MAX_CLUSTER_WEIGHT
 -- Keep legacy alias so external callers that read MAX_CLUSTER_SIZE still get
 -- the transaction-COUNT limit (not 101 kvB).
 M.MAX_CLUSTER_SIZE = MAX_CLUSTER_COUNT
+M.uf_snapshot_keys = uf_snapshot_keys
+M.sigops_adjusted_weight = sigops_adjusted_weight
+M.entry_cluster_weight = entry_cluster_weight
+M.get_cluster_stats = get_cluster_stats
 M.get_cluster_size = get_cluster_size
+M.get_cluster_weight = get_cluster_weight
 M.get_cluster_vsize = get_cluster_vsize
 M.get_cluster_txids = get_cluster_txids
 M.linearize_cluster = linearize_cluster
@@ -849,8 +976,10 @@ end
 -- @param vsize number: Virtual size
 -- @param height number: Block height when added
 -- @param time number: Unix timestamp when added (optional)
+-- @param adjusted_weight number: max(weight, sigop_cost*20) (optional)
 -- @return table: Mempool entry
-function M.mempool_entry(tx, txid, fee, vsize, height, time)
+function M.mempool_entry(tx, txid, fee, vsize, height, time, adjusted_weight)
+  local tx_weight = validation.get_tx_weight(tx)
   return {
     tx = tx,
     txid = txid,               -- hash256
@@ -862,7 +991,14 @@ function M.mempool_entry(tx, txid, fee, vsize, height, time)
     -- block-connect / re-entry so a prior delta carries over.
     modified_fee = fee,         -- satoshis (base + accumulated priority delta)
     vsize = vsize,              -- virtual size (weight / 4)
-    weight = validation.get_tx_weight(tx),
+    weight = tx_weight,
+    -- Sigop-adjusted weight: max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP).
+    -- Core policy/policy.cpp:390 GetSigOpsAdjustedWeight.  This is the exact
+    -- quantity Core sums into a cluster's size (txmempool.cpp:1017 feeds it to
+    -- TxGraph::AddTransaction), so it is what the cluster gate reads.  Falls
+    -- back to the raw weight when the caller has no sigop cost to hand; the
+    -- production caller (Mempool:accept_transaction) always passes the real one.
+    adjusted_weight = adjusted_weight or tx_weight,
     size = #serialize.serialize_transaction(tx, true),
     fee_rate = fee / vsize,     -- sat/vB
     height = height,            -- block height when added
@@ -1494,7 +1630,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       local affected_txids = {}
       for conflict_hex in pairs(all_conflicts) do
         local root = uf_find(conflict_hex)
-        for txid_iter, _ in pairs(uf_parent) do
+        -- Snapshot before walking: uf_find() inserts on the orphan re-root
+        -- path, and mutating uf_parent mid-`pairs` is undefined.  See
+        -- uf_snapshot_keys().
+        local uf_keys, uf_n = uf_snapshot_keys()
+        for i = 1, uf_n do
+          local txid_iter = uf_keys[i]
           if uf_find(txid_iter) == root and self.entries[txid_iter] then
             affected_txids[txid_iter] = true
           end
@@ -1605,29 +1746,30 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
     end
   end
 
-  if ancestor_count > M.MAX_ANCESTORS then
-    return false, "too many ancestors: " .. ancestor_count
-  end
-  if ancestor_size > M.MAX_ANCESTOR_SIZE then
-    return false, "ancestor size too large: " .. ancestor_size
-  end
-
-  -- 8b. Check descendant limits for ALL ancestors
-  -- Adding this transaction would add 1 to descendant_count and vsize to descendant_size
-  -- for every ancestor (including direct parents)
-  for anc_hex in pairs(ancestors) do
-    local anc_entry = self.entries[anc_hex]
-    if anc_entry then
-      local new_desc_count = anc_entry.descendant_count + 1
-      local new_desc_size = anc_entry.descendant_size + vsize
-      if new_desc_count > M.MAX_DESCENDANTS then
-        return false, "too many descendants for ancestor " .. anc_hex:sub(1, 16)
-      end
-      if new_desc_size > M.MAX_DESCENDANT_SIZE then
-        return false, "descendant size too large for ancestor " .. anc_hex:sub(1, 16)
-      end
-    end
-  end
+  -- 8b. NO ancestor-count / ancestor-size / descendant-count / descendant-size
+  -- acceptance gate.  Bitcoin Core v31's cluster mempool DELETED all four:
+  -- `too-long-mempool-chain` no longer exists anywhere in Core's tree, and
+  -- kernel/mempool_limits.h no longer even has ancestor/descendant SIZE fields.
+  -- The surviving `ancestor_count`/`descendant_count` members of MemPoolLimits
+  -- are consumed only by wallet coin-selection, via
+  -- interfaces::Chain::getPackageLimits (node/interfaces.cpp:709-716 ->
+  -- wallet/spend.cpp:879-882) — never by mempool acceptance.
+  --
+  -- A 26-long chain and a 27-transaction fan-out are both ACCEPTED by Core now;
+  -- the connected-component (cluster) gate at the bottom of this function is
+  -- what bounds them.  Rejecting here would be over-strict, and would also be
+  -- scoped wrong: these gates are ancestor/descendant-scoped, whereas a cluster
+  -- is the whole connected component (72 siblings sharing one parent form ONE
+  -- 73-transaction cluster while every child has just 2 ancestors).
+  --
+  -- The ancestor/descendant bookkeeping above and below is KEPT — it feeds
+  -- getmempoolentry's ancestorcount/ancestorsize/descendantcount fields, which
+  -- Core still reports (rpc/mempool.cpp:512-521).  Only the rejection is gone.
+  -- M.MAX_ANCESTORS / M.MAX_DESCENDANTS are likewise kept as constants for the
+  -- wallet-facing package-limit query, matching Core's remaining use of them.
+  --
+  -- TRUC's 2-ancestor / 2-descendant limits are the ONLY surviving
+  -- ancestor/descendant enforcement, and they are applied in step 8c below.
 
   -- 8c. BIP-431 TRUC (v3) policy checks.
   -- Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261 (SingleTRUCChecks).
@@ -1753,7 +1895,11 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   end
 
   -- 9. Add to mempool
-  local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time())
+  -- `weight` and `tx_sigop_cost` were computed above (steps 3d and 6); pass the
+  -- sigop-adjusted weight through so the cluster gate below sums exactly what
+  -- Core sums (policy.cpp:390 → txmempool.cpp:1017 → TxGraph).
+  local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time(),
+    sigops_adjusted_weight(weight, tx_sigop_cost))
   entry.ancestor_count = ancestor_count - 1  -- exclude self
   entry.ancestor_size = ancestor_size - vsize  -- exclude self
   entry.ancestor_fees = ancestor_fees - fee  -- exclude self
@@ -1801,23 +1947,38 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   for parent_hex in pairs(direct_parents) do
     uf_union(txid_hex, parent_hex)
   end
-  -- Check cluster limits (Bitcoin Core policy/policy.h:72-74,
-  -- kernel/mempool_limits.h:20-22, txmempool.cpp:1072-1079).
-  -- Two independent gates mirror Core's TxGraph::IsOversized() check:
-  --   (a) cluster transaction COUNT must not exceed DEFAULT_CLUSTER_LIMIT (64)
-  --   (b) cluster total vsize must not exceed DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000 (101000)
+  -- Cluster limits — the ONLY size/count bound on a connected component of the
+  -- mempool, and (with TRUC's 2/2) the only thing standing between a fan-out
+  -- and an unbounded cluster.  Bitcoin Core v31 replaced the old
+  -- ancestor/descendant limits with these; `too-long-mempool-chain` no longer
+  -- exists anywhere in Core's tree.
+  --
+  -- Core path:
+  --   validation.cpp:1341-1344  CheckMemPoolPolicyLimits() ->
+  --                             state.Invalid(TX_MEMPOOL_POLICY,
+  --                                           "too-large-cluster", "")
+  --   txmempool.cpp:1072-1080   CheckMemPoolPolicyLimits ->
+  --                             !m_txgraph->IsOversized(Level::TOP)
+  --   txgraph.cpp:2059          total_count > m_max_cluster_count ||
+  --                             total_size  > m_max_cluster_size
+  --
+  -- Both comparisons are STRICTLY greater-than, so 64 transactions ACCEPT and
+  -- 65 REJECT; 404,000 weight units ACCEPT and 404,001 REJECT.  Core raises the
+  -- single reject reason "too-large-cluster" with an EMPTY debug string for
+  -- either trigger, so we return exactly that token and append nothing.
+  --
+  -- Size is summed in WEIGHT units from each entry's sigop-adjusted weight
+  -- (see MAX_CLUSTER_WEIGHT / entry_cluster_weight above).  Do not reformulate
+  -- this as Σ⌈vsizeᵢ⌉ > 101000 — that is a systematically stricter rule.
+  --
+  -- NOTE: this is mempool POLICY, not consensus.  Nothing here may affect block
+  -- validation; a block containing a 100-transaction chain stays valid.
   local cluster_root = uf_find(txid_hex)
-  local cluster_count = get_cluster_size(cluster_root)
-  if cluster_count > MAX_CLUSTER_COUNT then
+  local cluster_count, cluster_weight = get_cluster_stats(cluster_root, self.entries)
+  if cluster_count > MAX_CLUSTER_COUNT or cluster_weight > MAX_CLUSTER_WEIGHT then
     -- Undo: remove the entry we just added
     self:remove_transaction(txid_hex, "cluster-limit")
-    return false, "cluster size exceeds count limit of " .. MAX_CLUSTER_COUNT
-  end
-  local cluster_vsize = get_cluster_vsize(cluster_root, self.entries)
-  if cluster_vsize > MAX_CLUSTER_VSIZE then
-    -- Undo: remove the entry we just added
-    self:remove_transaction(txid_hex, "cluster-limit")
-    return false, "cluster vsize " .. cluster_vsize .. " exceeds limit of " .. MAX_CLUSTER_VSIZE
+    return false, "too-large-cluster"
   end
 
   -- 9. Evict low-fee and expired transactions if mempool exceeds limits.
@@ -2505,6 +2666,11 @@ function Mempool:iter_by_wtxid()
 end
 
 --- Check descendant limits for a potential new child transaction.
+-- NOT a mempool acceptance gate — Core v31's cluster mempool removed
+-- descendant-count/size from acceptance entirely (see step 8b in
+-- accept_transaction).  This mirrors the wallet-facing package-limit query
+-- (interfaces::Chain::getPackageLimits, node/interfaces.cpp:709-716), which is
+-- the only thing in Core that still reads MemPoolLimits::descendant_count.
 -- @param parent_txid_hex string: Parent transaction id
 -- @param child_vsize number: Virtual size of the potential child
 -- @return boolean: True if limits would be satisfied
