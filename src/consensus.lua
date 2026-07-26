@@ -1374,6 +1374,100 @@ M.SCRIPT_FLAG_EXCEPTIONS = {
   regtest  = {},
 }
 
+--------------------------------------------------------------------------------
+-- get_block_script_flags — faithful port of Bitcoin Core's GetBlockScriptFlags
+-- (bitcoin-core/src/validation.cpp:2249-2289).
+--
+-- Core is a THREE-STEP sequence and the ORDER IS LOAD-BEARING:
+--
+--   step 1  BASE       flags = P2SH | WITNESS | TAPROOT, UNCONDITIONALLY, for
+--                      every block (validation.cpp:2262).  Core has had no
+--                      BIP16Height and no taprootHeight in this path since v23:
+--                      "For simplicity, always leave P2SH+WITNESS+TAPROOT on
+--                      except for the two violating blocks."  Height-gating any
+--                      of these three is a divergence.
+--
+--   step 2  EXCEPTION  on a block-hash hit in script_flag_exceptions, REPLACE
+--                      the entire flag set with the table's value
+--                      (validation.cpp:2264-2267).  This is an assignment, NOT
+--                      an early return.
+--
+--   step 3  HEIGHT     OR the four still-height-gated soft forks ON TOP of the
+--                      step-2 result (validation.cpp:2268-2286): DERSIG (BIP66),
+--                      CHECKLOCKTIMEVERIFY (BIP65), CHECKSEQUENCEVERIFY
+--                      (BIP68/112/113) and NULLDUMMY (BIP147, rides SegWit).
+--
+-- Why step 3 MUST run after step 2: mainnet block 692261's exception value is
+-- P2SH|WITNESS.  Returning early at step 2 yields P2SH|WITNESS alone and DROPS
+-- DERSIG|CLTV|CSV|NULLDUMMY — all four of which are active at that height.
+-- That is a FALSE-ACCEPT: the node would accept scripts Core rejects under
+-- BIP-66/65/112/147.  (This was lunarblock's bug: the height gates were folded
+-- into the base table and the exception assignment then wiped them.)
+--
+-- Buried-deployment activation predicate: Core uses DeploymentActiveAt(index),
+-- which for a buried deployment is `index.nHeight >= DeploymentHeight`
+-- (deploymentstatus.h) — the activation height itself IS active.
+--
+-- POLICY FLAGS ARE FORBIDDEN HERE.  NULLFAIL, CLEANSTACK, LOW_S, STRICTENC,
+-- MINIMALDATA, MINIMALIF, WITNESS_PUBKEYTYPE and CONST_SCRIPTCODE are
+-- STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:125) and must never appear in
+-- the block-validation flag set — setting them here false-rejects blocks Core
+-- accepts.
+--
+-- @param network table:  a M.networks entry (needs .name and the buried heights)
+-- @param height  number: the height of the block being connected
+-- @param block_hash  hash256 table | display-hex string | nil: the block's own
+--        hash.  The exception table is keyed by DISPLAY-order (big-endian) hex,
+--        which is what types.hash256_hex returns — the same orientation used by
+--        the BIP-30 exemption tables above.  nil skips the exception lookup.
+-- @return table: fresh flags table (never aliases SCRIPT_FLAG_EXCEPTIONS)
+--------------------------------------------------------------------------------
+function M.get_block_script_flags(network, height, block_hash)
+  -- step 1: BASE — unconditional P2SH | WITNESS | TAPROOT.
+  local flags = {
+    verify_p2sh    = true,
+    verify_witness = true,
+    verify_taproot = true,
+  }
+
+  -- step 2: EXCEPTION — replace the WHOLE set on a block-hash hit.
+  local exceptions = network and M.SCRIPT_FLAG_EXCEPTIONS[network.name]
+  if exceptions and block_hash ~= nil then
+    local hex
+    if type(block_hash) == "string" then
+      hex = block_hash
+    else
+      hex = require("lunarblock.types").hash256_hex(block_hash)
+    end
+    local override = exceptions[hex]
+    if override then
+      -- Copy, never alias: step 3 mutates `flags`, and aliasing the module
+      -- table would permanently corrupt the exception entry for every later
+      -- block in the process.
+      flags = {}
+      for k, v in pairs(override) do flags[k] = v end
+    end
+  end
+
+  -- step 3: HEIGHT — OR the four buried soft forks on top of step 2.
+  if network then
+    if network.bip66_height and height >= network.bip66_height then
+      flags.verify_dersig = true                    -- BIP66
+    end
+    if network.bip65_height and height >= network.bip65_height then
+      flags.verify_checklocktimeverify = true       -- BIP65
+    end
+    if network.csv_height and height >= network.csv_height then
+      flags.verify_checksequenceverify = true       -- BIP68/112/113
+    end
+    if network.segwit_height and height >= network.segwit_height then
+      flags.verify_nulldummy = true                 -- BIP147 (rides SegWit)
+    end
+  end
+
+  return flags
+end
+
 -- Convenience function to get network by name
 function M.get_network(name)
   return M.networks[name]
