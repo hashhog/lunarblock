@@ -595,32 +595,34 @@ describe("mempool", function()
   end)
 
   describe("ancestor/descendant limits", function()
-    it("rejects transaction exceeding ancestor count limit", function()
+    -- Core v31's cluster mempool DELETED the 25-ancestor acceptance gate:
+    -- `too-long-mempool-chain` is gone from Core's tree entirely, and the
+    -- surviving MemPoolLimits::ancestor_count is read only by wallet
+    -- coin-selection (node/interfaces.cpp:709-716 -> wallet/spend.cpp:879-882).
+    -- A 25-long chain is bounded now by the cluster gate (64 / 404,000 wu).
+    it("accepts a chain longer than the legacy 25-ancestor limit", function()
       local chain_state = make_mock_chain_state()
 
-      -- Create a chain of transactions exceeding MAX_ANCESTORS
       local prev_txid = types.hash256(string.rep("\x01", 32))
       local prev_txid_hex = types.hash256_hex(prev_txid)
       add_utxo(chain_state, prev_txid_hex, 0, 100000000)
 
       local mp = mempool.new(chain_state)
 
-      -- Build chain up to MAX_ANCESTORS
+      -- Build a chain one longer than the legacy MAX_ANCESTORS limit.
       local current_txid = prev_txid
-      for i = 1, mempool.MAX_ANCESTORS do
+      for i = 1, mempool.MAX_ANCESTORS + 1 do
         local tx = make_tx(1, {}, {}, 0)
         tx.inputs[1] = make_input(current_txid, 0)
         tx.outputs[1] = make_output(100000000 - i * 10000)  -- Decreasing value for fees
 
         local ok, txid_hex = mp:accept_transaction(tx)
-        if ok then
-          current_txid = validation.compute_txid(tx)
-        else
-          -- Chain should fail at some point due to ancestor limit
-          assert.truthy(txid_hex:match("too many ancestors"))
-          break
-        end
+        assert.is_true(ok, "tx " .. i .. " must be accepted (no ancestor gate): "
+          .. tostring(txid_hex))
+        current_txid = validation.compute_txid(tx)
       end
+
+      assert.equal(mempool.MAX_ANCESTORS + 1, mp.tx_count)
     end)
 
     it("tracks ancestor counts correctly", function()
@@ -660,7 +662,7 @@ describe("mempool", function()
       assert.equal(1, entry1.descendant_count)
     end)
 
-    it("rejects 26th transaction in a chain (exceeds MAX_ANCESTORS=25)", function()
+    it("accepts the 26th transaction in a chain (no 25-ancestor gate in v31)", function()
       local chain_state = make_mock_chain_state()
 
       -- Start with a UTXO
@@ -690,17 +692,19 @@ describe("mempool", function()
       local last_entry = mp:get_entry(txids[25])
       assert.equal(24, last_entry.ancestor_count)
 
-      -- The 26th transaction should be rejected
+      -- The 26th transaction is ACCEPTED: Core's cluster mempool has no
+      -- ancestor-count gate.  Matches diff-test corpus entry `cluster-linear-26`
+      -- (26 txs, Core verdict: all accept).
       local tx26 = make_tx(1, {}, {}, 0)
       tx26.inputs[1] = make_input(current_txid, 0)
       tx26.outputs[1] = make_output(500000000 - 26 * 1000000)
 
       local ok26, err26 = mp:accept_transaction(tx26)
-      assert.is_false(ok26)
-      assert.truthy(err26:match("too many ancestors"))
+      assert.is_true(ok26, "26th tx must be accepted: " .. tostring(err26))
+      assert.equal(26, mp.tx_count)
     end)
 
-    it("rejects transaction when ancestor has too many descendants", function()
+    it("accepts a 26th child of one parent (no 25-descendant gate in v31)", function()
       local chain_state = make_mock_chain_state()
 
       -- Create root UTXO with many outputs
@@ -739,14 +743,17 @@ describe("mempool", function()
       local parent_entry = mp:get_entry(parent_hex)
       assert.equal(25, parent_entry.descendant_count)
 
-      -- The 26th child should be rejected due to descendant limit
+      -- The 26th child is ACCEPTED: Core's cluster mempool has no
+      -- descendant-count gate.  Matches diff-test corpus entry `cluster-fan-26`
+      -- (1 parent + 26 children, Core verdict: all accept).  The whole fan-out
+      -- is ONE cluster of 27, still under the 64 limit.
       local child26 = make_tx(1, {}, {}, 0)
       child26.inputs[1] = make_input(parent_txid, 25)
       child26.outputs[1] = make_output(290000)
 
       local ok26, err26 = mp:accept_transaction(child26)
-      assert.is_false(ok26)
-      assert.truthy(err26:match("too many descendants"))
+      assert.is_true(ok26, "26th child must be accepted: " .. tostring(err26))
+      assert.equal(26, mp:get_entry(parent_hex).descendant_count)
     end)
 
     it("properly deduplicates ancestors with diamond dependency", function()
@@ -885,7 +892,12 @@ describe("mempool", function()
       assert.equal(2, mp.tx_count)
     end)
 
-    it("enforces ancestor size limit", function()
+    -- The old assertion here pinned "ancestor size too large" — a gate Core v31
+    -- removed (kernel/mempool_limits.h no longer has ancestor/descendant SIZE
+    -- fields at all).  What actually bounds a chain of large transactions now is
+    -- the cluster SIZE limit: Σ max(weightᵢ, sigopsᵢ*20) > 404,000 weight units
+    -- (txmempool.cpp:181, txgraph.cpp:2059).
+    it("enforces the cluster size limit in weight units", function()
       local chain_state = make_mock_chain_state()
 
       -- Create UTXOs for large transactions
@@ -897,35 +909,63 @@ describe("mempool", function()
 
       local mp = mempool.new(chain_state)
 
-      -- Build a chain of large transactions (each ~10KB)
-      -- MAX_ANCESTOR_SIZE = 101000, so after ~10 transactions it should fail
-      local prev_txid = types.hash256(string.rep("\x00", 32))
+      -- Build a chain of large transactions until the cluster weight bound trips.
+      -- NOTE: the old fixture seeded this chain from an all-zero txid, which is
+      -- the null prevout — every transaction was rejected with
+      -- `bad-txns-prevout-null` and the assertion never saw a real gate.  That
+      -- is why this test was already failing before this change.
+      local prev_txid = types.hash256(string.rep("\x7f", 32))
       add_utxo(chain_state, types.hash256_hex(prev_txid), 0, 1000000000)
 
+      local remaining = 1000000000
       local accepted_count = 0
-      for i = 1, 15 do
+      local rejected = false
+      for i = 1, 30 do
         local tx = make_tx(1, {}, {}, 0)
         tx.inputs[1] = make_input(prev_txid, 0)
-        -- Create multiple outputs to increase tx size
+        -- ~7 kB of outputs (~27,400 weight units) per transaction, so the
+        -- 404,000 wu cluster bound trips after ~14 of them — well short of the
+        -- 64-transaction count bound.
         tx.outputs = {}
-        for j = 1, 200 do  -- ~8KB with many outputs
-          tx.outputs[j] = make_output(4000000)
+        local carry = remaining - 199 * 1000 - 10000  -- 199 small outs + 10k fee
+        tx.outputs[1] = make_output(carry)
+        for j = 2, 200 do
+          tx.outputs[j] = make_output(1000)
         end
 
         local ok, result = mp:accept_transaction(tx)
         if ok then
           accepted_count = accepted_count + 1
           prev_txid = validation.compute_txid(tx)
+          remaining = carry
         else
-          -- Should eventually fail due to ancestor size
-          assert.truthy(result:match("ancestor size too large"))
+          -- Core's single reject reason for either cluster trigger, with an
+          -- EMPTY debug string (validation.cpp:1343) — the token must be exact,
+          -- with nothing appended.
+          assert.equal("too-large-cluster", result)
+          rejected = true
           break
         end
       end
 
+      assert.is_true(rejected, "cluster weight bound must eventually reject")
+
+      -- Everything that made it in must sit within the 404,000 wu bound, and
+      -- the chain must have stopped well short of the 64-tx COUNT limit — i.e.
+      -- it was size, not count, that fired.
+      local total_weight = 0
+      for _, e in pairs(mp.entries) do
+        total_weight = total_weight + mempool.entry_cluster_weight(e)
+      end
+      assert.is_true(total_weight <= mempool.MAX_CLUSTER_WEIGHT,
+        "resident cluster weight " .. total_weight .. " must be <= "
+          .. mempool.MAX_CLUSTER_WEIGHT)
+      assert.is_true(accepted_count < mempool.MAX_CLUSTER_COUNT,
+        "size limit must fire before the count limit in this fixture")
+
       -- Should have accepted some but not all
       assert.is_true(accepted_count > 0)
-      assert.is_true(accepted_count < 15)
+      assert.is_true(accepted_count < 30)
     end)
   end)
 
