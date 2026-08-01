@@ -248,31 +248,45 @@ describe("W105 CCheckQueue / parallel script verification audit", function()
   end)
 
   -- =========================================================================
-  -- BUG-1: G3 Script execution cache key uses txid+inp_idx instead of wtxid
-  -- FIXED: key is now per-TX (SHA-256(nonce||wtxid||flags)); input_index ignored
+  -- BUG-1: G3 Script execution cache key — CORRECTED to per-INPUT
+  -- (wtxid + input_index + flags)
+  --
+  -- The original W105 BUG-1 claim ("key must be per-TX like Core") conflated
+  -- Core's TWO caches:
+  --   1. Script execution cache (validation.cpp:2078-2086): per-TX,
+  --      SHA256(salt || wtxid || flags) — but Core inserts that entry ONCE,
+  --      AFTER every input's scripts have run (validation.cpp:2127-2131,
+  --      `cacheFullScriptStore && !pvChecks` at the end of CheckInputScripts).
+  --   2. Signature cache (script/sigcache.cpp:39-49): per
+  --      (sighash, pubkey, sig) — and the sighash commits to the input index,
+  --      so it is effectively per-INPUT.
+  -- lunarblock's sig_cache is inserted PER-INPUT inside the utxo.lua input
+  -- loop, so the sound mirror of Core is the per-INPUT key: a per-TX key here
+  -- would let vin[1..n-1] hit the entry seeded by vin[0] and skip
+  -- verification entirely (consensus-fork vector).  See src/sig_cache.lua
+  -- header for the full analysis.
   -- =========================================================================
-  describe("BUG-1 G3 sig_cache key: per-TX (wtxid+flags) — FIXED", function()
-    it("inserting same tx twice (different input_index) produces ONE cache entry", function()
-      -- FIXED: Core's SHA256(nonce || wtxid || flags) is per-TX; one cache entry
-      -- covers all inputs.  input_index is intentionally ignored in make_key.
+  describe("BUG-1 G3 sig_cache key: per-INPUT (wtxid+input_index+flags) — CORRECTED", function()
+    it("inserting same tx twice (different input_index) produces TWO cache entries", function()
+      -- Per-INPUT key (Core signature-cache granularity, sigcache.cpp:39-49):
+      -- each input of a tx has its OWN entry.
       local sc = sig_cache_mod.new(100)
       local txid = string.rep("\xaa", 32)
       sc:insert(txid, 1, 7)
       sc:insert(txid, 2, 7)
-      -- Both inserts hash to the same key (input_index excluded) → size = 1
-      assert.equals(1, sc:size(),
-        "FIXED BUG-1: per-TX key — same txid+flags = same key regardless of input_index")
+      assert.equals(2, sc:size(),
+        "per-INPUT key — (txid,input_index,flags) tuples are distinct entries")
     end)
 
-    it("cache hit on input 1 implies hit on input 2 (same tx, per-TX key)", function()
-      -- FIXED: after one insert for the tx, ALL inputs of that tx are cached.
+    it("cache hit on input 1 does NOT imply hit on input 2 (per-input isolation)", function()
+      -- Safety: input 2 must still be verified even after input 1 passed.
+      -- A per-TX hit here would skip vin[1]'s script check entirely.
       local sc = sig_cache_mod.new(100)
       local txid = string.rep("\xbb", 32)
       sc:insert(txid, 1, 3)
       assert.is_true(sc:lookup(txid, 1, 3))
-      -- Per-TX key: looking up with input_index=2 also hits (same tx, same flags)
-      assert.is_true(sc:lookup(txid, 2, 3),
-        "FIXED BUG-1: per-TX key — lookup with any input_index hits for cached tx")
+      assert.is_false(sc:lookup(txid, 2, 3),
+        "per-INPUT key — other inputs of the same tx must NOT hit")
     end)
 
     it("different wtxid gives cache miss (witness mutation detected)", function()

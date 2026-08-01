@@ -151,7 +151,7 @@ function M.new_headers_sync_state(peer_id, network, chain_start)
 
   -- Parse minimum required work from network config
   self.min_required_work = consensus.work_from_hex(
-    network.min_chain_work or string.rep("00", 64)
+    network.min_chain_work or string.rep("0", 64)  -- 64 hex chars = 32 bytes (uint256)
   )
 
   -- Chain start point (where we begin syncing from)
@@ -1332,7 +1332,7 @@ function HeaderChain:accept_header(header, opts)
   local candidate_work = consensus.work_add(parent.total_work, self:work_for_bits(header.bits))
   local _opts = opts or {}
   if not _opts.min_pow_checked then
-    local min_work_hex = self.network.min_chain_work or string.rep("00", 64)
+    local min_work_hex = self.network.min_chain_work or string.rep("0", 64)
     local min_work = consensus.work_from_hex(min_work_hex)
     -- candidate_work is already a 32-byte string; compare directly (no float conversion).
     if consensus.work_compare(candidate_work, min_work) < 0 then
@@ -1641,7 +1641,7 @@ end
 -- @return boolean: true if below minimum
 function HeaderChain:is_low_work_chain(total_work)
   local min_work = consensus.work_from_hex(
-    self.network.min_chain_work or string.rep("00", 64)
+    self.network.min_chain_work or string.rep("0", 64)  -- 64 hex chars = 32 bytes (uint256)
   )
   return consensus.work_compare(total_work, min_work) < 0
 end
@@ -1722,7 +1722,7 @@ function HeaderChain:try_low_work_sync(peer, headers)
   end
 
   local min_work = consensus.work_from_hex(
-    self.network.min_chain_work or string.rep("00", 64))
+    self.network.min_chain_work or string.rep("0", 64))  -- 64 hex chars = 32 bytes
 
   if consensus.work_compare(claimed_work, min_work) >= 0 then
     -- Chain has sufficient work, use normal sync

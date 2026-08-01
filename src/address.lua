@@ -22,9 +22,13 @@ function M.base58_encode(data)
   end
 
   -- Convert to big integer and repeatedly divide by 58
-  -- Work with a table of bytes for arbitrary precision
+  -- Work with a table of bytes for arbitrary precision.
+  -- Skip the leading zero bytes: they are encoded as '1's below and must not
+  -- contribute a spurious zero digit to the division loop (Core base58.cpp
+  -- EncodeBase58 advances the input iterator past leading zeros before
+  -- dividing; without this, an all-zero input encoded to one '1' too many).
   local bytes = {}
-  for i = 1, #data do bytes[i] = data:byte(i) end
+  for i = leading_zeros + 1, #data do bytes[#bytes + 1] = data:byte(i) end
 
   local result = {}
   while #bytes > 0 do

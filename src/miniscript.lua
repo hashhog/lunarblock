@@ -890,7 +890,15 @@ local function to_script(node, followed_by_verify)
 
   elseif frag == F.WRAP_V then
     local sub = node.subs[1]
-    local sub_script = to_script(sub, true)
+    -- Compile the sub WITHOUT the verify flag, then merge the implied
+    -- OP_VERIFY with its final opcode here.  (Passing followed_by_verify=true
+    -- down instead makes a mergeable sub emit its -VERIFY form already, and
+    -- the suffix check below then falls through and appends a second,
+    -- spurious OP_VERIFY — e.g. v:pk(K) wrongly became
+    -- <key> CHECKSIGVERIFY VERIFY instead of <key> CHECKSIGVERIFY.  Matches
+    -- Core's ToScript: the sub absorbs the following OP_VERIFY iff its final
+    -- opcode has a -VERIFY sibling, i.e. it lacks the 'x' type property.)
+    local sub_script = to_script(sub, false)
     -- If sub ends with OP_CHECKSIG, convert to OP_CHECKSIGVERIFY
     -- If sub ends with OP_CHECKMULTISIG, convert to OP_CHECKMULTISIGVERIFY
     -- If sub ends with OP_EQUAL, convert to OP_EQUALVERIFY
@@ -1479,10 +1487,16 @@ function M.from_policy(policy_str, key_map)
 
   local function read_key()
     skip_ws()
-    -- Key can be: hex pubkey, or identifier that maps to a key
+    -- Key can be: hex pubkey, or identifier that maps to a key.
+    -- Consult key_map FIRST: placeholder names made of hex characters
+    -- (e.g. "A") would otherwise be misread as hex pubkeys and silently
+    -- compile to the wrong bytes (hex_to_bin("A") == "A").
     local ch = peek()
     if ch:match("[%da-fA-F]") then
       local hex = read_hex()
+      if key_map[hex] then
+        return key_map[hex]
+      end
       return hex_to_bin(hex)
     else
       local name = read_ident()

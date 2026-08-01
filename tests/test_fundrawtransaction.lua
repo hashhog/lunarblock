@@ -127,7 +127,7 @@ test("funds a no-input raw tx: adds inputs + change, genuine fee/changepos", fun
   local raw_hex = build_unfunded_raw_hex(recip_addr, 0.5)
 
   -- Sanity: the pre-fund tx genuinely has NO inputs.
-  local pre_tx = serialize.deserialize_transaction(
+  local pre_tx = serialize.deserialize_transaction_auto(
     (raw_hex:gsub('..', function(cc) return string.char(tonumber(cc, 16)) end)))
   expect_eq(#pre_tx.inputs, 0, "pre-fund tx should have 0 inputs")
   expect_eq(#pre_tx.outputs, 1, "pre-fund tx should have 1 output")
@@ -144,7 +144,7 @@ test("funds a no-input raw tx: adds inputs + change, genuine fee/changepos", fun
   expect_true(result.fee > 0, "fee must be > 0, got " .. tostring(result.fee))
 
   -- Decode the returned hex back to a tx.
-  local funded = serialize.deserialize_transaction(
+  local funded = serialize.deserialize_transaction_auto(
     (result.hex:gsub('..', function(cc) return string.char(tonumber(cc, 16)) end)))
 
   -- Inputs were added (vin non-empty).

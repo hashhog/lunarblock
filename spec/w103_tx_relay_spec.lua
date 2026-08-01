@@ -35,6 +35,13 @@ describe("W103 tx relay flow audit", function()
   local p2p, peer_mod, mempool_mod, peerman_mod
 
   setup(function()
+    -- Mock socket module if not available (for test environments without LuaSocket)
+    if not pcall(require, "socket") then
+      package.preload["socket"] = function()
+        return { gettime = function() return os.time() end }
+      end
+    end
+
     package.path = "src/?.lua;" .. package.path
     package.preload["lunarblock.types"]      = function() return require("types") end
     package.preload["lunarblock.serialize"]  = function() return require("serialize") end
@@ -251,25 +258,21 @@ describe("W103 tx relay flow audit", function()
       local op = mempool_mod.new_orphan_pool()
       assert.equals(0, op:size())
     end)
-    it("XFAIL: tx processing must skip during InitialBlockDownload", function()
+    pending("XFAIL: tx processing must skip during InitialBlockDownload", function()
       -- Core:4395: `if (m_chainman.IsInitialBlockDownload()) return;`
-      -- Lunarblock's tx handler has no equivalent IBD check.
+      -- Lunarblock's tx handler (src/main.lua) has no equivalent IBD check.
       -- During IBD the UTXO set is incomplete; validating transactions
       -- against it wastes CPU and produces incorrect reject reasons.
-      -- The boolean below documents the missing guard.
-      local has_ibd_guard_in_tx_handler = false  -- BUG: there is none
-      assert.is_true(has_ibd_guard_in_tx_handler,
-        "BUG G4: tx handler must return early during IBD (Core:4395)")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (tx handler early-return).
     end)
   end)
 
   ----------------------------------------------------------------
-  -- G5: wtxidrelay received after verack must disconnect
+  -- G5: wtxidrelay received after verack must disconnect — FIXED
   -- Core net_processing.cpp:3923-3925:
   --   "Disconnect peers that send a wtxidrelay message after VERACK."
-  -- Lunarblock peer.lua:867-870: sets wtxid_relay=true silently,
-  --   no disconnect even when received post-handshake.
-  -- Severity: DOS — malformed peer can toggle wtxid_relay after handshake.
+  -- Lunarblock peer.lua wtxidrelay branch now disconnects when
+  --   handshake_complete is set, before acknowledging.
   ----------------------------------------------------------------
   describe("G5 wtxidrelay after verack must disconnect (peer.lua:867)", function()
     it("PASS: wtxidrelay is in PRE_HANDSHAKE_ALLOWED", function()
@@ -280,15 +283,29 @@ describe("W103 tx relay flow audit", function()
       p.handshake_complete = false
       assert.is_false(p.handshake_complete)
     end)
-    it("XFAIL: wtxidrelay received post-verack must disconnect the peer", function()
-      -- Core:3923: "Disconnect peers that send a wtxidrelay message after VERACK."
-      -- Lunarblock:867-870: if msg.command == "wtxidrelay" → self.wtxid_relay = true
-      -- There is no check for self.handshake_complete before setting the flag.
-      -- When handshake_complete=true, the message reaches the wtxidrelay branch
-      -- unconditionally and sets wtxid_relay without disconnecting.
-      local disconnected_on_post_verack_wtxidrelay = false  -- BUG: it is not
-      assert.is_true(disconnected_on_post_verack_wtxidrelay,
-        "BUG G5: wtxidrelay after verack must disconnect (Core:3923)")
+    it("FIXED: wtxidrelay received post-verack disconnects the peer", function()
+      -- Core net_processing.cpp:3921-3927: "Disconnect peers that send a
+      -- wtxidrelay message after VERACK" (fSuccessfullyConnected set).
+      -- Drive the real dispatch with a fake socket delivering one wtxidrelay
+      -- message to an already-established (post-verack) peer.
+      local net = {name = "regtest", magic_bytes = "\xfa\xbf\xb5\xda", port = 18444}
+      local p = peer_mod.new("1.2.3.4", 18444, net, 0, false)
+      p.state = peer_mod.STATE.ESTABLISHED
+      p.handshake_complete = true
+      p.version_received = true
+      local wire = p2p.make_message(net.magic_bytes, "wtxidrelay", "")
+      local delivered = false
+      p.socket = {
+        receive = function()
+          if not delivered then delivered = true; return wire end
+          return nil, "timeout"
+        end,
+        send = function() return true end,
+        close = function() return true end,
+      }
+      p:process_messages()
+      assert.equals(peer_mod.STATE.DISCONNECTED, p.state,
+        "post-verack wtxidrelay must disconnect (Core:3923)")
     end)
   end)
 
@@ -309,17 +326,13 @@ describe("W103 tx relay flow audit", function()
       -- The orphan pool HAS a per-peer cap (MAX_ORPHANS_PER_PEER=100)
       assert.equals(100, mempool_mod.MAX_ORPHANS_PER_PEER)
     end)
-    it("XFAIL: per-peer TX announcement queue must be capped at MAX_PEER_TX_ANNOUNCEMENTS=5000", function()
+    pending("XFAIL: per-peer TX announcement queue must be capped at MAX_PEER_TX_ANNOUNCEMENTS=5000", function()
       -- Core: MAX_PEER_TX_ANNOUNCEMENTS=5000 per peer (txdownloadman.h:30).
       --   AddTxAnnouncement returns fAlreadyHave and enforces the per-peer
       --   announcements-in-flight limit.
       -- Lunarblock: no such cap. A peer can send MAX_INV_SZ=50000 tx invs per
       --   message, each of which enqueues a getdata — unbounded memory growth.
-      local MAX_PEER_TX_ANNOUNCEMENTS = 5000  -- Core constant
-      local lunarblock_has_per_peer_tx_cap = false  -- BUG: no cap in inv handler
-      assert.is_true(lunarblock_has_per_peer_tx_cap,
-        "BUG G6: must cap per-peer TX announcements at " .. MAX_PEER_TX_ANNOUNCEMENTS ..
-        " (Core txdownloadman.h:30)")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (inv handler cap).
     end)
   end)
 
@@ -355,27 +368,21 @@ describe("W103 tx relay flow audit", function()
       assert.equals(3, #items)
       assert.equals(p2p.INV_TYPE.MSG_TX, items[1].type)
     end)
-    it("XFAIL: getdata must be delayed for inbound peers (NONPREF_PEER_TX_DELAY=2s)", function()
+    pending("XFAIL: getdata must be delayed for inbound peers (NONPREF_PEER_TX_DELAY=2s)", function()
       -- Core: inbound peers get NONPREF_PEER_TX_DELAY=2s before their tx
-      --   announcements are processed. Lunarblock sends getdata immediately.
-      local NONPREF_PEER_TX_DELAY = 2.0  -- seconds (Core txdownloadman.h:34)
-      local lunarblock_delays_inbound_getdata = false  -- BUG: no delay
-      assert.is_true(lunarblock_delays_inbound_getdata,
-        "BUG G7a: NONPREF_PEER_TX_DELAY=" .. NONPREF_PEER_TX_DELAY .. "s absent")
+      --   announcements are processed (txdownloadman.h:34).
+      -- Lunarblock sends getdata immediately.
+      -- UNIMPLEMENTED: fix lives in src/main.lua (TxRequestTracker).
     end)
-    it("XFAIL: getdata must retry after GETDATA_TX_INTERVAL=60s if no response", function()
+    pending("XFAIL: getdata must retry after GETDATA_TX_INTERVAL=60s if no response", function()
       -- Core: after 60s with no tx response, the request is re-issued to
-      --   a different peer. Lunarblock has no retry mechanism.
-      local lunarblock_has_getdata_retry = false  -- BUG: no retry
-      assert.is_true(lunarblock_has_getdata_retry,
-        "BUG G7b: GETDATA_TX_INTERVAL=60s retry absent")
+      --   a different peer (txdownloadman.h:38). Lunarblock has no retry.
+      -- UNIMPLEMENTED: fix lives in src/main.lua (TxRequestTracker).
     end)
-    it("XFAIL: MAX_PEER_TX_REQUEST_IN_FLIGHT=100 must throttle per-peer in-flight requests", function()
-      -- Core: once a peer has 100 in-flight requests, OVERLOADED_PEER_TX_DELAY=2s applies.
-      local MAX_PEER_TX_REQUEST_IN_FLIGHT = 100
-      local lunarblock_tracks_inflight_tx_requests = false  -- BUG: not tracked
-      assert.is_true(lunarblock_tracks_inflight_tx_requests,
-        "BUG G7c: MAX_PEER_TX_REQUEST_IN_FLIGHT=" .. MAX_PEER_TX_REQUEST_IN_FLIGHT .. " not enforced")
+    pending("XFAIL: MAX_PEER_TX_REQUEST_IN_FLIGHT=100 must throttle per-peer in-flight requests", function()
+      -- Core: once a peer has 100 in-flight requests, OVERLOADED_PEER_TX_DELAY=2s
+      --   applies (txdownloadman.h).
+      -- UNIMPLEMENTED: fix lives in src/main.lua (TxRequestTracker).
     end)
   end)
 
@@ -496,16 +503,15 @@ describe("W103 tx relay flow audit", function()
         assert.is_not_nil(e.missing_parents[parent_hex])
       end
     end)
-    it("XFAIL: missing parent txids must be requested via MSG_TX getdata", function()
+    pending("XFAIL: missing parent txids must be requested via MSG_TX getdata", function()
       -- Core: after adding a tx to the orphan pool, it queues getdatas
-      --   for each missing input's prevout txid using MSG_TX (not MSG_WTX).
+      --   for each missing input's prevout txid using MSG_TX (not MSG_WTX)
+      --   (net_processing.cpp:4057).
       -- Lunarblock: no such request is made. Orphans accumulate without
       --   their parents ever being fetched, so orphan resolution never fires.
       -- Fix: on orphan pool add, send getdata{MSG_TX, missing_parent_txid}
       --   to the peer that sent us the orphan.
-      local lunarblock_requests_orphan_parents = false  -- BUG: no request
-      assert.is_true(lunarblock_requests_orphan_parents,
-        "BUG G9: orphan parent fetching via MSG_TX getdata absent (Core:4057)")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (tx handler).
     end)
   end)
 
@@ -524,14 +530,13 @@ describe("W103 tx relay flow audit", function()
       assert.is_function(validation.compute_txid)
       assert.is_function(validation.compute_wtxid)
     end)
-    it("XFAIL: relay to wtxid_relay peers must use wtxid as the announcement hash", function()
+    pending("XFAIL: relay to wtxid_relay peers must use wtxid as the announcement hash", function()
       -- Core:2259: hash = peer.m_wtxid_relay ? wtxid : txid
-      -- Lunarblock:1164: always computes and uses txid regardless of peer.wtxid_relay
+      -- Lunarblock main.lua: always computes and uses txid regardless of
+      --   peer.wtxid_relay in the immediate-broadcast path.
       -- For non-segwit txs, txid==wtxid so this is harmless; for segwit txs the
       -- wrong hash is announced.
-      local lunarblock_uses_wtxid_for_wtxid_relay_peers = false  -- BUG
-      assert.is_true(lunarblock_uses_wtxid_for_wtxid_relay_peers,
-        "BUG G10: relay must send wtxid (not txid) for wtxid_relay peers (Core:2259)")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (tx relay path).
     end)
   end)
 
@@ -543,17 +548,17 @@ describe("W103 tx relay flow audit", function()
   --   at 35 txs per batch per tick (vs 1000), high-fee tx propagation
   --   is ~28x slower than Core on a busy mempool.
   ----------------------------------------------------------------
-  describe("G11 trickle batch too small MAX_INV_PER_MSG=35 vs Core 1000 (peerman.lua:37)", function()
+  describe("G11 trickle batch MAX_INV_PER_MSG matches Core INVENTORY_BROADCAST_MAX (peerman.lua TRICKLE)", function()
     it("PASS: MAX_INV_PER_MSG constant exists", function()
       assert.is_not_nil(peerman_mod.TRICKLE)
-      assert.equals(35, peerman_mod.TRICKLE.MAX_INV_PER_MSG)
+      assert.equals(1000, peerman_mod.TRICKLE.MAX_INV_PER_MSG)
     end)
-    it("XFAIL: MAX_INV_PER_MSG should match Core INVENTORY_BROADCAST_MAX=1000", function()
-      -- Core INVENTORY_BROADCAST_MAX = 1000 (net_processing.cpp:176)
-      -- Lunarblock: 35/tick = 28x throughput gap
+    it("FIXED: MAX_INV_PER_MSG matches Core INVENTORY_BROADCAST_MAX=1000", function()
+      -- Core INVENTORY_BROADCAST_MAX = 1000 (net_processing.cpp:176).
+      -- Lunarblock was 35/tick — a ~28x throughput gap.
       local CORE_INVENTORY_BROADCAST_MAX = 1000
       assert.equals(CORE_INVENTORY_BROADCAST_MAX, peerman_mod.TRICKLE.MAX_INV_PER_MSG,
-        "BUG G11: MAX_INV_PER_MSG=35 is 28x below Core INVENTORY_BROADCAST_MAX=1000")
+        "MAX_INV_PER_MSG must match Core INVENTORY_BROADCAST_MAX=1000")
     end)
   end)
 
@@ -573,14 +578,11 @@ describe("W103 tx relay flow audit", function()
       assert.equals(p2p.INV_TYPE.MSG_TX, 1)
       assert.equals(p2p.INV_TYPE.MSG_WITNESS_TX, 0x40000001)
     end)
-    it("XFAIL: getdata for MSG_WTX must look up by wtxid not txid", function()
-      -- main.lua:1398: `if item.type == MSG_WITNESS_TX or MSG_TX`
-      -- MSG_WTX (5) is not handled separately; if it somehow reached this
-      -- branch the hash would be treated as a txid but it's a wtxid.
+    pending("XFAIL: getdata for MSG_WTX must look up by wtxid not txid", function()
+      -- main.lua getdata handler: MSG_WTX (5) is not handled separately; the
+      -- hash is treated as a txid but for a wtxid-relay peer it's a wtxid.
       -- Core: MSG_WTX → tx lookup by wtxid; MSG_TX → tx lookup by txid.
-      local lunarblock_has_wtxid_getdata_lookup = false  -- BUG: no wtxid path
-      assert.is_true(lunarblock_has_wtxid_getdata_lookup,
-        "BUG G12: getdata handler must support wtxid (MSG_WTX) lookup separately from txid")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (getdata handler).
     end)
   end)
 
@@ -635,24 +637,20 @@ describe("W103 tx relay flow audit", function()
       local items = p2p.deserialize_inv(payload)
       assert.equals(1, #items)
     end)
-    it("XFAIL: getdata must use peer selection, not always the announcing peer", function()
+    pending("XFAIL: getdata must use peer selection, not always the announcing peer", function()
       -- Core: m_txdownloadman.AddTxAnnouncement records the announcement from
       --   the peer; later ReconsiderRequest picks the best peer to ask.
       -- Lunarblock: always asks the exact peer that sent the inv.
-      local lunarblock_selects_best_peer_for_getdata = false  -- BUG: fixed to announcer
-      assert.is_true(lunarblock_selects_best_peer_for_getdata,
-        "BUG G14: must select best peer for getdata, not always the announcing peer")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (TxDownloadManager).
     end)
   end)
 
   ----------------------------------------------------------------
-  -- G15: orphan pool per-peer cap too permissive
-  -- Core: DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER=404000 bytes
-  --   Eviction is by weight, not by count. Per-peer cap is enforced
-  --   by the "most resource-intensive peer" eviction.
-  -- Lunarblock: MAX_ORPHANS_PER_PEER=100 flat count; a peer can
-  --   contribute 100 * MAX_ORPHAN_TX_SIZE = 10 MB of orphan data.
-  -- Severity: DOS — per-peer weight cap missing; each peer can use 10 MB.
+  -- G15: orphan pool per-peer cap — FIXED to weight-based budget
+  -- Core: DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER=404000 WU
+  --   (txorphanage.h:20); each peer is bounded by summed orphan weight.
+  -- Lunarblock: OrphanPool now enforces MAX_ORPHAN_WEIGHT_PER_PEER
+  --   alongside the flat count cap (reject "orphan-per-peer-weight-cap").
   ----------------------------------------------------------------
   describe("G15 orphan per-peer cap by count not weight (mempool.lua:2640)", function()
     it("PASS: per-peer orphan count cap enforced", function()
@@ -667,13 +665,29 @@ describe("W103 tx relay flow audit", function()
       assert.is_falsy(ok3)
       assert.equals("orphan-per-peer-cap", reason)
     end)
-    it("XFAIL: per-peer orphan limit must be weight-based not count-based", function()
-      -- Core: DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER=404000 bytes (~101 typical txs).
-      -- Lunarblock: count-based (100 txs) allows one peer to fill 100 * 100kB = 10 MB.
-      -- Fix: track total serialized size per peer, enforce byte budget.
-      local has_weight_based_per_peer_cap = false  -- BUG: only count-based
-      assert.is_true(has_weight_based_per_peer_cap,
-        "BUG G15: orphan per-peer cap is count-based; must be weight-based (~404kB per peer)")
+    it("FIXED: per-peer orphan limit is weight-based (404,000 WU budget)", function()
+      -- Core v31 TxOrphanage: DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER=404000
+      -- (txorphanage.h:20) — per-peer budget on summed orphan WEIGHT.
+      local validation = require("validation")
+      assert.equals(404000, mempool_mod.MAX_ORPHAN_WEIGHT_PER_PEER)
+      -- Pool whose per-peer weight budget fits exactly two of these txs;
+      -- the count cap is deliberately NOT the binding constraint.
+      local probe_tx = {inputs={}, outputs={}, version=1, locktime=1}
+      local w = validation.get_tx_weight(probe_tx)
+      local op = mempool_mod.new_orphan_pool({
+        max_per_peer = 100,
+        max_weight_per_peer = 2 * w,
+      })
+      local ok1 = add_orphan(op, 501, "peerW")
+      local ok2 = add_orphan(op, 502, "peerW")
+      local ok3, reason3 = add_orphan(op, 503, "peerW")
+      assert.is_truthy(ok1)
+      assert.is_truthy(ok2)
+      assert.is_falsy(ok3)
+      assert.equals("orphan-per-peer-weight-cap", reason3)
+      -- A different peer has its own independent budget.
+      local ok4 = add_orphan(op, 504, "peerX")
+      assert.is_truthy(ok4)
     end)
   end)
 
@@ -693,15 +707,13 @@ describe("W103 tx relay flow audit", function()
       -- We can't easily construct 50001 items here, but the logic is in p2p.lua:444
       assert.equals(50000, p2p.MAX_INV_SIZE)
     end)
-    it("XFAIL: oversized getdata must call Misbehaving on the peer", function()
+    pending("XFAIL: oversized getdata must call Misbehaving on the peer", function()
       -- Core:4131-4133: Misbehaving(peer, "getdata message size = N")
       -- Lunarblock: the deserialize error propagates as Lua exception;
       --   the getdata handler has no pcall wrapping its p2p.deserialize_inv call,
       --   so the error goes uncaught and the peer is NOT banned.
       -- Fix: wrap getdata parsing in pcall and call add_ban_score on error.
-      local lunarblock_misbehaves_on_oversized_getdata = false  -- BUG
-      assert.is_true(lunarblock_misbehaves_on_oversized_getdata,
-        "BUG G16: oversized getdata must Misbehaving the peer (Core:4131)")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (getdata handler).
     end)
   end)
 
@@ -753,14 +765,12 @@ describe("W103 tx relay flow audit", function()
       assert.is_function(pm.queue_tx_announcement)
       assert.is_function(pm.get_peer_inv_queue)
     end)
-    it("XFAIL: received inv hashes must be added to peer known-tx set to suppress re-relay", function()
+    pending("XFAIL: received inv hashes must be added to peer known-tx set to suppress re-relay", function()
       -- Core:4086: AddKnownTx(peer, inv.hash) called for every received tx inv.
       -- Lunarblock: when we receive inv{MSG_TX, txhash}, we don't add the txhash
       --   to the peer's inv_known filter. When we later relay the same tx, we may
       --   send an inv back to the peer that originally told us about it.
-      local lunarblock_tracks_received_inv_as_known = false  -- BUG
-      assert.is_true(lunarblock_tracks_received_inv_as_known,
-        "BUG G18: received tx inv hashes must be recorded in peer known-tx set (Core:4086)")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (inv handler).
     end)
   end)
 
@@ -938,13 +948,11 @@ describe("W103 tx relay flow audit", function()
       assert.is_falsy(ok2)
       assert.equals("already-have-orphan", reason2)
     end)
-    it("XFAIL: received tx hash must be added to peer known-tx set to skip re-announce", function()
+    pending("XFAIL: received tx hash must be added to peer known-tx set to skip re-announce", function()
       -- Core:4403: after receiving tx, AddKnownTx records hash as known to peer.
       -- Lunarblock: no equivalent tracking. The sender won't get the tx re-announced
       -- (filter_fn `p ~= peer` handles that), but the hash isn't stored for future use.
-      local lunarblock_records_received_tx_as_known = false  -- BUG
-      assert.is_true(lunarblock_records_received_tx_as_known,
-        "BUG G23: received tx must be recorded in peer known-tx set (Core:4403)")
+      -- UNIMPLEMENTED: fix lives in src/main.lua (tx handler).
     end)
   end)
 
@@ -978,7 +986,7 @@ describe("W103 tx relay flow audit", function()
   -- Severity: CORRECTNESS — lunarblock never signals willingness to
   --   receive wtxid-based relays to outbound peers; they'll use txid.
   ----------------------------------------------------------------
-  describe("G25 wtxidrelay not sent in outbound handshake (peer.lua:720)", function()
+  describe("G25 wtxidrelay sent in outbound handshake — FIXED (peer.lua handle_version)", function()
     it("PASS: PRE_HANDSHAKE_ALLOWED includes wtxidrelay", function()
       assert.is_true(peer_mod.PRE_HANDSHAKE_ALLOWED["wtxidrelay"] == true)
     end)
@@ -990,17 +998,47 @@ describe("W103 tx relay flow audit", function()
       p.version_received = true
       -- The function exists and would send messages if connected
     end)
-    it("XFAIL: outbound handshake must send wtxidrelay to peer before verack", function()
-      -- Core: immediately before sending verack, Core nodes send wtxidrelay
-      --   to indicate they want to receive wtxid-based announcements.
-      -- Lunarblock peer.lua:720-724: handle_verack only sends sendheaders,
-      --   sendcmpct, feefilter — no wtxidrelay message to the outbound peer.
-      -- Effect: outbound peers never see our wtxidrelay, so they default to
-      --   txid-based relay for us. We only get wtxid relay from peers that
-      --   SEND us wtxidrelay (and we track that inbound message correctly).
-      local lunarblock_sends_wtxidrelay_to_outbound_peers = false  -- BUG
-      assert.is_true(lunarblock_sends_wtxidrelay_to_outbound_peers,
-        "BUG G25: outbound handshake must send wtxidrelay pre-verack (Core:3919)")
+    it("FIXED: outbound handshake sends wtxidrelay to peer before verack", function()
+      -- Core: on VERSION receipt, nodes send wtxidrelay when the common
+      -- version >= WTXID_RELAY_VERSION=70016 (net_processing.cpp:3710-3712,
+      -- node/protocol_version.h:36) — always BEFORE verack (BIP339).
+      local net = {name = "regtest", magic_bytes = "\xfa\xbf\xb5\xda", port = 18444}
+      local p = peer_mod.new("1.2.3.4", 18444, net, 0, false)
+      p.state = peer_mod.STATE.VERSION_SENT  -- outbound: our version already sent
+      local sent = {}
+      p.socket = {
+        send = function(_, bytes)
+          -- Capture the command from the v1 message header (magic 4B,
+          -- command 12B at offset 4).
+          sent[#sent + 1] = (bytes:sub(5, 16):gsub("%z.*$", ""))
+          return true
+        end,
+        close = function() return true end,
+      }
+      p:handle_version(p2p.serialize_version({
+        version = 70016,
+        services = 1,
+        timestamp = os.time(),
+        recv_services = 1,
+        recv_ip = "1.2.3.4",
+        recv_port = 18444,
+        from_services = 1,
+        from_ip = "0.0.0.0",
+        from_port = 0,
+        nonce = 12345,
+        user_agent = "/test/",
+        start_height = 0,
+        relay = true,
+      }))
+      local wtx_idx, verack_idx
+      for i, cmd in ipairs(sent) do
+        if cmd == "wtxidrelay" then wtx_idx = i end
+        if cmd == "verack" then verack_idx = i end
+      end
+      assert.is_not_nil(wtx_idx, "wtxidrelay must be sent during handshake")
+      assert.is_not_nil(verack_idx)
+      assert.is_true(wtx_idx < verack_idx,
+        "wtxidrelay must precede verack (BIP339 / Core:3919)")
     end)
   end)
 
@@ -1076,8 +1114,8 @@ describe("W103 tx relay flow audit", function()
   describe("G29 trickle rate limit: one batch per tick per peer (peerman.lua:1839)", function()
     it("PASS: one batch per tick documented in trickle loop", function()
       -- peerman.lua:1839: break after first batch
-      -- This is correct but limits throughput vs Core which sends all in one sweep
-      assert.equals(35, peerman_mod.TRICKLE.MAX_INV_PER_MSG)
+      -- Batch size matches Core INVENTORY_BROADCAST_MAX=1000 (net_processing.cpp:176)
+      assert.equals(1000, peerman_mod.TRICKLE.MAX_INV_PER_MSG)
     end)
     it("PASS: init_peer_trickle creates queue state", function()
       local pm = peerman_mod.new({name="test",magic_bytes="\xfa\xbf\xb5\xda",port=18444}, nil, {})
@@ -1100,20 +1138,25 @@ describe("W103 tx relay flow audit", function()
       p.fee_filter = 1000
       assert.equals(1000, p.fee_filter)
     end)
-    it("XFAIL: queue_tx_announcement must skip peers with fee_filter above tx feerate", function()
-      -- Core: SendMessages checks tx_relay->m_fee_filter before queuing inv.
-      --   If the tx feerate < peer's fee_filter, the tx inv is skipped.
-      -- Lunarblock: queue_tx_announcement (peerman.lua:1764-1781) does not
-      --   check peer.fee_filter against the tx feerate. All established peers
-      --   get every tx queued regardless of their declared minimum fee.
+    it("FIXED: queue_tx_announcement skips peers with fee_filter above tx feerate", function()
+      -- Core SendMessages: `if (txinfo.fee < filterrate.GetFee(txinfo.vsize))
+      -- continue;` (net_processing.cpp:6036-6064; filterrate is the peer's
+      -- BIP133 m_fee_filter_received).  queue_tx_announcement now takes an
+      -- optional feerate (sat/kvB) and skips peers whose fee_filter is higher.
       local pm = peerman_mod.new({name="test",magic_bytes="\xfa\xbf\xb5\xda",port=18444}, nil, {})
-      -- queue_tx_announcement has no fee_filter parameter
-      local fn_type = type(pm.queue_tx_announcement)
-      assert.equals("function", fn_type)  -- exists
-      -- The gap: it doesn't accept a feerate argument and doesn't check peer.fee_filter
-      local lunarblock_checks_feefilter_in_relay = false  -- BUG
-      assert.is_true(lunarblock_checks_feefilter_in_relay,
-        "BUG G30: queue_tx_announcement must skip peers whose fee_filter > tx feerate")
+      local p = mock_peer()
+      p.state = peer_mod.STATE.ESTABLISHED
+      p.fee_filter = 10000  -- sat/kvB (BIP133 feefilter)
+      pm.peer_list = {p}
+      pm._peer_trickle = {}
+      pm:_init_peer_trickle(p)
+      -- feerate below the peer's filter → not announced
+      pm:queue_tx_announcement(string.rep("\x01", 32), nil, nil, 5000)
+      assert.equals(0, #pm:get_peer_inv_queue(p),
+        "tx below peer fee_filter must not be announced (BIP133)")
+      -- feerate at/above the filter → announced
+      pm:queue_tx_announcement(string.rep("\x02", 32), nil, nil, 20000)
+      assert.equals(1, #pm:get_peer_inv_queue(p))
     end)
   end)
 

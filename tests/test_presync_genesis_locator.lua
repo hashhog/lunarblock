@@ -197,19 +197,16 @@ do
   local tip_total_work = hc.headers[types.hash256_hex(hc.header_tip_hash)].total_work or 0
 
   -- Just verify the math: 2000 * regtest_work + genesis_work < mainnet min_chain_work.
-  local claimed_work_float = tip_total_work
+  -- total_work and work_for_bits are exact 256-bit values (32-byte
+  -- big-endian strings), so use consensus.work_add/work_compare — this is
+  -- EXACT, no float approximation needed.
+  local claimed_work = tip_total_work
   for _ = 1, 2000 do
-    claimed_work_float = claimed_work_float + hc:work_for_bits(0x207fffff)
+    claimed_work = consensus.work_add(claimed_work, hc:work_for_bits(0x207fffff))
   end
 
-  local min_work_hex = mainnet.min_chain_work
-  local min_work_float = 0
-  for i = 1, 32 do
-    min_work_float = min_work_float * 256 +
-      tonumber(min_work_hex:sub(2*i-1, 2*i), 16)
-  end
-
-  expect_true(claimed_work_float < min_work_float,
+  local min_work = consensus.work_from_hex(mainnet.min_chain_work)
+  expect_true(consensus.work_compare(claimed_work, min_work) < 0,
     "regtest-difficulty 2000-header batch < mainnet min_chain_work")
 end
 

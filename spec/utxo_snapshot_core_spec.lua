@@ -14,6 +14,15 @@
 --   6. Cross-impl spot check: a hand-built Core-format file decodes
 --      cleanly through load_snapshot.
 
+-- Mock socket module if not available (for test environments without LuaSocket)
+-- — same convention as spec/w102_assumeutxo_audit_spec.lua:37-41; required
+-- because the loadtxoutset whitelist tests below pull in lunarblock.rpc.
+if not pcall(require, "socket") then
+  package.preload["socket"] = function()
+    return { gettime = function() return os.time() end }
+  end
+end
+
 local utxo = require("lunarblock.utxo")
 local consensus = require("lunarblock.consensus")
 local serialize = require("lunarblock.serialize")
@@ -328,7 +337,13 @@ describe("Core-format UTXO snapshot", function()
       local cs2 = utxo.new_chain_state(db2, consensus.networks.regtest)
       cs2:init()
 
-      local ok, load_err = cs2:load_snapshot(snapshot_file)
+      -- Pass base_height explicitly: Core always knows the snapshot base
+      -- height at load time (recovered from the header index,
+      -- validation.cpp:5766-5774) and lunarblock's production callers pass it
+      -- (main.lua:737 import-utxo, rpc.lua loadtxoutset via au_height).
+      -- Without it the per-coin guard (Core validation.cpp:5814-5819) falls
+      -- back to the fresh chainstate's genesis tip 0 and rejects every coin.
+      local ok, load_err = cs2:load_snapshot(snapshot_file, nil, 5)
       assert.is_true(ok)
       assert.is_nil(load_err)
 
@@ -364,7 +379,7 @@ describe("Core-format UTXO snapshot", function()
 
   describe("hand-built Core-format file decodes via load_snapshot", function()
     -- Build a minimal Core-format snapshot file by hand (one txid, one
-    -- coin, OP_RETURN script) and ensure load_snapshot parses it.
+    -- coin, raw-branch script) and ensure load_snapshot parses it.
     local snapshot_file
 
     setup(function()
@@ -381,7 +396,14 @@ describe("Core-format UTXO snapshot", function()
       local base_blockhash = types.hash256(string.rep("\xa1", 32))
 
       -- Hand-build the file.
-      local script_pubkey = "\x6a\x05hello"  -- 7-byte OP_RETURN script
+      -- Script is OP_1 <push5 "hello">: not a recognized Solver template, so
+      -- it still exercises the ScriptCompression raw branch — but it is
+      -- spendable, unlike the previous OP_RETURN fixture ("\x6a\x05hello").
+      -- Core never stores unspendable outputs in the UTXO set: AddCoin drops
+      -- them (coins.cpp:91, CScript::IsUnspendable script.h:582), so a real
+      -- Core dumptxoutset can never contain an OP_RETURN coin and lunarblock's
+      -- CoinView:add (utxo.lua:1296, W93 gate) correctly discards it too.
+      local script_pubkey = "\x51\x05hello"  -- 7-byte raw-branch script
       local entry = utxo.utxo_entry(1000000, script_pubkey, 42, false)
 
       -- Header.
@@ -407,7 +429,11 @@ describe("Core-format UTXO snapshot", function()
       local cs = utxo.new_chain_state(db, network)
       cs:init()
 
-      local ok, err = cs:load_snapshot(snapshot_file)
+      -- base_height=42 passed explicitly (the hand-built file's only coin is
+      -- from height 42); Core derives this from the header index at load time
+      -- (validation.cpp:5766-5774), lunarblock callers pass it in
+      -- (main.lua:737, rpc.lua loadtxoutset).
+      local ok, err = cs:load_snapshot(snapshot_file, nil, 42)
       assert.is_true(ok, err)
 
       -- The loaded UTXO should match what we wrote.
@@ -549,13 +575,23 @@ describe("Core-format UTXO snapshot", function()
 
   describe("chainparams.assumeutxo", function()
     it("contains all 4 mainnet snapshots from Bitcoin Core", function()
+      -- Core v31 mainnet m_assumeutxo_data has exactly these 4 heights
+      -- (chainparams.cpp:158-183).  lunarblock additionally carries two
+      -- documented hashhog-local recovery entries (481823 Track-B INERT and
+      -- 944183 mainnet rescue, consensus.lua:1029-1074+) that are NOT Core
+      -- chainparams — so this asserts Core's 4 are all present, in order,
+      -- as a subset of the sorted heights list.
       local heights = consensus.get_assumeutxo_heights(
         consensus.networks.mainnet)
-      assert.equal(4, #heights)
-      assert.equal(840000, heights[1])
-      assert.equal(880000, heights[2])
-      assert.equal(910000, heights[3])
-      assert.equal(935000, heights[4])
+      local core_heights = {840000, 880000, 910000, 935000}
+      local pos = 1
+      for _, h in ipairs(heights) do
+        if pos <= #core_heights and h == core_heights[pos] then
+          pos = pos + 1
+        end
+      end
+      assert.equal(#core_heights + 1, pos,
+        "all 4 Core mainnet assumeutxo heights must be present in order")
     end)
 
     it("uses real Core hash_serialized for height 840000", function()
@@ -726,7 +762,11 @@ describe("Core-format UTXO snapshot", function()
       local cs2 = utxo.new_chain_state(db2, consensus.networks.regtest)
       cs2:init()
       local wrong_hash = string.rep("\x00", 32)
-      local ok, err = cs2:load_snapshot(snapshot_file, wrong_hash)
+      -- base_height=7 so the fixture coin (height 7) clears the per-coin
+      -- height guard (Core validation.cpp:5814-5819) and the load reaches
+      -- the strict HASH_SERIALIZED gate under test; Core always knows this
+      -- height from the header index (validation.cpp:5766-5774).
+      local ok, err = cs2:load_snapshot(snapshot_file, wrong_hash, 7)
       db2.close()
       os.remove(snapshot_file)
 

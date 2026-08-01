@@ -144,7 +144,7 @@ describe("p2p", function()
         from_ip = "10.0.0.1",
         from_port = 18333,
         nonce = 12345678901234,
-        user_agent = "/LunarBlock:0.1.0/",
+        user_agent = "/LunarBlock:1.0.0/",
         start_height = 800000,
         relay = true,
       }
@@ -172,7 +172,10 @@ describe("p2p", function()
       local decoded = p2p.deserialize_version(payload)
 
       assert.equals(p2p.PROTOCOL_VERSION, decoded.version)
-      assert.equals("/LunarBlock:0.1.0/", decoded.user_agent)
+      -- Mirrors the release user agent at src/p2p.lua:443 (bumped to 1.0.0
+      -- for release; Core's subver likewise tracks the release version —
+      -- clientversion.cpp FormatSubVersion).
+      assert.equals("/LunarBlock:1.0.0/", decoded.user_agent)
     end)
 
     it("handles relay=false correctly", function()
@@ -426,7 +429,9 @@ describe("p2p", function()
     end)
 
     it("has correct max message size", function()
-      assert.equals(32 * 1024 * 1024, p2p.MAX_MESSAGE_SIZE)
+      -- Core v31 MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 (net.h:65).
+      -- (32 MiB is serialize.h's MAX_SIZE, a different limit.)
+      assert.equals(4 * 1000 * 1000, p2p.MAX_MESSAGE_SIZE)
     end)
 
     it("has correct protocol version", function()

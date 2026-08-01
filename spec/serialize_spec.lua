@@ -52,7 +52,10 @@ describe("serialize", function()
 
     it("writes u64le", function()
       local w = serialize.buffer_writer()
-      w.write_u64le(0x0102030405060708)
+      -- NB: 0x0102030405060708 exceeds 2^53, so a plain number literal cannot
+      -- represent it exactly (Lua doubles); the ULL cdata literal keeps all
+      -- 64 bits (LuaJIT extension), matching write_u64le's ffi path.
+      w.write_u64le(0x0102030405060708ULL)
       local result = w.result()
       assert.equal(8, #result)
       assert.equal(0x08, result:byte(1))
@@ -103,7 +106,9 @@ describe("serialize", function()
 
     it("reads u64le", function()
       local r = serialize.buffer_reader(string.char(0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01))
-      assert.equal(0x0102030405060708, r.read_u64le())
+      -- ULL cdata comparison is exact 64-bit; a plain number literal would
+      -- round to 72623859790382848 (2^53 double-precision limit).
+      assert.equal(0x0102030405060708ULL, r.read_u64le())
     end)
 
     it("reads bytes", function()
@@ -255,16 +260,30 @@ describe("serialize", function()
       test_varint(0x10000, 5)
     end)
 
+    -- Values above Core's MAX_SIZE (0x02000000) ENCODE fine, but
+    -- ReadCompactSize rejects them on read with "size too large"
+    -- (Core serialize.h range check; src/serialize.lua:224-225).  So for
+    -- these the contract is: correct encoding + read must throw.
+    local function test_varint_encode_only(val, expected_len)
+      local w = serialize.buffer_writer()
+      w.write_varint(val)
+      local result = w.result()
+      assert.equal(expected_len, #result, "expected length for " .. val)
+      local r = serialize.buffer_reader(result)
+      assert.has_error(function() r.read_varint() end,
+        "ReadCompactSize(): size too large")
+    end
+
     it("encodes 0xFFFFFFFE with 5 bytes", function()
-      test_varint(0xFFFFFFFE, 5)
+      test_varint_encode_only(0xFFFFFFFE, 5)
     end)
 
     it("encodes 0xFFFFFFFF with 5 bytes", function()
-      test_varint(0xFFFFFFFF, 5)
+      test_varint_encode_only(0xFFFFFFFF, 5)
     end)
 
     it("encodes 0x100000000 with 9 bytes", function()
-      test_varint(0x100000000, 9)
+      test_varint_encode_only(0x100000000, 9)
     end)
   end)
 

@@ -5,6 +5,16 @@
 -- `block_submission_paused` flag directly and confirm `submitblock`
 -- short-circuits with a "paused" reject string before any deserialization.
 
+-- Mock socket module if not available (for test environments without
+-- LuaSocket): rpc.lua requires "socket" at module load, but these tests only
+-- exercise the block_submission_paused flag with rpcport=0 and never open a
+-- listener. Same preload-guard pattern as sync_spec.
+if not pcall(require, "socket") then
+  package.preload["socket"] = function()
+    return { gettime = function() return os.time() end }
+  end
+end
+
 local rpc = require("lunarblock.rpc")
 local consensus = require("lunarblock.consensus")
 

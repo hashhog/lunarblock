@@ -187,7 +187,8 @@ describe("validation", function()
       tx.outputs[1] = types.txout(5000000000, string.rep("\x76\xa9", 1) .. string.rep("\x00", 23))
 
       local txid = validation.compute_txid(tx)
-      assert.equals("hash256", txid._type)
+      -- hash256 is a single-field {bytes} table: the `_type` tag was dropped
+      -- as a GC optimization (types.lua:13-18) — assert on bytes, not _type.
       assert.equals(32, #txid.bytes)
     end)
 
@@ -563,11 +564,18 @@ describe("validation", function()
       tx.segwit = false
       local prev_hash = types.hash256(string.rep("\x01", 32))
       -- P2SH scriptSig: <dummy> <sig1> <sig2> <sig3> <redeem_script>
+      -- The 105-byte redeem script MUST be pushed with OP_PUSHDATA1: direct
+      -- pushes cap at 75 bytes, so `string.char(#multisig)` would emit opcode
+      -- 0x69 (> OP_16), making the scriptSig non-push-only. Core's
+      -- CScript::GetSigOpCount(scriptSig) (script/script.cpp) returns 0 P2SH
+      -- sigops for such a scriptSig and the inaccurate legacy count then
+      -- dominates (21*4=84) — i.e. lunarblock already matched Core for the
+      -- malformed form; the fixture itself was wrong.
       local script_sig = string.char(0) ..
                          string.char(71) .. string.rep("\x00", 71) ..
                          string.char(71) .. string.rep("\x00", 71) ..
                          string.char(71) .. string.rep("\x00", 71) ..
-                         string.char(#multisig) .. multisig
+                         string.char(0x4c, #multisig) .. multisig
       tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), script_sig, 0xFFFFFFFF)
       tx.outputs[1] = types.txout(50000, script.make_p2pkh_script(string.rep("\x00", 20)))
 

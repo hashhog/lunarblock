@@ -136,7 +136,9 @@ test("createpsbt creates valid PSBT", function()
     {txid = "0101010101010101010101010101010101010101010101010101010101010101", vout = 0}
   }
   local outputs = {
-    {["bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3xueyj"] = 0.0005}  -- regtest address
+    -- Valid regtest bech32 (segwit v0, 20 zero bytes); the previous fixture
+    -- was not a valid address (bad checksum) and Core rejects it too.
+    {["bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"] = 0.0005}
   }
 
   local result = server.methods.createpsbt(server, {inputs, outputs})
@@ -158,9 +160,12 @@ test("decodepsbt decodes PSBT", function()
   local b64 = psbt_mod.to_base64(psbt)
 
   local decoded = server.methods.decodepsbt(server, {b64})
-  assert(decoded.tx ~= nil, "no tx in decoded")
-  assert(decoded.tx.version == 2, "wrong version")
-  assert(#decoded.inputs == 1, "wrong input count")
+  -- W51 byte-parity: the RPC returns {_raw_json = <Core-shaped JSON>}.
+  local json = decoded._raw_json
+  assert(type(json) == "string", "no _raw_json in decoded result")
+  assert(json:find('"txid"', 1, true) ~= nil, "no txid in decoded JSON")
+  assert(json:find('"version":2', 1, true) ~= nil, "wrong version")
+  assert(json:find('"inputs"', 1, true) ~= nil, "inputs array missing")
 end)
 
 test("combinepsbt combines PSBTs", function()

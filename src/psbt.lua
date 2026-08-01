@@ -1154,6 +1154,12 @@ function M.combine(psbts)
         res_inp.witness_script = inp.witness_script
       end
 
+      -- Merge sighash type (PSBT_IN_SIGHASH_TYPE; Core PSBTInput::Merge,
+      -- psbt.h — fills only when unset on the destination input)
+      if not res_inp.sighash_type and inp.sighash_type then
+        res_inp.sighash_type = inp.sighash_type
+      end
+
       -- Merge BIP32 derivations
       for pk, deriv in pairs(inp.bip32_derivations) do
         if not res_inp.bip32_derivations[pk] then
@@ -1209,6 +1215,62 @@ end
 -- PSBT Operations: Finalize
 --------------------------------------------------------------------------------
 
+-- BIP-342 tapscript leaf version (Core consensus.h TAPROOT_LEAF_TAPSCRIPT).
+local TAPROOT_LEAF_TAPSCRIPT = 0xc0
+
+--- Assemble a BIP-341 script-path witness from an input's BIP-371 fields.
+-- Mirrors the script-path half of Core's SignTaproot (bitcoin-core
+-- src/script/sign.cpp:601-615): for each (script, leaf_ver) leaf, satisfy
+-- the script from tap_script_sigs, then push the leaf script itself and the
+-- smallest control block; keep the smallest serialized witness across all
+-- satisfiable leaves. Core stores each leaf's control blocks in a std::set
+-- and takes begin() — the lexicographic minimum — mirrored below.
+--
+-- Core satisfies arbitrary miniscript leaves via TapSatisfier
+-- (sign.cpp:529-540 SignTaprootScript → miniscript::FromScript); only the
+-- single-key tapscript template <xonly-pubkey> OP_CHECKSIG is supported
+-- here. Like Core for unknown leaf versions (sign.cpp:532-533), non-0xc0
+-- leaves are skipped. The BIP-341 annex is not handled: BIP-371 defines no
+-- annex PSBT field and Core's finalizer never emits one.
+--
+-- @param inp table: PSBT input (tap_scripts / tap_script_sigs populated)
+-- @return table|nil: witness stack {sig, leaf_script, control_block}, or nil
+--   when no leaf can be satisfied (input stays unfinalized, as Core's
+--   FinalizePSBT leaves inputs it cannot complete — psbt.cpp:554-565).
+local function build_p2tr_script_path_witness(inp)
+  local best_witness, best_size = nil, nil
+  for _, leaf in pairs(inp.tap_scripts) do
+    if leaf.leaf_ver == TAPROOT_LEAF_TAPSCRIPT then
+      local leaf_script = leaf.script
+      -- Single-key tapscript leaf: 0x20 <32-byte xonly pubkey> OP_CHECKSIG.
+      if #leaf_script == 34
+          and leaf_script:byte(1) == 0x20
+          and leaf_script:byte(34) == script.OP.OP_CHECKSIG then
+        local xonly_hex = hex_encode(leaf_script:sub(2, 33))
+        -- BIP-342 leaf hash: tagged_hash("TapLeaf", leaf_ver || size || script)
+        -- (same construction as script.lua's taproot verifier).
+        local leaf_hash = crypto.tagged_hash("TapLeaf",
+          string.char(leaf.leaf_ver) .. crypto.compact_size(#leaf_script) .. leaf_script)
+        local sig = inp.tap_script_sigs[xonly_hex .. "." .. hex_encode(leaf_hash)]
+        if sig then
+          local smallest_cb = nil
+          for _, cb in ipairs(leaf.control_blocks) do
+            if not smallest_cb or cb < smallest_cb then smallest_cb = cb end
+          end
+          if smallest_cb then
+            local size = #sig + #leaf_script + #smallest_cb
+            if not best_size or size < best_size then
+              best_witness = { sig, leaf_script, smallest_cb }
+              best_size = size
+            end
+          end
+        end
+      end
+    end
+  end
+  return best_witness
+end
+
 --- Finalize a PSBT input by constructing final scriptSig/witness.
 -- @param psbt table: PSBT structure
 -- @param input_index number: Input index (0-based)
@@ -1238,17 +1300,28 @@ function M.finalize_input(psbt, input_index)
 
   local script_type = script.classify_script(script_pubkey)
 
-  -- P2-4 (P2TR key-path): finalize from BIP-371 tap_key_sig BEFORE we
-  -- fall through to the ECDSA partial_sigs path. Taproot inputs never
-  -- populate partial_sigs (those are pubkey-keyed ECDSA sigs); their
-  -- key-path sig lives on inp.tap_key_sig as either 64 bytes
-  -- (SIGHASH_DEFAULT) or 65 bytes (sig || hash_type). The witness is a
-  -- single stack element.
+  -- P2TR (BUG-19): finalize taproot inputs BEFORE the ECDSA partial_sigs
+  -- path — taproot inputs never populate partial_sigs. Two BIP-341 shapes,
+  -- mirroring Core's SignTaproot (script/sign.cpp:594-615) as driven by
+  -- FinalizePSBT (psbt.cpp:554-565):
+  --   key-path:    BIP-371 tap_key_sig (64 bytes SIGHASH_DEFAULT or 65
+  --                bytes sig || hash_type) → witness [sig]. BIP-341 also
+  --                allows [sig, annex], but BIP-371 defines no annex field
+  --                and Core's finalizer never emits one.
+  --   script-path: tap_script_sigs + tap_scripts → witness
+  --                [sig, leaf_script, control_block] (see
+  --                build_p2tr_script_path_witness above).
   if script_type == "p2tr" then
-    if not inp.tap_key_sig then
-      return false  -- not signed yet
+    local witness
+    if inp.tap_key_sig then
+      witness = { inp.tap_key_sig }
+    else
+      witness = build_p2tr_script_path_witness(inp)
+      if not witness then
+        return false  -- not signed yet / no satisfiable leaf
+      end
     end
-    inp.final_script_witness = { inp.tap_key_sig }
+    inp.final_script_witness = witness
     inp.final_script_sig = ""
     -- Clear non-final fields per BIP-174 + BIP-371 finalizer rules.
     inp.partial_sigs = {}
@@ -1466,8 +1539,15 @@ end
 -- @param psbt table: PSBT structure (must be fully finalized)
 -- @return transaction: Signed transaction ready for broadcast
 function M.extract(psbt)
-  -- Create a copy of the transaction
-  local tx_data = serialize.serialize_transaction(psbt.tx, true)
+  -- Create a copy of the transaction.
+  -- The unsigned PSBT tx never carries witness data (M.new rejects signed
+  -- txs), so the copy must NOT force a witness encoding: serializing with
+  -- include_witness=true on a tx whose segwit flag is set but whose inputs
+  -- have empty witness stacks produces the illegal "superfluous witness"
+  -- encoding and the deserialize round-trip throws (Core UnserializeTransaction
+  -- rejects it too — the flag is only legal when at least one input has a
+  -- non-empty witness).  Final witnesses are attached below.
+  local tx_data = serialize.serialize_transaction(psbt.tx, false)
   local tx = serialize.deserialize_transaction(tx_data)
 
   -- Apply final scripts

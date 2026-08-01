@@ -460,7 +460,21 @@ function M.serialize_transaction(tx, include_witness)
   local w = M.buffer_writer()
   w.write_i32le(tx.version)
 
-  local has_witness = include_witness and tx.segwit
+  -- Core CTransaction::HasWitness (primitives/transaction.h): the witness
+  -- marker+flag are emitted only when at least one input has a NON-EMPTY
+  -- witness stack.  Emitting them for all-empty witnesses is the illegal
+  -- "superfluous witness record" encoding (deserialization rejects it) —
+  -- e.g. a funded-but-unsigned segwit-flagged tx must serialize in legacy
+  -- form.  (tx.segwit alone is not sufficient.)
+  local has_witness = false
+  if include_witness then
+    for _, inp in ipairs(tx.inputs) do
+      if inp.witness and #inp.witness > 0 then
+        has_witness = true
+        break
+      end
+    end
+  end
   if has_witness then
     w.write_u8(0x00)  -- marker
     w.write_u8(0x01)  -- flag
@@ -482,8 +496,9 @@ function M.serialize_transaction(tx, include_witness)
 
   if has_witness then
     for _, inp in ipairs(tx.inputs) do
-      w.write_varint(#inp.witness)
-      for _, item in ipairs(inp.witness) do
+      local wit = inp.witness or {}
+      w.write_varint(#wit)
+      for _, item in ipairs(wit) do
         w.write_varstr(item)
       end
     end
@@ -493,23 +508,32 @@ function M.serialize_transaction(tx, include_witness)
   return w.result()
 end
 
--- Deserialize a transaction
-function M.deserialize_transaction(reader)
+-- Deserialize a transaction.
+-- allow_witness (default true) mirrors Core's SERIALIZE_TRANSACTION_NO_WITNESS
+-- flag: when false, a leading 0x00 is read as an EMPTY vin count (legacy
+-- serialization) rather than as the segwit marker.  Needed for the
+-- extended/legacy two-pass decode of 0-input funding-template txs
+-- (Core DecodeTx, core_io.cpp:156-190 — see M.deserialize_transaction_auto).
+function M.deserialize_transaction(reader, allow_witness)
   local types = require("lunarblock.types")
   if type(reader) == "string" then
     reader = M.buffer_reader(reader)
   end
+  if allow_witness == nil then allow_witness = true end
 
   local version = reader.read_i32le()
   local marker = reader.read_u8()
   local segwit = false
   local input_count
 
-  if marker == 0x00 then
+  if marker == 0x00 and allow_witness then
     local flag = reader.read_u8()
     assert(flag == 0x01, "Invalid segwit flag: " .. flag)
     segwit = true
     input_count = reader.read_varint()
+  elseif marker == 0x00 then
+    -- Witness disallowed: the 0x00 IS the empty vin count.
+    input_count = 0
   else
     -- marker is the first byte of the input-count CompactSize.
     -- Apply the same non-canonical + MAX_SIZE guards as read_varint
@@ -590,6 +614,35 @@ function M.deserialize_transaction(reader)
   local locktime = reader.read_u32le()
   local tx = types.transaction(version, inputs, outputs, locktime)
   tx.segwit = segwit
+  return tx
+end
+
+-- Two-pass hex-tx decode for RPC entry points (Core DecodeTx,
+-- core_io.cpp:156-190, used by DecodeHexTx for fundrawtransaction /
+-- sendrawtransaction / testmempoolaccept / etc.):
+--   - Try the extended (witness-aware) parse; accept only if it consumes
+--     the ENTIRE string.
+--   - Otherwise try the legacy (no-witness) parse; accept only on full
+--     consumption too.
+--   - If neither works, fail.
+-- This is REQUIRED for legacy empty-vin funding templates: with witness
+-- allowed, the leading 0x00 (empty vin) is read as the segwit marker and
+-- the vout count as the flag — a guaranteed misparse — while the legacy
+-- parse succeeds.  (Core's both-succeed CheckTxScriptsSanity tiebreak is
+-- not needed here: the extended parse is preferred whenever it fully
+-- consumes, which is only possible for genuinely witness-encoded txs.)
+function M.deserialize_transaction_auto(data)
+  assert(type(data) == "string", "deserialize_transaction_auto expects a string")
+  local ok, tx = pcall(function()
+    local r = M.buffer_reader(data)
+    local t = M.deserialize_transaction(r, true)
+    if not r.is_eof() then error("trailing bytes after transaction") end
+    return t
+  end)
+  if ok then return tx end
+  local r = M.buffer_reader(data)
+  local tx = M.deserialize_transaction(r, false)
+  if not r.is_eof() then error("trailing bytes after transaction") end
   return tx
 end
 

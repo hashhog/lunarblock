@@ -2123,6 +2123,20 @@ function ChainState:connect_genesis()
   local block_hash = validation.compute_block_hash(header)
   local block = types.block(header, {coinbase_tx})
 
+  -- Core LoadGenesisBlock (validation.cpp:4926) asserts the computed genesis
+  -- block hash equals consensus.hashGenesisBlock.  A mismatch means the
+  -- network's chainparams (coinbase message/pubkey/timestamp/bits/nonce) do
+  -- not reproduce the committed genesis block and every downstream
+  -- validation would diverge — fail LOUD here (Core aborts via assert)
+  -- instead of booting a forked chain.
+  if self.network.genesis_hash then
+    local computed_hex = types.hash256_hex(block_hash)
+    assert(computed_hex == self.network.genesis_hash,
+      "connect_genesis: computed genesis hash " .. computed_hex ..
+      " does not match network.genesis_hash " .. self.network.genesis_hash ..
+      " — misconfigured chainparams (Core LoadGenesisBlock assert)")
+  end
+
   -- Store the full block and header
   self.storage.put_block(block_hash, block)
   self.storage.put_header(block_hash, header)
@@ -5250,7 +5264,8 @@ end
 -- This clears the invalid flag and potentially allows re-activation.
 -- @param block_hash hash256: The hash of the block to reconsider
 -- @return boolean, string|nil: success flag, error message on failure
-function ChainState:reconsider_block(block_hash)
+function ChainState:reconsider_block(block_hash, opts)
+  opts = opts or {}
   -- Check if the block exists
   local header = self.storage.get_header(block_hash)
   if not header then
@@ -5260,7 +5275,12 @@ function ChainState:reconsider_block(block_hash)
   -- Remove invalid flag from this block
   self.invalid_blocks[block_hash.bytes] = nil
 
-  -- Also clear invalid flags from all ancestors
+  -- Also clear invalid flags from all ancestors.  This walk is
+  -- relationship-bounded BY CONSTRUCTION: starting from the target's
+  -- prev_hash, every entry cleared is an ancestor of the target — exactly
+  -- the Core ResetBlockFailureFlags condition
+  -- `pindex->GetAncestor(block_index.nHeight) == &block_index`
+  -- (validation.cpp:3718).  Unrelated blocks (siblings etc.) are untouched.
   local current_hash = header.prev_hash
   while current_hash and current_hash.bytes ~= string.rep("\0", 32) do
     self.invalid_blocks[current_hash.bytes] = nil
@@ -5277,6 +5297,20 @@ function ChainState:reconsider_block(block_hash)
 
   -- Persist the invalid blocks set
   self:save_invalid_blocks()
+
+  -- Core parity (reconsiderblock, rpc/blockchain.cpp:1771-1776): after
+  -- ResetBlockFailureFlags clears the failure masks, Core calls
+  -- ActivateBestChain so the newly-valid most-work branch is promoted onto
+  -- the active chain.  Trigger the equivalent here: locate the deepest
+  -- stored descendant of the reconsidered block (the branch tip) and, when
+  -- its body is on disk, drive accept_side_branch_block — a strictly-heavier
+  -- branch reorgs in; a lighter branch stores-and-keeps-tip and a
+  -- header-only branch is a no-op, matching Core's "nothing to activate".
+  local tip_hash, tip_block = self:find_stored_branch_tip(block_hash)
+  if tip_hash and tip_block then
+    self:accept_side_branch_block(tip_block, tip_hash,
+      { mempool = opts.mempool })
+  end
 
   return true
 end
@@ -5319,6 +5353,65 @@ function ChainState:clear_descendant_invalid_flags(block_hash)
   for hash_bytes, _ in pairs(descendants) do
     self.invalid_blocks[hash_bytes] = nil
   end
+end
+
+--- Find the deepest descendant of block_hash (including block_hash itself)
+-- whose block body is in storage — the tip of the (re)considered branch.
+-- Descent is proven by walking prev_hash links (the same relationship check
+-- clear_descendant_invalid_flags uses); depth is measured by a genesis walk.
+-- Used by reconsider_block to drive the post-clear re-activation (Core
+-- ActivateBestChain after ResetBlockFailureFlags, rpc/blockchain.cpp:1776).
+-- @param block_hash hash256: branch root
+-- @return hash256|nil, block|nil: branch-tip hash and body, or nil when no
+--         block body of the branch is stored (header-only → no-op)
+function ChainState:find_stored_branch_tip(block_hash)
+  local function descends_from(candidate_hash)
+    if types.hash256_eq(candidate_hash, block_hash) then return true end
+    local current = candidate_hash
+    while current do
+      local h = self.storage.get_header(current)
+      if not h then break end
+      if types.hash256_eq(h.prev_hash, block_hash) then return true end
+      if h.prev_hash.bytes == string.rep("\0", 32) then break end
+      current = h.prev_hash
+    end
+    return false
+  end
+  local function height_of(candidate_hash)
+    local n, current = 0, candidate_hash
+    while current do
+      local h = self.storage.get_header(current)
+      if not h or h.prev_hash.bytes == string.rep("\0", 32) then break end
+      n = n + 1
+      current = h.prev_hash
+    end
+    return n
+  end
+
+  local best_hash, best_block, best_height = nil, nil, -1
+  local own_block = self.storage.get_block(block_hash)
+  if own_block then
+    best_hash, best_block = block_hash, own_block
+    best_height = height_of(block_hash)
+  end
+  local iter = self.storage.iterator(storage_mod.CF.HEADERS)
+  iter.seek_to_first()
+  while iter.valid() do
+    local hash_bytes = iter.key()
+    local candidate_hash = types.hash256(hash_bytes)
+    if descends_from(candidate_hash) then
+      local b = self.storage.get_block(candidate_hash)
+      if b then
+        local h = height_of(candidate_hash)
+        if h > best_height then
+          best_hash, best_block, best_height = candidate_hash, b, h
+        end
+      end
+    end
+    iter.next()
+  end
+  iter.destroy()
+  return best_hash, best_block
 end
 
 --- Get the list of currently invalidated block hashes.

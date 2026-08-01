@@ -171,6 +171,16 @@ function M.create_coinbase_tx(height, value, coinbase_script_extra, witness_comm
   -- block was rejected with "bad-cb-height" (height mismatch at byte 1).
   w.write_bytes(validation.encode_bip34_height(height))
 
+  -- Core miner.cpp:187-193: for heights <= 16 the BIP34-encoded height alone
+  -- is only ONE byte (OP_0 / OP_1..OP_16), but consensus requires coinbase
+  -- scriptSigs to be at least two bytes ("bad-cb-length",
+  -- consensus/tx_check.cpp:50).  Core appends a dummy extraNonce (OP_0) via
+  -- include_dummy_extranonce (tests/regtest); we always need a valid block,
+  -- so append OP_0 unconditionally in the 1-byte case.
+  if height <= 16 then
+    w.write_bytes("\x00")  -- OP_0 dummy extraNonce
+  end
+
   if coinbase_script_extra then
     w.write_bytes(coinbase_script_extra)
   end

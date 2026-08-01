@@ -5,7 +5,7 @@
 io.stdout:setvbuf("line")
 io.stderr:setvbuf("line")
 
-local VERSION = "0.1.0"
+local VERSION = "1.0.0"
 
 --------------------------------------------------------------------------------
 -- Minimal argument parser (no external dependency)

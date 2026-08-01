@@ -380,22 +380,24 @@ describe("W107 CompactSize + VarInt serialization audit (lunarblock vs Core)", f
   -- read_u64le returns low + high * 4294967296, which is IEEE 754 double.
   -- Values > 2^53 lose precision since mantissa is only 53 bits.
   ---------------------------------------------------------------------------
-  describe("G16 64-bit CompactSize read precision (BUG)", function()
+  describe("G16 64-bit CompactSize read precision (FIXED W112 BUG-2)", function()
     -- 2^53 + 1 = 9007199254740993 = 0x0020000000000001
     -- LE8 bytes: 01 00 00 00 00 00 20 00
     local val_2_53_plus1_bytes =
       string.char(0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00)
-    pending("BUG: 64-bit read should distinguish 2^53 from 2^53+1 (CORRECTNESS)", function()
-      local v = dec(val_2_53_plus1_bytes)
-      assert.equal(9007199254740993, v,
-        "2^53+1 must round-trip without precision loss; use FFI cdata uint64_t")
-    end)
-    it("XFAIL: 2^53+1 loses last bit due to Lua double mantissa limit", function()
-      local v = dec(val_2_53_plus1_bytes)
-      -- IEEE 754 double rounds 9007199254740993 to 9007199254740992
-      local expected_rounded = 9007199254740992
-      assert.equal(expected_rounded, v,
-        "documents precision loss: 2^53+1 read as 2^53 (IEEE 754 double rounds)")
+    it("FIXED: 2^53+1 reads exactly via FFI uint64_t (no double rounding)", function()
+      -- Read via range_check=false: the default checked path rejects
+      -- 2^53+1 with "size too large" (Core serialize.h MAX_SIZE gate, G12)
+      -- BEFORE precision ever matters; the 64-bit payload is only readable
+      -- through the unchecked raw-bitfield path (serialize.lua
+      -- read_varint(false), e.g. BIP-155 services).
+      local r = serialize.buffer_reader(val_2_53_plus1_bytes)
+      local v = r.read_varint(false)
+      -- W112 BUG-2 fix (serialize.lua read_u64le): the 64-bit payload is
+      -- assembled as an FFI uint64_t cdata, so 2^53+1 is EXACT — the old
+      -- Lua-double path (low + high * 2^32) rounded it down to 2^53.
+      assert.equal("9007199254740993ULL", tostring(v),
+        "2^53+1 must round-trip exactly (FFI uint64_t, not IEEE 754 double)")
     end)
   end)
 

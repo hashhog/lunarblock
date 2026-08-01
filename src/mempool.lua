@@ -3217,12 +3217,18 @@ end
 --                              expire_stale().  Mirror of the constant used
 --                              in Core before the weight-based rewrite
 --                              (txorphanage.cpp, Core PR #22503).
+--   MAX_ORPHAN_WEIGHT_PER_PEER = 404000 WU (weight units) — Core v31
+--                              DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER
+--                              (txorphanage.h:20).  Per-peer budget on the
+--                              SUM of orphan weights; a flat count cap alone
+--                              lets one peer park 100 * 100000 = 10 MB.
 --------------------------------------------------------------------------------
 
 M.MAX_ORPHAN_TRANSACTIONS = 100
 M.MAX_ORPHAN_TX_SIZE      = 100000
 M.MAX_ORPHANS_PER_PEER    = 100
 M.ORPHAN_TX_EXPIRE_TIME   = 300  -- seconds; Core txorphanage.h (pre-weight-rewrite)
+M.MAX_ORPHAN_WEIGHT_PER_PEER = 404000  -- WU; Core txorphanage.h:20
 
 local OrphanPool = {}
 OrphanPool.__index = OrphanPool
@@ -3236,16 +3242,21 @@ function M.new_orphan_pool(config)
   self.max_orphans  = (config and config.max_orphans)  or M.MAX_ORPHAN_TRANSACTIONS
   self.max_per_peer = (config and config.max_per_peer) or M.MAX_ORPHANS_PER_PEER
   self.max_tx_size  = (config and config.max_tx_size)  or M.MAX_ORPHAN_TX_SIZE
+  self.max_weight_per_peer = (config and config.max_weight_per_peer)
+    or M.MAX_ORPHAN_WEIGHT_PER_PEER
 
   -- Primary storage keyed by wtxid_hex (BIP-339 / Core txorphanage.cpp).
   -- Secondary txid→wtxid index allows O(1) child lookup: missing_parents
   -- carries txid_hex values (from input prevout hashes), so we need to
   -- map those back to the wtxid primary key.
-  self.entries      = {}  -- wtxid_hex -> {tx, txid_hex, peer_id, time, size, missing_parents={txid_hex=true,...}}
+  self.entries      = {}  -- wtxid_hex -> {tx, txid_hex, peer_id, time, size, weight, missing_parents={txid_hex=true,...}}
   self.txid_to_wtxid = {} -- txid_hex  -> wtxid_hex  (secondary index for dedup + child resolution)
   self.count   = 0
   -- Per-peer announcement counts (peer_id -> count).
   self.by_peer = {}
+  -- Per-peer total orphan weight in weight units (Core v31
+  -- DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER, txorphanage.h:20).
+  self.weight_by_peer = {}
   -- Insertion order list for oldest-first eviction.  We accept the O(n)
   -- shift on eviction because n <= max_orphans (100 by default).
   self.order   = {}    -- ordered list of wtxid_hex
@@ -3301,6 +3312,21 @@ function OrphanPool:add(tx, wtxid_hex, peer_id, missing_parents)
     return false, "orphan-per-peer-cap"
   end
 
+  -- Per-peer WEIGHT budget (Core v31 parity).  Core's TxOrphanage reserves
+  -- DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER = 404'000 WU per peer
+  -- (txorphanage.h:20) and bounds each peer by summed orphan WEIGHT, not
+  -- count — otherwise one peer can park max_per_peer * max_tx_size
+  -- (100 * 100000 = 10 MB) of orphan data.  validation.get_tx_weight is
+  -- GetTransactionWeight (consensus/validation.h:132-135); fall back to
+  -- total_size * WITNESS_SCALE_FACTOR (a safe upper bound) if it fails.
+  local ok_w, weight = pcall(validation.get_tx_weight, tx)
+  if not ok_w or type(weight) ~= "number" then
+    weight = size * 4
+  end
+  if (self.weight_by_peer[pid] or 0) + weight > self.max_weight_per_peer then
+    return false, "orphan-per-peer-weight-cap"
+  end
+
   -- Global cap: evict oldest first to make room.
   while self.count >= self.max_orphans do
     if not self:_evict_oldest() then break end
@@ -3316,11 +3342,13 @@ function OrphanPool:add(tx, wtxid_hex, peer_id, missing_parents)
     peer_id         = pid,
     time            = os.time(),
     size            = size,
+    weight          = weight,
     missing_parents = missing_parents or {},
   }
   self.txid_to_wtxid[txid_hex] = wtxid_hex
   self.count = self.count + 1
   self.by_peer[pid] = (self.by_peer[pid] or 0) + 1
+  self.weight_by_peer[pid] = (self.weight_by_peer[pid] or 0) + weight
   self.order[#self.order + 1] = wtxid_hex
   return true
 end
@@ -3353,6 +3381,16 @@ function OrphanPool:_remove_internal(wtxid_hex)
       self.by_peer[pid] = nil
     else
       self.by_peer[pid] = n
+    end
+    -- Keep the per-peer weight budget in lockstep (Core v31
+    -- DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER accounting, txorphanage.h:20).
+    if entry.weight then
+      local w = (self.weight_by_peer[pid] or 0) - entry.weight
+      if w <= 0 then
+        self.weight_by_peer[pid] = nil
+      else
+        self.weight_by_peer[pid] = w
+      end
     end
   end
   return entry
