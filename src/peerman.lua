@@ -38,8 +38,11 @@ M.TRICKLE = {
   OUTBOUND_INTERVAL = 2.0,
   -- Average Poisson delay for inbound peers (more privacy)
   INBOUND_INTERVAL = 5.0,
-  -- Maximum inv entries per message (keeps messages small)
-  MAX_INV_PER_MSG = 35,
+  -- Maximum tx inv entries relayed per peer per trickle flush.
+  -- Core INVENTORY_BROADCAST_MAX = 1000 (net_processing.cpp:176) — the old
+  -- value of 35 throttled tx relay throughput ~28x below Core on a busy
+  -- mempool.  (Still far below the MAX_INV_SZ=50000 wire cap.)
+  MAX_INV_PER_MSG = 1000,
 }
 
 --------------------------------------------------------------------------------
@@ -898,33 +901,42 @@ function PeerManager:_select_address(new_only)
   local use_tried = not new_only and self._tried_count > 0 and
                     (self._new_count == 0 or math.random() < 0.5)
 
-  if use_tried then
-    -- Select from tried table
-    local attempts = 0
-    while attempts < 100 do
-      local bucket = math.random(0, M.ADDRMAN.TRIED_BUCKET_COUNT - 1)
-      local pos = math.random(0, M.ADDRMAN.BUCKET_SIZE - 1)
-      local entry = self._tried_buckets[bucket][pos]
-      if entry then
-        return {ip = entry.ip, port = entry.port, services = entry.services}
+  -- Core addrman.cpp:739-754 (AddrManImpl::Select_): pick a random bucket and
+  -- an initial position, then SCAN all BUCKET_SIZE positions wrapping around
+  -- (retrying other buckets when empty) — guaranteed to find an entry in any
+  -- non-empty bucket.  The old blind 100-probes-over-the-whole-table loop
+  -- almost always returned nil for a sparse table (1 entry in 256x64 slots
+  -- is hit with probability ~0.15% per 100 probes).
+  local function probe(buckets, bucket_count)
+    for _ = 1, 100 do
+      local bucket = math.random(0, bucket_count - 1)
+      local initial = math.random(0, M.ADDRMAN.BUCKET_SIZE - 1)
+      for i = 0, M.ADDRMAN.BUCKET_SIZE - 1 do
+        local entry = buckets[bucket][(initial + i) % M.ADDRMAN.BUCKET_SIZE]
+        if entry then
+          return {ip = entry.ip, port = entry.port, services = entry.services}
+        end
       end
-      attempts = attempts + 1
     end
+    -- Deterministic last resort (Core's unbounded retry loop): full scan so a
+    -- non-empty table never yields nil, however unlucky the random probes were.
+    for bucket = 0, bucket_count - 1 do
+      for pos = 0, M.ADDRMAN.BUCKET_SIZE - 1 do
+        local entry = buckets[bucket][pos]
+        if entry then
+          return {ip = entry.ip, port = entry.port, services = entry.services}
+        end
+      end
+    end
+    return nil
   end
 
-  -- Select from new table
-  local attempts = 0
-  while attempts < 100 do
-    local bucket = math.random(0, M.ADDRMAN.NEW_BUCKET_COUNT - 1)
-    local pos = math.random(0, M.ADDRMAN.BUCKET_SIZE - 1)
-    local entry = self._new_buckets[bucket][pos]
-    if entry then
-      return {ip = entry.ip, port = entry.port, services = entry.services}
-    end
-    attempts = attempts + 1
+  if use_tried then
+    local addr = probe(self._tried_buckets, M.ADDRMAN.TRIED_BUCKET_COUNT)
+    if addr then return addr end
   end
 
-  return nil
+  return probe(self._new_buckets, M.ADDRMAN.NEW_BUCKET_COUNT)
 end
 
 --- Select ONE address from the NEW table for a feeler probe.
@@ -1891,7 +1903,12 @@ function PeerManager:disconnect_peer(p, reason)
       break
     end
   end
-  self.our_nonces[p.nonce] = nil
+  -- Guard: partially-constructed peers (unit-test mocks) may lack a nonce;
+  -- real Peer objects always have one (peer.new sets nonce=0, randomized at
+  -- handshake). Same nil-tolerance idiom as the bytes_* counters above.
+  if p.nonce then
+    self.our_nonces[p.nonce] = nil
+  end
   -- Clean up trickling state
   self:_cleanup_peer_trickle(p)
   -- Clean up chain sync state
@@ -2103,9 +2120,10 @@ end
 
 --- Check if an IP is banned.
 -- @param ip string: IP address to check
--- @return boolean: true if banned
+-- @return boolean: true if banned, false otherwise (strict boolean — callers
+--   and specs compare with `== false`; C++ bool parity with Core IsBanned)
 function PeerManager:is_banned(ip)
-  return self.banned[ip] and self.banned[ip] > os.time()
+  return self.banned[ip] ~= nil and self.banned[ip] > os.time()
 end
 
 --- Discourage and disconnect a misbehaving peer (single-event, no score).
@@ -3025,17 +3043,31 @@ end
 -- transaction is checked against the filter; only matching txs are queued.
 -- Reference: bitcoin-core/src/net_processing.cpp SendMessages() — filters
 -- outbound tx inv via tx_relay->m_bloom_filter->IsRelevantAndUpdate().
+-- BIP-133: peers that sent us a feefilter do not receive announcements for
+-- transactions below their declared minimum feerate — Core SendMessages:
+-- `if (txinfo.fee < filterrate.GetFee(txinfo.vsize)) continue;`
+-- (net_processing.cpp:6036-6064, filterrate = m_fee_filter_received).
 -- @param txid  string: transaction id (hash256 as raw bytes)
 -- @param wtxid string: witness transaction id (hash256 as raw bytes, optional)
 -- @param tx    table:  deserialized transaction object (optional; required for
 --                      bloom-filter matching when the peer has loaded a filter)
-function PeerManager:queue_tx_announcement(txid, wtxid, tx)
+-- @param feerate_sat_kb number: tx feerate in sat/kvB (optional; when given,
+--                      peers whose fee_filter exceeds it are skipped)
+function PeerManager:queue_tx_announcement(txid, wtxid, tx, feerate_sat_kb)
   wtxid = wtxid or txid  -- Non-segwit: wtxid equals txid
   for _, p in ipairs(self.peer_list) do
     if p.state == peer_mod.STATE.ESTABLISHED then
       local key = p.ip .. ":" .. p.port
       local trickle = self._peer_trickle and self._peer_trickle[key]
       if trickle then
+        -- BIP-133: skip peers whose fee_filter is above the tx feerate
+        -- (Core net_processing.cpp:6036-6064 — `txinfo.fee <
+        -- filterrate.GetFee(txinfo.vsize)` → continue; both sides of the
+        -- comparison are in sat/kvB here, so it reduces to a rate compare).
+        if feerate_sat_kb ~= nil and (p.fee_filter or 0) > 0
+            and feerate_sat_kb < p.fee_filter then
+          goto continue_peer
+        end
         -- BIP-37: per-peer bloom filter check (FIX-37).
         -- Skip this peer if it has a loaded filter that rejects the tx.
         -- If no filter is loaded (peer.bloom_filter == nil) the tx is always

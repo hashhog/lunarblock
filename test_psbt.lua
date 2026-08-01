@@ -260,7 +260,9 @@ test("decode PSBT", function()
   assert(decoded.tx.version == 2, "wrong version")
   assert(#decoded.inputs == 1, "wrong input count")
   assert(#decoded.outputs == 1, "wrong output count")
-  assert(decoded.inputs[1].has_utxo, "utxo not detected")
+  -- Core decodepsbt emits a witness_utxo object, not a has_utxo flag
+  -- (rawtransaction.cpp:1124-1134).
+  assert(decoded.inputs[1].witness_utxo ~= nil, "witness_utxo not detected")
   assert(decoded.fee == (100000 - 50000) / consensus.COIN, "wrong fee")
 end)
 

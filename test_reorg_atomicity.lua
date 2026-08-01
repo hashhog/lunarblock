@@ -371,7 +371,7 @@ end
 --   the active chain.
 --------------------------------------------------------------------------------
 do
-  io.write("\n--- Test 3: MEMORY-CAP (MAX_REORG_DEPTH=100) ---\n")
+  io.write("\n--- Test 3: deep side-branch with header gap (archive node) ---\n")
   local dir = tmpdir()
   local stor = storage_mod.open(dir)
   local cs = utxo_mod.new_chain_state(stor, REGTEST)
@@ -391,13 +391,21 @@ do
   --
   -- Each header's prev_hash points back to the previous synthetic
   -- header.  The deepest synthetic header's prev_hash is a random
-  -- 32-byte value NOT in storage and NOT genesis — so if MAX_REORG_DEPTH
-  -- weren't enforced the walk would terminate with "side-branch-header-gap"
-  -- when it tried to load that nonexistent header.  We want the depth
-  -- guard to fire FIRST, which means we need exactly > MAX_REORG_DEPTH
-  -- headers in the synthetic chain.
+  -- 32-byte value NOT in storage and NOT genesis.
+  --
+  -- NOTE (post-2026-07-02 behavior): on an ARCHIVE node (pruning off,
+  -- the default) there is NO reorg depth cap — the old flat
+  -- MAX_REORG_DEPTH=100/288 guard was removed because Core
+  -- (ActivateBestChainStep, validation.cpp) follows the most-work valid
+  -- chain to ANY depth, and capping archive reorgs strands the node on
+  -- the minority chain (Class-A consensus split).  The walk now runs
+  -- until it meets the common ancestor, genesis, or a header gap.  This
+  -- synthetic branch bottoms out at an unknown hash, so the walk must
+  -- reject with "side-branch-header-gap".  ("reorg-depth-exceeded" now
+  -- fires only on PRUNED nodes whose fork point lies beyond the
+  -- retained undo window — see utxo.lua MAX_REORG_DEPTH.)
 
-  local chain_len = 102  -- > MAX_REORG_DEPTH (100)
+  local chain_len = 102
   local headers = {}
   local hashes = {}
   -- Deepest synthetic header points to a non-genesis "off-chain" hash
@@ -426,8 +434,8 @@ do
   -- The newest synthetic header is hashes[chain_len].  Submit a block
   -- whose prev_hash IS the newest synthetic.  accept_side_branch_block
   -- walks back: 1 step (newest synthetic) → 2 steps (one below) → … →
-  -- 102 steps.  The MAX_REORG_DEPTH guard caps the walk at 100 and
-  -- returns "reorg-depth-exceeded".
+  -- 102 steps → the 103rd get_header (the unknown \xCD… base) misses and
+  -- the walk returns "side-branch-header-gap".
   local top_header = headers[chain_len]
   local top_hash = hashes[chain_len]
   -- Build an actual block (with coinbase) whose prev = top_hash so the
@@ -438,14 +446,14 @@ do
   local r, err = cs:accept_side_branch_block(blk_deep, hash_deep,
     {skip_scripts=true, nosync=true})
 
-  check("test3 cap: deep side-branch rejected", r == nil)
-  check("test3 cap: error == 'reorg-depth-exceeded'",
-    err == "reorg-depth-exceeded",
+  check("test3 gap: deep side-branch rejected", r == nil)
+  check("test3 gap: error == 'side-branch-header-gap'",
+    err == "side-branch-header-gap",
     "got: " .. tostring(err))
 
   -- And the on-disk chain_tip MUST still be A1 (no partial mutation).
   local disk_hash, disk_height = stor.get_chain_tip()
-  check("test3 cap: on-disk chain_tip still at A1 (height=1)",
+  check("test3 gap: on-disk chain_tip still at A1 (height=1)",
     disk_height == 1 and disk_hash and types.hash256_eq(disk_hash, hash_a1))
 
   stor.close()

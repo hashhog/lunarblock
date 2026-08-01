@@ -168,8 +168,10 @@ describe("erlay (BIP330)", function()
         local decoded = p2p.deserialize_sendtxrcncl(payload)
 
         assert.equals(version, decoded.version)
-        -- Note: salt loses precision due to Lua number limits
-        assert.is_number(decoded.salt)
+        -- deserialize returns the BIP330 uint64 salt as an exact FFI uint64
+        -- cdata (serialize.read_u64le, W112 BUG-2 — no double precision loss).
+        -- tonumber() is exact here because the fixture salt < 2^53.
+        assert.equals(salt, tonumber(decoded.salt))
       end)
 
       it("erlay module serialization matches p2p", function()

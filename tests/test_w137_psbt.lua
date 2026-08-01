@@ -29,7 +29,7 @@
 --   G24    Taproot tree depth / leaf_ver / IsComplete (MISSING)
 --   G25    Global xpub key size (BUG)
 --   G26    Finalizer P2WPKH/P2PKH/P2SH/P2WSH multisig (PASS)
---   G27    Finalizer P2TR (MISSING)
+--   G27    Finalizer P2TR (FIXED — BUG-19: key-path + script-path)
 --   G28    Combiner Merge m_xpubs (BUG)
 --   G29    Extractor witness flag (PASS)
 --   G30    RPC PSBT methods coverage (PARTIAL)
@@ -681,22 +681,68 @@ function()
 end)
 
 --------------------------------------------------------------------------------
--- G27: Finalizer P2TR (MISSING)
+-- G27: Finalizer P2TR (FIXED — BUG-19)
 --------------------------------------------------------------------------------
-test("G27: BUG-19 finalize_input has NO p2tr branch",
+test("G27: BUG-19 (FIXED) finalize_input P2TR key-path + script-path",
 function()
-  log_bug("BUG-19", "P1",
-    "finalize_input (psbt.lua:1141-1344) covers p2wpkh/p2pkh/p2sh/p2wsh "
-    .. "but NO p2tr branch. A PSBT with tap_key_sig populated → "
-    .. "finalize_input falls through to 'Unsupported type' (line 1329). "
-    .. "Lightning / Ark / Taro PSBTs with v1 segwit inputs cannot be "
-    .. "finalized via lunarblock; user needs external finalizer. "
-    .. "Blocker for taproot rollout.")
-  -- Source: confirm no p2tr branch in finalize_input
-  local fin_func = PSBT_SRC:match("function M%.finalize_input.-end\n")
-  -- finalize_input is ~200 lines; not all captured. Confirm absence of p2tr
-  expect_false(PSBT_SRC:find('script_type%s*==%s*"p2tr"', 1, false) ~= nil,
-    "no script_type == 'p2tr' branch anywhere in psbt.lua")
+  -- BUG-19 was: finalize_input covered p2wpkh/p2pkh/p2sh/p2wsh but had NO
+  -- p2tr branch — taproot PSBTs could not be finalized. RESOLVED: the p2tr
+  -- branch now finalizes BIP-371 key-path (tap_key_sig → witness [sig]) and
+  -- script-path (tap_script_sigs + tap_scripts → witness
+  -- [sig, leaf_script, control_block]) per Core script/sign.cpp SignTaproot
+  -- (sign.cpp:594-615) as driven by FinalizePSBT (psbt.cpp:554-565).
+  -- Documented remaining limitations (psbt.lua build_p2tr_script_path_witness):
+  -- only <xonly-pk> OP_CHECKSIG leaves are satisfiable script-path (Core
+  -- satisfies arbitrary miniscript via TapSatisfier), and the BIP-341 annex
+  -- is not emitted (BIP-371 defines no annex field; Core never emits one).
+  -- Source-level: the p2tr branch now exists.
+  expect_true(PSBT_SRC:find('script_type%s*==%s*"p2tr"', 1, false) ~= nil,
+    "p2tr branch present in psbt.lua")
+
+  local P2TR_SPK = "\x51\x20" .. string.rep("\x99", 32)  -- OP_1 <32-byte program>
+
+  -- Behavioral: key-path finalize from tap_key_sig → witness [sig]
+  local p1 = make_minimal_psbt()
+  psbt_mod.update_input_utxo(p1, 0,
+    {value = 100000, script_pubkey = P2TR_SPK}, true)
+  local key_sig = string.rep("\x11", 64)  -- SIGHASH_DEFAULT 64-byte Schnorr sig
+  p1.inputs[1].tap_key_sig = key_sig
+  expect_true(psbt_mod.finalize_input(p1, 0), "key-path finalize succeeds")
+  expect_eq(#p1.inputs[1].final_script_witness, 1, "key-path witness has 1 element")
+  expect_eq(p1.inputs[1].final_script_witness[1], key_sig, "key-path witness = [sig]")
+  expect_eq(p1.inputs[1].final_script_sig, "", "key-path scriptSig empty")
+  expect_nil(p1.inputs[1].tap_key_sig, "tap_key_sig cleared after finalize")
+
+  -- Behavioral: unsigned p2tr input does NOT finalize
+  local p2 = make_minimal_psbt()
+  psbt_mod.update_input_utxo(p2, 0,
+    {value = 100000, script_pubkey = P2TR_SPK}, true)
+  expect_false(psbt_mod.finalize_input(p2, 0), "unsigned p2tr not finalized")
+
+  -- Behavioral: script-path finalize → witness [sig, leaf_script, control]
+  local crypto = require("lunarblock.crypto")
+  local xonly = string.rep("\x22", 32)
+  local leaf_script = "\x20" .. xonly .. "\xac"  -- <xonly-pk> OP_CHECKSIG
+  local leaf_ver = 0xc0  -- TAPROOT_LEAF_TAPSCRIPT
+  local control_block = "\xc0" .. string.rep("\x33", 32)  -- leaf_ver|parity + internal key
+  local leaf_hash = crypto.tagged_hash("TapLeaf",
+    string.char(leaf_ver) .. crypto.compact_size(#leaf_script) .. leaf_script)
+  local script_sig = string.rep("\x44", 64)
+
+  local p3 = make_minimal_psbt()
+  psbt_mod.update_input_utxo(p3, 0,
+    {value = 100000, script_pubkey = P2TR_SPK}, true)
+  local leaf_key = psbt_mod.hex_encode(leaf_script) .. ":" .. leaf_ver
+  p3.inputs[1].tap_scripts[leaf_key] =
+    {script = leaf_script, leaf_ver = leaf_ver, control_blocks = {control_block}}
+  p3.inputs[1].tap_script_sigs[
+    psbt_mod.hex_encode(xonly) .. "." .. psbt_mod.hex_encode(leaf_hash)] = script_sig
+  expect_true(psbt_mod.finalize_input(p3, 0), "script-path finalize succeeds")
+  expect_eq(#p3.inputs[1].final_script_witness, 3, "script-path witness has 3 elements")
+  expect_eq(p3.inputs[1].final_script_witness[1], script_sig, "witness[1] = sig")
+  expect_eq(p3.inputs[1].final_script_witness[2], leaf_script, "witness[2] = leaf script")
+  expect_eq(p3.inputs[1].final_script_witness[3], control_block, "witness[3] = control block")
+  expect_eq(p3.inputs[1].final_script_sig, "", "script-path scriptSig empty")
 end)
 
 --------------------------------------------------------------------------------

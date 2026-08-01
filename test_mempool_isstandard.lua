@@ -179,7 +179,11 @@ do
   local base_txid = types.hash256(string.rep("\x30", 32))
   local base_txid_hex = types.hash256_hex(base_txid)
 
-  -- One dust output (< 546 sat) is allowed (ephemeral dust rule)
+  -- One dust output (< 546 sat) with a NON-ZERO fee is rejected: Core's
+  -- ephemeral-dust rule (PreCheckEphemeralTx, policy/ephemeral_policy.cpp:23-31)
+  -- requires any tx carrying a dust output to pay exactly 0 fee — "we never
+  -- want to give incentives to mine this transaction alone".  The IsStandardTx
+  -- dust-count gate alone (MAX_DUST_OUTPUTS_PER_TX=1) is NOT sufficient.
   do
     local cs = make_mock_chain()
     add_utxo(cs, base_txid_hex, 0, 5000000)
@@ -189,8 +193,31 @@ do
     local out_dust   = types.txout(100, p2pkh_script())  -- 100 < 546, dust
     local tx = types.transaction(1, {inp}, {out_normal, out_dust}, 0)
     local ok, reason = mp:accept_transaction(tx)
-    check("one dust output (ephemeral dust) → accepted", ok,
+    check("one dust output paying a fee → rejected", not ok,
           "reason: " .. tostring(reason))
+    check("rejection reason is the 0-fee dust gate",
+          reason == "dust: tx with dust output must be 0-fee",
+          "got: " .. tostring(reason))
+  end
+
+  -- One dust output with a ZERO fee passes the ephemeral-dust gate, but a
+  -- STANDALONE 0-fee tx still fails the static min-relay floor: Core only
+  -- admits ephemeral dust as part of a package whose aggregate feerate pays
+  -- for it (mempool_ephemeral_dust.py: single dusty_tx submission →
+  -- "min relay fee not met"; validation.cpp:709).
+  do
+    local cs = make_mock_chain()
+    add_utxo(cs, base_txid_hex, 0, 5000000)
+    local mp = mempool.new(cs)
+    local inp = types.txin(types.outpoint(base_txid, 0), "", 0xFFFFFFFE)
+    local out_normal = types.txout(4999900, p2pkh_script())
+    local out_dust   = types.txout(100, p2pkh_script())  -- fee = 5000000-4999900-100 = 0
+    local tx = types.transaction(1, {inp}, {out_normal, out_dust}, 0)
+    local ok, reason = mp:accept_transaction(tx)
+    check("one dust output, 0-fee, standalone → rejected at min-relay floor", not ok,
+          "reason: " .. tostring(reason))
+    check("rejection reason is 'min relay fee not met'",
+          reason == "min relay fee not met", "got: " .. tostring(reason))
   end
 
   -- Two dust outputs → rejected with "dust"

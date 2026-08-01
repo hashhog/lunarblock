@@ -466,8 +466,12 @@ describe("wallet", function()
         }
       end
 
-      -- Manually update balance (normally done by scan_utxos)
-      w.balance = 10000 + 20000 + 30000
+      -- Manually update confirmed balance (normally done by scan_utxos).
+      -- get_balance() returns the spendable balance, falling back to the
+      -- confirmed balance when no scan has run — Core's getbalance reports
+      -- the trusted (confirmed, non-immature) total (bitcoin-core
+      -- src/wallet/wallet.cpp GetBalance / rpc getbalance).
+      w.confirmed_balance = 10000 + 20000 + 30000
 
       assert.equals(60000, w:get_balance())
     end)
@@ -759,7 +763,7 @@ describe("wallet", function()
         vout = 0,
         height = 100,
         is_coinbase = true,
-        confirmations = 50,  -- Less than 100
+        confirmations = 50,  -- Immature: below COINBASE_MATURITY+1 (=101)
       }
       w.confirmed_balance = 5000000000
 
@@ -767,8 +771,12 @@ describe("wallet", function()
       assert.equals(5000000000, details.confirmed)
       assert.equals(0, details.spendable)  -- Not spendable yet
 
-      -- Now with sufficient confirmations
-      w.utxos[utxo_key].confirmations = 100
+      -- Core's wallet treats a coinbase as immature until it has
+      -- COINBASE_MATURITY+1 (=101) confirmations: GetTxBlocksToMaturity
+      -- returns max(0, COINBASE_MATURITY+1 - depth) (bitcoin-core
+      -- src/wallet/wallet.cpp:3341) and AvailableCoins skips immature
+      -- coinbases (src/wallet/spend.cpp:357).
+      w.utxos[utxo_key].confirmations = 101
       details = w:get_balance_details()
       assert.equals(5000000000, details.spendable)
     end)
@@ -1306,7 +1314,11 @@ describe("psbt", function()
       assert.equals(2, decoded.tx.version)
       assert.equals(1, #decoded.inputs)
       assert.equals(1, #decoded.outputs)
-      assert.is_true(decoded.inputs[1].has_utxo)
+      -- Core's decodepsbt emits a witness_utxo object per input that has one
+      -- (bitcoin-core/src/rpc/rawtransaction.cpp:1124-1134); there is no
+      -- "has_utxo" field in Core's output shape.
+      assert.is_not_nil(decoded.inputs[1].witness_utxo)
+      assert.equals(100000 / consensus.COIN, decoded.inputs[1].witness_utxo.amount)
 
       -- Fee should be calculable
       assert.equals((100000 - 50000) / consensus.COIN, decoded.fee)
@@ -1434,6 +1446,11 @@ end)
 
 describe("descriptor", function()
   local address
+  -- The multi-wallet manager suites below (new_manager / createwallet /
+  -- loadwallet / unloadwallet / wallet paths) drive src/wallet.lua and need
+  -- the consensus networks table.
+  local wallet
+  local consensus
 
   setup(function()
     local loaders = package.loaders or package.searchers
@@ -1452,6 +1469,8 @@ describe("descriptor", function()
       return nil, "not found"
     end)
     address = require("lunarblock.address")
+    wallet = require("lunarblock.wallet")
+    consensus = require("lunarblock.consensus")
   end)
 
   describe("descriptor_checksum", function()
@@ -2061,15 +2080,22 @@ describe("descriptor", function()
     end)
 
     it("saves wallet on unload", function()
-      -- Create wallet and modify it
+      -- Create wallet and modify it. create_wallet pre-generates a gap_limit
+      -- keypool (M.create → generate_addresses), so the freshly handed-out
+      -- address is NOT addresses[1]; what must survive unload+reload is the
+      -- keypool advance itself (Core flushes the keypool on top-up).
       local w = manager:create_wallet("save_test", {})
       local addr1 = w:get_new_address()
 
       manager:unload_wallet("save_test")
 
-      -- Reload and verify
+      -- Reload and verify the handed-out address was re-derived
       local w2 = manager:load_wallet("save_test")
-      assert.equals(addr1, w2.addresses[1])
+      local found = false
+      for _, a in ipairs(w2.addresses) do
+        if a == addr1 then found = true break end
+      end
+      assert.is_true(found)
     end)
   end)
 
@@ -2082,6 +2108,18 @@ describe("descriptor", function()
       os.execute("mkdir -p '" .. test_datadir .. "'")
       manager = wallet.new_manager(test_datadir, consensus.networks.mainnet, nil)
       manager:ensure_wallets_dir()
+    end)
+
+    -- setup/teardown run once per describe, so unload every wallet after
+    -- each test to keep the default-wallet assertions isolated.
+    after_each(function()
+      local names = {}
+      for name, _ in pairs(manager.wallets) do
+        names[#names + 1] = name
+      end
+      for _, name in ipairs(names) do
+        manager:unload_wallet(name)
+      end
     end)
 
     teardown(function()

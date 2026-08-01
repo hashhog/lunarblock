@@ -203,16 +203,18 @@ test("CPFP: child pays for low-fee parent", function()
   local mp = mempool.new(chain_state)
 
   -- Parent with LOW fee (would be rejected individually)
-  -- With ~85 vB tx, need fee < 85 sat for < 1 sat/vB (< 1000 sat/KB)
+  -- With ~85 vB tx and Core v31's DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB
+  -- (policy/policy.h:70 — lowered from 1000 in v30+), need fee < 8.5 sat:
+  -- 8 sat / 85 vB = 94 sat/kvB < 100 → below the floor.
   local parent = make_tx(1, {}, {}, 0)
   parent.inputs[1] = make_input(base_txid, 0)
-  parent.outputs[1] = make_output(99999980)  -- 20 sat fee (way below min)
+  parent.outputs[1] = make_output(99999992)  -- 8 sat fee (below v31 min)
   local parent_txid = validation.compute_txid(parent)
 
   -- Child with HIGH fee (pays for both)
   local child = make_tx(1, {}, {}, 0)
   child.inputs[1] = make_input(parent_txid, 0)
-  child.outputs[1] = make_output(99899980)  -- 100000 sat fee (high)
+  child.outputs[1] = make_output(99899992)  -- 100000 sat fee (high)
 
   -- Parent alone should fail
   local ok_parent, err_parent = mp:accept_transaction(parent)
@@ -235,12 +237,14 @@ test("CPFP: rejects package with combined fee rate too low", function()
 
   local parent = make_tx(1, {}, {}, 0)
   parent.inputs[1] = make_input(base_txid, 0)
-  parent.outputs[1] = make_output(99999990)  -- 10 sat fee
+  parent.outputs[1] = make_output(99999992)  -- 8 sat fee
   local parent_txid = validation.compute_txid(parent)
 
   local child = make_tx(1, {}, {}, 0)
   child.inputs[1] = make_input(parent_txid, 0)
-  child.outputs[1] = make_output(99999980)  -- 10 sat fee
+  child.outputs[1] = make_output(99999984)  -- 8 sat fee
+  -- Combined: 16 sat / ~170 vB ≈ 94 sat/kvB < 100 (Core v31
+  -- DEFAULT_MIN_RELAY_TX_FEE, policy/policy.h:70) → package rejected.
 
   local ok, err = mp:accept_package({parent, child})
   assert_false(ok)

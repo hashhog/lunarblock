@@ -1,5 +1,8 @@
 #!/usr/bin/env luajit
--- Test script for mempool ancestor/descendant limits
+-- Test script for mempool cluster limits (Core v31: ancestor/descendant
+-- limits removed; cluster count (64) and cluster weight (404,000) are the only
+-- connected-component bounds.  Ancestor/descendant bookkeeping is still
+-- maintained for TRUC checks and the wallet-facing package-limits query.)
 -- Run: LD_LIBRARY_PATH=./lib luajit test_mempool_limits.lua
 
 package.path = './src/?.lua;./lunarblock/?.lua;' .. package.path
@@ -128,8 +131,13 @@ do
   assert_eq(last_entry.ancestor_count, 24, "Last tx has 24 ancestors")
 end
 
--- Test 2: 26th transaction should be rejected
-print("\nTEST 2: Reject 26th transaction (exceeds MAX_ANCESTORS)")
+-- Test 2: linear chain — Core v31 REMOVED the ancestor-count limit
+-- (`too-long-mempool-chain` no longer exists anywhere in Core's tree); the
+-- cluster count limit (DEFAULT_CLUSTER_LIMIT=64, policy/policy.h:72) is the
+-- only bound on a connected component.  64 chained txs accept; the 65th is
+-- rejected "too-large-cluster" (validation.cpp:1343, txgraph.cpp:2059 uses
+-- strictly-greater-than, so 64 accept and 65 reject).
+print("\nTEST 2: Linear chain — 64 accepted, 65th rejected (cluster limit, Core v31)")
 do
   local chain_state = make_mock_chain_state()
   local base_txid = types.hash256(string.rep("\x02", 32))
@@ -139,43 +147,47 @@ do
   local mp = mempool.new(chain_state)
   local current_txid = base_txid
 
-  for i = 1, 25 do
+  for i = 1, 64 do
     local tx = make_tx(1, {}, {}, 0)
     tx.inputs[1] = make_input(current_txid, 0)
     tx.outputs[1] = make_output(600000000 - i * 1000000)
     local ok, _ = mp:accept_transaction(tx)
+    assert_true(ok, "Chain tx " .. i .. " accepted (no ancestor limit in v31)")
     if ok then
       current_txid = validation.compute_txid(tx)
     end
   end
+  assert_eq(mp.tx_count, 64, "Mempool has 64 chained transactions")
 
-  -- 26th transaction
-  local tx26 = make_tx(1, {}, {}, 0)
-  tx26.inputs[1] = make_input(current_txid, 0)
-  tx26.outputs[1] = make_output(600000000 - 26 * 1000000)
+  -- 65th transaction would make the cluster 65 > 64
+  local tx65 = make_tx(1, {}, {}, 0)
+  tx65.inputs[1] = make_input(current_txid, 0)
+  tx65.outputs[1] = make_output(600000000 - 65 * 1000000)
 
-  local ok26, err26 = mp:accept_transaction(tx26)
-  assert_true(not ok26, "26th transaction rejected")
-  assert_match(err26, "too many ancestors", "Error mentions too many ancestors")
+  local ok65, err65 = mp:accept_transaction(tx65)
+  assert_true(not ok65, "65th transaction rejected")
+  assert_match(err65, "too%-large%-cluster", "Error is too-large-cluster")
 end
 
--- Test 3: Descendant limit enforcement
-print("\nTEST 3: Enforce descendant limits")
+-- Test 3: fan-out — Core v31 REMOVED the descendant-count limit; the cluster
+-- count limit (64) is the only bound.  Parent + 63 children = 64 cluster
+-- members accept; the 64th child (65th member) is rejected
+-- "too-large-cluster".  Descendant bookkeeping is still maintained (Core
+-- keeps it for the wallet-facing getPackageLimits query).
+print("\nTEST 3: Fan-out — 63 children accepted, 64th rejected (cluster limit, Core v31)")
 do
   local chain_state = make_mock_chain_state()
   local root_txid = types.hash256(string.rep("\x03", 32))
   local root_txid_hex = types.hash256_hex(root_txid)
-  for i = 0, 30 do
-    add_utxo(chain_state, root_txid_hex, i, 10000000)
-  end
+  add_utxo(chain_state, root_txid_hex, 0, 100000000)
 
   local mp = mempool.new(chain_state)
 
-  -- Create parent with 30 outputs
+  -- Create parent with 70 outputs (70 x 300000 = 21M <= 100M input)
   local parent_tx = make_tx(1, {}, {}, 0)
   parent_tx.inputs[1] = make_input(root_txid, 0)
   parent_tx.outputs = {}
-  for i = 1, 30 do
+  for i = 1, 70 do
     parent_tx.outputs[i] = make_output(300000)
   end
 
@@ -184,8 +196,8 @@ do
 
   local parent_txid = validation.compute_txid(parent_tx)
 
-  -- Create 25 children
-  for i = 0, 24 do
+  -- Create 63 children (cluster = parent + 63 = 64 members)
+  for i = 0, 62 do
     local child = make_tx(1, {}, {}, 0)
     child.inputs[1] = make_input(parent_txid, i)
     child.outputs[1] = make_output(290000)
@@ -194,16 +206,16 @@ do
   end
 
   local parent_entry = mp:get_entry(parent_hex)
-  assert_eq(parent_entry.descendant_count, 25, "Parent has 25 descendants")
+  assert_eq(parent_entry.descendant_count, 63, "Parent has 63 descendants")
 
-  -- 26th child should fail
-  local child26 = make_tx(1, {}, {}, 0)
-  child26.inputs[1] = make_input(parent_txid, 25)
-  child26.outputs[1] = make_output(290000)
+  -- 64th child would make the cluster 65 > 64
+  local child64 = make_tx(1, {}, {}, 0)
+  child64.inputs[1] = make_input(parent_txid, 63)
+  child64.outputs[1] = make_output(290000)
 
-  local ok26, err26 = mp:accept_transaction(child26)
-  assert_true(not ok26, "26th child rejected")
-  assert_match(err26, "too many descendants", "Error mentions too many descendants")
+  local ok64, err64 = mp:accept_transaction(child64)
+  assert_true(not ok64, "64th child rejected")
+  assert_match(err64, "too%-large%-cluster", "Error is too-large-cluster")
 end
 
 -- Test 4: Proper ancestor deduplication (diamond pattern)
@@ -331,11 +343,9 @@ end
 -- Test 7: Cluster count limit — constant and get_cluster_size function
 -- W75 fix: old code used MAX_CLUSTER_SIZE=101 as count limit (wrong).
 -- Correct limit is MAX_CLUSTER_COUNT=64 (DEFAULT_CLUSTER_LIMIT, policy/policy.h:72).
--- Note: in practice, with ancestor_limit=25 and descendant_limit=25, a linear
--- chain hits the ancestor limit (25) before the cluster count limit (64).
--- The cluster limit is the binding constraint only in wide topologies where
--- individual tx ancestor/descendant depths are shallow.  We test the constant
--- value and the underlying counter function directly.
+-- Note: pre-v31 Core also had ancestor/descendant limits (25) which bound a
+-- linear chain before the cluster limit could; v31 removed them, so the
+-- cluster count limit is now the ONLY bound in every topology.
 print("\nTEST 7: Cluster count limit constant and per-cluster counting (W75 fix)")
 do
   -- Verify the constant is correct before touching the mempool
@@ -368,14 +378,23 @@ do
   local cluster_n = mempool.get_cluster_size(root)
   assert_eq(cluster_n, 25, "Cluster of 25-chain has 25 members (not 101)")
 
-  -- 26th tx is rejected by ancestor limit (not cluster limit — that's expected:
-  -- cluster count = 25 < 64, ancestor count = 26 > 25)
-  local tx26 = make_tx(1, {}, {}, 0)
-  tx26.inputs[1] = make_input(current_txid, 0)
-  tx26.outputs[1] = make_output(700000000 - 26 * 1000000)
-  local ok26, err26 = mp:accept_transaction(tx26)
-  assert_true(not ok26, "26th chain tx rejected (ancestor limit)")
-  assert_match(err26, "ancestor", "26th chain tx rejected by ancestor limit (not cluster)")
+  -- 26th chain tx is ACCEPTED in v31 (no ancestor limit); the cluster count
+  -- limit (64) is the only bound.  Extend the chain to 64 (all accepted),
+  -- then the 65th must be rejected with "too-large-cluster".
+  for i = 26, 64 do
+    local tx = make_tx(1, {}, {}, 0)
+    tx.inputs[1] = make_input(current_txid, 0)
+    tx.outputs[1] = make_output(700000000 - i * 1000000)
+    local ok, _ = mp:accept_transaction(tx)
+    assert_true(ok, "Chain tx " .. i .. " accepted (no ancestor limit in v31)")
+    current_txid = validation.compute_txid(tx)
+  end
+  local tx65 = make_tx(1, {}, {}, 0)
+  tx65.inputs[1] = make_input(current_txid, 0)
+  tx65.outputs[1] = make_output(700000000 - 65 * 1000000)
+  local ok65, err65 = mp:accept_transaction(tx65)
+  assert_true(not ok65, "65th chain tx rejected (cluster limit)")
+  assert_match(err65, "too%-large%-cluster", "65th chain tx rejected with too-large-cluster")
 end
 
 -- Test 8: Cluster vsize function (W75 fix: vsize check was not implemented).
@@ -432,56 +451,60 @@ do
     "3-tx cluster vsize " .. computed_vsize .. " is within 101000 limit")
 end
 
--- Test 9: Star topology — descendant limit (25) is the binding constraint before
--- cluster count limit (64) in simple fan topologies.  This test confirms correct
--- ordering: one root with many leaves, root hits descendant limit at 25 leaves
--- (not cluster count limit at 64).
--- Root in-mempool tx has 30 outputs (30 × 30000 sat each = 900000 out of 1000000 in).
-print("\nTEST 9: Star topology — descendant limit (25) is binding before cluster limit (64)")
+-- Test 9: Star topology — pre-v31 the descendant limit (25) bound a fan-out
+-- before the cluster count limit (64) could; v31 removed the descendant
+-- limit, so the cluster count limit is now the binding constraint in this
+-- topology too: root + 63 children = 64 cluster members accept, the 64th
+-- child is rejected "too-large-cluster".
+-- Root in-mempool tx has 70 outputs (70 × 30000 sat each = 2.1M out of 3M in).
+print("\nTEST 9: Star topology — cluster limit (64) is binding in v31 (descendant limit removed)")
 do
   local chain_state = make_mock_chain_state()
   local root_txid = types.hash256(string.rep("\x09", 32))
   local root_txid_hex = types.hash256_hex(root_txid)
   -- One large confirmed UTXO for the root in-mempool tx
-  add_utxo(chain_state, root_txid_hex, 0, 1000000)
+  add_utxo(chain_state, root_txid_hex, 0, 3000000)
 
   local mp = mempool.new(chain_state)
 
-  -- Root in-mempool tx: 1 input (1,000,000 sat), 30 outputs (30,000 each = 900,000 total)
-  -- Fee = 100,000 sat.
+  -- Root in-mempool tx: 1 input (3,000,000 sat), 70 outputs (30,000 each = 2,100,000 total)
+  -- Fee = 900,000 sat.
   local root_tx = make_tx(1, {}, {}, 0)
   root_tx.inputs[1] = make_input(root_txid, 0)
   root_tx.outputs = {}
-  for i = 1, 30 do
+  for i = 1, 70 do
     root_tx.outputs[i] = make_output(30000)
   end
   local ok_r, root_hex = mp:accept_transaction(root_tx)
-  assert_true(ok_r, "Root tx accepted (1 in, 30 out, fee=100000)")
+  assert_true(ok_r, "Root tx accepted (1 in, 70 out, fee=900000)")
   local root_txid2 = validation.compute_txid(root_tx)
 
   -- Add children that each spend one of root_tx's outputs
   -- Each child: 1 input (30,000), 1 output (29,000), fee=1000
   local accepted_children = 0
-  for i = 0, 29 do
+  local last_err = nil
+  for i = 0, 69 do
     local child = make_tx(1, {}, {}, 0)
     child.inputs[1] = make_input(root_txid2, i)
     child.outputs[1] = make_output(29000)
     local ok_c, err_c = mp:accept_transaction(child)
     if not ok_c then
-      -- Root's descendant count exceeded MAX_DESCENDANTS=25
-      assert_match(err_c, "descendant", "Star limit is descendant count, not cluster count")
+      -- Cluster reached root + 63 children = 64 members; the 64th child
+      -- would make it 65 > MAX_CLUSTER_COUNT.
+      last_err = err_c
       break
     end
     accepted_children = accepted_children + 1
   end
-  -- Exactly 25 children accepted (root descendant_count = 25 at that point)
-  assert_eq(accepted_children, 25,
-    "Exactly 25 children accepted (descendant limit = 25, cluster limit = 64)")
-  -- Cluster has root + 25 children = 26, well under cluster limit of 64
+  assert_eq(accepted_children, 63,
+    "Exactly 63 children accepted (cluster limit = 64, descendant limit removed in v31)")
+  assert_match(last_err, "too%-large%-cluster",
+    "Star rejection is too-large-cluster, not a descendant limit")
+  -- Cluster has root + 63 children = 64 members, exactly at the limit
   local cluster_root = mempool.uf_find(root_hex)
   local cluster_n = mempool.get_cluster_size(cluster_root)
-  assert_true(cluster_n <= mempool.MAX_CLUSTER_COUNT,
-    "Cluster of " .. cluster_n .. " is under MAX_CLUSTER_COUNT=" .. mempool.MAX_CLUSTER_COUNT)
+  assert_eq(cluster_n, mempool.MAX_CLUSTER_COUNT,
+    "Cluster of " .. cluster_n .. " is exactly MAX_CLUSTER_COUNT=" .. mempool.MAX_CLUSTER_COUNT)
 end
 
 -- Test 10: Cluster count constant value is 64 (not 101 — regression check)

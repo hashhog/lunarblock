@@ -181,8 +181,10 @@ describe("miniscript", function()
       local node = miniscript.multi_a(1, keys)
       local s = miniscript.to_script(node)
       -- <key0> OP_CHECKSIG <key1> OP_CHECKSIGADD <1> OP_NUMEQUAL
+      -- Layout: push(1)+key0(32)=33 bytes, CHECKSIG at 34, push(1)+key1(32)
+      -- at 35..67, CHECKSIGADD at 68, OP_1 at 69, NUMEQUAL at 70.
       assert.equals(0xac, s:byte(34))  -- OP_CHECKSIG after first key
-      assert.equals(0xba, s:byte(67))  -- OP_CHECKSIGADD after second key
+      assert.equals(0xba, s:byte(68))  -- OP_CHECKSIGADD after second key
       assert.equals(0x9c, s:byte(#s))  -- OP_NUMEQUAL
     end)
 
@@ -318,8 +320,12 @@ describe("miniscript", function()
     end)
 
     it("or_d takes first branch if satisfied", function()
+      -- Core's type rule for or_d(X, Y): X must be Bdu, Y must be B
+      -- (miniscript.cpp ComputeType OR_D). just_1 is Bzufmxk (no 'd'), so
+      -- or_d(just_1(), ...) is invalid miniscript; pk() (c:pk_k) is Bdu.
+      local key = hex_to_bin("02" .. string.rep("33", 32))
       local node = miniscript.or_d(
-        miniscript.just_1(),
+        miniscript.pk(key),
         miniscript.just_0()
       )
       local wit = miniscript.satisfy(node)
@@ -400,12 +406,15 @@ describe("miniscript", function()
       assert.equals(3, #node.subs)
     end)
 
-    it("parses wrapper chain a:s:pk(A)", function()
+    it("parses wrapper chain a:n:pk(A)", function()
+      -- Core's type rules: s: requires a Bo sub and yields W, and a: requires
+      -- B — so "a:s:pk(A)" is invalid miniscript (W fed to a:). n: accepts B
+      -- and keeps B, making "a:n:pk(A)" a valid two-wrapper chain.
       local a = string.rep("\x02", 33)
-      local node = miniscript.from_policy("a:s:pk(A)", {A = a})
-      -- Should be WRAP_A containing WRAP_S containing pk
+      local node = miniscript.from_policy("a:n:pk(A)", {A = a})
+      -- Should be WRAP_A containing WRAP_N containing pk
       assert.equals("WRAP_A", node.fragment)
-      assert.equals("WRAP_S", node.subs[1].fragment)
+      assert.equals("WRAP_N", node.subs[1].fragment)
     end)
 
     it("parses sha256 with hex hash", function()

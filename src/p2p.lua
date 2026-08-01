@@ -440,7 +440,7 @@ function M.serialize_version(opts)
   w.write_u64le(opts.nonce or math.random(0, 2^52))
 
   -- User agent (varstr)
-  w.write_varstr(opts.user_agent or "/LunarBlock:0.1.0/")
+  w.write_varstr(opts.user_agent or "/LunarBlock:1.0.0/")
 
   -- Start height
   w.write_i32le(opts.start_height or 0)

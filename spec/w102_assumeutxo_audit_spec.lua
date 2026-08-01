@@ -33,6 +33,13 @@
 --   BUG-13 (G21, OBSERVABILITY): dumptxoutset txoutset_hash emitted in natural
 --          LE byte order; Core uint256::ToString() reverses to big-endian.
 
+-- Mock socket module if not available (for test environments without LuaSocket)
+if not pcall(require, "socket") then
+  package.preload["socket"] = function()
+    return { gettime = function() return os.time() end }
+  end
+end
+
 local types     = require("lunarblock.types")
 local utxo      = require("lunarblock.utxo")
 local consensus = require("lunarblock.consensus")
@@ -231,7 +238,14 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
   -- chainstate more than once".
   describe("BUG-3 FIXED: duplicate-activation guard", function()
     it("second loadtxoutset call is rejected with duplicate-activation error", function()
-      local db, cs = build_chain(1)
+      -- Genesis-only chain: the snapshot base MUST be a Core-valid height-0
+      -- state.  Core never connects the genesis coinbase into the UTXO set,
+      -- so the height-0 UTXO set is EMPTY; the background chainstate's
+      -- genesis->base re-derivation (Core MaybeValidateSnapshot) reproduces
+      -- exactly that.  A synthetic non-genesis block at height 0 puts a coin
+      -- in the snapshot that the bg pass can never re-derive, tripping the
+      -- "background validation UTXO hash mismatch" abort (utxo.lua:6214).
+      local db, cs = build_chain(0)
       local snap = "/tmp/lb_w102_bug3_" .. os.time() .. "_" .. math.random(1000000) .. ".dat"
       local tip_hex = types.hash256_hex(cs.tip_hash)
 
@@ -249,6 +263,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       -- Dump a real snapshot from this chainstate
       local ok = cs:dump_snapshot(snap)
       assert.is_not_nil(ok)
+
+      -- The load-time HASH_SERIALIZED gate (Core PopulateAndValidateSnapshot,
+      -- validation.cpp:5899-5915 — "Bad snapshot content hash") compares
+      -- au_data.hash_serialized against the recomputed UTXO content hash, so
+      -- the fake params must carry the REAL hash of this snapshot, not zeros.
+      fake_net.assumeutxo[0].hash_serialized =
+        types.hash256_hex(types.hash256(cs:compute_utxo_hash()))
 
       local server = rpc.new({
         chain_state = cs,
@@ -518,7 +539,12 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       -- spec/assumeutxo_dual_chainstate_spec.lua against a real-genesis chain.
       -- Use a height-0 base so the BUG-4 "work must exceed active chainstate"
       -- gate is skipped (that gate only fires for active_tip_height > 0).
-      local db, cs = build_chain(1)
+      -- Genesis-only chain: height 0 is ALWAYS genesis in Core and the
+      -- genesis coinbase never enters the UTXO set, so the height-0 snapshot
+      -- is empty and the bg chainstate's re-derivation matches it (a
+      -- synthetic non-genesis height-0 block would be un-re-derivable and
+      -- trip the "background validation UTXO hash mismatch" abort).
+      local db, cs = build_chain(0)
       local base_height = cs.tip_height  -- 0
       local fake_net = {}
       for k, v in pairs(consensus.networks.regtest) do fake_net[k] = v end
@@ -531,6 +557,12 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       }
       local snap = "/tmp/lb_w102_bug10_" .. os.time() .. "_" .. math.random(1000000) .. ".dat"
       cs:dump_snapshot(snap)
+
+      -- Supply the REAL content hash: the load-time HASH_SERIALIZED gate
+      -- (Core validation.cpp:5899-5915) rejects a zero expected hash with
+      -- "Bad snapshot content hash".
+      fake_net.assumeutxo[base_height].hash_serialized =
+        types.hash256_hex(types.hash256(cs:compute_utxo_hash()))
 
       local server = rpc.new({chain_state=cs, storage=db, network=fake_net})
       local raw, herr = server:handle_request(

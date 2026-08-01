@@ -11,11 +11,16 @@ M.MIN_BUCKET_FEE = 1        -- 1 sat/vB
 M.MAX_BUCKET_FEE = 10000    -- 10000 sat/vB
 M.FEE_SPACING = 1.2         -- Exponential spacing factor
 
--- Generate buckets
+-- Generate buckets.
+-- Core keeps raw double boundaries (never floors): CBlockPolicyEstimator ctor
+-- pushes `bucketBoundary *= FEE_SPACING` verbatim (Core
+-- src/policy/fees/block_policy_estimator.cpp:549-551, FEE_SPACING=1.05 at
+-- block_policy_estimator.h:198).  Flooring would collapse adjacent buckets
+-- (1,1,1,2,...) and break Core's lower_bound bucket lookup.
 do
   local fee = M.MIN_BUCKET_FEE
   for i = 1, M.BUCKET_COUNT do
-    M.FEE_BUCKETS[i] = math.floor(fee)
+    M.FEE_BUCKETS[i] = fee
     fee = fee * M.FEE_SPACING
     if fee > M.MAX_BUCKET_FEE then
       M.BUCKET_COUNT = i

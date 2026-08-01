@@ -35,6 +35,13 @@
 --  G29 getmininginfo: currentblockweight/currentblocktx are static zeros
 --  G30 BIP22 proposal mode absent in getblocktemplate handler
 
+-- Mock socket module if not available (for test environments without LuaSocket)
+if not pcall(require, "socket") then
+  package.preload["socket"] = function()
+    return { gettime = function() return os.time() end }
+  end
+end
+
 local types     = require("lunarblock.types")
 local mining    = require("lunarblock.mining")
 local consensus = require("lunarblock.consensus")
@@ -129,8 +136,13 @@ end
 -- Decode a minimal-push encoded little-endian integer from the coinbase scriptSig.
 -- Returns the decoded height value.
 local function decode_bip34_height(script_sig)
-  local n_bytes = script_sig:byte(1)
-  if n_bytes == 0 then return 0 end
+  local b1 = script_sig:byte(1)
+  -- Core CScript() << nHeight uses push_int64 (script.h:467): heights 1..16
+  -- are the single-byte small-int opcodes OP_1..OP_16 (0x51..0x60), height 0
+  -- is OP_0 (0x00); only heights >= 17 use a length-prefixed CScriptNum push.
+  if b1 == 0 then return 0 end
+  if b1 >= 0x51 and b1 <= 0x60 then return b1 - 0x50 end
+  local n_bytes = b1
   local value = 0
   for i = 0, n_bytes - 1 do
     value = value + script_sig:byte(2 + i) * (256 ^ i)
@@ -145,10 +157,13 @@ describe("W108 GBT/BlockTemplate 30-gate audit", function()
   -- G1: BIP34 coinbase height encoding
   -- =========================================================================
   describe("G1 BIP34 coinbase height encoding", function()
-    it("encodes height 1 as 1-byte minimal push", function()
+    it("encodes height 1 as the 1-byte small-int opcode OP_1", function()
       local cb = mining.create_coinbase_tx(1, 5000000000, nil, nil, make_payout_script())
       local ss = cb.inputs[1].script_sig
-      assert.equal(1, ss:byte(1))         -- length byte
+      -- Core CScript() << nHeight → push_int64 (script.h:467): heights 1..16
+      -- are the single-byte opcodes OP_1..OP_16, NOT a length-prefixed push.
+      -- (Trailing OP_0 at byte 2 is the dummy extraNonce, miner.cpp:192.)
+      assert.equal(0x51, ss:byte(1))
       assert.equal(1, decode_bip34_height(ss))
     end)
 
@@ -199,18 +214,22 @@ describe("W108 GBT/BlockTemplate 30-gate audit", function()
     end)
 
     it("validation rejects coinbase scriptSig > 100 bytes", function()
-      -- Build a coinbase with oversized extra data and verify check_block rejects it
+      -- Build a coinbase with oversized extra data and verify validation
+      -- rejects it.  The 2..100 byte coinbase-scriptSig rule lives in
+      -- CheckTransaction (Core consensus/tx_check.cpp:48-51), so exercise
+      -- check_transaction directly — check_block gates on PoW first and
+      -- would reject this synthetic block for the wrong reason.
       local cb = mining.create_coinbase_tx(100, 5000000000, string.rep("X", 100), nil, make_payout_script())
       local sig_len = #cb.inputs[1].script_sig
       -- The scriptSig will be > 100 bytes; check that validation catches it
       if sig_len > 100 then
-        local header = types.block_header(0x20000000, types.hash256_zero(),
-          types.hash256_zero(), os.time(), consensus.networks.regtest.pow_limit_bits, 0)
-        local block = types.block(header, {cb})
-        local ok, err = pcall(validation.check_block, block, consensus.networks.regtest, 1)
-        assert.is_false(ok, "Expected check_block to reject oversized coinbase scriptSig")
-        assert.truthy(tostring(err):find("coinbase") or tostring(err):find("bad-cb"),
-          "Error should mention coinbase, got: " .. tostring(err))
+        local ok, err = pcall(validation.check_transaction, cb)
+        assert.is_false(ok, "Expected check_transaction to reject oversized coinbase scriptSig")
+        -- Core reject token: consensus/tx_check.cpp:50 "bad-cb-length".
+        -- (Plain-find: "-" is a Lua pattern magic char and must not be
+        -- used unescaped in a pattern match.)
+        assert.truthy(tostring(err):find("bad-cb-length", 1, true),
+          "Error should carry the bad-cb-length token, got: " .. tostring(err))
       else
         -- If the mining module already truncates, just note the test passed vacuously
         assert.is_true(true)  -- no bug triggered

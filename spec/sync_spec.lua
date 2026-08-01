@@ -455,10 +455,14 @@ describe("sync", function()
       )
       assert.is_true(find_valid_nonce(header))
 
-      -- This header won't match the checkpoint hash
+      -- This header won't match the checkpoint hash. The rejection error is the
+      -- consensus layer's canonical "CHECKPOINT" code (consensus.check_checkpoint,
+      -- pinned by consensus_spec). Core v31 has no checkpoint enforcement to
+      -- mirror — the old sync-layer "checkpoint mismatch" string predates the
+      -- consensus.centralization in 1c96de5.
       local ok, err = chain:accept_header(header)
       assert.is_false(ok)
-      assert.is_truthy(err:match("checkpoint mismatch"))
+      assert.is_truthy(err:match("CHECKPOINT"))
     end)
   end)
 
@@ -472,9 +476,12 @@ describe("sync", function()
     end)
 
     it("calculates positive work for valid bits", function()
+      -- work_for_bits returns an exact 256-bit value as a 32-byte big-endian
+      -- string (29ed4b8, Core arith_uint256/GetBlockProof parity) — compare
+      -- with consensus.work_compare, not Lua number operators.
       local work = chain:work_for_bits(0x1d00ffff)  -- mainnet genesis difficulty
-      assert.is_true(work > 0)
-      assert.is_true(work < math.huge)
+      assert.equals(32, #work)
+      assert.equals(1, consensus.work_compare(work, consensus.work_zero()))
     end)
 
     it("returns higher work for lower target (higher difficulty)", function()
@@ -1408,6 +1415,12 @@ describe("sync", function()
 
     describe("stall detection", function()
       it("detects stalled requests and clears them", function()
+        -- Multi-peer path: with >=2 serving peers a timed-out request is
+        -- pruned from the stalled peer and re-requested from another peer
+        -- (sync.lua stall scan: `peer_elapsed > info.timeout and not
+        -- single_peer`).  With a SINGLE peer the prune is deliberately
+        -- skipped (Track-B wedge fix): there is no alternate peer to try,
+        -- and re-requesting floods the lone peer's FIFO serve queue.
         local parent_hash = chain:get_tip_hash()
         local timestamp = consensus.networks.regtest.genesis.timestamp + 600
 
@@ -1418,23 +1431,27 @@ describe("sync", function()
         local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
         downloader.base_stall_timeout = 0  -- Immediate timeout for testing
 
-        local peer = create_mock_peer(1)
+        local stalled_peer = create_mock_peer()
+        local fresh_peer = create_mock_peer()
         local hash_hex = chain.height_to_hash[1]
 
-        -- Simulate an old in-flight request
+        -- Simulate an old in-flight request on the stalled peer
         downloader.inflight[hash_hex] = {
-          peer = peer,
+          peer = stalled_peer,
           request_time = os.time() - 100,  -- 100 seconds ago
           timeout = 1  -- 1 second timeout
         }
-        downloader.peer_inflight[peer] = 1
+        downloader.peer_inflight[stalled_peer] = 1
 
-        -- Schedule should detect stall and clear it
-        downloader:schedule_downloads({peer})
+        -- Schedule should detect the stall and clear it (fresh peer listed
+        -- first so it wins the free-slot pick for the re-request).
+        downloader:schedule_downloads({fresh_peer, stalled_peer})
 
-        -- Stalled request should be cleared
-        -- Note: It will be re-requested in the same call
-        assert.equals(0, downloader.peer_inflight[peer] or 0)
+        -- Stalled peer's bookkeeping is cleared
+        assert.equals(0, downloader.peer_inflight[stalled_peer] or 0)
+        -- The block is re-requested in the same call — from the OTHER peer
+        assert.is_not_nil(downloader.inflight[hash_hex])
+        assert.equals(fresh_peer, downloader.inflight[hash_hex].peer)
       end)
 
       it("STALL RECOVERY fires after connect_stall_timeout (W65)", function()
@@ -1475,8 +1492,14 @@ describe("sync", function()
         }
         downloader.peer_inflight[peer] = 1
 
-        -- Also pre-stage some "far ahead" pending_blocks to verify the
-        -- recovery path evicts them correctly.
+        -- Pre-stage pending_blocks to pin the W71 zombie-sweep semantics:
+        -- recovery evicts ONLY pendings BEHIND the connect cursor (zombies
+        -- that can never connect again); far-ahead pendings are KEPT — they
+        -- connect naturally once the cursor catches up (evicting them would
+        -- force a wasteful re-download of the whole window).
+        downloader.pending_blocks["fake_zombie"] = {
+          block = {}, height = 0, hash = "fake_zombie",  -- behind cursor (h=1)
+        }
         for fake_height = 200, 210 do
           downloader.pending_blocks["fake_" .. fake_height] = {
             block = {}, height = fake_height, hash = "fake_" .. fake_height,
@@ -1495,14 +1518,16 @@ describe("sync", function()
         -- timed-out entry is cleared.
         assert.is_true(inflight_after <= 1, "expected inflight <= 1, got " .. inflight_after)
 
-        -- Far-ahead pendings should be evicted.
+        -- W71: the behind-cursor zombie pending is evicted...
+        assert.is_nil(downloader.pending_blocks["fake_zombie"])
+        -- ...but far-ahead pendings are deliberately NOT evicted.
         local far_ahead_remaining = 0
         for _, p in pairs(downloader.pending_blocks) do
           if p.height > downloader.next_connect_height + 64 then
             far_ahead_remaining = far_ahead_remaining + 1
           end
         end
-        assert.equals(0, far_ahead_remaining)
+        assert.equals(11, far_ahead_remaining)
 
         -- Timer re-armed to now (not still in the distant past).
         assert.is_true(

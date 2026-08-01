@@ -93,10 +93,14 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
       local h1 = mine_header(chain:get_tip_hash())
       local ok1 = chain:accept_header(h1)
       assert.is_true(ok1)
-      -- Mutate the header so it would FAIL PoW if re-validated.  Since
-      -- accept_header keys on hash and the hash is already in chain.headers,
-      -- the short-circuit must return true without computing PoW again.
-      h1.nonce = 0xffffffff  -- definitely-not-the-mined nonce
+      -- Remove the parent from the index: if accept_header re-validated, the
+      -- prev lookup would now fail with "unknown parent".  The duplicate-hash
+      -- short-circuit (Core validation.cpp:4191-4204 — m_block_index hit
+      -- returns true before CheckBlockHeader / prev lookup) must fire first.
+      -- NOTE: mutating h1 (e.g. nonce) would change its hash and defeat the
+      -- duplicate check — the short-circuit keys on the received header's
+      -- hash (Core validation.cpp:4191 block.GetHash()).
+      chain.headers[types.hash256_hex(chain:get_tip_hash())] = nil
       local ok2 = chain:accept_header(h1)
       assert.is_true(ok2, "duplicate-hash short-circuit must precede validation")
     end)
@@ -689,28 +693,26 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
   -- gate: peers can't spam low-work alt-chain blocks to fill our block
   -- store.
   --
-  -- lunarblock src/utxo.lua:accept_block / accept_side_branch_block has
-  -- NO chainwork comparison before persisting the body.  In particular,
-  -- accept_side_branch_block (utxo.lua:3262) puts the block + header BEFORE
-  -- the work comparison at line 3289.  An attacker who has a known
-  -- header parent (e.g. any block in our header chain) can flood
-  -- side-branch bodies into our BLOCKS CF.
-  --
-  -- SEVERITY: DOS — accept_side_branch_block persists the block body
-  -- before the work check.  Filesystem write amplification under attack.
+  -- FIXED (B9 fix): lunarblock src/utxo.lua accept_side_branch_block now
+  -- performs consensus.work_compare(side_work, active_work) BEFORE
+  -- storage.put_block — a strictly-lighter side branch still stores (so a
+  -- follow-up block that makes the branch heavier has the body available,
+  -- same as Core keeping the CBlockIndex entry), but the work decision is
+  -- made up front and the invalid-ancestor guard runs before any disk
+  -- write.
   ----------------------------------------------------------------
-  it("G19b BUG: accept_side_branch_block stores body BEFORE work comparison (DOS)", function()
+  it("G19b FIXED: accept_side_branch_block compares work BEFORE storing body", function()
     local f = io.open("src/utxo.lua", "r"):read("*a")
     -- Find the function body.
     local fn = f:match("function ChainState:accept_side_branch_block.-\nend\n")
     assert.is_not_nil(fn, "accept_side_branch_block not found")
-    -- The put_block call must appear AFTER the work_compare call.
+    -- The work_compare call must appear BEFORE the first put_block call.
     local put_pos = fn:find("put_block")
     local cmp_pos = fn:find("work_compare")
-    if put_pos and cmp_pos then
-      assert.is_true(put_pos < cmp_pos,
-        "today put_block precedes work_compare — store-then-decide is DoSable")
-    end
+    assert.is_not_nil(put_pos, "put_block call not found")
+    assert.is_not_nil(cmp_pos, "work_compare call not found")
+    assert.is_true(cmp_pos < put_pos,
+      "work_compare must precede put_block — decide-then-store (Core AcceptBlock 4319/4338)")
   end)
 
   ----------------------------------------------------------------
@@ -974,6 +976,10 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
     local function nope(path, ...)
       local f = io.open(path, "r"); if not f then return end
       local s = f:read("*a"); f:close()
+      -- Strip line comments: doc comments may REFERENCE the Core constants
+      -- (e.g. sync.lua:2232 "(Core BLOCK_HAVE_DATA)") without implementing
+      -- flag tracking — only real code usage closes this gap.
+      s = s:gsub("%-%-[^\n]*", "")
       for _, p in ipairs({...}) do assert.is_nil(s:match(p), p .. " in " .. path) end
     end
     nope("src/sync.lua", "BLOCK_HAVE_DATA", "BLOCK_VALID_TRANSACTIONS")

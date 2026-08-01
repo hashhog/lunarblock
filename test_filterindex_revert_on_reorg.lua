@@ -202,11 +202,16 @@ do
   check("enabled: A1 filter blob >= 64 bytes (filter_hash || filter_header)",
     parsed_a1 ~= nil)
 
-  -- Recompute expected filter header from filter_hash and zero seed.
-  local zero_header = types.hash256_zero()
+  -- Recompute expected filter header.  The seed is NOT zero: the genesis
+  -- block itself is indexed (Core BlockFilterIndex indexes the genesis
+  -- filter with prev_header=0, index/blockfilterindex.cpp), so block 1
+  -- chains from the GENESIS filter header.
+  local parsed_gen = decode_filter_blob(
+    stor.get(storage_mod.CF.BLOCK_FILTER, genesis_hash.bytes))
   local expect_a1_header = blockfilter.compute_filter_header(
-    types.hash256(parsed_a1.filter_hash), zero_header)
-  check("enabled: A1 filter_header chained from zero seed",
+    types.hash256(parsed_a1.filter_hash),
+    types.hash256(parsed_gen.filter_header))
+  check("enabled: A1 filter_header chained from genesis filter header",
     parsed_a1.filter_header == expect_a1_header.bytes)
   check("enabled: filterindex_last_header == A1 filter_header",
     read_last_header(stor) == parsed_a1.filter_header)
@@ -318,11 +323,15 @@ do
   -- disconnect) and the re-chain through B1, B2 all happened.
   local parsed_b1 = decode_filter_blob(blob_b1)
   local parsed_b2 = decode_filter_blob(blob_b2)
-  -- B1 chains from zero (rewound from A1 disconnect → zero seed at h=0).
-  local zero_header = types.hash256_zero()
+  -- B1 chains from the rewound seed.  The rewind after A1's disconnect
+  -- goes back to the GENESIS filter header (genesis is indexed, Core
+  -- BlockFilterIndex parity) — not the zero seed.
+  local parsed_gen = decode_filter_blob(
+    stor.get(storage_mod.CF.BLOCK_FILTER, genesis_hash.bytes))
   local expect_b1_header = blockfilter.compute_filter_header(
-    types.hash256(parsed_b1.filter_hash), zero_header)
-  check("revert: B1 filter_header chained from rewound zero seed",
+    types.hash256(parsed_b1.filter_hash),
+    types.hash256(parsed_gen.filter_header))
+  check("revert: B1 filter_header chained from rewound genesis seed",
     parsed_b1.filter_header == expect_b1_header.bytes)
   -- B2 chains from B1's filter_header.
   local expect_b2_header = blockfilter.compute_filter_header(
@@ -445,17 +454,21 @@ do
       == hash_b3.bytes)
   check("atomic: filterindex_height == 3 (best B-chain)",
     read_best_height(stor) == 3)
-  -- last_header chained through B1→B2→B3 from zero seed (genesis-rewound).
+  -- last_header chained through B1→B2→B3 from the rewound seed — the
+  -- GENESIS filter header (genesis is indexed, Core BlockFilterIndex
+  -- parity), not the zero seed.
   local parsed_b1 = decode_filter_blob(stor.get(storage_mod.CF.BLOCK_FILTER, hash_b1.bytes))
   local parsed_b2 = decode_filter_blob(stor.get(storage_mod.CF.BLOCK_FILTER, hash_b2.bytes))
   local parsed_b3 = decode_filter_blob(stor.get(storage_mod.CF.BLOCK_FILTER, hash_b3.bytes))
+  local parsed_gen = decode_filter_blob(stor.get(storage_mod.CF.BLOCK_FILTER, g.bytes))
   local h_b1 = blockfilter.compute_filter_header(
-    types.hash256(parsed_b1.filter_hash), types.hash256_zero())
+    types.hash256(parsed_b1.filter_hash),
+    types.hash256(parsed_gen.filter_header))
   local h_b2 = blockfilter.compute_filter_header(
     types.hash256(parsed_b2.filter_hash), h_b1)
   local h_b3 = blockfilter.compute_filter_header(
     types.hash256(parsed_b3.filter_hash), h_b2)
-  check("atomic: B1 filter_header == hash256(filter_hash || zero)",
+  check("atomic: B1 filter_header == hash256(filter_hash || genesis_filter_header)",
     parsed_b1.filter_header == h_b1.bytes)
   check("atomic: B2 filter_header chains onto B1",
     parsed_b2.filter_header == h_b2.bytes)

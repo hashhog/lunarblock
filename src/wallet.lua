@@ -1041,7 +1041,9 @@ function M.new(network, storage)
   -- tx, mirroring Bitcoin Core's mapWallet + CWalletTx accounting.
   self.tx_history = {}             -- txid_hex -> history entry (see scan_history)
   self.confirmed_balance = 0       -- Balance from confirmed transactions (incl. immature coinbase)
-  self.spendable_balance = 0       -- Confirmed balance excluding immature coinbase
+  -- nil until scan_utxos() runs (which resets it to 0 and accumulates):
+  -- get_balance() falls back to confirmed_balance while no scan has run.
+  self.spendable_balance = nil     -- Confirmed balance excluding immature coinbase
   self.immature_balance = 0        -- Sum of confirmed-but-immature coinbase values
   self.unconfirmed_balance = 0     -- Balance from unconfirmed transactions
   self.next_external_index = 0     -- BIP44 external chain index
@@ -2212,7 +2214,12 @@ function Wallet:get_available_utxos(include_unconfirmed, min_confirmations)
   -- Add confirmed UTXOs that are not spent in pending transactions
   for key, utxo in pairs(self.utxos) do
     if not self.spent_pending[key] then
-      if utxo.confirmations >= min_confirmations then
+      -- `confirmations` is a cache refreshed by scan_utxos; entries injected
+      -- without it (or before a scan runs) are treated as depth 0, matching
+      -- the defensive reads below and in get_balance_details / list_unspent.
+      -- Core's AvailableCoins likewise filters on tx depth with min_conf=0
+      -- by default (bitcoin-core/src/wallet/spend.cpp AvailableCoins).
+      if (utxo.confirmations or 0) >= min_confirmations then
         -- Coinbase maturity (matches the node's own consensus rule, and
         -- Bitcoin Core CWallet::GetTxBlocksToMaturity / CheckTxInputs):
         -- a coinbase is spendable only once it has COINBASE_MATURITY+1 (=101)
@@ -2499,7 +2506,10 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
   local available_utxos = self:get_available_utxos(include_unconfirmed)
 
   if #available_utxos == 0 then
-    return nil, "No available UTXOs"
+    -- Core reports a single "Insufficient funds" for every coin-selection
+    -- failure, including the empty-wallet case (bitcoin-core/src/wallet/
+    -- spend.cpp:1234 CreateTransactionInternal "General failure description").
+    return nil, "Insufficient funds"
   end
 
   -- 4. Estimate transaction size for initial target
@@ -4033,17 +4043,19 @@ function WalletManager:get_wallet(name)
   return self.wallets[name]
 end
 
---- Get default wallet (first loaded or named "").
+--- Get default wallet (named "" if loaded, else sticky default, else first loaded).
+-- The empty-named wallet is Core's default wallet (datadir-root wallet.json,
+-- created/loaded when no -wallet option is given), so it always takes
+-- precedence over the first-created fallback when both are loaded.
 -- @return Wallet|nil: Default wallet, or nil if no wallets loaded
 function WalletManager:get_default_wallet()
-  if self.default_wallet and self.wallets[self.default_wallet] then
-    return self.wallets[self.default_wallet], self.default_wallet
-  end
-  -- Fallback: empty string wallet or first loaded
   if self.wallets[""] then
     return self.wallets[""], ""
   end
-  -- Return first loaded wallet
+  if self.default_wallet and self.wallets[self.default_wallet] then
+    return self.wallets[self.default_wallet], self.default_wallet
+  end
+  -- Fallback: first loaded wallet
   for name, wallet in pairs(self.wallets) do
     return wallet, name
   end

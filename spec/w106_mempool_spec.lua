@@ -371,10 +371,16 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
   end)
 
   ---------------------------------------------------------------------------
-  -- G11: RBF Rule #1 — conflicting tx must signal RBF
+  -- G11: RBF Rule #1 — v31 full-RBF default / legacy strict opt-in mode
+  --
+  -- Core v31 REMOVED the SignalsOptInRBF gate from ReplacementChecks
+  -- (validation.cpp:984-1034 — no IsRBFOptIn call remains; full-RBF is
+  -- unconditional).  lunarblock mirrors this with DEFAULT_MEMPOOL_FULL_RBF
+  -- = true (mempool.lua:435); the opt-in gate only fires when the operator
+  -- sets fullrbf=false.
   ---------------------------------------------------------------------------
-  describe("G11: RBF Rule #1 - conflicting tx must signal RBF", function()
-    it("rejects replacement if conflicting tx has sequence=0xFFFFFFFF (FINAL)", function()
+  describe("G11: RBF Rule #1 - v31 full-RBF default / legacy opt-in", function()
+    it("accepts replacement of non-signaling tx under default full-RBF (v31)", function()
       local cs = make_chain()
       local coin = random_txid()
       add_utxo(cs, coin, 0, 200000)
@@ -387,7 +393,9 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
       local ok1 = accept(mp, orig)
       assert.is_true(ok1)
 
-      -- Attempt replacement (double-spend same coin with higher fee)
+      -- Replacement (double-spend same coin with higher fee): Core v31's
+      -- ReplacementChecks no longer consults opt-in signaling, so this is
+      -- accepted as long as Rules 3/4 (fee) pass.
       local coin2 = random_txid()
       add_utxo(cs, coin2, 0, 500000)
       local repl = types.transaction(1,
@@ -395,7 +403,31 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
           make_input(coin2, 0) },
         { make_output(200000) }, 0)
       local ok2, err2 = accept(mp, repl)
-      assert.is_false(ok2, "replacement should fail: original does not signal RBF")
+      assert.is_true(ok2,
+        "v31 full-RBF: replacement of non-signaling tx must be accepted; err=" ..
+        tostring(err2))
+    end)
+
+    it("rejects replacement when fullrbf=false (legacy strict opt-in)", function()
+      local cs = make_chain()
+      local coin = random_txid()
+      add_utxo(cs, coin, 0, 200000)
+
+      local mp = mempool.new(cs, {fullrbf = false})
+      local orig = types.transaction(1,
+        { make_input(coin, 0, 0xFFFFFFFF) },
+        { make_output(100000) }, 0)
+      local ok1 = accept(mp, orig)
+      assert.is_true(ok1)
+
+      local coin2 = random_txid()
+      add_utxo(cs, coin2, 0, 500000)
+      local repl = types.transaction(1,
+        { make_input(coin, 0, 0xFFFFFFFD),
+          make_input(coin2, 0) },
+        { make_output(200000) }, 0)
+      local ok2, err2 = accept(mp, repl)
+      assert.is_false(ok2, "fullrbf=false: original does not signal RBF")
       assert.is_string(err2)
     end)
   end)
@@ -588,20 +620,27 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
   end)
 
   ---------------------------------------------------------------------------
-  -- G18 BUG: No PrioritiseTransaction / mapDeltas — modified fee unavailable
+  -- G18 FIXED: PrioritiseTransaction / mapDeltas — modified fee available
   --
   -- Core uses GetModifiedFee() (fee + mapDeltas delta) for RBF Rules 3 and 4.
-  -- lunarblock has no mapDeltas or prioritise_transaction, so modified fees
-  -- are impossible to apply; RBF comparisons use raw base fees only.
+  -- lunarblock now implements Mempool:prioritise_transaction (mapDeltas
+  -- bookkeeping, mempool.lua:2557) and Mempool:get_modified_fee.
   ---------------------------------------------------------------------------
-  describe("G18 BUG: no PrioritiseTransaction/mapDeltas — modified fee unavailable", function()
-    it("DOCUMENTS: Mempool has no prioritise_transaction method", function()
+  describe("G18 FIXED: PrioritiseTransaction/mapDeltas — modified fee available", function()
+    it("prioritise_transaction applies a fee delta (Core mapDeltas)", function()
       local cs = make_chain()
       local mp = mempool.new(cs)
-      -- Core: CTxMemPool::PrioritiseTransaction updates mapDeltas and
-      -- calls m_txgraph->SetTransactionFee.  lunarblock has no equivalent.
-      assert.is_nil(mp.prioritise_transaction,
-        "BUG-G18: no prioritise_transaction method — Core mapDeltas gap")
+      -- Core: CTxMemPool::PrioritiseTransaction updates mapDeltas
+      -- (txmempool.cpp:644-646); GetModifiedFee() = fee + delta.
+      assert.is_function(mp.prioritise_transaction,
+        "prioritise_transaction must exist (Core mapDeltas)")
+      local txid_hex = string.rep("ab", 32)
+      mp:prioritise_transaction(txid_hex, 1000)
+      assert.equals(1000, mp:get_modified_fee(txid_hex),
+        "stored delta must surface via get_modified_fee")
+      -- Negative deltas subtract; zero net delta clears the entry.
+      mp:prioritise_transaction(txid_hex, -1000)
+      assert.equals(0, mp:get_modified_fee(txid_hex))
     end)
   end)
 

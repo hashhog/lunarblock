@@ -159,7 +159,10 @@ describe("BIP-22 submitblock result strings", function()
   -- ─── "inconclusive" in source ──────────────────────────────────────────────
 
   it("rpc.lua uses 'inconclusive' for orphan blocks (BIP-22 canonical)", function()
-    local f = io.open(package.searchpath("lunarblock.rpc", package.path), "r")
+    -- Read the canonical source directly: package.searchpath resolves
+    -- "lunarblock.rpc" to the shim lunarblock/rpc.lua (a dofile forwarder
+    -- with no handler code), not to src/rpc.lua.
+    local f = io.open("src/rpc.lua", "r")
     if f then
       local src = f:read("*a")
       f:close()

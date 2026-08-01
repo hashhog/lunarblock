@@ -27,6 +27,16 @@
 -- Companion W31 P2SH tests: spec/p2sh_commitment_spec.lua.
 -- Companion W38 PSBT P2WSH tests: spec/p2wsh_commitment_spec.lua.
 
+-- Mock socket module if not available (for test environments without LuaSocket)
+-- — same convention as spec/w102_assumeutxo_audit_spec.lua:37-41; required
+-- because this spec pulls in lunarblock.rpc (src/rpc.lua:4 requires "socket";
+-- the signing RPC paths under test never open a socket).
+if not pcall(require, "socket") then
+  package.preload["socket"] = function()
+    return { gettime = function() return os.time() end }
+  end
+end
+
 local function bin_to_hex(bin)
   local hex = {}
   for i = 1, #bin do hex[i] = string.format("%02x", bin:byte(i)) end

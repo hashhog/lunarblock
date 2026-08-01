@@ -1888,7 +1888,11 @@ function M.should_skip_script_validation(network, block_height, block_hash_hex,
   end
 
   -- Condition 5: best header must have minimum chain work
-  local min_work = M.work_from_hex(network.min_chain_work or string.rep("00", 64))
+  -- Fallback for networks without min_chain_work: 64 hex chars = zero
+  -- uint256 (Core's default uint256{} work).  (string.rep("00", 64) was
+  -- 128 chars and made work_from_hex raise — latent crash on any network
+  -- table lacking the field.)
+  local min_work = M.work_from_hex(network.min_chain_work or string.rep("0", 64))
   if M.work_compare(best_header_work, min_work) < 0 then
     return false, "best header chainwork below minimumchainwork"
   end

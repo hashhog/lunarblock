@@ -116,16 +116,18 @@ function M.detect_network_type(addr)
     return M.NETWORK_TYPE.I2P
   end
 
-  -- Check for Tor v3 onion (56 chars base32 + .onion)
+  -- Check for Tor .onion addresses.
+  -- ANY ".onion"-suffixed name is classified ONION regardless of label
+  -- length/format: RFC 7686 makes .onion a special-use TLD that must never
+  -- hit DNS, so it can only ever be reached via Tor — a malformed name must
+  -- route to the SOCKS5 proxy (where Tor answers HS_BAD_ADDRESS), never be
+  -- treated as an IPv4-routable domain.  Core recognizes only checksum-valid
+  -- torv3 names (CNetAddr::SetTor, netaddress.cpp:212-245; LookupIntern
+  -- netbase.cpp:146-155) and lets bogus ones die in DNS resolution; both
+  -- paths agree a ".onion" name is never reachable as plain IPv4.  For
+  -- onlynet filtering this also matches Core's IsReachable(NET_ONION) gate.
   if addr:match("%.onion$") then
-    local onion_part = addr:gsub("%.onion$", "")
-    if #onion_part == 56 then
-      return M.NETWORK_TYPE.ONION
-    end
-    -- Legacy v2 onion (16 chars) - deprecated but detect it
-    if #onion_part == 16 then
-      return M.NETWORK_TYPE.ONION
-    end
+    return M.NETWORK_TYPE.ONION
   end
 
   -- Check for IPv6 (contains colons)

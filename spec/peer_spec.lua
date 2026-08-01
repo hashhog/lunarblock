@@ -135,7 +135,10 @@ describe("peer", function()
     end)
 
     it("sends version and transitions to VERSION_SENT", function()
-      local p = peer_module.new("127.0.0.1", server_port, mainnet, 500)
+      -- use_v2=false: this mock server speaks v1 only. (Default use_v2=true
+      -- does the BIP-324 v2 key exchange first — Core v26+ -v2transport
+      -- default, net.h:101 DEFAULT_V2_TRANSPORT — state would be v2_key_sent.)
+      local p = peer_module.new("127.0.0.1", server_port, mainnet, 500, false)
       p:connect(1)
       -- Accept connection on server side
       client_sock = server:accept()
@@ -145,20 +148,23 @@ describe("peer", function()
       assert.equal(peer_module.STATE.VERSION_SENT, p.state)
       assert.is_true(p.nonce > 0)
 
-      -- Server should receive version message
-      local data = client_sock:receive(200)
-      assert.is_not_nil(data)
-      assert.is_true(#data >= p2p.HEADER_SIZE)
+      -- Server should receive version message. Exact reads: LuaSocket
+      -- receive(n) blocks until all n bytes arrive and returns nil+partial
+      -- on timeout, so read the 24-byte header first, then the payload.
+      local hdr = client_sock:receive(p2p.HEADER_SIZE)
+      assert.is_not_nil(hdr)
 
       -- Parse header
-      local header = p2p.parse_header(data:sub(1, p2p.HEADER_SIZE))
+      local header = p2p.parse_header(hdr)
       assert.equal("version", header.command)
+      client_sock:receive(header.length)  -- drain payload
 
       p:disconnect()
     end)
 
     it("completes handshake with version/verack exchange", function()
-      local p = peer_module.new("127.0.0.1", server_port, mainnet, 500)
+      -- use_v2=false: v1 mock server (see the VERSION_SENT test above).
+      local p = peer_module.new("127.0.0.1", server_port, mainnet, 500, false)
       p:connect(1)
       client_sock = server:accept()
       client_sock:settimeout(1)
@@ -166,9 +172,11 @@ describe("peer", function()
       p:start_handshake()
       assert.equal(peer_module.STATE.VERSION_SENT, p.state)
 
-      -- Read the version message from peer
-      local data = client_sock:receive(200)
-      assert.is_not_nil(data)
+      -- Read the version message from peer (exact reads — see above)
+      local hdr = client_sock:receive(p2p.HEADER_SIZE)
+      assert.is_not_nil(hdr)
+      local hdr_parsed = p2p.parse_header(hdr)
+      client_sock:receive(hdr_parsed.length)  -- drain payload
 
       -- Server sends version back
       local server_version = p2p.serialize_version({
@@ -212,15 +220,19 @@ describe("peer", function()
     end)
 
     it("rejects old protocol versions", function()
-      local p = peer_module.new("127.0.0.1", server_port, mainnet)
+      -- use_v2=false: v1 mock server (see the VERSION_SENT test above).
+      local p = peer_module.new("127.0.0.1", server_port, mainnet, nil, false)
       p:connect(1)
       client_sock = server:accept()
       client_sock:settimeout(1)
 
       p:start_handshake()
 
-      -- Read version from peer
-      client_sock:receive(200)
+      -- Read version from peer (exact reads — see above)
+      local hdr = client_sock:receive(p2p.HEADER_SIZE)
+      assert.is_not_nil(hdr)
+      local hdr_parsed = p2p.parse_header(hdr)
+      client_sock:receive(hdr_parsed.length)  -- drain payload
 
       -- Send old protocol version
       local old_version = p2p.serialize_version({
@@ -279,7 +291,12 @@ describe("peer", function()
     it("sends ping and measures latency from pong", function()
       local p = peer_module.new("127.0.0.1", server_port, mainnet)
       p:connect(1)
+      -- Simulate a fully-established session: the pre-handshake filter
+      -- (Core net_processing.cpp:3810/4010) drops data messages unless
+      -- version+verack completed.
       p.state = peer_module.STATE.ESTABLISHED
+      p.version_received = true
+      p.handshake_complete = true
       client_sock = server:accept()
       client_sock:settimeout(1)
 
@@ -288,11 +305,13 @@ describe("peer", function()
       assert.is_true(p.ping_nonce > 0)
       assert.is_true(p.last_ping_time > 0)
 
-      -- Read ping on server
-      local data = client_sock:receive(100)
-      local header = p2p.parse_header(data:sub(1, p2p.HEADER_SIZE))
+      -- Read ping on server (exact reads: LuaSocket receive(n) blocks until
+      -- all n bytes arrive and returns nil+partial on timeout)
+      local hdr = client_sock:receive(p2p.HEADER_SIZE)
+      assert.is_not_nil(hdr)
+      local header = p2p.parse_header(hdr)
       assert.equal("ping", header.command)
-      local payload = data:sub(p2p.HEADER_SIZE + 1, p2p.HEADER_SIZE + header.length)
+      local payload = client_sock:receive(header.length)
       local nonce = p2p.deserialize_ping(payload)
 
       -- Send pong back with same nonce
@@ -311,7 +330,10 @@ describe("peer", function()
     it("responds to ping with pong", function()
       local p = peer_module.new("127.0.0.1", server_port, mainnet)
       p:connect(1)
+      -- Fully-established session flags (see ping test above).
       p.state = peer_module.STATE.ESTABLISHED
+      p.version_received = true
+      p.handshake_complete = true
       client_sock = server:accept()
       client_sock:settimeout(1)
 
@@ -323,12 +345,12 @@ describe("peer", function()
       socket.sleep(0.05)
       p:process_messages()
 
-      -- Read pong on server
-      local data = client_sock:receive(100)
-      assert.is_not_nil(data)
-      local header = p2p.parse_header(data:sub(1, p2p.HEADER_SIZE))
+      -- Read pong on server (exact reads — see ping test above)
+      local hdr = client_sock:receive(p2p.HEADER_SIZE)
+      assert.is_not_nil(hdr)
+      local header = p2p.parse_header(hdr)
       assert.equal("pong", header.command)
-      local payload = data:sub(p2p.HEADER_SIZE + 1, p2p.HEADER_SIZE + header.length)
+      local payload = client_sock:receive(header.length)
       local nonce = p2p.deserialize_ping(payload)
       assert.equal(ping_nonce, nonce)
 
@@ -387,8 +409,10 @@ describe("peer", function()
     it("detects handshake timeout", function()
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
       p.state = peer_module.STATE.VERSION_SENT
-      -- Simulate last_recv 100 seconds ago
-      p.last_recv = socket.gettime() - 100
+      -- check_timeouts measures the 60 s handshake budget from
+      -- handshake_start_time (stamped at connect), not last_recv.
+      p.handshake_start_time = socket.gettime() - 61
+      p.last_recv = socket.gettime() - 10
 
       p:check_timeouts()
       assert.equal(peer_module.STATE.DISCONNECTED, p.state)
@@ -419,9 +443,32 @@ describe("peer", function()
   end)
 
   describe("message handler dispatch", function()
+    -- These tests drive an ESTABLISHED session: version_received +
+    -- handshake_complete must be set or the (Core-faithful) pre-handshake
+    -- filter drops the message and discourages the peer (peer.lua:916-930;
+    -- Core net_processing.cpp:3810 nVersion==0 / :4010 !fSuccessfullyConnected).
+    -- The mock socket needs send (reply paths) and close (disconnect path).
+    local function dispatch_mock_socket()
+      return setmetatable({}, {
+        __index = function(_, key)
+          if key == "receive" then
+            return function() return nil, "timeout", "" end
+          end
+          if key == "send" then
+            return function(_, data) return #data end
+          end
+          if key == "close" then
+            return function() return true end
+          end
+        end
+      })
+    end
+
     it("handles sendheaders message", function()
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
       p.state = peer_module.STATE.ESTABLISHED
+      p.version_received = true
+      p.handshake_complete = true
       assert.is_false(p.send_headers)
 
       -- Simulate receiving sendheaders
@@ -430,13 +477,7 @@ describe("peer", function()
       p.recv_buffer = msg
 
       -- Need a mock socket that returns nothing
-      p.socket = setmetatable({}, {
-        __index = function(_, key)
-          if key == "receive" then
-            return function() return nil, "timeout", "" end
-          end
-        end
-      })
+      p.socket = dispatch_mock_socket()
 
       p:process_messages()
       assert.is_true(p.send_headers)
@@ -445,18 +486,14 @@ describe("peer", function()
     it("handles feefilter message", function()
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
       p.state = peer_module.STATE.ESTABLISHED
+      p.version_received = true
+      p.handshake_complete = true
       assert.equal(0, p.fee_filter)
 
       local payload = p2p.serialize_feefilter(2000)
       local msg = p2p.make_message(mainnet.magic_bytes, "feefilter", payload)
       p.recv_buffer = msg
-      p.socket = setmetatable({}, {
-        __index = function(_, key)
-          if key == "receive" then
-            return function() return nil, "timeout", "" end
-          end
-        end
-      })
+      p.socket = dispatch_mock_socket()
 
       p:process_messages()
       assert.equal(2000, p.fee_filter)
@@ -465,18 +502,14 @@ describe("peer", function()
     it("handles sendcmpct message", function()
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
       p.state = peer_module.STATE.ESTABLISHED
+      p.version_received = true
+      p.handshake_complete = true
       assert.is_false(p.send_compact)
 
       local payload = p2p.serialize_sendcmpct(true, 2)
       local msg = p2p.make_message(mainnet.magic_bytes, "sendcmpct", payload)
       p.recv_buffer = msg
-      p.socket = setmetatable({}, {
-        __index = function(_, key)
-          if key == "receive" then
-            return function() return nil, "timeout", "" end
-          end
-        end
-      })
+      p.socket = dispatch_mock_socket()
 
       p:process_messages()
       assert.is_true(p.send_compact)
@@ -485,6 +518,8 @@ describe("peer", function()
     it("dispatches to custom handlers", function()
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
       p.state = peer_module.STATE.ESTABLISHED
+      p.version_received = true
+      p.handshake_complete = true
 
       local received_payload = nil
       p:on("addr", function(peer, payload)
@@ -494,13 +529,7 @@ describe("peer", function()
       local addr_payload = "test_payload"
       local msg = p2p.make_message(mainnet.magic_bytes, "addr", addr_payload)
       p.recv_buffer = msg
-      p.socket = setmetatable({}, {
-        __index = function(_, key)
-          if key == "receive" then
-            return function() return nil, "timeout", "" end
-          end
-        end
-      })
+      p.socket = dispatch_mock_socket()
 
       p:process_messages()
       assert.equal(addr_payload, received_payload)
@@ -566,11 +595,20 @@ describe("peer", function()
   end)
 
   describe("pre-handshake filtering", function()
+    -- Mock needs send (handle_version replies verack / wtxidrelay /
+    -- sendaddrv2; handle_ping replies pong) and close (misbehaving ->
+    -- disconnect path).
     local mock_socket = function()
       return setmetatable({}, {
         __index = function(_, key)
           if key == "receive" then
             return function() return nil, "timeout", "" end
+          end
+          if key == "send" then
+            return function(_, data) return #data end
+          end
+          if key == "close" then
+            return function() return true end
           end
         end
       })
@@ -589,7 +627,10 @@ describe("peer", function()
 
       local processed = p:process_messages()
       assert.equal(0, #processed)  -- Message dropped
-      assert.equal(10, p.ban_score)  -- Misbehavior scored
+      -- Single-event discourage (Core PR#25974, 2c394e0): no score
+      -- accumulation — the first misbehaving event disconnects the peer.
+      assert.equal(peer_module.STATE.DISCONNECTED, p.state)
+      assert.is_true(p.disconnect_reason:find("misbehaving") ~= nil)
     end)
 
     it("allows version message before handshake", function()
@@ -651,7 +692,10 @@ describe("peer", function()
 
       local processed = p:process_messages()
       assert.equal(0, #processed)  -- Message dropped
-      assert.equal(10, p.ban_score)
+      -- Single-event discourage (Core PR#25974, 2c394e0): first event
+      -- disconnects, no ban_score accumulation.
+      assert.equal(peer_module.STATE.DISCONNECTED, p.state)
+      assert.is_true(p.disconnect_reason:find("misbehaving") ~= nil)
     end)
 
     it("allows all messages after handshake complete", function()
@@ -703,20 +747,17 @@ describe("peer", function()
       assert.equal(0, p.ban_score)
     end)
 
-    it("accumulates misbehavior score and disconnects at threshold", function()
+    it("disconnects on first misbehavior (single-event discourage, PR#25974)", function()
+      -- Core post-PR#25974 has no score accumulator: the FIRST misbehaving
+      -- event sets m_should_discourage and the peer is disconnected
+      -- (lunarblock 2c394e0, W99 G1).  A single pre-version ping suffices.
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
       p.state = peer_module.STATE.CONNECTED
       p.socket = mock_socket()
 
-      -- Send 10 invalid messages (10 points each = 100 total = disconnect)
-      for i = 1, 10 do
-        local ping_msg = p2p.make_message(mainnet.magic_bytes, "ping", p2p.serialize_ping(i))
-        p.recv_buffer = ping_msg
-        p:process_messages()
-        if p.state == peer_module.STATE.DISCONNECTED then
-          break
-        end
-      end
+      local ping_msg = p2p.make_message(mainnet.magic_bytes, "ping", p2p.serialize_ping(1))
+      p.recv_buffer = ping_msg
+      p:process_messages()
 
       assert.equal(peer_module.STATE.DISCONNECTED, p.state)
       assert.is_true(p.disconnect_reason:find("misbehaving") ~= nil)
@@ -859,8 +900,11 @@ describe("peer", function()
       assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_NETWORK) ~= 0)
       assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_WITNESS) ~= 0)
       assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_BLOOM) ~= 0)
-      -- 0x0d = 1 | 4 | 8
-      assert.equal(0x0d, s)
+      -- Full Core v31 default full-node set: base LIMITED|WITNESS
+      -- (init.cpp:863) | NETWORK (non-prune, init.cpp:1950) | BLOOM
+      -- (-peerbloomfilters, init.cpp:1105) | P2P_V2 (-v2transport default,
+      -- init.cpp:989) = 1|8|1024|4|2048 = 0xC0D.
+      assert.equal(0xC0D, s)
     end)
 
     it("p2p.our_services drops NODE_BLOOM when peerbloomfilters=false", function()
@@ -868,8 +912,8 @@ describe("peer", function()
       assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_NETWORK) ~= 0)
       assert.is_truthy(bit.band(s, p2p.SERVICES.NODE_WITNESS) ~= 0)
       assert.equal(0, bit.band(s, p2p.SERVICES.NODE_BLOOM))
-      -- 0x09 = 1 | 8
-      assert.equal(0x09, s)
+      -- 1|8|1024|2048 = 0xC09 (see above for the Core composition).
+      assert.equal(0xC09, s)
     end)
 
     it("Peer.new defaults peerbloomfilters to false (matches Core DEFAULT_PEERBLOOMFILTERS)", function()
@@ -900,7 +944,9 @@ describe("peer", function()
       p.state = peer_module.STATE.CONNECTED
       p:start_handshake()
       assert.is_truthy(bit.band(p.our_services, p2p.SERVICES.NODE_BLOOM) ~= 0)
-      assert.equal(0x0d, p.our_services)
+      -- use_v2 defaults true here, so the Core v31 composite includes
+      -- P2P_V2: 1|8|1024|4|2048 = 0xC0D (init.cpp:863,989,1105,1950).
+      assert.equal(0xC0D, p.our_services)
     end)
 
     it("start_handshake omits NODE_BLOOM when peerbloomfilters=false", function()
@@ -914,7 +960,9 @@ describe("peer", function()
       p.state = peer_module.STATE.CONNECTED
       p:start_handshake()
       assert.equal(0, bit.band(p.our_services, p2p.SERVICES.NODE_BLOOM))
-      assert.equal(0x09, p.our_services)
+      -- use_v2=false here, so no P2P_V2 bit: 1|8|1024 = 0x409
+      -- (Core init.cpp:863 LIMITED|WITNESS base + :1950 NETWORK non-prune).
+      assert.equal(0x409, p.our_services)
     end)
 
     it("BIP-324 v2 maps mempool to short ID 15 in both directions", function()
