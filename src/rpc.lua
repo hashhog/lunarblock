@@ -13991,10 +13991,40 @@ function RPCServer:tick()
     local cl = line:match("^[Cc]ontent%-[Ll]ength:%s*(%d+)")
     if cl then content_length = tonumber(cl) end
   end
-  -- Read exact body
+  -- Read exact body.
+  --
+  -- The socket carries a 1s per-read timeout (above) to keep the event loop
+  -- responsive. A single receive(content_length) therefore CANNOT read a large
+  -- body: submitblock of a ~1 MB block is a ~2 MB hex POST, which does not
+  -- arrive within one second on a loaded box. LuaSocket then returns
+  -- `nil, "timeout", partial` and the `or ""` discarded the partial outright,
+  -- leaving an empty body -> JSON parse failure -> no usable response. Four
+  -- corpus entries (weight-exact-at-limit, weight-one-over-limit,
+  -- weight-just-under-outputonly, bad-blk-length -- every ~1 MB block in the
+  -- corpus, and only those) came back unparseable for this reason. A node that
+  -- cannot accept a 1 MB block via submitblock is not usable by a miner.
+  --
+  -- Loop instead: keep the 1s cap per read, accumulate the partial each time,
+  -- and bound the whole body by BODY_READ_DEADLINE so a stalled or malicious
+  -- client still cannot pin the loop open indefinitely.
+  local BODY_READ_DEADLINE = 30  -- seconds for the entire body
   local body_data = ""
   if content_length > 0 then
-    body_data = client:receive(content_length) or ""
+    local deadline = os.time() + BODY_READ_DEADLINE
+    while #body_data < content_length do
+      local want = content_length - #body_data
+      local chunk, rerr, partial = client:receive(want)
+      if chunk then
+        body_data = body_data .. chunk
+      else
+        if partial and #partial > 0 then
+          body_data = body_data .. partial
+        end
+        -- Anything other than a timeout (closed, reset) is terminal.
+        if rerr ~= "timeout" then break end
+        if os.time() >= deadline then break end
+      end
+    end
   end
   -- Reconstruct full request for parse_http_request
   local data = table.concat(headers_raw, "\r\n") .. "\r\n\r\n" .. body_data
