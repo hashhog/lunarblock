@@ -173,6 +173,30 @@ local function bip22_result(err)
     return "bad-cb-length"
   end
 
+  -- First transaction is not a coinbase. Core CheckBlock (validation.cpp:3952)
+  -- emits "bad-cb-missing" / "first tx is not coinbase". lunarblock asserts
+  -- "first transaction is not coinbase" (validation.lua:1531) and no rule
+  -- matched it, so it fell through to the generic "rejected".
+  --
+  -- MUST precede the coinbase-amount rule below, and the generic "script"
+  -- catcher further down, for the same reason the BIP34 rule at line 156 is
+  -- ordered early: a looser pattern placed first will steal the match. That
+  -- ordering hazard bit in both ouroboros and hotbuns while applying this fix.
+  --
+  -- Found by the 2026-08-02 corpus sweep, entry F-coinbase-prevout-nonnull: a
+  -- coinbase with a non-null prevout fails IsCoinBase(). SEVEN of ten impls
+  -- answered the generic form on that entry — only beamchain and rustoshi were
+  -- correct — so this is a shared gap. Equivalents: blockbrew 72a5519,
+  -- ouroboros a8f40ab, hotbuns 7c8a950, nimrod 5736da6.
+  --
+  -- Decision unchanged (rejected either way): R2 reason-code parity.
+  if s:find("bad%-cb%-missing")
+      or s:find("first transaction is not coinbase")
+      or s:find("first tx is not coinbase")
+      or s:find("no coinbase") then
+    return "bad-cb-missing"
+  end
+
   -- Coinbase value / subsidy
   if s:find("coinbase amount") or s:find("subsidy") or s:find("coinbase value") then
     return "bad-cb-amount"
