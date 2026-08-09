@@ -686,10 +686,49 @@ end
 -- Initialization
 --------------------------------------------------------------------------------
 
+--- Walk the in-memory header chain backwards from start_entry to find the
+--- entry at target_height.  Mirrors CBlockIndex::GetAncestor (bitcoin-core
+--- chain.cpp): follows pprev (header.prev_hash) links on the block's OWN
+--- ancestry rather than looking up the active-chain height index.
+---
+--- This is the correct lookup for get_next_work_required: the period's first
+--- block, the BIP94 base, and the min-diff walk-back must be resolved along
+--- the validated block's OWN lineage, not via height_to_hash which always
+--- reflects the last-accepted header at that height (which may be a competing
+--- fork's block — the exact anti-pattern the wave-2 MTP fix resolved for
+--- get_past_timestamps / collect_timestamps in beamchain / nimrod / camlcoin).
+--- POISON-IMMUNITY: height_to_hash is written for EVERY accepted header
+--- regardless of work (see accept_header), so it is attacker-poisonable and
+--- must never be used to resolve a consensus input.
+---
+--- Bitcoin Core reference: pow.cpp:44 — pindexLast->GetAncestor(nHeightFirst)
+--- pow.cpp:72 — pindexLast->GetAncestor(nHeightFirst) for BIP94 base
+--- pow.cpp:33-34 — pindex->pprev walk for min-diff walk-back
+---
+--- (Defined here, above load_from_storage, because the boot-time
+--- audit_snapshot_boundary needs it; Lua file-locals are only visible to code
+--- that appears after their declaration.)
+---
+--- @param headers table: the HeaderChain.headers map (hash_hex -> entry)
+--- @param start_entry table|nil: entry to start walking from
+--- @param target_height number: desired ancestor height
+--- @return table|nil: the entry at target_height, or nil if not found
+local function get_ancestor_entry(headers, start_entry, target_height)
+  local entry = start_entry
+  while entry do
+    if entry.height == target_height then return entry end
+    if entry.height < target_height then return nil end
+    local prev_hex = types.hash256_hex(entry.header.prev_hash)
+    entry = headers[prev_hex]
+  end
+  return nil
+end
+
 --- Initialize the header chain from storage or genesis.
 function HeaderChain:init()
   -- Recover the snapshot base height (if this datadir was snapshot-bootstrapped)
-  -- so the first-retarget-above-base diffbits relaxation survives restarts.
+  -- so a restarted snapshot node knows where its locally-held chain roots (the
+  -- pre-base retarget ancestor must then come from the pinned anchor).
   self.snapshot_base_height = self:get_snapshot_base_height()
   -- Check if we have a stored header tip (separate from chain tip!)
   io.stdout:write("  Checking header tip...\n"); io.stdout:flush()
@@ -834,6 +873,77 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
 
   self.header_tip_hash = tip_hash
   self.header_tip_height = tip_height
+
+  -- One-shot boot audit of the snapshot boundary (see audit_snapshot_boundary).
+  -- Runs AFTER the forward work pass so the whole base..tip window is in
+  -- memory.  A datadir that was exploited through the old skip_diffbits hole
+  -- BEFORE this fix shipped still carries the fabricated header; accept_header
+  -- only ever runs on NEW headers, so nothing else would ever re-check it.
+  local audit_ok, audit_err = self:audit_snapshot_boundary()
+  if not audit_ok then
+    self.snapshot_audit_error = audit_err
+    io.stderr:write("[ALERT] " .. audit_err .. "\n")
+    io.stderr:flush()
+  end
+end
+
+--- Re-validate the first retarget boundary above the snapshot base against the
+--- stored header chain.
+---
+--- WHY.  accept_header validates headers as they arrive.  A datadir that
+--- admitted a fabricated boundary header through the (now deleted)
+--- skip_diffbits relaxation keeps it forever: on restart the header is simply
+--- loaded from storage, never re-gated.  This audit is the only thing that
+--- catches an already-poisoned datadir, so it must ship with the gate.
+---
+--- Poison-immunity: the boundary header and its parent are located by walking
+--- PARENT POINTERS down from the header tip, not through height_to_hash (which
+--- the same attack corrupts -- accept_header writes it for every accepted
+--- header regardless of work).
+---
+--- @return boolean, string|nil: true when clean, false + message on mismatch
+function HeaderChain:audit_snapshot_boundary()
+  local base = self.snapshot_base_height
+  if not base then return true end
+  if self.network.pow_no_retarget then return true end
+
+  local interval = consensus.DIFFICULTY_ADJUSTMENT_INTERVAL
+  -- First retarget boundary STRICTLY above the base.
+  local boundary = math.floor(base / interval) * interval + interval
+
+  local tip_hex = self.header_tip_hash and types.hash256_hex(self.header_tip_hash)
+  local tip_entry = tip_hex and self.headers[tip_hex]
+  if not tip_entry or (tip_entry.height or -1) < boundary then
+    return true  -- not synced that far yet; accept_header will gate it live
+  end
+
+  local entry = get_ancestor_entry(self.headers, tip_entry, boundary)
+  local parent = get_ancestor_entry(self.headers, tip_entry, boundary - 1)
+  if not entry or not parent then return true end
+
+  local expected, why = consensus.get_next_work_required(
+    boundary, entry.header.timestamp, self.network,
+    self:make_work_ancestor_fn(parent))
+
+  if not expected then
+    return false, string.format(
+      "snapshot-boundary audit: cannot resolve the required nBits at height %d "
+      .. "(%s, snapshot base %d). The stored chain crosses a retarget boundary "
+      .. "this node cannot validate; refusing to start.",
+      boundary, tostring(why), base)
+  end
+
+  if entry.header.bits ~= expected then
+    return false, string.format(
+      "snapshot-boundary audit: stored header at height %d declares nBits "
+      .. "0x%08x but 0x%08x is required (snapshot base %d). This datadir was "
+      .. "admitted through the pre-2026-08-09 skip_diffbits hole and its "
+      .. "height index may be poisoned; refusing to start. Re-sync, or restore "
+      .. "from a known-good snapshot.",
+      boundary, entry.header.bits, expected, base)
+  end
+
+  return true
 end
 
 --- Calculate total work from genesis to a given height.
@@ -987,6 +1097,43 @@ function HeaderChain:inject_snapshot_base(base_height, base_hash, header, total_
     return false, "header tip already at/above base"
   end
 
+  -- PRECONDITION (ported from Core ActivateSnapshot, validation.cpp:5611-5624).
+  --
+  -- Core REFUSES to activate a snapshot whose base is not already a real
+  -- CBlockIndex inside a genesis-synced header chain:
+  --   "The base block header (%s) must appear in the headers chain. Make sure
+  --    all headers are syncing, and call loadtxoutset again"
+  -- and additionally requires m_best_header->GetAncestor(base->nHeight) == base.
+  -- That precondition is exactly what lets pow.cpp:41-45 assert(pindexFirst).
+  --
+  -- lunarblock forward-syncs from a fabricated base instead, so it must supply
+  -- the one ancestor the retarget at the first boundary above the base needs:
+  -- the pinned pre-base anchor at floor(base/2016)*2016.  Without it the node
+  -- would boot fine and then be UNABLE to validate the nBits of the header at
+  -- that boundary -- and would sit there rejecting honest headers
+  -- ("diffbits-unresolvable") 1321 blocks later, having already committed to
+  -- the datadir.  Fail at BOOT, loudly, instead.
+  --
+  -- This gate lives HERE, not only in consensus.validate_assumeutxo_anchors,
+  -- because it must also cover entries that arrive at runtime via
+  -- HASHHOG_CAMPAIGN_ASSUMEUTXO -- inject_snapshot_base sees the MERGED table,
+  -- so a campaign fixture cannot re-open the hole at its own boundary.
+  local need = consensus.required_pre_base_anchor_height(self.network, base_height)
+  if need then
+    local au_data = consensus.assumeutxo_for_height(self.network, base_height)
+    if not consensus.pre_base_ancestor(au_data, need) then
+      return false, string.format(
+        "snapshot base %d has no pinned pre-base ancestor at height %d: the "
+        .. "base's pre-retarget ancestor is unknown, so the nBits of the first "
+        .. "retarget boundary above the base (%d) could not be validated. "
+        .. "Sync headers from genesis, or add the pinned anchor to the "
+        .. "assumeutxo entry (consensus.lua pre_base_ancestors).",
+        base_height, need,
+        need + consensus.DIFFICULTY_ADJUSTMENT_INTERVAL),
+        "missing-pre-base-anchor"
+    end
+  end
+
   self.headers[hash_hex] = {
     header = header,
     height = base_height,
@@ -996,20 +1143,18 @@ function HeaderChain:inject_snapshot_base(base_height, base_hash, header, total_
   self.header_tip_hash = base_hash
   self.header_tip_height = base_height
 
-  -- Record the snapshot base height so the difficulty check can detect when a
-  -- retarget's "first block of the prior period" ancestor (boundary - 2016)
-  -- falls BELOW the base and is therefore un-indexed.  In a snapshot-bootstrap
-  -- node we only forward-sync headers from the base up; the pre-base headers
-  -- are never downloaded, so the very first retarget boundary above the base
-  -- cannot be recomputed locally (Core, by contrast, holds the full genesis->
-  -- tip header chain and always has the ancestor).  At that single boundary we
-  -- trust the peer's declared bits — the snapshot base is already past
-  -- min_chain_work (effectively assumevalid), so its sub-chain difficulty is
-  -- accepted as authoritative.  See the difficulty-check step (bad-diffbits).
+  -- Record the snapshot base height so the difficulty check knows where the
+  -- locally-held header chain ROOTS.  In a snapshot-bootstrap node we only
+  -- forward-sync headers from the base up; the pre-base headers are never
+  -- downloaded, so the retarget at the first boundary above the base has to
+  -- resolve its period-first ancestor from the pinned pre-base anchor
+  -- (HeaderChain:resolve_pre_base_ancestor) rather than from the chain.
+  -- Core needs none of this because it holds the full genesis->tip header
+  -- chain regardless of the UTXO snapshot.
   self.snapshot_base_height = base_height
   -- Persist for restart: a restarted snapshot node loads only base..tip from
   -- storage (the backward walk stops at the base where get_header returns nil),
-  -- so it must read the base height back to keep relaxing that first boundary.
+  -- so it must read the base height back to know where its chain roots.
   self:set_snapshot_base_height(base_height)
 
   -- Persist the base header + height-index row so it survives restart and so
@@ -1059,35 +1204,82 @@ end
 -- Header Processing
 --------------------------------------------------------------------------------
 
---- Walk the in-memory header chain backwards from start_entry to find the
---- entry at target_height.  Mirrors CBlockIndex::GetAncestor (bitcoin-core
---- chain.cpp): follows pprev (header.prev_hash) links on the block's OWN
---- ancestry rather than looking up the active-chain height index.
+--- Resolve a retarget ancestor that lies BELOW the snapshot base, from the
+--- PINNED pre-base anchor in the assumeutxo entry.
 ---
---- This is the correct lookup for get_next_work_required: the period's first
---- block, the BIP94 base, and the min-diff walk-back must be resolved along
---- the validated block's OWN lineage, not via height_to_hash which always
---- reflects the last-accepted header at that height (which may be a competing
---- fork's block — the exact anti-pattern the wave-2 MTP fix resolved for
---- get_past_timestamps / collect_timestamps in beamchain / nimrod / camlcoin).
+--- WHY THIS EXISTS.  A snapshot-bootstrapped node forward-syncs headers from
+--- the base, so it holds no header below it.  The first retarget boundary
+--- above the base needs the period-first block at boundary-2016, which is
+--- below the base.  Bitcoin Core never hits this: ActivateSnapshot
+--- (validation.cpp:5611-5624) refuses to activate unless the base is already a
+--- real CBlockIndex in a genesis-synced header chain, which is why pow.cpp:45
+--- can assert(pindexFirst).  lunarblock dropped that precondition and then
+--- papered over the hole by DISABLING the nBits check at that height -- a
+--- publicly computable single height at which any unauthenticated peer could
+--- mine a difficulty-1 header for free.  This resolver replaces the skip.
 ---
---- Bitcoin Core reference: pow.cpp:44 — pindexLast->GetAncestor(nHeightFirst)
---- pow.cpp:72 — pindexLast->GetAncestor(nHeightFirst) for BIP94 base
---- pow.cpp:33-34 — pindex->pprev walk for min-diff walk-back
+--- POISON-IMMUNITY (this is the whole point).  Everything here resolves
+--- through PARENT POINTERS or a compile-time constant.  height_to_hash is
+--- NEVER consulted:
+---   * step 2 walks the candidate's OWN ancestry (prev_hash links) down to the
+---     base height -- Core's pindexLast->GetAncestor (pow.cpp:44,72);
+---   * step 3 recomputes the hash of the entry found there and requires it to
+---     equal the PINNED base blockhash, proving this lineage actually runs
+---     through the base the anchor belongs to.  A fork that merely has *a*
+---     header at the base height gets nothing;
+---   * step 4 is an exact-height lookup in a hard-coded table -- no
+---     interpolation, no nearest-match.
+--- The height index is attacker-poisonable (any accepted header overwrites it,
+--- regardless of work -- see accept_header's unconditional height_to_hash
+--- write) and does not cover headers ahead of the validated tip.  Resolving
+--- through it would INVERT the check: honest headers rejected, the attack's
+--- difficulty-1 headers accepted.
 ---
---- @param headers table: the HeaderChain.headers map (hash_hex -> entry)
---- @param start_entry table|nil: entry to start walking from
---- @param target_height number: desired ancestor height
---- @return table|nil: the entry at target_height, or nil if not found
-local function get_ancestor_entry(headers, start_entry, target_height)
-  local entry = start_entry
-  while entry do
-    if entry.height == target_height then return entry end
-    if entry.height < target_height then return nil end
-    local prev_hex = types.hash256_hex(entry.header.prev_hash)
-    entry = headers[prev_hex]
+--- The attacker also cannot steer WHICH pre-base height is asked for:
+--- get_next_work_required only requests height-2016 at a boundary, and every
+--- lineage in `headers` roots at the base, so exactly one pre-base height is
+--- reachable.
+---
+--- @param parent table: the candidate header's parent entry (start of the walk)
+--- @param h number: the pre-base height to resolve
+--- @return table|nil: {header={timestamp,bits}, height=h, pinned=true}
+function HeaderChain:resolve_pre_base_ancestor(parent, h)
+  local base_height = self.snapshot_base_height
+  if not base_height then return nil end
+  if not h or h >= base_height then return nil end
+
+  -- Parent-pointer walk ONLY (never height_to_hash).
+  local base_entry = get_ancestor_entry(self.headers, parent, base_height)
+  if not base_entry or not base_entry.header then return nil end
+
+  local au_data = consensus.assumeutxo_for_height(self.network, base_height)
+  if not au_data or type(au_data.blockhash) ~= "string" then return nil end
+
+  -- Lineage gate: this header's ancestry must run through the PINNED base.
+  local base_hex = types.hash256_hex(validation.compute_block_hash(base_entry.header))
+  if base_hex ~= au_data.blockhash then return nil end
+
+  local a = consensus.pre_base_ancestor(au_data, h)
+  if not a then return nil end
+
+  return {
+    header = { timestamp = a.timestamp, bits = a.bits },
+    height = h,
+    pinned = true,
+  }
+end
+
+--- Ancestor oracle for get_next_work_required: the candidate's own lineage
+--- first, the pinned pre-base anchor only as a narrow, hash-gated fallback.
+--- @param parent table: parent entry of the header being validated
+--- @return function: fn(height) -> ancestor entry or nil
+function HeaderChain:make_work_ancestor_fn(parent)
+  local chain = self
+  return function(h)
+    local e = get_ancestor_entry(chain.headers, parent, h)
+    if e then return e end
+    return chain:resolve_pre_base_ancestor(parent, h)
   end
-  return nil
 end
 
 --- Process a batch of headers received from a peer.
@@ -1164,19 +1356,101 @@ function HeaderChain:accept_header(header, opts)
     end
   end
 
-  -- 5a. Check timestamp: must be > median time past of previous 11 blocks
-  --     (time-too-old gate).
-  --     Bitcoin Core validation.cpp:4092-4093.
   local height = parent.height + 1
+  local chain = self
+
+  -- ---------------------------------------------------------------------
+  -- Steps 5a-5d below mirror Bitcoin Core ContextualCheckBlockHeader
+  -- (validation.cpp:4080-4121) IN CORE'S ORDER.  The order is observable:
+  -- when a header breaks two rules, the reject reason Core reports is the
+  -- FIRST one it checks, and that reason is what the cross-impl diff-test
+  -- corpus compares and what rpc.lua:314 maps to a BIP-22 code.
+  --
+  -- Core's order is:  bad-diffbits -> time-too-old -> time-timewarp-attack
+  --                   -> time-too-new -> bad-version
+  -- lunarblock previously ran: time-too-old -> time-too-new -> timewarp ->
+  --                            diffbits -> bad-version  (two divergences).
+  -- ---------------------------------------------------------------------
+
+  -- 5a. Check proof of work: the declared nBits must EQUAL the REQUIRED bits.
+  --     Bitcoin Core validation.cpp:4086-4089 — the FIRST check in the
+  --     function:
+  --       if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))
+  --           return state.Invalid(..., "bad-diffbits", "incorrect proof of work");
+  --
+  --     NOTE this is a DIFFERENT check from step 4 above.  Step 4 is
+  --     hash <= DECLARED target (Core's CheckProofOfWork / "high-hash").  This
+  --     is declared-nBits vs REQUIRED-nBits.  Passing step 4 says only that the
+  --     miner did the work they claimed to do; without this step a peer can
+  --     claim difficulty 1 and do a laptop-second of work.
+  --
+  --     [FIX 2026-08-09] There used to be a `skip_diffbits` relaxation here
+  --     that DISABLED this check entirely at the first retarget boundary above
+  --     a snapshot base, on the grounds that the period-first ancestor
+  --     (boundary-2016) lies below the base and was never downloaded.  That
+  --     condition is satisfied at exactly ONE, PUBLICLY COMPUTABLE height per
+  --     base (for base 944183: 945504), so any unauthenticated peer could mine
+  --     a difficulty-1 header there for free -- and the resulting fork is
+  --     self-sustaining, because the NEXT retarget is then computed along the
+  --     attacker's own lineage.  The admitted header did not even need to
+  --     become the tip to do damage: step 9 below writes height_to_hash and
+  --     CF.HEIGHT_INDEX unconditionally.
+  --
+  --     The relaxation was never necessary.  The retarget needs exactly two
+  --     inputs -- the parent (locally held) and the period-first block's TIME
+  --     -- so one pinned, hash-verified pre-base anchor closes it with the full
+  --     Core arithmetic.  See HeaderChain:resolve_pre_base_ancestor for the
+  --     poison-immunity argument, and consensus.lua's pre_base_ancestors
+  --     tables for the trust model.
+  --
+  --     When the required value genuinely cannot be resolved we REJECT
+  --     ("diffbits-unresolvable"), never skip.  The reason string deliberately
+  --     does NOT contain "bad-diffbits": main.lua's HEADERS_BAN_SUBSTRINGS
+  --     substring-matches that token and would 100-score-ban every honest peer
+  --     at the boundary.  Unresolvable is OUR missing data, not peer
+  --     misbehaviour, so it must fall through to the disconnect-only branch
+  --     (Core MaybePunishNodeForBlock parity).
+  local expected_bits, unresolvable = consensus.get_next_work_required(
+    height,
+    header.timestamp,
+    self.network,
+    self:make_work_ancestor_fn(parent)
+  )
+  if not expected_bits then
+    return false, string.format(
+      "diffbits-unresolvable: %s (snapshot base %s)",
+      tostring(unresolvable), tostring(chain.snapshot_base_height))
+  end
+  if header.bits ~= expected_bits then
+    return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
+      expected_bits, header.bits)
+  end
+
+  -- 5b. Check timestamp: must be > median time past of previous 11 blocks
+  --     (time-too-old gate).
+  --     Bitcoin Core validation.cpp:4091-4093.
   local mtp_timestamps = self:get_past_timestamps(prev_hex, consensus.MEDIAN_TIME_PAST_BLOCKS)
   local mtp = consensus.get_median_time_past(mtp_timestamps)
   if header.timestamp <= mtp then
     return false, "time-too-old"
   end
 
-  -- 5b. Check timestamp: must not exceed wall-clock by MAX_FUTURE_BLOCK_TIME
+  -- 5c. BIP94 (testnet4 + regtest only): first block of each difficulty
+  --     adjustment period must not be more than MAX_TIMEWARP (600s) earlier
+  --     than the last block of the preceding period.  Prevents timewarp
+  --     attacks.
+  --     Bitcoin Core validation.cpp:4095-4105 — BEFORE the time-too-new gate.
+  if self.network.enforce_bip94 then
+    if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
+      if header.timestamp < parent.header.timestamp - consensus.MAX_TIMEWARP then
+        return false, "time-timewarp-attack"
+      end
+    end
+  end
+
+  -- 5d. Check timestamp: must not exceed wall-clock by MAX_FUTURE_BLOCK_TIME
   --     (time-too-new gate).
-  --     Bitcoin Core validation.cpp:4108-4110 (chain.h:29).
+  --     Bitcoin Core validation.cpp:4107-4110 (chain.h:29).
   --
   --     The "now" reference is wall-clock (NodeClock::now() in Core). For
   --     deterministic differential testing of this gate, opts.current_time
@@ -1191,67 +1465,6 @@ function HeaderChain:accept_header(header, opts)
   local now = (opts and opts.current_time) or os.time()
   if header.timestamp > now + consensus.MAX_FUTURE_BLOCK_TIME then
     return false, "time-too-new"
-  end
-
-  -- 5c. BIP94 (testnet4 only): first block of each difficulty adjustment
-  --     period must not be more than MAX_TIMEWARP (600s) earlier than the
-  --     last block of the preceding period.  Prevents timewarp attacks.
-  --     Bitcoin Core validation.cpp:4097-4105 (consensus/consensus.h:35).
-  if self.network.enforce_bip94 then
-    if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
-      if header.timestamp < parent.header.timestamp - consensus.MAX_TIMEWARP then
-        return false, "time-timewarp-attack"
-      end
-    end
-  end
-
-  -- 6. Check difficulty target using consensus.get_next_work_required
-  -- This handles mainnet, testnet3 walk-back, BIP94/testnet4, and regtest
-  local chain = self
-
-  -- Snapshot-bootstrap relaxation: at the FIRST retarget boundary above the
-  -- snapshot base, the "first block of the prior period" ancestor
-  -- (boundary - 2016) lies BELOW the base and was never downloaded (we only
-  -- forward-sync headers up from the base).  get_next_work_required cannot
-  -- recompute the retarget without it and silently falls back to prev.nBits,
-  -- which then fails to match the peer's correct (higher-difficulty) bits and
-  -- wedges the header chain one block short of the boundary (observed:
-  -- "bad-diffbits expected 0x17020684 got 0x17021369" at h=945504 with base
-  -- 944183).  A snapshot node is past min_chain_work (effectively assumevalid
-  -- below the base), so we trust the peer's declared bits at exactly this
-  -- boundary.  This affects only the single first boundary above the base; all
-  -- later retargets have their full 2016-ancestor window within the synced
-  -- range and are recomputed normally.  Core never hits this because it holds
-  -- the full genesis->tip header chain regardless of the UTXO snapshot.
-  local interval = consensus.DIFFICULTY_ADJUSTMENT_INTERVAL
-  local skip_diffbits = false
-  if chain.snapshot_base_height
-     and not self.network.pow_no_retarget
-     and height % interval == 0
-     and (height - interval) < chain.snapshot_base_height then
-    skip_diffbits = true
-  end
-
-  if not skip_diffbits then
-    -- Ancestor lookup walks the VALIDATED BLOCK'S OWN ancestry via prev_hash
-    -- links (parent -> parent.parent -> ...), matching Core's pindexLast->
-    -- GetAncestor(nHeightFirst) in pow.cpp:44,72.  The old closure used
-    -- chain.height_to_hash[h] which points at the last-accepted header at
-    -- height h — a competing fork's block when two chains have headers at the
-    -- same height — causing wrong expected bits on fork headers (both false-
-    -- reject and false-accept directions depending on which chain is active).
-    local expected_bits = consensus.get_next_work_required(
-      height,
-      header.timestamp,
-      self.network,
-      function(h)
-        return get_ancestor_entry(chain.headers, parent, h)
-      end
-    )
-    if header.bits ~= expected_bits then
-      return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
-        expected_bits, header.bits)
-    end
   end
 
   -- 6b. Reject outdated block versions once the corresponding soft fork has
@@ -1303,7 +1516,7 @@ function HeaderChain:accept_header(header, opts)
   end
 
   -- 7b. Check anti-fork: reject headers that would create a fork before last checkpoint
-  local chain = self
+  -- (`chain` is the `local chain = self` bound above, before the contextual gates.)
   local ok2, fork_err = consensus.check_checkpoint_anti_fork(
     self.network, height, hash_hex,
     function(h)
@@ -1452,9 +1665,11 @@ end
 --------------------------------------------------------------------------------
 
 --- Calculate the next required difficulty target.
+-- Two-value contract, matching consensus.get_next_work_required:
+--   returns `bits, nil` when computable, `nil, reason` when unresolvable.
 -- @param height number: height of the block being validated
 -- @param header block_header: header being validated
--- @return number: expected compact bits value
+-- @return number|nil, string|nil: expected compact bits, or nil + reason
 function HeaderChain:calculate_next_work_required(height, header)
   local chain = self
   -- Resolve the parent via header.prev_hash so the ancestor walk starts from
@@ -1465,9 +1680,7 @@ function HeaderChain:calculate_next_work_required(height, header)
     height,
     header.timestamp,
     self.network,
-    function(h)
-      return get_ancestor_entry(chain.headers, parent_entry, h)
-    end
+    self:make_work_ancestor_fn(parent_entry)
   )
 end
 

@@ -3925,29 +3925,76 @@ end
 -- pindexPrev->GetAncestor, pow.cpp) using the stored headers, matching
 -- sync.lua's get_ancestor_entry.  This makes fork blocks compute against their
 -- own chain rather than whatever competing header sits at that height in the
--- height index.
--- @return true on match; false, "bad-diffbits: ..." on mismatch.
+-- height index.  POISON-IMMUNITY: the height index (CF.HEIGHT_INDEX) is
+-- rewritten for every accepted header regardless of work, so it is
+-- attacker-poisonable and is deliberately never consulted here.
+--
+-- SNAPSHOT BASE (2026-08-09).  On a snapshot-bootstrapped datadir the storage
+-- walk bottoms out at the base (the pre-base headers were never downloaded),
+-- so at the first retarget boundary above the base the period-first ancestor
+-- is unreachable.  Pre-fix, get_next_work_required silently returned the OLD
+-- period's bits and this function would have FALSE-REJECTED the honest
+-- boundary block — which is exactly why accept_block's caller was allowed to
+-- skip it during IBD, leaving no connect-time backstop at all.  It is now
+-- resolved from the pinned, hash-verified pre-base anchor (same constant
+-- sync.lua uses), so the check is correct on that path and no longer needs to
+-- be skipped.
+-- @return true on match; false, "bad-diffbits: ..." / "diffbits-unresolvable:
+--         ..." on mismatch.
 function ChainState:check_diffbits(header, height)
   if not height or height <= 0 then return true end
   if not self.storage then return true end
 
+  local base = self:get_snapshot_base_height()
+
   local get_ancestor = function(target_height)
     if target_height < 0 or target_height >= height then return nil end
+    -- Below the snapshot base the chain simply stops.  Walk down to the BASE
+    -- instead and resolve the rest from the pinned anchor (gated on the
+    -- base hash below, so the anchor only ever applies to a lineage that
+    -- genuinely runs through the pinned base).
+    local pre_base = base ~= nil and target_height < base and height > base
+    local stop_height = pre_base and base or target_height
+
     local cur_hash = header.prev_hash
     local cur_height = height - 1
-    while cur_height > target_height do
+    while cur_height > stop_height do
       local hdr = self.storage.get_header(cur_hash)
       if not hdr then return nil end
       cur_hash = hdr.prev_hash
       cur_height = cur_height - 1
     end
-    local hdr = self.storage.get_header(cur_hash)
-    if not hdr then return nil end
-    return { header = hdr, height = cur_height }
+    if cur_height ~= stop_height then return nil end
+
+    if not pre_base then
+      local hdr = self.storage.get_header(cur_hash)
+      if not hdr then return nil end
+      return { header = hdr, height = cur_height }
+    end
+
+    -- Lineage gate: cur_hash is the hash of the block at `base` on THIS
+    -- block's own ancestry.  It must be the pinned snapshot base, otherwise
+    -- the pinned pre-base datum does not describe this chain.
+    local au_data = consensus.assumeutxo_for_height(self.network, base)
+    if not au_data or type(au_data.blockhash) ~= "string" then return nil end
+    if types.hash256_hex(cur_hash) ~= au_data.blockhash then return nil end
+
+    local a = consensus.pre_base_ancestor(au_data, target_height)
+    if not a then return nil end
+    return {
+      header = { timestamp = a.timestamp, bits = a.bits },
+      height = target_height,
+      pinned = true,
+    }
   end
 
-  local expected_bits = consensus.get_next_work_required(
+  local expected_bits, unresolvable = consensus.get_next_work_required(
     height, header.timestamp, self.network, get_ancestor)
+  if not expected_bits then
+    -- FAIL-CLOSED.  Never fall back to "whatever the block declares".
+    return false, string.format("diffbits-unresolvable: %s (snapshot base %s)",
+      tostring(unresolvable), tostring(base))
+  end
   if header.bits ~= expected_bits then
     return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
       expected_bits, header.bits)
@@ -3988,20 +4035,31 @@ function ChainState:accept_block(block, height, block_hash, opts)
     if not val_err then
       return nil, "check_block returned false (unexpected)"
     end
+  end
 
-    -- Stage 1b: contextual difficulty (nBits) check.  Core folds this into
-    -- ContextualCheckBlockHeader (validation.cpp:4088-4089).  Gated on the same
-    -- condition as check_block: the IBD/import callers pass skip_check_block=true
-    -- because sync.lua already enforced diffbits on the HEADER (with the
-    -- snapshot-base relaxation at the first retarget boundary above a UTXO
-    -- snapshot base), so re-checking here would be redundant and could
-    -- false-reject there.  The submitblock tip-extend + mining callers omit
-    -- skip_check_block, so this is exactly the path that previously bypassed the
-    -- diffbits gate.
-    local ok_db, db_err = self:check_diffbits(block.header, height)
-    if not ok_db then
-      return nil, db_err
-    end
+  -- Stage 1b: contextual difficulty (nBits) check.  Core folds this into
+  -- ContextualCheckBlockHeader (validation.cpp:4086-4089).
+  --
+  -- [FIX 2026-08-09] This used to sit INSIDE the `if not opts.skip_check_block`
+  -- block above, so the IBD / block-download path (main.lua:1347 passes
+  -- skip_check_block=true) had NO connect-time nBits check at all — the header
+  -- gate in sync.lua was the only enforcement, and that gate had a hole at the
+  -- first retarget boundary above a snapshot base.  The stated justification
+  -- for the skip ("sync.lua already enforced diffbits, with the snapshot-base
+  -- relaxation ... re-checking here would false-reject") died with the
+  -- relaxation: check_diffbits now resolves the pre-base ancestor from the
+  -- pinned anchor and is correct on that path too.  Defence in depth — this
+  -- runs on EVERY connected block regardless of which path delivered it.
+  --
+  -- Cost: one storage.get_header per connected block, plus a walk of up to
+  -- 2016 headers once per retarget period.  MEASURED (not assumed) against a
+  -- real RocksDB store holding the 944183..945503 mainnet header range,
+  -- 2026-08-09: 11.1 us per non-boundary block, 11.8 ms at a boundary
+  -- => ~17 us/block amortised.  Negligible next to script validation, but
+  -- visible on a full --reindex-chainstate replay.
+  local ok_db, db_err = self:check_diffbits(block.header, height)
+  if not ok_db then
+    return nil, db_err
   end
 
   -- Stage 2: compute prev_block_mtp for IsFinalTx (BIP-113) and BIP-68.

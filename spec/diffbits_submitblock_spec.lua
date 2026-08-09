@@ -136,6 +136,38 @@ describe("submitblock/accept_block bad-diffbits gate (Core parity)", function()
     assert.equal(3, cs.tip_height)                       -- tip unchanged
   end)
 
+  -- ── IBD / block-download arm (skip_check_block=true) ──────────────────────
+  -- main.lua:1347 connects downloaded blocks with skip_check_block=true.
+  -- check_diffbits USED to live inside that `if`, so the IBD path had NO
+  -- connect-time nBits check at all — the header gate in sync.lua was the sole
+  -- enforcement, and that gate had a hole at the first retarget boundary above
+  -- a UTXO snapshot base.  Core has no such carve-out: ContextualCheckBlockHeader
+  -- (validation.cpp:4086-4089) runs for every block on every path.
+  --
+  -- NOTE this arm is a regtest GUARD for the plumbing (fPowNoRetargeting means
+  -- required == parent's bits).  The mainnet-shaped proof that check_diffbits
+  -- is CORRECT on a snapshot-base chain lives in
+  -- spec/snapshot_base_diffbits_spec.lua ("T6").
+  it("IBD path (skip_check_block): REJECTS a wrong-nBits block", function()
+    local new_h = 4
+    local blk, block_hash = build_valid_block(new_h, tip_hash, WRONG_BITS)
+    local ok, err = cs:accept_block(blk, new_h, block_hash,
+      {skip_scripts = true, skip_check_block = true})
+    assert.is_falsy(ok, "PRE-fix the IBD path bypassed the diffbits gate entirely")
+    assert.truthy(err and err:find("^bad%-diffbits"),
+      "expected bad-diffbits, got " .. tostring(err))
+    assert.equal(3, cs.tip_height)
+  end)
+
+  it("IBD path (skip_check_block): ACCEPTS a correct-nBits block", function()
+    local new_h = 4
+    local blk, block_hash = build_valid_block(new_h, tip_hash, REQUIRED_BITS)
+    local ok, err = cs:accept_block(blk, new_h, block_hash,
+      {skip_scripts = true, skip_check_block = true})
+    assert.truthy(ok, "correct-nBits IBD block must accept; got " .. tostring(err))
+    assert.equal(4, cs.tip_height)
+  end)
+
   it("tip-extend: ACCEPTS a correct-nBits block", function()
     local new_h = 4
     local blk, block_hash = build_valid_block(new_h, tip_hash, REQUIRED_BITS)
