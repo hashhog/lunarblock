@@ -470,4 +470,92 @@ describe("assumeutxo", function()
     end)
   end)
 
+  ------------------------------------------------------------------------------
+  -- T7 — inject_snapshot_base boot gate (Core ActivateSnapshot precondition)
+  --
+  -- Bitcoin Core validation.cpp:5611-5624 REFUSES to activate a snapshot whose
+  -- base is not already a real CBlockIndex in a genesis-synced header chain:
+  --   "The base block header (%s) must appear in the headers chain. Make sure
+  --    all headers are syncing, and call loadtxoutset again"
+  -- That precondition is exactly what lets pow.cpp:41-45 assert(pindexFirst).
+  -- lunarblock forward-syncs from a fabricated base instead, so it must carry a
+  -- pinned pre-base anchor -- and must refuse at BOOT if it does not, rather
+  -- than discovering 1321 blocks later that it cannot validate a retarget.
+  ------------------------------------------------------------------------------
+  describe("snapshot base injection gate", function()
+    local sync = require("lunarblock.sync")
+    local helpers = require("spec.helpers")
+
+    -- Mainnet-shaped: retargets, no min-difficulty, base NOT 2016-aligned.
+    local BASE = 944183
+    local ANCHOR_H = 943488
+
+    local function net_with(anchor)
+      local src = consensus.networks.mainnet.assumeutxo[BASE]
+      return {
+        name = "mainnet-shaped", magic_bytes = "\xf9\xbe\xb4\xd9",
+        genesis = consensus.networks.mainnet.genesis,
+        genesis_hash = consensus.networks.mainnet.genesis_hash,
+        checkpoints = {}, pow_limit_bits = consensus.networks.mainnet.pow_limit_bits,
+        pow_no_retarget = false, pow_allow_min_difficulty = false,
+        enforce_bip94 = false, min_chain_work = string.rep("0", 64),
+        bip34_height = 227931, bip66_height = 363725, bip65_height = 388381,
+        csv_height = 419328, segwit_height = 481824, taproot_height = 709632,
+        assumeutxo = { [BASE] = {
+          hash_serialized = src.hash_serialized,
+          m_chain_tx_count = src.m_chain_tx_count,
+          blockhash = src.blockhash, header = src.header,
+          chain_work = src.chain_work,
+          pre_base_ancestors = anchor,
+        } },
+      }
+    end
+
+    local function base_header_obj()
+      local h = consensus.networks.mainnet.assumeutxo[BASE].header
+      return types.block_header(h.version, types.hash256_from_hex(h.prev_hash),
+        types.hash256_from_hex(h.merkle_root), h.timestamp, h.bits, h.nonce)
+    end
+
+    it("REFUSES to inject when the pinned pre-base anchor is missing", function()
+      local chain = sync.new_header_chain(net_with(nil), helpers.mock_storage())
+      local hdr = base_header_obj()
+      local ok, why, code = chain:inject_snapshot_base(
+        BASE, validation.compute_block_hash(hdr), hdr, consensus.work_zero())
+      assert.is_false(ok)
+      assert.equals("missing-pre-base-anchor", code)
+      assert.truthy(why:find(tostring(ANCHOR_H), 1, true), why)
+      assert.truthy(why:find("945504", 1, true), why)
+      -- Nothing was written.
+      assert.is_nil(chain.snapshot_base_height)
+      assert.is_nil(chain.height_to_hash[BASE])
+    end)
+
+    it("injects normally when the anchor is present", function()
+      local anchor = { [ANCHOR_H] = { blockhash = string.rep("ab", 32),
+                                      timestamp = 1775208520, bits = 0x17020684 } }
+      local chain = sync.new_header_chain(net_with(anchor), helpers.mock_storage())
+      local hdr = base_header_obj()
+      local ok, why = chain:inject_snapshot_base(
+        BASE, validation.compute_block_hash(hdr), hdr, consensus.work_zero())
+      assert.is_true(ok, tostring(why))
+      assert.equals(BASE, chain.snapshot_base_height)
+      assert.equals(BASE, chain.header_tip_height)
+    end)
+
+    it("regtest (pow_no_retarget) injects with no anchor and no warning", function()
+      -- Guards tools/boot-smoke.sh's height-299 Core-parity fixture: regtest
+      -- never reaches the retarget branch, so it never needs an anchor.
+      local rt = consensus.networks.regtest
+      assert.is_nil(consensus.required_pre_base_anchor_height(rt, 299))
+      local chain = sync.new_header_chain(rt, helpers.mock_storage())
+      local hdr = types.block_header(0x20000000, types.hash256_zero(),
+        types.hash256_zero(), 1296688602, rt.pow_limit_bits, 2)
+      local ok, why = chain:inject_snapshot_base(
+        299, validation.compute_block_hash(hdr), hdr, consensus.work_zero())
+      assert.is_true(ok, tostring(why))
+      assert.equals(299, chain.snapshot_base_height)
+    end)
+  end)
+
 end)

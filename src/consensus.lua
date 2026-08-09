@@ -405,15 +405,43 @@ end
 
 --- Get the next required work for a block.
 -- Implements full Bitcoin Core logic including testnet special rules and BIP94.
+--
+-- CONTRACT (changed 2026-08-09, snapshot-base diffbits fail-open fix):
+--   returns `bits, nil`   when the required value could be COMPUTED, or
+--   returns `nil, reason`  when a required ancestor is unavailable.
+--
+-- It previously returned a GUESS in three places (nil prev -> pow_limit_bits,
+-- i.e. difficulty 1 as the REQUIRED value; missing period-first -> prev.nBits;
+-- min-diff walk-back hitting a gap -> prev.nBits).  Every caller inherited the
+-- guess and could not tell "computed" from "invented", which is exactly the
+-- fail-open Bitcoin Core makes structurally impossible: pow.cpp:41-45 asserts
+--   assert(nHeightFirst >= 0);
+--   const CBlockIndex* pindexFirst = pindexLast->GetAncestor(nHeightFirst);
+--   assert(pindexFirst);
+-- Core can assert because it ALWAYS holds the full genesis->tip header chain
+-- (even under assumeutxo, see validation.cpp ActivateSnapshot's requirement
+-- that the base already appear in the headers chain).  lunarblock cannot
+-- assert -- a snapshot-bootstrapped node genuinely may not have the ancestor
+-- -- so it must say so and let the caller REJECT.  Returning a guess is the
+-- bug: at a retarget boundary the guess is the previous period's bits, which
+-- an attacker can satisfy for free.
+--
+-- The genesis terminator (`pindex_height > 0` in the min-diff walk-back) is
+-- Core's `pindex->pprev` check (pow.cpp:33-34) and is NOT a fail-open: at
+-- genesis there is legitimately nothing further to walk to.
+--
 -- @param height number: height of the block being validated
 -- @param timestamp number: timestamp of the block being validated
 -- @param network table: network configuration
 -- @param get_ancestor function: fn(height) -> {header={bits, timestamp}} for ancestor lookup
--- @return number: expected compact bits value
+-- @return number|nil, string|nil: expected compact bits, or nil + reason
 function M.get_next_work_required(height, timestamp, network, get_ancestor)
   local prev = get_ancestor(height - 1)
   if not prev then
-    return network.pow_limit_bits
+    -- FAIL-CLOSED.  Pre-fix this returned network.pow_limit_bits, i.e. it told
+    -- every caller that DIFFICULTY 1 was the required value whenever the
+    -- parent could not be resolved -- a latent accept-anything.
+    return nil, string.format("missing-ancestor:%d", height - 1)
   end
 
   -- No retargeting (regtest): always return the previous block's bits.
@@ -436,7 +464,17 @@ function M.get_next_work_required(height, timestamp, network, get_ancestor)
       if time_diff > M.TARGET_SPACING * 2 then
         return network.pow_limit_bits
       else
-        -- Walk back to find the last non-minimum-difficulty block
+        -- Walk back to find the last non-minimum-difficulty block.
+        -- Bitcoin Core pow.cpp:32-35:
+        --   while (pindex->pprev && pindex->nHeight % interval != 0 &&
+        --          pindex->nBits == nProofOfWorkLimit) pindex = pindex->pprev;
+        --   return pindex->nBits;
+        -- `pindex_height > 0` is Core's pprev/genesis terminator and stops
+        -- cleanly.  A MISSING ancestor above genesis is a different thing: on a
+        -- snapshot node the walk can descend below the snapshot base, where
+        -- lunarblock's chain "root" is the base rather than genesis.  Stopping
+        -- there and returning the base's bits would be a guess, not Core
+        -- behaviour, so it is unresolvable -> reject.
         local pindex = prev
         local pindex_height = height - 1
         while pindex_height > 0 and
@@ -444,11 +482,11 @@ function M.get_next_work_required(height, timestamp, network, get_ancestor)
               pindex.header.bits == network.pow_limit_bits do
           pindex_height = pindex_height - 1
           pindex = get_ancestor(pindex_height)
-          if not pindex then break end
+          if not pindex then
+            return nil, string.format("missing-ancestor:%d", pindex_height)
+          end
         end
-        if pindex then
-          return pindex.header.bits
-        end
+        return pindex.header.bits
       end
     end
     -- Not testnet min-diff: bits must match previous block
@@ -460,7 +498,14 @@ function M.get_next_work_required(height, timestamp, network, get_ancestor)
   local first_height = height - M.DIFFICULTY_ADJUSTMENT_INTERVAL
   local first = get_ancestor(first_height)
   if not first then
-    return prev.header.bits
+    -- FAIL-CLOSED.  Pre-fix this returned prev.header.bits -- the PREVIOUS
+    -- period's difficulty -- as the "required" value at a retarget boundary.
+    -- On a snapshot-bootstrapped node that is a free pass for any header at
+    -- the first boundary above the base, and (because retargets are then
+    -- recomputed along the attacker's own lineage) for tens of thousands of
+    -- headers after it.  Core cannot reach this state: pow.cpp:45
+    -- `assert(pindexFirst)`.
+    return nil, string.format("missing-ancestor:%d", first_height)
   end
 
   local actual_timespan = prev.header.timestamp - first.header.timestamp
@@ -1067,6 +1112,46 @@ M.networks.mainnet = {
         nonce      = 2918950304,
       },
       chain_work = "00000000000000000000000000000000000000011de68a167d5dad115a96be80",
+      -- PINNED PRE-BASE ANCESTOR (see M.validate_assumeutxo_anchors below).
+      --
+      -- A snapshot-bootstrapped node forward-syncs headers from the base, so it
+      -- holds NO header below 944183.  The first retarget boundary above the
+      -- base is 945504, and its period-first ancestor is 945504-2016 = 943488,
+      -- which is BELOW the base.  Without it get_next_work_required cannot
+      -- compute the required nBits at that single height.
+      --
+      -- Bitcoin Core never needs this: ActivateSnapshot (validation.cpp:5611-
+      -- 5624) REFUSES to activate a snapshot whose base is not already a real
+      -- CBlockIndex in a genesis-synced header chain ("The base block header
+      -- (%s) must appear in the headers chain..."), which is precisely why
+      -- pow.cpp:41-45 can assert(pindexFirst).  lunarblock dropped that
+      -- precondition, so the ancestor is pinned here instead.
+      --
+      -- TRUST CLASS: identical to the assumeutxo entry that houses it (which
+      -- already pins blockhash, the full 80-byte base header, and chain_work).
+      -- It is a compile-time constant, keyed to a hash-verified base, and is
+      -- NOT attacker-steerable: sync.lua only consults it after proving the
+      -- candidate's own parent-pointer ancestry reaches THIS base hash, and
+      -- get_next_work_required only ever asks for boundary-2016.
+      -- This is strictly weaker than Core (which DERIVES the value from a
+      -- validated chain).  Endstate = backfill genesis..base headers before
+      -- activating a snapshot and delete these constants; filed as follow-up.
+      --
+      -- `bits` is carried as well as `timestamp` because BIP94 networks
+      -- retarget off pindexFirst->nBits (pow.cpp:68-73), not pindexLast->nBits.
+      -- Mainnet (enforce_bip94=false) uses only the timestamp (pow.cpp:47).
+      --
+      -- VERIFIED 2026-08-09 against TWO independent genesis-synced mainnet
+      -- nodes (blockbrew RPC 8355 and haskoin RPC 8354); both agree, and the
+      -- values reproduce the REAL nBits of block 945504 (0x17021369) through
+      -- calculate_next_target -- asserted in spec/snapshot_base_diffbits_spec.
+      pre_base_ancestors = {
+        [943488] = {
+          blockhash = "00000000000000000000223415062538352e7e03e6720ef6a79bee4b7fa973b0",
+          timestamp = 1775208520,
+          bits      = 0x17020684,
+        },
+      },
     },
     [481823] = {
       hash_serialized = "25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4",
@@ -1084,6 +1169,18 @@ M.networks.mainnet = {
         nonce       = 940461593,
       },
       chain_work = "0000000000000000000000000000000000000000007eb5d786594edfb7192580",
+      -- PINNED PRE-BASE ANCESTOR — see the 944183 entry above for the full
+      -- rationale and trust model.  base 481823 -> anchor floor(481823/2016)
+      -- *2016 = 479808 (the period-first for the boundary 481824).
+      -- VERIFIED 2026-08-09 against blockbrew (8355) AND haskoin (8354); the
+      -- pair reproduces the real nBits of block 481824 (0x18013ce9).
+      pre_base_ancestors = {
+        [479808] = {
+          blockhash = "0000000000000000012e6060980c6475a9a8e62a1bf44b76c5d51f707d54522c",
+          timestamp = 1502282210,
+          bits      = 0x180130e0,
+        },
+      },
     }
   }
 }
@@ -1548,6 +1645,121 @@ end
 -- Run at module load. If a future patch breaks the invariant, the entire
 -- node refuses to boot rather than silently disagreeing with Core.
 M.validate_buried_deployment_consistency()
+
+--------------------------------------------------------------------------------
+-- AssumeUTXO pre-base anchor consistency
+--------------------------------------------------------------------------------
+
+--- Height of the pinned pre-base ancestor an INJECTABLE snapshot base needs.
+--
+-- A snapshot-bootstrapped node holds no header below the base, so the first
+-- retarget boundary above the base cannot resolve its period-first ancestor
+-- (boundary - 2016) from the chain.  There is at most ONE such height per
+-- base, and it is exactly floor(base/2016)*2016:
+--
+--   first boundary above base B  = ceil((B+1)/2016)*2016
+--   its period-first             = that - 2016 = floor(B/2016)*2016   (B%2016~=0)
+--
+-- When B is itself 2016-aligned the period-first of the next boundary IS the
+-- base, which the node has -- so no anchor is needed.  Networks with
+-- pow_no_retarget (regtest) never reach the retarget branch at all, so they
+-- never need an anchor either.  The predicate is keyed off the same conditions
+-- the math uses, so it cannot drift from it.
+--
+-- @param network table: network configuration
+-- @param base_height number: snapshot base height
+-- @return number|nil: required anchor height, or nil if none is required
+function M.required_pre_base_anchor_height(network, base_height)
+  if not network or not base_height then return nil end
+  if network.pow_no_retarget then return nil end
+  if base_height % M.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then return nil end
+  return math.floor(base_height / M.DIFFICULTY_ADJUSTMENT_INTERVAL)
+         * M.DIFFICULTY_ADJUSTMENT_INTERVAL
+end
+
+--- Look up the pinned pre-base ancestor for a base at an EXACT height.
+-- Exact-height hit only: no interpolation, no nearest-match.  An attacker
+-- cannot steer which height is asked for (see sync.lua
+-- HeaderChain:resolve_pre_base_ancestor).
+-- @param au_data table: an assumeutxo entry
+-- @param height number: the pre-base height being resolved
+-- @return table|nil: {blockhash, timestamp, bits}
+function M.pre_base_ancestor(au_data, height)
+  if not au_data or not au_data.pre_base_ancestors then return nil end
+  local a = au_data.pre_base_ancestors[height]
+  if type(a) ~= "table" then return nil end
+  if type(a.timestamp) ~= "number" or type(a.bits) ~= "number" then return nil end
+  return a
+end
+
+--- Validate that every INJECTABLE assumeutxo entry carries the pre-base anchor
+--- its base requires.
+--
+-- "Injectable" == the entry carries `.header`, i.e. main.lua can synthesise a
+-- base block-index from it and forward-sync (sync.lua inject_snapshot_base).
+-- An entry without `.header` is only a UTXO-hash whitelist row and never
+-- creates a header-chain hole.
+--
+-- Fails LOUD at module load so a future entry added without an anchor breaks
+-- the build/boot instead of silently re-opening the hole at its own boundary.
+-- (The runtime gate for entries that arrive later -- e.g. via
+-- HASHHOG_CAMPAIGN_ASSUMEUTXO -- lives in inject_snapshot_base, which sees the
+-- merged table.)
+--
+-- @param networks table|nil: networks table to check (defaults to M.networks)
+-- @return boolean: true (raises on inconsistency)
+function M.validate_assumeutxo_anchors(networks)
+  networks = networks or M.networks
+  for net_name, net in pairs(networks) do
+    if type(net) == "table" and type(net.assumeutxo) == "table" then
+      for base_height, entry in pairs(net.assumeutxo) do
+        if type(entry) == "table" and entry.header then
+          local need = M.required_pre_base_anchor_height(net, base_height)
+          if need then
+            local a = entry.pre_base_ancestors and entry.pre_base_ancestors[need]
+            if type(a) ~= "table" then
+              error(string.format(
+                "consensus.lua: %s assumeutxo base %d is injectable (has .header) "
+                .. "but has no pre_base_ancestors[%d]. The first retarget boundary "
+                .. "above the base cannot resolve its period-first ancestor, which "
+                .. "would silently disable the nBits check at that height. "
+                .. "Add the pinned anchor or drop the .header field.",
+                tostring(net_name), base_height, need))
+            end
+            if type(a.blockhash) ~= "string" or #a.blockhash ~= 64
+               or a.blockhash:match("^%x+$") == nil then
+              error(string.format(
+                "consensus.lua: %s assumeutxo base %d pre_base_ancestors[%d].blockhash "
+                .. "is not a 64-char hex string", tostring(net_name), base_height, need))
+            end
+            if type(a.timestamp) ~= "number" or a.timestamp <= 0
+               or a.timestamp ~= math.floor(a.timestamp) then
+              error(string.format(
+                "consensus.lua: %s assumeutxo base %d pre_base_ancestors[%d].timestamp "
+                .. "is not a positive integer", tostring(net_name), base_height, need))
+            end
+            -- `bits` is REQUIRED even on non-BIP94 networks: a BIP94 network
+            -- retargets off pindexFirst->nBits (pow.cpp:70-73), and an anchor
+            -- carrying only a timestamp would silently retarget off the wrong
+            -- base there -- a chain split in the "too hard" direction.
+            if type(a.bits) ~= "number" or a.bits <= 0
+               or a.bits ~= math.floor(a.bits) then
+              error(string.format(
+                "consensus.lua: %s assumeutxo base %d pre_base_ancestors[%d].bits "
+                .. "is missing or not a positive integer (BIP94 networks retarget "
+                .. "off the period-first block's nBits, pow.cpp:70-73)",
+                tostring(net_name), base_height, need))
+            end
+          end
+        end
+      end
+    end
+  end
+  return true
+end
+
+-- Run at module load, same policy as the buried-deployment validator above.
+M.validate_assumeutxo_anchors()
 
 --------------------------------------------------------------------------------
 -- 256-bit Chainwork Arithmetic (for anti-DoS header sync)
@@ -2142,6 +2354,52 @@ function M.load_campaign_assumeutxo(network)
         timestamp   = hdr.timestamp,
         bits        = hdr.bits,
         nonce       = hdr.nonce,
+      }
+    end
+
+    -- Optional pinned pre-base ancestor, same shape and same trust model as
+    -- the built-in tables (see M.validate_assumeutxo_anchors).  An entry that
+    -- supplies base_header WITHOUT this is still loaded into the allowlist,
+    -- but is NOT injectable: inject_snapshot_base refuses it rather than
+    -- forward-syncing into a chain whose first retarget boundary has no
+    -- resolvable period-first ancestor.  The gate lives there (it sees the
+    -- MERGED table) precisely so a campaign fixture cannot re-open the hole.
+    if e.pre_base_ancestor ~= nil then
+      local a = e.pre_base_ancestor
+      if type(a) ~= "table" then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) pre_base_ancestor is "
+          .. "not an object", i, height)
+      end
+      if type(a.height) ~= "number" or a.height < 0 or a.height ~= math.floor(a.height)
+         or a.height >= height then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) pre_base_ancestor.height "
+          .. "must be a non-negative integer below the base height", i, height)
+      end
+      if not is_hex(a.blockhash, 64) then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) pre_base_ancestor.blockhash "
+          .. "is invalid", i, height)
+      end
+      if type(a.timestamp) ~= "number" or a.timestamp <= 0
+         or a.timestamp ~= math.floor(a.timestamp) then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) pre_base_ancestor.timestamp "
+          .. "is invalid", i, height)
+      end
+      if type(a.bits) ~= "number" or a.bits <= 0 or a.bits ~= math.floor(a.bits) then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) pre_base_ancestor.bits "
+          .. "is invalid (required even on non-BIP94 networks; pow.cpp:70-73)",
+          i, height)
+      end
+      entry.pre_base_ancestors = {
+        [a.height] = {
+          blockhash = a.blockhash,
+          timestamp = a.timestamp,
+          bits      = a.bits,
+        },
       }
     end
 

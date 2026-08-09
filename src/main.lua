@@ -1099,6 +1099,20 @@ local function main()
   io.stdout:write("Initializing header chain...\n"); io.stdout:flush()
   local header_chain = sync_mod.new_header_chain(network, db)
   header_chain:init()
+
+  -- Snapshot-boundary boot audit (sync.lua HeaderChain:audit_snapshot_boundary).
+  -- accept_header only ever gates NEW headers, so a datadir that admitted a
+  -- fabricated header at the first retarget boundary above the snapshot base
+  -- through the pre-2026-08-09 skip_diffbits hole keeps it forever.  The audit
+  -- recomputes the required nBits for that one height with the pinned pre-base
+  -- anchor in place; a mismatch means the stored chain (and the persisted
+  -- height index built from it) is not trustworthy.  Refuse to start.
+  if header_chain.snapshot_audit_error then
+    io.stderr:write("[ALERT] " .. tostring(header_chain.snapshot_audit_error) .. "\n")
+    io.stderr:flush()
+    os.exit(1)
+  end
+
   io.stdout:write("Header chain initialized.\n"); io.stdout:flush()
   print(string.format("Chain tip: height=%d hash=%s",
     header_chain.header_tip_height,
@@ -1148,8 +1162,22 @@ local function main()
       else
         -- Exact 256-bit parse (B1 fix): inject_snapshot_base now takes a 32-byte string.
         local base_work = consensus_mod.work_from_hex(au_data.chain_work)
-        local injected, why = header_chain:inject_snapshot_base(
+        local injected, why, code = header_chain:inject_snapshot_base(
           au_height, chain_state.tip_hash, base_header, base_work)
+        if not injected and code == "missing-pre-base-anchor" then
+          -- Core-equivalent refusal.  ActivateSnapshot (validation.cpp:5611-
+          -- 5624) will not activate a snapshot whose base is not already in a
+          -- genesis-synced header chain; that precondition is what guarantees
+          -- the retarget ancestors exist (pow.cpp:41-45 assert).  lunarblock
+          -- substitutes a pinned pre-base anchor; without it the node would
+          -- boot happily and only discover it cannot validate the nBits of the
+          -- first retarget boundary 1300+ blocks later, after committing to
+          -- the datadir.  Fail at BOOT, loudly.
+          io.stderr:write(string.format(
+            "[ALERT] [assumeutxo] REFUSING to inject snapshot base: %s\n", tostring(why)))
+          io.stderr:flush()
+          os.exit(1)
+        end
         if injected then
           io.stdout:write(string.format(
             "[assumeutxo] injected snapshot base block-index: height=%d hash=%s "

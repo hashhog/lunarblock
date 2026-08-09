@@ -731,6 +731,161 @@ describe("consensus", function()
     end)
   end)
 
+  -- ---------------------------------------------------------------------------
+  -- get_next_work_required — FAIL-CLOSED contract (2026-08-09)
+  --
+  -- Bitcoin Core cannot express "I don't know": pow.cpp:41-45 asserts
+  --   assert(nHeightFirst >= 0);  ... assert(pindexFirst);
+  -- because it always holds the full genesis->tip header chain (ActivateSnapshot
+  -- refuses to activate a UTXO snapshot otherwise, validation.cpp:5611-5624).
+  -- lunarblock's snapshot bootstrap CAN be missing an ancestor, so
+  -- get_next_work_required returns (nil, reason) instead of guessing.
+  --
+  -- These tests use MAINNET parameters with the REAL chain data around block
+  -- 945504 -- the height the deleted skip_diffbits relaxation left unchecked.
+  -- Values read 2026-08-09 from two independent genesis-synced mainnet nodes.
+  -- ---------------------------------------------------------------------------
+  describe("get_next_work_required fail-closed (mainnet, real chain data)", function()
+    local M_FIRST_H, M_FIRST_TS = 943488, 1775208520   -- period-first for 945504
+    local M_PREV_H,  M_PREV_TS  = 945503, 1776448209   -- parent of 945504
+    local M_PERIOD_BITS = 0x17020684
+    local M_REAL_BITS   = 0x17021369                   -- real nBits of 945504
+
+    local function oracle(tbl)
+      return function(h) return tbl[h] end
+    end
+
+    it("T1: reproduces the REAL nBits of mainnet 945504 from two inputs", function()
+      -- 132740 * 1239689 / 1209600 = 136041 = 0x021369 -> 0x17021369.
+      -- Proves the retarget needs nothing but the parent and the period-first
+      -- block's TIME, i.e. that the relaxation was never necessary.
+      local bits, why = consensus.get_next_work_required(945504, M_PREV_TS + 600,
+        consensus.networks.mainnet,
+        oracle({
+          [M_PREV_H]  = { header = { bits = M_PERIOD_BITS, timestamp = M_PREV_TS } },
+          [M_FIRST_H] = { header = { bits = M_PERIOD_BITS, timestamp = M_FIRST_TS } },
+        }))
+      assert.is_nil(why)
+      assert.equals(M_REAL_BITS, bits)
+    end)
+
+    it("T2a: a missing period-first ancestor is UNRESOLVABLE, not prev.bits", function()
+      local bits, why = consensus.get_next_work_required(945504, M_PREV_TS + 600,
+        consensus.networks.mainnet,
+        oracle({ [M_PREV_H] = { header = { bits = M_PERIOD_BITS, timestamp = M_PREV_TS } } }))
+      -- PRE-FIX this returned 0x17020684 -- the OLD period's bits -- which an
+      -- attacker satisfies for free at the one boundary above a snapshot base.
+      assert.is_nil(bits)
+      assert.equals("missing-ancestor:943488", why)
+    end)
+
+    it("T2b: a missing parent is UNRESOLVABLE, not difficulty 1", function()
+      local bits, why = consensus.get_next_work_required(945504, M_PREV_TS + 600,
+        consensus.networks.mainnet, oracle({}))
+      -- PRE-FIX this returned network.pow_limit_bits, i.e. it announced
+      -- DIFFICULTY 1 as the REQUIRED value: a latent accept-anything.
+      assert.is_nil(bits)
+      assert.is_not.equals(consensus.networks.mainnet.pow_limit_bits, bits)
+      assert.equals("missing-ancestor:945503", why)
+    end)
+
+    it("T2c: a min-difficulty walk-back that hits a gap is UNRESOLVABLE", function()
+      local testnet = consensus.networks.testnet
+      local limit = testnet.pow_limit_bits
+      -- 2019 and 2018 are min-diff; 2017 is MISSING (below a snapshot base).
+      local bits, why = consensus.get_next_work_required(2020, 1003600 + 600, testnet,
+        oracle({
+          [2019] = { header = { bits = limit, timestamp = 1003600 } },
+          [2018] = { header = { bits = limit, timestamp = 1002400 } },
+        }))
+      assert.is_nil(bits)
+      assert.equals("missing-ancestor:2017", why)
+    end)
+
+    it("T2d: the genesis terminator is NOT a fail-open", function()
+      -- Core's loop stops at pindex->pprev == nullptr (pow.cpp:33).  Reaching
+      -- height 0 with the whole chain present is a legitimate answer.
+      local testnet = consensus.networks.testnet
+      local limit = testnet.pow_limit_bits
+      local tbl = {}
+      for h = 0, 9 do tbl[h] = { header = { bits = limit, timestamp = 1000 + h * 60 } } end
+      local bits, why = consensus.get_next_work_required(10, 1000 + 10 * 60, testnet,
+        oracle(tbl))
+      assert.is_nil(why)
+      assert.equals(limit, bits)
+    end)
+  end)
+
+  -- ---------------------------------------------------------------------------
+  -- T8 — assumeutxo pre-base anchor consistency (module-load validator)
+  -- ---------------------------------------------------------------------------
+  describe("validate_assumeutxo_anchors", function()
+    local function clone_mainnet_entry(mutate)
+      local src = consensus.networks.mainnet.assumeutxo[944183]
+      local entry = {
+        hash_serialized = src.hash_serialized,
+        m_chain_tx_count = src.m_chain_tx_count,
+        blockhash = src.blockhash,
+        header = src.header,
+        chain_work = src.chain_work,
+        pre_base_ancestors = {
+          [943488] = { blockhash = string.rep("ab", 32),
+                       timestamp = 1775208520, bits = 0x17020684 },
+        },
+      }
+      if mutate then mutate(entry) end
+      return {
+        fake = {
+          name = "fake", pow_no_retarget = false,
+          assumeutxo = { [944183] = entry },
+        },
+      }
+    end
+
+    it("passes on the shipped tables", function()
+      assert.is_true(consensus.validate_assumeutxo_anchors())
+    end)
+
+    it("fails when an injectable entry has no anchor", function()
+      assert.has_error(function()
+        consensus.validate_assumeutxo_anchors(
+          clone_mainnet_entry(function(e) e.pre_base_ancestors = nil end))
+      end)
+    end)
+
+    it("fails when the anchor sits at the wrong height", function()
+      assert.has_error(function()
+        consensus.validate_assumeutxo_anchors(
+          clone_mainnet_entry(function(e)
+            e.pre_base_ancestors = { [941472] = { blockhash = string.rep("ab", 32),
+                                                  timestamp = 1, bits = 1 } }
+          end))
+      end)
+    end)
+
+    it("fails when the anchor carries no bits (BIP94 needs them, pow.cpp:70-73)", function()
+      assert.has_error(function()
+        consensus.validate_assumeutxo_anchors(
+          clone_mainnet_entry(function(e) e.pre_base_ancestors[943488].bits = nil end))
+      end)
+    end)
+
+    it("ignores non-injectable entries (no .header = no header-chain hole)", function()
+      assert.is_true(consensus.validate_assumeutxo_anchors({
+        fake = { name = "fake", pow_no_retarget = false,
+                 assumeutxo = { [944183] = { blockhash = string.rep("ab", 32) } } },
+      }))
+    end)
+
+    it("ignores pow_no_retarget networks (regtest boot-smoke fixture)", function()
+      assert.is_true(consensus.validate_assumeutxo_anchors({
+        rt = { name = "rt", pow_no_retarget = true,
+               assumeutxo = { [299] = { blockhash = string.rep("ab", 32),
+                                        header = {} } } },
+      }))
+    end)
+  end)
+
   describe("sighash types", function()
     it("has correct SIGHASH_ALL", function()
       assert.equals(0x01, consensus.SIGHASH.ALL)
