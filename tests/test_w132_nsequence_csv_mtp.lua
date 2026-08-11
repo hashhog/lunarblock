@@ -619,12 +619,16 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G21: OP_CSV 5-byte CScriptNum ---")
 
-test("G21-a: pop_num(5) used (NOT pop_num(4))", function()
+test("G21-a: 5-byte CScriptNum read (NOT 4-byte)", function()
   local f = io.open("src/script.lua", "r")
   local src = f:read("*a"); f:close()
   local idx = src:find("opcode == M%.OP%.OP_CHECKSEQUENCEVERIFY", 1, false)
   local block = src:sub(idx, idx + 700)
-  expect_truthy(block:find("pop_num%(5%)", 1, false),
+  -- Post-8b06678 shape: script_num_decode(peek(), 5, ...) — still a 5-byte
+  -- CScriptNum read (allows full uint32 nSequence), now via peek so the
+  -- stacktop byte form is preserved (interpreter.cpp:574 stacktop(-1)).
+  expect_truthy(block:find("script_num_decode%(peek%(%)", 1, false) and
+                block:find(", 5,", 1, false),
     "CSV reads top as 5-byte CScriptNum (allows full uint32 nSequence)")
 end)
 
@@ -675,16 +679,20 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G24: OP_CSV stack preservation + BUG-5 source check ---")
 
-test("G24-a: BUG-5 — OP_CSV pops then re-pushes via script_num_encode (NOT byte-preserving)", function()
+test("G24-a: BUG-5 FIXED — OP_CSV preserves stacktop byte form (no pop + re-push)", function()
   local f = io.open("src/script.lua", "r")
   local src = f:read("*a"); f:close()
   local idx = src:find("opcode == M%.OP%.OP_CHECKSEQUENCEVERIFY", 1, false)
   local block = src:sub(idx, idx + 1500)
-  -- BUG-5 trigger: push(M.script_num_encode(sequence)) re-encodes the value
-  expect_truthy(block:find("push%(M%.script_num_encode%(sequence%)%)", 1, false) or
-                block:find("push%(M%.script_num_encode%(sequence%)%) ", 1, false),
-    "OP_CSV pops + re-pushes via script_num_encode (non-byte-preserving)")
-  bug("BUG-5", "P2")
+  -- BUG-5 was: push(M.script_num_encode(sequence)) re-encoded the value,
+  -- mutating non-minimal byte forms ("\x05\x00" → "\x05").  Fixed by
+  -- 8b06678: the implementation now reads via peek() (Core stacktop(-1),
+  -- interpreter.cpp:574) and never re-pushes.  Assert the buggy pattern
+  -- is ABSENT (regression guard — this used to confirm the bug present).
+  expect_falsy(block:find("push%(M%.script_num_encode%(sequence%)%)", 1, false),
+    "OP_CSV must not pop + re-push via script_num_encode")
+  expect_truthy(block:find("script_num_decode%(peek%(%)", 1, false),
+    "OP_CSV reads stacktop via peek (byte-preserving)")
 end)
 
 -- ---------------------------------------------------------------------------

@@ -149,22 +149,25 @@ describe("perf", function()
     it("put_u64_le encodes correctly", function()
       local buf = perf.new_serialize_buffer()
 
-      -- Test value 0x123456789ABCDEF0
-      -- This is within double precision range (< 2^53)
-      local val = 0x123456789ABCDEF0ULL
-      perf.put_u64_le(buf, tonumber(val))
+      -- Test value 0x123456789ABCD0 — every byte distinct, top byte 0x00.
+      -- Must stay < 2^53: put_u64_le's contract is a Lua number (double),
+      -- exact only for integers below 2^53.  The previous value
+      -- 0x123456789ABCDEF0 (~1.3e18 > 2^53) rounded to ...DF00 as a double,
+      -- losing the low byte before encoding even began.
+      local val = 0x123456789ABCD0
+      perf.put_u64_le(buf, val)
       local result = buf:get()
 
       assert.equals(8, #result)
       -- Low bytes first (little endian)
-      assert.equals(0xF0, result:byte(1))
-      assert.equals(0xDE, result:byte(2))
-      assert.equals(0xBC, result:byte(3))
-      assert.equals(0x9A, result:byte(4))
-      assert.equals(0x78, result:byte(5))
-      assert.equals(0x56, result:byte(6))
-      assert.equals(0x34, result:byte(7))
-      assert.equals(0x12, result:byte(8))
+      assert.equals(0xD0, result:byte(1))
+      assert.equals(0xBC, result:byte(2))
+      assert.equals(0x9A, result:byte(3))
+      assert.equals(0x78, result:byte(4))
+      assert.equals(0x56, result:byte(5))
+      assert.equals(0x34, result:byte(6))
+      assert.equals(0x12, result:byte(7))
+      assert.equals(0x00, result:byte(8))
     end)
 
     it("put_u64_le handles small values", function()

@@ -181,6 +181,10 @@ local function parse_format(path)
     if format then
       return path_without_suffix, format
     end
+    -- Dot-suffix present but unrecognized: return false so the router can
+    -- reject with 400 (Core rest.cpp ParseDataFormat: unknown suffix is
+    -- HTTP_BAD_REQUEST "output format not found", NOT a 404).
+    return path_without_suffix, false
   end
 
   -- No recognized format suffix
@@ -408,7 +412,8 @@ end
 --- GET /rest/block/<hash>.[json|bin|hex]
 -- Returns block data
 function RESTServer:handle_block(hash_hex, format, notxdetails)
-  if #hash_hex ~= 64 then
+  -- Core ParseHashStr: 64 hex chars, both checks (rest.cpp util).
+  if #hash_hex ~= 64 or hash_hex:find("[^0-9a-fA-F]") then
     return error_response(400, "Invalid hash: " .. hash_hex)
   end
 
@@ -592,7 +597,8 @@ end
 --- GET /rest/tx/<txid>.[json|bin|hex]
 -- Returns transaction data
 function RESTServer:handle_tx(txid_hex, format)
-  if #txid_hex ~= 64 then
+  -- Core ParseHashStr: 64 hex chars, both checks (rest.cpp util).
+  if #txid_hex ~= 64 or txid_hex:find("[^0-9a-fA-F]") then
     return error_response(400, "Invalid hash: " .. txid_hex)
   end
 
@@ -730,7 +736,7 @@ function RESTServer:handle_headers(count_str, hash_hex, format)
       M.MAX_HEADERS_COUNT, count_str))
   end
 
-  if #hash_hex ~= 64 then
+  if #hash_hex ~= 64 or hash_hex:find("[^0-9a-fA-F]") then
     return error_response(400, "Invalid hash: " .. hash_hex)
   end
 
@@ -1728,23 +1734,30 @@ function RESTServer:route(method, path, body)
   end
 
   local clean_path, format = parse_format(path)
+  if format == false then
+    -- Unrecognized dot-suffix (Core rest.cpp ParseDataFormat → 400, not 404).
+    return error_response(400, "output format not found (available: .bin, .hex, .json)")
+  end
   local query_params = parse_query(path)
 
-  -- /rest/block/<hash>
-  local hash_hex = clean_path:match("^/rest/block/notxdetails/([0-9a-fA-F]+)$")
+  -- /rest/block/<hash>.  The segment is captured as-is (any non-slash
+  -- chars) and validated by handle_block — Core takes the path segment
+  -- verbatim and 400s on unparseable hashes (rest.cpp:420-428
+  -- ParseHashStr); a hex-only route regex would 404 instead.
+  local hash_hex = clean_path:match("^/rest/block/notxdetails/([^/]+)$")
   if hash_hex then
     format = format or M.FORMAT.JSON
     return self:handle_block(hash_hex, format, true)
   end
 
-  hash_hex = clean_path:match("^/rest/block/([0-9a-fA-F]+)$")
+  hash_hex = clean_path:match("^/rest/block/([^/]+)$")
   if hash_hex then
     format = format or M.FORMAT.JSON
     return self:handle_block(hash_hex, format, false)
   end
 
   -- /rest/tx/<txid>
-  local txid_hex = clean_path:match("^/rest/tx/([0-9a-fA-F]+)$")
+  local txid_hex = clean_path:match("^/rest/tx/([^/]+)$")
   if txid_hex then
     format = format or M.FORMAT.JSON
     return self:handle_tx(txid_hex, format)
@@ -1752,7 +1765,7 @@ function RESTServer:route(method, path, body)
 
   -- /rest/headers/<count>/<hash>  (path form, deprecated upstream but still
   -- accepted for back-compat — Core rest.cpp:474-484 keeps both.)
-  local count_str, header_hash = clean_path:match("^/rest/headers/(%d+)/([0-9a-fA-F]+)$")
+  local count_str, header_hash = clean_path:match("^/rest/headers/([^/]+)/([^/]+)$")
   if count_str and header_hash then
     format = format or M.FORMAT.JSON
     return self:handle_headers(count_str, header_hash, format)
@@ -1768,7 +1781,7 @@ function RESTServer:route(method, path, body)
   end
 
   -- /rest/blockhashbyheight/<height>
-  local height_str = clean_path:match("^/rest/blockhashbyheight/(%d+)$")
+  local height_str = clean_path:match("^/rest/blockhashbyheight/([^/]+)$")
   if height_str then
     format = format or M.FORMAT.JSON
     return self:handle_blockhashbyheight(height_str, format)

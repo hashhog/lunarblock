@@ -18,8 +18,15 @@ describe("mempool_persist (Bitcoin Core compatible)", function()
     return types.txin(types.outpoint(txid_hash, vout), "",
       sequence or 0xFFFFFFFE)
   end
+  -- Helper to create output.
+  -- Default script is a valid P2PKH (OP_DUP OP_HASH160 <20-byte hash>
+  -- OP_EQUALVERIFY OP_CHECKSIG) so that IsStandardTx() accepts it — see
+  -- mempool_spec.lua W96 note: the all-zeros 25-byte script is classified
+  -- "nonstandard" and rejected at the relay gate with reason "scriptpubkey"
+  -- (Core src/validation.cpp:808 -> policy.cpp:100 IsStandardTx).
   local function make_output(value, script_pubkey)
-    return types.txout(value, script_pubkey or string.rep("\x00", 25))
+    return types.txout(value, script_pubkey or
+      "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac")
   end
   local function make_mock_chain_state(utxos)
     utxos = utxos or {}
@@ -32,11 +39,14 @@ describe("mempool_persist (Bitcoin Core compatible)", function()
     }
     return { coin_view = mock_coin_view, tip_height = 700000 }
   end
+  -- Same W96 standardness rationale as make_output: the mock prev UTXO's
+  -- scriptPubKey is checked by the input-standardness gate (Core
+  -- policy.cpp AreInputsStandard), so default to a valid P2PKH script.
   local function add_utxo(chain_state, txid_hex, vout, value)
     local key = txid_hex .. ":" .. vout
     chain_state.coin_view.utxos[key] = {
       value = value,
-      script_pubkey = string.rep("\x00", 25),
+      script_pubkey = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac",
       height = 500000,
       is_coinbase = false,
     }

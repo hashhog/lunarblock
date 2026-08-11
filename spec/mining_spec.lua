@@ -168,8 +168,12 @@ describe("mining", function()
     it("encodes height 0 correctly", function()
       local coinbase = mining.create_coinbase_tx(0, 5000000000, nil, nil, make_payout_script())
       local script_sig = coinbase.inputs[1].script_sig
-      assert.equal(1, script_sig:byte(1))
-      assert.equal(0, script_sig:byte(2))
+      -- Core CScript() << 0 → push_int64(0) → OP_0 (0x00) — NOT a
+      -- length-prefixed push (script.h:467).  The trailing 0x00 is the
+      -- dummy extraNonce (miner.cpp:187-193) keeping scriptSig >= 2 bytes
+      -- ("bad-cb-length", consensus/tx_check.cpp:50).
+      assert.equal(0x00, script_sig:byte(1))
+      assert.equal(0x00, script_sig:byte(2))
     end)
 
     it("encodes large heights correctly", function()
@@ -385,7 +389,9 @@ describe("mining", function()
 
       assert.is_true(success)
       assert.truthy(hash)
-      assert.equal("hash256", hash._type)
+      -- hash256 is a single-field table ({bytes=...}); the _type tag was
+      -- deliberately dropped as a LuaJIT GC optimization (types.lua:13-17).
+      assert.equal(32, #hash.bytes)
 
       -- Verify the nonce was set
       assert.truthy(block.header.nonce >= 0)

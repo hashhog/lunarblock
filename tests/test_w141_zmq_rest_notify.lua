@@ -468,7 +468,9 @@ test("G19-a: handle_tx defined", function()
                 "handle_tx missing")
 end)
 test("G19-b: /rest/tx/ route in router", function()
-  expect_truthy(file_contains("src/rest.lua", '"^/rest/tx/([0-9a-fA-F]+)$"'),
+  -- Route pattern is [^/]+ since 1.0.0: the segment is captured verbatim
+  -- and handle_tx 400s on unparseable hashes (Core rest.cpp ParseHashStr).
+  expect_truthy(file_contains("src/rest.lua", '"^/rest/tx/([^/]+)$"'),
                 "/rest/tx/ route absent")
 end)
 
@@ -479,8 +481,9 @@ test("G20-a: handle_block defined", function()
                 "handle_block missing")
 end)
 test("G20-b: /rest/block/notxdetails route", function()
+  -- Same [^/]+ capture pattern (see G19-b note).
   expect_truthy(file_contains("src/rest.lua",
-                              '"^/rest/block/notxdetails/([0-9a-fA-F]+)$"'),
+                              '"^/rest/block/notxdetails/([^/]+)$"'),
                 "/rest/block/notxdetails route absent")
 end)
 
@@ -522,8 +525,10 @@ test("G23-a: handle_headers defined", function()
                 "handle_headers missing")
 end)
 test("G23-b: path-form /rest/headers/<count>/<hash>", function()
+  -- Same [^/]+ capture pattern; handle_headers validates count/hash
+  -- (see G19-b note).
   expect_truthy(file_contains("src/rest.lua",
-                              '"^/rest/headers/(%d+)/([0-9a-fA-F]+)$"'),
+                              '"^/rest/headers/([^/]+)/([^/]+)$"'),
                 "path-form headers route missing")
 end)
 test("G23-c: query-form /rest/headers/<hash>?count=", function()

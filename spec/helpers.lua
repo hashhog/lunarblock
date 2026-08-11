@@ -80,7 +80,7 @@ end
 -- @param opts table: optional configuration
 --   - ip: peer IP (default "127.0.0.1")
 --   - port: peer port (default 18444)
---   - user_agent: peer user agent (default "/LunarBlock:0.1.0/")
+--   - user_agent: peer user agent (default "/LunarBlock:1.0.0/")
 --   - start_height: peer's reported chain height (default 0)
 --   - services: peer services bitmask (default 1)
 -- @return table: mock peer object with send method
@@ -89,7 +89,7 @@ function M.mock_peer(opts)
   local peer = {
     ip = opts.ip or "127.0.0.1",
     port = opts.port or 18444,
-    user_agent = opts.user_agent or "/LunarBlock:0.1.0/",
+    user_agent = opts.user_agent or "/LunarBlock:1.0.0/",
     start_height = opts.start_height or 0,
     services = opts.services or 1,
     sent = {},
@@ -137,6 +137,7 @@ function M.mock_storage()
     headers = {},
     height_index = {},
     blocks = {},
+    chaintx = {},
   }
 
   local storage = {
@@ -245,6 +246,16 @@ function M.mock_storage()
       pending = {}
     end
     return batch
+  end
+
+  -- Cumulative chain tx count (m_chain_tx_count analogue, Core chain.h).
+  -- Required by utxo connect_genesis / connect_block (utxo.lua:2205, :3506).
+  function storage.get_chaintx_at_height(height)
+    return data.chaintx[height]
+  end
+
+  function storage.put_chaintx_at_height(height, count, sync)
+    data.chaintx[height] = count
   end
 
   return storage

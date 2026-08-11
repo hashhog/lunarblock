@@ -39,6 +39,7 @@ end
 local vector_paths = {
   "../ouroboros/bitcoin/src/test/data/sighash.json",
   "/home/max/hashhog/ouroboros/bitcoin/src/test/data/sighash.json",
+  "/home/max/hashhog/bitcoin-core/src/test/data/sighash.json",
 }
 
 local f, json_text

@@ -352,12 +352,20 @@ describe("header sync", function()
       -- patching each block's prev_hash to point to the one below it.
       local cur_prevhash = prev_hash  -- the prev-hash of start_height block
       local entries = {}
+      -- total_work must be an exact 256-bit 32-byte string, not a Lua number:
+      -- accept_header accumulates via consensus.work_add (29ed4b8, Core
+      -- arith_uint256 parity). Seed from the parent entry and accumulate
+      -- per-block work like the real accept path does.
+      local parent_hex = types.hash256_hex(prev_hash)
+      local parent_entry = ch.headers[parent_hex]
+      local cumulative = (parent_entry and parent_entry.total_work) or consensus.work_zero()
       for h = start_height, end_height do
         -- Unique bytes: combine height into a recognizable pattern
         local b = string.rep(string.char((h * 7 + 13) % 251 + 1), 32)
         local hash = types.hash256(b)
         local hex = types.hash256_hex(hash)
         entries[h] = { hash = hash, hex = hex }
+        cumulative = consensus.work_add(cumulative, consensus.get_block_work(base_bits))
         ch.headers[hex] = {
           header = {
             version = 4,
@@ -366,7 +374,7 @@ describe("header sync", function()
             timestamp = base_ts + h * 600,
             bits = base_bits, nonce = 0,
           },
-          height = h, total_work = h,
+          height = h, total_work = cumulative,
         }
         ch.height_to_hash[h] = hex
         cur_prevhash = hash
@@ -804,9 +812,12 @@ describe("header sync", function()
     end)
 
     it("calculates positive work for valid bits", function()
+      -- work_for_bits returns an exact 256-bit value as a 32-byte big-endian
+      -- string (29ed4b8, Core arith_uint256/GetBlockProof parity) — compare
+      -- with consensus.work_compare, not Lua number operators.
       local work = chain:work_for_bits(0x1d00ffff)  -- mainnet genesis difficulty
-      assert.is_true(work > 0)
-      assert.is_true(work < math.huge)
+      assert.equals(32, #work)
+      assert.equals(1, consensus.work_compare(work, consensus.work_zero()))
     end)
 
     it("returns higher work for lower target (higher difficulty)", function()

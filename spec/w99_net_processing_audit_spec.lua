@@ -30,9 +30,16 @@
 local helpers = require("spec.helpers")
 
 describe("W99 net_processing dispatch + Misbehaving audit", function()
-  local peer_mod, p2p, consensus, mempool_mod, sync
+  local peer_mod, p2p, consensus, mempool_mod, sync, types
 
   setup(function()
+    -- Mock socket module if not available (for test environments without LuaSocket)
+    if not pcall(require, "socket") then
+      package.preload["socket"] = function()
+        return { gettime = function() return os.time() end }
+      end
+    end
+
     package.path = "src/?.lua;" .. package.path
     package.preload["lunarblock.types"]      = function() return require("types") end
     package.preload["lunarblock.serialize"]  = function() return require("serialize") end
@@ -50,6 +57,7 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
     consensus = require("consensus")
     mempool_mod = require("mempool")
     sync      = require("sync")
+    types     = require("types")
   end)
 
   ----------------------------------------------------------------
@@ -342,14 +350,19 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
         hash = consensus.networks.regtest.genesis and consensus.networks.regtest.genesis.prev_hash or
                require("types").hash256_zero(),
         height = 0,
-        work = require("consensus").work_from_hex(string.rep("00", 64)),
+        -- uint256 work is 32 bytes = 64 hex chars (consensus.work_from_hex
+        -- rejects anything else).  Zero work == chain-start minimum.
+        work = require("consensus").work_from_hex(string.rep("0", 64)),
         bits = consensus.networks.regtest.genesis and
                consensus.networks.regtest.genesis.bits or 0x207fffff,
       }
       local ss = sync.new_headers_sync_state("peer1", net, chain_start)
-      -- PRESYNC state tracks cumulative work for min_pow check
+      -- PRESYNC state tracks cumulative work for the min_pow check; the
+      -- threshold lives in min_required_work (parsed from
+      -- network.min_chain_work, sync.lua:153-155) and is consulted at the
+      -- PRESYNC→REDOWNLOAD transition (sync.lua:375).
       assert.is_not_nil(ss.state)
-      assert.is_not_nil(ss.min_chain_work)
+      assert.is_not_nil(ss.min_required_work)
     end)
   end)
 
@@ -547,13 +560,21 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
   describe("G13 recursive orphan resolve (main.lua:1198-1216)", function()
     it("children_of returns children for a known parent", function()
       local pool = mempool_mod.new_orphan_pool()
-      -- Add a synthetic orphan with a known missing parent
-      local orphan_tx = {inputs = {{prev_hash = string.rep("\x01", 32), prev_index = 0,
-                                    script = "", sequence = 0xffffffff}},
-                         outputs = {}, version = 1, locktime = 0}
+      -- Add a synthetic orphan with a known missing parent.  Must use the
+      -- typed transaction shape (types.txin/txout with prev_out/script_sig)
+      -- because OrphanPool:add round-trips the tx through
+      -- serialize.serialize_transaction (mempool.lua) to size it — the old
+      -- raw-table shape fails serialization and the add is rejected with
+      -- "bad-orphan-serialize" before any bookkeeping happens.
+      local parent = types.hash256(string.rep("\x01", 32))
+      local orphan_tx = types.transaction(1,
+        {types.txin(types.outpoint(parent, 0), "", 0xffffffff)},
+        {types.txout(50000, "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac")},
+        0)
       local parent_hex = string.rep("01", 32)
       local missing = {[parent_hex] = true}
-      pool:add(orphan_tx, "aa" .. string.rep("00", 31), "peer1", missing)
+      local ok = pool:add(orphan_tx, "aa" .. string.rep("00", 31), "peer1", missing)
+      assert.is_true(ok)
       local children = pool:children_of(parent_hex)
       assert.equals(1, #children)
     end)
@@ -890,7 +911,14 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
     it("our_services returns correct bitfield", function()
       local bit = require("bit")
       local s = p2p.our_services(false, false)
-      assert.equals(p2p.SERVICES.NODE_NETWORK + p2p.SERVICES.NODE_WITNESS, s)
+      -- Core full-node default (non-pruned, v2transport on):
+      --   g_local_services = NODE_NETWORK_LIMITED | NODE_WITNESS  (init.cpp:863)
+      --   + NODE_NETWORK     when not pruning                     (init.cpp:1950)
+      --   + NODE_P2P_V2      when -v2transport (DEFAULT on)       (init.cpp:988-990)
+      -- our_services(false, false) leaves use_v2 at its default (advertise),
+      -- so the bitfield is 1 | 8 | 1024 | 2048 = 3081.
+      assert.equals(p2p.SERVICES.NODE_NETWORK + p2p.SERVICES.NODE_WITNESS +
+                    p2p.SERVICES.NODE_NETWORK_LIMITED + p2p.SERVICES.NODE_P2P_V2, s)
     end)
   end)
 
@@ -1126,17 +1154,19 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
 
     it("per-peer cap rejects orphan when peer has 100 already", function()
       local pool = mempool_mod.new_orphan_pool({max_per_peer = 2})
-      -- Reduce to 2 for test speed
-      for i = 1, 2 do
-        local tx = {inputs = {{prev_hash = string.rep("\0", 32), prev_index = i,
-                                script = "", sequence = 0xffffffff}},
-                    outputs = {}, version = 1, locktime = 0}
-        pool:add(tx, string.format("%064d", i), "attacker", {})
+      -- Reduce to 2 for test speed.  Txs use the typed shape so the pool's
+      -- serialize-based sizing accepts them (see G13 note above).
+      local function make_orphan(i)
+        return types.transaction(1,
+          {types.txin(types.outpoint(types.hash256(string.rep("\0", 32)), i),
+                      "", 0xffffffff)},
+          {types.txout(50000, "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac")},
+          0)
       end
-      local tx3 = {inputs = {{prev_hash = string.rep("\0", 32), prev_index = 3,
-                               script = "", sequence = 0xffffffff}},
-                   outputs = {}, version = 1, locktime = 0}
-      local ok, reason = pool:add(tx3, string.rep("0", 63) .. "3", "attacker", {})
+      for i = 1, 2 do
+        assert.is_true(pool:add(make_orphan(i), string.format("%064d", i), "attacker", {}))
+      end
+      local ok, reason = pool:add(make_orphan(3), string.rep("0", 63) .. "3", "attacker", {})
       assert.is_false(ok)
       assert.is_truthy(reason:match("per%-peer") or reason:match("cap"))
     end)

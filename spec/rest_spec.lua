@@ -283,7 +283,9 @@ describe("rest", function()
       local txid_hex = types.hash256_hex(txid)
 
       local mock_mempool = {
-        get_entry = function(id)
+        -- get_entry is a colon-method on the real Mempool
+        -- (Mempool:get_entry(txid_hex)), so the mock receives self first.
+        get_entry = function(self, id)
           if id == txid_hex then
             return {tx = tx}
           end
@@ -314,7 +316,9 @@ describe("rest", function()
       local txid_hex = types.hash256_hex(txid)
 
       local mock_mempool = {
-        get_entry = function(id)
+        -- get_entry is a colon-method on the real Mempool
+        -- (Mempool:get_entry(txid_hex)), so the mock receives self first.
+        get_entry = function(self, id)
           if id == txid_hex then
             return {tx = tx}
           end

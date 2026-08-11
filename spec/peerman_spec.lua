@@ -19,6 +19,19 @@ end
 describe("peerman", function()
 
   local test_network
+  -- Temp data_dirs created by new_pm(); cleaned in teardown below.
+  local _pm_tmp_dirs = {}
+
+  --- PeerManager instances with an ISOLATED temp data_dir.  Without this, the
+  --- default data_dir="." makes new() load (and ban_peer/_save_addrman write)
+  --- banned.dat / peers.dat in the REPO ROOT, cross-polluting tests within and
+  --- across runs (a ban of 192.168.1.x from one test broke "default config",
+  --- "max peers reached" and selection tests in the next run).
+  local function new_pm()
+    local dir = make_temp_dir()
+    _pm_tmp_dirs[#_pm_tmp_dirs + 1] = dir
+    return peerman.new(test_network, nil, {data_dir = dir})
+  end
 
   before_each(function()
     -- Use regtest for testing (no DNS seeds)
@@ -31,10 +44,15 @@ describe("peerman", function()
     }
   end)
 
+  teardown(function()
+    for _, d in ipairs(_pm_tmp_dirs) do cleanup_temp_dir(d) end
+    _pm_tmp_dirs = {}
+  end)
+
   describe("PeerManager creation", function()
 
     it("creates with default config", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       assert.is_not_nil(pm)
       assert.equals(8, pm.max_outbound)
       assert.equals(117, pm.max_inbound)
@@ -58,7 +76,7 @@ describe("peerman", function()
     end)
 
     it("stores network configuration", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       assert.equals(test_network, pm.network)
     end)
 
@@ -67,14 +85,14 @@ describe("peerman", function()
   describe("known address management", function()
 
     it("adds new addresses", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local added = pm:add_known_address("192.168.1.1", 8333)
       assert.is_true(added)
       assert.equals(1, pm:get_known_address_count())
     end)
 
     it("rejects duplicate addresses", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:add_known_address("192.168.1.1", 8333)
       local added = pm:add_known_address("192.168.1.1", 8333)
       assert.is_false(added)
@@ -82,7 +100,7 @@ describe("peerman", function()
     end)
 
     it("tracks multiple addresses", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:add_known_address("192.168.1.1", 8333)
       pm:add_known_address("192.168.1.2", 8333)
       pm:add_known_address("192.168.1.3", 8334)
@@ -90,7 +108,7 @@ describe("peerman", function()
     end)
 
     it("stores address metadata", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local now = os.time()
       pm:add_known_address("10.0.0.1", 8333, p2p.SERVICES.NODE_WITNESS, now)
       local info = pm.known_addresses["10.0.0.1:8333"]
@@ -104,7 +122,7 @@ describe("peerman", function()
     end)
 
     it("selects candidates excluding connected peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:add_known_address("192.168.1.1", 8333)
       pm:add_known_address("192.168.1.2", 8333)
 
@@ -117,7 +135,7 @@ describe("peerman", function()
     end)
 
     it("selects candidates excluding banned peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:add_known_address("192.168.1.1", 8333)
       pm:add_known_address("192.168.1.2", 8333)
 
@@ -130,7 +148,7 @@ describe("peerman", function()
     end)
 
     it("selects candidates excluding recently tried peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:add_known_address("192.168.1.1", 8333)
       pm:add_known_address("192.168.1.2", 8333)
 
@@ -143,7 +161,7 @@ describe("peerman", function()
     end)
 
     it("returns nil when no candidates available", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local candidate = pm:select_peer_to_connect()
       assert.is_nil(candidate)
     end)
@@ -153,13 +171,13 @@ describe("peerman", function()
   describe("ban management", function()
 
     it("bans a peer IP", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:ban_peer("192.168.1.1")
       assert.is_true(pm:is_banned("192.168.1.1"))
     end)
 
     it("uses default 24 hour ban duration", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local before = os.time()
       pm:ban_peer("192.168.1.1")
       local expected_min = before + 86400
@@ -167,7 +185,7 @@ describe("peerman", function()
     end)
 
     it("accepts custom ban duration", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local before = os.time()
       pm:ban_peer("192.168.1.1", 3600)  -- 1 hour
       assert.is_true(pm.banned["192.168.1.1"] >= before + 3600)
@@ -175,7 +193,7 @@ describe("peerman", function()
     end)
 
     it("rejects connection from banned peer", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:ban_peer("192.168.1.1")
       local ok, err = pm:connect_peer("192.168.1.1", 8333)
       assert.is_false(ok)
@@ -183,14 +201,18 @@ describe("peerman", function()
     end)
 
     it("allows connection after ban expires", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       -- Set ban in the past
       pm.banned["192.168.1.1"] = os.time() - 1
       assert.is_false(pm:is_banned("192.168.1.1"))
     end)
 
-    it("adds ban score and bans at threshold", function()
-      local pm = peerman.new(test_network, nil, nil)
+    it("add_ban_score discourages on first call (single-event, PR#25974)", function()
+      -- Core post-PR#25974 (net_processing.cpp Misbehaving +
+      -- MaybeDiscourageAndDisconnect): no score accumulation — the first
+      -- misbehaving event discourages (bans) and disconnects a regular peer.
+      -- add_ban_score is the legacy alias of misbehaving (2c394e0, W99 G1).
+      local pm = new_pm()
       -- Create a mock peer
       local mock_peer = {
         ip = "192.168.1.1",
@@ -206,18 +228,13 @@ describe("peerman", function()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
 
-      -- Add score below threshold
       pm:add_ban_score(mock_peer, 50, "test")
-      assert.is_false(pm:is_banned("192.168.1.1"))
-      assert.equals(50, mock_peer.ban_score)
-
-      -- Add score to exceed threshold
-      pm:add_ban_score(mock_peer, 60, "threshold exceeded")
       assert.is_true(pm:is_banned("192.168.1.1"))
+      assert.equals(peer_mod.STATE.DISCONNECTED, mock_peer.state)
     end)
 
     it("unbans a peer", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:ban_peer("192.168.1.1")
       assert.is_true(pm:is_banned("192.168.1.1"))
       pm:unban_peer("192.168.1.1")
@@ -225,7 +242,7 @@ describe("peerman", function()
     end)
 
     it("gets list of banned peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:ban_peer("192.168.1.1", 3600)
       pm:ban_peer("192.168.1.2", 7200)
       local banned_list = pm:get_banned_list()
@@ -233,7 +250,7 @@ describe("peerman", function()
     end)
 
     it("clears expired bans", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       -- Set one expired ban and one active ban
       pm.banned["192.168.1.1"] = os.time() - 1  -- expired
       pm.banned["192.168.1.2"] = os.time() + 3600  -- active
@@ -260,46 +277,46 @@ describe("peerman", function()
       }
     end
 
-    it("increments ban score with misbehaving()", function()
-      local pm = peerman.new(test_network, nil, nil)
+    it("discourages on first misbehaving() call (single-event, PR#25974)", function()
+      -- Core post-PR#25974 (net_processing.cpp Misbehaving:1893 +
+      -- MaybeDiscourageAndDisconnect): Misbehaving sets m_should_discourage
+      -- on the FIRST call — no score accumulator.  2c394e0 (W99 G1) removed
+      -- lunarblock's ban_score accumulation to match.
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
 
       pm:misbehaving(mock_peer, 25, "test reason")
-      assert.equals(25, mock_peer.ban_score)
+      assert.is_true(pm:is_banned("192.168.1.1"))
+      assert.equals(peer_mod.STATE.DISCONNECTED, mock_peer.state)
     end)
 
-    it("accumulates misbehavior scores", function()
-      local pm = peerman.new(test_network, nil, nil)
+    it("bans even for low-score single events (no accumulation)", function()
+      -- Three separate managers (a peer is gone after the first event):
+      -- each single low-score event is independently enough to discourage.
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
 
       pm:misbehaving(mock_peer, 20, "first offense")
-      pm:misbehaving(mock_peer, 30, "second offense")
-      pm:misbehaving(mock_peer, 40, "third offense")
-      assert.equals(90, mock_peer.ban_score)
-      assert.is_false(pm:is_banned("192.168.1.1"))
+      assert.is_true(pm:is_banned("192.168.1.1"))
     end)
 
-    it("bans peer when score reaches threshold", function()
-      local pm = peerman.new(test_network, nil, nil)
+    it("bans peer on first offense (no 100-point threshold)", function()
+      -- Pre-2c394e0 this needed score >= 100; now the first event bans.
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
 
-      -- Should not ban at 99
-      pm:misbehaving(mock_peer, 99, "almost banned")
-      assert.is_false(pm:is_banned("192.168.1.1"))
-
-      -- Should ban at 100
       pm:misbehaving(mock_peer, 1, "final offense")
       assert.is_true(pm:is_banned("192.168.1.1"))
     end)
 
     it("bans instantly for invalid block header (100 points)", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
@@ -310,7 +327,7 @@ describe("peerman", function()
     end)
 
     it("bans instantly for invalid block (100 points)", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
@@ -319,51 +336,37 @@ describe("peerman", function()
       assert.is_true(pm:is_banned("192.168.1.1"))
     end)
 
-    it("requires 10 invalid transactions to ban", function()
-      local pm = peerman.new(test_network, nil, nil)
+    it("bans on first invalid transaction (single-event, PR#25974)", function()
+      -- Old score model needed 10 x INVALID_TRANSACTION (10 pts each); Core
+      -- post-PR#25974 discourages on the first.
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
 
-      -- 9 invalid transactions = 90 points, not banned
-      for i = 1, 9 do
-        pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_TRANSACTION, "invalid tx " .. i)
-      end
-      assert.equals(90, mock_peer.ban_score)
-      assert.is_false(pm:is_banned("192.168.1.1"))
-
-      -- 10th invalid transaction = 100 points, banned
-      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_TRANSACTION, "invalid tx 10")
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.INVALID_TRANSACTION, "invalid tx 1")
       assert.is_true(pm:is_banned("192.168.1.1"))
     end)
 
-    it("requires 5 unsolicited data violations to ban", function()
-      local pm = peerman.new(test_network, nil, nil)
+    it("bans on first unsolicited data violation (single-event, PR#25974)", function()
+      -- Old score model needed 5 x UNSOLICITED_DATA (20 pts each).
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
 
-      -- 4 unsolicited = 80 points, not banned
-      for i = 1, 4 do
-        pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.UNSOLICITED_DATA, "unsolicited " .. i)
-      end
-      assert.is_false(pm:is_banned("192.168.1.1"))
-
-      -- 5th unsolicited = 100 points, banned
-      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.UNSOLICITED_DATA, "unsolicited 5")
+      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.UNSOLICITED_DATA, "unsolicited 1")
       assert.is_true(pm:is_banned("192.168.1.1"))
     end)
 
-    it("requires 2 message floods to ban", function()
-      local pm = peerman.new(test_network, nil, nil)
+    it("bans on first message flood (single-event, PR#25974)", function()
+      -- Old score model needed 2 x TOO_MANY_MESSAGES (50 pts each).
+      local pm = new_pm()
       local mock_peer = make_mock_peer()
       pm.peers["192.168.1.1:8333"] = mock_peer
       pm.peer_list[1] = mock_peer
 
       pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.TOO_MANY_MESSAGES, "flood 1")
-      assert.is_false(pm:is_banned("192.168.1.1"))
-
-      pm:misbehaving(mock_peer, peerman.MISBEHAVIOR.TOO_MANY_MESSAGES, "flood 2")
       assert.is_true(pm:is_banned("192.168.1.1"))
     end)
 
@@ -505,7 +508,7 @@ describe("peerman", function()
     end)
 
     it("rejects duplicate connection", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm.peers["192.168.1.1:8333"] = {}
       local ok, err = pm:connect_peer("192.168.1.1", 8333)
       assert.is_false(ok)
@@ -513,7 +516,7 @@ describe("peerman", function()
     end)
 
     it("gets peer counts", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm.peer_list = {
         {inbound = false},
         {inbound = false},
@@ -526,7 +529,7 @@ describe("peerman", function()
     end)
 
     it("disconnects peer and removes from tracking tables", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local mock_peer = {
         ip = "192.168.1.1",
         port = 8333,
@@ -549,7 +552,7 @@ describe("peerman", function()
     end)
 
     it("calls on_peer_disconnected callback", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local callback_called = false
       local callback_peer, callback_reason
       pm.callbacks.on_peer_disconnected = function(p, reason)
@@ -583,14 +586,14 @@ describe("peerman", function()
   describe("message handler registration", function()
 
     it("registers handler for new commands", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local handler_fn = function() end
       pm:register_handler("block", handler_fn)
       assert.equals(handler_fn, pm.message_handlers["block"])
     end)
 
     it("propagates handler to existing peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local registered_handlers = {}
       local mock_peer = {
         on = function(self, cmd, handler)
@@ -611,7 +614,7 @@ describe("peerman", function()
   describe("broadcast", function()
 
     it("sends to all established peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local sent_messages = {}
       local function make_mock_peer(id, state)
         return {
@@ -643,7 +646,7 @@ describe("peerman", function()
     end)
 
     it("respects filter function", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local sent_to = {}
       local function make_mock_peer(id, services)
         return {
@@ -705,7 +708,7 @@ describe("peerman", function()
     end
 
     it("sends `headers` to peers that opted in via sendheaders", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local p_hdr = make_mock_peer(1, true)
       pm.peer_list = {p_hdr}
 
@@ -724,7 +727,7 @@ describe("peerman", function()
     end)
 
     it("sends `inv` to peers that did NOT send sendheaders", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local p_inv = make_mock_peer(1, false)
       pm.peer_list = {p_inv}
 
@@ -741,7 +744,7 @@ describe("peerman", function()
     end)
 
     it("branches per-peer in a mixed fleet", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local p_hdr = make_mock_peer(1, true)
       local p_inv = make_mock_peer(2, false)
       local p_hdr2 = make_mock_peer(3, true)
@@ -763,7 +766,7 @@ describe("peerman", function()
     end)
 
     it("falls back to inv when header is nil", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local p = make_mock_peer(1, true)
       pm.peer_list = {p}
 
@@ -774,7 +777,7 @@ describe("peerman", function()
     end)
 
     it("respects optional filter_fn", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local p_keep = make_mock_peer(1, true)
       local p_skip = make_mock_peer(2, true)
       pm.peer_list = {p_keep, p_skip}
@@ -791,7 +794,7 @@ describe("peerman", function()
   describe("get_established_peers", function()
 
     it("returns only established peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm.peer_list = {
         {id = 1, state = peer_mod.STATE.ESTABLISHED},
         {id = 2, state = peer_mod.STATE.CONNECTING},
@@ -806,7 +809,7 @@ describe("peerman", function()
     end)
 
     it("returns empty list when no established peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm.peer_list = {
         {id = 1, state = peer_mod.STATE.CONNECTING},
       }
@@ -841,26 +844,36 @@ describe("peerman", function()
   describe("addr message handling", function()
 
     it("adds addresses from addr message", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local now = os.time()
 
-      -- Create addr message payload
+      -- Create addr message payload.  Must use PUBLICLY ROUTABLE IPs:
+      -- handle_addr rejects RFC1918/loopback/etc. per Core AddrManImpl::
+      -- AddSingle (addrman.cpp:534, CNetAddr::IsRoutable), so the old
+      -- 192.168.1.x fixtures are correctly dropped.
       local addresses = {
-        {timestamp = now - 100, services = 1, ip = "192.168.1.1", port = 8333},
-        {timestamp = now - 200, services = 1, ip = "192.168.1.2", port = 8333},
+        {timestamp = now - 100, services = 1, ip = "23.94.1.1", port = 8333},
+        {timestamp = now - 200, services = 1, ip = "23.94.1.2", port = 8333},
       }
       local payload = p2p.serialize_addr(addresses)
 
-      local mock_peer = {}
+      local mock_peer = {
+        -- Pre-fund the addr rate-limit token bucket: Core starts it at 1.0
+        -- and each processed address costs 1.0 (net_processing.cpp:5663-5670),
+        -- so a fresh peer admits only the FIRST address of a message.  This
+        -- test exercises addr storage, not the rate limiter.
+        addr_token_bucket = 10.0,
+        addr_token_timestamp = 0,
+      }
       pm:handle_addr(mock_peer, payload)
 
       assert.equals(2, pm:get_known_address_count())
-      assert.is_not_nil(pm.known_addresses["192.168.1.1:8333"])
-      assert.is_not_nil(pm.known_addresses["192.168.1.2:8333"])
+      assert.is_not_nil(pm.known_addresses["23.94.1.1:8333"])
+      assert.is_not_nil(pm.known_addresses["23.94.1.2:8333"])
     end)
 
     it("rejects addresses with old timestamps", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local now = os.time()
 
       -- Create addr with old timestamp (> 3 hours old)
@@ -876,7 +889,7 @@ describe("peerman", function()
     end)
 
     it("rejects addresses with future timestamps", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local now = os.time()
 
       -- Create addr with future timestamp (> 10 minutes in future)
@@ -896,7 +909,7 @@ describe("peerman", function()
   describe("stop", function()
 
     it("disconnects all peers", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       local disconnect_reasons = {}
       local function make_mock_peer(id)
         return {
@@ -934,6 +947,8 @@ describe("peerman", function()
   end)
 
   describe("transaction trickling", function()
+
+    local types = require("lunarblock.types")
 
     local function make_mock_peer(ip, port, inbound, wtxid_relay)
       return {
@@ -1020,7 +1035,7 @@ describe("peerman", function()
     describe("inv_queue management", function()
 
       it("initializes trickle state for established peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1033,7 +1048,7 @@ describe("peerman", function()
       end)
 
       it("queues transaction announcements for established peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1049,7 +1064,7 @@ describe("peerman", function()
       end)
 
       it("uses wtxid for wtxidrelay peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer("192.168.1.1", 8333, false, true)  -- wtxid_relay = true
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1066,7 +1081,7 @@ describe("peerman", function()
       end)
 
       it("does not re-announce known transactions", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1082,7 +1097,7 @@ describe("peerman", function()
       end)
 
       it("cleans up trickle state on disconnect", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1099,7 +1114,7 @@ describe("peerman", function()
     describe("trickle timer", function()
 
       it("sets different intervals for inbound vs outbound", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
 
         local outbound_peer = make_mock_peer("192.168.1.1", 8333, false)
         pm.peer_list[1] = outbound_peer
@@ -1119,7 +1134,7 @@ describe("peerman", function()
       end)
 
       it("delays announcements until timer expires", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1143,7 +1158,7 @@ describe("peerman", function()
       end)
 
       it("sends inv when timer expires", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1169,7 +1184,7 @@ describe("peerman", function()
       end)
 
       it("batches up to MAX_INV_PER_MSG entries", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1178,42 +1193,49 @@ describe("peerman", function()
         -- Set next_send_time to the past
         pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
 
-        -- Queue more than MAX_INV_PER_MSG transactions
+        -- Queue 50 transactions (fewer than MAX_INV_PER_MSG).
+        -- queue_tx_announcement takes hash256 OBJECTS (production passes
+        -- validation.compute_txid output) — raw strings would not
+        -- serialize into the inv payload.
         for i = 1, 50 do
-          local txid = string.rep(string.char(i), 32)
+          local txid = types.hash256(string.rep(string.char(i), 32))
           pm:queue_tx_announcement(txid)
         end
 
         -- Process trickle once - should send one batch
         pm:_process_trickle()
 
-        -- Should have sent exactly MAX_INV_PER_MSG (35)
+        -- Should have sent exactly one inv
         assert.is_not_nil(mock_peer._sent_messages)
         assert.equals(1, #mock_peer._sent_messages)
 
-        -- Parse the inv message to verify count
+        -- Parse the inv message: 50 < MAX_INV_PER_MSG (=1000, Core
+        -- INVENTORY_BROADCAST_MAX net_processing.cpp:176), so the whole
+        -- queue drains in a single batch.
         local inv_items = p2p.deserialize_inv(mock_peer._sent_messages[1].payload)
-        assert.equals(peerman.TRICKLE.MAX_INV_PER_MSG, #inv_items)
+        assert.equals(50, #inv_items)
+        assert.equals(1000, peerman.TRICKLE.MAX_INV_PER_MSG)
 
-        -- Remaining items still in queue
+        -- Queue fully drained
         local queue = pm:get_peer_inv_queue(mock_peer)
-        assert.equals(50 - peerman.TRICKLE.MAX_INV_PER_MSG, #queue)
+        assert.equals(0, #queue)
       end)
 
       it("randomizes order of announcements", function()
         -- This is a statistical test - run multiple times
         local orderings = {}
         for _ = 1, 10 do
-          local pm = peerman.new(test_network, nil, nil)
+          local pm = new_pm()
           local mock_peer = make_mock_peer()
           pm.peer_list[1] = mock_peer
           pm.peers["192.168.1.1:8333"] = mock_peer
           pm:_init_peer_trickle(mock_peer)
           pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
 
-          -- Queue 10 transactions with sequential IDs
+          -- Queue 10 transactions with sequential IDs (hash256 objects,
+          -- the production contract for queue_tx_announcement).
           for i = 1, 10 do
-            local txid = string.rep(string.char(i), 32)
+            local txid = types.hash256(string.rep(string.char(i), 32))
             pm:queue_tx_announcement(txid)
           end
 
@@ -1222,7 +1244,7 @@ describe("peerman", function()
           local inv_items = p2p.deserialize_inv(mock_peer._sent_messages[1].payload)
           local order = ""
           for _, item in ipairs(inv_items) do
-            order = order .. string.byte(item.hash:sub(1, 1))
+            order = order .. string.byte(item.hash.bytes:sub(1, 1))
           end
           orderings[order] = true
         end
@@ -1238,14 +1260,14 @@ describe("peerman", function()
     describe("relay with wtxid", function()
 
       it("uses MSG_TX for non-wtxidrelay peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer("192.168.1.1", 8333, false, false)
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
         pm:_init_peer_trickle(mock_peer)
         pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
 
-        local txid = string.rep("\x01", 32)
+        local txid = types.hash256(string.rep("\x01", 32))
         pm:queue_tx_announcement(txid)
         pm:_process_trickle()
 
@@ -1254,21 +1276,21 @@ describe("peerman", function()
       end)
 
       it("uses MSG_WTX for wtxidrelay peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer("192.168.1.1", 8333, false, true)
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
         pm:_init_peer_trickle(mock_peer)
         pm._peer_trickle["192.168.1.1:8333"].next_send_time = 0
 
-        local txid = string.rep("\x01", 32)
-        local wtxid = string.rep("\x02", 32)
+        local txid = types.hash256(string.rep("\x01", 32))
+        local wtxid = types.hash256(string.rep("\x02", 32))
         pm:queue_tx_announcement(txid, wtxid)
         pm:_process_trickle()
 
         local inv_items = p2p.deserialize_inv(mock_peer._sent_messages[1].payload)
         assert.equals(p2p.INV_TYPE.MSG_WTX, inv_items[1].type)
-        assert.equals(wtxid, inv_items[1].hash)
+        assert.equals(wtxid.bytes, inv_items[1].hash.bytes)
       end)
 
     end)
@@ -1276,7 +1298,7 @@ describe("peerman", function()
     describe("inv_known filter", function()
 
       it("marks sent transactions as known", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1296,7 +1318,7 @@ describe("peerman", function()
       end)
 
       it("allows clearing known filter", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1401,7 +1423,7 @@ describe("peerman", function()
     describe("new table", function()
 
       it("adds addresses to new table", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local added = pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
         assert.is_true(added)
         local stats = pm:get_addrman_stats()
@@ -1409,7 +1431,7 @@ describe("peerman", function()
       end)
 
       it("tracks multiple addresses", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
         pm:_add_to_new("192.168.1.2", 8333, 1, os.time(), "10.0.0.2")
         pm:_add_to_new("192.168.1.3", 8333, 1, os.time(), "10.0.0.3")
@@ -1418,7 +1440,7 @@ describe("peerman", function()
       end)
 
       it("updates timestamp for duplicate addresses", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local old_time = os.time() - 1000
         local new_time = os.time()
         pm:_add_to_new("192.168.1.1", 8333, 1, old_time, "10.0.0.1")
@@ -1433,7 +1455,7 @@ describe("peerman", function()
     describe("tried table", function()
 
       it("moves addresses from new to tried", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
         local stats1 = pm:get_addrman_stats()
         assert.equals(1, stats1.new_count)
@@ -1446,7 +1468,7 @@ describe("peerman", function()
       end)
 
       it("tracks multiple tried addresses", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         for i = 1, 5 do
           local ip = "192.168." .. i .. ".1"
           pm:_add_to_new(ip, 8333, 1, os.time(), "10.0.0.1")
@@ -1457,7 +1479,7 @@ describe("peerman", function()
       end)
 
       it("updates last_success for repeated successful connections", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
         pm:_move_to_tried("192.168.1.1", 8333)
         -- Move again (simulating reconnect)
@@ -1472,13 +1494,13 @@ describe("peerman", function()
     describe("address selection", function()
 
       it("returns nil when tables are empty", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local addr = pm:_select_address()
         assert.is_nil(addr)
       end)
 
       it("selects from new table", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
         local addr = pm:_select_address()
         assert.is_not_nil(addr)
@@ -1487,7 +1509,7 @@ describe("peerman", function()
       end)
 
       it("selects from tried table", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm:_move_to_tried("192.168.1.1", 8333)
         local addr = pm:_select_address()
         assert.is_not_nil(addr)
@@ -1495,7 +1517,7 @@ describe("peerman", function()
       end)
 
       it("can be restricted to new table only", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
         pm:_move_to_tried("192.168.1.2", 8333)
         -- Select only from new
@@ -1642,26 +1664,26 @@ describe("peerman", function()
   describe("outbound diversity (eclipse mitigation)", function()
 
     it("allows first connection from any subnet", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       assert.is_true(pm:_check_outbound_diversity("192.168.1.1"))
     end)
 
     it("rejects second connection from same /16 subnet", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:_add_outbound_group("192.168.1.1")
       assert.is_false(pm:_check_outbound_diversity("192.168.1.2"))
       assert.is_false(pm:_check_outbound_diversity("192.168.1.100"))
     end)
 
     it("allows connections from different /16 subnets", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:_add_outbound_group("192.168.1.1")
       assert.is_true(pm:_check_outbound_diversity("192.169.1.1"))
       assert.is_true(pm:_check_outbound_diversity("10.0.0.1"))
     end)
 
     it("allows reconnection after disconnect", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:_add_outbound_group("192.168.1.1")
       assert.is_false(pm:_check_outbound_diversity("192.168.1.2"))
 
@@ -1670,7 +1692,7 @@ describe("peerman", function()
     end)
 
     it("tracks multiple connections per subnet correctly", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       -- Simulate two connections from different subnets
       pm:_add_outbound_group("192.168.1.1")
       pm:_add_outbound_group("10.0.0.1")
@@ -1684,7 +1706,7 @@ describe("peerman", function()
     end)
 
     it("rejects same-subnet peer in connect_peer", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       pm:add_known_address("192.168.1.1", 8333)
       pm:add_known_address("192.168.1.2", 8333)
 
@@ -1697,7 +1719,7 @@ describe("peerman", function()
     end)
 
     it("filters candidates in select_peer_to_connect", function()
-      local pm = peerman.new(test_network, nil, nil)
+      local pm = new_pm()
       -- Add addresses from same subnet
       pm:add_known_address("192.168.1.1", 8333)
       pm:add_known_address("192.168.1.2", 8333)
@@ -1789,13 +1811,13 @@ describe("peerman", function()
     describe("tip_may_be_stale", function()
 
       it("returns false when tip was recently updated", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm:record_tip_update()
         assert.is_false(pm:tip_may_be_stale())
       end)
 
       it("returns true when tip is older than 3x block interval", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm.network = {pow_target_spacing = 600}  -- 10 minute blocks
         -- Simulate old tip (> 30 minutes = 1800 seconds)
         pm._last_tip_update = pm._last_tip_update - 2000
@@ -1803,7 +1825,7 @@ describe("peerman", function()
       end)
 
       it("returns false when blocks are in-flight even if tip is old", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm.network = {pow_target_spacing = 600}
         pm._last_tip_update = pm._last_tip_update - 2000
         -- Simulate blocks in-flight
@@ -1812,7 +1834,7 @@ describe("peerman", function()
       end)
 
       it("updates stale state after tip update", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm.network = {pow_target_spacing = 600}
         pm._last_tip_update = pm._last_tip_update - 2000
         assert.is_true(pm:tip_may_be_stale())
@@ -1826,7 +1848,7 @@ describe("peerman", function()
     describe("peer best block tracking", function()
 
       it("sets and gets peer best block", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
 
         pm:set_peer_best_block(mock_peer, 100000, "blockhash", 123456)
@@ -1838,7 +1860,7 @@ describe("peerman", function()
       end)
 
       it("returns nil for unknown peer", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
         assert.is_nil(pm:get_peer_best_block(mock_peer))
       end)
@@ -1848,7 +1870,7 @@ describe("peerman", function()
     describe("peer block announcement tracking", function()
 
       it("records block announcement timestamp", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
 
         local before = os.time()
@@ -1859,7 +1881,7 @@ describe("peerman", function()
       end)
 
       it("returns 0 for peer with no announcements", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
         assert.equals(0, pm:get_peer_last_block_announcement(mock_peer))
       end)
@@ -1869,7 +1891,7 @@ describe("peerman", function()
     describe("chain sync state", function()
 
       it("initializes chain sync state for outbound peer", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
 
         pm:_init_peer_chain_sync(mock_peer)
@@ -1883,7 +1905,7 @@ describe("peerman", function()
       end)
 
       it("cleans up chain sync state on disconnect", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
 
         pm:_init_peer_chain_sync(mock_peer)
@@ -1902,7 +1924,7 @@ describe("peerman", function()
     describe("consider_eviction", function()
 
       it("does nothing for inbound peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
         mock_peer.inbound = true
 
@@ -1915,7 +1937,7 @@ describe("peerman", function()
       end)
 
       it("does nothing for protected peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
 
         pm:_init_peer_chain_sync(mock_peer)
@@ -1931,7 +1953,7 @@ describe("peerman", function()
       end)
 
       it("resets timeout when peer catches up to our tip", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
 
         pm:_init_peer_chain_sync(mock_peer)
@@ -1946,7 +1968,7 @@ describe("peerman", function()
       end)
 
       it("sets timeout when peer is behind our tip", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
 
         pm:_init_peer_chain_sync(mock_peer)
@@ -1962,7 +1984,7 @@ describe("peerman", function()
       end)
 
       it("sends getheaders when timeout exceeded first time", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -1984,7 +2006,7 @@ describe("peerman", function()
       end)
 
       it("disconnects peer when timeout exceeded after getheaders sent", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = make_mock_outbound_peer()
         pm.peer_list[1] = mock_peer
         pm.peers["192.168.1.1:8333"] = mock_peer
@@ -2026,12 +2048,16 @@ describe("peerman", function()
       end)
 
       it("evicts peer with oldest block announcement when over target", function()
+        -- Eviction only fires above TARGET_OUTBOUND_FULL_RELAY = 8
+        -- (Core MAX_OUTBOUND_FULL_RELAY_CONNECTIONS=8, net.h:1107) —
+        -- max_outbound is unrelated.  9 full-relay peers = 1 extra.
         local pm = peerman.new(test_network, nil, {max_outbound = 2})
         local now = os.time()
 
-        -- Add 3 outbound peers (1 over target)
-        for i = 1, 3 do
+        local mocks = {}
+        for i = 1, 9 do
           local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
+          mocks[i] = mock_peer
           pm.peer_list[i] = mock_peer
           pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
           pm:_init_peer_chain_sync(mock_peer)
@@ -2043,18 +2069,19 @@ describe("peerman", function()
 
         pm:evict_extra_outbound_peers(now)
 
-        -- Peer 3 has oldest announcement, should be disconnected
-        assert.equals(peer_mod.STATE.DISCONNECTED, pm.peer_list[3].state)
-        assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[1].state)
-        assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[2].state)
+        -- Peer 9 has oldest announcement, should be disconnected (and is
+        -- removed from peer_list by disconnect_peer, so assert on the
+        -- object references, not list indices).
+        assert.equals(peer_mod.STATE.DISCONNECTED, mocks[9].state)
+        assert.equals(peer_mod.STATE.ESTABLISHED, mocks[1].state)
+        assert.equals(peer_mod.STATE.ESTABLISHED, mocks[2].state)
       end)
 
       it("does not evict peers with blocks in-flight", function()
         local pm = peerman.new(test_network, nil, {max_outbound = 2})
         local now = os.time()
 
-        -- Add 3 outbound peers (1 over target)
-        for i = 1, 3 do
+        for i = 1, 9 do
           local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
           pm.peer_list[i] = mock_peer
           pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
@@ -2063,13 +2090,13 @@ describe("peerman", function()
           pm._peer_connect_time["192.168." .. i .. ".1:8333"] = now - 1000
         end
 
-        -- Peer 3 has blocks in-flight
-        pm._blocks_in_flight["somehash"] = {peer = pm.peer_list[3], time = now}
+        -- Peer 9 (oldest announcement) has blocks in-flight
+        pm._blocks_in_flight["somehash"] = {peer = pm.peer_list[9], time = now}
 
         pm:evict_extra_outbound_peers(now)
 
         -- No peer should be evicted (worst peer has blocks in-flight)
-        for i = 1, 3 do
+        for i = 1, 9 do
           assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[i].state)
         end
       end)
@@ -2078,8 +2105,7 @@ describe("peerman", function()
         local pm = peerman.new(test_network, nil, {max_outbound = 2})
         local now = os.time()
 
-        -- Add 3 outbound peers (1 over target)
-        for i = 1, 3 do
+        for i = 1, 9 do
           local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
           pm.peer_list[i] = mock_peer
           pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
@@ -2092,7 +2118,7 @@ describe("peerman", function()
         pm:evict_extra_outbound_peers(now)
 
         -- No peer should be evicted (all connected within MINIMUM_CONNECT_TIME)
-        for i = 1, 3 do
+        for i = 1, 9 do
           assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[i].state)
         end
       end)
@@ -2101,9 +2127,10 @@ describe("peerman", function()
         local pm = peerman.new(test_network, nil, {max_outbound = 2})
         local now = os.time()
 
-        -- Add 3 outbound peers
-        for i = 1, 3 do
+        local mocks = {}
+        for i = 1, 9 do
           local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
+          mocks[i] = mock_peer
           pm.peer_list[i] = mock_peer
           pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
           pm:_init_peer_chain_sync(mock_peer)
@@ -2111,15 +2138,15 @@ describe("peerman", function()
           pm._peer_connect_time["192.168." .. i .. ".1:8333"] = now - 1000
         end
 
-        -- Protect peer 3 (the one that would normally be evicted)
-        local key3 = "192.168.3.1:8333"
-        pm._peer_chain_sync[key3].protect = true
+        -- Protect peer 9 (the one that would normally be evicted)
+        local key9 = "192.168.9.1:8333"
+        pm._peer_chain_sync[key9].protect = true
 
         pm:evict_extra_outbound_peers(now)
 
-        -- Peer 2 should be evicted instead (next oldest announcement)
-        assert.equals(peer_mod.STATE.DISCONNECTED, pm.peer_list[2].state)
-        assert.equals(peer_mod.STATE.ESTABLISHED, pm.peer_list[3].state)
+        -- Peer 8 should be evicted instead (next oldest announcement)
+        assert.equals(peer_mod.STATE.DISCONNECTED, mocks[8].state)
+        assert.equals(peer_mod.STATE.ESTABLISHED, mocks[9].state)
       end)
 
       it("clears try_new_outbound_peer flag after successful eviction", function()
@@ -2127,8 +2154,7 @@ describe("peerman", function()
         local now = os.time()
         pm._try_new_outbound_peer = true
 
-        -- Add 3 outbound peers
-        for i = 1, 3 do
+        for i = 1, 9 do
           local mock_peer = make_mock_outbound_peer("192.168." .. i .. ".1", 8333)
           pm.peer_list[i] = mock_peer
           pm.peers["192.168." .. i .. ".1:8333"] = mock_peer
@@ -2147,7 +2173,7 @@ describe("peerman", function()
     describe("check_for_stale_tip_and_evict_peers", function()
 
       it("runs consider_eviction for outbound peers", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm.network = {pow_target_spacing = 600}
         pm.our_height = 100000
         pm._extra_peer_check_time = 0  -- Force check to run
@@ -2166,7 +2192,7 @@ describe("peerman", function()
       end)
 
       it("enables extra outbound peer when tip is stale", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm.network = {pow_target_spacing = 600}
         pm._last_tip_update = pm._last_tip_update - 2000  -- Old tip
         pm._stale_tip_check_time = 0  -- Force check to run
@@ -2177,7 +2203,7 @@ describe("peerman", function()
       end)
 
       it("disables extra outbound peer when tip is no longer stale", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         pm.network = {pow_target_spacing = 600}
         pm._try_new_outbound_peer = true
         pm._stale_tip_check_time = 0
@@ -2193,7 +2219,7 @@ describe("peerman", function()
     describe("extra outbound connections", function()
 
       it("should_try_new_outbound_peer returns correct state", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         assert.is_false(pm:should_try_new_outbound_peer())
         pm:set_try_new_outbound_peer(true)
         assert.is_true(pm:should_try_new_outbound_peer())
@@ -2220,7 +2246,7 @@ describe("peerman", function()
     describe("blocks in-flight tracking", function()
 
       it("records and removes blocks in-flight", function()
-        local pm = peerman.new(test_network, nil, nil)
+        local pm = new_pm()
         local mock_peer = {}
 
         pm:record_block_in_flight("hash1", mock_peer)

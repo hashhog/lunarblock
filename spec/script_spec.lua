@@ -720,7 +720,15 @@ describe("script", function()
       it(name .. " raises error", function()
         -- Push some data and try the disabled opcode
         local s = "\x51\x51" .. string.char(opcode)
-        assert.has_error(function()
+        -- luassert's has_error(string) is EXACT equality, but the source
+        -- raises the more informative "disabled opcode: <name>". Core's
+        -- ScriptErrorString is the bare "disabled opcode"
+        -- (script_error.cpp:42-43), but the opcode name is diagnostic-only:
+        -- the consensus behavior is failing even in an unexecuted branch
+        -- (interpreter.cpp:457-472), which is what matters here. The only
+        -- message consumer (rpc.lua reject-reason mapping) substring-matches
+        -- "disabled opcode", so keep the source message and pattern-match.
+        assert.has_error.match(function()
           script.execute_script(s)
         end, "disabled opcode")
       end)
@@ -904,7 +912,10 @@ describe("script", function()
         {opcode = script.OP.OP_CHECKSIGADD, data = nil},
       })
 
-      local result = script.execute_script(s, {}, {}, checker)
+      -- OP_CHECKSIGADD is only defined in tapscript; in BASE/witness-v0 Core
+      -- fails with SCRIPT_ERR_BAD_OPCODE (interpreter.cpp:1086-1087), which
+      -- is why the tapscript flag is required for the script to run at all.
+      local result = script.execute_script(s, {}, {is_tapscript = true}, checker)
       assert.equals(1, #result)
       assert.equals(1, script.script_num_decode(result[1]))
     end)
@@ -926,7 +937,7 @@ describe("script", function()
         {opcode = script.OP.OP_CHECKSIGADD, data = nil},
       })
 
-      local result = script.execute_script(s, {}, {}, checker)
+      local result = script.execute_script(s, {}, {is_tapscript = true}, checker)
       assert.equals(1, #result)
       assert.equals(5, script.script_num_decode(result[1]))  -- unchanged
     end)
@@ -1049,10 +1060,16 @@ describe("script", function()
       local script_hash = crypto.hash160(redeem_script)
       local script_pubkey = script.make_p2sh_script(script_hash)
 
-      -- scriptSig with OP_CHECKSIG (0xac)
-      local script_sig = "\xac" .. string.char(#redeem_script) .. redeem_script
+      -- scriptSig with OP_CHECKSIG (0xac). Feed it two dummy operands so
+      -- scriptSig execution SUCCEEDS: Core's VerifyScript runs scriptSig and
+      -- scriptPubKey BEFORE the P2SH-gated IsPushOnly check
+      -- (interpreter.cpp:2019-2026 vs 2052-2056), so a bare "\xac" would die
+      -- with SCRIPT_ERR_INVALID_STACK_OPERATION (interpreter.cpp:1063-1064)
+      -- and never reach the push-only rule this test targets.
+      local script_sig = "\x01\x01\x01\x01\xac" .. string.char(#redeem_script) .. redeem_script
 
-      local result, err = script.verify_script(script_sig, script_pubkey, {verify_p2sh = true})
+      local checker = { check_sig = function() return true end }
+      local result, err = script.verify_script(script_sig, script_pubkey, {verify_p2sh = true}, checker)
       assert.is_nil(result)
       assert.equals("SIG_PUSHONLY", err)
     end)

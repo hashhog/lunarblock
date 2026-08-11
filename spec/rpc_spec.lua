@@ -10,7 +10,7 @@ describe("rpc", function()
       local request = "POST / HTTP/1.1\r\n" ..
         "Host: localhost:8332\r\n" ..
         "Content-Type: application/json\r\n" ..
-        "Content-Length: 52\r\n" ..
+        "Content-Length: 61\r\n" ..
         "\r\n" ..
         '{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}'
 
@@ -19,7 +19,7 @@ describe("rpc", function()
       assert.equal("POST", method)
       assert.equal("/", path)
       assert.equal("application/json", headers["content-type"])
-      assert.equal("52", headers["content-length"])
+      assert.equal("61", headers["content-length"])
       assert.equal('{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}', body)
     end)
 
@@ -433,15 +433,18 @@ describe("rpc", function()
   end)
 
   describe("estimatesmartfee", function()
-    it("returns feerate and blocks", function()
+    it("returns errors object when no fee data (Core fees.cpp:88-92)", function()
       local server = rpc.new({network = consensus.networks.mainnet})
 
       local request = '{"method":"estimatesmartfee","params":[6],"id":1}'
       local response = server:handle_request(request)
       local decoded = cjson.decode(response)
 
-      assert.is_number(decoded.result.feerate)
-      assert.is_number(decoded.result.blocks)
+      -- With no fee estimator data, Core returns {errors=[...], blocks=N}
+      -- and NO feerate key (fees.cpp:88-92 "Insufficient data or no feerate
+      -- found").
+      assert.is_nil(decoded.result.feerate)
+      assert.is_table(decoded.result.errors)
       assert.equal(6, decoded.result.blocks)
     end)
 
@@ -452,7 +455,8 @@ describe("rpc", function()
       local response = server:handle_request(request)
       local decoded = cjson.decode(response)
 
-      assert.is_number(decoded.result.feerate)
+      assert.is_nil(decoded.result.feerate)
+      assert.is_table(decoded.result.errors)
       assert.equal(6, decoded.result.blocks)  -- Default target
     end)
   end)
@@ -926,7 +930,7 @@ describe("rpc", function()
       assert.equal(64, #decoded.result)  -- txid is 64 hex chars
     end)
 
-    it("broadcasts inv to peers on success", function()
+    it("queues trickle announcement to peers on success (Core RelayTransaction)", function()
       local tx = make_test_tx()
       local raw = serialize.serialize_transaction(tx, false)
       local hex = rpc.hex_encode(raw)
@@ -942,12 +946,11 @@ describe("rpc", function()
       local request = '{"method":"sendrawtransaction","params":["' .. hex .. '"],"id":1}'
       server:handle_request(request)
 
-      -- Should have broadcast an inv message
-      assert.equal(1, #mock_peer_manager.broadcasts)
-      assert.equal("inv", mock_peer_manager.broadcasts[1].command)
-
-      -- Should have queued trickling announcement
+      -- Core BroadcastTransaction relays via RelayTransaction → the inv is
+      -- QUEUED into each peer's m_tx_inventory_to_send for the next trickle
+      -- flush; there is NO immediate broadcast.
       assert.equal(1, #mock_peer_manager.announcements)
+      assert.equal(0, #mock_peer_manager.broadcasts)
     end)
 
     it("returns DESERIALIZATION_ERROR for invalid hex", function()
@@ -980,27 +983,35 @@ describe("rpc", function()
       assert.equal(rpc.ERROR.DESERIALIZATION_ERROR, decoded.error.code)
     end)
 
-    it("returns VERIFY_ALREADY_IN_CHAIN when tx already in mempool", function()
+    it("succeeds and re-announces when tx already in mempool (Core v31)", function()
       local tx = make_test_tx()
       local txid = validation.compute_txid(tx)
       local txid_hex = types.hash256_hex(txid)
       local raw = serialize.serialize_transaction(tx, false)
       local hex = rpc.hex_encode(raw)
 
-      -- Mempool already has this transaction
+      -- Mempool already has this transaction.  Core BroadcastTransaction:
+      -- "There's already a transaction in the mempool with this txid... do
+      -- attempt to reannounce the mempool transaction" and returns OK —
+      -- sendrawtransaction returns the txid, NOT an error
+      -- (node/transaction.cpp:63-70).  Only a UTXO-set (confirmed)
+      -- duplicate errors with -27 ALREADY_IN_UTXO_SET.
       local mock_mempool = make_mock_mempool(true, 1000, {[txid_hex] = {tx = tx}})
+      local mock_peer_manager = make_mock_peer_manager()
       local server = rpc.new({
         network = consensus.networks.mainnet,
-        mempool = mock_mempool
+        mempool = mock_mempool,
+        peer_manager = mock_peer_manager,
       })
 
       local request = '{"method":"sendrawtransaction","params":["' .. hex .. '"],"id":1}'
       local response = server:handle_request(request)
       local decoded = cjson.decode(response)
 
-      assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.VERIFY_ALREADY_IN_CHAIN, decoded.error.code)
-      assert.truthy(decoded.error.message:match("already"))
+      assert.equal(cjson.null, decoded.error)
+      assert.equal(txid_hex, decoded.result)
+      -- Re-announced via the trickle queue
+      assert.equal(1, #mock_peer_manager.announcements)
     end)
 
     it("returns VERIFY_ERROR for missing inputs", function()
@@ -1061,8 +1072,11 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("exceeds maxfeerate"))
+      -- Core: MAX_FEE_EXCEEDED → RPC_TRANSACTION_ERROR (-25),
+      -- "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"
+      -- (common/messages.cpp:138-139).
+      assert.equal(-25, decoded.error.code)
+      assert.truthy(decoded.error.message:match("exceeds maximum configured"))
     end)
 
     it("accepts any fee when maxfeerate is 0", function()
@@ -1105,8 +1119,10 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("cannot exceed"))
+      -- Core ParseFeeRate: rates >= 1 BTC/kvB → RPC_INVALID_PARAMETER (-8)
+      -- (rpc/util.cpp:113).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
+      assert.truthy(decoded.error.message:match("larger than or equal to 1BTC/kvB"))
     end)
 
     it("uses default maxfeerate of 0.10 BTC/kvB", function()
@@ -1533,7 +1549,9 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+      -- ParseHashV parity: malformed hash → RPC_INVALID_PARAMETER (-8)
+      -- at the parse boundary (Core rpc/util.cpp:117-122).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
     end)
 
     it("returns error for invalid blockhash format", function()
@@ -1549,7 +1567,9 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+      -- ParseHashV parity: malformed hash → RPC_INVALID_PARAMETER (-8)
+      -- (Core rpc/util.cpp:117-122).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
     end)
 
     it("calculates vsize correctly (ceil(weight/4))", function()
@@ -2210,7 +2230,9 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+      -- ParseHashV parity: malformed hash → RPC_INVALID_PARAMETER (-8)
+      -- (Core rpc/util.cpp:117-122).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
     end)
 
     it("returns error for block not found", function()
@@ -2653,7 +2675,9 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+      -- ParseHashV parity: malformed hash → RPC_INVALID_PARAMETER (-8)
+      -- (Core rpc/util.cpp:117-122).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
     end)
 
     it("returns error when chain_state is not available", function()
@@ -2780,7 +2804,9 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, decoded.error.code)
+      -- ParseHashV parity: malformed hash → RPC_INVALID_PARAMETER (-8)
+      -- (Core rpc/util.cpp:117-122).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
     end)
 
     it("returns error when chain_state is not available", function()
@@ -3060,11 +3086,15 @@ describe("rpc", function()
     local function build_mempool_with_one_tx()
       local prev_txid = types.hash256(string.rep("\xab", 32))
       local prev_hex = types.hash256_hex(prev_txid)
+      -- Standard P2PKH scripts: the mempool's IsStandardTx gate rejects an
+      -- all-zeros 25-byte script as "scriptpubkey" (Core validation.cpp
+      -- TX_NOT_STANDARD), so fixtures must use a standard output type.
+      local p2pkh = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
       local mock_coin_view = {
         utxos = {
           [prev_hex .. ":0"] = {
             value = 100000,
-            script_pubkey = string.rep("\x00", 25),
+            script_pubkey = p2pkh,
             height = 500000,
             is_coinbase = false,
           },
@@ -3080,7 +3110,7 @@ describe("rpc", function()
       local mp = mempool.new(chain_state)
       local tx = types.transaction(1,
         { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFE) },
-        { types.txout(90000, string.rep("\x00", 25)) },
+        { types.txout(90000, p2pkh) },
         0)
       assert(mp:accept_transaction(tx))
       return mp, chain_state, tx
@@ -3316,11 +3346,13 @@ describe("rpc", function()
     local function build_mempool_with_one_tx()
       local prev_txid = types.hash256(string.rep("\xab", 32))
       local prev_hex = types.hash256_hex(prev_txid)
+      -- Standard P2PKH scripts (Core IsStandardTx "scriptpubkey" gate).
+      local p2pkh = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
       local mock_coin_view = {
         utxos = {
           [prev_hex .. ":0"] = {
             value = 100000,
-            script_pubkey = string.rep("\x00", 25),
+            script_pubkey = p2pkh,
             height = 500000,
             is_coinbase = false,
           },
@@ -3333,7 +3365,7 @@ describe("rpc", function()
       local mp = mempool.new(chain_state)
       local tx = types.transaction(1,
         { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFE) },
-        { types.txout(90000, string.rep("\x00", 25)) },
+        { types.txout(90000, p2pkh) },
         0)
       assert(mp:accept_transaction(tx))
       return mp
@@ -3379,7 +3411,8 @@ describe("rpc", function()
       -- That creates an in-mempool ancestor/descendant edge tx1 <- tx2.
       local prev_txid = types.hash256(string.rep("\xcd", 32))
       local prev_hex = types.hash256_hex(prev_txid)
-      local script_pk = string.rep("\x00", 25)
+      -- Standard P2PKH script (Core IsStandardTx "scriptpubkey" gate).
+      local script_pk = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
       local mock_coin_view = {
         utxos = {
           [prev_hex .. ":0"] = {
@@ -3561,7 +3594,9 @@ describe("rpc", function()
         '{"method":"gettxout","params":["abc",0],"id":1}')
       local resp = cjson.decode(body)
       assert.is_truthy(resp.error and resp.error ~= cjson.null)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+      -- ParseHashV parity: malformed hash → RPC_INVALID_PARAMETER (-8)
+      -- (Core rpc/util.cpp:117-122).
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, resp.error.code)
     end)
 
     it("rejects negative vout", function()
@@ -3941,7 +3976,8 @@ describe("rpc", function()
     local function build_chain_state()
       local prev_txid = types.hash256(string.rep("\xfa", 32))
       local prev_hex = types.hash256_hex(prev_txid)
-      local script_pk = string.rep("\x00", 25)
+      -- Standard P2PKH script (Core IsStandardTx "scriptpubkey" gate).
+      local script_pk = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
       local utxos = {
         [prev_hex .. ":0"] = {
           value = 100000000,

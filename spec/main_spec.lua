@@ -4,6 +4,15 @@ describe("main module", function()
   local main
 
   setup(function()
+    -- Mock socket module if not available (for test environments without
+    -- LuaSocket). peer.lua/rpc.lua require "socket" at module load; the
+    -- module-loading test only checks that each module loads, never opens
+    -- a connection. Same pattern as sync_spec.
+    if not pcall(require, "socket") then
+      package.preload["socket"] = function()
+        return { gettime = function() return os.time() end }
+      end
+    end
     main = require("lunarblock.main")
   end)
 

@@ -14,6 +14,14 @@ describe("parallel_verify", function()
 
   setup(function()
     package.path = "src/?.lua;" .. package.path
+    -- Mock socket module if not available (for test environments without
+    -- LuaSocket); only gettime() is used here, and the 5 s wedge assertion
+    -- below tolerates os.time()'s 1 s granularity. Same pattern as sync_spec.
+    if not pcall(require, "socket") then
+      package.preload["socket"] = function()
+        return { gettime = function() return os.time() end }
+      end
+    end
     validation = require("lunarblock.validation")
     crypto = require("lunarblock.crypto")
     socket = require("socket")

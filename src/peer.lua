@@ -675,7 +675,7 @@ function Peer:start_handshake()
     from_ip = "0.0.0.0",
     from_port = 0,
     nonce = self.nonce,
-    user_agent = "/LunarBlock:0.1.0/",
+    user_agent = "/LunarBlock:1.0.0/",
     start_height = self.our_height,
     relay = true,
   })
@@ -734,7 +734,7 @@ function Peer:handle_version(payload)
       from_ip = "0.0.0.0",
       from_port = 0,
       nonce = self.nonce,
-      user_agent = "/LunarBlock:0.1.0/",
+      user_agent = "/LunarBlock:1.0.0/",
       start_height = self.our_height,
       relay = true,
     })
@@ -743,6 +743,15 @@ function Peer:handle_version(payload)
   end
 
   -- Feature negotiation AFTER version, BEFORE verack (BIP155, BIP330).
+  -- WTXIDRELAY (BIP339): signal we want wtxid-based tx announcements.
+  -- Core sends it on VERSION receipt when greatest_common_version >=
+  -- WTXID_RELAY_VERSION (70016) (net_processing.cpp:3710-3712,
+  -- node/protocol_version.h:36), always before VERACK (BIP339 requires the
+  -- negotiation to happen between VERSION and VERACK).
+  if ver.version >= 70016 then
+    self:send_message("wtxidrelay", "")
+  end
+
   -- SENDADDRV2 (BIP155): signal addrv2 support so the peer relays Tor/I2P/CJDNS;
   -- empty payload; only when peer protocol >= 70016 (Core net_processing.cpp).
   if ver.version >= 70016 then
@@ -946,7 +955,13 @@ function Peer:process_messages()
     elseif msg.command == "feefilter" then
       self.fee_filter = p2p.deserialize_feefilter(msg.payload)
     elseif msg.command == "wtxidrelay" then
-      -- BIP 339: wtxidrelay must be sent before verack
+      -- BIP 339: wtxidrelay must be sent before verack.
+      -- Core net_processing.cpp:3921-3927: "Disconnect peers that send a
+      -- wtxidrelay message after VERACK" (fSuccessfullyConnected set).
+      if self.handshake_complete then
+        self:disconnect("wtxidrelay received after verack")
+        break
+      end
       -- Just acknowledge, no payload
       self.wtxid_relay = true
     elseif msg.command == "sendaddrv2" then

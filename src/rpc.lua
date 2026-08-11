@@ -1763,9 +1763,17 @@ function RPCServer:handle_request(request_body)
     }), nil
   end
 
-  -- Check for batch request: array with numeric keys
-  -- JSON arrays in cjson have consecutive integer keys starting at 1
-  if type(parsed) == "table" and parsed[1] ~= nil then
+  -- Check for batch request: array with numeric keys.
+  -- Detect the array from the raw text: cjson decodes both [] and {} to the
+  -- same empty Lua table, so parsed[1] alone cannot tell "empty batch" from
+  -- "empty object".  An EMPTY batch is still a batch — Core's
+  -- JSONRPCExecBatch over zero elements returns an empty JSON array ([]),
+  -- not the 204 no-content notification response.
+  local is_batch = request_body:match("^%s*%[") ~= nil
+  if is_batch and type(parsed) == "table" and #parsed == 0 then
+    return "[]", nil
+  end
+  if is_batch and type(parsed) == "table" and parsed[1] ~= nil then
     -- This is a batch request
     local batch_size = #parsed
 
@@ -4043,29 +4051,99 @@ function RPCServer:register_methods()
   self.methods["sendrawtransaction"] = function(rpc, params)
     local hex = params[1]
     assert(type(hex) == "string", "Transaction hex required")
-    local raw = M.hex_decode(hex)
-    local tx = serialize.deserialize_transaction(raw)
-    assert(rpc.mempool, "Mempool not available")
-    local ok, txid_hex = rpc.mempool:accept_transaction(tx)
-    if not ok then
-      -- W96: route mempool reject reasons to canonical Core RPC error codes.
-      -- "txn-already-in-mempool" / "txn-same-nonwitness-data-in-mempool" →
-      -- VERIFY_ALREADY_IN_CHAIN (-27) per Bitcoin Core rpc/rawtransaction.cpp.
-      -- Other rejects remain VERIFY_REJECTED (-26).
-      local err_str = tostring(txid_hex or "")
-      if err_str:find("already", 1, true)
-         or err_str:find("same-nonwitness-data", 1, true) then
-        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN, message = err_str})
-      end
-      error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
+
+    -- maxfeerate (BTC/kvB): Core DEFAULT_MAX_RAW_TX_FEE_RATE = 0.1 BTC/kvB
+    -- (node/transaction.h:28); 0 disables the fee check.  ParseFeeRate
+    -- rejects rates >= 1 BTC/kvB with RPC_INVALID_PARAMETER
+    -- (rpc/util.cpp:113 "Fee rates larger than or equal to 1BTC/kvB are not
+    -- accepted").
+    local maxfeerate_btc_kb = params[2]
+    if maxfeerate_btc_kb == nil or maxfeerate_btc_kb == cjson.null then
+      maxfeerate_btc_kb = 0.10
     end
-    -- Broadcast to peers
-    if rpc.peer_manager then
-      local txid = validation.compute_txid(tx)
-      local inv_payload = p2p.serialize_inv({
-        {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
-      })
-      rpc.peer_manager:broadcast("inv", inv_payload)
+    assert(type(maxfeerate_btc_kb) == "number", "maxfeerate must be numeric")
+    local maxfee_rate_sat_kb = maxfeerate_btc_kb * 1e8
+    if maxfee_rate_sat_kb >= 1e8 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "Fee rates larger than or equal to 1BTC/kvB are not accepted"})
+    end
+
+    -- Decode: Core DecodeHexTx failure → RPC_DESERIALIZATION_ERROR (-22)
+    -- (rpc/mempool.cpp sendrawtransaction: "TX decode failed. Make sure the
+    -- tx has at least one input.").  deserialize_transaction_auto is the
+    -- DecodeHexTx two-pass (witness first, legacy fallback, core_io.cpp:156-190).
+    local raw = M.hex_decode(hex)
+    local ok_dec, tx = pcall(serialize.deserialize_transaction_auto, raw)
+    if not ok_dec or type(tx) ~= "table" then
+      error({code = M.ERROR.DESERIALIZATION_ERROR,
+        message = "TX decode failed. Make sure the tx has at least one input."})
+    end
+    assert(rpc.mempool, "Mempool not available")
+
+    local txid = validation.compute_txid(tx)
+    local wtxid = validation.compute_wtxid(tx)
+    local txid_hex = types.hash256_hex(txid)
+
+    -- Already in the mempool: Core BroadcastTransaction does NOT error — it
+    -- re-announces the mempool transaction and returns the txid
+    -- (node/transaction.cpp:63-70).  Only a UTXO-set (confirmed) duplicate
+    -- errors (ALREADY_IN_UTXO_SET, -27).
+    local ok, accept_result, accept_fee = true, txid_hex, nil
+    if rpc.mempool.has and rpc.mempool:has(txid_hex) then
+      accept_fee = nil
+    else
+      ok, accept_result, accept_fee = rpc.mempool:accept_transaction(tx)
+      if not ok then
+        -- W96: route mempool reject reasons to canonical Core RPC error codes.
+        -- "txn-already-in-mempool" / "txn-same-nonwitness-data-in-mempool" →
+        -- VERIFY_ALREADY_IN_CHAIN (-27) per Bitcoin Core rpc/rawtransaction.cpp.
+        -- Other rejects remain VERIFY_REJECTED (-26).
+        local err_str = tostring(accept_result or "")
+        if err_str:find("already", 1, true)
+           or err_str:find("same-nonwitness-data", 1, true) then
+          error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN, message = err_str})
+        end
+        -- Core BroadcastTransaction: TransactionError::MISSING_INPUTS maps
+        -- through the DEFAULT arm of RPCErrorFromTransactionError to
+        -- RPC_TRANSACTION_ERROR (-25) — NOT to VERIFY_REJECTED (-26)
+        -- (rpc/util.cpp:391-401, JSONRPCTransactionError:408-415;
+        -- validation.cpp:866 emits "bad-txns-inputs-missingorspent" as
+        -- TX_MISSING_INPUTS).
+        if err_str:find("missing inputs", 1, true)
+           or err_str:find("inputs-missingorspent", 1, true) then
+          error({code = M.ERROR.VERIFY_ERROR, message = err_str})
+        end
+        error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
+      end
+      txid_hex = accept_result or txid_hex
+    end
+
+    -- maxfeerate check (Core transaction.cpp:74-83: fee > max_tx_fee →
+    -- MAX_FEE_EXCEEDED, -25 "Fee exceeds maximum configured by user
+    -- (e.g. -maxtxfee, maxfeerate)", common/messages.cpp:138-139).
+    -- max_tx_fee = maxfee_rate.GetFee(vsize) = sat/kvB * vsize / 1000.
+    -- lunarblock accepts first (no test_accept hook), so on failure the tx
+    -- is rolled back out of the mempool to mirror Core's never-admitted
+    -- outcome.
+    if maxfee_rate_sat_kb > 0 and accept_fee then
+      local weight = validation.get_tx_weight(tx)
+      local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
+      local max_tx_fee = math.floor(maxfee_rate_sat_kb * vsize / 1000)
+      if accept_fee > max_tx_fee then
+        if rpc.mempool.remove_transaction then
+          rpc.mempool:remove_transaction(txid_hex, "maxfeerate")
+        end
+        error({code = M.ERROR.VERIFY_ERROR,  -- -25 = Core RPC_TRANSACTION_ERROR
+          message = "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"})
+      end
+    end
+
+    -- Relay to peers via the trickle queue (Core RelayTransaction queues the
+    -- inv into each peer's m_tx_inventory_to_send for the next trickle
+    -- flush; there is no immediate broadcast).  queue_tx_announcement picks
+    -- wtxid for wtxid-relay peers, txid otherwise (BIP-339).
+    if rpc.peer_manager and rpc.peer_manager.queue_tx_announcement then
+      rpc.peer_manager:queue_tx_announcement(txid, wtxid)
     end
     return txid_hex
   end
@@ -4938,7 +5016,7 @@ function RPCServer:register_methods()
 
     return oj_result(oj({
       "version",            250000,                  -- masked (software identity)
-      "subversion",         "/LunarBlock:0.1.0/",    -- masked (software identity)
+      "subversion",         "/LunarBlock:1.0.0/",    -- masked (software identity)
       "protocolversion",    p2p.PROTOCOL_VERSION,
       "localservices",      LOCAL_SERVICES,
       "localservicesnames", oj_array_of_strings(SERVICE_NAMES),
@@ -11142,9 +11220,11 @@ function RPCServer:register_methods()
     end
     if rpc.chain_state then wallet:scan_utxos(rpc.chain_state) end
 
-    -- 1. Decode the raw transaction.
+    -- 1. Decode the raw transaction.  Two-pass (extended then legacy), so a
+    --    0-input funding template in legacy form decodes correctly
+    --    (Core DecodeHexTx, core_io.cpp:156-190).
     local ok_dec, tx = pcall(function()
-      return serialize.deserialize_transaction(M.hex_decode(hexstring))
+      return serialize.deserialize_transaction_auto(M.hex_decode(hexstring))
     end)
     if not ok_dec or type(tx) ~= "table" then
       error({code = M.ERROR.INVALID_ADDRESS, message = "TX decode failed"})

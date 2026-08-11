@@ -93,6 +93,13 @@
 --   Bucket hashing:        src/peerman.lua M.get_tried_bucket / M.get_new_bucket (163-195)
 --   Respond getaddr:       src/peerman.lua PeerManager:_respond_getaddr (1715)
 
+-- Mock socket module if not available (for test environments without LuaSocket)
+if not pcall(require, "socket") then
+  package.preload["socket"] = function()
+    return { gettime = function() return os.time() end }
+  end
+end
+
 local peerman = require("lunarblock.peerman")
 local peer_mod = require("lunarblock.peer")
 
@@ -565,13 +572,21 @@ end)
 
 describe("G17 peers.dat persistence (BUG-17)", function()
 
-  it("BUG-17 XFAIL: addrman is not persisted to peers.dat", function()
+  it("BUG-17 FIXED: addrman is persisted to peers.dat on stop() and reloaded on start", function()
     local pm, d = make_pm()
     pm:_add_to_new("1.2.3.4", 8333, 1, os.time(), "5.6.7.8")
     pm:stop()
-    -- peers.dat should exist in data_dir after stop() if persistence implemented
+    -- Core dumps the address book on shutdown (DumpAddresses()) and reloads
+    -- it on boot (AddrManImpl::Serialize/Unserialize to peers.dat).
     local f = io.open(d .. "/peers.dat", "r")
-    assert.is_nil(f, "peers.dat absent — addrman state lost on restart (BUG-17)")
+    assert.is_not_nil(f, "peers.dat must exist in data_dir after stop()")
+    local data = f:read("*a"); f:close()
+    assert.is_true(#data > 0, "peers.dat must be non-empty")
+    -- Round-trip: a fresh PeerManager on the same datadir restores the entry.
+    local pm2 = peerman.new(make_network(), nil, { data_dir = d })
+    assert.is_not_nil(pm2._addr_info["1.2.3.4:8333"],
+      "restarted node must reload addrman entry from peers.dat")
+    pm2:stop()
     rm_dir(d)
   end)
 
@@ -953,10 +968,11 @@ describe("G29 handle_addr integration", function()
     rm_dir(d)
   end)
 
-  it("handle_addr rejects too-future timestamps", function()
+  it("handle_addr clamps too-future timestamps (does not drop)", function()
     local pm, d = make_pm()
     local p2p_mod = require("lunarblock.p2p")
-    local future_t = os.time() + 700
+    local now = os.time()
+    local future_t = now + 700
     local payload = p2p_mod.serialize_addr({{
       timestamp = future_t,
       services = p2p_mod.SERVICES.NODE_NETWORK,
@@ -965,8 +981,14 @@ describe("G29 handle_addr integration", function()
     }})
     local fake_peer = {ip = "5.6.7.8", port = 8888}
     pm:handle_addr(fake_peer, payload)
-    assert.is_nil(pm.known_addresses["1.2.3.4:8333"],
-      "too-future address should be rejected")
+    -- Core net_processing.cpp:5678-5680: addresses >10min in the future are
+    -- NOT dropped; their nTime is clamped to (now - 5 days) and stored.
+    local entry = pm.known_addresses["1.2.3.4:8333"]
+    assert.is_not_nil(entry, "clamped address must still be stored")
+    local clamped = os.time() - 5 * 24 * 60 * 60
+    -- Allow a few seconds of drift between handle_addr's os.time() and ours.
+    assert.is_true(math.abs(entry.timestamp - clamped) <= 5,
+      "too-future timestamp must be clamped to now - 5 days")
     rm_dir(d)
   end)
 

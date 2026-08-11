@@ -248,237 +248,237 @@ describe("proxy", function()
   end)
 
   describe("SOCKS5 handshake with mock server", function()
-    local server
-    local server_port = 19400
+    -- These tests need a REAL concurrent peer.  luasocket is blocking and
+    -- busted runs single-threaded, so the previous coroutine pattern
+    -- (resume -> server:accept() with a 0.5s timeout BEFORE the client ever
+    -- connects) deadlocked by construction: accept timed out, the coroutine
+    -- finished without serving anything, and s5:connect() then timed out
+    -- talking to a listening-but-never-accepted socket.  The mock server
+    -- now runs in a fork()ed child process: it accepts one connection,
+    -- checks the wire bytes against Core's SOCKS5 sequence
+    -- (netbase.cpp:400-500), and reports "ok"/"bad:<what>" through a
+    -- transcript file the parent asserts on.
+    local ffi = require("ffi")
+    ffi.cdef[[
+      typedef int32_t pid_t;
+      pid_t fork(void);
+      pid_t waitpid(pid_t pid, int *status, int options);
+    ]]
 
-    before_each(function()
-      server = socket.tcp()
-      server:setoption("reuseaddr", true)
-      local ok = server:bind("127.0.0.1", server_port)
-      if not ok then
-        server_port = server_port + 1
-        server:bind("127.0.0.1", server_port)
+    local function wait_for_file(path, timeout)
+      local deadline = socket.gettime() + timeout
+      while socket.gettime() < deadline do
+        local f = io.open(path, "r")
+        if f then f:close(); return true end
+        socket.sleep(0.01)
       end
-      server:listen(1)
-      server:settimeout(0.5)
-    end)
+      return false
+    end
 
-    after_each(function()
-      if server then
-        server:close()
-        server = nil
+    -- Fork a mock-server child running server_fn(cs, want).
+    -- @return port, transcript_path, child_pid
+    local function start_mock_server(server_fn)
+      -- Grab an ephemeral port first so the child never races a bind.
+      local probe = socket.tcp()
+      probe:setoption("reuseaddr", true)
+      assert(probe:bind("127.0.0.1", 0))
+      local _, port = probe:getsockname()
+      probe:close()
+
+      local transcript = os.tmpname()
+      local ready = transcript .. ".ready"
+
+      local pid = ffi.C.fork()
+      assert(pid >= 0, "fork failed")
+      if pid == 0 then
+        -- ── child process: the mock SOCKS5 server ─────────────────────
+        local result
+        local srv = socket.tcp()
+        srv:setoption("reuseaddr", true)
+        local bind_ok = srv:bind("127.0.0.1", port)
+        if bind_ok then srv:listen(1) end
+        srv:settimeout(3)
+        -- Signal the parent that the listener is up (or failed to come up).
+        local rf = io.open(ready, "w"); rf:write("1"); rf:close()
+        if not bind_ok then
+          result = "bad:bind"
+        else
+          local cs = srv:accept()
+          if not cs then
+            result = "bad:accept-timeout"
+          else
+            cs:settimeout(2)
+            local fails = {}
+            local function want(got, expected, what)
+              if got ~= expected then
+                fails[#fails + 1] = string.format("%s: got %s, want %s",
+                  what, tostring(got), tostring(expected))
+              end
+            end
+            local ok, perr = pcall(server_fn, cs, want)
+            if not ok then
+              result = "bad:" .. tostring(perr)
+            elseif #fails > 0 then
+              result = "bad:" .. fails[1]
+            else
+              result = "ok"
+            end
+            cs:close()
+          end
+        end
+        srv:close()
+        local tf = io.open(transcript, "w")
+        tf:write(result or "bad:unknown")
+        tf:close()
+        os.exit(0)
       end
-    end)
+
+      -- ── parent: wait for the child's listener ───────────────────────
+      assert.is_true(wait_for_file(ready, 3),
+        "mock server child did not start listening")
+      return port, transcript, pid
+    end
+
+    -- Reap the child and assert its wire-level checks all passed.
+    local function assert_mock_ok(pid, transcript)
+      ffi.C.waitpid(pid, nil, 0)
+      local f = io.open(transcript, "r")
+      local result = f and f:read("*a") or "bad:no-transcript"
+      if f then f:close() end
+      os.remove(transcript)
+      os.remove(transcript .. ".ready")
+      assert.equals("ok", result)
+    end
 
     it("performs SOCKS5 handshake with no auth", function()
-      -- Start a coroutine to act as the SOCKS5 server
-      local server_done = false
-      local client_sock = nil
+      -- Core sends 05 01 00 (VER, 1 method, NO_AUTH) for a credential-less
+      -- client (netbase.cpp:405-411) and always uses ATYP=0x03 DOMAINNAME
+      -- in the CONNECT request (netbase.cpp:453-461).
+      local port, transcript, pid = start_mock_server(function(cs, want)
+        want(cs:receive(3), string.char(0x05, 0x01, 0x00), "method selection")
+        cs:send(string.char(0x05, 0x00))
 
-      -- Accept connection in a separate coroutine
-      local co = coroutine.create(function()
-        client_sock = server:accept()
-        if client_sock then
-          client_sock:settimeout(1)
+        want(cs:receive(4), string.char(0x05, 0x01, 0x00, 0x03),
+          "CONNECT header")
+        local dlen = cs:receive(1)
+        want(cs:receive(dlen:byte(1)), "example.com", "CONNECT domain")
+        local pb = cs:receive(2)
+        want(pb:byte(1) * 256 + pb:byte(2), 80, "CONNECT port")
 
-          -- Receive method selection
-          local data = client_sock:receive(3)
-          assert.equals(string.char(0x05, 0x01, 0x00), data)
-
-          -- Send method selection response (no auth)
-          client_sock:send(string.char(0x05, 0x00))
-
-          -- Receive CONNECT request
-          local req_header = client_sock:receive(4)
-          assert.equals(string.char(0x05, 0x01, 0x00, 0x03), req_header)
-
-          -- Read domain length and domain
-          local domain_len = client_sock:receive(1)
-          local domain = client_sock:receive(domain_len:byte(1))
-          assert.equals("example.com", domain)
-
-          -- Read port
-          local port_bytes = client_sock:receive(2)
-          local port = port_bytes:byte(1) * 256 + port_bytes:byte(2)
-          assert.equals(80, port)
-
-          -- Send success response
-          -- VER REP RSV ATYP BND.ADDR BND.PORT
-          client_sock:send(string.char(
-            0x05, 0x00, 0x00, 0x01,  -- SOCKS5, success, reserved, IPv4
-            127, 0, 0, 1,             -- Bound address (127.0.0.1)
-            0x00, 0x50                -- Bound port (80)
-          ))
-
-          server_done = true
-        end
+        -- VER REP RSV ATYP BND.ADDR BND.PORT — success, 127.0.0.1:80
+        cs:send(string.char(
+          0x05, 0x00, 0x00, 0x01,
+          127, 0, 0, 1,
+          0x00, 0x50
+        ))
       end)
 
-      -- Run server coroutine briefly
-      coroutine.resume(co)
-
-      -- Connect through proxy
-      local s5 = proxy.new_socks5("127.0.0.1", server_port)
-      s5.timeout = 1
-
+      local s5 = proxy.new_socks5("127.0.0.1", port)
+      s5.timeout = 2
       local sock, err = s5:connect("example.com", 80)
 
-      -- Resume server to handle remaining steps
-      coroutine.resume(co)
-
-      -- Verify connection succeeded
       assert.is_not_nil(sock)
       assert.is_nil(err)
-
       if sock then sock:close() end
-      if client_sock then client_sock:close() end
+      assert_mock_ok(pid, transcript)
     end)
 
     it("handles SOCKS5 authentication", function()
-      local client_sock = nil
+      -- With credentials Core advertises both methods (05 02 00 02,
+      -- netbase.cpp:404-409), then speaks RFC 1929: 01 ulen user plen pass
+      -- (netbase.cpp:425-435) and requires the 01 00 success reply.
+      local port, transcript, pid = start_mock_server(function(cs, want)
+        want(cs:receive(4), string.char(0x05, 0x02, 0x00, 0x02),
+          "method selection")
+        -- Request username/password auth
+        cs:send(string.char(0x05, 0x02))
 
-      local co = coroutine.create(function()
-        client_sock = server:accept()
-        if client_sock then
-          client_sock:settimeout(1)
+        want(cs:receive(1), string.char(0x01), "auth version")
+        local ulen = cs:receive(1)
+        want(cs:receive(ulen:byte(1)), "testuser", "auth username")
+        local plen = cs:receive(1)
+        want(cs:receive(plen:byte(1)), "testpass", "auth password")
+        cs:send(string.char(0x01, 0x00))
 
-          -- Receive method selection (should include USER_PASS)
-          local data = client_sock:receive(4)
-          assert.equals(string.char(0x05, 0x02, 0x00, 0x02), data)
+        -- CONNECT request (domain + port consumed, not pinned here)
+        cs:receive(4)
+        local dlen = cs:receive(1)
+        cs:receive(dlen:byte(1))
+        cs:receive(2)
 
-          -- Request username/password auth
-          client_sock:send(string.char(0x05, 0x02))
-
-          -- Receive auth request (version, ulen, user, plen, pass)
-          local auth_ver = client_sock:receive(1)
-          assert.equals(string.char(0x01), auth_ver)
-
-          local ulen = client_sock:receive(1)
-          local user = client_sock:receive(ulen:byte(1))
-          assert.equals("testuser", user)
-
-          local plen = client_sock:receive(1)
-          local pass = client_sock:receive(plen:byte(1))
-          assert.equals("testpass", pass)
-
-          -- Send auth success
-          client_sock:send(string.char(0x01, 0x00))
-
-          -- Receive CONNECT request
-          local req_header = client_sock:receive(4)
-
-          -- Read domain
-          local domain_len = client_sock:receive(1)
-          client_sock:receive(domain_len:byte(1))
-          client_sock:receive(2)
-
-          -- Send success
-          client_sock:send(string.char(
-            0x05, 0x00, 0x00, 0x01,
-            127, 0, 0, 1,
-            0x00, 0x50
-          ))
-        end
+        cs:send(string.char(
+          0x05, 0x00, 0x00, 0x01,
+          127, 0, 0, 1,
+          0x00, 0x50
+        ))
       end)
 
-      coroutine.resume(co)
-
-      local s5 = proxy.new_socks5("127.0.0.1", server_port, "testuser", "testpass")
-      s5.timeout = 1
-
+      local s5 = proxy.new_socks5("127.0.0.1", port, "testuser", "testpass")
+      s5.timeout = 2
       local sock, err = s5:connect("test.onion", 80)
-
-      coroutine.resume(co)
 
       assert.is_not_nil(sock)
       assert.is_nil(err)
-
       if sock then sock:close() end
-      if client_sock then client_sock:close() end
+      assert_mock_ok(pid, transcript)
     end)
 
     it("handles connection refused error", function()
-      local client_sock = nil
+      -- REP=0x05 must surface Core's Socks5ErrorString text
+      -- (netbase.cpp:365 "connection refused").
+      local port, transcript, pid = start_mock_server(function(cs)
+        cs:receive(3)
+        cs:send(string.char(0x05, 0x00))
 
-      local co = coroutine.create(function()
-        client_sock = server:accept()
-        if client_sock then
-          client_sock:settimeout(1)
+        cs:receive(4)
+        local dlen = cs:receive(1)
+        cs:receive(dlen:byte(1))
+        cs:receive(2)
 
-          -- Method selection
-          client_sock:receive(3)
-          client_sock:send(string.char(0x05, 0x00))
-
-          -- CONNECT request
-          client_sock:receive(4)
-          local domain_len = client_sock:receive(1)
-          client_sock:receive(domain_len:byte(1))
-          client_sock:receive(2)
-
-          -- Send connection refused error
-          client_sock:send(string.char(
-            0x05, 0x05, 0x00, 0x01,  -- CONNREFUSED
-            0, 0, 0, 0,
-            0x00, 0x00
-          ))
-        end
+        cs:send(string.char(
+          0x05, 0x05, 0x00, 0x01,  -- CONNREFUSED
+          0, 0, 0, 0,
+          0x00, 0x00
+        ))
       end)
 
-      coroutine.resume(co)
-
-      local s5 = proxy.new_socks5("127.0.0.1", server_port)
-      s5.timeout = 1
-
+      local s5 = proxy.new_socks5("127.0.0.1", port)
+      s5.timeout = 2
       local sock, err = s5:connect("test.com", 80)
-
-      coroutine.resume(co)
 
       assert.is_nil(sock)
       assert.is_not_nil(err)
       assert.is_true(err:find("connection refused") ~= nil)
-
-      if client_sock then client_sock:close() end
+      assert_mock_ok(pid, transcript)
     end)
 
     it("handles Tor-specific onion service errors", function()
-      local client_sock = nil
+      -- REP=0xF0 is Tor's HS_DESC_NOT_FOUND extension
+      -- (netbase.cpp:276, Socks5ErrorString netbase.cpp:371-372).
+      local port, transcript, pid = start_mock_server(function(cs)
+        cs:receive(3)
+        cs:send(string.char(0x05, 0x00))
 
-      local co = coroutine.create(function()
-        client_sock = server:accept()
-        if client_sock then
-          client_sock:settimeout(1)
+        cs:receive(4)
+        local dlen = cs:receive(1)
+        cs:receive(dlen:byte(1))
+        cs:receive(2)
 
-          client_sock:receive(3)
-          client_sock:send(string.char(0x05, 0x00))
-
-          client_sock:receive(4)
-          local domain_len = client_sock:receive(1)
-          client_sock:receive(domain_len:byte(1))
-          client_sock:receive(2)
-
-          -- Send Tor onion service not found error
-          client_sock:send(string.char(
-            0x05, 0xF0, 0x00, 0x01,  -- TOR_HS_DESC_NOT_FOUND
-            0, 0, 0, 0,
-            0x00, 0x00
-          ))
-        end
+        cs:send(string.char(
+          0x05, 0xF0, 0x00, 0x01,  -- TOR_HS_DESC_NOT_FOUND
+          0, 0, 0, 0,
+          0x00, 0x00
+        ))
       end)
 
-      coroutine.resume(co)
-
-      local s5 = proxy.new_socks5("127.0.0.1", server_port)
-      s5.timeout = 1
-
+      local s5 = proxy.new_socks5("127.0.0.1", port)
+      s5.timeout = 2
       local sock, err = s5:connect("nonexistent.onion", 80)
-
-      coroutine.resume(co)
 
       assert.is_nil(sock)
       assert.is_not_nil(err)
       assert.is_true(err:find("onion service") ~= nil)
-
-      if client_sock then client_sock:close() end
+      assert_mock_ok(pid, transcript)
     end)
   end)
 

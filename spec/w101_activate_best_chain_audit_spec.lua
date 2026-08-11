@@ -595,21 +595,26 @@ describe("W101 ActivateBestChain + InvalidateBlock gate audit", function()
   end)
 
   ----------------------------------------------------------------
-  -- B6: reconsider_block — clears ALL ancestors unconditionally
+  -- B6: reconsider_block — ancestor clear must be relationship-bounded
   --
   -- Core: ResetBlockFailureFlags (validation.cpp:3718) uses GetAncestor to
-  --       test relationship before clearing. Lunarblock walks ALL ancestors
-  --       back to genesis.
-  -- Bug:  utxo.lua:3970-3978 — unconditional ancestor clear.
-  -- SEVERITY: CORRECTNESS
+  --       test relationship before clearing.  FIXED: lunarblock's ancestor
+  --       phase walks only the target's own prev_hash chain (relationship
+  --       by construction); siblings are never touched.
   ----------------------------------------------------------------
   describe("B6 reconsider_block clears all ancestors unconditionally (utxo.lua:3970)", function()
 
-    it("B6 BUG: reconsider_block clears invalid flag on unrelated sibling (code inspection)", function()
-      -- Core's ResetBlockFailureFlags checks GetAncestor(nHeight)==pindex OR
-      -- pindex->GetAncestor(block_index.nHeight)==&block_index before clearing.
-      -- Lunarblock's reconsider_block (utxo.lua:3970-3978) walks ALL ancestors
-      -- back to genesis and clears EVERY one, regardless of relationship.
+    it("B6 FIXED: ancestor-clear phase is relationship-bounded (code inspection)", function()
+      -- Core's ResetBlockFailureFlags (validation.cpp:3718) clears the failed
+      -- mask only on blocks RELATED to pindex: GetAncestor in either
+      -- direction.  Lunarblock's reconsider_block ancestor phase walks the
+      -- TARGET'S OWN prev_hash chain, so every entry it clears is by
+      -- construction an ancestor of the target (Core's
+      -- `pindex->GetAncestor(block_index.nHeight) == &block_index` arm);
+      -- descendants are cleared separately by clear_descendant_invalid_flags
+      -- which proves descent per candidate before clearing.  Unrelated
+      -- blocks (siblings) are never touched — proven by the runtime test
+      -- below.
       local source = io.open("src/utxo.lua", "r")
       if not source then return end
       local content = source:read("*a")
@@ -620,17 +625,15 @@ describe("W101 ActivateBestChain + InvalidateBlock gate audit", function()
       assert.is_not_nil(fn_start)
       local fn_body = content:sub(fn_start, fn_end)
 
-      -- A correct implementation would check ancestry before clearing each entry.
-      -- Lunarblock clears current_hash unconditionally in a while loop.
-      -- We confirm this by checking that the loop does NOT call GetAncestor
-      -- or any equivalent relationship guard before setting nil.
-      local has_relationship_check = fn_body:find("get_ancestor") ~= nil
-                                  or fn_body:find("GetAncestor") ~= nil
-                                  or fn_body:find("is_ancestor") ~= nil
-      -- B6 BUG: expected to FAIL (no relationship guard present)
-      assert.is_true(has_relationship_check,
-        "B6 BUG: reconsider_block clears ALL ancestors unconditionally. " ..
-        "Core's ResetBlockFailureFlags uses GetAncestor to verify relationship first.")
+      -- Ancestor phase must be a prev_hash walk starting at the target
+      -- (relationship-bounded), NOT an unconditional global header scan.
+      local walks_prev_chain = fn_body:find("current_hash = h.prev_hash", 1, true) ~= nil
+      local iterates_all_headers = fn_body:find("storage.iterator", 1, true) ~= nil
+      assert.is_true(walks_prev_chain,
+        "ancestor-clear phase must walk the target's prev_hash chain " ..
+        "(relationship-bounded, Core validation.cpp:3718)")
+      assert.is_false(iterates_all_headers,
+        "ancestor-clear phase must not iterate all headers unconditionally")
     end)
 
     it("B6 BUG: reconsider_block clears unrelated sibling (runtime check with full mock)", function()
@@ -680,19 +683,20 @@ describe("W101 ActivateBestChain + InvalidateBlock gate audit", function()
   end)
 
   ----------------------------------------------------------------
-  -- B7: reconsider_block — no ActivateBestChain trigger after clearing
+  -- B7: reconsider_block — ActivateBestChain trigger after clearing
   --
   -- Core: after ResetBlockFailureFlags, calls ActivateBestChain to promote
-  --       newly-valid candidates (validation.cpp implied by caller flow).
-  -- Bug:  utxo.lua:3960-3988 — just clears flags and persists.
-  -- SEVERITY: CORRECTNESS
+  --       newly-valid candidates (reconsiderblock, rpc/blockchain.cpp:1771-1776).
+  -- FIXED: reconsider_block drives accept_side_branch_block on the branch
+  --       tip via find_stored_branch_tip after clearing flags.
   ----------------------------------------------------------------
   describe("B7 reconsider_block missing ActivateBestChain trigger (utxo.lua:3960)", function()
 
-    it("B7 BUG: reconsider_block does not trigger ActivateBestChain (code inspection)", function()
+    it("B7 FIXED: reconsider_block triggers re-activation after clearing (code inspection)", function()
       -- Core calls ActivateBestChain after ResetBlockFailureFlags so newly-valid
-      -- candidates are promoted. Lunarblock's reconsider_block only clears
-      -- flags and persists; it never triggers re-activation.
+      -- candidates are promoted (reconsiderblock, rpc/blockchain.cpp:1771-1776).
+      -- Lunarblock's reconsider_block now drives accept_side_branch_block on the
+      -- branch tip after clearing flags (see find_stored_branch_tip).
       local source = io.open("src/utxo.lua", "r")
       if not source then return end
       local content = source:read("*a")
@@ -706,10 +710,9 @@ describe("W101 ActivateBestChain + InvalidateBlock gate audit", function()
       local has_reactivation = fn_body:find("accept_side_branch_block", 1, true) ~= nil
                             or fn_body:find("activate_best_chain", 1, true)      ~= nil
                             or fn_body:find("accept_block", 1, true)             ~= nil
-      -- B7 BUG: expected to FAIL until the fix lands.
       assert.is_true(has_reactivation,
-        "B7 BUG: reconsider_block does not call ActivateBestChain after clearing flags. " ..
-        "Core triggers ActivateBestChain to promote newly-valid candidates.")
+        "reconsider_block must trigger re-activation after clearing flags " ..
+        "(Core ActivateBestChain, rpc/blockchain.cpp:1776)")
     end)
 
   end)
@@ -752,16 +755,18 @@ describe("W101 ActivateBestChain + InvalidateBlock gate audit", function()
   end)
 
   ----------------------------------------------------------------
-  -- B10: connect_genesis — no hash verification against network params
+  -- B10: connect_genesis — hash verification against network params
   --
   -- Core: LoadGenesisBlock (validation.cpp:4926) asserts computed hash == genesis_hash.
-  -- Bug:  utxo.lua:1623-1704 — no assertion on computed hash.
-  -- SEVERITY: OBSERVABILITY
+  -- FIXED: connect_genesis fails loud on mismatch (misconfigured chainparams).
   ----------------------------------------------------------------
   describe("B10 connect_genesis missing genesis hash verification (utxo.lua:1623)", function()
 
-    it("B10 BUG: connect_genesis does not verify hash matches network.genesis_hash", function()
-      -- Inspect the connect_genesis body for any hash comparison.
+    it("B10 FIXED: connect_genesis verifies hash matches network.genesis_hash", function()
+      -- Core LoadGenesisBlock (validation.cpp:4926) asserts the computed
+      -- genesis hash equals consensus.hashGenesisBlock; lunarblock's
+      -- connect_genesis now does the same (fails loud on misconfigured
+      -- chainparams).  Inspect the body for the comparison.
       local source = io.open("src/utxo.lua", "r")
       if not source then return end
       local content = source:read("*a")
@@ -774,10 +779,9 @@ describe("W101 ActivateBestChain + InvalidateBlock gate audit", function()
 
       -- Look for a comparison between computed_hash and network.genesis_hash
       local has_hash_check = fn_body:find("genesis_hash", 1, true)
-      -- B10 BUG: this assertion is expected to FAIL until the fix lands.
       assert.is_not_nil(has_hash_check,
-        "B10 BUG: connect_genesis does not verify computed block_hash == network.genesis_hash. " ..
-        "Core's LoadGenesisBlock asserts hash equality to catch misconfigured params.")
+        "connect_genesis must verify computed block_hash == network.genesis_hash " ..
+        "(Core LoadGenesisBlock, validation.cpp:4926)")
     end)
 
     it("regtest genesis hash is defined in network params", function()
@@ -913,11 +917,18 @@ describe("W101 ActivateBestChain + InvalidateBlock gate audit", function()
       local content = source:read("*a")
       source:close()
 
-      -- The comparison should be <= 0 (meaning side NOT strictly greater → no reorg)
-      local cmp_line = content:match("work_compare%(side_work, active_work%) ([<>=!]+) 0")
-      assert.is_not_nil(cmp_line, "work_compare(side_work, active_work) comparison not found")
-      assert.equal("<=", cmp_line,
-        "side branch must only trigger reorg when side_work STRICTLY > active_work")
+      -- The default (non-precious) decision must be store-without-reorg when
+      -- work_cmp <= 0, i.e. the branch reorgs ONLY when STRICTLY heavier
+      -- (Core validation.cpp:3308 uses `>`).  The precious=true variant uses
+      -- `< 0`, reproducing Core's preciousblock equal-work tiebreak
+      -- (CBlockIndexWorkComparator / nSequenceId, validation.cpp PreciousBlock).
+      assert.is_not_nil(
+        content:find("consensus.work_compare(side_work, active_work)", 1, true),
+        "work_compare(side_work, active_work) call not found")
+      assert.is_not_nil(
+        content:find("store_without_reorg = (work_cmp <= 0)", 1, true),
+        "default path must store-without-reorg on work_cmp <= 0 " ..
+        "(reorg only when side_work STRICTLY > active_work)")
     end)
 
   end)

@@ -2,7 +2,7 @@ package = "lunarblock"
 version = "scm-1"
 rockspec_format = "3.0"
 source = {
-  url = "git+https://github.com/user/lunarblock.git"
+  url = "git+https://github.com/hashhog/lunarblock.git"
 }
 description = {
   summary = "A Bitcoin full node implementation in Lua targeting LuaJIT 2.1",

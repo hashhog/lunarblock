@@ -492,8 +492,11 @@ function M.new_memory_storage()
   return attach_high_level_helpers(dbobj)
 end
 
--- Open a RocksDB database
-function M.open(path, cache_size_mb)
+-- Open a RocksDB database with the given compression type (RocksDB enum:
+-- 0 = kNoCompression, 1 = kSnappyCompression).  Called by M.open, which
+-- handles the graceful-degradation fallback when the linked librocksdb
+-- lacks Snappy.
+local function open_with_compression(path, cache_size_mb, compression)
   cache_size_mb = cache_size_mb or 2048
   local errptr = ffi.new("char*[1]")
 
@@ -527,8 +530,9 @@ function M.open(path, cache_size_mb)
   --
   -- Snappy chosen over lz4/zstd for the lowest CPU overhead (GB/s) so it cannot
   -- reintroduce a CPU ceiling on the per-coin import loop that commit 72af3ce
-  -- just removed.
-  librocksdb.rocksdb_options_set_compression(options, 1)  -- 1 = Snappy
+  -- just removed.  M.open retries with kNoCompression when the linked
+  -- librocksdb was built without Snappy (see below).
+  librocksdb.rocksdb_options_set_compression(options, compression)
 
   -- Leveled-compaction tuning for the bulk AssumeUTXO snapshot import.
   --
@@ -863,6 +867,29 @@ function M.open(path, cache_size_mb)
   end
 
   return dbobj
+end
+
+-- Open a RocksDB database.
+--
+-- Tries Snappy first (see the comment block in open_with_compression); if the
+-- linked librocksdb was built without Snappy, DB::Open fails options
+-- validation with "Compression type Snappy is not linked with the binary".
+-- Catch that specific case and retry with kNoCompression + a warning so the
+-- node stays portable to such hosts (compression is per-SST and recorded in
+-- the SST footer, so mixed-compression databases are fully readable either
+-- way — no consensus surface).  Any other open error propagates unchanged.
+function M.open(path, cache_size_mb)
+  local ok, result = pcall(open_with_compression, path, cache_size_mb, 1)
+  if ok then
+    return result
+  end
+  if not tostring(result):lower():match("compression") then
+    error(result, 0)
+  end
+  print(string.format(
+    "WARNING: RocksDB Snappy compression unavailable (%s); " ..
+    "falling back to kNoCompression", tostring(result)))
+  return open_with_compression(path, cache_size_mb, 0)
 end
 
 return M

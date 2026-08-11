@@ -724,13 +724,19 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G20: accept_package ancestor limits ---")
 
-test("G20-a: accept_package enforces MAX_ANCESTORS limit", function()
+test("G20-a: accept_package enforces Core package limits (count 25 / weight 404000)", function()
   local f = io.open("src/mempool.lua")
   local src = f:read("*a"); f:close()
-  local start_pos = src:find("function Mempool:accept_package")
+  -- Core v31: package-level bounds are MAX_PACKAGE_COUNT=25 and
+  -- MAX_PACKAGE_WEIGHT=404000 (policy.h:86-89, enforced in
+  -- is_well_formed_package); the old ancestor/descendant 25-limits were
+  -- REMOVED from acceptance (cluster limits cover connected components).
+  local start_pos = src:find("function M.is_well_formed_package")
   local ap_region = start_pos and src:sub(start_pos, start_pos + 8000) or ""
-  local has_ancestor = ap_region:find("MAX_ANCESTORS") ~= nil
-  expect_true(has_ancestor, "accept_package should enforce MAX_ANCESTORS limit")
+  local has_count = ap_region:find("MAX_PACKAGE_COUNT") ~= nil
+  local has_weight = ap_region:find("MAX_PACKAGE_WEIGHT") ~= nil
+  expect_true(has_count, "is_well_formed_package should enforce MAX_PACKAGE_COUNT")
+  expect_true(has_weight, "is_well_formed_package should enforce MAX_PACKAGE_WEIGHT")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -866,7 +872,9 @@ test("G28-a: compute_package_hash uses single SHA256 (matching Core's GetSHA256)
   local f = io.open("src/mempool.lua")
   local src = f:read("*a"); f:close()
   local start = src:find("function M.compute_package_hash")
-  local region = start and src:sub(start, start + 600) or ""
+  -- Window must cover the whole function (the sha256 call sits after the
+  -- wtxid sort comparator, ~700 bytes in).
+  local region = start and src:sub(start, start + 1200) or ""
   -- The function must call crypto.sha256
   local uses_sha256 = region:find("crypto%.sha256%(") ~= nil
   -- Must NOT call crypto.sha256d, double_sha256, or hash.double
