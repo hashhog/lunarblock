@@ -1453,89 +1453,14 @@ local function chainstate_size_on_disk(datadir, network_name)
   return n and math.floor(tonumber(n)) or 0
 end
 
---- Minimal base64 encoder used for HTTP Basic auth when calling
--- the local Bitcoin Core node.  Only ASCII-safe input (cookie strings).
-local _b64_alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local function _base64_encode(s)
-  local out = {}
-  local pad = (3 - #s % 3) % 3
-  local padded = s .. string.rep("\0", pad)
-  for i = 1, #padded, 3 do
-    local b1, b2, b3 = padded:byte(i, i + 2)
-    local n = b1 * 65536 + b2 * 256 + b3
-    out[#out + 1] = _b64_alpha:sub(math.floor(n / 262144) % 64 + 1, math.floor(n / 262144) % 64 + 1)
-    out[#out + 1] = _b64_alpha:sub(math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1)
-    out[#out + 1] = _b64_alpha:sub(math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1)
-    out[#out + 1] = _b64_alpha:sub(n % 64 + 1, n % 64 + 1)
-  end
-  if pad > 0 then
-    for i = 1, pad do out[#out - i + 1] = "=" end
-  end
-  return table.concat(out)
-end
-
---- Query the local Bitcoin Core node (127.0.0.1:8332) for getblockheader fields
--- that lunarblock does not persist: chainwork and nTx.
--- Returns chainwork_hex (64 chars), ntx (integer), or nil, nil on any error.
--- Cookie file locations tried in order:
---   /data/nvme1/hashhog-mainnet/bitcoin-core/.cookie
---   /home/work/.bitcoin/.cookie
-local function query_local_core_header(blockhash_hex)
-  local cookie_paths = {
-    "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-    "/home/work/.bitcoin/.cookie",
-  }
-  local cookie = nil
-  for _, path in ipairs(cookie_paths) do
-    local f = io.open(path, "r")
-    if f then cookie = f:read("*l"); f:close(); break end
-  end
-  if not cookie then return nil, nil end
-
-  local auth = _base64_encode(cookie)
-  local body = string.format(
-    '{"jsonrpc":"1.0","method":"getblockheader","params":["%s",true],"id":1}',
-    blockhash_hex
-  )
-
-  local tcp = socket.tcp()
-  tcp:settimeout(4)
-  local ok, err = tcp:connect("127.0.0.1", 8332)
-  if not ok then tcp:close(); return nil, nil end
-
-  local req = table.concat({
-    "POST / HTTP/1.1\r\n",
-    "Host: 127.0.0.1:8332\r\n",
-    "Authorization: Basic ", auth, "\r\n",
-    "Content-Type: application/json\r\n",
-    "Content-Length: ", tostring(#body), "\r\n",
-    "Connection: close\r\n",
-    "\r\n",
-    body,
-  })
-  tcp:send(req)
-
-  -- receive("*a") reads until the connection closes (Connection: close ensures
-  -- the server closes after sending the response body).
-  local response, rerr = tcp:receive("*a")
-  tcp:close()
-  if not response then return nil, nil end
-  local json_body = response:match("\r\n\r\n(.+)$")
-  if not json_body then return nil, nil end
-
-  local ok2, parsed = pcall(cjson.decode, json_body)
-  if not ok2 or type(parsed) ~= "table" or not parsed.result then return nil, nil end
-
-  local r = parsed.result
-  -- cjson.decode maps JSON null to the cjson.null userdata sentinel, which is
-  -- TRUTHY in Lua, so the `not parsed.result` guard above does NOT catch it. A
-  -- queried Core that lacks this block (a regtest hash against the mainnet Core,
-  -- or any unknown block) returns result:null -> userdata; indexing it crashed
-  -- getblock/getblockheader at verbosity>=1 ("attempt to index a userdata value").
-  -- Treat any non-table result as a miss and fall back to the caller's defaults.
-  if type(r) ~= "table" then return nil, nil end
-  return r.chainwork, r.nTx
-end
+-- R3(a) oracle independence: the former `query_local_core_header` helper (and
+-- its `_base64_encode` HTTP-Basic-auth companion) queried the local Bitcoin
+-- Core node's JSON-RPC port for chainwork + nTx, making the getblock /
+-- getblockheader RPC path a Core front-end. Both were removed: chainwork is now
+-- summed natively along the header chain via `compute_chainwork` (byte-identical
+-- to Core's nChainWork.GetHex()), and nTx is taken from the stored block body
+-- (#block.transactions), matching Core blockchain.cpp blockheaderToJSON. No
+-- production RPC path consults an external node.
 
 --- Get median time of past 11 blocks.
 -- @param storage table: Storage object
