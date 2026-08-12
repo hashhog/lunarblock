@@ -131,6 +131,24 @@ local function bip22_result(err)
     -- Raised as a bare token via assert() in check_block, so the position-prefix
     -- strip above surfaces it here for exact BIP-22 parity with Core.
     "unexpected-witness",
+    -- bwmc corpus parity (2026-08 sweep, entries A2/A5/A6/C7 — all were
+    -- ERROR-CODE divergences falling through to the generic "rejected"):
+    --   bad-blk-length          Core validation.cpp:3948 CheckBlock size limits
+    --                           (includes vtx.empty()); raised by check_block's
+    --                           empty-transactions assert.
+    --   bad-cb-multiple         Core validation.cpp:3955 "more than one
+    --                           coinbase"; raised by check_block's per-tx loop.
+    --   bad-witness-nonce-size  Core validation.cpp:3883 CheckWitnessMalleation
+    --                           (witness reserved value must be exactly one
+    --                           32-byte stack item, checked BEFORE the
+    --                           commitment-hash compare). check_witness_malleation
+    --                           already emitted this token (validation.lua:1306)
+    --                           but it was missing here, so the "witness nonce"
+    --                           substring rule below never matched the hyphenated
+    --                           token and it degraded to "rejected".
+    "bad-blk-length",
+    "bad-cb-multiple",
+    "bad-witness-nonce-size",
   }
   for _, key in ipairs(canonical_keys) do
     if s == key or s:sub(1, #key + 1) == key .. ":" then
