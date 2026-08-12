@@ -1504,8 +1504,14 @@ function M.check_block(block, network, height, check_pow)
     end
   end
 
-  -- Must have at least one transaction
-  assert(#block.transactions > 0, "block has no transactions")
+  -- Must have at least one transaction.
+  -- Core CheckBlock size-limits gate (validation.cpp:3948): an empty vtx is
+  -- part of the "size limits failed" check and rejects with "bad-blk-length"
+  -- — NOT bad-cb-missing (the coinbase-presence check at :3952 runs AFTER the
+  -- size limits). Embed Core's exact BIP-22 token so the submitblock mapper
+  -- (rpc.lua bip22_result) surfaces it verbatim; previously the bare human
+  -- message fell through to the generic "rejected".
+  assert(#block.transactions > 0, "bad-blk-length: block has no transactions")
 
   -- Single-pass: check transactions, compute weight, count sigops, and cache
   -- serialized data on each tx to eliminate redundant serializations in
@@ -1530,7 +1536,10 @@ function M.check_block(block, network, height, check_pow)
     if i == 1 then
       assert(is_cb, "first transaction is not coinbase")
     else
-      assert(not is_cb, "transaction " .. i .. " is coinbase")
+      -- Core CheckBlock (validation.cpp:3955): "more than one coinbase" →
+      -- "bad-cb-multiple". Embed the exact token; the bare human message
+      -- previously fell through to the generic "rejected" in bip22_result.
+      assert(not is_cb, "bad-cb-multiple: transaction " .. i .. " is coinbase")
     end
 
     -- Weight: base_size * 3 + total_size (per-transaction contribution only)
