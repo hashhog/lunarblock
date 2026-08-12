@@ -1638,21 +1638,24 @@ M.MAX_BATCH_SIZE = 1000
 
 --- Process a single JSON-RPC request object.
 -- @param request table: Parsed JSON-RPC request
--- @return table|nil: Response object, or nil for notifications
+-- @return table: Response object.
+--
+-- R3(b)/R5 2026-08-12: id-less requests are ANSWERED, not swallowed.
+-- Bitcoin Core's HTTP-RPC is JSON-RPC 1.0-shaped: it implements no
+-- notification semantics at all and replies to every request; when the
+-- request carries no "id" the response simply omits the field
+-- ({"result":...,"error":null} — verified against live Core).  lunarblock's
+-- former JSON-RPC 2.0 notification handling silently dropped every id-less
+-- request (empty HTTP body), which broke Core-convention clients and
+-- surfaced in the 2026-08-12 fleet R3(b) sweep as a phantom asymmetry.
+-- With `id = nil`, cjson omits the key — Core's exact response shape.
 function RPCServer:handle_single_request(request)
   local method = request.method
   local params = request.params or {}
   local id = request.id
 
-  -- Check if this is a notification (no id field at all)
-  local is_notification = (id == nil)
-
   local handler = self.methods[method]
   if not handler then
-    -- Notifications should not return errors either
-    if is_notification then
-      return nil
-    end
     return {
       result = cjson.null,
       error = {code = M.ERROR.METHOD_NOT_FOUND, message = "Method not found: " .. tostring(method)},
@@ -1662,10 +1665,6 @@ function RPCServer:handle_single_request(request)
 
   local success, result = pcall(handler, self, params)
   if not success then
-    -- Notifications should not return errors
-    if is_notification then
-      return nil
-    end
     -- Check if it's a structured error
     if type(result) == "table" and result.code then
       return {
@@ -1679,11 +1678,6 @@ function RPCServer:handle_single_request(request)
       error = {code = M.ERROR.INTERNAL_ERROR, message = tostring(result)},
       id = id,
     }
-  end
-
-  -- Notifications should not return responses
-  if is_notification then
-    return nil
   end
 
   -- W51: handlers that need Core-byte-exact JSON (e.g. decodepsbt) can
