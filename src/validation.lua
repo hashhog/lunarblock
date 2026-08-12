@@ -1490,17 +1490,17 @@ function M.check_block(block, network, height, check_pow)
     if block.header.version < 2
       and network.bip34_height ~= nil
       and height >= network.bip34_height then
-      error(string.format("bad-version(0x%08x)", block.header.version))
+      error(string.format("bad-version(0x%08x)", block.header.version % 0x100000000))
     end
     if block.header.version < 3
       and network.bip66_height ~= nil
       and height >= network.bip66_height then
-      error(string.format("bad-version(0x%08x)", block.header.version))
+      error(string.format("bad-version(0x%08x)", block.header.version % 0x100000000))
     end
     if block.header.version < 4
       and network.bip65_height ~= nil
       and height >= network.bip65_height then
-      error(string.format("bad-version(0x%08x)", block.header.version))
+      error(string.format("bad-version(0x%08x)", block.header.version % 0x100000000))
     end
   end
 

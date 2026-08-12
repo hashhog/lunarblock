@@ -138,6 +138,18 @@ local function bip22_result(err)
     end
   end
 
+  -- BIP30 duplicate-txid overwrite (Core validation.cpp ConnectBlock BIP30 gate,
+  -- state.Invalid(BLOCK_CONSENSUS, "bad-txns-BIP30")). utxo.lua raises
+  -- "bad-txns-BIP30: tried to overwrite transaction"; because `s` is lowercased
+  -- above, the mixed-case token never matched the canonical_keys set and fell
+  -- through to the generic "rejected" (version-dup bip30-duplicate-txid-reject).
+  -- Match the lowercased form here and return Core's EXACT mixed-case token.
+  -- Distinct from CheckTransaction dup-vin (bad-txns-inputs-duplicate) and the
+  -- double-spend path (bad-txns-inputs-missingorspent).
+  if s:find("bad%-txns%-bip30") then
+    return "bad-txns-BIP30"
+  end
+
   -- PoW / difficulty
   if s:find("proof of work") or s:find("invalid pow") or s:find("does not meet target") then
     return "high-hash"

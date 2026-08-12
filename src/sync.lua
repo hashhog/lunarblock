@@ -1496,17 +1496,17 @@ function HeaderChain:accept_header(header, opts)
   if header.version < 2
     and net.bip34_height
     and height >= net.bip34_height then
-    return false, string.format("bad-version(0x%08x)", header.version)
+    return false, string.format("bad-version(0x%08x)", header.version % 0x100000000)
   end
   if header.version < 3
     and net.bip66_height
     and height >= net.bip66_height then
-    return false, string.format("bad-version(0x%08x)", header.version)
+    return false, string.format("bad-version(0x%08x)", header.version % 0x100000000)
   end
   if header.version < 4
     and net.bip65_height
     and height >= net.bip65_height then
-    return false, string.format("bad-version(0x%08x)", header.version)
+    return false, string.format("bad-version(0x%08x)", header.version % 0x100000000)
   end
 
   -- 7. Check against checkpoints
