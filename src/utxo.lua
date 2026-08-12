@@ -4352,13 +4352,13 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     -- The network table stores activation heights as DeploymentHeight, so the gate
     -- is height >= activation (deploymentstatus.h:17 DeploymentActiveAfter).
     if h.version < 2 and net.bip34_height and new_height >= net.bip34_height then
-      return nil, string.format("bad-version(0x%08x)", h.version)
+      return nil, string.format("bad-version(0x%08x)", h.version % 0x100000000)
     end
     if h.version < 3 and net.bip66_height and new_height >= net.bip66_height then
-      return nil, string.format("bad-version(0x%08x)", h.version)
+      return nil, string.format("bad-version(0x%08x)", h.version % 0x100000000)
     end
     if h.version < 4 and net.bip65_height and new_height >= net.bip65_height then
-      return nil, string.format("bad-version(0x%08x)", h.version)
+      return nil, string.format("bad-version(0x%08x)", h.version % 0x100000000)
     end
 
     -- (e) contextual difficulty (nBits) — the prior fix (158b9c6).
