@@ -914,6 +914,28 @@ local function main()
   print("Network: " .. args.network)
   print("Data directory: " .. datadir)
 
+  -- Announce the SHA-256 path. This exists because the accelerated path was
+  -- silently absent for months: csrc/sha256_accel.c was never compiled (the
+  -- Makefile `build` target printed "(no FFI helpers to build)"), so
+  -- crypto.init_sha256_accel failed all five of its search paths and fell back
+  -- to a full EVP_MD_CTX lifecycle per hash — twice per double-SHA, ~12-14 per
+  -- transaction input, on the hottest path in the node. The loader is pcall'd
+  -- and the fallback is correct, so NOTHING reported it. lib/*.so is
+  -- gitignored and built by `make build`, so any deploy that skips that step
+  -- silently takes the slow path again. Now it says so, every boot.
+  do
+    local ok, crypto_mod = pcall(require, "lunarblock.crypto")
+    if ok and crypto_mod.sha256_hw_info then
+      local hw = crypto_mod.sha256_hw_info()
+      if hw == "generic" then
+        print("SHA-256: GENERIC (no acceleration) — run `make build` to compile "
+              .. "lib/sha256_accel.so; measured ~2.9x on double-SHA")
+      else
+        print("SHA-256: hardware-accelerated (" .. hw .. ")")
+      end
+    end
+  end
+
   -- Operational helpers: daemon, PID file, logger, signals, ready-fd.
   -- Must run before storage open() because daemonize() closes inherited
   -- FDs (Bitcoin Core init.cpp does the same: AppInitMain calls

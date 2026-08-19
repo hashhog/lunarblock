@@ -18,9 +18,30 @@ help:
 # Note: HDOG-format snapshot importer (csrc/hdog_import.c) was retired in
 # favor of a pure-Lua Core-format loader; see src/utxo.lua load_snapshot
 # and src/main.lua run_import_utxo.
-build:
+#
+# sha256_accel: SHA-NI / AVX2 SHA-256, the same instruction path Bitcoin Core
+# uses (csrc/sha256_accel.c is modelled on Core's sha256_x86_shani.cpp).
+#
+# This target previously printed "(no FFI helpers to build)" and built NOTHING,
+# so lib/ held only parallel_verify.so and src/crypto.lua's init_sha256_accel
+# failed on all five of its search paths — silently, because the loader is
+# pcall'd and falls back. EVERY SHA-256 in the node therefore took the generic
+# path at crypto.lua:129, which runs a full EVP_MD_CTX create/init/update/
+# final/free per call; since hash256 = sha256(sha256(x)), a double-SHA cost TWO
+# complete OpenSSL context lifecycles. At ~12-14 of those per transaction input
+# that is a large constant on the hottest path in the node.
+#
+# No -msha/-mavx2 needed globally: the accelerated routines carry
+# __attribute__((target("sha,sse4.1"))) per-function (csrc/sha256_accel.c:81,
+# 272, 325) and sha256_accel_init() probes CPUID at runtime, returning
+# 1=SHA-NI, 2=AVX2, 0=generic. So the .so is safe to build and ship on hosts
+# without the instructions — it just reports generic.
+build: lib/sha256_accel.so
+
+lib/sha256_accel.so: csrc/sha256_accel.c
 	@mkdir -p lib
-	@echo "(no FFI helpers to build)"
+	$(CC) -O3 -fPIC -shared -o $@ $< -lcrypto
+	@echo "built $@"
 
 # Run tests with busted using LuaJIT
 test:
