@@ -2895,6 +2895,31 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       local input_total = 0
       local tx_undo = M.tx_undo({})
 
+      -- Build prev_outputs once per TX for the Taproot key-path checker.
+      -- (utxo_cache is built in the first pass above; lazy because only
+      -- Taproot key-path actually needs it.)
+      --
+      -- HOISTED 2026-08-19. This memo and its closure used to be declared
+      -- INSIDE the per-input loop below, so `tx_prev_outputs` was reset to nil
+      -- on every iteration and the "build once per tx" it promised never
+      -- happened: each input that consulted it rebuilt the whole array. For a
+      -- tx with N inputs that is N array allocations plus N*N small tables --
+      -- O(N^2) -- which is why individual blocks carrying large consolidation
+      -- transactions showed 12-25 SECOND connect times in the [W77-CB] logs
+      -- while the median block was ~3.4 s. Declaring it here, in per-tx scope,
+      -- makes the comment true. Behaviour is otherwise identical: same values,
+      -- same laziness, still built only if a Taproot key-path input asks.
+      local tx_prev_outputs = nil
+      local function get_tx_prev_outputs()
+        if tx_prev_outputs then return tx_prev_outputs end
+        tx_prev_outputs = {}
+        for pi = 1, #tx.inputs do
+          local pu = utxo_cache[pi]
+          tx_prev_outputs[pi] = { value = pu.value, script_pubkey = pu.script_pubkey }
+        end
+        return tx_prev_outputs
+      end
+
       for inp_idx, inp in ipairs(tx.inputs) do
         local utxo = utxo_cache[inp_idx]
 
@@ -2989,20 +3014,6 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           -- Check signature cache first
           if self.sig_cache:lookup(wtxid_bytes, inp_idx, cache_flags) then
             goto skip_verification
-          end
-
-          -- Build prev_outputs once per tx for Taproot key-path checker.
-          -- (utxo_cache is built in the first pass above; lazy because
-          -- only Taproot key-path actually needs it.)
-          local tx_prev_outputs = nil
-          local function get_tx_prev_outputs()
-            if tx_prev_outputs then return tx_prev_outputs end
-            tx_prev_outputs = {}
-            for pi = 1, #tx.inputs do
-              local pu = utxo_cache[pi]
-              tx_prev_outputs[pi] = { value = pu.value, script_pubkey = pu.script_pubkey }
-            end
-            return tx_prev_outputs
           end
 
           -- Determine which scripts to run based on output type. We classify
