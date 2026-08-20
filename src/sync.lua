@@ -2516,39 +2516,6 @@ function BlockDownloader:_apply_fork_aware_floor()
   if self.pruner ~= nil and self.pruner.enabled then
     fork_dl_cap = BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH
   end
-  -- The fork point is the last common ancestor with the ACTIVE VALIDATED
-  -- chain -- NOT simply the deepest ancestor whose body happens to be on disk.
-  --
-  -- Conflating those caused the 2026-08-19 mainnet wedge. A node stuck on a
-  -- minority chain KEEPS storing newly-announced tip blocks as SIDE-BRANCH
-  -- bodies, so have_body is true for the header tip itself. The descent then
-  -- broke on its first iteration (steps=0, fork_point=header_tip), never
-  -- examined anything below the active tip, left missing_below_or_at_tip
-  -- false, and returned without lowering the floor -- so the bridging body was
-  -- never requested and the reorg orchestrator waited for it forever (477
-  -- "[FORK-DL] ... pending a bridging body; waiting" lines over 3.5 days, on a
-  -- ONE-BLOCK fork). Core computes the last common ancestor
-  -- (FindNextBlocksToDownload walks the best header chain back to its fork
-  -- with the active chain); this mirrors that.
-  --
-  -- Cost: active_cursor only ever moves DOWN, and so does the header-tip
-  -- descent, so total work is O(fork depth + tip gap), NOT O(chain length).
-  -- That bound is the point: a first attempt at this fix prebuilt the entire
-  -- active-ancestor set bounded by fork_dl_cap -- which is math.huge on an
-  -- archive node (pruning off = default) -- and so walked to genesis on EVERY
-  -- scheduler pass, hanging the node. Never walk the whole chain here.
-  local active_cursor = active_tip_hex
-  local function active_hash_at(h)
-    while true do
-      local e = hc.headers[active_cursor]
-      if not e then return nil end
-      if e.height <= h then return active_cursor end
-      local pv = e.header.prev_hash
-      if pv.bytes == string.rep("\0", 32) then return active_cursor end
-      active_cursor = types.hash256_hex(pv)
-    end
-  end
-
   local fork_point_height = nil
   local missing_below_or_at_tip = false
   local cursor_hex = tip_hex
@@ -2567,23 +2534,18 @@ function BlockDownloader:_apply_fork_aware_floor()
       return false
     end
 
-    -- Fork point reached when this ancestor is ON THE ACTIVE VALIDATED CHAIN:
-    -- we can connect forward from it and everything below it is already
-    -- connected. A body merely being present on disk is NOT sufficient -- a
-    -- stored side-branch body satisfies that and is exactly what wedged this
-    -- walk before.
-    if active_hash_at(entry.height) == cursor_hex then
+    -- Fork point reached when we already have the body on disk. We need not
+    -- fetch it nor anything below it (its ancestors are likewise on disk).
+    local block_hash = validation.compute_block_hash(entry.header)
+    local have_body = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes) ~= nil
+    if have_body then
       fork_point_height = entry.height
       break
     end
 
-    local block_hash = validation.compute_block_hash(entry.header)
-    local have_body = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes) ~= nil
-
-    -- Off the active chain. If its body is MISSING and it sits at or below the
-    -- active tip height, it is a bridging body the normal floor would skip —
-    -- record that there is real work to do.
-    if (not have_body) and entry.height <= active_tip_height then
+    -- Body missing. If it is at or below the active tip height, this is a
+    -- bridging body the normal floor would skip — record that we have work.
+    if entry.height <= active_tip_height then
       missing_below_or_at_tip = true
     end
 
