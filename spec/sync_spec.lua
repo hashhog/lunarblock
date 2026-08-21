@@ -1128,10 +1128,16 @@ describe("sync", function()
         assert.equals(types.hash256_hex(b_hashes[10]),
           types.hash256_hex(chain.header_tip_hash))
 
-        -- Punch a hole in the header map BELOW both tips: the lockstep descent
-        -- must hit it before reaching the LCA (genesis) and ABORT — bounded,
-        -- loud, and side-effect-free. The two reverted fixes hung right here.
+        -- Punch a hole BELOW both tips — in the in-memory map AND in storage.
+        -- (The walk's storage fallback intentionally heals a map-only hole:
+        -- that is the live side-branch-active-tip case. A hole in BOTH models
+        -- genuine header loss, and the walk must ABORT loudly — bounded and
+        -- side-effect-free — never keep walking. The two reverted fixes hung
+        -- right here.)
         chain.headers[types.hash256_hex(b_hashes[2])] = nil
+        -- Mock storage has no delete(); putting nil erases the key (real
+        -- RocksDB storage exposes delete(), but the walk only reads).
+        storage.put(storage.CF.HEADERS, b_hashes[2].bytes, nil)
 
         local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
         downloader.next_connect_height = active_tip_height + 1

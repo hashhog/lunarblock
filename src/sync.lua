@@ -2535,12 +2535,29 @@ function BlockDownloader:_apply_fork_aware_floor()
   local fork_point_height = nil
   local missing_below_or_at_tip = false
 
-  local a = hc.headers[active_tip_hex]
+  -- Resolve a header by hash: in-memory map first, then STORAGE. The storage
+  -- fallback is load-bearing, not defensive: the boot loader populates
+  -- hc.headers by walking back from the HEADER tip along the main chain, so a
+  -- node wedged on a side branch has an active tip that is NOT on that
+  -- ancestry and misses the map even though its height is well inside the
+  -- resident window (observed live 2026-08-20: active tip 962722 absent while
+  -- main-chain 944k..963k were resident). Storage holds every accepted
+  -- header; lookups here are RocksDB point reads bounded by the walk cap.
+  local function resolve_header(hash256, height_hint)
+    local hx = types.hash256_hex(hash256)
+    local e = hc.headers[hx]
+    if e then return e, hx end
+    local hdr = self.storage.get_header and self.storage.get_header(hash256) or nil
+    if not hdr then return nil, hx end
+    return { header = hdr, height = height_hint }, hx
+  end
+
+  local a = resolve_header(active_tip_hash, active_tip_height)
   local b = tip_entry
   if not a then
     print(string.format(
-      "[FORK-DL] cannot walk: ACTIVE TIP %s (h=%d) not resident in the header map; "
-        .. "floor unchanged (partial header map after restart?)",
+      "[FORK-DL] cannot walk: ACTIVE TIP %s (h=%d) in neither header map nor "
+        .. "storage; floor unchanged",
       tostring(active_tip_hex):sub(1, 16), active_tip_height))
     return false
   end
@@ -2548,8 +2565,7 @@ function BlockDownloader:_apply_fork_aware_floor()
   local function parent_of(entry, label)
     local prev = entry.header.prev_hash
     if prev.bytes == string.rep("\0", 32) then return nil, "genesis" end
-    local pk = types.hash256_hex(prev)
-    local e = hc.headers[pk]
+    local e = resolve_header(prev, entry.height - 1)
     if not e then return nil, label end
     return e, nil
   end
