@@ -994,6 +994,181 @@ describe("sync", function()
         end
       end)
 
+      -- REGRESSION (mainnet wedge, 2026-08-19). The test above stores NO fork
+      -- bodies, so the fork-point walk descends to genesis and works. Production
+      -- does not look like that: a node stuck on a minority chain KEEPS storing
+      -- newly-announced tip blocks as SIDE-BRANCH bodies, so the header tip
+      -- itself has have_body=true. The walk broke on its FIRST iteration
+      -- (steps=0), declared the fork point to BE the header tip, never looked
+      -- below the active tip, and returned without lowering the floor. The
+      -- bridging body was never requested and the reorg orchestrator waited for
+      -- it forever -- 477 "[FORK-DL] ... pending a bridging body; waiting" lines
+      -- over 3.5 days, on a ONE-BLOCK fork, on mainnet lunarblock at h=962722.
+      --
+      -- have_body is NOT the same as on-the-active-chain. A stored side-branch
+      -- body satisfies the first and not the second.
+      it("finds the fork point when the header tip's own body is already stored", function()
+        local function build_branch(parent_hash, n, ts0, ts_step, store_from)
+          local hashes = {}
+          local parent, ts = parent_hash, ts0
+          for i = 1, n do
+            ts = ts + ts_step
+            local header = create_valid_header(parent, ts)
+            assert.is_true(find_valid_nonce(header))
+            assert.is_true(chain:accept_header(header))
+            local bh = validation.compute_block_hash(header)
+            hashes[#hashes + 1] = bh
+            -- store_from = nil  -> store none
+            -- store_from = k    -> store bodies for index >= k
+            if store_from and i >= store_from then
+              storage.put_block(bh, types.block(header, {}))
+            end
+            parent = bh
+          end
+          return hashes
+        end
+
+        local genesis_hash = chain:get_tip_hash()
+        local genesis_ts = consensus.networks.regtest.genesis.timestamp
+        storage.put_block(genesis_hash,
+          types.block(chain:get_header_at_height(0).header, {}))
+
+        -- Active chain A: heights 1..5, all bodies stored. Active tip = 5.
+        local a_hashes = build_branch(genesis_hash, 5, genesis_ts, 600, 1)
+        local active_tip_height = 5
+
+        -- Competing heavier chain B: heights 1..9, forking at genesis.
+        -- Bodies stored for B6..B9 ONLY -- the tip blocks this node kept
+        -- receiving and storing as side branches while wedged. The BRIDGING
+        -- bodies B1..B5 (at/below the active tip) are missing: they are exactly
+        -- what must be requested for the reorg to become possible.
+        local b_hashes = build_branch(genesis_hash, 9, genesis_ts, 720, 6)
+
+        assert.equals(9, chain.header_tip_height)
+        assert.equals(types.hash256_hex(b_hashes[#b_hashes]),
+          types.hash256_hex(chain.header_tip_hash))
+        -- Precondition that makes this test different from the one above:
+        -- the header tip's body IS on disk.
+        assert.is_truthy(storage.get(storage.CF.BLOCKS, b_hashes[9].bytes),
+          "precondition: header-tip body must be stored for this regression")
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = active_tip_height + 1
+        downloader.next_download_height = active_tip_height + 1
+        downloader.active_tip_provider = function()
+          return a_hashes[active_tip_height], active_tip_height
+        end
+
+        local peer = create_mock_peer(1, 100)
+        downloader:schedule_downloads({peer})
+
+        local requested = {}
+        for _, msg in ipairs(peer.messages_sent) do
+          if msg.command == "getdata" then
+            for _, item in ipairs(p2p.deserialize_inv(msg.payload)) do
+              requested[types.hash256_hex(item.hash)] = true
+            end
+          end
+        end
+
+        -- THE ASSERTION THE OLD WALK FAILED: the missing bridging bodies
+        -- B1..B5 must be requested even though the header tip already has one.
+        for i = 1, 5 do
+          local hx = types.hash256_hex(b_hashes[i])
+          assert.is_true(requested[hx],
+            "bridging body B" .. i .. " NOT requested — the fork-point walk stopped at a " ..
+            "stored SIDE-BRANCH body instead of descending to the active chain")
+        end
+
+        -- Bodies already on disk must not be re-fetched.
+        for i = 6, 9 do
+          assert.is_falsy(requested[types.hash256_hex(b_hashes[i])],
+            "already-stored fork body B" .. i .. " was wrongly re-requested")
+        end
+      end)
+
+      -- REGRESSION (live hang, 2026-08-19/20, twice). hc.headers is a PARTIAL
+      -- map on the live node (~19k of 963k resident after restart). Both failed
+      -- fixes walked the ancestry assuming completeness: a lookup miss made the
+      -- active-chain probe nil forever while the descent walked to genesis
+      -- under a math.huge cap. The walk must treat a header-map gap as a LOUD
+      -- bounded exit, never keep walking.
+      it("aborts loudly (no hang, no reorg, connect cursor intact) when the header map has a gap", function()
+        local function build_branch(parent_hash, n, ts0, ts_step, store_from)
+          local hashes = {}
+          local parent, ts = parent_hash, ts0
+          for i = 1, n do
+            ts = ts + ts_step
+            local header = create_valid_header(parent, ts)
+            assert.is_true(find_valid_nonce(header))
+            chain:accept_header(header)  -- duplicate-tolerant: shared describe chain
+            local bh = validation.compute_block_hash(header)
+            hashes[#hashes + 1] = bh
+            if store_from and i >= store_from then
+              storage.put_block(bh, types.block(header, {}))
+            end
+            parent = bh
+          end
+          return hashes
+        end
+
+        local genesis_hash = chain:get_tip_hash()
+        local genesis_ts = consensus.networks.regtest.genesis.timestamp
+        storage.put_block(genesis_hash,
+          types.block(chain:get_header_at_height(0).header, {}))
+
+        -- Active chain: 5 blocks (unique ts lineage), bodies stored.
+        local a_hashes = build_branch(genesis_hash, 5, genesis_ts, 960, 1)
+        local active_tip_height = 5
+        -- Competing fork: 10 blocks (taller than anything earlier tests build,
+        -- so it OWNS the header tip regardless of shared-state residue), and
+        -- NO bodies stored — nothing can connect, so no reorg can fire.
+        local b_hashes = build_branch(genesis_hash, 10, genesis_ts, 1080, nil)
+        assert.equals(10, chain.header_tip_height)
+        assert.equals(types.hash256_hex(b_hashes[10]),
+          types.hash256_hex(chain.header_tip_hash))
+
+        -- Punch a hole in the header map BELOW both tips: the lockstep descent
+        -- must hit it before reaching the LCA (genesis) and ABORT — bounded,
+        -- loud, and side-effect-free. The two reverted fixes hung right here.
+        chain.headers[types.hash256_hex(b_hashes[2])] = nil
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = active_tip_height + 1
+        downloader.next_download_height = active_tip_height + 1
+        downloader.active_tip_provider = function()
+          return a_hashes[active_tip_height], active_tip_height
+        end
+
+        local peer = create_mock_peer(1, 100)
+        -- The old bugs made this call walk to genesis (or forever); busted
+        -- hanging IS their failure mode. Bounded implementation returns fast.
+        downloader:schedule_downloads({peer})
+        -- The CONNECT cursor must not move on an aborted walk (the download
+        -- cursor may legitimately advance as the normal request loop issues
+        -- above-floor getdata). And no reorg can have fired: the fork has no
+        -- bodies.
+        assert.equals(active_tip_height + 1, downloader.next_connect_height)
+        assert.equals(types.hash256_hex(b_hashes[10]),
+          types.hash256_hex(chain.header_tip_hash))
+      end)
+
+      -- The walk must be bounded by a FINITE constant even on archive nodes
+      -- (pruning off). fork_dl_cap = math.huge is what turned both failed
+      -- fixes into live hangs.
+      it("gives up at the hard cap on a fork deeper than FORK_WALK_HARD_CAP", function()
+        -- Can't build 2016 PoW headers in a unit test; instead assert the cap
+        -- constant exists in source and is finite — a tripwire against
+        -- reintroducing math.huge.
+        local src = io.open("src/sync.lua", "r"):read("*a")
+        local cap = src:match("local FORK_WALK_HARD_CAP = (%d+)")
+        assert.is_truthy(cap, "FORK_WALK_HARD_CAP must be a literal finite number")
+        assert.is_true(tonumber(cap) >= 288 and tonumber(cap) <= 10000,
+          "cap should be a sane finite bound, got " .. tostring(cap))
+        assert.is_falsy(src:match("fork_dl_cap%s*=%s*math%.huge"),
+          "math.huge fork cap must never return (it hung the live node twice)")
+      end)
+
       -- INVARIANT guard: a header tip that simply EXTENDS the active chain
       -- (normal IBD / steady state, no competing fork) must leave the download
       -- floor untouched — only blocks above the active tip get requested, never
