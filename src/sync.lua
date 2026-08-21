@@ -2504,73 +2504,117 @@ function BlockDownloader:_apply_fork_aware_floor()
   -- of those along the heavier header fork (sync.lua:1342/1346), so after the
   -- header tip flips they point at the FORK chain, not the active validated
   -- chain. CF.BLOCKS + the active tip hash are the only fork-faithful signals.
-  -- Cap the descent depth.  Core-parity (2026-07-02): mirror the reorg
-  -- orchestrator's pruning-gated bound (utxo.lua accept_side_branch_block).  On
-  -- an ARCHIVE node (pruning OFF = default) there is NO cap — fetch the full
-  -- bridging-body set down to the true fork point so the deep reorg can actually
-  -- fire (Core FindNextBlocksToDownload follows the most-work header chain
-  -- unbounded; the depth is bounded in practice by the already-PoW-validated
-  -- header chain).  Only a PRUNED node keeps the finite window, because a fork
-  -- deeper than its retained undo is un-appliable anyway.
-  local fork_dl_cap = math.huge
-  if self.pruner ~= nil and self.pruner.enabled then
-    fork_dl_cap = BlockDownloader.MAX_FORK_DOWNLOAD_DEPTH
-  end
+  -- Locate the fork point: the LAST COMMON ANCESTOR of the header tip and
+  -- the ACTIVE VALIDATED chain, found by a lockstep descent of both
+  -- ancestries. Three hard-won rules from the 2026-08-19/20 attempts govern
+  -- this walk; do not relax any of them:
+  --
+  --  (1) The walk is ALWAYS bounded by a finite constant. The previous
+  --      design's only terminator was `have_body`, which a stored SIDE-BRANCH
+  --      body satisfies -- a wedged node keeps storing new tip blocks as side
+  --      branches, so the walk broke at step 0, declared the fork point to BE
+  --      the header tip, and never lowered the floor (the 3.5-day mainnet
+  --      wedge at 962722, task #28). Two attempted fixes removed the
+  --      have_body break and were left with a cap of math.huge on archive
+  --      nodes: one prebuilt a full ancestor set (962k blocks walked per
+  --      scheduler pass), one walked to genesis hunting an active-chain match
+  --      that could never come -- BOTH hung the live node and were reverted.
+  --      A fork deeper than the cap gets a LOUD log and no floor change --
+  --      conservative, and 2016 blocks (~2 weeks) is far beyond any real
+  --      reorg.
+  --
+  --  (2) A missing header entry is an explicit, logged exit -- never a
+  --      keep-walking. hc.headers is a PARTIAL map on the live node (~19k of
+  --      963k headers resident after a restart); attempt 2 hung precisely
+  --      because a lookup miss made its active-chain probe return nil forever
+  --      while the descent kept going.
+  --
+  --  (3) Work is O(fork depth + tip gap), never O(chain length): both cursors
+  --      only move DOWN, once each per iteration.
+  local FORK_WALK_HARD_CAP = 2016
   local fork_point_height = nil
   local missing_below_or_at_tip = false
-  local cursor_hex = tip_hex
-  local steps = 0
-  while cursor_hex do
-    local entry = hc.headers[cursor_hex]
-    if not entry then
-      -- Header gap (should not happen for a connected header chain); bail
-      -- rather than guess. The normal cursor logic still runs.
-      return false
-    end
 
-    -- If the ancestry reaches the active validated tip, the header tip EXTENDS
-    -- our chain — ordinary IBD, not a fork.  Leave both cursors untouched.
-    if cursor_hex == active_tip_hex then
-      return false
-    end
-
-    -- Fork point reached when we already have the body on disk. We need not
-    -- fetch it nor anything below it (its ancestors are likewise on disk).
-    local block_hash = validation.compute_block_hash(entry.header)
-    local have_body = self.storage.get(self.storage.CF.BLOCKS, block_hash.bytes) ~= nil
-    if have_body then
-      fork_point_height = entry.height
-      break
-    end
-
-    -- Body missing. If it is at or below the active tip height, this is a
-    -- bridging body the normal floor would skip — record that we have work.
-    if entry.height <= active_tip_height then
-      missing_below_or_at_tip = true
-    end
-
-    steps = steps + 1
-    if steps >= fork_dl_cap then
-      -- Descent hit the depth cap without reaching a have-body ancestor. On a
-      -- pruned node a reorg deeper than this is un-appliable (undo gone), so
-      -- stop here and floor at the deepest height we walked to.  (Archive nodes
-      -- never reach this: fork_dl_cap is math.huge.)
-      fork_point_height = entry.height - 1
-      print(string.format(
-        "[FORK-DL] descent hit fork-download cap=%d at height %d; capping",
-        fork_dl_cap, entry.height))
-      break
-    end
-
-    -- Genesis sentinel: prev_hash all zeros — no parent to walk to.
-    local prev = entry.header.prev_hash
-    if prev.bytes == string.rep("\0", 32) then
-      fork_point_height = entry.height - 1
-      break
-    end
-    cursor_hex = types.hash256_hex(prev)
+  local a = hc.headers[active_tip_hex]
+  local b = tip_entry
+  if not a then
+    print(string.format(
+      "[FORK-DL] cannot walk: ACTIVE TIP %s (h=%d) not resident in the header map; "
+        .. "floor unchanged (partial header map after restart?)",
+      tostring(active_tip_hex):sub(1, 16), active_tip_height))
+    return false
   end
 
+  local function parent_of(entry, label)
+    local prev = entry.header.prev_hash
+    if prev.bytes == string.rep("\0", 32) then return nil, "genesis" end
+    local pk = types.hash256_hex(prev)
+    local e = hc.headers[pk]
+    if not e then return nil, label end
+    return e, nil
+  end
+
+  local steps = 0
+  local a_hex, b_hex = active_tip_hex, tip_hex
+  local aborted = false
+  -- Phase 1: lower the header-tip cursor to the active tip's height.
+  while b.height > a.height do
+    steps = steps + 1
+    if steps > FORK_WALK_HARD_CAP then
+      print(string.format(
+        "[FORK-DL] fork walk hit HARD CAP %d during descent from header tip h=%d "
+          .. "to active h=%d; floor unchanged (a reorg this deep would be refused)",
+        FORK_WALK_HARD_CAP, hc.header_tip_height, active_tip_height))
+      aborted = true
+      break
+    end
+    local nb, why = parent_of(b, "header-map gap (b)")
+    if not nb then
+      print(string.format(
+        "[FORK-DL] fork walk stopped at h=%d: %s; floor unchanged",
+        b.height, tostring(why)))
+      aborted = true
+      break
+    end
+    b = nb
+    b_hex = types.hash256_hex(b.hash and b.hash or validation.compute_block_hash(b.header))
+  end
+  -- Phase 2: descend BOTH in lockstep until the hashes meet (the LCA).
+  while not aborted and a_hex ~= b_hex do
+    -- b is off the active chain here; a missing BODY at/below the active tip
+    -- is a bridging body the normal floor would never request.
+    if b.height <= active_tip_height then
+      local bh = validation.compute_block_hash(b.header)
+      if self.storage.get(self.storage.CF.BLOCKS, bh.bytes) == nil then
+        missing_below_or_at_tip = true
+      end
+    end
+    steps = steps + 1
+    if steps > FORK_WALK_HARD_CAP then
+      print(string.format(
+        "[FORK-DL] fork walk hit HARD CAP %d in lockstep at h=%d; floor unchanged",
+        FORK_WALK_HARD_CAP, a.height))
+      aborted = true
+      break
+    end
+    local na, whya = parent_of(a, "header-map gap (a)")
+    local nb, whyb = parent_of(b, "header-map gap (b)")
+    if not na or not nb then
+      print(string.format(
+        "[FORK-DL] fork walk stopped at h=%d: %s; floor unchanged",
+        a.height, tostring(whya or whyb)))
+      aborted = true
+      break
+    end
+    a, b = na, nb
+    a_hex = types.hash256_hex(validation.compute_block_hash(a.header))
+    b_hex = types.hash256_hex(validation.compute_block_hash(b.header))
+  end
+  if aborted then
+    return false
+  end
+  -- a_hex == b_hex: `a` is the last common ancestor -- the fork point.
+  fork_point_height = a.height
   -- Only lower the floor when a bridging body at/below the active tip is
   -- actually missing — i.e. a genuine below-tip fork. A header tip that simply
   -- extends the active chain has have_body=true at the active tip on the very
