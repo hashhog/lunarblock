@@ -3542,15 +3542,36 @@ function BlockDownloader:_connect_pending_blocks_inner()
         blocks_this_call = blocks_this_call + 1
         goto continue_loop
       elseif sb_result == "stored" then
-        -- Side-branch body persisted; active tip unchanged.  This height's
-        -- ACTIVE-chain block is something else (this fork body is below/beside
-        -- the active tip in work).  Advance the connect cursor past it so the
-        -- loop does not re-route the same stored body forever, and stamp the
-        -- stall timer (storing IS forward progress on the fork).  When a later
-        -- fork body crosses the active-tip work the "connected" arm above
-        -- fires and the reorg switches the tip.
+        -- Side-branch body persisted; active tip unchanged.
+        --
+        -- The cursor advance below is CONDITIONAL, and the condition is the
+        -- 2026-08-20 mainnet wedge (second act). Unconditional `+1` made the
+        -- connect cursor track "blocks STORED", not "blocks CONNECTED": every
+        -- stored body marched it forward, so on a node catching up from
+        -- behind (bodies above the frontier arrive parent-missing and are
+        -- stored) the cursor ran away to the HEADER TIP (observed live:
+        -- next_conn=963384 with the validated tip at 962731 -- immediately
+        -- after the fork-point fix un-wedged the node, this became the next
+        -- wedge: downloader believed everything was done, Inflight: 0).
+        --
+        -- The advance exists so the loop does not re-route the same stored
+        -- side-branch body at the cursor forever. That purpose only applies
+        -- when the stored body sits AT the cursor and AT/BELOW the active
+        -- frontier -- a true beside-the-chain side branch. A stored body
+        -- ABOVE the active tip is a not-yet-connectable future block; the
+        -- cursor must stay at the frontier so the downloader keeps fetching
+        -- the missing parents.
         self.pending_blocks[hash_hex] = nil
-        self.next_connect_height = self.next_connect_height + 1
+        if pending.height == nil or pending.height == self.next_connect_height then
+          -- Advance ONLY for a stored body AT the cursor: that is the sole
+          -- case where standing still re-requests and re-routes the same
+          -- lost-race body at this height forever. A stored body ABOVE the
+          -- cursor is a not-yet-connectable future block -- advancing on
+          -- those is exactly the runaway (cursor tracks stored-not-connected
+          -- and marches to the header tip). nil height keeps the legacy
+          -- advance for harnesses without height bookkeeping.
+          self.next_connect_height = self.next_connect_height + 1
+        end
         local _sb_sock = require("socket")
         self.last_connect_advance = _sb_sock.gettime()
         blocks_this_call = blocks_this_call + 1
