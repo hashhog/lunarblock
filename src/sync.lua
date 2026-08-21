@@ -2735,16 +2735,21 @@ function BlockDownloader:_route_fork_body(block, hash, entry)
     end
   end
 
-  -- Idempotence: if the body is already on disk we have already routed it
-  -- as a SIDE BRANCH (the extend case returned above); do not double-store /
-  -- re-reorg.
-  if self.storage and self.storage.CF and self.storage.CF.BLOCKS then
-    local have = self.storage.get(self.storage.CF.BLOCKS, hash.bytes)
-    if have then
-      return "stored"  -- already persisted; nothing further to do here
-    end
-  end
-
+  -- NO already-on-disk short-circuit here. There used to be one ("already
+  -- persisted; nothing further to do") and it was LAYER 4 of the 2026-08-20/21
+  -- wedge: a node that had persisted the entire heavier fork during earlier
+  -- wedged sessions could never CONSULT the orchestrator about those bodies --
+  -- each re-routed persisted body returned "stored" before
+  -- accept_side_branch_block ever saw it, so the fork's work was never
+  -- compared and the reorg never fired. The cursor then marched the whole
+  -- range connecting nothing.
+  --
+  -- Idempotence belongs to the ORCHESTRATOR, and it already has it:
+  -- accept_side_branch_block work-compares BEFORE storing (utxo.lua B9),
+  -- put_block is an explicit idempotent overwrite, a lighter-or-equal branch
+  -- returns "stored" without reorging, and a body already on the active chain
+  -- compares non-heavier and no-ops. Routing a persisted body is safe; NOT
+  -- routing it is the wedge.
   local ok, result, err = pcall(self.side_branch_callback, block, hash, entry and entry.height)
   if not ok then
     -- The callback raised (e.g. a Lua error inside the reorg connect loop).

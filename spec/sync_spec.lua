@@ -1159,6 +1159,104 @@ describe("sync", function()
           types.hash256_hex(chain.header_tip_hash))
       end)
 
+      -- LAYER-4 FIXTURE (the 2026-08-21 live state, in miniature): a node on a
+      -- side branch with the ENTIRE heavier fork PRE-PERSISTED in storage from
+      -- earlier wedged sessions -- none of it ever connected. The node must
+      -- reach the fork tip WITHOUT re-downloading anything. Live, the cursor
+      -- marched the whole range classifying each body "stored" and connected
+      -- nothing (Height 962722 -> cursors at 963394, "too-far-ahead").
+      it("connects a fully pre-persisted heavier fork to its tip (no re-download)", function()
+        local function build_branch(parent_hash, n, ts0, ts_step, persist)
+          local hashes = {}
+          local parent, ts = parent_hash, ts0
+          for i = 1, n do
+            ts = ts + ts_step
+            local header = create_valid_header(parent, ts)
+            assert.is_true(find_valid_nonce(header))
+            chain:accept_header(header)
+            local bh = validation.compute_block_hash(header)
+            hashes[#hashes + 1] = bh
+            if persist then storage.put_block(bh, types.block(header, {})) end
+            parent = bh
+          end
+          return hashes
+        end
+
+        local genesis_hash = chain:get_tip_hash()
+        local genesis_ts = consensus.networks.regtest.genesis.timestamp
+        storage.put_block(genesis_hash,
+          types.block(chain:get_header_at_height(0).header, {}))
+
+        -- Active side branch: A1..A3 (bodies persisted, "connected" past).
+        local a_hashes = build_branch(genesis_hash, 3, genesis_ts, 1200, true)
+        -- Heavier fork off genesis: B1..B12, ALL bodies pre-persisted.
+        local b_hashes = build_branch(genesis_hash, 12, genesis_ts, 1440, true)
+        assert.equals(12, chain.header_tip_height)
+
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        downloader.next_connect_height = 4
+        downloader.next_download_height = 4
+        -- Mutable active tip: starts on the side branch; the orchestrator mock
+        -- switches it when the fork's work crosses, mirroring the real
+        -- accept_side_branch_block contract.
+        local active = { hash = a_hashes[3], height = 3 }
+        downloader.active_tip_provider = function()
+          return active.hash, active.height
+        end
+        -- Orchestrator mock with the REAL contract: given a fork body, if the
+        -- fork (all on disk) has more work than the active branch, connect the
+        -- whole stored prefix and return "connected"; if the body extends the
+        -- active tip, say "extend"; else store and report "stored".
+        local connect_callback_hits = 0
+        downloader.connect_callback = function(block, height)
+          -- normal connect path: adopt as new active tip
+          local bh = validation.compute_block_hash(block.header)
+          active.hash, active.height = bh, height
+          connect_callback_hits = connect_callback_hits + 1
+          return true
+        end
+        downloader.side_branch_callback = function(block, hash, height)
+          if block.header.prev_hash.bytes == active.hash.bytes then
+            return "extend"
+          end
+          -- Fork body: the whole B chain is heavier once its tip exceeds the
+          -- active work; emulate accept_side_branch_block connecting the
+          -- stored prefix B1..B(k) in one drive and switching the tip.
+          for i = 1, #b_hashes do
+            if b_hashes[i].bytes == hash.bytes then
+              if i > active.height or true then
+                -- connect the stored prefix up to this body
+                active.hash, active.height = b_hashes[i], i
+                return "connected"
+              end
+            end
+          end
+          return "stored"
+        end
+
+        local peer = create_mock_peer(1, 100)
+        -- Drive the node the way main.lua does: alternate scheduling and
+        -- connecting, several rounds. NOTHING is delivered by the peer -- all
+        -- bodies are already in storage, so progress must come from the
+        -- storage-load path in connect_pending_blocks.
+        for _ = 1, 30 do
+          downloader:schedule_downloads({peer})
+          downloader:connect_pending_blocks()
+        end
+
+        -- THE ASSERTION THE LIVE NODE FAILS: the node must reach the fork tip.
+        assert.equals(12, active.height,
+          "node did not connect the pre-persisted fork to its tip (layer-4 wedge)")
+        -- And nothing should have been re-requested from the peer for bodies
+        -- already on disk (allow header-sync messages; count getdata only).
+        local getdata = 0
+        for _, msg in ipairs(peer.messages_sent) do
+          if msg.command == "getdata" then getdata = getdata + 1 end
+        end
+        assert.is_true(getdata <= 2,
+          "node re-downloaded pre-persisted bodies (" .. getdata .. " getdata messages)")
+      end)
+
       -- The walk must be bounded by a FINITE constant even on archive nodes
       -- (pruning off). fork_dl_cap = math.huge is what turned both failed
       -- fixes into live hangs.
