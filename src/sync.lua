@@ -2718,8 +2718,26 @@ function BlockDownloader:_route_fork_body(block, hash, entry)
     return nil, "no-side-branch-callback"
   end
 
+  -- A body that EXTENDS the active tip must reach the normal connect path
+  -- no matter what is on disk. This check must come BEFORE the idempotence
+  -- short-circuit below: bodies persisted during an EARLIER (wedged) session
+  -- are on disk without ever having been connected, and classifying them
+  -- "stored" here made the caller's at-cursor advance skip them one by one --
+  -- the cursor marched through the whole previously-persisted range
+  -- 962732..963393 without connecting anything (the third act of the
+  -- 2026-08-20/21 wedge: Height 962731, cursors at the header tip,
+  -- Inflight 0). Disk presence says nothing about connection.
+  if self.active_tip_provider then
+    local at_hash = self.active_tip_provider()
+    if at_hash and block.header and block.header.prev_hash
+        and block.header.prev_hash.bytes == at_hash.bytes then
+      return "extend"
+    end
+  end
+
   -- Idempotence: if the body is already on disk we have already routed it
-  -- (or connected it on the active chain); do not double-store / re-reorg.
+  -- as a SIDE BRANCH (the extend case returned above); do not double-store /
+  -- re-reorg.
   if self.storage and self.storage.CF and self.storage.CF.BLOCKS then
     local have = self.storage.get(self.storage.CF.BLOCKS, hash.bytes)
     if have then
