@@ -531,8 +531,19 @@ end
 -- @param payload string: message payload (optional, defaults to empty)
 -- @return boolean: true on success
 function Peer:send_message(command, payload)
-  if self.state == M.STATE.DISCONNECTED then return false end
-  if not self.socket then return false end
+  -- #74: these early-return false WITHOUT disconnecting — callers with
+  -- request-tracking state MUST check the return (the socket:send failure
+  -- below self-disconnects, these two paths do not).
+  if self.state == M.STATE.DISCONNECTED then
+    io.stderr:write(string.format("[peer] send_message(%s) dropped — %s:%s already disconnected\n",
+      command, tostring(self.ip), tostring(self.port)))
+    return false
+  end
+  if not self.socket then
+    io.stderr:write(string.format("[peer] send_message(%s) dropped — %s:%s has no socket\n",
+      command, tostring(self.ip), tostring(self.port)))
+    return false
+  end
   payload = payload or ""
 
   local msg

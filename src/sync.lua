@@ -1870,7 +1870,15 @@ function HeaderChain:start_sync(peer)
     types.hash256_zero()  -- no stop hash = get all
   )
 
-  peer:send_message("getheaders", payload)
+  if not peer:send_message("getheaders", payload) then
+    -- #74: the getheaders never left — release the syncing latch, else
+    -- every re-engagement point (gated on `not self.syncing`) is dead
+    -- until on_peer_disconnected fires (which the no-socket/disconnected
+    -- early-returns in send_message do NOT trigger).
+    self.syncing = false
+    self.sync_peer = nil
+    io.stderr:write("[sync] start_sync getheaders dropped — latch released\n")
+  end
 end
 
 --- Try to initiate low-work header sync (PRESYNC/REDOWNLOAD).
@@ -2050,7 +2058,9 @@ function HeaderChain:handle_headers(peer, payload)
           locator,
           types.hash256_zero()
         )
-        peer:send_message("getheaders", send_payload)
+        if not peer:send_message("getheaders", send_payload) then
+          io.stderr:write("[sync] PRESYNC continuation getheaders dropped (send_message logged why)\n")
+        end
       end
     else
       -- Sync complete
@@ -2103,7 +2113,9 @@ function HeaderChain:handle_headers(peer, payload)
             locator,
             types.hash256_zero()
           )
-          peer:send_message("getheaders", send_payload)
+          if not peer:send_message("getheaders", send_payload) then
+            io.stderr:write("[sync] low-work-sync initial getheaders dropped (send_message logged why)\n")
+          end
         end
       end
       return 0  -- Headers queued in PRESYNC, not yet accepted
@@ -3201,7 +3213,20 @@ function BlockDownloader:schedule_downloads(peers)
     if #items > 0 then
       -- Update peer inflight count
       self.peer_inflight[p] = (self.peer_inflight[p] or 0) + #items
-      p:send_message("getdata", p2p.serialize_inv(items))
+      if not p:send_message("getdata", p2p.serialize_inv(items)) then
+        -- #74: the getdata never left — revert this batch's in-flight
+        -- state now instead of stranding it against a request that was
+        -- never sent (the blockbrew-wedge shape; old recovery was the
+        -- stall sweep). send_message logs the drop.
+        self.peer_inflight[p] = math.max((self.peer_inflight[p] or 0) - #items, 0)
+        for _, item in ipairs(items) do
+          local hex = types.hash256_hex(item.hash)
+          if self.inflight[hex] and self.inflight[hex].peer == p then
+            self.inflight[hex] = nil
+          end
+        end
+        io.stderr:write(string.format("[sync] getdata batch of %d reverted — send dropped\n", #items))
+      end
     end
   end
 end
