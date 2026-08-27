@@ -2463,10 +2463,27 @@ function BlockDownloader:_apply_fork_aware_floor()
   local tip_entry = hc.headers[tip_hex]
   if not tip_entry then return false end
 
-  -- GATE 2 — only a header tip with MORE work than the active validated tip can
-  -- trigger a reorg.  A header tip at/below the active tip height is either our
-  -- own chain or a lighter side branch; either way no rewind is warranted.
-  if (tip_entry.height or 0) <= active_tip_height then return false end
+  -- GATE 2 — only a header tip with MORE work than the active validated tip
+  -- can trigger the fork descent (#53, 2026-08-27: the code previously
+  -- compared HEIGHT while this comment already claimed work — a
+  -- heavier-but-SHORTER header chain, possible at a difficulty boundary,
+  -- was wrongly refused here; a taller-but-lighter one wrongly admitted).
+  -- Compare cumulative work when both sides have it; fall back to the old
+  -- height gate LOUDLY only when the active tip's work is unavailable
+  -- (the descent is a download-scheduling path — final selection is
+  -- enforced at connect by the work-selected header machinery).
+  local active_hex_for_work = types.hash256_hex(active_tip_hash)
+  local active_entry = hc.headers[active_hex_for_work]
+  if tip_entry.total_work and active_entry and active_entry.total_work then
+    if consensus.work_compare(tip_entry.total_work, active_entry.total_work) <= 0 then
+      return false
+    end
+  else
+    io.stderr:write(string.format(
+      "[sync] GATE2: no work basis for active tip %s (entry=%s) — height fallback\n",
+      active_hex_for_work:sub(1, 16), tostring(active_entry ~= nil)))
+    if (tip_entry.height or 0) <= active_tip_height then return false end
+  end
 
   local active_tip_hex = types.hash256_hex(active_tip_hash)
 
