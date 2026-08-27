@@ -12531,9 +12531,27 @@ function RPCServer:register_methods()
       return blk, bh
     end
 
+    -- #53: plumb cumulative WORK for the activation gate when the header
+    -- chain has both sides (Core validation.cpp:5706 compares work, not
+    -- height). Missing entries fall back to the loud height proxy inside
+    -- load_snapshot.
+    local snap_base_work, active_tip_work
+    if rpc.header_chain and rpc.header_chain.headers then
+      -- base_hash_hex (display-order hex) is exactly the header-map key.
+      local e = rpc.header_chain.headers[base_hash_hex]
+      snap_base_work = e and e.total_work or nil
+      local at_hash = rpc.chain_state and rpc.chain_state.tip_hash
+      if at_hash then
+        local types_mod = require("lunarblock.types")
+        local at_hex = type(at_hash) == "table" and types_mod.hash256_hex(at_hash) or at_hash
+        local e2 = rpc.header_chain.headers[at_hex]
+        active_tip_work = e2 and e2.total_work or nil
+      end
+    end
     local activation, aerr = utxo_mod.activate_snapshot_with_background(
       rpc.chain_state, path, au_data, au_height, bg_get_block,
-      { active_tip_height = active_tip, mempool = rpc.mempool })
+      { active_tip_height = active_tip, mempool = rpc.mempool,
+        snapshot_base_work = snap_base_work, active_tip_work = active_tip_work })
     if not activation then
       error({code = M.ERROR.MISC_ERROR,
         message = aerr or "load failed"})

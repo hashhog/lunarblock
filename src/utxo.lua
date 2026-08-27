@@ -5927,7 +5927,7 @@ end
 --                           and non-empty the load is refused (BUG-5 /
 --                           Core:5627-5629).
 -- @return boolean, string|nil: success flag, error message
-function ChainState:load_snapshot(file_path, expected_hash, base_height, active_tip_height, mempool)
+function ChainState:load_snapshot(file_path, expected_hash, base_height, active_tip_height, mempool, snapshot_base_work, active_tip_work)
   -- BUG-3 fix: duplicate-activation guard.
   -- Core validation.cpp:5600-5601: if m_from_snapshot_blockhash is already
   -- set, refuse with "Can't activate a snapshot-based chainstate more than
@@ -5937,17 +5937,31 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
   end
 
   -- BUG-4 fix: snapshot work must exceed active chainstate.
-  -- Core validation.cpp:5706-5708: refuse if the snapshot tip does not
+  -- Core validation.cpp:5706-5708: refuse if the snapshot base does not
   -- represent more work than the current active chain tip.
-  -- lunarblock does not carry per-block chainwork; we use tip height as a
-  -- monotone proxy (same network, same difficulty — higher height ≡ more work).
-  -- Only apply when the active chain has progressed beyond genesis (height > 0);
-  -- loading a snapshot into a fresh node (active_tip_height <= 0) is the normal
+  -- #53 (2026-08-27): compare CUMULATIVE WORK when the caller supplies it
+  -- (the header chain carries total_work; the RPC loadtxoutset path plumbs
+  -- both sides through). The old code compared HEIGHT while the refusal
+  -- MESSAGE claimed work — the comment-vs-code lie this campaign hunts.
+  -- The height proxy survives only as a LOUD fallback when work is
+  -- unavailable, with a message that tells the truth.
+  -- Only apply when the active chain has progressed beyond genesis;
+  -- loading into a fresh node (active_tip_height <= 0) is the normal
   -- AssumeUTXO fast-sync path and must not be rejected.
   if active_tip_height ~= nil and active_tip_height > 0 then
-    local snap_height = base_height or (self.tip_height or -1)
-    if snap_height <= active_tip_height then
-      return false, "work does not exceed active chainstate"
+    if snapshot_base_work and active_tip_work then
+      local consensus = require("lunarblock.consensus")
+      if consensus.work_compare(snapshot_base_work, active_tip_work) <= 0 then
+        return false, "work does not exceed active chainstate"
+      end
+    else
+      local snap_height = base_height or (self.tip_height or -1)
+      io.stderr:write(string.format(
+        "[assumeutxo] no work basis for activation gate (snap_work=%s active_work=%s) — height proxy\n",
+        tostring(snapshot_base_work ~= nil), tostring(active_tip_work ~= nil)))
+      if snap_height <= active_tip_height then
+        return false, "height does not exceed active chainstate (height proxy; header work unavailable)"
+      end
     end
   end
 
@@ -6432,7 +6446,8 @@ function M.activate_snapshot_with_background(active_chain_state, snapshot_path,
   -- that wants the load-time gate too can pass opts.enforce_load_hash=true.
   local load_expected = opts.enforce_load_hash and expected_hash or nil
   local ok, lerr = active_chain_state:load_snapshot(
-    snapshot_path, load_expected, base_height, opts.active_tip_height, opts.mempool)
+    snapshot_path, load_expected, base_height, opts.active_tip_height, opts.mempool,
+    opts.snapshot_base_work, opts.active_tip_work)
   if not ok then
     return nil, lerr or "snapshot load failed"
   end
