@@ -306,10 +306,10 @@ describe("W100 CCoinsViewCache + FlushStateToDisk audit", function()
       local bit = require("bit")
       local FLAG_FRESH = 0x02
       local is_fresh = bit.band(cache_entry.flags or 0, FLAG_FRESH) ~= 0
-      -- SPEC: should be false (coin exists on disk already)
-      -- Current buggy behavior: is_fresh = true
-      -- assert.is_false(is_fresh)  -- would pass when fixed
-      assert.is_true(is_fresh)  -- BUG documented: FRESH wrongly set
+      -- FLIPPED (was the B2 lock-in): the coin exists on disk, so the
+      -- re-add must NOT be FRESH (add() probes the store on a cache miss).
+      -- FAILS AT PARENT: the parent wrongly set FRESH here.
+      assert.is_false(is_fresh)
     end)
 
     it("FRESH+spent coin eviction skips disk delete — phantom UTXO left — B2", function()
@@ -331,13 +331,12 @@ describe("W100 CCoinsViewCache + FlushStateToDisk audit", function()
       -- Flush — no delete should have been queued for the FRESH-spent entry.
       view:flush(true)
 
-      -- SPEC: coin is spent, disk should return nil.
-      -- BUG: coin was never deleted from disk (FRESH path skipped delete).
-      -- After flush+evict, :get falls through to disk and may find the phantom.
+      -- FLIPPED (was the B2 lock-in asserting the phantom): the re-add of a
+      -- disk-resident coin is no longer marked FRESH (add() probes the store
+      -- on a cache miss), so the spend queues the disk delete and the flush
+      -- removes the coin.  FAILS AT PARENT: the parent found the phantom.
       local phantom = view:get(tx, 0)
-      -- assert.is_nil(phantom)  -- would pass when fixed
-      -- Document current behavior: phantom coin found on disk
-      assert.is_not_nil(phantom)  -- BUG: phantom UTXO
+      assert.is_nil(phantom)
     end)
   end)
 

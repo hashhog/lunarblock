@@ -1314,11 +1314,14 @@ function CoinView:add(txid, vout, entry)
   -- (i.e., it was just created and never flushed to disk)
   local mark_fresh = true
   if existing then
-    -- If the existing entry was dirty (but not fresh), we can't mark as fresh
-    -- because the original might still be on disk
-    if is_dirty(existing) and not is_fresh(existing) then
-      mark_fresh = false
-    end
+    -- FRESH provenance: INHERIT from the existing entry (w100 G8/B2 fix).
+    -- Any cached entry without the FRESH flag — a clean read-through, a
+    -- flushed entry, or a spent tombstone awaiting its disk delete — may be
+    -- disk-resident; re-marking it fresh would make CoinView:spend skip the
+    -- disk delete and leave a phantom UTXO on disk forever.  (The old rule
+    -- only caught dirty-and-not-fresh, so a CLEAN disk-backed hit was
+    -- wrongly re-marked fresh.)
+    mark_fresh = is_fresh(existing)
     -- Update memory tracking
     self.cached_memory_usage = self.cached_memory_usage - estimate_entry_memory(existing)
 
@@ -1328,9 +1331,14 @@ function CoinView:add(txid, vout, entry)
       self.dirty_count = self.dirty_count - 1
     end
   else
-    -- New entry not in cache - could be on disk, can't assume fresh
-    -- Actually, if we're adding, it's typically a new output, so mark fresh
-    mark_fresh = true
+    -- Cache miss: the outpoint can still be DISK-resident (post-flush
+    -- eviction, crash-replay re-connect).  FRESH is only safe when the coin
+    -- is provably absent from the store, so probe it — Core's replay path
+    -- does the same (AddCoins check_for_overwrite; clearbit fb4051b and
+    -- beamchain 8cfc3d3 are the fleet siblings of this fix).
+    if self:_fetch_from_disk(key) ~= nil then
+      mark_fresh = false
+    end
   end
 
   -- Set flags
