@@ -408,31 +408,12 @@ function HeadersSyncState:presync_complete()
   return self.state == HeadersSyncState.STATE.REDOWNLOAD
 end
 
---- Get the getheaders request parameters for current state.
--- Mirrors Bitcoin Core HeadersSyncState::NextHeadersRequestLocator()
--- (headerssync.cpp:296-317).
--- @return table: {locator_hashes, stop_hash}
-function HeadersSyncState:get_getheaders_request()
-  if self.state == HeadersSyncState.STATE.PRESYNC then
-    -- During PRESYNC, continue from the last header received.
-    -- Bitcoin Core: locator.push_back(m_last_header_received.GetHash())
-    return {
-      locator_hashes = {self.presync.last_hash},
-      stop_hash = types.hash256_zero()
-    }
-  elseif self.state == HeadersSyncState.STATE.REDOWNLOAD then
-    -- Bug-fix: during REDOWNLOAD, resume from the last buffered/redownloaded hash,
-    -- NOT from chain_start_hash.  Old code returned chain_start_hash which forced
-    -- re-downloading from the very beginning of the chain on every batch.
-    -- Bitcoin Core: locator.push_back(m_redownload_buffer_last_hash) (headerssync.cpp:311).
-    return {
-      locator_hashes = {self.redownload.last_hash},
-      stop_hash = types.hash256_zero()
-    }
-  else
-    return nil
-  end
-end
+-- NOTE(2026-08-27, meta #72): HeadersSyncState:get_getheaders_request was
+-- deleted — it returned the single-hash continue-from locator (the
+-- degenerate shape fixed live in six sibling nodes) and had ZERO send-site
+-- callers: the live PRESYNC/REDOWNLOAD continuations use
+-- build_presync_locator (full exponential chain_start walk, genesis-
+-- terminated, see :17xx). Deleted as a second-implementation trap.
 
 --------------------------------------------------------------------------------
 -- REDOWNLOAD Phase
