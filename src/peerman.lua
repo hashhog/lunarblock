@@ -3287,15 +3287,32 @@ function PeerManager:consider_eviction(p, now)
       -- Already sent getheaders and still behind - disconnect
       self:disconnect_peer(p, "outbound peer has old chain")
     else
-      -- Send a getheaders to give peer a chance
+      -- Send a getheaders to give peer a chance.
+      -- Core sends GetLocator(m_chain_sync.m_work_header->pprev)
+      -- (net_processing.cpp:5248-5252) — a REAL locator anchored one
+      -- block below our work header, so an honest peer at the same tip
+      -- still answers with at least one header. The old code sent an
+      -- EMPTY locator with a zero hash_stop: Core's ProcessGetHeaders
+      -- treats a null locator as "look up hash_stop", zero resolves to
+      -- nothing, so most peers answered with NOTHING — the probe was a
+      -- functional no-op that converted the timeout into a guaranteed
+      -- eviction (#72 audit row (4), 2026-08-27).
       if p.state == peer_mod.STATE.ESTABLISHED then
-        -- Send getheaders with our tip
-        local getheaders_payload = p2p.serialize_getheaders(
-          p2p.PROTOCOL_VERSION,
-          {},  -- empty locator = from genesis
-          p2p.ZERO_HASH
-        )
-        p:send_message("getheaders", getheaders_payload)
+        local locator = {}
+        if self.locator_provider then
+          locator = self.locator_provider() or {}
+        end
+        if #locator == 0 then
+          io.stderr:write("[peerman] chain-sync probe has no locator available; " ..
+            "skipping getheaders (would be a no-op with an empty locator)\n")
+        else
+          local getheaders_payload = p2p.serialize_getheaders(
+            p2p.PROTOCOL_VERSION,
+            locator,
+            p2p.ZERO_HASH
+          )
+          p:send_message("getheaders", getheaders_payload)
+        end
       end
       sync_state.sent_getheaders = true
       -- Extend timeout by HEADERS_RESPONSE_TIME

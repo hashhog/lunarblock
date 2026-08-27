@@ -1725,6 +1725,15 @@ local function main()
     data_dir = datadir,
   })
   peer_manager.our_height = header_chain.header_tip_height
+  -- Chain-sync-timeout probe locator (#72 row (4)): Core anchors this
+  -- getheaders one block BELOW the work header (GetLocator(pprev),
+  -- net_processing.cpp:5248) so a same-tip honest peer still answers
+  -- with >=1 header. An empty locator (the old behavior) elicited
+  -- nothing and guaranteed the eviction it was meant to avert.
+  peer_manager.locator_provider = function()
+    local h = math.max((header_chain.header_tip_height or 1) - 1, 0)
+    return header_chain:build_locator_from_height(h)
+  end
 
   -- Load ASMap for ASN-based IP bucketing (W115 FIX-50, BUG-25 startup log).
   -- --asmap PATH: load from disk.  No --asmap: skip (plain /16//32 bucketing).
