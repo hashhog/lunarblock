@@ -55,6 +55,86 @@
 --   bitcoin-core/src/univalue/include/univalue.h         getInt<Int>
 --   bitcoin-core/src/rpc/protocol.h                      RPC_MISC_ERROR = -1
 --                                                        RPC_INVALID_PARAMETER = -8
+--
+--
+-- ============================================================================
+-- SECOND DEFECT (same RPC, same file): an EXPLICIT `replaceable=true` that the
+-- supplied sequence numbers contradict was silently accepted
+-- ============================================================================
+--
+-- THE DEFECT
+-- ----------
+-- `createrawtransaction(ins, outs, 0, true)` asks for a REPLACEABLE
+-- transaction.  BIP-125 opt-in signalling means at least one input carrying
+-- nSequence <= MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD); a sequence ABOVE that
+-- value is precisely the opt-OUT.  So a caller who passes replaceable=true and
+-- also pins every input to 0xFFFFFFFE or 0xFFFFFFFF has asked for two things
+-- that cannot both be true.
+--
+-- Pre-fix, this node resolved the contradiction silently and in favour of the
+-- sequence: it returned a well-formed transaction hex that CANNOT be
+-- fee-bumped, with no error, no warning and no log line.  The caller learns
+-- the truth only when the bump is actually needed and the replacement is
+-- refused by the network -- at which point the transaction is already
+-- broadcast and stuck.  Nine of the ten nodes in this repo still behave this
+-- way.  Core refuses to guess which of the two the caller meant.
+--
+-- WHAT BITCOIN CORE DOES
+-- ----------------------
+-- The LAST statement of ConstructTransaction
+-- (bitcoin-core/src/rpc/rawtransaction_util.cpp:166), after AddInputs AND
+-- AddOutputs have both run:
+--
+--     if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+--         !SignalsOptInRBF(CTransaction(rawTx))) {
+--         throw JSONRPCError(RPC_INVALID_PARAMETER,
+--             "Invalid parameter combination: Sequence number(s) contradict "
+--             "replaceable option");
+--     }
+--
+-- with SignalsOptInRBF (bitcoin-core/src/util/rbf.cpp) returning true if ANY
+-- input has nSequence <= MAX_BIP125_RBF_SEQUENCE (util/rbf.h = 0xfffffffd).
+-- "Any" rather than "all" is deliberate upstream: in a multi-party protocol a
+-- single participant must not be able to disable replacement by opting out in
+-- their own input.
+--
+-- THE ABSENT-vs-EXPLICIT ASYMMETRY (the subtle part)
+-- --------------------------------------------------
+-- `rbf` is a std::optional<bool>, left `nullopt` when the JSON param is
+-- absent/null.  TWO DIFFERENT QUESTIONS are asked of it:
+--   • AddInputs asks `rbf.value_or(true)` -- absent counts as TRUE, which is
+--     what makes 0xFFFFFFFD the DEFAULT sequence.
+--   • this check asks `rbf.has_value() && rbf.value()` -- absent counts as NOT
+--     SET, so no check fires at all.
+-- Consequence, verified against a live Core node: an omitted `replaceable`
+-- with an explicit final sequence is ACCEPTED, while the same call with
+-- `replaceable=true` spelled out is REJECTED.  A check that keyed off the
+-- effective boolean instead of has_value() would break the first case, which
+-- is ordinary, legal usage.
+--
+-- ORDERING
+-- --------
+-- Core runs the check after AddOutputs, so an OUTPUT error still wins over it.
+-- A request that is wrong in both ways must report the output error.  The
+-- ordering case below pins that.
+--
+-- TEETH
+-- -----
+-- Only two of the eight oracle rows are rejections.  The four ACCEPT rows
+-- (absent-rbf, signalling sequence, no inputs at all, one-of-two inputs
+-- signalling) plus replaceable=false and the defaulted sequence are the real
+-- guard: an over-eager check that ignored has_value(), or scanned for "all
+-- inputs signal" instead of "any input signals", or forgot the vin-empty
+-- guard, passes both rejections and fails these.  Where the tx is built
+-- successfully the assertions DECODE the returned hex with the node's own
+-- deserializer and read the sequence that actually landed in the wire bytes.
+--
+-- References:
+--   bitcoin-core/src/rpc/rawtransaction_util.cpp:147-171  ConstructTransaction
+--   bitcoin-core/src/rpc/rawtransaction_util.cpp:47-66    AddInputs sequence
+--   bitcoin-core/src/util/rbf.cpp                         SignalsOptInRBF
+--   bitcoin-core/src/util/rbf.h                           MAX_BIP125_RBF_SEQUENCE
+--                                                           = 0xfffffffd
 
 local rpc = require("lunarblock.rpc")
 local serialize = require("lunarblock.serialize")
@@ -195,6 +275,190 @@ describe("createrawtransaction vout int32 range", function()
       -- Mandatory teeth: proves the handler still does its normal job, so the
       -- rejection tests above cannot be satisfied by a reject-everything stub.
       assert_accepted(call_vout("7"), 7, "vout 7 (ordinary)")
+    end)
+  end)
+
+  -- ==========================================================================
+  -- explicit replaceable=true contradicted by the sequence numbers
+  -- (ConstructTransaction:166 + SignalsOptInRBF).  Every case below is a row
+  -- of the oracle table captured from a LIVE Bitcoin Core node.
+  -- ==========================================================================
+  describe("replaceable option contradicted by sequence numbers", function()
+
+    local CONTRADICT_MSG =
+      "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+
+    -- MAX_BIP125_RBF_SEQUENCE and its two neighbours, spelled decimal because
+    -- that is how they travel in JSON.
+    local SEQ_RBF      = 4294967293  -- 0xFFFFFFFD  MAX_BIP125_RBF_SEQUENCE
+    local SEQ_NONFINAL = 4294967294  -- 0xFFFFFFFE  MAX_SEQUENCE_NONFINAL
+    local SEQ_FINAL    = 4294967295  -- 0xFFFFFFFF  SEQUENCE_FINAL
+
+    -- One input, optional explicit sequence, optional trailing args. `rbf_json`
+    -- is spliced in as literal JSON text so that ABSENT (nil here) and the
+    -- JSON literals `true` / `false` / `null` reach the handler exactly as they
+    -- would off the wire -- the absent/present distinction is the whole point
+    -- of these cases and must not be laundered through a Lua encoder.
+    local function call_rbf(sequence_json, rbf_json)
+      local seq_part = ""
+      if sequence_json then
+        seq_part = ',"sequence":' .. sequence_json
+      end
+      local extra = nil
+      if rbf_json then
+        extra = ',0,' .. rbf_json    -- locktime 0, then replaceable
+      end
+      return call('[{"txid":"' .. TXID .. '","vout":0' .. seq_part .. '}]', extra)
+    end
+
+    -- Read back the sequence numbers that actually reached the wire bytes,
+    -- using the node's own deserializer (same technique as first_input_vout).
+    local function tx_sequences(hex)
+      local tx = serialize.deserialize_transaction(rpc.hex_decode(hex))
+      local seqs = {}
+      for i = 1, #tx.inputs do
+        seqs[i] = tx.inputs[i].sequence
+      end
+      return seqs
+    end
+
+    local function assert_sequences(decoded, expected, what)
+      if decoded.error ~= nil and decoded.error ~= cjson.null then
+        assert.truthy(false, what .. ": expected success but got error " ..
+          tostring(decoded.error.code) .. " " .. tostring(decoded.error.message))
+      end
+      assert.truthy(type(decoded.result) == "string",
+        what .. ": expected a hex string result, got " .. type(decoded.result))
+      local got = tx_sequences(decoded.result)
+      assert.truthy(#got == #expected, what .. ": expected " ..
+        tostring(#expected) .. " input(s) in the tx bytes, got " ..
+        tostring(#got))
+      for i = 1, #expected do
+        assert.truthy(got[i] == expected[i], what .. ": input " .. tostring(i) ..
+          " sequence in the tx bytes -- expected " .. tostring(expected[i]) ..
+          ", got " .. tostring(got[i]))
+      end
+    end
+
+    -- ---- ROW 1 ----
+    it("ACCEPTS an ABSENT replaceable with a FINAL sequence (has_value() is false)",
+    function()
+      -- The asymmetry case. Absent still DEFAULTS to replaceable for choosing
+      -- the sequence, but has_value() is false so the contradiction check is
+      -- skipped entirely. A check keyed off the effective boolean rather than
+      -- has_value() breaks this ordinary, legal call.
+      assert_sequences(call_rbf(tostring(SEQ_FINAL), nil), {SEQ_FINAL},
+        "row 1: rbf absent, sequence 0xFFFFFFFF")
+    end)
+
+    -- ---- ROW 2 ----
+    it("ACCEPTS replaceable=true with sequence 0xFFFFFFFD (it signals)",
+    function()
+      -- Exactly MAX_BIP125_RBF_SEQUENCE: SignalsOptInRBF is `<=`, so this
+      -- signals. Fails loudly if the comparison is written `<`.
+      assert_sequences(call_rbf(tostring(SEQ_RBF), "true"), {SEQ_RBF},
+        "row 2: rbf true, sequence 0xFFFFFFFD")
+    end)
+
+    -- ---- ROW 3 ----
+    it("REJECTS replaceable=true with sequence 0xFFFFFFFE (-8)", function()
+      -- One above MAX_BIP125_RBF_SEQUENCE: the tight boundary on the other
+      -- side. This is MAX_SEQUENCE_NONFINAL -- still non-final for locktime
+      -- purposes, but NOT RBF-signalling.
+      assert_error(call_rbf(tostring(SEQ_NONFINAL), "true"),
+        rpc.ERROR.INVALID_PARAMETER, CONTRADICT_MSG,
+        "row 3: rbf true, sequence 0xFFFFFFFE")
+    end)
+
+    -- ---- ROW 4 ----
+    it("REJECTS replaceable=true with sequence 0xFFFFFFFF (-8)", function()
+      assert_error(call_rbf(tostring(SEQ_FINAL), "true"),
+        rpc.ERROR.INVALID_PARAMETER, CONTRADICT_MSG,
+        "row 4: rbf true, sequence 0xFFFFFFFF")
+    end)
+
+    -- ---- ROW 5 ----
+    it("ACCEPTS replaceable=true with NO inputs at all (vin.size() > 0 guard)",
+    function()
+      -- A transaction with no inputs cannot signal, and Core does not punish
+      -- it for that: rawTx.vin.size() > 0 short-circuits first. Dropping that
+      -- guard turns this legal call into an error.
+      local decoded = call('[]', ',0,true')
+      if decoded.error ~= nil and decoded.error ~= cjson.null then
+        assert.truthy(false,
+          "row 5: rbf true, zero inputs: expected success but got error " ..
+          tostring(decoded.error.code) .. " " .. tostring(decoded.error.message))
+      end
+      assert.truthy(type(decoded.result) == "string",
+        "row 5: expected a hex string result, got " .. type(decoded.result))
+      -- Assert on the SERIALIZED BYTES, but not via deserialize_transaction:
+      -- a zero-input legacy tx begins `02000000 00 01 ...`, whose 0x00 0x01 is
+      -- byte-identical to the segwit marker+flag, so any BIP-144 deserializer
+      -- (ours and Core's alike) mis-reads it. Read the input-count CompactSize
+      -- directly instead: bytes 1-4 are the version, byte 5 is the count.
+      assert.truthy(decoded.result:sub(9, 10) == "00",
+        "row 5: input-count byte in the tx bytes -- expected \"00\", got \"" ..
+        tostring(decoded.result:sub(9, 10)) .. "\" (full hex " ..
+        tostring(decoded.result) .. ")")
+    end)
+
+    -- ---- ROW 6 ----
+    it("ACCEPTS replaceable=true when ONE of two inputs signals", function()
+      -- SignalsOptInRBF is ANY, not ALL -- deliberately, so that in a
+      -- multi-party protocol one participant cannot disable replacement by
+      -- opting out in their own input. A check written as "every input must
+      -- signal" passes rows 3 and 4 and fails here.
+      local decoded = call(
+        '[{"txid":"' .. TXID .. '","vout":0,"sequence":' .. SEQ_FINAL .. '},' ..
+        '{"txid":"' .. TXID .. '","vout":1,"sequence":0}]', ',0,true')
+      assert_sequences(decoded, {SEQ_FINAL, 0},
+        "row 6: rbf true, sequences {0xFFFFFFFF, 0}")
+    end)
+
+    -- ---- ROW 7 ----
+    it("ACCEPTS replaceable=false with a FINAL sequence (rbf.value() is false)",
+    function()
+      -- The caller asserted NON-replaceable and supplied a matching sequence.
+      -- Nothing contradicts anything; the second conjunct is false.
+      assert_sequences(call_rbf(tostring(SEQ_FINAL), "false"), {SEQ_FINAL},
+        "row 7: rbf false, sequence 0xFFFFFFFF")
+    end)
+
+    -- ---- ROW 8 ----
+    it("ACCEPTS replaceable=true with NO explicit sequence (default signals)",
+    function()
+      -- With no `sequence` key, AddInputs picks MAX_BIP125_RBF_SEQUENCE
+      -- because rbf.value_or(true) is true -- so the default sequence is
+      -- itself signalling and the check is satisfied. This is the single most
+      -- common RBF call there is; breaking it would be catastrophic.
+      assert_sequences(call_rbf(nil, "true"), {SEQ_RBF},
+        "row 8: rbf true, sequence defaulted")
+    end)
+
+    -- ---- Extra: the JSON null spelling of "absent" ----
+    it("ACCEPTS an explicit JSON null replaceable with a FINAL sequence",
+    function()
+      -- Core's test is `request.params[3].isNull()`, so a literal null is the
+      -- same as omitting the argument: nullopt, has_value() false, no check.
+      assert_sequences(call_rbf(tostring(SEQ_FINAL), "null"), {SEQ_FINAL},
+        "rbf JSON null, sequence 0xFFFFFFFF")
+    end)
+
+    -- ---- Extra: ordering, an output error still wins ----
+    it("reports the OUTPUT error, not the contradiction, when both are wrong",
+    function()
+      -- Core runs the contradiction check as the LAST statement of
+      -- ConstructTransaction, after AddOutputs. Hoisting it up next to the
+      -- input loop -- where it reads more naturally -- would silently change
+      -- which error this request reports. Pins the placement.
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = '{"method":"createrawtransaction","params":[' ..
+        '[{"txid":"' .. TXID .. '","vout":0,"sequence":' .. SEQ_FINAL .. '}],' ..
+        '{"notanaddress":0.1},0,true],"id":1}'
+      local decoded = cjson.decode((server:handle_request(body)))
+      assert_error(decoded, rpc.ERROR.INVALID_ADDRESS,
+        "Invalid Bitcoin address: notanaddress",
+        "output error must outrank the replaceable contradiction")
     end)
   end)
 end)

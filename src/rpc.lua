@@ -4612,6 +4612,10 @@ function RPCServer:register_methods()
   --   duplicate `data`            -> -8 "Invalid parameter, duplicate key: data"
   --   duplicate address           -> -8 "Invalid parameter, duplicated address: <a>"
   --   invalid address             -> -5 "Invalid Bitcoin address: <a>"
+  --   EXPLICIT replaceable=true + >=1 input + no input signalling BIP-125
+  --     (all sequences > MAX_BIP125_RBF_SEQUENCE) -> -8 "Invalid parameter
+  --     combination: Sequence number(s) contradict replaceable option",
+  --     checked AFTER outputs.  See the block near the end of this handler.
   self.methods["createrawtransaction"] = function(rpc, params)
     local SEQUENCE_FINAL        = 0xFFFFFFFF
     local MAX_SEQUENCE_NONFINAL = 0xFFFFFFFE
@@ -4638,8 +4642,30 @@ function RPCServer:register_methods()
     end
 
     -- replaceable (Core RPCArg::Default{true} -> rbf.value_or(true)).
+    --
+    -- Core carries this argument as `std::optional<bool> rbf`, and the
+    -- OPTIONAL-NESS IS LOAD-BEARING, not incidental: it stays `nullopt` when
+    -- the JSON param is absent or null (rawtransaction.cpp createrawtransaction
+    -- builds it as `request.params[3].isNull() ? std::nullopt :
+    -- std::optional<bool>{request.params[3].get_bool()}`).  Two DIFFERENT
+    -- questions are then asked of it further down:
+    --   • AddInputs asks `rbf.value_or(true)` -- absent behaves as TRUE, which
+    --     is what makes 0xFFFFFFFD the default sequence.
+    --   • the contradiction check at the end of ConstructTransaction asks
+    --     `rbf.has_value() && rbf.value()` -- absent behaves as NOT SET, so no
+    --     check fires.
+    -- So `createrawtransaction(ins, outs)` with a final sequence is fine while
+    -- `createrawtransaction(ins, outs, 0, true)` with the same sequence is an
+    -- error, even though both default to replaceable for the purpose of
+    -- choosing a sequence.  That asymmetry is deliberate in Core: it only
+    -- refuses when the caller ASSERTED replaceability, never when it merely
+    -- inherited the default.  Keep the two facts in separate locals so the
+    -- distinction survives; `replaceable` below stays byte-identical to the
+    -- previous value_or(true) behaviour.
+    local replaceable_explicit =
+      (replaceable_in ~= nil and replaceable_in ~= cjson.null)
     local replaceable = true
-    if replaceable_in ~= nil and replaceable_in ~= cjson.null then
+    if replaceable_explicit then
       replaceable = replaceable_in and true or false
     end
 
@@ -4829,6 +4855,52 @@ function RPCServer:register_methods()
           error({code = M.ERROR.TYPE_ERROR, message = "Amount out of range"})
         end
         tx_outputs[#tx_outputs + 1] = types.txout(sats, spk)
+      end
+    end
+
+    -- ---- Contradiction check (bitcoin-core/src/rpc/rawtransaction_util.cpp
+    --      ConstructTransaction:166) ----
+    --
+    -- POSITION IS PART OF THE BEHAVIOUR.  Core runs this as the LAST thing in
+    -- ConstructTransaction, after BOTH AddInputs and AddOutputs, so an output
+    -- error (bad address, duplicate key, amount out of range) still wins over
+    -- it.  Placing it earlier -- right after the input loop, where it would
+    -- read more naturally -- would silently change which of two errors a
+    -- caller sees for a request that is wrong in both ways.  Hence it sits
+    -- here, immediately before the transaction is assembled.
+    --
+    -- WHAT IT CATCHES.  A caller who explicitly passes replaceable=true and
+    -- ALSO pins every input to a sequence above MAX_BIP125_RBF_SEQUENCE has
+    -- asked for two incompatible things: BIP-125 opt-in signalling requires at
+    -- least ONE input with nSequence <= 0xFFFFFFFD, and anything above that is
+    -- precisely the opt-OUT.  Nine of the ten nodes in this repo silently
+    -- ACCEPT that contradiction today: they return a perfectly well-formed
+    -- transaction that CANNOT be fee-bumped, having quietly resolved the
+    -- conflict in favour of the sequence, with no error and no warning.  The
+    -- caller finds out only later, when the fee bump is needed and the
+    -- replacement is refused -- by which time the transaction is already
+    -- broadcast and stuck.  Core refuses to guess which of the two the caller
+    -- meant and errors out instead.
+    --
+    -- The scan is SignalsOptInRBF (bitcoin-core/src/util/rbf.cpp): ANY input at
+    -- or below MAX_BIP125_RBF_SEQUENCE (util/rbf.h: 0xfffffffd) makes the whole
+    -- transaction signalling.  "Any", not "all", is deliberate upstream -- in a
+    -- multi-party protocol one participant must not be able to disable
+    -- replacement by opting out in their own input.  So a two-input request
+    -- with one final sequence and one signalling sequence is ACCEPTED.
+    -- rawTx.vin.size() > 0 is the other guard: a transaction with no inputs
+    -- cannot signal, and Core does not punish it for that.
+    if replaceable_explicit and replaceable and #tx_inputs > 0 then
+      local signals_rbf = false
+      for i = 1, #tx_inputs do
+        if tx_inputs[i].sequence <= MAX_BIP125_RBF_SEQ then
+          signals_rbf = true
+          break
+        end
+      end
+      if not signals_rbf then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = "Invalid parameter combination: Sequence number(s) contradict replaceable option"})
       end
     end
 
