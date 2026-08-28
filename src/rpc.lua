@@ -4666,6 +4666,21 @@ function RPCServer:register_methods()
                message = "Invalid parameter, missing vout key"})
       end
       vout = math.floor(vout)
+      -- Core reads vout with getInt<int>() -- a 32-BIT int -- so the RANGE
+      -- check fires BEFORE the sign test, and an out-of-int32 value surfaces
+      -- as univalue's own "JSON integer out of range" at RPC_MISC_ERROR
+      -- rather than a vout-specific error. That ordering is Core's, not the
+      -- obvious one.
+      --
+      -- Without the upper bound the serializer TRUNCATED to 32 bits: on the
+      -- live mainnet node vout 2^32 AND vout 2^33 both became vout 0, so a
+      -- request to spend one outpoint silently became a request to spend a
+      -- DIFFERENT, probably real one -- returned as success.
+      -- (bitcoin-core/src/rpc/rawtransaction_util.cpp AddInputs:41-45.)
+      if vout < -2147483648 or vout > 2147483647 then
+        error({code = M.ERROR.MISC_ERROR,
+               message = "JSON integer out of range"})
+      end
       if vout < 0 then
         error({code = M.ERROR.INVALID_PARAMETER,
                message = "Invalid parameter, vout cannot be negative"})
