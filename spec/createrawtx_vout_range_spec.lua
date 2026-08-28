@@ -461,4 +461,124 @@ describe("createrawtransaction vout int32 range", function()
         "output error must outrank the replaceable contradiction")
     end)
   end)
+
+  -- ==========================================================================
+  -- THIRD DEFECT (same RPC, same handler): a PRESENT but NON-NUMERIC
+  -- `sequence` must be IGNORED, not rejected.
+  --
+  -- Core reads the field under a type guard (rawtransaction_util.cpp:57-65):
+  --
+  --     const UniValue& sequenceObj = o.find_value("sequence");
+  --     if (sequenceObj.isNum()) {
+  --         int64_t seqNr64 = sequenceObj.getInt<int64_t>();
+  --         if (seqNr64 < 0 || seqNr64 > CTxIn::SEQUENCE_FINAL) { throw ... }
+  --         else nSequence = (uint32_t)seqNr64;
+  --     }
+  --
+  -- There is no `else`. A string, bool, object, array or null simply does not
+  -- enter the branch, and the default chosen a few lines above survives. Core
+  -- ACCEPTS the call.
+  --
+  -- lunarblock rejected it with -8 "Invalid parameter, sequence number is out
+  -- of range" -- a message that is wrong twice over: nothing was out of range,
+  -- and the value was not a number to have a range in the first place.
+  --
+  -- THE ASSERTION IS ON THE EMITTED SEQUENCE, NOT ON MERE ACCEPTANCE. This is
+  -- a two-sided trap: rustoshi originally fell through to SEQUENCE_FINAL
+  -- (0xFFFFFFFF) here, which "accepts" while silently building a
+  -- NON-replaceable transaction. With `replaceable` absent, rbf.value_or(true)
+  -- is TRUE, so the correct default is MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD).
+  -- ==========================================================================
+  describe("a present but NON-NUMERIC sequence is ignored, not an error",
+  function()
+
+    local SEQ_RBF   = 4294967293  -- 0xFFFFFFFD  MAX_BIP125_RBF_SEQUENCE
+    local SEQ_FINAL = 4294967295  -- 0xFFFFFFFF  SEQUENCE_FINAL
+
+    local function first_sequence(hex)
+      local tx = serialize.deserialize_transaction(rpc.hex_decode(hex))
+      assert.truthy(#tx.inputs == 1,
+        "expected exactly one input in the built tx, got " .. tostring(#tx.inputs))
+      return tx.inputs[1].sequence
+    end
+
+    -- Every JSON type that is not a number. Each is spliced in as literal JSON
+    -- text so it reaches the handler exactly as it would off the wire.
+    local NON_NUMERIC = {
+      {json = '"nope"',  what = "string"},
+      {json = 'true',    what = "bool true"},
+      {json = 'false',   what = "bool false"},
+      {json = 'null',    what = "null"},
+      {json = '{}',      what = "object"},
+      {json = '[]',      what = "array"},
+    }
+
+    for _, case in ipairs(NON_NUMERIC) do
+      it("ignores a " .. case.what .. " sequence and applies the RBF default",
+      function()
+        local decoded = call('[{"txid":"' .. TXID ..
+          '","vout":0,"sequence":' .. case.json .. '}]')
+        if decoded.error ~= nil and decoded.error ~= cjson.null then
+          assert.truthy(false, case.what ..
+            " sequence: expected success but got error " ..
+            tostring(decoded.error.code) .. " " ..
+            tostring(decoded.error.message))
+        end
+        assert.truthy(type(decoded.result) == "string",
+          case.what .. " sequence: expected a hex string result, got " ..
+          type(decoded.result))
+        local got = first_sequence(decoded.result)
+        assert.truthy(got == SEQ_RBF, case.what ..
+          " sequence: the tx bytes must carry the RBF default 0xFFFFFFFD (" ..
+          tostring(SEQ_RBF) .. "), got " .. tostring(got) ..
+          " -- accepting with SEQUENCE_FINAL is the OTHER way to get this wrong")
+      end)
+    end
+
+    it("ignores a non-numeric sequence but still honours replaceable=false",
+    function()
+      -- The ignored field must leave the DEFAULT in charge, and the default
+      -- still tracks `replaceable`: with rbf explicitly false and locktime 0,
+      -- AddInputs picks SEQUENCE_FINAL. Proves the fall-through reaches the
+      -- real default computation rather than a hard-coded constant.
+      local decoded = call('[{"txid":"' .. TXID ..
+        '","vout":0,"sequence":"nope"}]', ',0,false')
+      if decoded.error ~= nil and decoded.error ~= cjson.null then
+        assert.truthy(false,
+          "rbf=false + non-numeric sequence: expected success but got error " ..
+          tostring(decoded.error.code) .. " " .. tostring(decoded.error.message))
+      end
+      local got = first_sequence(decoded.result)
+      assert.truthy(got == SEQ_FINAL,
+        "rbf=false + non-numeric sequence: expected SEQUENCE_FINAL (" ..
+        tostring(SEQ_FINAL) .. "), got " .. tostring(got))
+    end)
+
+    -- CONTROL: the NUMERIC out-of-range rejection must be untouched. Without
+    -- this the fix above is satisfiable by deleting the range check outright.
+    it("CONTROL: a NUMERIC out-of-range sequence is still rejected -8",
+    function()
+      assert_error(call('[{"txid":"' .. TXID ..
+        '","vout":0,"sequence":4294967296}]'),
+        rpc.ERROR.INVALID_PARAMETER,
+        "Invalid parameter, sequence number is out of range",
+        "numeric sequence 2^32 must still be rejected")
+    end)
+
+    it("CONTROL: a NUMERIC negative sequence is still rejected -8", function()
+      assert_error(call('[{"txid":"' .. TXID ..
+        '","vout":0,"sequence":-1}]'),
+        rpc.ERROR.INVALID_PARAMETER,
+        "Invalid parameter, sequence number is out of range",
+        "numeric sequence -1 must still be rejected")
+    end)
+
+    it("CONTROL: an in-range NUMERIC sequence still reaches the tx bytes",
+    function()
+      local decoded = call('[{"txid":"' .. TXID ..
+        '","vout":0,"sequence":12345}]')
+      assert.truthy(first_sequence(decoded.result) == 12345,
+        "an ordinary numeric sequence must still be honoured")
+    end)
+  end)
 end)

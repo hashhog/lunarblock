@@ -4721,11 +4721,24 @@ function RPCServer:register_methods()
       else
         sequence = SEQUENCE_FINAL
       end
-      if o.sequence ~= nil and o.sequence ~= cjson.null then
-        if type(o.sequence) ~= "number" then
-          error({code = M.ERROR.INVALID_PARAMETER,
-                 message = "Invalid parameter, sequence number is out of range"})
-        end
+      -- Core guards the whole read with `if (sequenceObj.isNum())`
+      -- (rawtransaction_util.cpp:57-65).  A `sequence` field that is PRESENT
+      -- but NOT a number is therefore IGNORED and the default computed above
+      -- still applies -- it is not an error.  Rejecting it, as this node did,
+      -- turned a call Core ACCEPTS into -8 "sequence number is out of range",
+      -- and that message is doubly wrong: nothing was out of range, the value
+      -- was not a number at all.
+      --
+      -- The DEFAULT is the point of the row, not merely the acceptance: with
+      -- `replaceable` defaulting to true the emitted sequence must be
+      -- MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD).  Falling through to
+      -- SEQUENCE_FINAL instead would also "accept", while quietly building a
+      -- NON-replaceable transaction -- the exact trap rustoshi fell into from
+      -- the other side.
+      --
+      -- cjson.null is lightuserdata, so `type() == "number"` already excludes
+      -- it, matching Core (isNum() is false for a JSON null).
+      if type(o.sequence) == "number" then
         local seq = math.floor(o.sequence)
         if seq < 0 or seq > SEQUENCE_FINAL then
           error({code = M.ERROR.INVALID_PARAMETER,
