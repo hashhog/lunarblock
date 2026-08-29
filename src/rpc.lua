@@ -13870,12 +13870,28 @@ function RPCServer:setup_w47b_methods()
     local time_diff = top_hdr.timestamp - bot_hdr.timestamp
     if time_diff <= 0 then return 0 end
 
-    -- Chainwork diff via header_chain.headers entries
+    -- Chainwork diff via header_chain.headers entries.
+    --
+    -- total_work has TWO representations in this codebase: a float from
+    -- HeaderChain:work_for_bits, and a 32-byte big-endian binary string from
+    -- consensus.work_zero/work_add (which is what a mainnet header chain
+    -- actually holds).  Subtracting the string form raised
+    --   "attempt to perform arithmetic on local 'work_top' (a string value)"
+    -- -> -32603 with a Lua source path on the wire, on EVERY mainnet call.
+    -- Normalise to the float form both sides understand.
+    local function work_number(w)
+      if type(w) == "number" then return w end
+      if type(w) == "string" and #w == 32 then
+        return consensus.work_float_from_hex(consensus.work_to_hex(w))
+      end
+      return 0
+    end
+
     local function get_work(hh_val)
       if not rpc.header_chain then return 0 end
       local hex = types.hash256_hex(hh_val)
       local entry = rpc.header_chain.headers and rpc.header_chain.headers[hex]
-      return entry and (entry.total_work or 0) or 0
+      return work_number(entry and entry.total_work or 0)
     end
 
     local work_top = get_work(top_hh)

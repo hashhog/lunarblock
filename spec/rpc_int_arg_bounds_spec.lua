@@ -137,6 +137,38 @@ describe("RPC integer-argument bounds (Core getInt<T> parity)", function()
       assert.equal(cjson.null, resp.error)
     end)
 
+    -- Regression: total_work is a 32-byte big-endian string on a real chain
+    -- (consensus.work_zero/work_add), not the float that work_for_bits
+    -- produces, so `work_top - work_bot` raised a Lua arithmetic error and
+    -- getnetworkhashps answered -32603 with a source path for EVERY mainnet
+    -- call.  Proven live on 2026-08-29 against the deployed node.
+    it("computes a hashrate when total_work is the 32-byte binary form", function()
+      local types = require("lunarblock.types")
+      -- storage returns wrapped hash256 values (types.hash256), which is what
+      -- the handler hands to types.hash256_hex.
+      local h_top = types.hash256(string.rep("\1", 32))
+      local h_bot = types.hash256(string.rep("\2", 32))
+      local top_work = consensus.work_from_hex(string.rep("0", 48) .. "0000000000010000")
+      local bot_work = consensus.work_from_hex(string.rep("0", 64))
+      local srv = rpc.new({
+        network = consensus.networks.mainnet,
+        chain_state = {tip_height = 200},
+        storage = {
+          get_hash_by_height = function(h) return (h == 200) and h_top or h_bot end,
+          get_header = function(hh)
+            return {timestamp = (hh == h_top) and 2000 or 1000, bits = 0x1d00ffff}
+          end,
+        },
+        header_chain = {headers = {
+          [types.hash256_hex(h_top)] = {total_work = top_work},
+          [types.hash256_hex(h_bot)] = {total_work = bot_work},
+        }},
+      })
+      local resp = rpc_call(srv, "getnetworkhashps", {120})
+      assert.equal(cjson.null, resp.error)
+      assert.equal(65, resp.result)  -- floor(0x10000 / (2000-1000))
+    end)
+
     it("type-errors a non-number instead of falling back to the default", function()
       local resp = rpc_call(server(), "getnetworkhashps", {"120"})
       assert.is_truthy(resp.error and resp.error ~= cjson.null)
