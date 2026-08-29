@@ -4622,6 +4622,46 @@ function RPCServer:register_methods()
     local MAX_BIP125_RBF_SEQ    = 0xFFFFFFFD
     local LOCKTIME_MAX          = 0xFFFFFFFF
 
+-- Core's `version` argument for the createrawtransaction family
+-- (rpc/rawtransaction.cpp:122).
+--
+-- Core reads it as self.Arg<uint32_t>("version") -- a THIRTY-TWO BIT UNSIGNED
+-- parse, unlike the int32 used for vout -- then bounds it to
+-- [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+-- (policy/policy.h:152-153) inside ConstructTransaction
+-- (rawtransaction_util.cpp:158-161) and ASSIGNS it to the transaction.
+--
+-- These handlers passed a hardcoded 2 to types.transaction() and ignored the
+-- argument, so a caller asking for version 3 got a version 2 transaction and a
+-- success reply, and version 4 -- which Core rejects -- was accepted. Version 3
+-- is TRUC (BIP 431) and carries different policy rules.
+--
+-- The UNSIGNED width decides which error you get: 2147483648 fits a uint32,
+-- survives the conversion and reaches the DOMAIN error (-8), while -1 and
+-- 4294967296 fail the CONVERSION first (-1).
+--
+-- LUA HAZARD: numbers here are doubles, so a non-integral value must be
+-- rejected explicitly rather than silently floored -- `math.floor(2.7)` would
+-- otherwise become version 2 and be reported as valid. Core's getInt refuses a
+-- non-integer outright.
+local TX_VERSION_MIN, TX_VERSION_MAX = 1, 3
+local UINT32_MAX_VERSION = 4294967295
+
+local function parse_version_arg(v)
+  if v == nil or v == cjson.null then return 2 end  -- Core DEFAULT_RAWTX_VERSION
+  if type(v) ~= "number" or v ~= math.floor(v) then
+    error({code = M.ERROR.MISC_ERROR, message = "JSON integer out of range"})
+  end
+  if v < 0 or v > UINT32_MAX_VERSION then
+    error({code = M.ERROR.MISC_ERROR, message = "JSON integer out of range"})
+  end
+  if v < TX_VERSION_MIN or v > TX_VERSION_MAX then
+    error({code = M.ERROR.INVALID_PARAMETER,
+           message = "Invalid parameter, version out of range(1~3)"})
+  end
+  return math.floor(v)
+end
+
     local inputs_in  = params and params[1]
     local outputs_in = params and params[2]
     local locktime_in = params and params[3]
@@ -4917,7 +4957,9 @@ function RPCServer:register_methods()
       end
     end
 
-    local tx = types.transaction(2, tx_inputs, tx_outputs, locktime)
+    -- Was a hardcoded 2, which discarded the caller's `version`.
+    local tx_version = parse_version_arg(params and params[5])
+    local tx = types.transaction(tx_version, tx_inputs, tx_outputs, locktime)
     -- Unsigned: no witness data, emit the legacy (non-segwit) serialization,
     -- exactly as Core's EncodeHexTx(CTransaction(rawTx)) does for a tx with no
     -- witness stacks.
@@ -7834,7 +7876,9 @@ function RPCServer:register_methods()
     end
 
     -- Create unsigned transaction
-    local tx = types.transaction(2, inputs, outputs, locktime)
+    -- Same argument, same routine in Core (ConstructTransaction).
+    local tx_version = parse_version_arg(params and params[5])
+    local tx = types.transaction(tx_version, inputs, outputs, locktime)
 
     -- Create PSBT
     local psbt = psbt_mod.new(tx)

@@ -43,37 +43,47 @@ lib/sha256_accel.so: csrc/sha256_accel.c
 	$(CC) -O3 -fPIC -shared -o $@ $< -lcrypto
 	@echo "built $@"
 
+# busted is installed under ~/.luarocks but its own modules are NOT on the
+# default LuaJIT search path, so `busted` fails at `require 'busted.runner'`
+# before running a single spec. That made the whole suite look unrunnable on a
+# stock checkout (2026-08-29) -- a HARNESS fact that reads like a broken node.
+# Export the luarocks tree so `make test` works out of the box.
+LUAROCKS_TREE ?= $(HOME)/.luarocks
+BUSTED_ENV = LD_LIBRARY_PATH=./lib \
+  LUA_PATH="$(LUAROCKS_TREE)/share/lua/5.1/?.lua;$(LUAROCKS_TREE)/share/lua/5.1/?/init.lua;;" \
+  LUA_CPATH="$(LUAROCKS_TREE)/lib/lua/5.1/?.so;;"
+
 # Run tests with busted using LuaJIT
 test:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/
+	$(BUSTED_ENV) busted --lua=luajit spec/
 
 # Run individual test files
 test-crypto:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/crypto_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/crypto_spec.lua
 
 test-serialize:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/serialize_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/serialize_spec.lua
 
 test-script:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/script_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/script_spec.lua
 
 test-p2p:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/p2p_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/p2p_spec.lua
 
 test-peer:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/peer_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/peer_spec.lua
 
 test-handshake:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/p2p_handshake_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/p2p_handshake_spec.lua
 
 test-sync:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/sync_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/sync_spec.lua
 
 test-header-sync:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/header_sync_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/header_sync_spec.lua
 
 test-miniscript:
-	LD_LIBRARY_PATH=./lib busted --lua=luajit spec/miniscript_spec.lua
+	$(BUSTED_ENV) busted --lua=luajit spec/miniscript_spec.lua
 
 # Run luacheck linter
 lint:
