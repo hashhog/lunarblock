@@ -43,6 +43,86 @@ local function core_json_type_name(v)
 end
 
 --------------------------------------------------------------------------------
+-- Core integer-argument reads (univalue getInt<T>)
+--------------------------------------------------------------------------------
+--
+-- Core reads every numeric RPC argument through UniValue::getInt<T>()
+-- (univalue.h), which runs std::from_chars over the raw JSON token INTO THE
+-- DESTINATION WIDTH.  Two consequences the handlers below depend on:
+--
+--   * The width check lives INSIDE the conversion, so it fires BEFORE the
+--     handler's own domain test.  A value outside the destination type -- or
+--     one with a fractional part, which leaves from_chars with unconsumed
+--     input -- throws std::runtime_error("JSON integer out of range"), and
+--     rpc/server.cpp turns any std::exception into RPC_MISC_ERROR (-1).
+--     Only values that SURVIVE the conversion ever reach a -8 range check.
+--   * The destination width is per-argument: gettxout's `n` is uint32_t, so a
+--     negative fails from_chars (no sign accepted) with the SAME -1, while
+--     getnodeaddresses' `count` is int, so -1 converts fine and is then
+--     rejected by the handler with -8.
+--
+-- Lua numbers are IEEE doubles, so an out-of-range integer arrives intact and
+-- an explicit bound is the only thing standing between it and a silent
+-- narrowing (or, worse, a clamp that fabricates an answer to a question the
+-- caller never asked).
+local CORE_INT32_MIN, CORE_INT32_MAX = -2147483648, 2147483647
+local CORE_UINT32_MAX = 4294967295
+
+local function core_int_range_error()
+  error({code = M.ERROR.MISC_ERROR, message = "JSON integer out of range"})
+end
+
+-- getInt<int32_t> parity: integral and within int32, else -1.
+local function core_getint32(v)
+  if v ~= v or v ~= math.floor(v) or v < CORE_INT32_MIN or v > CORE_INT32_MAX then
+    core_int_range_error()
+  end
+  return v
+end
+
+-- getInt<uint32_t> parity: integral and within uint32 (negatives included in
+-- the rejection -- from_chars does not accept a sign for an unsigned type).
+local function core_getuint32(v)
+  if v ~= v or v ~= math.floor(v) or v < 0 or v > CORE_UINT32_MAX then
+    core_int_range_error()
+  end
+  return v
+end
+
+-- RPCHelpMan's declared-type check, which runs before the handler body.
+local function core_arg_number(v)
+  if type(v) ~= "number" then
+    error({code = M.ERROR.TYPE_ERROR,
+           message = "JSON value of type " .. core_json_type_name(v) ..
+                     " is not of expected type number"})
+  end
+  return v
+end
+
+-- An optional NUM argument with a default: null/absent takes the default,
+-- anything else goes through the declared-type check then getInt<int>.
+local function core_optional_int32(v, default)
+  if v == nil or v == cjson.null then
+    return default
+  end
+  core_arg_number(v)
+  return core_getint32(v)
+end
+
+-- Core: rpc/util.cpp ParseConfirmTarget.  getInt<int> first (width/fractional
+-- -> -1), THEN the domain test against the estimator's highest tracked target.
+-- Clamping instead of rejecting fabricates an estimate for a horizon the
+-- caller never asked about.
+local function core_parse_confirm_target(v, max_target)
+  core_getint32(v)
+  if v < 1 or v > max_target then
+    error({code = M.ERROR.INVALID_PARAMETER,
+           message = string.format("Invalid conf_target, must be between %d and %d", 1, max_target)})
+  end
+  return v
+end
+
+--------------------------------------------------------------------------------
 -- Network Name Translation
 --------------------------------------------------------------------------------
 --
@@ -2690,11 +2770,9 @@ function RPCServer:register_methods()
              message = "JSON value of type " .. core_json_type_name(v) ..
                        " is not of expected type number"})
     end
-    -- Core getInt<int>: a non-integral JSON number fails std::from_chars on the
-    -- fractional part -> "JSON integer out of range".
-    if v ~= math.floor(v) then
-      error({code = M.ERROR.TYPE_ERROR, message = "JSON integer out of range"})
-    end
+    -- Core getInt<int>: fractional or out-of-int32 fails std::from_chars ->
+    -- -1 "JSON integer out of range", BEFORE the negative-timeout test.
+    core_getint32(v)
     if v < 0 then
       error({code = M.ERROR.MISC_ERROR, message = "Negative timeout"})
     end
@@ -2848,9 +2926,7 @@ function RPCServer:register_methods()
              message = "JSON value of type " .. core_json_type_name(h) ..
                        " is not of expected type number"})
     end
-    if h ~= math.floor(h) then
-      error({code = M.ERROR.TYPE_ERROR, message = "JSON integer out of range"})
-    end
+    core_getint32(h)
     local timeout_ms = parse_wait_timeout(params[2])
 
     return wait_for_tip(rpc, function(_h, ht)
@@ -5955,7 +6031,8 @@ end
       if type(count_arg) ~= "number" then
         error({code = M.ERROR.TYPE_ERROR, message = "JSON value of type string is not of expected type number"})
       end
-      count = math.floor(count_arg)
+      -- getInt<int> BEFORE the handler's own -8 range test.
+      count = core_getint32(count_arg)
     end
     if count < 0 then
       error({code = M.ERROR.INVALID_PARAMETER, message = "Address count out of range"})
@@ -6096,7 +6173,26 @@ end
     if type(conf_target) ~= "number" then
       error({code = M.ERROR.INVALID_PARAMS, message = "conf_target must be numeric"})
     end
-    conf_target = math.max(1, math.min(1008, math.floor(conf_target)))
+    conf_target = core_parse_confirm_target(conf_target, 1008)
+
+    -- estimate_mode (positional 1): Core validates it with FeeModeFromString
+    -- (common/messages.cpp), case-insensitively, and rejects anything else.
+    -- Ignoring the argument entirely accepted "" -- and any other garbage --
+    -- and returned an estimate as if the caller had asked for the default.
+    local mode = params[2]
+    if mode ~= nil and mode ~= cjson.null then
+      if type(mode) ~= "string" then
+        error({code = M.ERROR.TYPE_ERROR,
+               message = "JSON value of type " .. core_json_type_name(mode) ..
+                         " is not of expected type string"})
+      end
+      local up = mode:upper()
+      if up ~= "UNSET" and up ~= "ECONOMICAL" and up ~= "CONSERVATIVE" then
+        error({code = M.ERROR.INVALID_PARAMETER,
+               message = 'Invalid estimate_mode parameter, must be one of: "unset", "economical", "conservative"'})
+      end
+    end
+
     if rpc.fee_estimator then
       local fee_rate, actual_target = rpc.fee_estimator:estimate_smart_fee(conf_target)
       if fee_rate and fee_rate > 0 then
@@ -6127,7 +6223,7 @@ end
       error({code = M.ERROR.INVALID_PARAMS, message = "threshold must be numeric"})
     end
     threshold = (type(threshold) == "number") and threshold or 0.95
-    conf_target = math.max(1, math.min(1008, math.floor(conf_target)))
+    conf_target = core_parse_confirm_target(conf_target, 1008)
 
     local horizons = { short = 12, medium = 144, long = 1008 }
     local result = {}
@@ -6514,9 +6610,13 @@ end
     -- ParseHashV parity: malformed txid (wrong length / non-hex) -> -8 at the
     -- parse boundary.  A well-formed-but-absent txid returns null below.
     parse_hash_v(txid_hex, "txid")
-    if type(n) ~= "number" or n < 0 or n ~= math.floor(n) then
+    if n == nil or n == cjson.null then
       error({code = M.ERROR.INVALID_PARAMS, message = "vout must be a non-negative integer"})
     end
+    -- Core reads n as getInt<uint32_t>: negative, fractional and >uint32 all
+    -- fail the conversion with -1 before any lookup happens.
+    core_arg_number(n)
+    core_getuint32(n)
     if not rpc.chain_state or not rpc.chain_state.coin_view then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
     end
@@ -13715,21 +13815,47 @@ function RPCServer:setup_w47b_methods()
 
   -- getnetworkhashps: estimate network hash rate over last nblocks
   self.methods["getnetworkhashps"] = function(rpc, params)
-    local nblocks = (params and type(params[1]) == "number") and math.floor(params[1]) or 120
-    local height  = (params and type(params[2]) == "number") and math.floor(params[2]) or -1
+    -- Core: self.Arg<int>("nblocks") / Arg<int>("height") -- getInt<int> with
+    -- the declared defaults, so a fractional or out-of-int32 value is -1 and a
+    -- non-number is a type error rather than a silent fall back to the default.
+    local nblocks = core_optional_int32(params and params[1], 120)
+    local height  = core_optional_int32(params and params[2], -1)
+
+    -- Core: rpc/mining.cpp GetNetworkHashPS rejects both degenerate arguments
+    -- outright, nblocks first and before it touches the chain.  Clamping them
+    -- instead answers a question the caller did not ask -- a request for the
+    -- hashrate at height 99999999 came back as the hashrate at the tip,
+    -- reported as success.
+    if nblocks < -1 or nblocks == 0 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Invalid nblocks. Must be a positive number or -1."})
+    end
 
     if not rpc.chain_state or not rpc.storage then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
     end
 
     local tip_h = rpc.chain_state.tip_height or 0
-    if height < 0 or height > tip_h then height = tip_h end
+    if height < -1 or height > tip_h then
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Block does not exist at specified height"})
+    end
+    if height < 0 then height = tip_h end
 
-    -- Need at least 2 blocks
+    -- Core: `if (pb == nullptr || !pb->nHeight) return 0` -- genesis has no
+    -- predecessor to measure against.
     if height < 1 then return 0 end
 
+    -- Core: nblocks == -1 means "since the last difficulty change"; a window
+    -- longer than the chain is truncated to the chain.
+    local lookup = nblocks
+    if lookup == -1 then
+      lookup = height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL + 1
+    end
+    if lookup > height then lookup = height end
+
     -- window: [start_h .. height]
-    local start_h = (nblocks == 0) and 0 or math.max(0, height - nblocks)
+    local start_h = height - lookup
 
     local function get_header_at(h)
       local hh = rpc.storage.get_hash_by_height(h)

@@ -3290,14 +3290,28 @@ describe("rpc", function()
       assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
     end)
 
-    it("clamps conf_target to [1, 1008]", function()
+    -- Core: ParseConfirmTarget (rpc/util.cpp) REJECTS a target above the
+    -- estimator's highest tracked horizon -- it does not clamp.  Clamping
+    -- answered a question the caller never asked (a 99999-block estimate
+    -- silently became a 1008-block one) and reported it as success.
+    it("rejects conf_target above the highest tracked target", function()
       local server = rpc.new({network = consensus.networks.mainnet})
-      -- 99999 -> clamped to 1008; should still return a valid result.
       local body = server:handle_request(
         '{"method":"estimaterawfee","params":[99999],"id":1}')
       local resp = cjson.decode(body)
-      assert.equal(cjson.null, resp.error)
-      assert.is_table(resp.result.short)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, resp.error.code)
+      assert.equal("Invalid conf_target, must be between 1 and 1008", resp.error.message)
+    end)
+
+    it("rejects conf_target outside int32 with Core's conversion error", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local body = server:handle_request(
+        '{"method":"estimaterawfee","params":[4294967296],"id":1}')
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.MISC_ERROR, resp.error.code)
+      assert.equal("JSON integer out of range", resp.error.message)
     end)
   end)
 
@@ -3564,6 +3578,9 @@ describe("rpc", function()
       assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
     end)
 
+    -- Core reads n as getInt<uint32_t>: from_chars accepts no sign for an
+    -- unsigned destination, so a negative vout fails the CONVERSION with
+    -- RPC_MISC_ERROR, not a handler-level range check.
     it("rejects negative vout", function()
       local _, _, txid_hex = make_chain_with_utxo()
       local server = rpc.new({network = consensus.networks.mainnet,
@@ -3573,7 +3590,21 @@ describe("rpc", function()
       }))
       local resp = cjson.decode(body)
       assert.is_truthy(resp.error and resp.error ~= cjson.null)
-      assert.equal(rpc.ERROR.INVALID_PARAMS, resp.error.code)
+      assert.equal(rpc.ERROR.MISC_ERROR, resp.error.code)
+      assert.equal("JSON integer out of range", resp.error.message)
+    end)
+
+    it("rejects a vout above uint32 with Core's conversion error", function()
+      local _, _, txid_hex = make_chain_with_utxo()
+      local server = rpc.new({network = consensus.networks.mainnet,
+        chain_state = make_chain_with_utxo()})
+      local body = server:handle_request(cjson.encode({
+        method = "gettxout", params = {txid_hex, 4294967296}, id = 1,
+      }))
+      local resp = cjson.decode(body)
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.MISC_ERROR, resp.error.code)
+      assert.equal("JSON integer out of range", resp.error.message)
     end)
   end)
 
