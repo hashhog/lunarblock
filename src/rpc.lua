@@ -2065,6 +2065,9 @@ function RPCServer:register_methods()
     if type(height) ~= "number" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Height must be a number"})
     end
+    -- getInt<int> BEFORE the -8 range test: 4294967296 is a CONVERSION
+    -- failure in Core, not a "Block height out of range".
+    core_getint32(height)
     -- Out-of-range height (negative or beyond tip): Core's getblockhash
     -- throws RPC_INVALID_PARAMETER (-8) with the static message
     -- "Block height out of range" (bitcoin-core/src/rpc/blockchain.cpp
@@ -2101,6 +2104,12 @@ function RPCServer:register_methods()
     -- Handle boolean for backwards compatibility (true = 1, false = 0)
     if verbosity == true then verbosity = 1
     elseif verbosity == false then verbosity = 0
+    else
+      -- Core reads verbosity with getInt<int>, so the width check happens in
+      -- the CONVERSION, before the blockhash is even looked up. Without it an
+      -- out-of-int32 verbosity reached the lookup and answered -5 "Block not
+      -- found" where Core answers -1 "JSON integer out of range".
+      core_getint32(core_arg_number(verbosity))
     end
 
     -- ParseHashV parity: malformed blockhash (wrong length / non-hex) -> -8
@@ -3164,6 +3173,9 @@ function RPCServer:register_methods()
     local default_blockcount = math.floor(30 * 24 * 60 * 60 / spacing)
     local blockcount
     local nblocks_arg = params[1]
+    -- getInt<int> first; the -8 "Invalid block count" domain error only
+    -- applies to values that survive the conversion.
+    if type(nblocks_arg) == "number" then core_getint32(nblocks_arg) end
     if nblocks_arg == nil or nblocks_arg == cjson.null then
       -- max(0, min(default, height - 1))
       blockcount = math.max(0, math.min(default_blockcount, final_height - 1))
@@ -4103,6 +4115,9 @@ function RPCServer:register_methods()
     --   2                → 2 (verbose JSON + per-vin prevout + fee)
     local verbosity = 0
     local vp = params[2]
+    -- getInt<int> width check before any lookup (Core answers -1, not the
+    -- -5 "No such mempool or blockchain transaction" this reached before).
+    if type(vp) == "number" then core_getint32(vp) end
     if vp == true or vp == 1 then
       verbosity = 1
     elseif vp == 2 then
@@ -5884,7 +5899,8 @@ end
 
     if command == "add" then
       if rpc.peer_manager:is_banned(key) then
-        error({code = M.ERROR.MISC_ERROR,
+        -- Core: RPC_CLIENT_NODE_ALREADY_ADDED (-23), not the generic -1.
+        error({code = M.ERROR.CLIENT_NODE_ALREADY_ADDED,
                message = "Error: IP/Subnet already banned"})
       end
       -- Default ban duration: 24 h (peerman.MISBEHAVIOR.DEFAULT_BAN_DURATION).
@@ -5896,11 +5912,18 @@ end
                  message = "Error: bantime must be a number"})
         end
         if absolute then
-          -- bantime is a UNIX epoch — translate back to a duration so
-          -- ban_peer's `os.time() + duration` produces the requested
-          -- absolute expiry.  Negative durations are clamped to 1s
-          -- (Core treats absolute-in-the-past as a no-op insert; we
-          -- mirror that with a 1-tick ban that the next clear sweeps.)
+          -- bantime is a UNIX epoch.
+          --
+          -- The comment that used to sit here claimed "Core treats
+          -- absolute-in-the-past as a no-op insert" and clamped to a 1s ban.
+          -- That belief was WRONG, and the differential's CONTROL caught it:
+          -- `setban <ip> add 1 true` answers -8 "Error: Absolute timestamp is
+          -- in the past" on Core (rpc/net.cpp), while this accepted it and
+          -- installed a 1-second ban.
+          if math.floor(bantime) <= os.time() then
+            error({code = M.ERROR.INVALID_PARAMETER,
+                   message = "Error: Absolute timestamp is in the past"})
+          end
           duration = math.max(1, math.floor(bantime - os.time()))
         else
           if bantime == 0 then
@@ -8899,6 +8922,10 @@ end
     if type(nrequired) ~= "number" or math.floor(nrequired) ~= nrequired then
       error({code = M.ERROR.INVALID_PARAMS, message = "nrequired must be an integer"})
     end
+    -- getInt<int> runs BEFORE the keys array is examined: Core answers
+    -- -1 for an out-of-int32 nrequired even when keys is empty, where this
+    -- previously reported the empty-keys error instead.
+    core_getint32(nrequired)
     nrequired = math.floor(nrequired)
 
     -- Validate pubkeys array

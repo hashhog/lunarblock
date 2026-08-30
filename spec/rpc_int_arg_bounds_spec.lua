@@ -244,3 +244,128 @@ describe("RPC integer-argument bounds (Core getInt<T> parity)", function()
     end)
   end)
 end)
+
+-- ==========================================================================
+-- #41 round: the SAME width rule on the methods that already rejected, but
+-- with their own later error instead of Core's conversion error.
+--
+-- Core's getInt<T> fails in the CONVERSION, so an out-of-int32 argument never
+-- reaches the lookup or the domain test. These five answered -5 "Block not
+-- found" / -8 "Block height out of range" / -32602 instead of -1.
+-- ==========================================================================
+
+describe("#41 conversion beats the later error", function()
+  local function range_err(method, params)
+    local resp = rpc_call(server(), method, params)
+    assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    assert.equal(rpc.ERROR.MISC_ERROR, resp.error.code)
+    assert.equal("JSON integer out of range", resp.error.message)
+  end
+
+  it("getblockhash height converts before the -8 range test", function()
+    for _, v in ipairs(OUT_OF_INT32) do range_err("getblockhash", {v}) end
+  end)
+
+  it("getblock verbosity converts before the block lookup", function()
+    for _, v in ipairs(OUT_OF_INT32) do
+      range_err("getblock", {string.rep("a", 64), v})
+    end
+  end)
+
+  it("getrawtransaction verbosity converts before the tx lookup", function()
+    for _, v in ipairs(OUT_OF_INT32) do
+      range_err("getrawtransaction", {string.rep("a", 64), v})
+    end
+  end)
+
+  it("getchaintxstats nblocks converts before the -8 domain test", function()
+    -- Needs a storage/chain_state stub: this handler checks "Storage not
+    -- available" before it reads nblocks, so a bare server never reaches the
+    -- conversion. (Core does the conversion in RPCHelpMan, i.e. before the
+    -- handler body runs at all — a nuance no measurement here covers, so the
+    -- handler order is left as the codebase has it.)
+    local srv = rpc.new({
+      network = consensus.networks.mainnet,
+      chain_state = {tip_height = 10, tip_hash = string.rep("\0", 32)},
+      storage = {get_hash_by_height = function() return nil end,
+                 get_header = function() return nil end},
+    })
+    for _, v in ipairs(OUT_OF_INT32) do
+      local resp = rpc_call(srv, "getchaintxstats", {v})
+      assert.is_truthy(resp.error and resp.error ~= cjson.null)
+      assert.equal(rpc.ERROR.MISC_ERROR, resp.error.code)
+      assert.equal("JSON integer out of range", resp.error.message)
+    end
+  end)
+
+  it("createmultisig nrequired converts before the keys array is read", function()
+    -- Core answers -1 even though keys is ALSO empty: the conversion runs
+    -- first. This previously reported the empty-keys error.
+    for _, v in ipairs(OUT_OF_INT32) do range_err("createmultisig", {v, {}}) end
+  end)
+
+  -- CONTROL: in-range values must still get PAST the conversion and reach the
+  -- handler. This suite builds a bare server with no chainstate, so what the
+  -- handler then says varies ("Chain state not available") — the assertion
+  -- that carries meaning is that it is NOT the conversion error. Without this,
+  -- a handler that answered -1 for every value would satisfy all five cases
+  -- above.
+  it("CONTROL an in-range height gets past the conversion", function()
+    local resp = rpc_call(server(), "getblockhash", {999999999})
+    assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    assert.are_not.equal("JSON integer out of range", resp.error.message)
+  end)
+
+  it("CONTROL int32 boundary values are accepted by the conversion", function()
+    for _, v in ipairs({2147483647, -2147483648}) do
+      local resp = rpc_call(server(), "getblockhash", {v})
+      assert.are_not.equal("JSON integer out of range", resp.error.message)
+    end
+  end)
+
+  it("CONTROL an in-range verbosity still reaches the block lookup", function()
+    local resp = rpc_call(server(), "getblock", {string.rep("a", 64), 1})
+    assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    assert.are_not.equal("JSON integer out of range", resp.error.message)
+  end)
+end)
+
+-- ==========================================================================
+-- setban: two defects the differential's CONTROLS found, not its hostile cases.
+-- ==========================================================================
+
+describe("#41 setban parity", function()
+  local function srv_with_peers()
+    local pm = {
+      bans = {},
+      is_banned = function(self, k) return self.bans[k] == true end,
+      ban_peer = function(self, k, _d) self.bans[k] = true end,
+    }
+    return rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+  end
+
+  it("an absolute bantime in the past is REJECTED, not clamped to 1s", function()
+    -- The code carried a comment asserting Core "treats absolute-in-the-past
+    -- as a no-op insert". Core actually answers -8 here.
+    local resp = rpc_call(srv_with_peers(), "setban", {"1.2.3.4", "add", 1, true})
+    assert.is_truthy(resp.error and resp.error ~= cjson.null)
+    assert.equal(rpc.ERROR.INVALID_PARAMETER, resp.error.code)
+    assert.equal("Error: Absolute timestamp is in the past", resp.error.message)
+  end)
+
+  it("re-banning answers Core's -23, not the generic -1", function()
+    local s = srv_with_peers()
+    local first = rpc_call(s, "setban", {"1.2.3.4", "add", 3600})
+    assert.equal(cjson.null, first.error)
+    local again = rpc_call(s, "setban", {"1.2.3.4", "add", 3600})
+    assert.is_truthy(again.error and again.error ~= cjson.null)
+    assert.equal(rpc.ERROR.CLIENT_NODE_ALREADY_ADDED, again.error.code)
+    assert.equal("Error: IP/Subnet already banned", again.error.message)
+  end)
+
+  it("CONTROL a future absolute bantime is still accepted", function()
+    local future = os.time() + 86400
+    local resp = rpc_call(srv_with_peers(), "setban", {"1.2.3.4", "add", future, true})
+    assert.equal(cjson.null, resp.error)
+  end)
+end)
