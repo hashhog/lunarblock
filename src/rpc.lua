@@ -1729,6 +1729,67 @@ M.MAX_BATCH_SIZE = 1000
 -- request (empty HTTP body), which broke Core-convention clients and
 -- surfaced in the 2026-08-12 fleet R3(b) sweep as a phantom asymmetry.
 -- With `id = nil`, cjson omits the key — Core's exact response shape.
+-- ---------------------------------------------------------------------------
+-- Dispatcher arity check (Core rpc/util.cpp:644 -> IsValidNumArgs at :733)
+-- ---------------------------------------------------------------------------
+--
+-- Core validates argument COUNT centrally, before any handler runs:
+--     if (GET_HELP || !IsValidNumArgs(request.params.size())) throw HelpResult{...}
+--     IsValidNumArgs = num_required <= n && n <= num_declared
+-- and the violation surfaces as error -1 carrying the method's help text.
+--
+-- No implementation in this fleet had that check: handlers decline to police
+-- argument count because the dispatcher is supposed to, and no dispatcher did.
+-- The operator probe found savemempool accepting a surplus argument in 10 of 10
+-- implementations and clearbanned in 9 of 10 (2026-08-31).
+--
+-- The table is DERIVED FROM CORE by tools/core-arity.py, which reads
+-- `help <method>` (optional arguments are parenthesised in the signature line),
+-- rather than hand-written once per language. Validated by calling Core with
+-- declared+1 arguments on nine read-only methods: all nine returned -1.
+--
+-- COVERAGE: 87 of the 103 operator-subset methods. A method ABSENT from the
+-- table is NOT checked, deliberately -- treating an unknown method as zero-arg
+-- would reject calls Core accepts, a worse failure than the one being fixed.
+local CORE_ARITY = (function()
+  local path = (os.getenv("LUNARBLOCK_SRC") or debug.getinfo(1, "S").source:match("@?(.*/)") or "./")
+                 .. "core-arity.json"
+  local f = io.open(path, "r")
+  if not f then return nil end          -- table absent: check disabled, loudly below
+  local text = f:read("*a"); f:close()
+  local ok, decoded = pcall(cjson.decode, text)
+  if not ok then return nil end
+  return decoded
+end)()
+
+-- A missing or corrupt table must be visible, not silently permissive.
+if not CORE_ARITY then
+  io.stderr:write("lunarblock: WARNING core-arity.json unavailable -- " ..
+                  "RPC argument-count checking is DISABLED\n")
+end
+
+local function check_core_arity(method, params)
+  if not CORE_ARITY then return nil end
+  local spec = CORE_ARITY[method]
+  if not spec then return nil end               -- fail OPEN (see COVERAGE)
+  -- Only positional (array) params are subject to this check. cjson decodes a
+  -- JSON object to a table with string keys; an empty array and an empty object
+  -- are indistinguishable, and both mean "no positional arguments".
+  if type(params) ~= "table" then return nil end
+  for k in pairs(params) do
+    if type(k) ~= "number" then return nil end  -- named params: not our business
+  end
+  local n = #params
+  if n < spec.required or n > spec.declared then
+    local want
+    if spec.required == spec.declared then want = tostring(spec.declared)
+    else want = tostring(spec.required) .. " to " .. tostring(spec.declared) end
+    return {code = -1, message = method .. " takes " .. want ..
+                                 " argument(s), got " .. tostring(n)}
+  end
+  return nil
+end
+
 function RPCServer:handle_single_request(request)
   local method = request.method
   local params = request.params or {}
@@ -1741,6 +1802,12 @@ function RPCServer:handle_single_request(request)
       error = {code = M.ERROR.METHOD_NOT_FOUND, message = "Method not found: " .. tostring(method)},
       id = id,
     }
+  end
+
+  -- Core checks argument count centrally before dispatching (see above).
+  local arity_err = check_core_arity(method, params)
+  if arity_err then
+    return {result = cjson.null, error = arity_err, id = id}
   end
 
   local success, result = pcall(handler, self, params)
