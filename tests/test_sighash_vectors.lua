@@ -36,10 +36,19 @@ end
 --------------------------------------------------------------------------------
 
 -- Try multiple paths for the sighash.json file
-local vector_paths = {
-  "../ouroboros/bitcoin/src/test/data/sighash.json",
-  "/home/max/hashhog/ouroboros/bitcoin/src/test/data/sighash.json",
-}
+local vector_paths = {}
+-- Search several depths so the lookup works whether the cwd is the repo root,
+-- this submodule, or a subdirectory. The list used to hold TWO ENTRIES THAT
+-- WERE THE SAME DEAD PATH (a fallback that falls back to itself), pointing at
+-- a developer laptop -- and for sighash, into a SIBLING implementation's
+-- vendored tree. Neither exists on the build host, so the assert below fired
+-- before a single vector was checked. Found 2026-08-30 fixing the same class
+-- of breakage across the fleet.
+for _, prefix in ipairs({ "", "../", "../../", "../../../", "../../../../" }) do
+  for _, rel in ipairs({ "bitcoin-core/src/test/data/", "resources/" }) do
+    vector_paths[#vector_paths + 1] = prefix .. rel .. "sighash.json"
+  end
+end
 
 local f, json_text
 for _, path in ipairs(vector_paths) do
