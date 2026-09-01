@@ -15,6 +15,12 @@ docker run -v lunarblock-data:/data -p 48351:48351 -p 48341:48341 lunarblock
 
 ```bash
 # Required: luajit, luasocket, lua-cjson, libsecp256k1, openssl, rocksdb
+# Toolchain: LuaJIT 2.1 (rockspec: lua >= 5.1, luasocket >= 3.1.0, lua-cjson >= 2.1.0;
+#   Dockerfile builds on debian:bookworm-slim apt packages). System libs loaded via
+#   FFI: libcrypto (OpenSSL), libsecp256k1, librocksdb (C API) — Debian: apt install
+#   libssl-dev libsecp256k1-dev librocksdb-dev lua-cjson lua-socket. Then run
+#   `make build` to compile lib/sha256_accel.so (not tracked in git) before the
+#   LD_LIBRARY_PATH=./lib commands below.
 # Optional: lua-sec (luasec) — enables HTTPS/TLS termination on the
 #           RPC server when --rpc-tls-cert/--rpc-tls-key are passed.
 #           Install via `luarocks install luasec` or
