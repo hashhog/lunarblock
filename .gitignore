@@ -15,3 +15,11 @@ anchors.dat
 # Project-meta audit artifacts live in the meta-repo (audit-archive/).
 audit/
 CORE-PARITY-AUDIT/
+
+# Runtime files the node writes into its cwd (the test runner starts a node
+# whose cwd is the repo). Never commit these.
+peers.dat
+banlist.json
+mempool.dat
+fee_estimates.json
+*.log
