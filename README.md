@@ -4,7 +4,7 @@ A Bitcoin full node implementation in Lua, targeting LuaJIT 2.1.
 
 ## Status — v1.0.0
 
-**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+**Label: "Replay-pending — awaiting the stateless-replay run now in flight"**
 (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
 deliberately weaker than "Validated", and the scorecard spells out why: it means
 lunarblock agreed with Core on every block the nightly instruments showed it — 169
@@ -41,8 +41,11 @@ operator probe run 2026-09-01T18:26:42Z
 (`SKIP-REGTEST`) for every node including Core. Cite the run, not "the score":
 the probe ten minutes earlier
 (`tools/diff-test-artifacts/r5-probe/20260901T181552Z.json`) scored lunarblock 58
-with no deploy in between, and several of the differences are RPC **timeouts**
-(`getblockheader`, `getblockchaininfo`) rather than wrong answers.
+with no deploy in between. **Three** of lunarblock's 29 failures are RPC
+**timeouts** (`getblockheader`, `getblockchaininfo`, `getblock`) rather than wrong
+answers; the other 26 are wrong answers, wrong error codes or wrong shapes. An
+earlier draft said "several", which softened the score with a count the artifact
+does not support.
 
 **Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
 unit suite is *measured, not fixed*, and 2026-09-01 was the **first time it had
@@ -56,6 +59,12 @@ found the test runner writing `peers.dat`, `banlist.json`, `mempool.dat`,
 
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
 > the hashhog meta-repo, not to this repository.
+> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
+> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
+> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
+> against a running fleet. The nightly `diffguard-*.log` files are likewise
+> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
+> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
 ## Quick Start
 
