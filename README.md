@@ -2,6 +2,61 @@
 
 A Bitcoin full node implementation in Lua, targeting LuaJIT 2.1.
 
+## Status — v1.0.0
+
+**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+(`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
+deliberately weaker than "Validated", and the scorecard spells out why: it means
+lunarblock agreed with Core on every block the nightly instruments showed it — 169
+distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
+nightly corpus sweep — and that a 26,067-height stateless replay was still running
+when the release was written. **Until that run produces a `summary.json`, this node
+has no from-genesis evidence at all.** The git tag `v0.1.0-beta1`
+(`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
+is reserved for an independent from-genesis `--assumevalid=0` reproduction of
+Core's UTXO-set commitment, and `beta` means that receipt does not exist
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+**lunarblock has not been shown to validate the chain from genesis, and on this
+hardware it cannot finish trying.** There is no lunarblock row in the
+reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`) and no lunarblock replay
+ledger in `CORE-PARITY-AUDIT/replay-ledgers/`. `CHARTER.md` (§"R4 — Proven
+validator", "Honest limit") measures lunarblock at ~609 blocks/hour, roughly two
+months per from-genesis pass, and records the rung as unreachable for it without
+different hardware or a native hot path; `receipts/TRUST-ANCHOR.md:172` says its genesis lineage is months out.
+`receipts/TRUST-ANCHOR.md:187-198` (correction, 2026-09-01) additionally
+retracts lunarblock's pre-2026-09-01 M2 boundary-campaign rows as script
+evidence — those window blocks were connected with scripts **skipped** under the
+default assumevalid: `submitblock` computes `skip_scripts` from
+`consensus.should_skip_script_validation`, whose first condition is that
+`network.assumevalid` is non-nil, and only `--noassumevalid` clears it
+(`receipts/TRUST-ANCHOR.md:225-228`). A reader of this repository alone should
+assume lunarblock's from-genesis validation is untested.
+
+**Operator RPC parity: 56 of Bitcoin Core's 85.** From the 103-method R5
+operator probe run 2026-09-01T18:26:42Z
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): lunarblock 56 PASS
+/ 29 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core. Cite the run, not "the score":
+the probe ten minutes earlier
+(`tools/diff-test-artifacts/r5-probe/20260901T181552Z.json`) scored lunarblock 58
+with no deploy in between, and several of the differences are RPC **timeouts**
+(`getblockheader`, `getblockchaininfo`) rather than wrong answers.
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+unit suite is *measured, not fixed*, and 2026-09-01 was the **first time it had
+ever been measured** — **256 failing tests** out of a total the baseline itself
+marks NOT VERIFIED. None were triaged as test-bug or node-bug. The same pass
+found the test runner writing `peers.dat`, `banlist.json`, `mempool.dat`,
+`fee_estimates.json` and `*.log` into the repository (`6e2b2d2`).
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Docker
@@ -101,7 +156,7 @@ LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
 
 ## RPC API
 
-Bitcoin Core-compatible JSON-RPC 1.0/2.0 over HTTP with Basic auth.
+JSON-RPC 1.0/2.0 over HTTP with Basic auth, modelled on Bitcoin Core's. Not behaviourally compatible: on the 2026-09-01T18:26:42Z operator probe lunarblock answers 56 of the 103 probed methods correctly against Core's 85, with 29 failures — several of them RPC timeouts (`getblockheader`, `getblockchaininfo`) rather than wrong answers (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 | Category | Methods |
 |----------|---------|
@@ -124,7 +179,7 @@ No built-in Prometheus exporter. Monitor via RPC calls to `getblockchaininfo`, `
 
 ## Architecture
 
-lunarblock is built on LuaJIT 2.1, leveraging its trace-based JIT compiler to achieve near-native speeds for the hot validation loops. The FFI (Foreign Function Interface) provides zero-overhead bindings to libsecp256k1 for ECDSA/Schnorr signature verification and OpenSSL for SHA256/RIPEMD160 hashing, avoiding the Lua/C boundary overhead that standard `lua_CFunction` bindings would introduce. Buffer pools and LRU caches reduce GC pressure during block processing.
+lunarblock is built on LuaJIT 2.1 and uses its trace-based JIT compiler for the hot validation loops. "Near-native" would be an overstatement: the project measures lunarblock at ~609 blocks/hour on the reference machine — roughly two months for a single from-genesis pass — and records a full from-genesis validation as unreachable for it without different hardware or a native hot path (`CHARTER.md`, §"R4 — Proven validator" and §"R5", which notes that lunarblock "cannot complete a from-genesis validation" while exposing more Core RPCs than the flagship). The FFI (Foreign Function Interface) provides zero-overhead bindings to libsecp256k1 for ECDSA/Schnorr signature verification and OpenSSL for SHA256/RIPEMD160 hashing, avoiding the Lua/C boundary overhead that standard `lua_CFunction` bindings would introduce. Buffer pools and LRU caches reduce GC pressure during block processing.
 
 The node runs on a single-threaded event loop with a 20Hz tick rate, processing P2P messages, mempool transactions, and RPC requests in each cycle. The peer manager handles connection pooling, DNS seed discovery, and eclipse attack mitigations through bucketed address management with netgroup diversity enforcement. Block download uses a parallel sliding window with per-peer limits and adaptive stall detection.
 
