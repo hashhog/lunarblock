@@ -2220,6 +2220,113 @@ end
 -- Campaign AssumeUTXO Loader (HASHHOG_CAMPAIGN_ASSUMEUTXO)
 --------------------------------------------------------------------------------
 
+--- Verify a campaign entry's `base_tail_headers` band and read one ancestor out.
+--
+-- The band is an ASCENDING run of real, consecutive 80-byte block headers whose
+-- LAST element is the snapshot base's own header, supplied because a
+-- snapshot-bootstrapped node holds no header below the base (see the caller).
+-- It is attacker-adjacent input that will be turned into a pinned consensus
+-- constant, so NOTHING is taken on faith: every invariant that makes the band
+-- self-proving is checked before a single field is read out of it.
+--
+--   * each element is exactly 160 hex chars / 80 bytes and deserialises;
+--   * each header's prev_hash equals the double-SHA256 of its predecessor, so
+--     the band is one unbroken chain and no element can be swapped;
+--   * every header meets its OWN target and that target is within the
+--     network's pow_limit (validation.check_proof_of_work's conditions 3+4,
+--     Core pow.cpp DeriveTarget/CheckProofOfWorkImpl) -- forging a band that
+--     links AND carries real work is the same cost as forging the chain;
+--   * the last header hashes to the entry's declared blockhash, which is the
+--     hash the snapshot's own commitment is keyed to, so the whole band is
+--     anchored to a value the import path already verified;
+--   * the band is no longer than the base height allows (it cannot start
+--     below genesis).
+--
+-- Heights are implied, not supplied: the last header IS the base, so element
+-- `idx` sits at `base_height - (n - idx)`.  That is why linkage has to hold for
+-- the WHOLE band -- one missing link would silently shift every height below it.
+--
+-- @param raw_list table: the fixture's base_tail_headers array
+-- @param base_height number: the entry's height (height of the LAST header)
+-- @param base_blockhash string: the entry's blockhash, display-order hex
+-- @param want_height number|nil: pre-base height to extract, nil for none
+-- @param network table: network config (supplies pow_limit_bits)
+-- @return table|nil, string|nil: {start_height, anchor={blockhash,timestamp,bits}|nil}
+--                                 or nil + reason
+local function verify_base_tail_headers(raw_list, base_height, base_blockhash,
+                                        want_height, network)
+  if type(raw_list) ~= "table" or raw_list[1] == nil then
+    return nil, "base_tail_headers is not a non-empty array"
+  end
+  local n = #raw_list
+  if n - 1 > base_height then
+    return nil, string.format(
+      "base_tail_headers has %d entries but the base height is only %d "
+      .. "(the band would start below genesis)", n, base_height)
+  end
+
+  local serialize_mod = require("lunarblock.serialize")
+  local types_mod     = require("lunarblock.types")
+  local crypto_mod    = require("lunarblock.crypto")
+
+  local start_height = base_height - (n - 1)
+  local pow_limit = M.bits_to_target(network.pow_limit_bits)
+
+  local prev_hash_le, last_hash, anchor
+
+  for idx = 1, n do
+    local hex = raw_list[idx]
+    if type(hex) ~= "string" or #hex ~= 160 or hex:match("^%x+$") == nil then
+      return nil, string.format(
+        "base_tail_headers[%d] is not 160 hex chars / 80 bytes", idx)
+    end
+    local raw = hex:gsub("%x%x",
+      function(byte_hex) return string.char(tonumber(byte_hex, 16)) end)
+    local parse_ok, hdr = pcall(serialize_mod.deserialize_block_header, raw)
+    if not parse_ok then
+      return nil, string.format(
+        "base_tail_headers[%d] failed to parse: %s", idx, tostring(hdr))
+    end
+
+    -- Linkage: this header's parent pointer must be the previous element.
+    if prev_hash_le and hdr.prev_hash.bytes ~= prev_hash_le then
+      return nil, string.format(
+        "base_tail_headers[%d] prev-hash does not link to [%d]", idx, idx - 1)
+    end
+
+    -- Proof of work, on the header's own declared target.  Same two gates as
+    -- validation.check_proof_of_work (which cannot be called from here --
+    -- validation requires consensus).
+    local hash = crypto_mod.hash256_type(raw)
+    local target = M.bits_to_target(hdr.bits)
+    if M.compare_targets(target, pow_limit) > 0
+       or not M.hash_meets_target(hash.bytes, target) then
+      return nil, string.format(
+        "base_tail_headers[%d] (height %d) does not satisfy proof of work",
+        idx, start_height + idx - 1)
+    end
+
+    prev_hash_le = hash.bytes
+    last_hash = hash
+    if want_height and start_height + idx - 1 == want_height then
+      anchor = {
+        blockhash = types_mod.hash256_hex(hash),
+        timestamp = hdr.timestamp,
+        bits      = hdr.bits,
+      }
+    end
+  end
+
+  local last_hex = types_mod.hash256_hex(last_hash)
+  if last_hex ~= base_blockhash then
+    return nil, string.format(
+      "base_tail_headers ends at %s, which is not the entry blockhash %s",
+      last_hex, base_blockhash)
+  end
+
+  return { start_height = start_height, anchor = anchor }
+end
+
 --- Load campaign-only assumeutxo entries from HASHHOG_CAMPAIGN_ASSUMEUTXO and
 -- append them to `network`'s assumeutxo allowlist. Read ONCE at startup, after
 -- network-params selection (see main.lua's main()). Unset or empty ⇒ this
@@ -2231,7 +2338,8 @@ end
 --
 -- Fixture JSON is an array of entries:
 --   {height, blockhash, hash_serialized, m_chain_tx_count,
---    base_mtp?, base_header?, chainwork?}
+--    base_mtp?, base_header?, chainwork?, base_tail_headers?,
+--    pre_base_ancestor?}
 -- All hex fields are DISPLAY order (Core kernel/chainparams.cpp convention).
 -- lunarblock's built-in tables (mainnet/regtest above) already store
 -- hash_serialized/blockhash verbatim in that same display-order hex -- unlike
@@ -2357,13 +2465,66 @@ function M.load_campaign_assumeutxo(network)
       }
     end
 
-    -- Optional pinned pre-base ancestor, same shape and same trust model as
-    -- the built-in tables (see M.validate_assumeutxo_anchors).  An entry that
-    -- supplies base_header WITHOUT this is still loaded into the allowlist,
-    -- but is NOT injectable: inject_snapshot_base refuses it rather than
-    -- forward-syncing into a chain whose first retarget boundary has no
-    -- resolvable period-first ancestor.  The gate lives there (it sees the
-    -- MERGED table) precisely so a campaign fixture cannot re-open the hole.
+    -- PRE-BASE ANCESTRY.  A snapshot-bootstrapped node holds no header below
+    -- the base, so the first retarget boundary above it cannot resolve its
+    -- period-first ancestor (boundary - 2016) from its own chain.  Core is
+    -- never in this position: ActivateSnapshot (validation.cpp:5611-5616)
+    -- REFUSES a snapshot whose base header is not already in a genesis-synced
+    -- headers chain, and that precondition is exactly what lets pow.cpp:41-45
+    -- assert(pindexFirst).  lunarblock deliberately accepts a base without
+    -- synced headers -- the range-validation premise -- so it has to
+    -- MATERIALISE that ancestor instead of assuming it.
+    --
+    -- Two optional sources, both merged into entry.pre_base_ancestors:
+    --   base_tail_headers -- an ascending band of real consecutive 80-byte
+    --                        headers ending at the base.  Fully verified
+    --                        (linkage + PoW + it hashes to this entry's
+    --                        blockhash) by verify_base_tail_headers BEFORE
+    --                        anything is read out of it; the anchor the gate
+    --                        needs is then read from the band at its own height.
+    --   pre_base_ancestor -- a single hand-pinned {height, blockhash,
+    --                        timestamp, bits} record (the original shape),
+    --                        same trust model as the built-in tables (see
+    --                        M.validate_assumeutxo_anchors).
+    --
+    -- Neither source weakens the gate.  An entry that supplies no usable
+    -- ancestry is still loaded into the allowlist but stays NON-injectable:
+    -- inject_snapshot_base refuses it at boot rather than forward-syncing into
+    -- a chain whose first retarget boundary has no resolvable period-first
+    -- ancestor.  That gate lives there (it sees the MERGED table) precisely so
+    -- a campaign fixture cannot re-open the hole.
+    local ancestors = nil
+    if e.base_tail_headers ~= nil then
+      -- There is at most ONE pre-base height any chain rooted at this base can
+      -- ever ask for (consensus.required_pre_base_anchor_height), so the band
+      -- is verified in full but only that height is pinned.
+      local need = M.required_pre_base_anchor_height(network, height)
+      local band, band_err = verify_base_tail_headers(
+        e.base_tail_headers, height, e.blockhash, need, network)
+      if not band then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) %s",
+          i, height, band_err)
+      end
+      if need and band.anchor then
+        ancestors = { [need] = band.anchor }
+        io.stdout:write(string.format(
+          "[CAMPAIGN-ASSUMEUTXO] entry height %d: verified %d base_tail_headers "
+          .. "(heights %d..%d, linkage + PoW, ends at the entry blockhash) -> "
+          .. "pinned pre-base ancestor %d=%s\n",
+          height, #e.base_tail_headers, band.start_height, height,
+          need, band.anchor.blockhash))
+        io.stdout:flush()
+      elseif need then
+        io.stderr:write(string.format(
+          "[CAMPAIGN-ASSUMEUTXO] WARNING: entry height %d: base_tail_headers "
+          .. "covers heights %d..%d, which does NOT include the required "
+          .. "pre-base anchor height %d; the entry stays NON-injectable\n",
+          height, band.start_height, height, need))
+        io.stderr:flush()
+      end
+    end
+
     if e.pre_base_ancestor ~= nil then
       local a = e.pre_base_ancestor
       if type(a) ~= "table" then
@@ -2394,14 +2555,28 @@ function M.load_campaign_assumeutxo(network)
           .. "is invalid (required even on non-BIP94 networks; pow.cpp:70-73)",
           i, height)
       end
-      entry.pre_base_ancestors = {
-        [a.height] = {
-          blockhash = a.blockhash,
-          timestamp = a.timestamp,
-          bits      = a.bits,
-        },
+      ancestors = ancestors or {}
+      -- If base_tail_headers already produced an ancestor at this height the
+      -- two must agree.  A disagreement means the fixture contradicts itself,
+      -- and silently preferring either source would pin a value no check has
+      -- corroborated -- refuse instead.
+      local derived = ancestors[a.height]
+      if derived and (derived.blockhash ~= a.blockhash
+                      or derived.timestamp ~= a.timestamp
+                      or derived.bits ~= a.bits) then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) pre_base_ancestor "
+          .. "at height %d (%s) contradicts the ancestor derived from the "
+          .. "verified base_tail_headers band (%s) -- refusing to start",
+          i, height, a.height, a.blockhash, derived.blockhash)
+      end
+      ancestors[a.height] = {
+        blockhash = a.blockhash,
+        timestamp = a.timestamp,
+        bits      = a.bits,
       }
     end
+    if ancestors then entry.pre_base_ancestors = ancestors end
 
     network.assumeutxo[height] = entry
     loaded_heights[#loaded_heights + 1] = height
