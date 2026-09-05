@@ -668,6 +668,29 @@ local function run_import_utxo(args)
     os.exit(1)
   end
 
+  -- HASHHOG_CAMPAIGN_ASSUMEUTXO: the import path needs the campaign allowlist
+  -- exactly as much as the daemon does, and used not to load it. main() reads
+  -- the fixture right after network selection (see the comment there), but the
+  -- --import-utxo branch returns BEFORE reaching that call, so a campaign
+  -- snapshot arrived here with an empty allowlist: assumeutxo_for_blockhash()
+  -- below missed, pre_base_height stayed nil, load_snapshot fell back to the
+  -- fresh-datadir genesis tip (0), and the per-coin height guard killed the
+  -- very first coin ("Bad snapshot data after deserializing 0 coins").
+  -- Loading it here is strictly better than reaching for
+  -- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: the campaign entry carries a real
+  -- hash_serialized, so the commitment comparison at the bottom of this
+  -- function RUNS instead of being skipped, and the import is reported
+  -- VERIFIED rather than "NOT VERIFIED". Same call, same network table, same
+  -- refuse-on-malformed/collision semantics as the daemon; unset (the default)
+  -- is one os.getenv and a no-op. Only ONE of the two call sites ever runs per
+  -- process -- import-utxo returns early -- so entries are never loaded twice.
+  local campaign_count, campaign_err = consensus_mod.load_campaign_assumeutxo(network)
+  if not campaign_count then
+    io.stderr:write("import-utxo FAILED: HASHHOG_CAMPAIGN_ASSUMEUTXO error: "
+      .. tostring(campaign_err) .. "\n")
+    os.exit(1)
+  end
+
   -- import-blocks (line 292) opens the same RocksDB at `datadir/chainstate`,
   -- and so does the daemon path (line 656). Without the `/chainstate` here,
   -- import-utxo wrote into a sibling DB at `datadir/` whose chain_tip was
@@ -811,10 +834,19 @@ local function run_import_utxo(args)
   local h0 = os.time()
   local set_hash, count = cs:compute_utxo_hash()
   local hash_elapsed = os.time() - h0
-  local set_hash_hex = ""
-  for i = 1, 32 do
-    set_hash_hex = set_hash_hex .. string.format("%02x", set_hash:byte(i))
-  end
+  -- Print the set hash in DISPLAY order (uint256::ToString, i.e. reversed),
+  -- which is what Core's dumptxoutset/gettxoutsetinfo txoutset_hash, the
+  -- chainparams/campaign `hash_serialized` field, and every other hashhog
+  -- impl emit. This line used to loop over set_hash's raw bytes forwards and
+  -- print INTERNAL order, so a correct import logged
+  -- "set_hash=685e5326... MATCHES ... (hash_serialized=e3e6c52f...)" -- the
+  -- same digest twice, byte-reversed, reading like a contradiction. Only the
+  -- rendering changes: the equality test below still compares raw internal
+  -- bytes (set_hash) against hash256_from_hex(hash_serialized), which reverses
+  -- the display hex back to internal. Do NOT "fix" a future mismatch by
+  -- flipping that comparison -- reversing one side twice would make the node
+  -- accept snapshots it must reject.
+  local set_hash_hex = types.hash256_hex(types.hash256(set_hash))
 
   db.close()
 
