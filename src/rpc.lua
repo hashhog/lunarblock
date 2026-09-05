@@ -12805,6 +12805,54 @@ end
     local base_hash_hex = types.hash256_hex(meta.base_blockhash)
     local au_data, au_height = consensus.assumeutxo_for_blockhash(
       rpc.network, base_hash_hex)
+
+    -- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+    -- chainparams assumeutxo whitelist.  Core (and this node by default) only
+    -- accepts snapshots whose base blockhash is a hardcoded trust anchor,
+    -- because loadtxoutset is a trust shortcut for end users.  Setting this
+    -- variable to the snapshot's base height accepts ANY snapshot and takes
+    -- that height on faith -- it exists so the fleet can validate arbitrary
+    -- block ranges in parallel from a locally generated snapshot ladder, where
+    -- correctness is established by checking the range's OUTPUT utxo hash
+    -- against an independent commitment, not by trusting the input.  ONLY the
+    -- whitelist membership requirement and its paired hardcoded
+    -- `hash_serialized` comparison are bypassed; the network-magic check above,
+    -- the header format, the coin count, per-coin parsing, the per-coin height
+    -- + MoneyRange guards and the trailing-data guard in load_snapshot all
+    -- still run, and so does the background genesis->base re-derivation (see
+    -- the target-hash rewire after activation).  Unset (the default, and what
+    -- ships) = unchanged Core-strict behaviour.
+    local whitelist_bypassed = false
+    if not au_data then
+      local raw_unsafe = os.getenv("HASHHOG_UNSAFE_SNAPSHOT_HEIGHT")
+      local unsafe_digits = raw_unsafe and raw_unsafe:match("^%s*(%d+)%s*$")
+      if raw_unsafe and raw_unsafe ~= "" and not unsafe_digits then
+        error({code = M.ERROR.INVALID_PARAMS,
+          message = string.format(
+            "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=%q is not a block height",
+            raw_unsafe)})
+      end
+      if unsafe_digits then
+        whitelist_bypassed = true
+        au_height = tonumber(unsafe_digits)
+        -- No trust anchor exists for this base, so the synthesized entry
+        -- deliberately carries NO hash_serialized: every downstream comparison
+        -- against a hardcoded commitment (activate_snapshot_with_background's
+        -- expected_hash and the W102-BUG1 load-time gate below) is keyed on
+        -- that field and is therefore the only thing skipped.
+        au_data = { height = au_height, blockhash = base_hash_hex }
+        io.stderr:write(string.format(
+          "loadtxoutset *** UNVERIFIED SNAPSHOT ACCEPTED *** "
+          .. "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=%d bypassed the assumeutxo "
+          .. "whitelist: base blockhash %s is NOT a chainparams trust anchor, "
+          .. "so its hardcoded hash_serialized commitment does not exist and "
+          .. "was NOT checked. Base height %d is taken on faith from the "
+          .. "environment. DEVELOPMENT ONLY -- never enable this in "
+          .. "production.\n",
+          au_height, base_hash_hex, au_height))
+      end
+    end
+
     if not au_data then
       -- Core-strict whitelist (bitcoin-core/src/validation.cpp:5775-5780):
       -- after looking up the snapshot's base block in the header index to
@@ -12893,6 +12941,17 @@ end
     if not activation then
       error({code = M.ERROR.MISC_ERROR,
         message = aerr or "load failed"})
+    end
+
+    -- Whitelist bypassed (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT): there is no
+    -- hardcoded hash_serialized for this base, so the background validator was
+    -- built with target_hash = nil and would fail its final comparison against
+    -- nil.  Record the LOADED set's own hash as the target instead, so the
+    -- INDEPENDENT genesis->base re-derivation still runs and still has to agree
+    -- with the snapshot -- that check is not bypassed, only the chainparams
+    -- trust anchor is.
+    if whitelist_bypassed then
+      activation.background.target_hash = rpc.chain_state:compute_utxo_hash()
     end
 
     -- ── W102-BUG1 fix: SYNCHRONOUS load-time HASH_SERIALIZED gate. ─────────

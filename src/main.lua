@@ -691,6 +691,9 @@ local function run_import_utxo(args)
   -- bottom of this function did the same thing, just too late to help the
   -- guard) and feed it in.
   local pre_base_height = nil
+  -- Set only when HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypassed the whitelist below;
+  -- carried past the `do` block so the post-load chain-tip write can use it.
+  local unsafe_base_height = nil
   do
     local hf = io.open(args.import_utxo, "rb")
     if not hf then
@@ -721,13 +724,51 @@ local function run_import_utxo(args)
         "import-utxo: base block %s -> assumeutxo height %d",
         base_hex, _au_height))
     else
-      -- No assumeutxo entry for this base block.  We still attempt the load,
-      -- but warn loudly: the per-coin height guard will reject the snapshot
-      -- because effective_base_height falls back to the genesis tip (0).
-      io.stderr:write(string.format(
-        "import-utxo WARNING: no assumeutxo entry for base block %s; "
-        .. "per-coin height guard will reject coins from blocks > 0\n",
-        base_hex))
+      -- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+      -- chainparams assumeutxo whitelist.  Core (and this node by default)
+      -- only accepts snapshots whose base blockhash is a hardcoded trust
+      -- anchor, because loadtxoutset is a trust shortcut for end users.
+      -- Setting this variable to the snapshot's base height accepts ANY
+      -- snapshot and takes that height on faith -- it exists so the fleet can
+      -- validate arbitrary block ranges in parallel from a locally generated
+      -- snapshot ladder, where correctness is established by checking the
+      -- range's OUTPUT utxo hash against an independent commitment, not by
+      -- trusting the input.  ONLY the whitelist membership requirement and its
+      -- paired hardcoded `hash_serialized` comparison are bypassed; the header
+      -- format/magic checks, the coin count, per-coin parsing, the per-coin
+      -- height + MoneyRange guards and the trailing-data guard in
+      -- utxo.lua:ChainState:load_snapshot all still run.  Unset (the default,
+      -- and what ships) = unchanged behaviour.
+      local raw_unsafe = os.getenv("HASHHOG_UNSAFE_SNAPSHOT_HEIGHT")
+      local unsafe_digits = raw_unsafe and raw_unsafe:match("^%s*(%d+)%s*$")
+      if raw_unsafe and raw_unsafe ~= "" and not unsafe_digits then
+        db.close()
+        io.stderr:write(string.format(
+          "import-utxo FAILED: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=%q is not a "
+          .. "block height\n", raw_unsafe))
+        os.exit(1)
+      end
+      if unsafe_digits then
+        unsafe_base_height = tonumber(unsafe_digits)
+        pre_base_height = unsafe_base_height
+        io.stderr:write(string.format(
+          "import-utxo *** UNVERIFIED SNAPSHOT ACCEPTED *** "
+          .. "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=%d bypassed the assumeutxo "
+          .. "whitelist: base blockhash %s is NOT a chainparams trust anchor, "
+          .. "so its hardcoded hash_serialized commitment does not exist and "
+          .. "was NOT checked. Base height %d is taken on faith from the "
+          .. "environment. DEVELOPMENT ONLY -- never enable this in "
+          .. "production.\n",
+          unsafe_base_height, base_hex, unsafe_base_height))
+      else
+        -- No assumeutxo entry for this base block.  We still attempt the load,
+        -- but warn loudly: the per-coin height guard will reject the snapshot
+        -- because effective_base_height falls back to the genesis tip (0).
+        io.stderr:write(string.format(
+          "import-utxo WARNING: no assumeutxo entry for base block %s; "
+          .. "per-coin height guard will reject coins from blocks > 0\n",
+          base_hex))
+      end
     end
   end
 
@@ -746,6 +787,15 @@ local function run_import_utxo(args)
   -- Resolve assumeutxo height for the loaded base block.
   local tip_hex = types.hash256_hex(cs.tip_hash)
   local au_data, au_height = consensus_mod.assumeutxo_for_blockhash(network, tip_hex)
+  if not au_height and unsafe_base_height then
+    -- Whitelist bypassed above (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT): the entry that
+    -- normally supplies the base height does not exist, so take the height from
+    -- the environment.  Without this the chain tip is never written and the
+    -- imported snapshot is orphaned in the datadir.  au_data stays nil, so the
+    -- hardcoded hash_serialized comparison below is skipped and the run reports
+    -- "NOT VERIFIED".
+    au_height = unsafe_base_height
+  end
   if au_height then
     cs.tip_height = au_height
     db.set_chain_tip(cs.tip_hash, au_height, true)
