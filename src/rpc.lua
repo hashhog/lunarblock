@@ -388,7 +388,23 @@ local function bip22_result(err)
      s:find("cleanstack") or s:find("stack_size") or s:find("minimalif") or
      s:find("nullfail") or s:find("eval_false") or s:find("sig_schnorr") or
      s:find("sig_findanddelete") or s:find("sig_pushonly") or
-     s:find("op_codeseparator") or s:find("taproot") or s:find("discourage_") then
+     s:find("op_codeseparator") or s:find("taproot") or s:find("discourage_") or
+     -- SCRIPT_ERR_* tokens raised by execute_script via error() (not wrapped
+     -- with "Script verification failed", so they never hit s:find("script")).
+     -- Core validation.cpp:2122 maps every connect-block script failure to
+     -- "block-script-verify-flag-failed (%s)". R2 cluster (B1-scripttests 6 +
+     -- BIP112 CSV 4 + BIP65 CLTV 3) was reject:rejected vs Core's token.
+     -- interpreter.cpp: SCRIPT_ERR_OP_COUNT / UNBALANCED_CONDITIONAL /
+     -- NEGATIVE_LOCKTIME / UNSATISFIED_LOCKTIME / INVALID_STACK_OPERATION.
+     s:find("op_count") or s:find("unbalanced_conditional") or
+     s:find("negative_locktime") or s:find("unsatisfied_locktime") or
+     s:find("invalid_stack_operation") or s:find("invalid_altstack_operation") or
+     -- Legacy human-readable execute_script messages (pre-token rename).
+     s:find("unknown opcode") or s:find("too many opcodes") or
+     s:find("stack overflow") or s:find("unbalanced if") or
+     s:find("op_else without") or s:find("op_endif without") or
+     s:find("checklocktimeverify") or s:find("checksequenceverify") or
+     s:find("negative sequence") or s:find("negative locktime") then
     -- taproot: match both the raw TAPROOT_* code tokens (lowercased
     -- "taproot_...") AND the human-readable "taproot ..." assert messages
     -- raised on the native P2TR connect-block verify path in utxo.lua

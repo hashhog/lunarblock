@@ -862,7 +862,7 @@ describe("script", function()
 
       assert.has_error(function()
         script.execute_script(s)
-      end, "too many opcodes")
+      end, "OP_COUNT")
     end)
 
     it("exactly 201 opcodes succeeds", function()
@@ -2276,7 +2276,7 @@ describe("script", function()
       -- tapscripts can have far more than 201 counted opcodes.
       -- 250 OP_NOPs (0x61) -> over the 201-op legacy limit.
       local many_ops = string.rep("\x61", 250)
-      -- Legacy: must fail "too many opcodes" (raised via assert)
+      -- Legacy: must fail OP_COUNT (raised via error(), interpreter.cpp:452)
       local ok_legacy = pcall(function()
         script.execute_script(many_ops, {}, {}, {})
       end)
@@ -2907,6 +2907,113 @@ describe("script", function()
       -- Core: element left as "\x05\x00" -> OP_SIZE=2 -> OP_2 OP_NUMEQUAL TRUE.
       -- Pre-fix lunarblock: element re-encoded to "\x05" -> OP_SIZE=1 -> FALSE.
       assert.is_true(script.cast_to_bool(result[#result]))
+    end)
+  end)
+
+  -- R2 interpreter cluster (QUEUES.md lunarblock item 1): B1-scripttests +
+  -- BIP112 CSV + BIP65 CLTV failed corpus-sweep as reject:rejected vs Core's
+  -- reject:block-script-verify-flag-failed. execute_script now raises Core
+  -- SCRIPT_ERR_* tokens (interpreter.cpp); bip22_result maps them. Reverting
+  -- the token names or the mapper turns these red.
+  describe("R2 SCRIPT_ERR tokens (BIP22 cluster)", function()
+    local rpc
+    setup(function()
+      rpc = require("lunarblock.rpc")
+    end)
+
+    local function classify_err(err)
+      return rpc.classify_block_rejection(tostring(err))
+    end
+
+    it("unknown opcode 0xbb raises BAD_OPCODE → block-script-verify-flag-failed", function()
+      -- B1 badopcode-reject: executed 0xbb (interpreter.cpp:1217-1218)
+      local ok, err = pcall(script.execute_script, "\x51\xbb")
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("BAD_OPCODE", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("202 OP_NOPs raise OP_COUNT → block-script-verify-flag-failed", function()
+      -- B1 opcount-202-reject / opcount-unexec-reject (interpreter.cpp:452-454)
+      local ok, err = pcall(script.execute_script, string.rep("\x61", 202))
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("OP_COUNT", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("1001 OP_1 pushes return STACK_SIZE (not throw stack overflow)", function()
+      -- B1 stacksize-1001-reject. Core interpreter.cpp:1221-1223 checks
+      -- AFTER the opcode. Pre-fix push() asserted "stack overflow" first,
+      -- which bip22 mapped to generic "rejected".
+      local stack, err = script.execute_script(string.rep("\x51", 1001))
+      assert.is_nil(stack)
+      assert.equals("STACK_SIZE", err)
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("OP_IF without ENDIF raises UNBALANCED_CONDITIONAL", function()
+      -- B1 unbalanced-if-reject (interpreter.cpp:1235-1236)
+      local ok, err = pcall(script.execute_script, "\x51\x63")  -- OP_1 OP_IF
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("UNBALANCED_CONDITIONAL", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("OP_ENDIF without OP_IF raises UNBALANCED_CONDITIONAL", function()
+      -- B1 unbalanced-endif-reject (interpreter.cpp:647-648)
+      local ok, err = pcall(script.execute_script, "\x68")  -- OP_ENDIF
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("UNBALANCED_CONDITIONAL", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("CLTV of -1 raises NEGATIVE_LOCKTIME", function()
+      -- BIP65 cltv-negative-reject (interpreter.cpp:551-552)
+      local checker = { check_locktime = function() return true end }
+      local flags = { verify_checklocktimeverify = true }
+      local ok, err = pcall(script.execute_script, "\x4f\xb1", {}, flags, checker)
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("NEGATIVE_LOCKTIME", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("CLTV CheckLockTime false raises UNSATISFIED_LOCKTIME", function()
+      -- BIP65 cltv-nsequence-final-reject / cltv-type-mismatch-reject
+      -- (interpreter.cpp:555-556)
+      local checker = { check_locktime = function() return false end }
+      local flags = { verify_checklocktimeverify = true }
+      local ok, err = pcall(script.execute_script, "\x51\xb1", {}, flags, checker)
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("UNSATISFIED_LOCKTIME", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("CSV of -1 raises NEGATIVE_LOCKTIME", function()
+      -- BIP112 csv-negative-locktime (interpreter.cpp:579-580)
+      local checker = { check_sequence = function() return true end }
+      local flags = { verify_checksequenceverify = true }
+      local ok, err = pcall(script.execute_script, "\x4f\xb2", {}, flags, checker)
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("NEGATIVE_LOCKTIME", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("CSV CheckSequence false raises UNSATISFIED_LOCKTIME", function()
+      -- BIP112 csv-compare-unsatisfied / csv-type-flag-mismatch /
+      -- csv-version-low-gate (interpreter.cpp:589-590)
+      local checker = { check_sequence = function() return false end }
+      local flags = { verify_checksequenceverify = true }
+      local ok, err = pcall(script.execute_script, "\x51\xb2", {}, flags, checker)
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("UNSATISFIED_LOCKTIME", 1, true))
+      assert.equals("block-script-verify-flag-failed", classify_err(err))
+    end)
+
+    it("CONTROL: unclassified prose still maps to rejected (mapper is not a blanket catch)", function()
+      -- Negative control: a non-script connect-block error must stay generic.
+      -- If classify_block_rejection started returning script-verify for
+      -- everything, this would go green on a broken mapper.
+      assert.equals("rejected", rpc.classify_block_rejection("totally unrelated boom"))
     end)
   end)
 end)

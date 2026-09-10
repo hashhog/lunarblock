@@ -1183,9 +1183,13 @@ function M.execute_script(script_bytes, stack, flags, checker)
     return stack[#stack]
   end
 
-  -- Helper: push to stack
+  -- Helper: push to stack.
+  -- Stack-size is NOT gated here. Core EvalScript (interpreter.cpp:1221-1223)
+  -- checks `stack.size() + altstack.size() > MAX_STACK_SIZE` AFTER the opcode
+  -- and reports SCRIPT_ERR_STACK_SIZE. A pre-push assert fired first with
+  -- "stack overflow", which submitblock mapped to generic "rejected" instead
+  -- of block-script-verify-flag-failed (B1 stacksize-1001-reject).
   local function push(val)
-    assert(#stack < MAX_STACK_SIZE + #altstack, "stack overflow")
     assert(#val <= MAX_SCRIPT_ELEMENT_SIZE, "element too large")
     stack[#stack + 1] = val
   end
@@ -1247,7 +1251,11 @@ function M.execute_script(script_bytes, stack, flags, checker)
     -- ordinals/inscription tapscripts blow past MAX_OPS legitimately.
     if not flags.is_tapscript and is_counted_opcode(opcode) then
       op_count = op_count + 1
-      assert(op_count <= MAX_OPS, "too many opcodes")
+      -- interpreter.cpp:452-454: SCRIPT_ERR_OP_COUNT. Keep error() so
+      -- existing pcall(execute_script) specs still observe a throw.
+      if op_count > MAX_OPS then
+        error("OP_COUNT")
+      end
     end
 
     -- OP_VERIF and OP_VERNOTIF always fail (even in non-executing branches)
@@ -1301,7 +1309,10 @@ function M.execute_script(script_bytes, stack, flags, checker)
       i = i + 1
       goto continue
     elseif opcode == M.OP.OP_ELSE then
-      assert(#if_stack > 0, "OP_ELSE without OP_IF")
+      -- interpreter.cpp:639-640: SCRIPT_ERR_UNBALANCED_CONDITIONAL
+      if #if_stack == 0 then
+        error("UNBALANCED_CONDITIONAL")
+      end
       -- Only flip if we're the inner-most if and parent is executing
       local parent_executing = true
       for j = 1, #if_stack - 1 do
@@ -1316,7 +1327,10 @@ function M.execute_script(script_bytes, stack, flags, checker)
       i = i + 1
       goto continue
     elseif opcode == M.OP.OP_ENDIF then
-      assert(#if_stack > 0, "OP_ENDIF without OP_IF")
+      -- interpreter.cpp:647-648: SCRIPT_ERR_UNBALANCED_CONDITIONAL
+      if #if_stack == 0 then
+        error("UNBALANCED_CONDITIONAL")
+      end
       if_stack[#if_stack] = nil
       i = i + 1
       goto continue
@@ -1787,7 +1801,9 @@ function M.execute_script(script_bytes, stack, flags, checker)
       local n = pop_num()
       assert(n >= 0 and n <= 20, "invalid pubkey count")
       op_count = op_count + n
-      assert(op_count <= MAX_OPS, "too many opcodes")
+      if op_count > MAX_OPS then
+        error("OP_COUNT")
+      end
 
       local pubkeys = {}
       for j = 1, n do
@@ -1900,19 +1916,22 @@ function M.execute_script(script_bytes, stack, flags, checker)
       if flags.verify_checklocktimeverify then
         -- BIP65 / Bitcoin Core interpreter.cpp:529-558
         -- Stack must not be empty (SCRIPT_ERR_INVALID_STACK_OPERATION).
-        assert(#stack > 0, "CHECKLOCKTIMEVERIFY requires stack value")
+        -- interpreter.cpp:529-530. Keep assert(#stack > 0) form: W132 G20 greps it.
+        assert(#stack > 0, "INVALID_STACK_OPERATION")
         -- Read top of stack WITHOUT consuming it (Core uses stacktop(-1)).
         -- 5-byte CScriptNum: avoids year-2038 problem on uint32 nLockTime.
         -- interpreter.cpp:546: CScriptNum nLockTime(stacktop(-1), fRequireMinimal, 5)
         local locktime = M.script_num_decode(peek(), 5, flags and flags.verify_minimaldata)
         -- Negative locktime is invalid (SCRIPT_ERR_NEGATIVE_LOCKTIME).
         -- interpreter.cpp:551-552
-        assert(locktime >= 0, "negative locktime")
+        if locktime < 0 then
+          error("NEGATIVE_LOCKTIME")
+        end
         -- Compare script locktime against transaction locktime.
         -- interpreter.cpp:555-556: CheckLockTime(nLockTime) → SCRIPT_ERR_UNSATISFIED_LOCKTIME
         if checker.check_locktime then
           if not checker.check_locktime(locktime) then
-            error("CHECKLOCKTIMEVERIFY failed")
+            error("UNSATISFIED_LOCKTIME")
           end
         end
         -- Stack is left unchanged: stacktop(-1) is not popped by CLTV.
@@ -1924,7 +1943,9 @@ function M.execute_script(script_bytes, stack, flags, checker)
       end
     elseif opcode == M.OP.OP_CHECKSEQUENCEVERIFY then
       if flags.verify_checksequenceverify then
-        assert(#stack > 0, "CHECKSEQUENCEVERIFY requires stack value")
+        -- interpreter.cpp:568-569: SCRIPT_ERR_INVALID_STACK_OPERATION.
+        -- Keep assert(#stack > 0) form: W132 G20 greps it.
+        assert(#stack > 0, "INVALID_STACK_OPERATION")
         -- Read top of stack WITHOUT consuming it (Core uses stacktop(-1),
         -- interpreter.cpp:574). The original element must be left byte-for-byte
         -- intact — popping + re-pushing the minimal re-encoding mutates it
@@ -1937,12 +1958,15 @@ function M.execute_script(script_bytes, stack, flags, checker)
           if not disable_flag then
             if checker.check_sequence then
               if not checker.check_sequence(sequence) then
-                error("CHECKSEQUENCEVERIFY failed")
+                -- interpreter.cpp:589-590: SCRIPT_ERR_UNSATISFIED_LOCKTIME
+                error("UNSATISFIED_LOCKTIME")
               end
             end
           end
         else
-          error("negative sequence")
+          -- interpreter.cpp:579-580: SCRIPT_ERR_NEGATIVE_LOCKTIME (CSV and CLTV
+          -- share the same error; Core does not have a distinct "negative sequence").
+          error("NEGATIVE_LOCKTIME")
         end
       else
         -- When CSV is not active, it acts as NOP3
@@ -2040,7 +2064,8 @@ function M.execute_script(script_bytes, stack, flags, checker)
       end
 
     else
-      error("unknown opcode: " .. string.format("0x%02x", opcode))
+      -- interpreter.cpp:1217-1218 default: SCRIPT_ERR_BAD_OPCODE
+      error("BAD_OPCODE")
     end
 
     -- STACK_SIZE: stack + altstack must not exceed 1000 after each operation
@@ -2052,8 +2077,10 @@ function M.execute_script(script_bytes, stack, flags, checker)
     ::continue::
   end
 
-  -- Assert if_stack is empty at end
-  assert(#if_stack == 0, "unbalanced IF/ENDIF")
+  -- interpreter.cpp:1235-1236: leftover vfExec → SCRIPT_ERR_UNBALANCED_CONDITIONAL
+  if #if_stack ~= 0 then
+    error("UNBALANCED_CONDITIONAL")
+  end
 
   return stack
 end

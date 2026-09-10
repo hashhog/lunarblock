@@ -115,7 +115,12 @@ describe("BIP-65 CLTV + IsFinalTx + BIP-113 (W81)", function()
         script.execute_script("\xb1", {}, flags, checker)
       end)
       assert.is_false(ok, "expected error on empty stack")
-      assert.truthy(err:find("CHECKLOCKTIMEVERIFY") or err:find("stack"))
+      assert.truthy(
+        tostring(err):find("INVALID_STACK_OPERATION", 1, true)
+          or tostring(err):find("CHECKLOCKTIMEVERIFY")
+          or tostring(err):lower():find("stack"),
+        "empty-stack CLTV must be INVALID_STACK_OPERATION (interpreter.cpp:529-530); got "
+          .. tostring(err))
     end)
   end)
 
@@ -212,7 +217,12 @@ describe("BIP-65 CLTV + IsFinalTx + BIP-113 (W81)", function()
         script.execute_script("\xb1", stk, flags, checker)
       end)
       assert.is_false(ok, "negative locktime must fail")
-      assert.truthy(tostring(err):find("negative") or tostring(err):find("locktime"))
+      assert.truthy(
+        tostring(err):find("NEGATIVE_LOCKTIME", 1, true)
+          or tostring(err):lower():find("negative")
+          or tostring(err):lower():find("locktime"),
+        "negative CLTV must be NEGATIVE_LOCKTIME (interpreter.cpp:551-552); got "
+          .. tostring(err))
     end)
 
     it("rejects script_locktime = -1000", function()

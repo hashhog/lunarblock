@@ -638,8 +638,8 @@ test("G22-a: source rejects negative sequence", function()
   local src = f:read("*a"); f:close()
   local idx = src:find("opcode == M%.OP%.OP_CHECKSEQUENCEVERIFY", 1, false)
   local block = src:sub(idx, idx + 1500)
-  expect_truthy(block:find('error%("negative sequence"%)', 1, false),
-    "error path for sequence < 0")
+  expect_truthy(block:find('error%("NEGATIVE_LOCKTIME"%)', 1, false),
+    "error path for sequence < 0 is SCRIPT_ERR_NEGATIVE_LOCKTIME")
 end)
 
 -- ---------------------------------------------------------------------------
