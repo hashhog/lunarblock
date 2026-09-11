@@ -5444,214 +5444,228 @@ M.serialize_txoutser = _serialize_txoutser
 -- straight into the SHA256 hasher. The record is txid(32) + vout(4) +
 -- code(4) + value(8) + varint(<=9) + scriptPubKey; scriptPubKey is bounded
 -- by Core's per-coin limits, but we size generously so an over-long script
--- never overruns (compute_utxo_hash asserts the fit below).
+-- never overruns (compute_utxo_stats asserts the fit below).
 local _txoutser_hash_buf = ffi.new("uint8_t[?]", 64 + 1024 * 1024)
 
---- Compute the HASH_SERIALIZED UTXO set hash for AssumeUTXO snapshot
--- validation, byte-compatible with Bitcoin Core's
--- CoinStatsHashType::HASH_SERIALIZED (kernel/coinstats.cpp:111-146,
--- 161-163, 182-184).
---
--- Algorithm (matches Core's HashWriter path):
---   for each (outpoint, coin) in canonical order:
---       update sha256 with TxOutSer(outpoint, coin)
---   return SHA256d(sha256_state)   -- HashWriter::GetHash() is double-SHA256
---
--- Canonical order = lex-ascending txid (RocksDB key order on the 32-byte
--- prefix), then ascending vout within each txid (Core groups by txid
--- via std::map<uint32_t,Coin>, which sorts vouts as ascending uint32).
---
--- This is what bitcoin-core/src/validation.cpp:5904-5915 (loadtxoutset
--- strict gate) hashes against au_data.hash_serialized — the values pinned
--- in chainparams.cpp m_assumeutxo_data. MuHash3072 is for gettxoutsetinfo
--- hash_type=muhash, NOT for assumeutxo.
---
--- @return string: 32 raw bytes (SHA256d output, natural little-endian
---                 order; reverse for uint256 hex display).
--- @return number: total UTXO count.
-function ChainState:compute_utxo_hash()
-  -- Flush any pending changes to ensure we're reading from disk.
-  self.coin_view:flush()
+-- On-disk UTXO value: value(i64LE) | CompactSize(spkLen) | spk | height(u32LE) | cb(u8)
+-- Returns script_len, height_pos (1-based index of the first height byte), or nil
+-- for the rare 8-byte CompactSize / truncated record (caller falls back).
+local function _disk_spk_and_height(v)
+  if type(v) ~= "string" or #v < 9 then return nil end
+  local first = v:byte(9)
+  local sp_start, sp_len
+  if first < 0xFD then
+    sp_len = first
+    sp_start = 10
+  elseif first == 0xFD then
+    if #v < 12 then return nil end
+    sp_len = v:byte(10) + v:byte(11) * 256
+    sp_start = 12
+  elseif first == 0xFE then
+    if #v < 14 then return nil end
+    sp_len = v:byte(10) + v:byte(11) * 256 + v:byte(12) * 65536
+          + v:byte(13) * 16777216
+    sp_start = 14
+  else
+    return nil
+  end
+  local height_pos = sp_start + sp_len
+  -- height (4) + coinbase (1) must be present.
+  if #v < height_pos + 4 then return nil end
+  return sp_len, height_pos
+end
 
-  local hasher = crypto.sha256_init()
-  local count = 0
+local function _disk_i64le(v)
+  local b1, b2, b3, b4, b5, b6, b7, b8 = v:byte(1, 8)
+  if not b8 then return 0 end
+  local lo = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+  local hi = b5 + b6 * 256 + b7 * 65536 + b8 * 16777216
+  if hi >= 2147483648 then
+    return -((4294967295 - lo) + (4294967295 - hi) * 4294967296 + 1)
+  end
+  return lo + hi * 4294967296
+end
 
-  -- Core's coinstats.cpp:111-146 groups records by txid, builds a
-  -- std::map<uint32_t,Coin> per txid (which iterates vouts in ascending
-  -- uint32 order), then feeds ApplyHash(hash_obj, prevkey, outputs).
-  --
-  -- RocksDB iterates the 36-byte key (txid || vout_LE) bytewise. Bytewise
-  -- iteration agrees with Core's per-txid grouping (txids are 32 raw bytes
-  -- so the prefix sorts the same way), but per-vout LE bytewise sort
-  -- diverges from numeric uint32 sort once vout crosses a byte boundary
-  -- (vout=0x01 byte-LE = "01 00 00 00" sorts AFTER vout=0x100 byte-LE
-  -- "00 01 00 00"). Real txs do have vout >= 256, so we must group by
-  -- txid and re-sort vouts numerically before hashing — exactly what
-  -- dump_snapshot already does for the on-wire body.
-  --
-  -- PERF (perf(snapshot)): the old loop allocated, per coin, a deserialized
-  -- utxo_entry table + a hash256 wrapper + a 36-byte outpoint string + a
-  -- fresh buffer_writer (table + 5 closures + several string.char fragments)
-  -- + a table.concat result, then handed the resulting Lua string to
-  -- EVP_DigestUpdate. Over ~190M coins that churned hundreds of MB of GC
-  -- garbage and capped the rate at ~110-150k coins/s (the 45min+ post-load
-  -- finalize stall). This rewrite keeps the *exact* same emission order and
-  -- byte-identical TxOutSer payload (proven by a round-trip set-hash check),
-  -- but serializes each record directly into a reused C buffer and streams it
-  -- to EVP_DigestUpdate by pointer (hasher.update_ptr) — zero per-coin Lua
-  -- allocation. Measured ~20M coins/s on synthetic UTXO-shaped data (~130x).
-  --
-  -- The per-vout payload is translated straight from the on-disk value bytes:
-  --   on-disk value : value(i64LE) | varint(spkLen) | spk | height(u32LE) | cb(u8)
-  --   TxOutSer tail  : code(u32LE)  | value(i64LE)   | varint(spkLen) | spk
-  -- The on-disk prefix value|varint|spk is byte-identical to the TxOutSer
-  -- tail after `code`, so it copies in a single ffi.copy with no parse of the
-  -- script bytes themselves.
-  local buf = _txoutser_hash_buf
+-- Fill buf with TxOutSer (coinstats.cpp:46-51). Bytes 0..31 already hold txid.
+-- Returns rec_len, script_len, value_sats, or nil to take the table fallback.
+local function _txoutser_fill_from_disk(buf, vout, v)
+  local sp_len, height_pos = _disk_spk_and_height(v)
+  if not sp_len then return nil end
+  buf[32] = band(vout, 0xFF)
+  buf[33] = band(rshift(vout, 8), 0xFF)
+  buf[34] = band(rshift(vout, 16), 0xFF)
+  buf[35] = band(rshift(vout, 24), 0xFF)
+  local hb1, hb2, hb3, hb4 = v:byte(height_pos, height_pos + 3)
+  local height = hb1 + hb2 * 256 + hb3 * 65536 + hb4 * 16777216
+  local cb = v:byte(height_pos + 4) or 0
+  local code = height * 2 + cb
+  buf[36] = band(code, 0xFF)
+  buf[37] = band(rshift(code, 8), 0xFF)
+  buf[38] = band(rshift(code, 16), 0xFF)
+  buf[39] = band(rshift(code, 24), 0xFF)
+  -- On-disk prefix value|CompactSize|spk == TxOutSer tail after `code`.
+  local tail_len = height_pos - 1
+  local rec_len = 40 + tail_len
+  assert(rec_len <= 64 + 1024 * 1024,
+    "compute_utxo_stats: TxOutSer record exceeds scratch buffer")
+  ffi.copy(buf + 40, v, tail_len)
+  return rec_len, sp_len, _disk_i64le(v)
+end
+
+--- Stream the on-disk UTXO keyspace one txid group at a time.
+-- STREAMING-UTXO-GROUPS: never a list of the whole coin set. Peak live
+-- memory is the widest single txid, matching Core's std::map<uint32_t,Coin>
+-- in kernel/coinstats.cpp:115-128 and haskoin streamUTXOSnapshotGroups.
+--
+-- RocksDB yields keys as txid[32] || vout_LE[4]. That is txid-major (one
+-- txid's outputs are adjacent) but WITHIN a txid it is LE32 *byte* order,
+-- which diverges from numeric vout order at vout >= 256 (256 = 00 01 00 00
+-- sorts before 1 = 01 00 00 00). Each group is regrouped and sorted
+-- numerically before the callback.
+--
+-- write_group(txid_bytes, sorted_vouts, outputs)
+--   outputs is a map vout -> raw on-disk value bytes; valid only during
+--   the callback. Malformed keys (not 36 bytes) are skipped.
+--
+-- @return coins_emitted, peak_group_size
+function M.stream_utxo_groups(storage, write_group)
+  if not storage or not storage.iterator then
+    return 0, 0
+  end
+  local coins = 0
+  local peak = 0
   local current_txid
-  local outputs = {}      -- vout -> raw on-disk value string
+  local outputs = {}
   local sorted_vouts = {}
   local n_vouts = 0
 
-  local function flush_txid()
-    if current_txid == nil then return end
+  local function flush()
+    if current_txid == nil or n_vouts == 0 then return end
+    if n_vouts > peak then peak = n_vouts end
     table.sort(sorted_vouts)
-    -- txid is the same 32 raw bytes for every vout in this group; copy once.
-    ffi.copy(buf, current_txid, 32)
-    for i = 1, n_vouts do
-      local vout = sorted_vouts[i]
-      local v = outputs[vout]    -- raw on-disk value bytes for this coin
-
-      -- vout LE (bytes 33..36 of the key region)
-      buf[32] = band(vout, 0xFF)
-      buf[33] = band(rshift(vout, 8), 0xFF)
-      buf[34] = band(rshift(vout, 16), 0xFF)
-      buf[35] = band(rshift(vout, 24), 0xFF)
-
-      -- Parse just enough of the on-disk value to locate height/coinbase:
-      -- skip value(8), read the scriptPubKey-length varint, skip the script.
-      local first = v:byte(9)
-      local sp_start, sp_len
-      if first < 0xFD then
-        sp_len = first; sp_start = 10
-      elseif first == 0xFD then
-        sp_len = v:byte(10) + v:byte(11) * 256; sp_start = 12
-      elseif first == 0xFE then
-        sp_len = v:byte(10) + v:byte(11) * 256 + v:byte(12) * 65536
-              + v:byte(13) * 16777216
-        sp_start = 14
-      else
-        -- 8-byte varint (extremely unlikely for a script length); fall back
-        -- to the table path so the rare case stays exactly correct.
-        local entry = M.deserialize_utxo_entry(v)
-        local key = M.outpoint_key(types.hash256(current_txid), vout)
-        hasher.update(_serialize_txoutser(key, entry))
-        count = count + 1
-        goto continue
-      end
-
-      do
-        local height_pos = sp_start + sp_len   -- 1-based index of height byte 1
-        local hb1, hb2, hb3, hb4 = v:byte(height_pos, height_pos + 3)
-        local height = hb1 + hb2 * 256 + hb3 * 65536 + hb4 * 16777216
-        local cb = v:byte(height_pos + 4)      -- is_coinbase byte (0/1)
-        local code = height * 2 + cb
-
-        -- code (u32 LE) at offset 36
-        buf[36] = band(code, 0xFF)
-        buf[37] = band(rshift(code, 8), 0xFF)
-        buf[38] = band(rshift(code, 16), 0xFF)
-        buf[39] = band(rshift(code, 24), 0xFF)
-
-        -- The on-disk prefix value(8)|varint|spk == TxOutSer tail after code,
-        -- byte for byte. That prefix is the first (height_pos - 1) bytes of v.
-        local tail_len = height_pos - 1
-        assert(40 + tail_len <= 64 + 1024 * 1024,
-          "compute_utxo_hash: TxOutSer record exceeds scratch buffer")
-        ffi.copy(buf + 40, v, tail_len)
-
-        hasher.update_ptr(buf, 40 + tail_len)
-        count = count + 1
-      end
-
-      ::continue::
-    end
+    write_group(current_txid, sorted_vouts, outputs)
+    coins = coins + n_vouts
     outputs = {}
     sorted_vouts = {}
     n_vouts = 0
   end
 
-  local iter = self.storage.iterator(storage_mod.CF.UTXO)
-  iter.seek_to_first()
-
-  while iter.valid() do
-    local key = iter.key()
-    local data = iter.value()
-
-    local txid_bytes = key:sub(1, 32)
-    -- vout is the 4-byte LE suffix of the 36-byte key.
-    local vout = key:byte(33) + key:byte(34) * 256 + key:byte(35) * 65536
-              + key:byte(36) * 16777216
-
-    if current_txid ~= txid_bytes then
-      flush_txid()
-      current_txid = txid_bytes
+  local iter = storage.iterator(storage_mod.CF.UTXO)
+  local ok, err = xpcall(function()
+    iter.seek_to_first()
+    while iter.valid() do
+      local key = iter.key()
+      local data = iter.value()
+      if key and #key == 36 and data then
+        local txid_bytes = key:sub(1, 32)
+        local vout = key:byte(33) + key:byte(34) * 256
+                   + key:byte(35) * 65536 + key:byte(36) * 16777216
+        if current_txid ~= txid_bytes then
+          flush()
+          current_txid = txid_bytes
+        end
+        if outputs[vout] == nil then
+          n_vouts = n_vouts + 1
+          sorted_vouts[n_vouts] = vout
+        end
+        outputs[vout] = data
+      end
+      iter.next()
     end
-    -- Stash the RAW on-disk value bytes; the per-coin table allocation that
-    -- M.deserialize_utxo_entry would do is avoided entirely in flush_txid.
-    outputs[vout] = data
-    n_vouts = n_vouts + 1
-    sorted_vouts[n_vouts] = vout
-
-    iter.next()
-  end
+    flush()
+  end, debug.traceback)
   iter.destroy()
-  flush_txid()
-
-  -- HashWriter::GetHash() = SHA256d. crypto.sha256_init().final() is
-  -- single SHA256, so we hash once more to get the double.
-  local single = hasher.final()
-  return crypto.sha256(single), count
+  if not ok then error(err) end
+  return coins, peak
 end
 
---- Compute the MuHash3072 set hash of the current UTXO set, byte-compatible
--- with Bitcoin Core's CoinStatsHashType::MUHASH (kernel/coinstats.cpp).
---
--- This is the value `gettxoutsetinfo hash_type=muhash` reports. It is NOT
--- what AssumeUTXO snapshot validation commits to (despite the field being
--- spelled "hash_serialized" in chainparams.cpp m_assumeutxo_data — those
--- entries are HASH_SERIALIZED / SHA256d-via-HashWriter values and live on
--- compute_utxo_hash). See validation.cpp:5904-5915 for the strict gate.
---
--- Order-independent (MuHash is a homomorphic set hash), but for sanity we
--- still iterate in canonical RocksDB key order.
---
--- @return string: 32 raw bytes (SHA256 of the canonical 384-byte Num3072
---                 packing, in the natural little-endian byte order).
--- @return number: number of UTXOs hashed.
-function ChainState:compute_muhash()
-  -- Flush any pending changes to ensure we're reading from disk.
+--- One streamed ComputeUTXOStats pass (kernel/coinstats.cpp:111-146).
+-- hash_type: "hash_serialized_3" (HashWriter SHA256d of TxOutSer),
+--            "muhash" (MuHash3072 of the same per-coin bytes),
+--            "none" (counts/amounts only).
+-- Holds one txid group. ApplyStats + ApplyHash per group, then FinalizeHash.
+-- @return {hash, txouts, transactions, bogosize, total_amount, peak}
+function ChainState:compute_utxo_stats(hash_type)
+  hash_type = hash_type or "hash_serialized_3"
   self.coin_view:flush()
 
-  local muhash_mod = require("lunarblock.muhash")
-  local mh = muhash_mod.new()
-
-  local count = 0
-  local iter = self.storage.iterator(storage_mod.CF.UTXO)
-  iter.seek_to_first()
-
-  while iter.valid() do
-    local key = iter.key()
-    local data = iter.value()
-    local entry = M.deserialize_utxo_entry(data)
-    mh:insert(_serialize_txoutser(key, entry))
-    count = count + 1
-    iter.next()
+  local hasher, mh
+  if hash_type == "hash_serialized_3" then
+    hasher = crypto.sha256_init()
+  elseif hash_type == "muhash" then
+    mh = require("lunarblock.muhash").new()
   end
-  iter.destroy()
 
-  return mh:finalize(), count
+  local buf = _txoutser_hash_buf
+  local n_txs = 0
+  local bogosize = 0
+  local total_sats = 0
+
+  local function apply_coin(txid_bytes, vout, v)
+    -- buf[0..31] already holds this group's txid.
+    local rec_len, sp_len, value = _txoutser_fill_from_disk(buf, vout, v)
+    if rec_len then
+      if hasher then hasher.update_ptr(buf, rec_len) end
+      if mh then mh:insert(ffi.string(buf, rec_len)) end
+      bogosize = bogosize + 32 + 4 + 4 + 8 + 2 + sp_len
+      total_sats = total_sats + value
+      return
+    end
+    -- Rare CompactSize-of-script >= 2^32, or truncated record.
+    local entry = M.deserialize_utxo_entry(v)
+    local key = M.outpoint_key(types.hash256(txid_bytes), vout)
+    local ser = _serialize_txoutser(key, entry)
+    if hasher then hasher.update(ser) end
+    if mh then mh:insert(ser) end
+    bogosize = bogosize + _csi_bogosize(#entry.script_pubkey)
+    total_sats = total_sats + (entry.value or 0)
+  end
+
+  local coins, peak = M.stream_utxo_groups(self.storage, function(txid, vouts, outputs)
+    n_txs = n_txs + 1
+    ffi.copy(buf, txid, 32)
+    for i = 1, #vouts do
+      local vout = vouts[i]
+      apply_coin(txid, vout, outputs[vout])
+    end
+  end)
+
+  local hash
+  if hasher then
+    -- HashWriter::GetHash() is SHA256d (hash.h:115-119; coinstats.cpp:182-184).
+    hash = crypto.sha256(hasher.final())
+  elseif mh then
+    hash = mh:finalize()
+  end
+
+  return {
+    hash = hash,
+    txouts = coins,
+    transactions = n_txs,
+    bogosize = bogosize,
+    total_amount = total_sats,
+    peak = peak,
+  }
 end
+
+--- HASH_SERIALIZED (SHA256d of streamed TxOutSer). Same primitive the
+-- assumeutxo strict gate uses (validation.cpp:5904-5915).
+-- @return string: 32 raw bytes (HashWriter::GetHash order)
+-- @return number: UTXO count
+function ChainState:compute_utxo_hash()
+  local stats = self:compute_utxo_stats("hash_serialized_3")
+  return stats.hash, stats.txouts
+end
+
+--- MuHash3072 of the same per-coin TxOutSer stream. gettxoutsetinfo
+-- hash_type=muhash only — not the assumeutxo commitment.
+-- @return string: 32 raw bytes
+-- @return number: UTXO count
+function ChainState:compute_muhash()
+  local stats = self:compute_utxo_stats("muhash")
+  return stats.hash, stats.txouts
+end
+
 
 -- libc fsync/fileno bindings, declared lazily on first use. We avoid
 -- forcing the cdef at module load so embedded LuaJIT environments

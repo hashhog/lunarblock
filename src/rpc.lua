@@ -13231,12 +13231,12 @@ function RPCServer:setup_w47b_methods()
   --                         TxOutSer stream of every (outpoint, coin), in
   --                         (txid lex-asc, vout uint32-asc) order. The legacy
   --                         algorithm; what assumeutxo commits to. Computed by
-  --                         ChainState:compute_utxo_hash (utxo.lua) — the same
+  --                         ChainState:compute_utxo_stats (utxo.lua) — the same
   --                         primitive the assumeutxo strict gate uses
-  --                         (validation.cpp:5904-5915), no second hasher.
+  --                         (validation.cpp:5904-5915), streamed one txid
+  --                         group at a time (coinstats.cpp:46-56, 111-146).
   --   "muhash"            — MuHash3072 order-independent multiset hash over the
-  --                         same per-coin TxOutSer serialization. Computed by
-  --                         ChainState:compute_muhash (utxo.lua).
+  --                         same per-coin TxOutSer serialization.
   --   "none"              — skip the set-hash (just the counts/amounts).
   --
   -- With coinstatsindex enabled: hash_or_height routes to the per-height
@@ -13409,72 +13409,41 @@ function RPCServer:setup_w47b_methods()
       return { _raw_json = strip_btc_sentinels(cjson.encode(result_csi)) }
     end
 
-    -- ── AT-TIP PATH (original UTXO walk). ────────────────────────────────
+    -- ── AT-TIP PATH: one streamed ComputeUTXOStats walk. ────────────────
+    -- STREAMING-UTXO-GROUPS: coinstats.cpp:111-146 (one std::map per txid,
+    -- ApplyStats + ApplyHash) then FinalizeHash SHA256d at 161-163, 182-184.
+    -- Peak is the widest tx, not the set.
     local tip_height  = rpc.chain_state.tip_height or 0
     local tip_hash    = rpc.chain_state.tip_hash
     local tip_hash_hex = tip_hash and types.hash256_hex(tip_hash) or string.rep("0", 64)
 
-    -- ── single UTXO walk: txouts, transactions, bogosize, total_amount. ──
-    -- transactions = number of distinct txids with at least one unspent
-    -- output (coinstats.cpp:99 stats.nTransactions++ once per txid group).
-    -- bogosize = 32 (txid) + 4 (vout) + 4 (height<<1|cb) + 8 (amount)
-    --          + 2 (scriptPubKey CompactSize len) + scriptPubKey.size()
-    -- per GetBogoSize (coinstats.cpp:35-43).
-    local n_txouts   = 0
-    local n_txs      = 0
-    local total_sats = 0
-    local bogosize   = 0
-    local prev_txid  = nil
-
-    if rpc.storage.iterator then
-      local iter = rpc.storage.iterator(storage_mod.CF.UTXO)
-      iter.seek_to_first()
-      while iter.valid() do
-        local key = iter.key()
-        local v = iter.value()
-        if v then
-          local ok, entry = pcall(utxo_mod.deserialize_utxo_entry, v)
-          if ok and entry then
-            -- The on-disk key is (txid[32] || vout LE[4]); the 32-byte
-            -- prefix groups outputs by txid (RocksDB key order matches
-            -- Core's per-txid grouping).
-            local txid = key and #key >= 32 and key:sub(1, 32) or nil
-            if txid ~= prev_txid then
-              n_txs = n_txs + 1
-              prev_txid = txid
-            end
-            n_txouts   = n_txouts + 1
-            total_sats = total_sats + (entry.value or 0)
-            local script_len = entry.script_pubkey and #entry.script_pubkey or 0
-            bogosize = bogosize + 32 + 4 + 4 + 8 + 2 + script_len
-          end
-        end
-        iter.next()
-      end
-      iter.destroy()
+    if not (rpc.chain_state.compute_utxo_stats) then
+      error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
+    end
+    local ok_stats, stats = pcall(rpc.chain_state.compute_utxo_stats,
+                                 rpc.chain_state, hash_type)
+    if not (ok_stats and type(stats) == "table") then
+      error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
     end
 
-    -- ── set-hash (only for the chosen hash_type). ────────────────────────
+    local n_txouts   = stats.txouts or 0
+    local n_txs      = stats.transactions or 0
+    local total_sats = stats.total_amount or 0
+    local bogosize   = stats.bogosize or 0
+
     local hash_serialized_3, muhash_hex
     if hash_type == "hash_serialized_3" then
-      if not (rpc.chain_state.compute_utxo_hash) then
+      if type(stats.hash) ~= "string" or #stats.hash ~= 32 then
         error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
       end
-      local ok, raw = pcall(rpc.chain_state.compute_utxo_hash, rpc.chain_state)
-      if not (ok and type(raw) == "string" and #raw == 32) then
-        error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
-      end
-      hash_serialized_3 = reverse_hex(raw)
+      hash_serialized_3 = reverse_hex(stats.hash)
     elseif hash_type == "muhash" then
-      if not (rpc.chain_state.compute_muhash) then
+      if type(stats.hash) ~= "string" or #stats.hash ~= 32 then
         error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
       end
-      local ok, raw = pcall(rpc.chain_state.compute_muhash, rpc.chain_state)
-      if not (ok and type(raw) == "string" and #raw == 32) then
-        error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
-      end
-      muhash_hex = reverse_hex(raw)
+      muhash_hex = reverse_hex(stats.hash)
     end
+
 
     -- disk_size: Core reports CCoinsViewDB::EstimateSize(). On an UNFLUSHED
     -- chainstate (the submitblock-fed differential node never flushes to a

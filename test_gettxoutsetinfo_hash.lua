@@ -184,4 +184,111 @@ test("known UTXO fixture matches independently-streamed SHA256d", function()
     "total_amount mismatch: " .. tostring(decoded.result.total_amount))
 end)
 
+-- ---------------------------------------------------------------------------
+-- Test 3: STREAMING-UTXO-GROUPS peak is the widest txid, not the set.
+-- Mirrors haskoin streamUTXOSnapshotGroups: 50 singletons + one 80-output
+-- tx + one tx with vouts {0,1,256} (LE key order != numeric). A walker that
+-- materialises the set and reports length as "peak" fails; so does one that
+-- never flushes. vout 256 must hash after vout 1 (std::map<uint32_t,Coin>).
+-- ---------------------------------------------------------------------------
+local function read_file(path)
+  local f = assert(io.open(path, "r"))
+  local s = f:read("*a")
+  f:close()
+  return s
+end
+
+local function extract_between(src, start_pat, stop_pat)
+  local i = src:find(start_pat, 1, true)
+  assert(i, "missing " .. start_pat)
+  local rest = src:sub(i)
+  local j = rest:find(stop_pat, #start_pat + 1, true)
+  if j then rest = rest:sub(1, j - 1) end
+  return rest
+end
+
+test("stream_utxo_groups / gettxoutsetinfo do not materialise the coin set",
+function()
+  local utxo_src = read_file("src/utxo.lua")
+  local rpc_src = read_file("src/rpc.lua")
+  local walk = extract_between(utxo_src,
+    "function M.stream_utxo_groups",
+    "function ChainState:compute_utxo_stats")
+  local stats = extract_between(utxo_src,
+    "function ChainState:compute_utxo_stats",
+    "function ChainState:compute_utxo_hash")
+  local gtxo = extract_between(rpc_src,
+    'self.methods["gettxoutsetinfo"]',
+    'self.methods["scantxoutset"]')
+
+  assert(utxo_src:find("STREAMING-UTXO-GROUPS", 1, true),
+    "walker must be tagged STREAMING-UTXO-GROUPS")
+  assert(rpc_src:find("STREAMING-UTXO-GROUPS", 1, true),
+    "gettxoutsetinfo must be tagged STREAMING-UTXO-GROUPS")
+  assert(walk:find("outputs = {}", 1, true),
+    "walker must drop the group after flush")
+  assert(not walk:find("utxos_by_txid", 1, true),
+    "walker must not accumulate the set")
+  assert(stats:find("stream_utxo_groups", 1, true),
+    "compute_utxo_stats must stream groups")
+  assert(gtxo:find("compute_utxo_stats", 1, true),
+    "gettxoutsetinfo must use the streamed stats pass")
+  local at_tip = gtxo:match("AT%-TIP PATH.*")
+  assert(at_tip, "missing AT-TIP PATH marker")
+  assert(not at_tip:find("deserialize_utxo_entry", 1, true),
+    "gettxoutsetinfo at-tip path must not deserialize the whole set")
+end)
+
+test("stream_utxo_groups peak is the widest txid, not the set", function()
+  local db = storage_mod.open(tmp_path("peak"))
+  local cs = utxo.new_chain_state(db, consensus.networks.regtest)
+  local script = script_mod.make_p2pkh_script(string.rep("\x11", 20))
+  local function txid_of(b)
+    return types.hash256(string.char(b) .. string.rep("\x00", 31))
+  end
+  for i = 1, 50 do
+    cs.coin_view:add(txid_of(i), 0, utxo.utxo_entry(1, script, 1, false))
+  end
+  local wide = txid_of(0xAA)
+  for n = 0, 79 do
+    cs.coin_view:add(wide, n, utxo.utxo_entry(1, script, 1, false))
+  end
+  local le = txid_of(0xBB)
+  for _, n in ipairs({0, 1, 256}) do
+    cs.coin_view:add(le, n, utxo.utxo_entry(1, script, 1, false))
+  end
+  cs.coin_view:flush()
+
+  local seen_le
+  local n, peak = utxo.stream_utxo_groups(db, function(txid, vouts, _outputs)
+    if txid == le.bytes then
+      seen_le = {vouts[1], vouts[2], vouts[3]}
+    end
+  end)
+  -- Independent SHA256d of TxOutSer in the order the grouper emits
+  -- (numeric vout inside the LE-order trap txid).
+  local ref = crypto.sha256_init()
+  utxo.stream_utxo_groups(db, function(txid, vouts, outputs)
+    for i = 1, #vouts do
+      local vout = vouts[i]
+      local entry = utxo.deserialize_utxo_entry(outputs[vout])
+      ref.update(utxo.serialize_txoutser(utxo.outpoint_key(
+        types.hash256(txid), vout), entry))
+    end
+  end)
+  local expected = crypto.sha256(ref.final())
+  local got = cs:compute_utxo_hash()
+  db.close()
+
+  assert(n == 50 + 80 + 3,
+    "coins_emitted " .. tostring(n) .. " (expected 133)")
+  assert(peak == 80,
+    "peak " .. tostring(peak) .. " (materialised set would be 133)")
+  assert(seen_le and seen_le[1] == 0 and seen_le[2] == 1 and seen_le[3] == 256,
+    "vouts not numeric-sorted (LE key order trap): "
+      .. tostring(seen_le and table.concat(seen_le, ",")))
+  assert(got == expected,
+    "streamed HASH_SERIALIZED mismatch against grouper order")
+end)
+
 print("\nAll tests passed.")

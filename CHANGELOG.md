@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: gettxoutsetinfo.hash_serialized_3 is Core HASH_SERIALIZED, streamed one txid group at a time
 - fix: Core SCRIPT_ERR tokens for CSV/CLTV/script-limit failures (BIP22 block-script-verify-flag-failed)
 - 1b064ec docs: say the cited paths are private before the claims that rest on them
 - 05fd0c9 test: run the 106 standalone test scripts that executed nowhere
