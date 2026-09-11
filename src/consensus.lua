@@ -2506,6 +2506,13 @@ function M.load_campaign_assumeutxo(network)
           "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) %s",
           i, height, band_err)
       end
+      -- Keep the verified band on the entry so inject_snapshot_base can
+      -- graft the real pre-base headers into the header index. Pinning the
+      -- single retarget ancestor is not enough: GetMedianTimePast of the
+      -- base needs the 11 headers ending at the base, and a truncated
+      -- window (the base timestamp alone) false-rejects the first blocks
+      -- above some seeds (mainnet 91,706 accepted, 91,707 time-too-old).
+      entry.base_tail_headers = e.base_tail_headers
       if need and band.anchor then
         ancestors = { [need] = band.anchor }
         io.stdout:write(string.format(

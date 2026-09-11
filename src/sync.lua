@@ -723,6 +723,27 @@ function HeaderChain:init()
     -- Start from genesis
     self:add_genesis()
   end
+
+  -- A snapshot-bootstrapped datadir injected before the tail-graft fix has
+  -- the base header but none of its ancestors. Re-graft from the campaign
+  -- band so GetMedianTimePast of the base is the real 11-block median, not
+  -- the base timestamp alone. Skip when the header tip is still below the
+  -- base: that is first-boot-before-inject, and grafting the base hash
+  -- into `headers` here would make inject_snapshot_base no-op.
+  if self.snapshot_base_height
+     and (self.header_tip_height or -1) >= self.snapshot_base_height then
+    local au_data = consensus.assumeutxo_for_height(self.network, self.snapshot_base_height)
+    if au_data and au_data.base_tail_headers then
+      local n = self:graft_base_tail_headers(
+        au_data.base_tail_headers, self.snapshot_base_height)
+      if n > 0 then
+        io.stdout:write(string.format(
+          "  grafted %d missing base_tail_headers below snapshot base %d\n",
+          n, self.snapshot_base_height))
+        io.stdout:flush()
+      end
+    end
+  end
 end
 
 --- Get the header tip from storage (NOT the chain tip).
@@ -840,8 +861,17 @@ function HeaderChain:load_from_storage(tip_hash, tip_height)
   -- Forward pass: compute total_work incrementally from the chain start
   -- (genesis, or the snapshot base when bootstrapped) to tip.
   -- All arithmetic is exact 256-bit (work_add on 32-byte strings).
+  --
+  -- Start at the snapshot base, not height 0: grafted base_tail_headers
+  -- live in height_to_hash below the base so the MTP walk can see them,
+  -- but their work is already inside the assumeutxo chain_work seed.
+  -- Adding them again would inflate every post-base total_work.
   local cumulative_work = seed_cumulative_work
-  for h = 0, tip_height do
+  local work_from = 0
+  if base_height and base_height > 0 then
+    work_from = base_height
+  end
+  for h = work_from, tip_height do
     local hash_hex = self.height_to_hash[h]
     if hash_hex then
       local entry = self.headers[hash_hex]
@@ -1036,10 +1066,14 @@ end
 --     height_to_hash) never reaches it, and connect_block / MTP can't resolve
 --     the parent header.
 --   LAYER 3 (MTP window): the first ~11 post-snapshot blocks have an
---     11-block median-time-past window reaching below the un-indexed base;
---     compute_mtp_from_storage breaks early and returns nothing.
+--     11-block median-time-past window reaching below the un-indexed base.
+--     Using the base TIMESTAMP as a 1-header "median" is not Core's
+--     GetMedianTimePast: at seed 91,705 it accepts 91,706 then rejects
+--     91,707 (time 1289718063 <= truncated MTP 1289718132) while Core
+--     accepts (true MTP 1289717360). The campaign `base_tail_headers`
+--     band is the real ancestors; grafting it restores the 11-window.
 --
--- Injecting a connectable base block-index fixes all three:
+-- Injecting a connectable base block-index plus the tail band fixes all three:
 --   * LAYER 1: total_work is seeded with the base's REAL cumulative chainwork
 --     (passed in as a 32-byte big-endian string from the assumeutxo entry's
 --     chain_work), which is by construction above min_chain_work — so header
@@ -1049,15 +1083,69 @@ end
 --     in-memory headers/height_to_hash maps, and becomes header_tip — so the
 --     download loop requests base+1 immediately and connect_block resolves the
 --     parent.
---   * LAYER 3: with the base header in storage, compute_mtp_from_storage walks
---     down to the base and uses the base TIMESTAMP as the MTP proxy for the
---     incomplete window, until it fills with real post-base timestamps.
+--   * LAYER 3: graft_base_tail_headers writes the verified pre-base band so
+--     get_past_timestamps / compute_mtp_from_storage walk the real 11
+--     ancestors. The base timestamp is no longer used as an MTP proxy.
 --
 -- Idempotent: a no-op if the base is already present (e.g. on a restart where
--- the header chain has already been persisted past the base).  Only ever
--- extends the header chain UP from the base — it never touches blocks below
--- the base, and never participates in reorg.
---
+-- the header chain has already been persisted past the base); tails are still
+-- grafted if missing. The header tip is only ever moved UP to the base.
+
+--- Graft a verified `base_tail_headers` band below the snapshot base.
+-- @param raw_list table: ascending hex 80-byte headers, last is the base
+-- @param base_height number: height of the last header
+-- @return number: count of newly inserted headers
+function HeaderChain:graft_base_tail_headers(raw_list, base_height)
+  -- Last element IS the base (already injected); earlier elements are its
+  -- real ancestors so GetMedianTimePast and the retarget walk see the same
+  -- headers Core has. Does not move header_tip.
+  --
+  -- Bitcoin Core never needs this: ActivateSnapshot refuses a snapshot
+  -- whose base is not already in a genesis-synced header chain
+  -- (validation.cpp:5611-5616). lunarblock range-validates from a
+  -- fabricated base, so the campaign fixture carries the band.
+  if type(raw_list) ~= "table" or raw_list[1] == nil then
+    return 0
+  end
+  local n = #raw_list
+  if n - 1 > base_height then
+    return 0
+  end
+  local start_height = base_height - (n - 1)
+  local grafted = 0
+  for idx = 1, n do
+    local hex = raw_list[idx]
+    if type(hex) == "string" and #hex == 160 and hex:match("^%x+$") then
+      local raw = hex:gsub("%x%x",
+        function(byte_hex) return string.char(tonumber(byte_hex, 16)) end)
+      local parse_ok, hdr = pcall(serialize.deserialize_block_header, raw)
+      if parse_ok and hdr then
+        local hash = validation.compute_block_hash(hdr)
+        local hash_hex = types.hash256_hex(hash)
+        local height = start_height + idx - 1
+        if not self.headers[hash_hex] then
+          -- work_zero so a pre-base tail cannot displace the base as tip
+          -- (accept_header compares total_work). Real cumulative work at
+          -- these heights is already inside the assumeutxo chain_work seed.
+          self.headers[hash_hex] = {
+            header = hdr,
+            height = height,
+            total_work = consensus.work_zero(),
+          }
+          self.height_to_hash[height] = hash_hex
+          self.storage.put_header(hash, hdr)
+          self.storage.put_height_index(height, hash)
+          grafted = grafted + 1
+        elseif not self.height_to_hash[height] then
+          self.height_to_hash[height] = hash_hex
+        end
+      end
+    end
+  end
+  return grafted
+end
+
+--- Inject a snapshot base block-index (see comment block above).
 -- @param base_height number: snapshot base height
 -- @param base_hash hash256: snapshot base block hash
 -- @param header table: base block header (types.block_header)
@@ -1068,6 +1156,10 @@ function HeaderChain:inject_snapshot_base(base_height, base_hash, header, total_
 
   -- Idempotence: already indexed (restart where headers persisted past base).
   if self.headers[hash_hex] then
+    local au = consensus.assumeutxo_for_height(self.network, base_height)
+    if au and au.base_tail_headers then
+      self:graft_base_tail_headers(au.base_tail_headers, base_height)
+    end
     return false, "base already indexed"
   end
 
@@ -1100,8 +1192,8 @@ function HeaderChain:inject_snapshot_base(base_height, base_hash, header, total_
   -- HASHHOG_CAMPAIGN_ASSUMEUTXO -- inject_snapshot_base sees the MERGED table,
   -- so a campaign fixture cannot re-open the hole at its own boundary.
   local need = consensus.required_pre_base_anchor_height(self.network, base_height)
+  local au_data = consensus.assumeutxo_for_height(self.network, base_height)
   if need then
-    local au_data = consensus.assumeutxo_for_height(self.network, base_height)
     if not consensus.pre_base_ancestor(au_data, need) then
       return false, string.format(
         "snapshot base %d has no pinned pre-base ancestor at height %d: the "
@@ -1143,6 +1235,17 @@ function HeaderChain:inject_snapshot_base(base_height, base_hash, header, total_
   self.storage.put_header(base_hash, header)
   self.storage.put_height_index(base_height, base_hash)
   self:set_header_tip(base_hash, base_height, true)
+
+  if au_data and au_data.base_tail_headers then
+    local n = self:graft_base_tail_headers(au_data.base_tail_headers, base_height)
+    if n > 0 then
+      io.stdout:write(string.format(
+        "[assumeutxo] grafted %d base_tail_headers below height %d "
+        .. "(MTP window + retarget ancestors)\n",
+        n, base_height))
+      io.stdout:flush()
+    end
+  end
 
   return true
 end
