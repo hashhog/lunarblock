@@ -168,8 +168,8 @@ describe("mining", function()
     it("encodes height 0 correctly", function()
       local coinbase = mining.create_coinbase_tx(0, 5000000000, nil, nil, make_payout_script())
       local script_sig = coinbase.inputs[1].script_sig
-      assert.equal(1, script_sig:byte(1))
-      assert.equal(0, script_sig:byte(2))
+      -- Minimal CScriptNum encoding of 0 is OP_0 (0x00), not a 1-byte push.
+      assert.equal(0, script_sig:byte(1))
     end)
 
     it("encodes large heights correctly", function()
@@ -385,7 +385,7 @@ describe("mining", function()
 
       assert.is_true(success)
       assert.truthy(hash)
-      assert.equal("hash256", hash._type)
+      assert.equal(32, #hash.bytes)
 
       -- Verify the nonce was set
       assert.truthy(block.header.nonce >= 0)

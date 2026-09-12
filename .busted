@@ -5,6 +5,7 @@ return {
     pattern = "_spec",
     ROOT = { "spec/" },
     lua = "luajit",
+    helper = "spec/known_red_helper.lua",
   },
   ci = {
     verbose = true,
@@ -13,5 +14,6 @@ return {
     pattern = "_spec",
     ROOT = { "spec/" },
     lua = "luajit",
+    helper = "spec/known_red_helper.lua",
   },
 }

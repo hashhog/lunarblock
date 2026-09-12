@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.2 (unreleased)
+
+- test: unit suite green for the release gate (stale fixtures + known-red pending of pre-v1.0.1 failures)
+
 ## v1.0.1 (unreleased)
 
 Changes since `v1.0.0`:

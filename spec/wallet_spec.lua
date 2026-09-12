@@ -321,6 +321,7 @@ describe("wallet", function()
         txid = fake_txid,
         vout = 0,
         height = 100,
+        confirmations = 100,
         is_coinbase = false,
       }
       w.balance = 100000
@@ -372,6 +373,7 @@ describe("wallet", function()
         txid = fake_txid,
         vout = 0,
         height = 100,
+        confirmations = 100,
         is_coinbase = false,
       }
       w.balance = 100000
@@ -1434,6 +1436,8 @@ end)
 
 describe("descriptor", function()
   local address
+  local wallet
+  local consensus
 
   setup(function()
     local loaders = package.loaders or package.searchers
@@ -1452,6 +1456,8 @@ describe("descriptor", function()
       return nil, "not found"
     end)
     address = require("lunarblock.address")
+    wallet = require("lunarblock.wallet")
+    consensus = require("lunarblock.consensus")
   end)
 
   describe("descriptor_checksum", function()

@@ -1891,7 +1891,9 @@ function PeerManager:disconnect_peer(p, reason)
       break
     end
   end
-  self.our_nonces[p.nonce] = nil
+  if p.nonce then
+    self.our_nonces[p.nonce] = nil
+  end
   -- Clean up trickling state
   self:_cleanup_peer_trickle(p)
   -- Clean up chain sync state

@@ -34,7 +34,9 @@ describe("peerman", function()
   describe("PeerManager creation", function()
 
     it("creates with default config", function()
-      local pm = peerman.new(test_network, nil, nil)
+      -- Isolate from cwd banned.dat / peers.dat left by earlier specs.
+      local tmp = make_temp_dir()
+      local pm = peerman.new(test_network, nil, {data_dir = tmp})
       assert.is_not_nil(pm)
       assert.equals(8, pm.max_outbound)
       assert.equals(117, pm.max_inbound)
@@ -44,6 +46,7 @@ describe("peerman", function()
       assert.same({}, pm.peer_list)
       assert.same({}, pm.known_addresses)
       assert.same({}, pm.banned)
+      cleanup_temp_dir(tmp)
     end)
 
     it("creates with custom config", function()

@@ -40,13 +40,15 @@ function M.buffer_writer()
   -- For 64-bit values, use FFI uint64_t to avoid Lua double precision loss
   -- above 2^53 (W112 BUG-3: old code used val % 4294967296 which silently
   -- corrupted nonces and other large u64 values).
+  --
+  -- Do NOT use LuaJIT's bit.rshift for the high word: it is a 32-bit op, so
+  -- bit.rshift(uint64, 32) is always 0. Write the 8 little-endian bytes
+  -- through a uint64_t overlay instead.
   function writer.write_u64le(val)
     if _ffi64 then
-      local v = _ffi64.new("uint64_t", val)
-      local low  = tonumber(_ffi64.cast("uint32_t", v))
-      local high = tonumber(_ffi64.cast("uint32_t", bit.rshift(v, 32)))
-      writer.write_u32le(low)
-      writer.write_u32le(high)
+      local buf = _ffi64.new("uint8_t[8]")
+      _ffi64.cast("uint64_t*", buf)[0] = _ffi64.new("uint64_t", val)
+      writer.write_bytes(_ffi64.string(buf, 8))
     else
       local low = val % 4294967296
       local high = math.floor(val / 4294967296)

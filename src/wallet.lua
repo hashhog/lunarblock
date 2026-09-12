@@ -2212,7 +2212,7 @@ function Wallet:get_available_utxos(include_unconfirmed, min_confirmations)
   -- Add confirmed UTXOs that are not spent in pending transactions
   for key, utxo in pairs(self.utxos) do
     if not self.spent_pending[key] then
-      if utxo.confirmations >= min_confirmations then
+      if (utxo.confirmations or 0) >= min_confirmations then
         -- Coinbase maturity (matches the node's own consensus rule, and
         -- Bitcoin Core CWallet::GetTxBlocksToMaturity / CheckTxInputs):
         -- a coinbase is spendable only once it has COINBASE_MATURITY+1 (=101)

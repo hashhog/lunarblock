@@ -187,7 +187,6 @@ describe("validation", function()
       tx.outputs[1] = types.txout(5000000000, string.rep("\x76\xa9", 1) .. string.rep("\x00", 23))
 
       local txid = validation.compute_txid(tx)
-      assert.equals("hash256", txid._type)
       assert.equals(32, #txid.bytes)
     end)
 
@@ -563,11 +562,13 @@ describe("validation", function()
       tx.segwit = false
       local prev_hash = types.hash256(string.rep("\x01", 32))
       -- P2SH scriptSig: <dummy> <sig1> <sig2> <sig3> <redeem_script>
+      -- Redeem is 105 bytes, so it MUST be PUSHDATA1 (0x4c); a raw
+      -- string.char(#multisig) is opcode 0x69 (OP_VERIFY), not a push.
       local script_sig = string.char(0) ..
                          string.char(71) .. string.rep("\x00", 71) ..
                          string.char(71) .. string.rep("\x00", 71) ..
                          string.char(71) .. string.rep("\x00", 71) ..
-                         string.char(#multisig) .. multisig
+                         string.char(0x4c, #multisig) .. multisig
       tx.inputs[1] = types.txin(types.outpoint(prev_hash, 0), script_sig, 0xFFFFFFFF)
       tx.outputs[1] = types.txout(50000, script.make_p2pkh_script(string.rep("\x00", 20)))
 

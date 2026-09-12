@@ -426,7 +426,8 @@ describe("p2p", function()
     end)
 
     it("has correct max message size", function()
-      assert.equals(32 * 1024 * 1024, p2p.MAX_MESSAGE_SIZE)
+      -- Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 (net.h), not 32 MiB
+      assert.equals(4 * 1000 * 1000, p2p.MAX_MESSAGE_SIZE)
     end)
 
     it("has correct protocol version", function()

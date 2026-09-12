@@ -93,10 +93,9 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
       local h1 = mine_header(chain:get_tip_hash())
       local ok1 = chain:accept_header(h1)
       assert.is_true(ok1)
-      -- Mutate the header so it would FAIL PoW if re-validated.  Since
-      -- accept_header keys on hash and the hash is already in chain.headers,
-      -- the short-circuit must return true without computing PoW again.
-      h1.nonce = 0xffffffff  -- definitely-not-the-mined nonce
+      -- Re-submit the same header (same hash). Mutating nonce would change
+      -- the hash and is not a duplicate; on regtest almost every nonce still
+      -- meets the target, so that version of the test was a coin-flip.
       local ok2 = chain:accept_header(h1)
       assert.is_true(ok2, "duplicate-hash short-circuit must precede validation")
     end)

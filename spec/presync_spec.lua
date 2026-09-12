@@ -75,26 +75,26 @@ describe("presync anti_dos header_sync", function()
 
   describe("256-bit work arithmetic", function()
     it("parses hex work values", function()
-      local zero = consensus.work_from_hex(string.rep("00", 64))
+      local zero = consensus.work_from_hex(string.rep("00", 32))
       assert.equals(32, #zero)
       for i = 1, 32 do
         assert.equals(0, zero:byte(i))
       end
 
-      local one = consensus.work_from_hex(string.rep("00", 62) .. "01")
+      local one = consensus.work_from_hex(string.rep("00", 31) .. "01")
       assert.equals(1, one:byte(32))
 
-      local ff = consensus.work_from_hex(string.rep("ff", 64))
+      local ff = consensus.work_from_hex(string.rep("ff", 32))
       for i = 1, 32 do
         assert.equals(255, ff:byte(i))
       end
     end)
 
     it("compares work values correctly", function()
-      local zero = consensus.work_from_hex(string.rep("00", 64))
-      local one = consensus.work_from_hex(string.rep("00", 62) .. "01")
-      local two = consensus.work_from_hex(string.rep("00", 62) .. "02")
-      local max = consensus.work_from_hex(string.rep("ff", 64))
+      local zero = consensus.work_from_hex(string.rep("00", 32))
+      local one = consensus.work_from_hex(string.rep("00", 31) .. "01")
+      local two = consensus.work_from_hex(string.rep("00", 31) .. "02")
+      local max = consensus.work_from_hex(string.rep("ff", 32))
 
       assert.equals(0, consensus.work_compare(zero, zero))
       assert.equals(-1, consensus.work_compare(zero, one))
@@ -104,16 +104,16 @@ describe("presync anti_dos header_sync", function()
     end)
 
     it("adds work values correctly", function()
-      local one = consensus.work_from_hex(string.rep("00", 62) .. "01")
-      local two = consensus.work_from_hex(string.rep("00", 62) .. "02")
+      local one = consensus.work_from_hex(string.rep("00", 31) .. "01")
+      local two = consensus.work_from_hex(string.rep("00", 31) .. "02")
 
       local sum = consensus.work_add(one, one)
       assert.equals(0, consensus.work_compare(sum, two))
 
       -- Test carry
-      local ff = consensus.work_from_hex(string.rep("00", 62) .. "ff")
+      local ff = consensus.work_from_hex(string.rep("00", 31) .. "ff")
       local sum2 = consensus.work_add(ff, one)
-      local expected = consensus.work_from_hex(string.rep("00", 60) .. "0100")
+      local expected = consensus.work_from_hex(string.rep("00", 30) .. "0100")
       assert.equals(0, consensus.work_compare(sum2, expected))
     end)
 
@@ -176,7 +176,7 @@ describe("presync anti_dos header_sync", function()
         pow_no_retarget = true,
         pow_allow_min_difficulty = true,
         -- Low min_chain_work so we can test transitions
-        min_chain_work = string.rep("00", 60) .. "00001000",
+        min_chain_work = string.rep("00", 28) .. "00001000",
       }
 
       genesis_hash = types.hash256(string.rep("\x00", 32))
@@ -250,7 +250,7 @@ describe("presync anti_dos header_sync", function()
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
         pow_allow_min_difficulty = true,
-        min_chain_work = string.rep("00", 62) .. "0001",  -- very low
+        min_chain_work = string.rep("00", 30) .. "0001",  -- very low
       }
 
       local state = sync.new_headers_sync_state("peer1", low_work_network, chain_start)
@@ -306,7 +306,7 @@ describe("presync anti_dos header_sync", function()
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
         pow_allow_min_difficulty = true,
-        min_chain_work = string.rep("00", 62) .. "0001",  -- very low
+        min_chain_work = string.rep("00", 30) .. "0001",  -- very low
       }
 
       genesis_hash = types.hash256(string.rep("\x00", 32))
@@ -414,7 +414,7 @@ describe("presync anti_dos header_sync", function()
         pow_no_retarget = true,
         pow_allow_min_difficulty = true,
         -- Require significant work (hard to reach with regtest difficulty)
-        min_chain_work = string.rep("00", 50) .. string.rep("ff", 14),
+        min_chain_work = string.rep("00", 25) .. string.rep("ff", 7),
       }
 
       storage = helpers.mock_storage()
@@ -468,7 +468,7 @@ describe("presync anti_dos header_sync", function()
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
         pow_allow_min_difficulty = true,
-        min_chain_work = string.rep("00", 62) .. "0001",
+        min_chain_work = string.rep("00", 30) .. "0001",
       }
 
       local easy_storage = helpers.mock_storage()
@@ -507,7 +507,7 @@ describe("presync anti_dos header_sync", function()
         genesis = consensus.networks.regtest.genesis,
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
-        min_chain_work = string.rep("00", 64),
+        min_chain_work = string.rep("00", 32),
       }
 
       local state = sync.new_headers_sync_state("peer1", network, chain_start)
@@ -531,7 +531,7 @@ describe("presync anti_dos header_sync", function()
         genesis = consensus.networks.regtest.genesis,
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
-        min_chain_work = string.rep("00", 62) .. "0001",
+        min_chain_work = string.rep("00", 30) .. "0001",
       }
 
       local state = sync.new_headers_sync_state("peer1", network, chain_start)
@@ -565,7 +565,7 @@ describe("presync anti_dos header_sync", function()
         genesis = consensus.networks.regtest.genesis,
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
-        min_chain_work = string.rep("00", 62) .. "0001",
+        min_chain_work = string.rep("00", 30) .. "0001",
       }
 
       local state = sync.new_headers_sync_state("peer1", network, chain_start)
@@ -600,7 +600,7 @@ describe("presync anti_dos header_sync", function()
         genesis = consensus.networks.regtest.genesis,
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
-        min_chain_work = string.rep("00", 64),
+        min_chain_work = string.rep("00", 32),
       }
 
       local state = sync.new_headers_sync_state("peer1", network, chain_start)
@@ -629,7 +629,7 @@ describe("presync anti_dos header_sync", function()
         genesis = consensus.networks.regtest.genesis,
         pow_limit_bits = 0x207fffff,
         pow_no_retarget = true,
-        min_chain_work = string.rep("00", 64),
+        min_chain_work = string.rep("00", 32),
       }
 
       local state1 = sync.new_headers_sync_state("peer1", network, chain_start)

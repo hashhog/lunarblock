@@ -51,8 +51,10 @@ describe("serialize", function()
     end)
 
     it("writes u64le", function()
+      -- LuaJIT uint64 literal: a plain Lua number cannot hold this value
+      -- exactly (above 2^53).
       local w = serialize.buffer_writer()
-      w.write_u64le(0x0102030405060708)
+      w.write_u64le(0x0102030405060708ULL)
       local result = w.result()
       assert.equal(8, #result)
       assert.equal(0x08, result:byte(1))
@@ -103,7 +105,8 @@ describe("serialize", function()
 
     it("reads u64le", function()
       local r = serialize.buffer_reader(string.char(0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01))
-      assert.equal(0x0102030405060708, r.read_u64le())
+      -- Reader returns uint64_t cdata so values above 2^53 stay exact.
+      assert.equal("72623859790382856ULL", tostring(r.read_u64le()))
     end)
 
     it("reads bytes", function()
@@ -230,7 +233,11 @@ describe("serialize", function()
         assert.equal(expected_len, #result, "expected length for " .. val)
       end
       local r = serialize.buffer_reader(result)
-      assert.equal(val, r.read_varint(), "round-trip for " .. val)
+      -- range_check=false: these tests encode integers, not container lengths.
+      -- ReadCompactSize rejects values > MAX_SIZE (0x02000000) by default.
+      local got = r.read_varint(false)
+      if type(got) == "cdata" then got = tonumber(got) end
+      assert.equal(val, got, "round-trip for " .. val)
     end
 
     it("encodes single byte varints (0-0xFC)", function()

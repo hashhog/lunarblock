@@ -342,7 +342,7 @@ describe("W99 net_processing dispatch + Misbehaving audit", function()
         hash = consensus.networks.regtest.genesis and consensus.networks.regtest.genesis.prev_hash or
                require("types").hash256_zero(),
         height = 0,
-        work = require("consensus").work_from_hex(string.rep("00", 64)),
+        work = require("consensus").work_from_hex(string.rep("00", 32)),
         bits = consensus.networks.regtest.genesis and
                consensus.networks.regtest.genesis.bits or 0x207fffff,
       }

@@ -722,7 +722,7 @@ describe("script", function()
         local s = "\x51\x51" .. string.char(opcode)
         assert.has_error(function()
           script.execute_script(s)
-        end, "disabled opcode")
+        end, "disabled opcode: " .. name)
       end)
     end
   end)
@@ -904,7 +904,7 @@ describe("script", function()
         {opcode = script.OP.OP_CHECKSIGADD, data = nil},
       })
 
-      local result = script.execute_script(s, {}, {}, checker)
+      local result = script.execute_script(s, {}, {is_tapscript = true}, checker)
       assert.equals(1, #result)
       assert.equals(1, script.script_num_decode(result[1]))
     end)
@@ -926,7 +926,7 @@ describe("script", function()
         {opcode = script.OP.OP_CHECKSIGADD, data = nil},
       })
 
-      local result = script.execute_script(s, {}, {}, checker)
+      local result = script.execute_script(s, {}, {is_tapscript = true}, checker)
       assert.equals(1, #result)
       assert.equals(5, script.script_num_decode(result[1]))  -- unchanged
     end)

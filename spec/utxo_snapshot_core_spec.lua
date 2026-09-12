@@ -551,11 +551,15 @@ describe("Core-format UTXO snapshot", function()
     it("contains all 4 mainnet snapshots from Bitcoin Core", function()
       local heights = consensus.get_assumeutxo_heights(
         consensus.networks.mainnet)
-      assert.equal(4, #heights)
-      assert.equal(840000, heights[1])
-      assert.equal(880000, heights[2])
-      assert.equal(910000, heights[3])
-      assert.equal(935000, heights[4])
+      local set = {}
+      for _, h in ipairs(heights) do set[h] = true end
+      -- Core chainparams entries. Extra hashhog-local heights (campaign
+      -- 481823, recovery 944183) may also be present.
+      assert.is_true(set[840000])
+      assert.is_true(set[880000])
+      assert.is_true(set[910000])
+      assert.is_true(set[935000])
+      assert.is_true(#heights >= 4)
     end)
 
     it("uses real Core hash_serialized for height 840000", function()

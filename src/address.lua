@@ -21,10 +21,11 @@ function M.base58_encode(data)
     end
   end
 
-  -- Convert to big integer and repeatedly divide by 58
-  -- Work with a table of bytes for arbitrary precision
+  -- Convert the non-leading-zero suffix. An all-zero input must not emit a
+  -- remainder digit here — that extra '1' plus the leading-zero loop produced
+  -- n+1 ones for n zero bytes (spec/address_spec.lua "handles all-zero input").
   local bytes = {}
-  for i = 1, #data do bytes[i] = data:byte(i) end
+  for i = leading_zeros + 1, #data do bytes[#bytes + 1] = data:byte(i) end
 
   local result = {}
   while #bytes > 0 do
