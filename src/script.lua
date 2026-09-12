@@ -537,34 +537,24 @@ end
 -- Standard script template builders
 
 -- P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+-- Byte form, not build_script: this is reconstructed on every P2WPKH
+-- CHECKSIG (validation.make_sig_checker) so the table-of-ops path was a
+-- per-input allocation on the hottest connect_block script.
 function M.make_p2pkh_script(pubkey_hash20)
   assert(#pubkey_hash20 == 20, "P2PKH requires 20-byte pubkey hash")
-  return M.build_script({
-    {opcode = M.OP.OP_DUP, data = nil},
-    {opcode = M.OP.OP_HASH160, data = nil},
-    make_push(pubkey_hash20),
-    {opcode = M.OP.OP_EQUALVERIFY, data = nil},
-    {opcode = M.OP.OP_CHECKSIG, data = nil},
-  })
+  return "\x76\xa9\x14" .. pubkey_hash20 .. "\x88\xac"
 end
 
 -- P2SH: OP_HASH160 <20 bytes> OP_EQUAL
 function M.make_p2sh_script(script_hash20)
   assert(#script_hash20 == 20, "P2SH requires 20-byte script hash")
-  return M.build_script({
-    {opcode = M.OP.OP_HASH160, data = nil},
-    make_push(script_hash20),
-    {opcode = M.OP.OP_EQUAL, data = nil},
-  })
+  return "\xa9\x14" .. script_hash20 .. "\x87"
 end
 
 -- P2WPKH: OP_0 <20 bytes>
 function M.make_p2wpkh_script(pubkey_hash20)
   assert(#pubkey_hash20 == 20, "P2WPKH requires 20-byte pubkey hash")
-  return M.build_script({
-    {opcode = M.OP.OP_0, data = nil},
-    make_push(pubkey_hash20),
-  })
+  return "\x00\x14" .. pubkey_hash20
 end
 
 -- P2WSH: OP_0 <32 bytes>
@@ -1119,6 +1109,77 @@ local function is_disabled_opcode(opcode)
          opcode == M.OP.OP_RSHIFT
 end
 
+-- P2PKH-template fast path. Kill switch for the A/B control and for
+-- anyone who needs to force the generic interpreter.
+M.use_p2pkh_fastpath = true
+M.p2pkh_fastpath_hits = 0
+
+-- Execute the canonical 25-byte P2PKH template
+--   OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+-- without parse_script / nested closures. Accept/reject matches
+-- execute_script on the same bytes: HASH160 mismatch throws
+-- OP_EQUALVERIFY (same as the generic EQUALVERIFY handler);
+-- CHECKSIG encoding / NULLFAIL return nil, err; extra stack items
+-- below (sig, pubkey) are preserved; DUP of a 1000-item stack hits
+-- STACK_SIZE. Used by native P2PKH and by BIP141's synthetic P2WPKH
+-- script — the 900k connect_block hot path.
+local function execute_p2pkh_template(script_bytes, stack, flags, checker)
+  M.p2pkh_fastpath_hits = M.p2pkh_fastpath_hits + 1
+
+  -- DUP copies the top item. Underflow and the 520-byte push limit
+  -- fire on that copy in the generic interpreter.
+  assert(#stack >= 1, "stack underflow")
+  local pubkey = stack[#stack]
+  assert(#pubkey <= MAX_SCRIPT_ELEMENT_SIZE, "element too large")
+
+  -- After DUP, stack+altstack would be #stack+1 (altstack is empty at
+  -- the start of execute_script). MAX_STACK_SIZE is 1000.
+  if #stack >= MAX_STACK_SIZE then
+    return nil, "STACK_SIZE"
+  end
+
+  -- HASH160(pubkey) EQUALVERIFY <program>. Generic EQUALVERIFY throws
+  -- (does not return nil, err) so submitblock's pcall surface matches.
+  local program = script_bytes:sub(4, 23)
+  if crypto.hash160(pubkey) ~= program then
+    error("OP_EQUALVERIFY failed")
+  end
+
+  -- CHECKSIG pops pubkey then sig. A 1-item stack that passed EQUALVERIFY
+  -- underflows here, same as the generic interpreter.
+  assert(#stack >= 2, "stack underflow")
+  local sig = stack[#stack - 1]
+
+  -- CONST_SCRIPTCODE / FindAndDelete: the 25-byte template never contains
+  -- the signature as a script push, so the count is always 0.
+
+  local sig_ok, sig_err = check_signature_encoding(sig, flags)
+  if not sig_ok then
+    return nil, sig_err
+  end
+  local pk_ok, pk_err = check_pubkey_encoding(pubkey, flags)
+  if not pk_ok then
+    return nil, pk_err
+  end
+  pk_ok, pk_err = M.check_pubkey_encoding_witness(pubkey, flags)
+  if not pk_ok then
+    return nil, pk_err
+  end
+  local valid = false
+  if checker.check_sig then
+    valid = checker.check_sig(sig, pubkey)
+  end
+  if not valid and flags.verify_nullfail and #sig > 0 then
+    return nil, "NULLFAIL"
+  end
+
+  -- CHECKSIG replaces (sig, pubkey) with a bool. Net -1 vs the input stack.
+  stack[#stack] = nil
+  stack[#stack] = nil
+  stack[#stack + 1] = valid and "\x01" or ""
+  return stack
+end
+
 -- Execute a script
 -- stack: initial stack (table of byte strings), defaults to {}
 -- flags: table of boolean consensus flags
@@ -1157,6 +1218,19 @@ function M.execute_script(script_bytes, stack, flags, checker)
   -- extra args (its codesep position is committed differently).
   if checker.set_codesep then
     checker.set_codesep(0xFFFFFFFF, nil, script_bytes)
+  end
+
+  -- P2PKH template (native P2PKH and BIP141's synthetic P2WPKH script).
+  -- Tapscript never uses this 25-byte form; skip if the kill switch is off.
+  if M.use_p2pkh_fastpath ~= false
+     and not flags.is_tapscript
+     and #script_bytes == 25
+     and script_bytes:byte(1) == 0x76
+     and script_bytes:byte(2) == 0xa9
+     and script_bytes:byte(3) == 0x14
+     and script_bytes:byte(24) == 0x88
+     and script_bytes:byte(25) == 0xac then
+    return execute_p2pkh_template(script_bytes, stack, flags, checker)
   end
 
   -- Helper: check if we're in an executing branch

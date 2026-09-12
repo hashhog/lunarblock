@@ -5,6 +5,7 @@ local M = {}
 -- SHA-256 hardware acceleration state
 local sha256_accel_lib = nil
 local sha256_hw_type = nil  -- "sha_ni", "avx2", or "generic"
+local hash160_oneshot = false
 
 -- OpenSSL FFI declarations
 ffi.cdef[[
@@ -72,6 +73,7 @@ ffi.cdef[[
   int sha256_accel_init(void);
   void sha256_accel(const uint8_t* data, size_t len, uint8_t out[32]);
   void sha256d_accel(const uint8_t* data, size_t len, uint8_t out[32]);
+  void hash160_accel(const uint8_t* data, size_t len, uint8_t out[20]);
 ]]
 
 -- Try to load the hardware-accelerated SHA-256 library
@@ -101,6 +103,12 @@ local function init_sha256_accel()
       else
         sha256_hw_type = "generic"
       end
+      -- Probe HASH160 oneshot. An older .so without the symbol must not
+      -- abort the process — hash160() falls back to sha256+ripemd160.
+      local probe = ffi.new("uint8_t[20]")
+      hash160_oneshot = pcall(function()
+        lib.hash160_accel("", 0, probe)
+      end)
       return sha256_accel_lib
     end
   end
@@ -113,6 +121,23 @@ end
 -- Initialize on module load (non-fatal if not available)
 pcall(init_sha256_accel)
 
+-- Reused FFI digest output buffers. LuaJIT is single-threaded; sha256 /
+-- hash256 / hash160 / ripemd160 return ffi.string copies, so a later call
+-- overwriting the buffer cannot change a previously returned digest.
+local sha256_out = ffi.new("uint8_t[32]")
+local hash160_out = ffi.new("uint8_t[20]")
+local evp_out32 = ffi.new("unsigned char[32]")
+local evp_out20 = ffi.new("unsigned char[20]")
+local evp_md_len = ffi.new("unsigned int[1]")
+
+-- Reused EVP contexts for the OpenSSL fallback / RIPEMD-160 path. Init_ex
+-- resets the context, so this is safe across sequential calls.
+local sha256_evp_ctx = libcrypto.EVP_MD_CTX_new()
+local ripemd_evp_ctx = libcrypto.EVP_MD_CTX_new()
+assert(sha256_evp_ctx ~= nil and ripemd_evp_ctx ~= nil, "Failed to create EVP_MD_CTX")
+ffi.gc(sha256_evp_ctx, libcrypto.EVP_MD_CTX_free)
+ffi.gc(ripemd_evp_ctx, libcrypto.EVP_MD_CTX_free)
+
 -- OpenSSL EVP control constants
 local EVP_CTRL_AEAD_SET_IVLEN = 0x09
 local EVP_CTRL_AEAD_GET_TAG = 0x10
@@ -121,20 +146,13 @@ local EVP_CTRL_AEAD_SET_TAG = 0x11
 -- SHA-256: single hash (uses hardware acceleration if available)
 function M.sha256(data)
   if sha256_accel_lib then
-    local md = ffi.new("uint8_t[32]")
-    sha256_accel_lib.sha256_accel(data, #data, md)
-    return ffi.string(md, 32)
+    sha256_accel_lib.sha256_accel(data, #data, sha256_out)
+    return ffi.string(sha256_out, 32)
   end
-  -- Fallback to OpenSSL
-  local ctx = libcrypto.EVP_MD_CTX_new()
-  assert(ctx ~= nil, "Failed to create EVP_MD_CTX")
-  local md = ffi.new("unsigned char[32]")
-  local md_len = ffi.new("unsigned int[1]")
-  libcrypto.EVP_DigestInit_ex(ctx, libcrypto.EVP_sha256(), nil)
-  libcrypto.EVP_DigestUpdate(ctx, data, #data)
-  libcrypto.EVP_DigestFinal_ex(ctx, md, md_len)
-  libcrypto.EVP_MD_CTX_free(ctx)
-  return ffi.string(md, 32)
+  libcrypto.EVP_DigestInit_ex(sha256_evp_ctx, libcrypto.EVP_sha256(), nil)
+  libcrypto.EVP_DigestUpdate(sha256_evp_ctx, data, #data)
+  libcrypto.EVP_DigestFinal_ex(sha256_evp_ctx, evp_out32, evp_md_len)
+  return ffi.string(evp_out32, 32)
 end
 
 -- SHA-1 (for OP_SHA1)
@@ -191,9 +209,8 @@ end
 -- Double SHA-256: hash256 used for block hashes, txids (uses hardware acceleration if available)
 function M.hash256(data)
   if sha256_accel_lib then
-    local md = ffi.new("uint8_t[32]")
-    sha256_accel_lib.sha256d_accel(data, #data, md)
-    return ffi.string(md, 32)
+    sha256_accel_lib.sha256d_accel(data, #data, sha256_out)
+    return ffi.string(sha256_out, 32)
   end
   -- Fallback to two OpenSSL calls
   return M.sha256(M.sha256(data))
@@ -215,20 +232,29 @@ end
 
 -- RIPEMD-160
 function M.ripemd160(data)
-  local ctx = libcrypto.EVP_MD_CTX_new()
-  assert(ctx ~= nil, "Failed to create EVP_MD_CTX")
-  local md = ffi.new("unsigned char[20]")
-  local md_len = ffi.new("unsigned int[1]")
-  libcrypto.EVP_DigestInit_ex(ctx, libcrypto.EVP_ripemd160(), nil)
-  libcrypto.EVP_DigestUpdate(ctx, data, #data)
-  libcrypto.EVP_DigestFinal_ex(ctx, md, md_len)
-  libcrypto.EVP_MD_CTX_free(ctx)
-  return ffi.string(md, 20)
+  libcrypto.EVP_DigestInit_ex(ripemd_evp_ctx, libcrypto.EVP_ripemd160(), nil)
+  libcrypto.EVP_DigestUpdate(ripemd_evp_ctx, data, #data)
+  libcrypto.EVP_DigestFinal_ex(ripemd_evp_ctx, evp_out20, evp_md_len)
+  return ffi.string(evp_out20, 20)
 end
 
--- HASH160: RIPEMD160(SHA256(data)) used for addresses
+-- HASH160: RIPEMD160(SHA256(data)) used for addresses and P2WPKH/P2PKH.
+-- When lib/sha256_accel.so exports hash160_accel this is one C call
+-- (SHA-NI SHA-256 + OpenSSL RIPEMD-160) instead of two Lua digest calls.
 function M.hash160(data)
+  if hash160_oneshot then
+    sha256_accel_lib.hash160_accel(data, #data, hash160_out)
+    return ffi.string(hash160_out, 20)
+  end
   return M.ripemd160(M.sha256(data))
+end
+
+--- True when HASH160 is the C oneshot (not Lua sha256+ripemd160).
+function M.hash160_oneshot_available()
+  if sha256_hw_type == nil then
+    init_sha256_accel()
+  end
+  return hash160_oneshot
 end
 
 -- HASH160 returning a hash160 type

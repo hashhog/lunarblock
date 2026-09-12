@@ -20,7 +20,8 @@ help:
 # and src/main.lua run_import_utxo.
 #
 # sha256_accel: SHA-NI / AVX2 SHA-256, the same instruction path Bitcoin Core
-# uses (csrc/sha256_accel.c is modelled on Core's sha256_x86_shani.cpp).
+# uses (csrc/sha256_accel.c is modelled on Core's sha256_x86_shani.cpp), plus
+# hash160_accel (RIPEMD160(SHA256)) for the P2WPKH/P2PKH commitment check.
 #
 # This target previously printed "(no FFI helpers to build)" and built NOTHING,
 # so lib/ held only parallel_verify.so and src/crypto.lua's init_sha256_accel

@@ -2,6 +2,7 @@
 
 ## v1.0.2 (unreleased)
 
+- perf: P2PKH-template fast path + HASH160 oneshot (script-verify hot path at 900k)
 - test: unit suite green for the release gate (stale fixtures + known-red pending of pre-v1.0.1 failures)
 
 ## v1.0.1 (unreleased)

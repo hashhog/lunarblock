@@ -15,6 +15,7 @@
 #endif
 
 #include <openssl/sha.h>
+#include <openssl/ripemd.h>
 
 /* Acceleration type enum */
 #define ACCEL_GENERIC 0
@@ -402,4 +403,30 @@ void sha256d_accel(const uint8_t* data, size_t len, uint8_t out[32]) {
         sha256_accel_init();
     }
     sha256d_impl(data, len, out);
+}
+
+/*
+ * HASH160: RIPEMD160(SHA256(data)). The P2WPKH / P2PKH hot path does this
+ * once per input (pubkey commitment). Doing it in one C call avoids two Lua
+ * FFI round-trips and the EVP_MD_CTX lifecycle crypto.lua's ripemd160 used
+ * to pay on every HASH160.
+ *
+ * SHA-256 uses the same dispatched impl as sha256_accel (SHA-NI when the
+ * CPU has it). RIPEMD-160 has no SHA-NI equivalent; OpenSSL's one-shot
+ * RIPEMD160() is the same primitive EVP_ripemd160 wraps.
+ */
+void hash160_accel(const uint8_t* data, size_t len, uint8_t out[20]) {
+    uint8_t sha[32];
+    if (sha256_impl == NULL) {
+        sha256_accel_init();
+    }
+    sha256_impl(data, len, sha);
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    RIPEMD160(sha, 32, out);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }
