@@ -1577,9 +1577,20 @@ end
 -- @param tag string: The tag string (e.g., "TapLeaf", "TapBranch", "TapTweak")
 -- @param msg string: The message to hash
 -- @return string: 32-byte hash
+--
+-- SHA256(tag) is constant per tag. Core keeps HashWriter HASHER_TAPSIGHASH
+-- etc. as process-lifetime constants (interpreter.cpp). Caching the 64-byte
+-- prefix here saves two SHA256s on every TapSighash / TapLeaf / TapBranch /
+-- TapTweak — the BIP341 hot path at 900k.
+local tagged_hash_prefix = {}
 function M.tagged_hash(tag, msg)
-  local tag_hash = M.sha256(tag)
-  return M.sha256(tag_hash .. tag_hash .. msg)
+  local prefix = tagged_hash_prefix[tag]
+  if not prefix then
+    local tag_hash = M.sha256(tag)
+    prefix = tag_hash .. tag_hash
+    tagged_hash_prefix[tag] = prefix
+  end
+  return M.sha256(prefix .. msg)
 end
 
 --- Encode a length as Bitcoin compact size (varint).

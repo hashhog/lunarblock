@@ -2918,6 +2918,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       -- makes the comment true. Behaviour is otherwise identical: same values,
       -- same laziness, still built only if a Taproot key-path input asks.
       local tx_prev_outputs = nil
+      local tx_cache = nil
       local function get_tx_prev_outputs()
         if tx_prev_outputs then return tx_prev_outputs end
         tx_prev_outputs = {}
@@ -2926,6 +2927,16 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           tx_prev_outputs[pi] = { value = pu.value, script_pubkey = pu.script_pubkey }
         end
         return tx_prev_outputs
+      end
+      -- Core PrecomputedTransactionData: hashPrevouts / hashSequence /
+      -- hashOutputs (BIP143) and the BIP341 single-SHA256 siblings are
+      -- identical across every input of this tx. Built lazily so a
+      -- sigcache hit on every input never hashes the prefix. Shared
+      -- across every checker constructed for this tx.
+      local function get_tx_cache()
+        if tx_cache then return tx_cache end
+        tx_cache = validation.precomputed_tx_data(tx, get_tx_prev_outputs())
+        return tx_cache
       end
 
       for inp_idx, inp in ipairs(tx.inputs) do
@@ -3129,12 +3140,12 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           if use_parallel_verify then
             checker = validation.make_collecting_sig_checker(
               tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs,
-              get_tx_prev_outputs(), legacy_needs_inline
+              get_tx_prev_outputs(), legacy_needs_inline, get_tx_cache()
             )
           else
             checker = validation.make_sig_checker(
               tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags,
-              get_tx_prev_outputs()
+              get_tx_prev_outputs(), get_tx_cache()
             )
           end
 
@@ -3164,11 +3175,12 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               if use_parallel_verify then
                 segwit_checker = validation.make_collecting_sig_checker(
                   tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs,
-                  nil, false
+                  nil, false, get_tx_cache()
                 )
               else
                 segwit_checker = validation.make_sig_checker(
-                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags,
+                  nil, get_tx_cache()
                 )
               end
               -- BIP141: Use execute_witness_script which enforces cleanstack
@@ -3209,11 +3221,12 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               if use_parallel_verify then
                 segwit_checker = validation.make_collecting_sig_checker(
                   tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs,
-                  nil, p2wsh_needs_inline
+                  nil, p2wsh_needs_inline, get_tx_cache()
                 )
               else
                 segwit_checker = validation.make_sig_checker(
-                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags
+                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags,
+                  nil, get_tx_cache()
                 )
               end
               -- BIP141: Use execute_witness_script which enforces cleanstack
@@ -3252,12 +3265,9 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               end
             end
 
-            -- Collect prev_outputs for taproot sighash (needs all inputs' prevouts)
-            local prev_outputs = {}
-            for pi = 1, #tx.inputs do
-              local pu = utxo_cache[pi]
-              prev_outputs[pi] = { value = pu.value, script_pubkey = pu.script_pubkey }
-            end
+            -- Collect prev_outputs for taproot sighash (needs all inputs' prevouts).
+            -- Shared with get_tx_cache so BIP341 singles are hashed once per tx.
+            local prev_outputs = get_tx_prev_outputs()
 
             if #witness == 1 then
               -- Key-path spend: single element is a Schnorr signature
@@ -3289,7 +3299,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               -- schnorr_verify and accept any sig the attacker had
               -- pre-computed against that placeholder — real split.
               local sighash, sh_err = validation.signature_hash_taproot(
-                tx, inp_idx - 1, hash_type, prev_outputs, 0, annex)
+                tx, inp_idx - 1, hash_type, prev_outputs, 0, annex, nil, nil, get_tx_cache())
               assert(sighash, "taproot sighash failed: " .. tostring(sh_err))
 
               -- Verify Schnorr signature against the output key (witness_program)
@@ -3353,7 +3363,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
                 -- Create tapscript-aware sig checker
                 local tapscript_checker = validation.make_tapscript_checker(
-                  tx, inp_idx - 1, prev_outputs, leaf_hash, annex)
+                  tx, inp_idx - 1, prev_outputs, leaf_hash, annex, get_tx_cache())
 
                 -- BIP-342 validation-weight budget: seed from the FULL
                 -- witness stack (annex INCLUDED, control + script + args

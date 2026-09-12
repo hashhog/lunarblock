@@ -162,14 +162,14 @@
 --        on next access), the non-determinism makes benchmarking and
 --        deterministic replay impossible, and can thrash hot entries.
 --
--- BUG-13 [PERFORMANCE] G13 No PrecomputedTransactionData equivalent.
+-- BUG-13 [PERFORMANCE] G13 PrecomputedTransactionData — CLOSED.
 --        Core's CheckInputScripts pre-computes BIP-143 (segwit v0) hashing
 --        intermediates (hashPrevouts, hashSequences, hashOutputs) once per tx
 --        via PrecomputedTransactionData (validation.cpp:2086-2096). These are
 --        reused across all inputs of the same tx, avoiding O(N²) re-hashing.
---        Lunarblock recomputes signature_hash_segwit_v0 (validation.lua:806-899)
---        from scratch for every input. For a tx with 100 inputs, this is
---        100× the work for the shared prefix.
+--        Lunarblock now has validation.precomputed_tx_data + an optional cache
+--        arg on signature_hash_segwit_v0 / signature_hash_taproot; connect_block
+--        shares one cache per tx. Control: luajit test_sighash_precompute.lua.
 --
 -- BUG-14 [PERFORMANCE] G14 No CCheckQueueControl RAII / early-abort.
 --        Core's CCheckQueueControl destructor calls Complete() automatically
@@ -558,24 +558,25 @@ describe("W105 CCheckQueue / parallel script verification audit", function()
   end)
 
   -- =========================================================================
-  -- BUG-13: G13 No PrecomputedTransactionData (O(N) sighash re-hashing)
+  -- BUG-13: G13 PrecomputedTransactionData (closed — cache is wired)
   -- =========================================================================
-  describe("BUG-13 G13 no PrecomputedTransactionData — segwit hashPrevouts recomputed per-input", function()
-    it("signature_hash_segwit_v0 recomputes shared prefix on each call", function()
-      -- Build a 2-input segwit tx and call signature_hash_segwit_v0 twice.
-      -- If PrecomputedTransactionData existed, the hashPrevouts would be computed once.
-      -- We can only verify the function accepts two calls without caching.
+  describe("BUG-13 G13 PrecomputedTransactionData — segwit hashPrevouts cached per-tx", function()
+    it("cached signature_hash_segwit_v0 matches uncached across both inputs", function()
       local ph = types.hash256(string.rep("\xaa", 32))
       local tx = types.transaction(2, {}, {}, 0)
       tx.inputs[1] = types.txin(types.outpoint(ph, 0), "", 0xFFFFFFFE)
       tx.inputs[2] = types.txin(types.outpoint(ph, 1), "", 0xFFFFFFFE)
       tx.outputs[1] = types.txout(1000, string.char(0x51, 0x20) .. string.rep("\x05", 32))
       local script_code1 = string.char(0x76, 0xa9, 0x14) .. string.rep("\x01", 20) .. string.char(0x88, 0xac)
+      local cache = validation.precomputed_tx_data(tx)
       local h1a = validation.signature_hash_segwit_v0(tx, 0, script_code1, 5000, 1)
-      local h1b = validation.signature_hash_segwit_v0(tx, 0, script_code1, 5000, 1)
-      -- Repeated call gives same result but no shared precomputed state
-      assert.equals(h1a, h1b,
-        "BUG-13: repeated sighash calls produce consistent results (no precomputed cache)")
+      local h1b = validation.signature_hash_segwit_v0(tx, 0, script_code1, 5000, 1, cache)
+      local h2a = validation.signature_hash_segwit_v0(tx, 1, script_code1, 5000, 1)
+      local h2b = validation.signature_hash_segwit_v0(tx, 1, script_code1, 5000, 1, cache)
+      assert.equals(h1a, h1b)
+      assert.equals(h2a, h2b)
+      assert.is_true(cache.bip143_ready,
+        "BUG-13: cache fills hashPrevouts/hashSequence/hashOutputs on first use")
     end)
   end)
 

@@ -906,6 +906,106 @@ function M.signature_hash_legacy(tx, input_index, script_code, hash_type, sig_by
 end
 
 --------------------------------------------------------------------------------
+-- PrecomputedTransactionData (Core script/interpreter.h)
+--
+-- BIP143 hashPrevouts/hashSequence/hashOutputs and the BIP341 single-SHA256
+-- siblings are identical across every input of a tx (for a given hash_type
+-- class). Core computes them once in PrecomputedTransactionData::Init and
+-- reuses them in SignatureHash / SignatureHashSchnorr. Lunarblock used to
+-- re-serialize and re-hash the shared prefix on every check_sig — O(N²) in
+-- the prevout/output bytes for an N-input consolidation tx, which is why
+-- script verification dominated the 0.27–0.33 blk/s number at 900k.
+--------------------------------------------------------------------------------
+
+local ZERO_HASH = string.rep("\0", 32)
+
+local function serialize_prevouts(tx)
+  local w = serialize.buffer_writer()
+  for _, inp in ipairs(tx.inputs) do
+    w.write_hash256(inp.prev_out.hash)
+    w.write_u32le(inp.prev_out.index)
+  end
+  return w.result()
+end
+
+local function serialize_sequences(tx)
+  local w = serialize.buffer_writer()
+  for _, inp in ipairs(tx.inputs) do
+    w.write_u32le(inp.sequence)
+  end
+  return w.result()
+end
+
+local function serialize_outputs(tx)
+  local w = serialize.buffer_writer()
+  for _, out in ipairs(tx.outputs) do
+    w.write_i64le(out.value)
+    w.write_varstr(out.script_pubkey)
+  end
+  return w.result()
+end
+
+local function serialize_spent_amounts(spent)
+  local w = serialize.buffer_writer()
+  for _, po in ipairs(spent) do
+    w.write_i64le(po.value)
+  end
+  return w.result()
+end
+
+local function serialize_spent_scripts(spent)
+  local w = serialize.buffer_writer()
+  for _, po in ipairs(spent) do
+    w.write_varstr(po.script_pubkey)
+  end
+  return w.result()
+end
+
+-- Shared singles are SHA256 (not SHA256d). BIP341 uses them directly;
+-- BIP143 hashPrevouts = SHA256(single) == HASH256(serialization).
+local function fill_shared_singles(cache, tx)
+  if cache.prevouts_single then return end
+  cache.prevouts_single = crypto.sha256(serialize_prevouts(tx))
+  cache.sequences_single = crypto.sha256(serialize_sequences(tx))
+  cache.outputs_single = crypto.sha256(serialize_outputs(tx))
+end
+
+local function fill_bip143(cache, tx)
+  if cache.bip143_ready then return end
+  fill_shared_singles(cache, tx)
+  cache.hashPrevouts = crypto.sha256(cache.prevouts_single)
+  cache.hashSequence = crypto.sha256(cache.sequences_single)
+  cache.hashOutputs = crypto.sha256(cache.outputs_single)
+  cache.bip143_ready = true
+end
+
+local function fill_bip341(cache, tx, spent)
+  if cache.bip341_ready then return end
+  spent = spent or cache.spent_outputs
+  if not spent or #spent == 0 then return end
+  fill_shared_singles(cache, tx)
+  cache.spent_amounts_single = crypto.sha256(serialize_spent_amounts(spent))
+  cache.spent_scripts_single = crypto.sha256(serialize_spent_scripts(spent))
+  cache.spent_outputs = cache.spent_outputs or spent
+  cache.bip341_ready = true
+end
+
+--- Allocate a per-tx sighash midstate cache (Core PrecomputedTransactionData).
+-- Fields are filled lazily on the first BIP143 / BIP341 sighash that receives
+-- this table, so a sigcache hit on every input never hashes the prefix.
+-- @param tx transaction: The transaction being verified or signed
+-- @param spent_outputs table|nil: `{value, script_pubkey}` per input (BIP341)
+-- @return table: cache object passed as the optional last arg of the sighash
+--                and checker constructors
+function M.precomputed_tx_data(tx, spent_outputs)
+  return {
+    spent_outputs = spent_outputs,
+    bip143_ready = false,
+    bip341_ready = false,
+  }
+end
+
+--------------------------------------------------------------------------------
 -- Signature Hash (SegWit v0 - BIP143)
 --------------------------------------------------------------------------------
 
@@ -915,34 +1015,34 @@ end
 -- @param script_code string: The script code to sign
 -- @param value number: Value of the input being spent (satoshis)
 -- @param hash_type number: The hash type
+-- @param cache table|nil: PrecomputedTransactionData from precomputed_tx_data
 -- @return string: 32-byte hash
-function M.signature_hash_segwit_v0(tx, input_index, script_code, value, hash_type)
+function M.signature_hash_segwit_v0(tx, input_index, script_code, value, hash_type, cache)
   local ht = bit.band(hash_type, 0x1F)
   local anyone_can_pay = bit.band(hash_type, 0x80) ~= 0
+
+  if cache then
+    fill_bip143(cache, tx)
+  end
 
   -- Compute hashPrevouts
   local hash_prevouts
   if anyone_can_pay then
-    hash_prevouts = string.rep("\0", 32)
+    hash_prevouts = ZERO_HASH
+  elseif cache and cache.bip143_ready then
+    hash_prevouts = cache.hashPrevouts
   else
-    local w = serialize.buffer_writer()
-    for _, inp in ipairs(tx.inputs) do
-      w.write_hash256(inp.prev_out.hash)
-      w.write_u32le(inp.prev_out.index)
-    end
-    hash_prevouts = crypto.hash256(w.result())
+    hash_prevouts = crypto.hash256(serialize_prevouts(tx))
   end
 
   -- Compute hashSequence
   local hash_sequence
   if anyone_can_pay or ht == consensus.SIGHASH.SINGLE or ht == consensus.SIGHASH.NONE then
-    hash_sequence = string.rep("\0", 32)
+    hash_sequence = ZERO_HASH
+  elseif cache and cache.bip143_ready then
+    hash_sequence = cache.hashSequence
   else
-    local w = serialize.buffer_writer()
-    for _, inp in ipairs(tx.inputs) do
-      w.write_u32le(inp.sequence)
-    end
-    hash_sequence = crypto.hash256(w.result())
+    hash_sequence = crypto.hash256(serialize_sequences(tx))
   end
 
   -- Compute hashOutputs
@@ -955,18 +1055,15 @@ function M.signature_hash_segwit_v0(tx, input_index, script_code, value, hash_ty
       w.write_varstr(out.script_pubkey)
       hash_outputs = crypto.hash256(w.result())
     else
-      hash_outputs = string.rep("\0", 32)
+      hash_outputs = ZERO_HASH
     end
   elseif ht == consensus.SIGHASH.NONE then
-    hash_outputs = string.rep("\0", 32)
+    hash_outputs = ZERO_HASH
+  elseif cache and cache.bip143_ready then
+    hash_outputs = cache.hashOutputs
   else
     -- SIGHASH_ALL
-    local w = serialize.buffer_writer()
-    for _, out in ipairs(tx.outputs) do
-      w.write_i64le(out.value)
-      w.write_varstr(out.script_pubkey)
-    end
-    hash_outputs = crypto.hash256(w.result())
+    hash_outputs = crypto.hash256(serialize_outputs(tx))
   end
 
   -- Build the preimage
@@ -1030,7 +1127,7 @@ end
 -- digest would verify in lunarblock while Core rejected the input with
 -- SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
 function M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
-                                  ext_flag, annex, tapleaf_hash, codesep_pos)
+                                  ext_flag, annex, tapleaf_hash, codesep_pos, cache)
   ext_flag = ext_flag or 0
   codesep_pos = codesep_pos or 0xFFFFFFFF
 
@@ -1059,6 +1156,10 @@ function M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
     return nil, "TAPROOT_SIGHASH_SINGLE_OUT_OF_RANGE"
   end
 
+  if cache then
+    fill_bip341(cache, tx, prev_outputs)
+  end
+
   local w = serialize.buffer_writer()
   w.write_u8(0x00)  -- epoch
   w.write_u8(hash_type)
@@ -1066,39 +1167,36 @@ function M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
   w.write_u32le(tx.locktime)
 
   if not anyone_can_pay then
-    local pw = serialize.buffer_writer()
-    for _, inp in ipairs(tx.inputs) do
-      pw.write_hash256(inp.prev_out.hash)
-      pw.write_u32le(inp.prev_out.index)
-    end
-    w.write_bytes(crypto.sha256(pw.result()))
+    if cache and cache.bip341_ready then
+      w.write_bytes(cache.prevouts_single)
+      w.write_bytes(cache.spent_amounts_single)
+      w.write_bytes(cache.spent_scripts_single)
+      w.write_bytes(cache.sequences_single)
+    else
+      w.write_bytes(crypto.sha256(serialize_prevouts(tx)))
 
-    local aw = serialize.buffer_writer()
-    for _, po in ipairs(prev_outputs) do
-      aw.write_i64le(po.value)
-    end
-    w.write_bytes(crypto.sha256(aw.result()))
+      local aw = serialize.buffer_writer()
+      for _, po in ipairs(prev_outputs) do
+        aw.write_i64le(po.value)
+      end
+      w.write_bytes(crypto.sha256(aw.result()))
 
-    local sw = serialize.buffer_writer()
-    for _, po in ipairs(prev_outputs) do
-      sw.write_varstr(po.script_pubkey)
-    end
-    w.write_bytes(crypto.sha256(sw.result()))
+      local sw = serialize.buffer_writer()
+      for _, po in ipairs(prev_outputs) do
+        sw.write_varstr(po.script_pubkey)
+      end
+      w.write_bytes(crypto.sha256(sw.result()))
 
-    local qw = serialize.buffer_writer()
-    for _, inp in ipairs(tx.inputs) do
-      qw.write_u32le(inp.sequence)
+      w.write_bytes(crypto.sha256(serialize_sequences(tx)))
     end
-    w.write_bytes(crypto.sha256(qw.result()))
   end
 
   if output_type ~= 0x02 and output_type ~= 0x03 then
-    local ow = serialize.buffer_writer()
-    for _, out in ipairs(tx.outputs) do
-      ow.write_i64le(out.value)
-      ow.write_varstr(out.script_pubkey)
+    if cache and cache.bip341_ready then
+      w.write_bytes(cache.outputs_single)
+    else
+      w.write_bytes(crypto.sha256(serialize_outputs(tx)))
     end
-    w.write_bytes(crypto.sha256(ow.result()))
   end
 
   local annex_present = annex and 1 or 0
@@ -1154,9 +1252,9 @@ end
 -- @return string|nil 32-byte sighash on success, nil + err string on
 --                    failure (bad hash_type or SIGHASH_SINGLE oor-output).
 function M.signature_hash_taproot(tx, input_index, hash_type, prev_outputs,
-                                   ext_flag, annex, tapleaf_hash, codesep_pos)
+                                   ext_flag, annex, tapleaf_hash, codesep_pos, cache)
   local msg, err = M.signature_msg_taproot(tx, input_index, hash_type, prev_outputs,
-                                       ext_flag, annex, tapleaf_hash, codesep_pos)
+                                       ext_flag, annex, tapleaf_hash, codesep_pos, cache)
   if not msg then return nil, err end
   return crypto.tagged_hash("TapSighash", msg)
 end
@@ -1758,7 +1856,7 @@ end
 -- @param prev_script_pubkey string: ScriptPubKey of the previous output
 -- @param flags table: Script verification flags
 -- @return table: Checker with check_sig, check_locktime, check_sequence methods
-function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, prev_outputs)
+function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, prev_outputs, cache)
   flags = flags or {}
   local checker = {}
 
@@ -1883,7 +1981,7 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     local sighash
     if is_segwit then
       -- SegWit does NOT use FindAndDelete
-      sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
+      sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type, cache)
     elseif all_sigs then
       -- OP_CHECKMULTISIG (legacy): FindAndDelete EVERY signature from the
       -- scriptCode up front, then build the sighash without a further
@@ -1934,7 +2032,7 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
     end
 
     local sighash = M.signature_hash_taproot(
-      tx, input_index, hash_type, prev_outputs, 0, annex)
+      tx, input_index, hash_type, prev_outputs, 0, annex, nil, nil, cache)
     -- Core CheckSchnorrSignature line 1737-1738: if SignatureHashSchnorr
     -- returns false, set SCRIPT_ERR_SCHNORR_SIG_HASHTYPE and fail. We
     -- mirror by returning false (the surrounding tapscript dispatcher
@@ -2017,7 +2115,7 @@ end
 -- @param tapleaf_hash string: 32-byte tapleaf hash for this script
 -- @param annex string|nil: Annex data (if present)
 -- @return table: Checker with check_sig, check_locktime, check_sequence methods
-function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, annex)
+function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, annex, cache)
   local checker = {}
   local codesep_pos = 0xFFFFFFFF
 
@@ -2058,7 +2156,7 @@ function M.make_tapscript_checker(tx, input_index, prev_outputs, tapleaf_hash, a
     -- Compute taproot sighash for script-path (ext_flag = 1)
     local sighash = M.signature_hash_taproot(
       tx, input_index, hash_type, prev_outputs,
-      1, annex, tapleaf_hash, codesep_pos
+      1, annex, tapleaf_hash, codesep_pos, cache
     )
     -- Same Core parity as keypath: SIGHASH_SINGLE-OOR or bad hash_type
     -- returns nil; we surface false here so the tapscript opcode
@@ -2154,7 +2252,7 @@ end
 -- @param prev_outputs table|nil: Per-input prev_outputs for taproot key-path
 -- @param inline_verify boolean|nil: If true, verify ECDSA inline (CHECKMULTISIG)
 -- @return table: Checker compatible with make_sig_checker interface
-function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector, prev_outputs, inline_verify)
+function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector, prev_outputs, inline_verify, cache)
   flags = flags or {}
   local checker = {}
 
@@ -2232,7 +2330,7 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
     -- Compute sighash now (order-dependent — must run here in script execution)
     local sighash
     if is_segwit then
-      sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type)
+      sighash = M.signature_hash_segwit_v0(tx, input_index, script_code, prev_output_value, hash_type, cache)
     elseif all_sigs then
       -- OP_CHECKMULTISIG (legacy): FindAndDelete every signature up front
       -- (Core interpreter.cpp:1142-1167), then hash without per-sig FAD.
@@ -2282,7 +2380,7 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
     end
 
     local sighash = M.signature_hash_taproot(
-      tx, input_index, hash_type, prev_outputs, 0, annex)
+      tx, input_index, hash_type, prev_outputs, 0, annex, nil, nil, cache)
     -- Core parity (see make_sig_checker.check_schnorr_keypath above):
     -- nil sighash means SIGHASH_SINGLE-OOR or bad hash_type; surface as
     -- verify failure so the dispatcher fails the script.
