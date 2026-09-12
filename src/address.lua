@@ -1328,10 +1328,16 @@ end
 
 -- Get descriptor info (canonicalize + add checksum)
 function M.get_descriptor_info(desc_str)
-  -- Strip existing checksum if present
+  -- Strip existing checksum if present. A present-but-wrong checksum is
+  -- RPC_INVALID_ADDRESS_OR_KEY on Core (getdescriptorinfo), not a silent
+  -- recompute.
   local desc = desc_str
   local hash_pos = desc:find("#")
   if hash_pos then
+    local ok_csum = M.validate_descriptor_checksum(desc_str)
+    if not ok_csum then
+      return nil, "invalid checksum"
+    end
     desc = desc:sub(1, hash_pos - 1)
   end
 

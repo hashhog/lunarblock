@@ -2,6 +2,7 @@
 
 ## v1.0.2 (unreleased)
 
+- fix: T1/T2 R5 probe parity (error codes, ConstructTransaction PSBT, importmempool/pruneblockchain/descriptorprocesspsbt). Control: `luajit tests/test_t1_t2_r5.lua`
 - perf: FFI BIP143 preimage + one checker per native P2WPKH (script-verify hot path at 900k)
 - perf: P2PKH-template fast path + HASH160 oneshot (script-verify hot path at 900k)
 - test: unit suite green for the release gate (stale fixtures + known-red pending of pre-v1.0.1 failures)

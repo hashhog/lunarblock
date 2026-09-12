@@ -496,11 +496,16 @@ function M.serialize_transaction(tx, include_witness)
 end
 
 -- Deserialize a transaction
-function M.deserialize_transaction(reader)
+function M.deserialize_transaction(reader, allow_witness)
   local types = require("lunarblock.types")
   if type(reader) == "string" then
     reader = M.buffer_reader(reader)
   end
+  -- Core UnserializeTransaction (primitives/transaction.h): when
+  -- allow_witness is false (SERIALIZE_TRANSACTION_NO_WITNESS), a leading
+  -- CompactSize 0 is an empty vin, NOT the segwit dummy. PSBT unsigned
+  -- txs are always NO_WITNESS, including 0-input constructions (joinpsbts).
+  if allow_witness == nil then allow_witness = true end
 
   local version = reader.read_i32le()
   local marker = reader.read_u8()
@@ -508,10 +513,19 @@ function M.deserialize_transaction(reader)
   local input_count
 
   if marker == 0x00 then
-    local flag = reader.read_u8()
-    assert(flag == 0x01, "Invalid segwit flag: " .. flag)
-    segwit = true
-    input_count = reader.read_varint()
+    if not allow_witness then
+      input_count = 0
+    else
+      local flag = reader.read_u8()
+      if flag ~= 0 then
+        assert(flag == 0x01, "Invalid segwit flag: " .. flag)
+        segwit = true
+        input_count = reader.read_varint()
+      else
+        -- empty vin + flags=0: Core leaves vin empty (0-in tx, no dummy).
+        input_count = 0
+      end
+    end
   else
     -- marker is the first byte of the input-count CompactSize.
     -- Apply the same non-canonical + MAX_SIZE guards as read_varint

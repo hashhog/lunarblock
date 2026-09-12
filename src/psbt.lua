@@ -483,7 +483,9 @@ function M.deserialize(data)
 
     if key_type == M.GLOBAL_UNSIGNED_TX then
       assert(#entry.key == 1, "Invalid unsigned tx key")
-      psbt.tx = serialize.deserialize_transaction(entry.value)
+      -- BIP174 unsigned tx is SERIALIZE_TRANSACTION_NO_WITNESS, so a
+      -- 0-input construction is CompactSize(0) not the segwit dummy.
+      psbt.tx = serialize.deserialize_transaction(entry.value, false)
       -- Verify it's unsigned
       for _, inp in ipairs(psbt.tx.inputs) do
         if #inp.script_sig > 0 or (inp.witness and #inp.witness > 0) then

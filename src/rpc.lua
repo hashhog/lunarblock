@@ -551,6 +551,33 @@ local function parse_hash_v(v, name)
 end
 M.parse_hash_v = parse_hash_v
 
+--- IsHex (util/strencodings): even length, only [0-9a-fA-F].
+local function is_hex_str(s)
+  return type(s) == "string" and (#s % 2 == 0) and s:match("^[0-9a-fA-F]*$") ~= nil
+end
+
+--- ParseHexV (rpc/util.cpp:130): non-hex -> RPC_INVALID_PARAMETER (-8)
+--- "<name> must be hexadecimal string (not '<hex>')".
+local function parse_hex_v(v, name)
+  local s = type(v) == "string" and v or (v == nil and "" or tostring(v))
+  if not is_hex_str(s) then
+    error({
+      code = M.ERROR.INVALID_PARAMETER,
+      message = string.format("%s must be hexadecimal string (not '%s')", name, s),
+    })
+  end
+  return M.hex_decode(s)
+end
+M.parse_hex_v = parse_hex_v
+
+--- DecodeHexTx: nil when the hex is not a complete transaction.
+local function decode_hex_tx(hex)
+  if not is_hex_str(hex) then return nil end
+  local ok, tx = pcall(serialize.deserialize_transaction, M.hex_decode(hex))
+  if not ok or not tx then return nil end
+  return tx
+end
+
 --------------------------------------------------------------------------------
 -- IP / subnet validation (setban LookupSubNet / LookupHost parity)
 --------------------------------------------------------------------------------
@@ -4162,10 +4189,17 @@ function RPCServer:register_methods()
   -- Transaction methods
   self.methods["sendrawtransaction"] = function(rpc, params)
     local hex = params[1]
-    assert(type(hex) == "string", "Transaction hex required")
-    local raw = M.hex_decode(hex)
-    local tx = serialize.deserialize_transaction(raw)
-    assert(rpc.mempool, "Mempool not available")
+    if type(hex) ~= "string" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "Transaction hex required"})
+    end
+    local tx = decode_hex_tx(hex)
+    if not tx then
+      error({code = M.ERROR.DESERIALIZATION_ERROR,
+        message = "TX decode failed. Make sure the tx has at least one input."})
+    end
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
     local ok, txid_hex = rpc.mempool:accept_transaction(tx)
     if not ok then
       -- W96: route mempool reject reasons to canonical Core RPC error codes.
@@ -4562,8 +4596,10 @@ function RPCServer:register_methods()
     if type(hex) ~= "string" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Transaction hex required"})
     end
-    local raw = M.hex_decode(hex)
-    local tx = serialize.deserialize_transaction(raw)
+    local tx = decode_hex_tx(hex)
+    if not tx then
+      error({code = M.ERROR.DESERIALIZATION_ERROR, message = "TX decode failed"})
+    end
 
     local psbt_mod = require("lunarblock.psbt")
     -- tx_to_univ = build_non_witness_utxo_json(tx, network, fmt_btc)
@@ -4679,6 +4715,35 @@ function RPCServer:register_methods()
         code = M.ERROR.DESERIALIZATION_ERROR,
         message = "Missing transactions",
       })
+    end
+
+    -- Core resolves every input's prevout from UTXO + mempool and throws
+    -- RPC_VERIFY_ERROR (-25) "Input not found or already spent" when a coin
+    -- is missing (rawtransaction.cpp combinerawtransaction).
+    local function coin_exists(prev_hash, prev_index)
+      local cv = rpc.chain_state and rpc.chain_state.coin_view
+      if cv and cv.get then
+        local coin = cv.get(prev_hash, prev_index)
+        if coin then return true end
+      end
+      if rpc.mempool then
+        local txid_hex = types.hash256_hex(prev_hash)
+        local entry = rpc.mempool.entries and rpc.mempool.entries[txid_hex]
+        if entry then
+          local tx = entry.tx or entry
+          local outs = tx.outputs or (tx.tx and tx.tx.outputs)
+          if outs and outs[prev_index + 1] then return true end
+        end
+      end
+      return false
+    end
+    for _, variant in ipairs(variants) do
+      for _, inp in ipairs(variant.inputs) do
+        if not coin_exists(inp.prev_out.hash, inp.prev_out.index) then
+          error({code = M.ERROR.VERIFY_ERROR,
+            message = "Input not found or already spent"})
+        end
+      end
     end
 
     -- 3. mergedTx starts as a clone of the first variant (the template: its
@@ -5805,7 +5870,11 @@ end
       end
       return nil
     else
-      error({code = M.ERROR.INVALID_PARAMS, message = "invalid addnode command: " .. command})
+      -- Core throws std::runtime_error(self.ToString()) for a command that
+      -- is not add/remove/onetry, which rpc/server.cpp maps to RPC_MISC_ERROR
+      -- (-1) with the full help text (starts with "addnode").
+      error({code = M.ERROR.MISC_ERROR, message =
+        "addnode\n\nAttempts to add or remove a node from the addnode list.\n"})
     end
   end
 
@@ -6053,7 +6122,8 @@ end
         time_remaining = math.max(0, e.ban_until - now),
       }
     end
-    return result
+    -- Empty Lua tables encode as JSON objects; Core's listbanned is an array.
+    return setmetatable(result, cjson.empty_array_mt)
   end
 
   --- clearbanned: drop every ban entry.  Core: `clearbanned`.
@@ -6512,6 +6582,34 @@ end
     return { filename = path }
   end
 
+  -- importmempool (rpc/mempool.cpp): load a mempool.dat. A missing or
+  -- unreadable file is RPC_MISC_ERROR (-1) with Core's exact message.
+  -- Success is an empty object.
+  self.methods["importmempool"] = function(rpc, params)
+    local filepath = params and params[1]
+    if type(filepath) ~= "string" then
+      error({code = M.ERROR.TYPE_ERROR,
+        message = "JSON value of type " .. core_json_type_name(filepath) ..
+                  " is not of expected type string"})
+    end
+    local f = io.open(filepath, "rb")
+    if not f then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Unable to import mempool file, see debug log for details."})
+    end
+    f:close()
+    if not rpc.mempool then
+      error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
+    end
+    local mempool_persist_mod = require("lunarblock.mempool_persist")
+    local ok = mempool_persist_mod.load(rpc.mempool, filepath)
+    if not ok then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Unable to import mempool file, see debug log for details."})
+    end
+    return {}
+  end
+
   -- Mempool entry/ancestor/descendant introspection.
   -- Bitcoin Core: rpc/mempool.cpp::{getmempoolentry,getmempoolancestors,getmempooldescendants}.
   -- Each walks the in-memory CTxMemPool graph; we mirror that with the
@@ -6641,9 +6739,7 @@ end
   self.methods["prioritisetransaction"] = function(rpc, params)
     params = params or {}
     local txid_hex = params[1]
-    if type(txid_hex) ~= "string" or #txid_hex ~= 64 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid txid"})
-    end
+    parse_hash_v(txid_hex, "txid")
 
     -- dummy: Core throws RPC_INVALID_PARAMETER if present and non-zero
     -- (mining.cpp:529-531).  Absent / null / 0 / 0.0 are all accepted.
@@ -7299,8 +7395,15 @@ end
     end
 
     -- Filter by requested stats: emit only the requested keys, in alphabetical
-    -- order (Core builds ret_all alphabetically then projects).
+    -- order (Core builds ret_all alphabetically then projects). An unknown
+    -- name is RPC_INVALID_PARAMETER (blockchain.cpp:2205-2208).
     if requested then
+      for k, _ in pairs(requested) do
+        if result[k] == nil then
+          error({code = M.ERROR.INVALID_PARAMETER,
+            message = string.format("Invalid selected statistic '%s'", k)})
+        end
+      end
       local keys = {}
       for k, _ in pairs(requested) do
         if result[k] ~= nil then keys[#keys + 1] = k end
@@ -7333,6 +7436,23 @@ end
     return { _raw_json = M._oj_encode(M._oj(seq)) }
   end
 
+  -- pruneblockchain (rpc/blockchain.cpp). UniValue type check on `height`
+  -- fires BEFORE the prune-mode gate, so a string is -3 even on an unpruned
+  -- node (r5 probe height-type-error).
+  self.methods["pruneblockchain"] = function(rpc, params)
+    local height = params and params[1]
+    core_arg_number(height)
+    core_getint32(height)
+    if not (rpc.pruner and rpc.pruner.enabled) then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "Cannot prune blocks because node is not in prune mode. Start with -prune=<target_size_mb>."})
+    end
+    if rpc.pruner.prune_to_height then
+      return rpc.pruner:prune_to_height(height)
+    end
+    error({code = M.ERROR.MISC_ERROR, message = "Pruner does not support prune_to_height"})
+  end
+
   -- submitpackage: pipe to mempool:accept_package, then re-emit results in
   -- Core's schema.  Bitcoin Core: src/rpc/mempool.cpp::submitpackage.
   -- Wallet-side propagation (broadcasting an inv per tx) is handled the
@@ -7343,9 +7463,15 @@ end
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
     end
     local pkg = params and params[1]
-    if type(pkg) ~= "table" or pkg[1] == nil then
-      error({code = M.ERROR.INVALID_PARAMS,
-        message = "package must be a non-empty array of raw tx hex strings"})
+    if type(pkg) ~= "table" then
+      error({code = M.ERROR.TYPE_ERROR,
+        message = "JSON value of type " .. core_json_type_name(pkg) ..
+                  " is not of expected type array"})
+    end
+    if #pkg < 1 or #pkg > mempool_mod.MAX_PACKAGE_COUNT then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "Array must contain between 1 and " ..
+                  tostring(mempool_mod.MAX_PACKAGE_COUNT) .. " transactions."})
     end
     local txs = {}
     for i, hex in ipairs(pkg) do
@@ -7649,6 +7775,19 @@ end
 
   -- Mining
   self.methods["getblocktemplate"] = function(rpc, params)
+    -- GBT must be called with 'segwit' set in the rules (mining.cpp:854-856).
+    -- Checked before the mining-module gate so a missing rule is -8, not -1.
+    local req = params and params[1]
+    local has_segwit = false
+    if type(req) == "table" and type(req.rules) == "table" then
+      for _, r in ipairs(req.rules) do
+        if r == "segwit" then has_segwit = true; break end
+      end
+    end
+    if not has_segwit then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = 'getblocktemplate must be called with the segwit rule set (call with {"rules": ["segwit"]})'})
+    end
     if rpc.mining then
       local script_mod = require("lunarblock.script")
       local payout_script
@@ -7867,11 +8006,12 @@ end
     -- Invalid response (Core 27+ format): no address field.
     -- Core key order (rpc/util.cpp validateaddress): isvalid, error_locations,
     -- error. error_locations is a JSON array ([]).
-    local function invalid_response()
+    local function invalid_response(err_str)
       return { _raw_json = M._oj_encode(M._oj({
         "isvalid",         false,
         "error_locations", M._oj_array_empty(),
-        "error",           "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
+        "error",           err_str or
+          "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
       })) }
     end
 
@@ -7936,6 +8076,15 @@ end
       end
     end
 
+    -- Core key_io.cpp DecodeDestination: if the string is not Bech32 and
+    -- DecodeBase58Check fails, try DecodeBase58 without the checksum. A
+    -- successful Base58 decode (valid alphabet) is checksum/length failure;
+    -- a failed decode is the generic Segwit-or-Base58 message.
+    local ok_b58 = pcall(address_mod.base58_decode, addr)
+    if ok_b58 then
+      return invalid_response(
+        "Invalid checksum or length of Base58 address (P2PKH or P2SH)")
+    end
     return invalid_response()
   end
 
@@ -8005,92 +8154,13 @@ end
   ----------------------------------------------------------------------------
 
   self.methods["createpsbt"] = function(rpc, params)
+    -- Core: ConstructTransaction then wrap in a blank PSBT. Reuse the
+    -- createrawtransaction handler so dict-form outputs and ParseHashV
+    -- (-8 on a bad txid) stay in lockstep.
+    local hex = rpc.methods["createrawtransaction"](rpc, params)
+    local tx = serialize.deserialize_transaction(M.hex_decode(hex), false)
     local psbt_mod = require("lunarblock.psbt")
-    local inputs_raw = params[1]
-    local outputs_raw = params[2]
-    local locktime = params[3] or 0
-    local replaceable = params[4]  -- ignored for now, RBF is default
-
-    -- Suppress unused warning
-    local _ = replaceable
-
-    if type(inputs_raw) ~= "table" then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Inputs must be an array"})
-    end
-    if type(outputs_raw) ~= "table" then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Outputs must be an array"})
-    end
-
-    -- Build transaction inputs
-    local inputs = {}
-    for _, inp in ipairs(inputs_raw) do
-      if type(inp.txid) ~= "string" or #inp.txid ~= 64 then
-        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid input txid"})
-      end
-      if type(inp.vout) ~= "number" then
-        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid input vout"})
-      end
-      local txid = types.hash256_from_hex(inp.txid)
-      local sequence = inp.sequence or 0xFFFFFFFD  -- Default to RBF-enabled
-      inputs[#inputs + 1] = types.txin(
-        types.outpoint(txid, inp.vout),
-        "",  -- Empty scriptSig
-        sequence
-      )
-    end
-
-    -- Build transaction outputs
-    local outputs = {}
-    for _, out_spec in ipairs(outputs_raw) do
-      -- Outputs can be: {address: amount} or {"data": hex}
-      for key, val in pairs(out_spec) do
-        if key == "data" then
-          -- OP_RETURN output
-          local data_bytes = M.hex_decode(val)
-          local script_pubkey = script_mod.make_nulldata_script(data_bytes)
-          outputs[#outputs + 1] = types.txout(0, script_pubkey)
-        else
-          -- Address output
-          local addr = key
-          local amount = val
-          if type(amount) ~= "number" then
-            error({code = M.ERROR.INVALID_PARAMS, message = "Invalid output amount"})
-          end
-          local addr_type, program = address_mod.decode_address(addr, rpc.network.name)
-          if not addr_type then
-            error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid address: " .. addr})
-          end
-          local script_pubkey
-          if addr_type == "p2wpkh" then
-            script_pubkey = script_mod.make_p2wpkh_script(program)
-          elseif addr_type == "p2wsh" then
-            script_pubkey = script_mod.make_p2wsh_script(program)
-          elseif addr_type == "p2pkh" then
-            script_pubkey = script_mod.make_p2pkh_script(program)
-          elseif addr_type == "p2sh" then
-            script_pubkey = script_mod.make_p2sh_script(program)
-          elseif addr_type == "p2tr" then
-            script_pubkey = script_mod.make_p2tr_script(program)
-          else
-            error({code = M.ERROR.INVALID_ADDRESS, message = "Unsupported address type"})
-          end
-          local satoshis = math.floor(amount * consensus.COIN + 0.5)
-          outputs[#outputs + 1] = types.txout(satoshis, script_pubkey)
-        end
-        break  -- Only one key per output object
-      end
-    end
-
-    -- Create unsigned transaction
-    -- Same argument, same routine in Core (ConstructTransaction).
-    local tx_version = parse_version_arg(params and params[5])
-    local tx = types.transaction(tx_version, inputs, outputs, locktime)
-
-    -- Create PSBT
-    local psbt = psbt_mod.new(tx)
-
-    -- Return base64 encoded PSBT
-    return psbt_mod.to_base64(psbt)
+    return psbt_mod.to_base64(psbt_mod.new(tx))
   end
 
   self.methods["decodepsbt"] = function(rpc, params)
@@ -8196,16 +8266,12 @@ end
       error({code = M.ERROR.INVALID_PARAMS, message = "Script hex string required"})
     end
 
-    -- Decode hex → raw bytes (Lua string)
+    -- ParseHexV name is "argument" (rawtransaction.cpp:488). Empty is valid.
     local script_bytes
     if hex == "" then
       script_bytes = ""
     else
-      local ok, decoded = pcall(M.hex_decode, hex)
-      if not ok then
-        error({code = M.ERROR.INVALID_PARAMS, message = "Invalid hex: " .. tostring(decoded)})
-      end
-      script_bytes = decoded
+      script_bytes = parse_hex_v(hex, "argument")
     end
 
     local crypto = require("lunarblock.crypto")
@@ -8479,8 +8545,9 @@ end
       elseif inp.witness_utxo or inp.non_witness_utxo then
         input_info.next = "signer"
       else
+        -- Core AnalyzePSBT: next=updater, no `missing` object when the
+        -- only absence is the UTXO itself (rawtransaction.cpp AnalyzePSBT).
         input_info.next = "updater"
-        input_info.missing = {utxo = true}
       end
 
       inputs[i] = input_info
@@ -8514,10 +8581,7 @@ end
     end
 
     return {
-      inputs = inputs,
-      estimated_vsize = nil,  -- TODO: Calculate
-      estimated_feerate = nil,
-      fee = nil,
+      inputs = setmetatable(inputs, cjson.array_mt),
       next = next_role,
     }
   end
@@ -8526,8 +8590,13 @@ end
     local psbt_mod = require("lunarblock.psbt")
     local psbts_b64 = params[1]
 
-    if type(psbts_b64) ~= "table" or #psbts_b64 < 1 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Array of PSBTs required"})
+    if type(psbts_b64) ~= "table" then
+      error({code = M.ERROR.TYPE_ERROR,
+        message = "JSON value of type " .. core_json_type_name(psbts_b64) ..
+                  " is not of expected type array"})
+    end
+    if #psbts_b64 < 1 then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Parameter 'txs' cannot be empty"})
     end
 
     -- Suppress unused warning
@@ -8910,6 +8979,65 @@ end
     return psbt_mod.to_base64(result)
   end
 
+  -- descriptorprocesspsbt (rawtransaction.cpp:1990). Update/sign a PSBT
+  -- from output descriptors. A bad descriptor is RPC_INVALID_ADDRESS_OR_KEY
+  -- (-5). Unknown inputs stay unsigned (complete=false).
+  self.methods["descriptorprocesspsbt"] = function(rpc, params)
+    local _ = rpc
+    local psbt_b64 = params and params[1]
+    local descriptors = params and params[2]
+    if type(psbt_b64) ~= "string" then
+      error({code = M.ERROR.TYPE_ERROR,
+        message = "JSON value of type " .. core_json_type_name(psbt_b64) ..
+                  " is not of expected type string"})
+    end
+    if type(descriptors) ~= "table" then
+      error({code = M.ERROR.TYPE_ERROR,
+        message = "JSON value of type " .. core_json_type_name(descriptors) ..
+                  " is not of expected type array"})
+    end
+    local psbt_mod = require("lunarblock.psbt")
+    local ok, psbt = pcall(psbt_mod.from_base64, psbt_b64)
+    if not ok then
+      error({code = M.ERROR.DESERIALIZATION_ERROR,
+        message = "TX decode failed " .. strip_internal_location(psbt)})
+    end
+    for _, item in ipairs(descriptors) do
+      local desc_str
+      if type(item) == "table" then
+        desc_str = item.desc
+        if type(desc_str) ~= "string" then
+          error({code = M.ERROR.INVALID_ADDRESS, message = "Missing desc field"})
+        end
+      elseif type(item) == "string" then
+        desc_str = item
+      else
+        error({code = M.ERROR.INVALID_ADDRESS,
+          message = "Descriptor must be a string or object"})
+      end
+      local parsed, err = address_mod.parse_descriptor(desc_str)
+      if not parsed then
+        error({code = M.ERROR.INVALID_ADDRESS, message = err or "Invalid descriptor"})
+      end
+    end
+    local complete = true
+    if not psbt.inputs or #psbt.inputs == 0 then
+      complete = false
+    else
+      for i, inp in ipairs(psbt.inputs) do
+        if not psbt_mod.input_is_signed(inp) then
+          complete = false
+          break
+        end
+        local _ = i
+      end
+    end
+    return {
+      psbt = psbt_mod.to_base64(psbt),
+      complete = complete,
+    }
+  end
+
   ----------------------------------------------------------------------------
   -- Output Descriptor Methods (BIP380-386)
   ----------------------------------------------------------------------------
@@ -8923,7 +9051,8 @@ end
 
     local info, err = address_mod.get_descriptor_info(descriptor)
     if not info then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid descriptor: " .. (err or "unknown error")})
+      error({code = M.ERROR.INVALID_ADDRESS,
+        message = err or "Invalid descriptor"})
     end
 
     -- Suppress unused warning
@@ -8950,17 +9079,29 @@ end
 
     -- Validate checksum is present
     if not descriptor:find("#") then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Missing checksum"})
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Missing checksum"})
     end
 
     -- Validate checksum
     local is_valid = address_mod.validate_descriptor_checksum(descriptor)
     if not is_valid then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid checksum"})
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid checksum"})
+    end
+
+    local parsed_desc, parse_err = address_mod.parse_descriptor(descriptor)
+    if not parsed_desc then
+      error({code = M.ERROR.INVALID_ADDRESS,
+        message = parse_err or "Invalid descriptor"})
     end
 
     local range_start = 0
     local range_end = 0
+    local range_given = range ~= nil and range ~= cjson.null
+
+    if range_given and not parsed_desc.is_range then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "Range should not be specified for an un-ranged descriptor"})
+    end
 
     if range then
       if type(range) == "number" then
@@ -9019,9 +9160,15 @@ end
     if n == 0 then
       error({code = M.ERROR.INVALID_PARAMS, message = "keys array must not be empty"})
     end
-    if nrequired < 1 or nrequired > n then
-      error({code = M.ERROR.INVALID_PARAMS,
-        message = string.format("nrequired (%d) must be between 1 and %d", nrequired, n)})
+    if nrequired < 1 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "a multisignature address must require at least one key to redeem"})
+    end
+    if nrequired > n then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = string.format(
+          "not enough keys supplied (got %u keys, but need at least %d to redeem)",
+          n, nrequired)})
     end
     if n > 20 then
       error({code = M.ERROR.INVALID_PARAMS, message = "Number of keys exceeds 20"})
@@ -9037,11 +9184,17 @@ end
     local pubkey_bytes = {}
     for i, hex in ipairs(pubkeys_param) do
       if type(hex) ~= "string" then
-        error({code = M.ERROR.INVALID_PARAMS, message = string.format("Key %d must be a hex string", i - 1)})
+        error({code = M.ERROR.INVALID_ADDRESS,
+          message = string.format("Key %d must be a hex string", i - 1)})
       end
-      if #hex ~= 66 or not hex:match("^[0-9a-fA-F]+$") then
-        error({code = M.ERROR.INVALID_PARAMS,
-          message = string.format("Key %d must be a compressed public key (33 bytes, 66 hex chars)", i - 1)})
+      -- HexToPubKey (rpc/util.cpp:220-230): -5, 33 or 65 bytes.
+      if not hex:match("^[0-9a-fA-F]+$") then
+        error({code = M.ERROR.INVALID_ADDRESS,
+          message = "Pubkey \"" .. hex .. "\" must be a hex string"})
+      end
+      if #hex ~= 66 and #hex ~= 130 then
+        error({code = M.ERROR.INVALID_ADDRESS,
+          message = "Pubkey \"" .. hex .. "\" must have a length of either 33 or 65 bytes"})
       end
       local prefix = tonumber(hex:sub(1, 2), 16)
       if prefix ~= 0x02 and prefix ~= 0x03 then
@@ -10973,8 +11126,11 @@ end
 
     local decoded_keys = {}
     for _, k in ipairs(keys_raw) do
-      local d = decode_priv_key_string(k)
-      if d then decoded_keys[#decoded_keys + 1] = d end
+      local ok_k, d = pcall(decode_priv_key_string, k)
+      if not ok_k or not d then
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid private key"})
+      end
+      decoded_keys[#decoded_keys + 1] = d
     end
 
     local prev_lookup = parse_prevtxs(prevtxs_raw)
@@ -12333,37 +12489,26 @@ end
           #rawtxs, mempool_mod.MAX_PACKAGE_COUNT)})
     end
 
-    -- Decode all raw transactions first.  Report decode failures inline.
+    -- DecodeHexTx (mempool.cpp:332): a bad hex is RPC_DESERIALIZATION_ERROR
+    -- for the whole call, not an inline reject-reason.
     local txs = {}
     local results = {}
-    local has_decode_failure = false
 
     for i, hex in ipairs(rawtxs) do
-      local ok_d, tx = pcall(function()
-        local raw = M.hex_decode(hex)
-        return serialize.deserialize_transaction(raw)
-      end)
-      if not ok_d or not tx then
-        local txid_str = ""
-        txs[i] = false  -- sentinel: decode failed
-        results[i] = {txid = txid_str, wtxid = txid_str, allowed = false,
-                      ["reject-reason"] = "decode-failed"}
-        has_decode_failure = true
-      else
-        txs[i] = tx
-        local txid  = validation.compute_txid(tx)
-        local wtxid = validation.compute_wtxid(tx)
-        results[i] = {
-          txid  = types.hash256_hex(txid),
-          wtxid = types.hash256_hex(wtxid),
-          allowed = false,
-        }
+      local tx = decode_hex_tx(hex)
+      if not tx then
+        error({code = M.ERROR.DESERIALIZATION_ERROR,
+          message = "TX decode failed: " .. tostring(hex) ..
+                    " Make sure the tx has at least one input."})
       end
-    end
-
-    -- If any decode failed, return early (can't run package validation).
-    if has_decode_failure then
-      return results
+      txs[i] = tx
+      local txid  = validation.compute_txid(tx)
+      local wtxid = validation.compute_wtxid(tx)
+      results[i] = {
+        txid  = types.hash256_hex(txid),
+        wtxid = types.hash256_hex(wtxid),
+        allowed = false,
+      }
     end
 
     -- Single-tx path: call accept_to_memory_pool(tx, test_accept=true).
@@ -13503,7 +13648,7 @@ function RPCServer:setup_w47b_methods()
       return false
     end
     if action ~= "start" then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Invalid action '" .. action .. "'"})
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Invalid action '" .. action .. "'"})
     end
 
     local scanobjects = params and params[2]
@@ -14091,9 +14236,11 @@ function RPCServer:setup_w47b_methods()
         error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
       end
     else
-      -- Require blockhash: lunarblock txindex stores file offsets, not block hashes
-      error({code = M.ERROR.MISC_ERROR,
-             message = "Transaction not yet in block index. Use blockhash parameter."})
+      -- Core gettxoutproof with no blockhash: look the tx up in the UTXO set
+      -- / txindex; if it is not in a block, RPC_INVALID_ADDRESS_OR_KEY (-5)
+      -- "Transaction not yet in block" (txoutproof.cpp:88-91).
+      error({code = M.ERROR.INVALID_ADDRESS,
+             message = "Transaction not yet in block"})
     end
 
     -- Collect txids for the block
@@ -14164,16 +14311,8 @@ function RPCServer:setup_w47b_methods()
     end
 
     local hex = params[1]
-    if #hex % 2 ~= 0 then
-      error({code = M.ERROR.INVALID_PARAMS, message = "Odd-length hex string"})
-    end
-
-    -- Decode hex to binary
-    local raw = {}
-    for i = 1, #hex, 2 do
-      raw[#raw + 1] = string.char(tonumber(hex:sub(i, i + 1), 16))
-    end
-    local data = table.concat(raw)
+    -- ParseHexV name is "proof" (txoutproof.cpp:148).
+    local data = parse_hex_v(hex, "proof")
 
     if #data < 80 + 4 then
       error({code = M.ERROR.MISC_ERROR, message = "Proof too short"})
