@@ -2771,6 +2771,45 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- identical `flags` value to GetTransactionSigOpCost).
   local sigop_flags = block_script_flags
 
+  -- W160 cache key bits are a function of the per-block flag table only
+  -- (plus a namespace constant). Computed once, not per input.
+  -- Core's SignatureCacheHasher mixes in the FULL flags integer
+  -- (sigcache.cpp:39-50). Collapsing BIP34/66/65/CSV/WITNESS into a few
+  -- bits dropped TAPROOT and NULLDUMMY. A cache entry that passed under a
+  -- looser flag context could be HIT by a later strict-flag context.
+  local block_cache_flags = 0
+  if block_script_flags.verify_p2sh                then block_cache_flags = block_cache_flags +     1 end
+  if block_script_flags.verify_dersig              then block_cache_flags = block_cache_flags +     2 end
+  if block_script_flags.verify_checklocktimeverify then block_cache_flags = block_cache_flags +     4 end
+  if block_script_flags.verify_checksequenceverify then block_cache_flags = block_cache_flags +     8 end
+  if block_script_flags.verify_witness             then block_cache_flags = block_cache_flags +    16 end
+  if block_script_flags.verify_nulldummy           then block_cache_flags = block_cache_flags +    32 end
+  if block_script_flags.verify_taproot             then block_cache_flags = block_cache_flags +    64 end
+  -- Constant namespace offset for the block-connect ("consensus")
+  -- verification context, distinguishing these cache entries from any
+  -- relay/standardness verification that runs the STANDARD flag set
+  -- (STRICTENC, LOW_S, NULLFAIL, MINIMALDATA, MINIMALIF,
+  -- WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE — see mempool.lua). NONE of
+  -- those are block-consensus flags (GetBlockScriptFlags omits them);
+  -- this is purely a cache-key namespace constant, not an enabled flag.
+  block_cache_flags = block_cache_flags + 128 + 256 + 512 + 1024 + 2048 + 4096 + 8192
+
+  -- Shared witness-v0 flags for native P2WPKH. is_segwit / is_witness_v0
+  -- are set once; the P2PKH-template path does not mutate this table, so
+  -- every P2WPKH input in the block can reuse it. P2WSH copies before
+  -- setting witness_script (that field is per-input).
+  local witness_v0_flags = nil
+  local function get_witness_v0_flags()
+    if witness_v0_flags then return witness_v0_flags end
+    witness_v0_flags = {}
+    for k, v in pairs(block_script_flags) do
+      witness_v0_flags[k] = v
+    end
+    witness_v0_flags.is_segwit = true
+    witness_v0_flags.is_witness_v0 = true
+    return witness_v0_flags
+  end
+
   -- Determine if we should use parallel verification
   -- Auto-detect: use parallel if available and block has enough inputs
   --
@@ -2967,59 +3006,6 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
 
         -- Script verification (skip if assumevalid optimization is active)
         if not skip_script_validation then
-          -- Consensus-only script flags — the SAME per-block value already
-          -- computed by consensus.get_block_script_flags() above (Core's
-          -- three-step GetBlockScriptFlags: unconditional P2SH|WITNESS|TAPROOT
-          -- base, whole-set replacement on a script_flag_exceptions hash hit,
-          -- then DERSIG/CLTV/CSV/NULLDUMMY OR'd on top by height).
-          --
-          -- A per-input SHALLOW COPY is taken because the interpreter mutates
-          -- the flags table it is handed (script.lua:2460 sets
-          -- `flags.script_code` while descending into a P2SH redeemScript, and
-          -- the tapscript path tracks `validation_weight_left`).  Handing out
-          -- the shared per-block table — or, as the pre-fix code did on an
-          -- exception hit, the SCRIPT_FLAG_EXCEPTIONS module table itself —
-          -- would let one input's execution scribble on every later input's
-          -- flags and permanently corrupt the exception entry for the process.
-          --
-          -- NOTE: no policy flags here. verify_nullfail, verify_witness_pubkeytype
-          -- and verify_const_scriptcode are STANDARD_SCRIPT_VERIFY_FLAGS
-          -- (Core policy/policy.h:125-129), NOT block-consensus flags.  Setting
-          -- verify_const_scriptcode in the block-connect path OVER-FLAGS: Core
-          -- only returns SCRIPT_ERR_SIG_FINDANDDELETE when that flag is set
-          -- (interpreter.cpp:330-332, 1146-1148), so a legacy script whose
-          -- scriptCode contains the signature push is ACCEPTED by Core during
-          -- block connection but would be FALSE-REJECTED here — a chain-split
-          -- risk.  Those flags belong in the mempool/relay path only
-          -- (see mempool.lua).
-          local flags = {}
-          for _k, _v in pairs(block_script_flags) do flags[_k] = _v end
-
-          -- W160 BUG-9 fix: cache key must include ALL consensus script-verify
-          -- flag bits, not a coarse height-bitmask. Core's SignatureCacheHasher
-          -- (sigcache.cpp:39-50) mixes in the FULL `flags` integer. Collapsing
-          -- BIP34/66/65/CSV/WITNESS into a few bits dropped TAPROOT and
-          -- NULLDUMMY. A cache entry that passed under a looser flag context
-          -- could be HIT by a later strict-flag context and falsely-verify a
-          -- bad sig. We derive cache_flags from the `flags` table above so the
-          -- key materially covers every consensus flag the verifier consumes.
-          local cache_flags = 0
-          if flags.verify_p2sh                then cache_flags = cache_flags +     1 end
-          if flags.verify_dersig              then cache_flags = cache_flags +     2 end
-          if flags.verify_checklocktimeverify then cache_flags = cache_flags +     4 end
-          if flags.verify_checksequenceverify then cache_flags = cache_flags +     8 end
-          if flags.verify_witness             then cache_flags = cache_flags +    16 end
-          if flags.verify_nulldummy           then cache_flags = cache_flags +    32 end
-          if flags.verify_taproot             then cache_flags = cache_flags +    64 end
-          -- Constant namespace offset for the block-connect ("consensus")
-          -- verification context, distinguishing these cache entries from any
-          -- relay/standardness verification that runs the STANDARD flag set
-          -- (STRICTENC, LOW_S, NULLFAIL, MINIMALDATA, MINIMALIF,
-          -- WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE — see mempool.lua). NONE of
-          -- those are block-consensus flags (GetBlockScriptFlags omits them);
-          -- this is purely a cache-key namespace constant, not an enabled flag.
-          cache_flags = cache_flags + 128 + 256 + 512 + 1024 + 2048 + 4096 + 8192
-
           -- W160 BUG-9 fix: cache key must use wtxid (witness-bearing) not
           -- txid (non-witness). sig_cache.lua:6-7 documents the contract:
           -- "Callers should pass the wtxid (witness txid) so that segwit
@@ -3031,123 +3017,15 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           local wtxid_bytes = validation.compute_wtxid(tx).bytes
 
           -- Check signature cache first
-          if self.sig_cache:lookup(wtxid_bytes, inp_idx, cache_flags) then
+          if self.sig_cache:lookup(wtxid_bytes, inp_idx, block_cache_flags) then
             goto skip_verification
           end
 
-          -- Determine which scripts to run based on output type. We classify
-          -- BEFORE creating the checker so we can decide inline_verify for
-          -- the deferred-collect path (CHECKMULTISIG correctness gate, see
-          -- make_collecting_sig_checker for full rationale).
+          -- Classify BEFORE constructing a checker. Native P2WPKH/P2WSH/P2TR
+          -- never use the legacy collecting checker; building one anyway
+          -- (then throwing it away) was ~1.2 us of closures per input — the
+          -- leftover serial Lua after the P2PKH-template fast path.
           local script_type = script.classify_script(utxo.script_pubkey)
-
-          -- Scan for OP_CHECKMULTISIG/CHECKMULTISIGVERIFY in any script that
-          -- will be executed against the legacy/P2SH `checker` below. The
-          -- script_sig is normally push-only sig+pubkey data, but several
-          -- cases reach executed scripts that may contain multisig:
-          --   (a) P2SH: the redeem script is the LAST push of script_sig.
-          --   (b) P2SH-wrapped witness (P2SH-P2WPKH / P2SH-P2WSH): the
-          --       redeem is a witness program; the actual sig-bearing script
-          --       is then the witness script (last witness item) for P2WSH.
-          --       P2SH-P2WPKH is synthetic P2PKH (no multisig). For P2SH-P2WSH
-          --       we additionally scan the witness script.
-          --   (c) Plain script_pubkey contains the multisig opcode (bare
-          --       multisig, sometimes still seen on mainnet).
-          --   (d) The script_sig ITSELF contains OP_CHECKMULTISIG. Pre-P2SH
-          --       (mainnet < 173805) the scriptSig executes sequentially and
-          --       its result stack flows into the scriptPubKey, so a whole
-          --       bare m-of-n check can live in the scriptSig with the
-          --       scriptPubKey doing only a push/no-op/DROP. Block 164676's
-          --       tx bc179baab547… does exactly this (scriptSig:
-          --       0 <sig> OP_CODESEPARATOR OP_1 <pk1> <pk2> OP_2 CHECKMULTISIG,
-          --       spending a `<20> OP_NOP2 OP_DROP` output). If we do not
-          --       detect the multisig here, inline_verify stays false and the
-          --       collecting checker returns `true` optimistically for the
-          --       CHECKMULTISIG trial-pairing loop — pairing the signature
-          --       with the WRONG pubkey and deferring that bad (sig,pubkey)
-          --       pair to the batch verifier, which then rejects a block that
-          --       Bitcoin Core accepts (consensus split). has_multisig_op walks
-          --       pushdata, so a 0xae byte inside a sig/pubkey push is not a
-          --       false positive.
-          local legacy_has_multisig = false
-          if script.has_multisig_op(inp.script_sig) then
-            legacy_has_multisig = true
-          elseif script.has_multisig_op(utxo.script_pubkey) then
-            legacy_has_multisig = true
-          elseif flags.verify_p2sh and script_type == "p2sh" then
-            local redeem = script.extract_last_push(inp.script_sig)
-            if redeem then
-              if script.has_multisig_op(redeem) then
-                legacy_has_multisig = true
-              elseif flags.verify_witness then
-                -- P2SH-P2WSH: redeem is a witness v0 program 0x00 0x20 <h32>;
-                -- the actual sig-bearing script is the last witness item.
-                local wv, wp = script.is_witness_program(redeem)
-                if wv == 0 and wp and #wp == 32 then
-                  -- P2WSH inner: witness script is the last witness item.
-                  local witness_stack = inp.witness or {}
-                  if #witness_stack > 0 then
-                    local inner_ws = witness_stack[#witness_stack]
-                    if inner_ws and script.has_multisig_op(inner_ws) then
-                      legacy_has_multisig = true
-                    end
-                  end
-                end
-                -- P2SH-P2WPKH (wv=0, #wp=20) is synthetic P2PKH — no multisig.
-                -- Witness v1 (taproot) doesn't use the legacy checker for
-                -- ECDSA, and tapscript disables CHECKMULTISIG anyway.
-              end
-            end
-          end
-
-          -- CONSENSUS: the deferred/parallel collector returns `true`
-          -- optimistically from check_sig, then batch-verifies EVERY collected
-          -- (pubkey,sig,sighash) triple at end-of-block requiring all to pass.
-          -- That is sound ONLY when every CHECKSIG that runs is REQUIRED to
-          -- succeed — i.e. a simple single-signature template (P2PKH / P2PK)
-          -- whose lone terminal CHECKSIG result IS the script result. Any
-          -- richer script can legitimately tolerate a CHECKSIG returning false
-          -- via boolean logic (OP_BOOLOR / OP_IF / OP_NOTIF) or CHECKMULTISIG
-          -- trial-pairing; Core accepts it (a failed CHECKSIG just pushes
-          -- false, NULLFAIL is not consensus pre-segwit) but the blind batch
-          -- would reject the tolerated-false sig and split from Core. Mainnet
-          -- block 269760 tx be774942… input 0 does exactly this (a hash-puzzle
-          -- OP_BOOLOR'd over a decoy CHECKSIG). CHECKMULTISIG is already
-          -- covered by legacy_has_multisig above; here we additionally force
-          -- inline for ANY executed script that is not a deferrable single-sig
-          -- template (and any non-push-only scriptSig, which could itself run a
-          -- tolerated-false CHECKSIG), so the interpreter's own boolean logic —
-          -- not the batch — decides the outcome.
-          local legacy_needs_inline = legacy_has_multisig
-          if not legacy_needs_inline then
-            local exec_script = utxo.script_pubkey
-            if flags.verify_p2sh and script_type == "p2sh" then
-              local redeem = script.extract_last_push(inp.script_sig)
-              if redeem then exec_script = redeem end
-            end
-            if not (script.is_push_only(inp.script_sig)
-                    and script.is_deferrable_sig_template(exec_script)) then
-              legacy_needs_inline = true
-            end
-          end
-
-          -- Select checker: collecting (deferred ECDSA) when parallel mode
-          -- is active, or immediate when serial.  Taproot (Schnorr) is always
-          -- verified immediately — only ECDSA is deferred to the batch pass.
-          -- Inline-verify is forced when CHECKMULTISIG is reachable so the
-          -- script's m-of-n trial pairing sees real check_sig results.
-          local checker
-          if use_parallel_verify then
-            checker = validation.make_collecting_sig_checker(
-              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs,
-              get_tx_prev_outputs(), legacy_needs_inline, get_tx_cache()
-            )
-          else
-            checker = validation.make_sig_checker(
-              tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags,
-              get_tx_prev_outputs(), get_tx_cache()
-            )
-          end
 
           if script_type == "p2wpkh" or script_type == "p2wsh" then
             -- SegWit: scriptSig must be empty, use witness stack
@@ -3155,36 +3033,16 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             -- Execute witness program
             local witness_stack = inp.witness or {}
             if script_type == "p2wpkh" then
-              -- P2WPKH: witness = {sig, pubkey}, execute synthetic P2PKH
-              -- The synthetic script is OP_DUP OP_HASH160 <20> OP_EQUALVERIFY
-              -- OP_CHECKSIG — never multisig — so inline_verify=false.
-              -- Core interpreter.cpp VerifyWitnessProgram: a v0 20-byte program
-              -- with a witness stack size != 2 is SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH
-              -- (maps to block-script-verify-flag-failed).  Emit the canonical
-              -- code so submitblock's BIP22 reason matches Core rather than the
-              -- generic "rejected".
-              assert(#witness_stack == 2, "WITNESS_PROGRAM_MISMATCH")
-              local pkh = utxo.script_pubkey:sub(3, 22)
-              local synthetic_script = script.make_p2pkh_script(pkh)
-              local stack = {witness_stack[1], witness_stack[2]}
-              local segwit_flags = {}
-              for k, v in pairs(flags) do segwit_flags[k] = v end
-              segwit_flags.is_segwit = true
-              segwit_flags.is_witness_v0 = true  -- Enable WITNESS_PUBKEYTYPE check
-              local segwit_checker
-              if use_parallel_verify then
-                segwit_checker = validation.make_collecting_sig_checker(
-                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags, parallel_sigs,
-                  nil, false, get_tx_cache()
-                )
-              else
-                segwit_checker = validation.make_sig_checker(
-                  tx, inp_idx - 1, utxo.value, utxo.script_pubkey, segwit_flags,
-                  nil, get_tx_cache()
-                )
-              end
-              -- BIP141: Use execute_witness_script which enforces cleanstack
-              local ok, err = script.execute_witness_script(synthetic_script, stack, segwit_flags, segwit_checker)
+              -- P2WPKH: witness = {sig, pubkey}, execute synthetic P2PKH.
+              -- One checker (validation.verify_native_p2wpkh); never
+              -- CHECKMULTISIG so inline_verify=false. Core
+              -- interpreter.cpp VerifyWitnessProgram: a v0 20-byte program
+              -- with a witness stack size != 2 is SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH.
+              local ok, err = validation.verify_native_p2wpkh(
+                tx, inp_idx - 1, utxo.value, utxo.script_pubkey,
+                get_witness_v0_flags(),
+                use_parallel_verify and parallel_sigs or nil,
+                get_tx_cache())
               assert(ok, err or "P2WPKH script verification failed")
             elseif script_type == "p2wsh" then
               -- P2WSH: last witness item is the script.
@@ -3203,10 +3061,10 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
               for i = 1, #witness_stack - 1 do
                 stack[i] = witness_stack[i]
               end
+              -- Copy so witness_script (per-input) does not leak onto the
+              -- shared per-block witness_v0_flags table used by P2WPKH.
               local segwit_flags = {}
-              for k, v in pairs(flags) do segwit_flags[k] = v end
-              segwit_flags.is_segwit = true
-              segwit_flags.is_witness_v0 = true  -- Enable WITNESS_PUBKEYTYPE check
+              for k, v in pairs(get_witness_v0_flags()) do segwit_flags[k] = v end
               segwit_flags.witness_script = witness_script
               -- Scan the witness script: P2WSH multisig is the canonical place
               -- for modern multisig. CHECKMULTISIG inside witness_script must
@@ -3387,14 +3245,125 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             end
 
           else
-            -- Legacy or P2SH
+            -- Legacy or P2SH. Per-input SHALLOW COPY of the block flags:
+            -- the interpreter mutates the table it is handed (script.lua
+            -- sets flags.script_code while descending into a P2SH
+            -- redeemScript). Native witness above does not mutate flags, so
+            -- it shares get_witness_v0_flags().
+            --
+            -- NOTE: no policy flags here. verify_nullfail, verify_witness_pubkeytype
+            -- and verify_const_scriptcode are STANDARD_SCRIPT_VERIFY_FLAGS
+            -- (Core policy/policy.h:125-129), NOT block-consensus flags.
+            local flags = {}
+            for _k, _v in pairs(block_script_flags) do flags[_k] = _v end
+
+            -- Scan for OP_CHECKMULTISIG/CHECKMULTISIGVERIFY in any script that
+            -- will be executed against the legacy/P2SH `checker` below. The
+            -- script_sig is normally push-only sig+pubkey data, but several
+            -- cases reach executed scripts that may contain multisig:
+            --   (a) P2SH: the redeem script is the LAST push of script_sig.
+            --   (b) P2SH-wrapped witness (P2SH-P2WPKH / P2SH-P2WSH): the
+            --       redeem is a witness program; the actual sig-bearing script
+            --       is then the witness script (last witness item) for P2WSH.
+            --       P2SH-P2WPKH is synthetic P2PKH (no multisig). For P2SH-P2WSH
+            --       we additionally scan the witness script.
+            --   (c) Plain script_pubkey contains the multisig opcode (bare
+            --       multisig, sometimes still seen on mainnet).
+            --   (d) The script_sig ITSELF contains OP_CHECKMULTISIG. Pre-P2SH
+            --       (mainnet < 173805) the scriptSig executes sequentially and
+            --       its result stack flows into the scriptPubKey, so a whole
+            --       bare m-of-n check can live in the scriptSig with the
+            --       scriptPubKey doing only a push/no-op/DROP. Block 164676's
+            --       tx bc179baab547… does exactly this (scriptSig:
+            --       0 <sig> OP_CODESEPARATOR OP_1 <pk1> <pk2> OP_2 CHECKMULTISIG,
+            --       spending a `<20> OP_NOP2 OP_DROP` output). If we do not
+            --       detect the multisig here, inline_verify stays false and the
+            --       collecting checker returns `true` optimistically for the
+            --       CHECKMULTISIG trial-pairing loop — pairing the signature
+            --       with the WRONG pubkey and deferring that bad (sig,pubkey)
+            --       pair to the batch verifier, which then rejects a block that
+            --       Bitcoin Core accepts (consensus split). has_multisig_op walks
+            --       pushdata, so a 0xae byte inside a sig/pubkey push is not a
+            --       false positive.
+            local legacy_has_multisig = false
+            if script.has_multisig_op(inp.script_sig) then
+              legacy_has_multisig = true
+            elseif script.has_multisig_op(utxo.script_pubkey) then
+              legacy_has_multisig = true
+            elseif flags.verify_p2sh and script_type == "p2sh" then
+              local redeem = script.extract_last_push(inp.script_sig)
+              if redeem then
+                if script.has_multisig_op(redeem) then
+                  legacy_has_multisig = true
+                elseif flags.verify_witness then
+                  -- P2SH-P2WSH: redeem is a witness v0 program 0x00 0x20 <h32>;
+                  -- the actual sig-bearing script is the last witness item.
+                  local wv, wp = script.is_witness_program(redeem)
+                  if wv == 0 and wp and #wp == 32 then
+                    local p2sh_witness_stack = inp.witness or {}
+                    if #p2sh_witness_stack > 0 then
+                      local inner_ws = p2sh_witness_stack[#p2sh_witness_stack]
+                      if inner_ws and script.has_multisig_op(inner_ws) then
+                        legacy_has_multisig = true
+                      end
+                    end
+                  end
+                  -- P2SH-P2WPKH (wv=0, #wp=20) is synthetic P2PKH — no multisig.
+                end
+              end
+            end
+
+            -- CONSENSUS: the deferred/parallel collector returns `true`
+            -- optimistically from check_sig, then batch-verifies EVERY collected
+            -- (pubkey,sig,sighash) triple at end-of-block requiring all to pass.
+            -- That is sound ONLY when every CHECKSIG that runs is REQUIRED to
+            -- succeed — i.e. a simple single-signature template (P2PKH / P2PK)
+            -- whose lone terminal CHECKSIG result IS the script result. Any
+            -- richer script can legitimately tolerate a CHECKSIG returning false
+            -- via boolean logic (OP_BOOLOR / OP_IF / OP_NOTIF) or CHECKMULTISIG
+            -- trial-pairing; Core accepts it (a failed CHECKSIG just pushes
+            -- false, NULLFAIL is not consensus pre-segwit) but the blind batch
+            -- would reject the tolerated-false sig and split from Core. Mainnet
+            -- block 269760 tx be774942… input 0 does exactly this (a hash-puzzle
+            -- OP_BOOLOR'd over a decoy CHECKSIG). CHECKMULTISIG is already
+            -- covered by legacy_has_multisig above; here we additionally force
+            -- inline for ANY executed script that is not a deferrable single-sig
+            -- template (and any non-push-only scriptSig, which could itself run a
+            -- tolerated-false CHECKSIG), so the interpreter's own boolean logic —
+            -- not the batch — decides the outcome.
+            local legacy_needs_inline = legacy_has_multisig
+            if not legacy_needs_inline then
+              local exec_script = utxo.script_pubkey
+              if flags.verify_p2sh and script_type == "p2sh" then
+                local redeem = script.extract_last_push(inp.script_sig)
+                if redeem then exec_script = redeem end
+              end
+              if not (script.is_push_only(inp.script_sig)
+                      and script.is_deferrable_sig_template(exec_script)) then
+                legacy_needs_inline = true
+              end
+            end
+
+            local checker
+            if use_parallel_verify then
+              checker = validation.make_collecting_sig_checker(
+                tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags, parallel_sigs,
+                get_tx_prev_outputs(), legacy_needs_inline, get_tx_cache()
+              )
+            else
+              checker = validation.make_sig_checker(
+                tx, inp_idx - 1, utxo.value, utxo.script_pubkey, flags,
+                get_tx_prev_outputs(), get_tx_cache()
+              )
+            end
+
             local ok, err = script.verify_script(inp.script_sig, utxo.script_pubkey, flags, checker)
             assert(ok, string.format("Script verification failed for input %d of tx %s: %s",
               inp_idx, types.hash256_hex(txid), err or "verify_script returned false"))
           end
 
           -- Cache successful verification (W160 BUG-9: keyed on wtxid).
-          self.sig_cache:insert(wtxid_bytes, inp_idx, cache_flags)
+          self.sig_cache:insert(wtxid_bytes, inp_idx, block_cache_flags)
           ::skip_verification::
         end
 

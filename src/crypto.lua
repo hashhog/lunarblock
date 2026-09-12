@@ -216,6 +216,20 @@ function M.hash256(data)
   return M.sha256(M.sha256(data))
 end
 
+--- Double SHA-256 of `len` bytes at an FFI pointer, no Lua string.
+-- Used by the BIP143 per-input preimage writer so the 182-byte buffer
+-- never becomes a GC string. Byte-identical to hash256(ffi.string(ptr, len)).
+-- @param ptr cdata: uint8_t* (or uint8_t[?])
+-- @param len number: byte count (may be 0)
+-- @return string: 32-byte digest
+function M.hash256_ptr(ptr, len)
+  if sha256_accel_lib then
+    sha256_accel_lib.sha256d_accel(ptr, len, sha256_out)
+    return ffi.string(sha256_out, 32)
+  end
+  return M.hash256(ffi.string(ptr, len))
+end
+
 -- Double SHA-256 returning a hash256 type
 function M.hash256_type(data)
   return types.hash256(M.hash256(data))

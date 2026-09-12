@@ -1005,6 +1005,99 @@ function M.precomputed_tx_data(tx, spent_outputs)
   }
 end
 
+-- Kill switch for the A/B control and for anyone who needs the buffer_writer
+-- preimage. Default ON: the 900k connect_block hot path.
+M.use_fast_bip143_preimage = true
+
+-- Count make_sig_checker / make_collecting_sig_checker constructions. The
+-- native-P2WPKH connect path must construct exactly one (the unused legacy
+-- checker was a per-input leak at 900k).
+M.checker_ctor_count = 0
+
+-- Reused BIP143 preimage buffer. LuaJIT is single-threaded; hash256_ptr
+-- copies the digest out before the next call overwrites the buffer.
+-- 16 KiB covers MAX_SCRIPT_SIZE (10_000) plus the 156-byte BIP143 header.
+local BIP143_PREIMAGE_CAP = 16384
+local bip143_preimage_buf = ffi.new("uint8_t[?]", BIP143_PREIMAGE_CAP)
+
+local function write_u32le_buf(buf, off, val)
+  val = bit.tobit(val)
+  buf[off]     = bit.band(val, 0xFF)
+  buf[off + 1] = bit.band(bit.rshift(val, 8), 0xFF)
+  buf[off + 2] = bit.band(bit.rshift(val, 16), 0xFF)
+  buf[off + 3] = bit.band(bit.rshift(val, 24), 0xFF)
+end
+
+local function write_i64le_buf(buf, off, val)
+  -- Amounts are non-negative CAmount and fit in a Lua double. Split rather
+  -- than a uint64 overlay: `off` is not 8-aligned inside the preimage.
+  local lo = val % 4294967296
+  local hi = math.floor(val / 4294967296)
+  write_u32le_buf(buf, off, lo)
+  write_u32le_buf(buf, off + 4, hi)
+end
+
+local function write_compact_size_buf(buf, off, n)
+  if n < 0xFD then
+    buf[off] = n
+    return 1
+  elseif n <= 0xFFFF then
+    buf[off] = 0xFD
+    buf[off + 1] = bit.band(n, 0xFF)
+    buf[off + 2] = bit.band(bit.rshift(n, 8), 0xFF)
+    return 3
+  else
+    buf[off] = 0xFE
+    write_u32le_buf(buf, off + 1, n)
+    return 5
+  end
+end
+
+-- Write the BIP143 per-input preimage into bip143_preimage_buf and return
+-- HASH256 of it. nil means "too big, use buffer_writer".
+local function hash256_bip143_preimage(tx, input_index, script_code, value, hash_type,
+                                       hash_prevouts, hash_sequence, hash_outputs)
+  local sc_len = #script_code
+  local compact_len
+  if sc_len < 0xFD then
+    compact_len = 1
+  elseif sc_len <= 0xFFFF then
+    compact_len = 3
+  else
+    compact_len = 5
+  end
+  -- version + hashPrevouts + hashSequence + outpoint + compact(scriptCode)
+  -- + scriptCode + amount + nSequence + hashOutputs + nLockTime + nHashType
+  local total = 4 + 32 + 32 + 36 + compact_len + sc_len + 8 + 4 + 32 + 4 + 4
+  if total > BIP143_PREIMAGE_CAP then
+    return nil
+  end
+
+  local buf = bip143_preimage_buf
+  local off = 0
+  write_u32le_buf(buf, off, tx.version); off = off + 4
+  ffi.copy(buf + off, hash_prevouts, 32); off = off + 32
+  ffi.copy(buf + off, hash_sequence, 32); off = off + 32
+
+  local inp = tx.inputs[input_index + 1]
+  ffi.copy(buf + off, inp.prev_out.hash.bytes, 32); off = off + 32
+  write_u32le_buf(buf, off, inp.prev_out.index); off = off + 4
+
+  off = off + write_compact_size_buf(buf, off, sc_len)
+  if sc_len > 0 then
+    ffi.copy(buf + off, script_code, sc_len)
+    off = off + sc_len
+  end
+
+  write_i64le_buf(buf, off, value); off = off + 8
+  write_u32le_buf(buf, off, inp.sequence); off = off + 4
+  ffi.copy(buf + off, hash_outputs, 32); off = off + 32
+  write_u32le_buf(buf, off, tx.locktime); off = off + 4
+  write_u32le_buf(buf, off, hash_type); off = off + 4
+
+  return crypto.hash256_ptr(buf, off)
+end
+
 --------------------------------------------------------------------------------
 -- Signature Hash (SegWit v0 - BIP143)
 --------------------------------------------------------------------------------
@@ -1066,7 +1159,15 @@ function M.signature_hash_segwit_v0(tx, input_index, script_code, value, hash_ty
     hash_outputs = crypto.hash256(serialize_outputs(tx))
   end
 
-  -- Build the preimage
+  if M.use_fast_bip143_preimage ~= false then
+    local h = hash256_bip143_preimage(
+      tx, input_index, script_code, value, hash_type,
+      hash_prevouts, hash_sequence, hash_outputs)
+    if h then return h end
+  end
+
+  -- Slow path: serialize.buffer_writer (12 closures + concat). Kept as
+  -- the kill-switch / overflow fallback so the A/B control has a red side.
   local w = serialize.buffer_writer()
   w.write_i32le(tx.version)
   w.write_bytes(hash_prevouts)
@@ -1857,6 +1958,7 @@ end
 -- @param flags table: Script verification flags
 -- @return table: Checker with check_sig, check_locktime, check_sequence methods
 function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, prev_outputs, cache)
+  M.checker_ctor_count = M.checker_ctor_count + 1
   flags = flags or {}
   local checker = {}
 
@@ -2253,6 +2355,7 @@ end
 -- @param inline_verify boolean|nil: If true, verify ECDSA inline (CHECKMULTISIG)
 -- @return table: Checker compatible with make_sig_checker interface
 function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_script_pubkey, flags, collector, prev_outputs, inline_verify, cache)
+  M.checker_ctor_count = M.checker_ctor_count + 1
   flags = flags or {}
   local checker = {}
 
@@ -2419,6 +2522,44 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
   end
 
   return checker
+end
+
+--- Verify a native P2WPKH input (connect_block hot path at 900k).
+-- One checker, one flags table. connect_block used to construct a legacy
+-- collecting checker, throw it away, then construct a second segwit
+-- checker — 1.2 us of closures per input, times every P2WPKH in the block.
+-- Accept/reject matches execute_witness_script on the synthetic P2PKH
+-- template (WITNESS_PROGRAM_MISMATCH when the witness stack is not
+-- [sig, pubkey]; CLEANSTACK / HASH160 / CHECKSIG via the template).
+-- @param tx transaction
+-- @param input_index number: 0-based
+-- @param utxo_value number: satoshis of the prevout
+-- @param script_pubkey string: 22-byte P2WPKH scriptPubKey
+-- @param flags table: must include is_segwit / is_witness_v0 (caller may
+--   share one per-block witness-v0 flags table; this path does not mutate it)
+-- @param collector table|nil: parallel-verify collector; nil = inline ECDSA
+-- @param cache table|nil: PrecomputedTransactionData
+-- @return boolean|nil, string|nil
+function M.verify_native_p2wpkh(tx, input_index, utxo_value, script_pubkey, flags, collector, cache)
+  local inp = tx.inputs[input_index + 1]
+  local witness = inp.witness or {}
+  -- Core interpreter.cpp VerifyWitnessProgram: a v0 20-byte program with
+  -- a witness stack size != 2 is SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH.
+  if #witness ~= 2 then
+    return nil, "WITNESS_PROGRAM_MISMATCH"
+  end
+  local pkh = script_pubkey:sub(3, 22)
+  local synthetic = script.make_p2pkh_script(pkh)
+  local stack = {witness[1], witness[2]}
+  local checker
+  if collector then
+    checker = M.make_collecting_sig_checker(
+      tx, input_index, utxo_value, script_pubkey, flags, collector, nil, false, cache)
+  else
+    checker = M.make_sig_checker(
+      tx, input_index, utxo_value, script_pubkey, flags, nil, cache)
+  end
+  return script.execute_witness_script(synthetic, stack, flags, checker)
 end
 
 return M

@@ -62,6 +62,7 @@ end
 local function wrap_hash_counters()
   local n_hash256, n_sha256 = 0, 0
   local orig_hash256, orig_sha256 = crypto.hash256, crypto.sha256
+  local orig_hash256_ptr = crypto.hash256_ptr
   crypto.hash256 = function(...)
     n_hash256 = n_hash256 + 1
     return orig_hash256(...)
@@ -70,9 +71,18 @@ local function wrap_hash_counters()
     n_sha256 = n_sha256 + 1
     return orig_sha256(...)
   end
+  -- Fast BIP143 preimage hashes through hash256_ptr (no Lua string). Count
+  -- those as hash256 so the 4N uncached / O(1)+N cached budget still holds.
+  if orig_hash256_ptr then
+    crypto.hash256_ptr = function(...)
+      n_hash256 = n_hash256 + 1
+      return orig_hash256_ptr(...)
+    end
+  end
   local function restore()
     crypto.hash256 = orig_hash256
     crypto.sha256 = orig_sha256
+    crypto.hash256_ptr = orig_hash256_ptr
   end
   local function counts()
     return n_hash256, n_sha256
