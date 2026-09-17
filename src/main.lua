@@ -28,6 +28,7 @@ local function default_args()
     rpc_tls_cert = nil,
     rpc_tls_key  = nil,
     port = nil,  -- will default from network config
+    bind = nil,  -- nil = all interfaces (0.0.0.0 and [::]); --bind restricts
     maxpeers = 125,
     dbcache = 450,
     connect = nil,
@@ -112,7 +113,9 @@ local function parse_args(argv)
       print("      --rpc-tls-cert PATH PEM cert path (enables HTTPS; requires --rpc-tls-key)")
       print("      --rpc-tls-key PATH  PEM private-key path (requires --rpc-tls-cert)")
       print("      --port PORT         P2P listen port")
+      print("      --bind ADDR[:PORT]  Bind P2P listen socket (repeatable; default 0.0.0.0 and [::])")
       print("      --maxpeers N        Maximum peer connections (default: 125)")
+      print("      --maxconnections N  Alias for --maxpeers (Bitcoin Core name)")
       print("      --dbcache MB        Database cache size in MB (default: 450)")
       print("      --connect IP:PORT   Connect to specific peer")
       print("      --testnet           Use testnet")
@@ -194,9 +197,18 @@ local function parse_args(argv)
     elseif arg == "--port" then
       i = i + 1
       args.port = tonumber(argv[i])
-    elseif arg == "--maxpeers" then
-      i = i + 1
-      args.maxpeers = tonumber(argv[i])
+    elseif arg == "--bind" or arg:match("^%-%-bind=") then
+      -- Repeatable.  Default (unset) is all-interfaces 0.0.0.0 and [::].
+      -- Passing --bind restricts the listener to the given address(es).
+      local v = arg:match("^%-%-bind=(.*)$")
+      if v == nil then i = i + 1; v = argv[i] end
+      if not args.bind then args.bind = {} end
+      args.bind[#args.bind + 1] = v
+    elseif arg == "--maxpeers" or arg == "--maxconnections"
+        or arg:match("^%-%-maxpeers=") or arg:match("^%-%-maxconnections=") then
+      local v = arg:match("^%-%-maxpeers=(.*)$") or arg:match("^%-%-maxconnections=(.*)$")
+      if v == nil then i = i + 1; v = argv[i] end
+      args.maxpeers = tonumber(v)
     elseif arg == "--dbcache" then
       i = i + 1
       args.dbcache = tonumber(argv[i])
@@ -1784,6 +1796,9 @@ local function main()
   -- Initialize peer manager
   local peer_manager = peerman_mod.new(network, db, {
     maxpeers = args.maxpeers,
+    max_peers = args.maxpeers,
+    bind = args.bind,
+    port = args.port,
     -- Core-semantic --connect: pin to ONLY the given peer, no auto-outbound
     -- fill (the block-downloader can stall on flaky DNS peers; a single
     -- reliable pinned peer avoids that).
@@ -2944,12 +2959,21 @@ local function main()
     peer_manager:connect_peer(ip, connect_port, true, nil, true)
   end
 
-  -- Start P2P listener
-  local listen_ok, listen_err = peer_manager:start_listener("0.0.0.0", args.port)
+  -- Start P2P listener.  Default bind is all-interfaces (0.0.0.0 and [::]);
+  -- --bind restricts it.  Do not hardcode loopback — inbound peers must be
+  -- reachable once the operator opens the P2P port.
+  local listen_ok, listen_err = peer_manager:start_listener()
   if listen_ok then
-    print(string.format("P2P listening on port %d", args.port))
+    local live = peer_manager:get_listening_binds()
+    local parts = {}
+    for _, b in ipairs(live) do
+      local host = b.host
+      if host:find(":") then host = "[" .. host .. "]" end
+      parts[#parts + 1] = string.format("%s:%d", host, b.port)
+    end
+    print("P2P listening on " .. table.concat(parts, ", "))
   else
-    print(string.format("WARNING: P2P listener failed on port %d: %s", args.port, tostring(listen_err)))
+    print(string.format("WARNING: P2P listener failed: %s", tostring(listen_err)))
   end
 
   -- Dial last session's anchor peers FIRST (Core CConnman::Start), right after
@@ -3315,7 +3339,9 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --rpc-tls-cert PATH PEM cert path (enables HTTPS; requires --rpc-tls-key)")
       print("      --rpc-tls-key PATH  PEM private-key path (requires --rpc-tls-cert)")
       print("      --port PORT         P2P listen port")
+      print("      --bind ADDR[:PORT]  Bind P2P listen socket (repeatable; default 0.0.0.0 and [::])")
       print("      --maxpeers N        Maximum peer connections (default: 125)")
+      print("      --maxconnections N  Alias for --maxpeers (Bitcoin Core name)")
       print("      --dbcache MB        Database cache size in MB (default: 450)")
       print("      --connect IP:PORT   Connect to specific peer")
       print("      --testnet           Use testnet")

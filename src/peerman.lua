@@ -98,6 +98,33 @@ M.STALE_TIP = {
 -- Reference: Bitcoin Core src/net.h + src/net_processing.cpp
 --------------------------------------------------------------------------------
 
+-- Default P2P listen hosts: all interfaces, not loopback.  Core's
+-- CConnman binds 0.0.0.0 and [::] unless -bind restricts it.
+-- --bind is the restrict flag (repeatable).
+M.DEFAULT_BIND_HOSTS = { "0.0.0.0", "::" }
+
+--- Parse a -bind spec into {host, port}.
+-- Accepts: "0.0.0.0", "127.0.0.1:8334", "[::]", "[::1]:18444", "::".
+-- @param spec string
+-- @param default_port number
+-- @return table {host=string, port=number}
+function M.parse_bind_spec(spec, default_port)
+  if type(spec) ~= "string" or spec == "" then
+    error("bind spec must be a non-empty string")
+  end
+  default_port = default_port or 8333
+  local host, port = spec:match("^%[(.-)%]:(%d+)$")
+  if host then return { host = host, port = tonumber(port) } end
+  host = spec:match("^%[(.-)%]$")
+  if host then return { host = host, port = default_port } end
+  host, port = spec:match("^([^%[%]:]+):(%d+)$")
+  if host then return { host = host, port = tonumber(port) } end
+  if spec:find(":") then
+    return { host = spec, port = default_port }
+  end
+  return { host = spec, port = default_port }
+end
+
 M.CONNMAN = {
   -- At most one in-flight feeler at a time (Core net.h:75 MAX_FEELER_CONNECTIONS = 1).
   MAX_FEELER_CONNECTIONS = 1,
@@ -347,8 +374,18 @@ function M.new(network, storage, config)
   config = config or {}
   self.config = config
   self.max_outbound = config.max_outbound or 8
-  self.max_inbound = config.max_inbound or 117
-  self.max_peers = config.max_peers or 125
+  -- Core nMaxConnections / nMaxInbound: inbound budget is whatever is
+  -- left after reserved outbound slots, so a flood of inbound cannot
+  -- starve outbound sync (net.cpp nMaxInbound = nMaxConnections - nMaxOutbound).
+  self.max_peers = config.max_peers or config.maxpeers or 125
+  if config.max_inbound ~= nil then
+    self.max_inbound = config.max_inbound
+  else
+    self.max_inbound = math.max(self.max_peers - self.max_outbound, 0)
+  end
+  -- Seconds.  nil = Peer.HANDSHAKE_TIMEOUT (60).  Tests pass a short
+  -- value so the half-open reap control does not wait a minute.
+  self.handshake_timeout = config.handshake_timeout
   self.data_dir = config.data_dir or "."
   self.peers = {}              -- ip:port -> Peer object
   self.peer_list = {}          -- ordered list for iteration
@@ -370,7 +407,8 @@ function M.new(network, storage, config)
   self.manual_peers = {}
   self.manual_reconnect_interval = 30  -- seconds; matches clearbit
   self.our_height = 0
-  self.listen_socket = nil
+  self.listen_socket = nil     -- first live listen socket (backward compat)
+  self.listen_sockets = {}     -- { {socket, host, port, bound_port}, ... }
   self.message_handlers = {}   -- command -> handler(peer, payload)
   self.callbacks = {
     on_peer_connected = nil,
@@ -1836,6 +1874,9 @@ function PeerManager:connect_peer(ip, port, skip_diversity, use_v2_override, is_
     p.is_manual = true
   end
 
+  if self.handshake_timeout then
+    p.handshake_timeout = self.handshake_timeout
+  end
   p:start_handshake()
 
   if self.callbacks.on_peer_connected then
@@ -2393,36 +2434,139 @@ end
 -- Inbound Connection Listener
 --------------------------------------------------------------------------------
 
---- Start the inbound connection listener.
--- @param bind_ip string: IP to bind to (default "0.0.0.0")
--- @param port number: port to listen on (default network default port)
--- @return boolean: true on success
--- @return string: error message on failure
-function PeerManager:start_listener(bind_ip, port)
-  local listen_port = port or (self.network and self.network.port) or 8333
-  -- Use tcp4() so setoption("reuseaddr", true) actually succeeds on this
-  -- LuaSocket 3.0 build (setsockopt fails on the generic tcp() master socket).
+--- Resolved listen addresses (host, port) from config.bind / --bind.
+-- Default is all-interfaces IPv4 and IPv6 on the listen port, not loopback.
+-- @return table list of {host=string, port=number}
+function PeerManager:get_bind_addresses()
+  local port = self.config.port
+  if port == nil then
+    port = (self.network and self.network.port) or 8333
+  end
+  local binds = self.config.bind
+  if type(binds) == "string" then
+    binds = { binds }
+  end
+  if not binds or (type(binds) == "table" and #binds == 0) then
+    local out = {}
+    for _, h in ipairs(M.DEFAULT_BIND_HOSTS) do
+      out[#out + 1] = { host = h, port = port }
+    end
+    return out
+  end
+  local out = {}
+  for _, spec in ipairs(binds) do
+    if type(spec) == "table" and spec.host then
+      out[#out + 1] = { host = spec.host, port = spec.port or port }
+    else
+      out[#out + 1] = M.parse_bind_spec(tostring(spec), port)
+    end
+  end
+  return out
+end
+
+--- Currently bound listen sockets after start_listener.
+-- @return table list of {host=string, port=number}
+function PeerManager:get_listening_binds()
+  local out = {}
+  for _, entry in ipairs(self.listen_sockets or {}) do
+    out[#out + 1] = { host = entry.host, port = entry.bound_port or entry.port }
+  end
+  return out
+end
+
+local function _is_ipv6_host(host)
+  return type(host) == "string" and host:find(":") ~= nil
+end
+
+function PeerManager:_bind_one(host, port)
+  local sock
+  if _is_ipv6_host(host) then
+    if not socket.tcp6 then return nil, "ipv6 not supported" end
+    sock = socket.tcp6()
+    if sock then
+      -- Bind [::] independently of 0.0.0.0 (Core sets IPV6_V6ONLY).
+      pcall(function() sock:setoption("ipv6-v6only", true) end)
+    end
+  else
+    sock = socket.tcp4()
+  end
+  if not sock then return nil, "failed to create socket" end
+  -- Use tcp4()/tcp6() so setoption("reuseaddr", true) actually succeeds on
+  -- this LuaSocket 3.0 build (setsockopt fails on the generic tcp() master).
   -- Without SO_REUSEADDR, bind() fails with "address already in use" during
   -- the TIME_WAIT window after a clean SIGTERM relaunch.
-  local sock = socket.tcp4()
-  if not sock then return false, "failed to create socket" end
   local ok, err = sock:setoption("reuseaddr", true)
   if not ok then
     sock:close()
-    return false, err
+    return nil, err
   end
-  ok, err = sock:bind(bind_ip or "0.0.0.0", listen_port)
+  ok, err = sock:bind(host, port)
   if not ok then
     sock:close()
-    return false, err
+    return nil, err
   end
   ok, err = sock:listen(32)
   if not ok then
     sock:close()
-    return false, err
+    return nil, err
   end
-  self.listen_socket = sock
-  self.listen_socket:settimeout(0)
+  sock:settimeout(0)
+  return sock
+end
+
+--- Start the inbound connection listener.
+-- @param bind_ip string|table|nil: IP, list of specs, or nil to use config.bind
+--   (default all-interfaces 0.0.0.0 and [::])
+-- @param port number: port to listen on (default network default port)
+-- @return boolean: true on success
+-- @return string: error message on failure
+function PeerManager:start_listener(bind_ip, port)
+  local specs
+  if type(bind_ip) == "table" then
+    local default_port = port or self.config.port or (self.network and self.network.port) or 8333
+    specs = {}
+    for _, spec in ipairs(bind_ip) do
+      if type(spec) == "table" and spec.host then
+        specs[#specs + 1] = { host = spec.host, port = spec.port or default_port }
+      else
+        specs[#specs + 1] = M.parse_bind_spec(tostring(spec), default_port)
+      end
+    end
+  elseif bind_ip then
+    local listen_port = port or self.config.port or (self.network and self.network.port) or 8333
+    specs = { { host = bind_ip, port = listen_port } }
+  else
+    specs = self:get_bind_addresses()
+  end
+
+  self.listen_sockets = {}
+  self.listen_socket = nil
+  local shared_port = nil
+  local last_err
+  for _, spec in ipairs(specs) do
+    local p = spec.port
+    if (p == nil or p == 0) and shared_port then
+      p = shared_port
+    end
+    local sock, err = self:_bind_one(spec.host, p or 0)
+    if sock then
+      local _bound_host, bound_port = sock:getsockname()
+      bound_port = tonumber(bound_port)
+      if not shared_port then shared_port = bound_port end
+      self.listen_sockets[#self.listen_sockets + 1] = {
+        socket = sock,
+        host = spec.host,
+        port = spec.port,
+        bound_port = bound_port,
+      }
+    else
+      last_err = err
+    end
+  end
+  if #self.listen_sockets == 0 then
+    return false, last_err or "failed to bind any listen address"
+  end
+  self.listen_socket = self.listen_sockets[1].socket
   return true
 end
 
@@ -2536,8 +2680,19 @@ function PeerManager:select_inbound_eviction_candidate()
 end
 
 function PeerManager:accept_inbound()
+  if self.listen_sockets and #self.listen_sockets > 0 then
+    for _, entry in ipairs(self.listen_sockets) do
+      self:_accept_from(entry.socket)
+    end
+    return
+  end
   if not self.listen_socket then return end
-  local client, err = self.listen_socket:accept()
+  self:_accept_from(self.listen_socket)
+end
+
+function PeerManager:_accept_from(listen_sock)
+  if not listen_sock then return end
+  local client, err = listen_sock:accept()
   if not client then
     -- No connection waiting (timeout or error)
     local _ = err
@@ -2597,6 +2752,9 @@ function PeerManager:accept_inbound()
   p.conn_time = socket.gettime()
   p.last_recv = socket.gettime()
   p.handshake_start_time = socket.gettime()
+  if self.handshake_timeout then
+    p.handshake_timeout = self.handshake_timeout
+  end
   client:settimeout(0)
 
   -- BIP-324 v2 inbound: build a responder-mode V2Transport now so the
@@ -3502,10 +3660,11 @@ function PeerManager:stop()
   end
   self.peer_list = {}
   self.peers = {}
-  if self.listen_socket then
-    self.listen_socket:close()
-    self.listen_socket = nil
+  for _, entry in ipairs(self.listen_sockets or {}) do
+    if entry.socket then pcall(function() entry.socket:close() end) end
   end
+  self.listen_sockets = {}
+  self.listen_socket = nil
 end
 
 --------------------------------------------------------------------------------

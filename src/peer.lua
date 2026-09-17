@@ -1065,10 +1065,12 @@ end
 --- Check for timeouts and send keepalive pings.
 function Peer:check_timeouts()
   local now = socket.gettime()
-  -- Handshake timeout: 60 seconds from connection start
-  -- This is stricter than the old 90-second inactivity check
+  -- Handshake timeout from connection start (default 60s; tests may
+  -- shorten Peer.handshake_timeout so a half-open inbound is reaped
+  -- without waiting a minute).
   if not self.handshake_complete and self.state ~= M.STATE.DISCONNECTED then
-    if self.handshake_start_time > 0 and now - self.handshake_start_time > M.HANDSHAKE_TIMEOUT then
+    local timeout = self.handshake_timeout or M.HANDSHAKE_TIMEOUT
+    if self.handshake_start_time > 0 and now - self.handshake_start_time > timeout then
       self:disconnect("handshake timeout")
       return
     end

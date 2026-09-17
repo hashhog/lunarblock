@@ -155,7 +155,9 @@ LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
 | `--rpc-tls-cert PATH` | none | PEM cert path — enables HTTPS RPC (pair with `--rpc-tls-key`; requires `luasec`) |
 | `--rpc-tls-key PATH` | none | PEM private-key path — pair with `--rpc-tls-cert` |
 | `--port PORT` | per-network | P2P listen port |
+| `--bind ADDR[:PORT]` | `0.0.0.0` and `[::]` | Bind P2P listen socket (repeatable; omit for all interfaces) |
 | `--maxpeers N` | `125` | Maximum peer connections |
+| `--maxconnections N` | `125` | Alias for `--maxpeers` |
 | `--dbcache MB` | `450` | Database cache size in MB |
 | `--connect IP:PORT` | none | Connect to specific peer |
 | `--testnet` | off | Use testnet |
