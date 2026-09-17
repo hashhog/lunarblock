@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-17
 
+- docs: 363708-388364 and 900000-910000 CLOSED (28 ranges / 578,701 blocks, zero leftover verdicts). 910000 matches Core chainparams assumeutxo.
 - fix: cache SHA-256 FFI symbols; do not punish --connect peers for local LuaJIT/FFI or RocksDB ENOSPC (900619 range stall)
 - 748cab7 fix: T1/T2 R5 probe parity (error codes, ConstructTransaction, missing methods)
 - 509702a feat: FFI BIP143 preimage and one checker per P2WPKH

@@ -1,0 +1,38 @@
+{
+ "note": "Snapshot-booted ladder ranges. TRUST-ANCHOR: these do NOT count as R4 from-genesis evidence. Recorded so the two QUEUES.md holes (STALLED 363708-388364, NO-ORACLE-SURFACE 900000-910000) have an in-repo CLOSED receipt a stranger can check without the private meta-repo.",
+ "snapshot_booted": true,
+ "counts_as_r4": false,
+ "closed": 28,
+ "closed_blocks": 578701,
+ "other_verdicts": {},
+ "holes": [
+  {
+   "impl": "lunarblock",
+   "from_height": 363708,
+   "to_height": 388364,
+   "blocks": 24656,
+   "verdict": "CLOSED",
+   "detail": "24656 blocks connected, UTXO set == rung 388364 commitment",
+   "utxo_hash": "d9e0fe319e1ded126e29262af3d5abbf9096be573cf97af6dab12968920e1775",
+   "tip_hash": "000000000000000005ca7ddb94daced48b96d8a1f332f4f4f0fd30e67fd49caa",
+   "scripts_ack": "yes",
+   "oracle_attested_by": "boundary-snapshot.sh",
+   "impl_commit": "753b38f2704a",
+   "ran": "2026-09-17T11:50:44+00:00"
+  },
+  {
+   "impl": "lunarblock",
+   "from_height": 900000,
+   "to_height": 910000,
+   "blocks": 10000,
+   "verdict": "CLOSED",
+   "detail": "10000 blocks connected, UTXO set == rung 910000 commitment",
+   "utxo_hash": "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+   "tip_hash": "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+   "scripts_ack": "yes",
+   "oracle_attested_by": "Core chainparams built-in assumeutxo (v30, height 910000): hash_serialized and blockhash byte-identical",
+   "impl_commit": "e030e95bf081",
+   "ran": "2026-09-17T23:09:16+00:00"
+  }
+ ]
+}

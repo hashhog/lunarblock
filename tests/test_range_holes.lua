@@ -1,9 +1,11 @@
 #!/usr/bin/env luajit
 -- Control for QUEUES.md lunarblock item 0 (range holes).
 --
--- Two holes were open: 363708→388364 STALLED (now CLOSED on 753b38f) and
--- 900000→910000 NO-ORACLE-SURFACE (tip correct, no hash_serialized_3).
--- A RANGE_FORCE re-run of 900k on 2026-09-17 died at block 900619:
+-- Two holes were open: 363708→388364 STALLED (CLOSED 2026-09-17T11:50:44Z
+-- on 753b38f, 24656 blocks, UTXO == rung) and 900000→910000
+-- NO-ORACLE-SURFACE (tip correct, no hash_serialized_3). The NO-ORACLE
+-- surface itself was fixed in 2fd97454; a RANGE_FORCE re-run of 900k on
+-- 2026-09-17 then died at block 900619:
 --
 --   crypto.lua:149: bad argument #1 to '__index' (userdata expected, got number)
 --
@@ -25,8 +27,10 @@
 
 package.path = "src/?.lua;src/?/init.lua;" .. package.path
 
-local sync   = require("lunarblock.sync")
-local crypto = require("lunarblock.crypto")
+local sync      = require("lunarblock.sync")
+local crypto    = require("lunarblock.crypto")
+local consensus = require("lunarblock.consensus")
+local cjson     = require("cjson")
 
 local PASS, FAIL = 0, 0
 local function pass(name)
@@ -212,6 +216,80 @@ test("JIT stress: 20k sha256 calls of mixed lengths do not throw", function()
     local d = crypto.sha256(string.rep(string.char(i % 256), n))
     assert(#d == 32)
   end
+end)
+
+-- Operator control for the two QUEUES.md holes: both ranges must be
+-- recorded CLOSED in-repo. Snapshot-booted; does NOT count as R4.
+local HOLES_PATH = "proof/r4/range-holes-closed.json"
+local HASH_910000 = "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"
+local TIP_910000  = "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"
+local HASH_388364 = "d9e0fe319e1ded126e29262af3d5abbf9096be573cf97af6dab12968920e1775"
+local TIP_388364  = "000000000000000005ca7ddb94daced48b96d8a1f332f4f4f0fd30e67fd49caa"
+
+test("proof/r4/range-holes-closed.json exists (operator CLOSED receipt)", function()
+  local f = io.open(HOLES_PATH, "r")
+  expect_true(f ~= nil,
+    "missing " .. HOLES_PATH
+      .. " — 363708-388364 / 900000-910000 still unrecorded as CLOSED")
+  f:close()
+end)
+
+local holes_doc = nil
+test("CLOSED receipt is JSON with both holes and no leftover verdicts", function()
+  local raw = read_file(HOLES_PATH)
+  holes_doc = cjson.decode(raw)
+  expect_false(holes_doc.counts_as_r4,
+    "snapshot-booted ranges must not claim R4")
+  expect_true(holes_doc.snapshot_booted,
+    "these boots start from a Core-format snapshot")
+  expect_eq(holes_doc.closed, 28, "coverage closed-range count")
+  expect_eq(holes_doc.closed_blocks, 578701, "coverage closed-block count")
+  local other = holes_doc.other_verdicts
+  expect_true(type(other) == "table", "other_verdicts missing")
+  local n_other = 0
+  for _ in pairs(other) do n_other = n_other + 1 end
+  expect_eq(n_other, 0, "STALLED / NO-ORACLE-SURFACE must be gone")
+  expect_eq(#holes_doc.holes, 2, "exactly the two QUEUES holes")
+end)
+
+local function hole_named(from_h, to_h)
+  for i = 1, #holes_doc.holes do
+    local h = holes_doc.holes[i]
+    if h.from_height == from_h and h.to_height == to_h then
+      return h
+    end
+  end
+  error("missing hole " .. from_h .. "-" .. to_h, 2)
+end
+
+test("363708-388364 is CLOSED, UTXO == rung, tip == Core 388364", function()
+  local h = hole_named(363708, 388364)
+  expect_eq(h.verdict, "CLOSED")
+  expect_eq(h.blocks, 24656)
+  expect_eq(h.scripts_ack, "yes")
+  expect_eq(h.utxo_hash, HASH_388364,
+    "UTXO set must equal the 388364 rung commitment")
+  expect_eq(h.tip_hash, TIP_388364,
+    "tip must equal Core getblockhash(388364)")
+  expect_eq(h.impl_commit:sub(1, 7), "753b38f")
+end)
+
+test("900000-910000 is CLOSED against Core's built-in assumeutxo", function()
+  local h = hole_named(900000, 910000)
+  expect_eq(h.verdict, "CLOSED")
+  expect_eq(h.blocks, 10000)
+  expect_eq(h.scripts_ack, "yes")
+  expect_eq(h.utxo_hash, HASH_910000,
+    "UTXO set must equal Core chainparams assumeutxo 910000")
+  expect_eq(h.tip_hash, TIP_910000,
+    "tip must equal Core getblockhash(910000)")
+  expect_eq(h.impl_commit:sub(1, 7), "e030e95")
+  local au = consensus.networks.mainnet.assumeutxo[910000]
+  expect_true(au ~= nil, "mainnet assumeutxo[910000] missing")
+  expect_eq(h.utxo_hash, au.hash_serialized,
+    "receipt hash must pin consensus.lua assumeutxo[910000]")
+  expect_eq(h.tip_hash, au.blockhash,
+    "receipt tip must pin consensus.lua assumeutxo[910000].blockhash")
 end)
 
 print(string.format("\n%d PASS / %d FAIL", PASS, FAIL))
