@@ -2010,5 +2010,36 @@ describe("sync", function()
       assert.equal("unknown",
         sync.classify_callback_error("ETIMEDOUT on rpc socket"))
     end)
+
+    it("classifies RocksDB / ENOSPC as local (not a peer fault)", function()
+      local enospc = "Failed to connect block 374505: ./lunarblock/../src/storage.lua:215: "
+        .. "RocksDB error: IO error: No space left on device: While appending to file: "
+        .. "chainstate/000339.sst: No space left on device"
+      assert.equal("local", sync.classify_callback_error(enospc))
+      assert.equal("local",
+        sync.classify_callback_error("No space left on device"))
+      assert.equal("local",
+        sync.classify_callback_error("RocksDB error: IO error: While appending to file"))
+      assert.equal("local",
+        sync.classify_callback_error("RocksDB error: IO error: Read-only file system"))
+    end)
+
+    it("classifies LuaJIT FFI __index faults as local (900619)", function()
+      local ffi_err = "src/main.lua:1504: Failed to connect block 900619: "
+        .. "./lunarblock/../src/crypto.lua:149: bad argument #1 to '__index' "
+        .. "(userdata expected, got number)"
+      assert.equal("local", sync.classify_callback_error(ffi_err))
+    end)
+
+    it("should_punish_peer_for_block_error skips local IO and deserialize", function()
+      assert.is_false(sync.should_punish_peer_for_block_error(
+        "RocksDB error: IO error: No space left on device"))
+      assert.is_false(sync.should_punish_peer_for_block_error("deserialize failed"))
+      assert.is_false(sync.should_punish_peer_for_block_error(
+        "bad argument #1 to '__index' (userdata expected, got number)"))
+      assert.is_true(sync.should_punish_peer_for_block_error("bad-prevblk"))
+      assert.is_true(sync.should_punish_peer_for_block_error(
+        "Script verification failed for input 3"))
+    end)
   end)
 end)

@@ -1978,11 +1978,13 @@ local function main()
     if not ok then
       local err_str = tostring(err)
       print(string.format("Block download error: %s", err_str))
-      -- Bitcoin Core net_processing.cpp:4788 / MaybePunishNodeForBlock:
-      -- BLOCK_MUTATED (witness malleation) and BLOCK_INVALID_HEADER both call
-      -- Misbehaving(peer, 100). Deserialize failures are network noise (not
-      -- necessarily the peer's fault), so we skip the ban score only for that.
-      if err_str ~= "deserialize failed" then
+      -- Bitcoin Core net_processing.cpp MaybePunishNodeForBlock:
+      -- punish BLOCK_CONSENSUS / MUTATED / INVALID_HEADER / INVALID_PREV /
+      -- MISSING_PREV. Deserialize is wire noise. Local RocksDB/ENOSPC and
+      -- LuaJIT/FFI faults are not a peer fault — punishing them disconnected
+      -- the only --connect feeder (900619 FFI __index, 2026-09-17; ENOSPC
+      -- at 374505, 2026-09-12).
+      if sync_mod.should_punish_peer_for_block_error(err_str) then
         peer_manager:add_ban_score(peer, 100, err_str)
       end
     end

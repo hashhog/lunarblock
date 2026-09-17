@@ -19,7 +19,7 @@ local M = {}
 -- time chasing a chainstate ghost when the real fix was a script.lua rule.
 --
 -- This helper classifies the error string from pcall(self.connect_callback)
--- into one of three buckets so the caller can emit a banner that names the
+-- into one of four buckets so the caller can emit a banner that names the
 -- right failure class:
 --
 --   "consensus" — script/tx-validation rule mismatch with Bitcoin Core.
@@ -27,6 +27,14 @@ local M = {}
 --   "chainstate" — block body / undo data missing on disk; the chain_tip
 --                  advanced past data that never persisted. Operator action:
 --                  --reindex-chainstate.
+--   "local"     — this node's storage/IO or LuaJIT/FFI runtime failed
+--                 (ENOSPC, RocksDB IO, `userdata expected, got number`).
+--                 Not a peer fault. Operator action: free disk / fix the
+--                 node; do NOT disconnect the feeder. 900000→910000 died
+--                 at 900619 (2026-09-17) because main.lua's block handler
+--                 add_ban_score'd the --connect replay peer on a crypto.lua
+--                 FFI __index fault; 363708→388364 STALLED 2026-09-12 on
+--                 the same punish path with RocksDB ENOSPC.
 --   "unknown"   — couldn't classify; emit a neutral banner with the raw
 --                 error string and let the operator triage.
 --
@@ -96,7 +104,44 @@ function M.classify_callback_error(err)
     if s:find(pat) then return "chainstate" end
   end
 
+  -- Local disk / RocksDB IO / LuaJIT FFI. These are this node's problem,
+  -- never the peer's: Core MaybePunishNodeForBlock does not Misbehaving()
+  -- on BlockValidationResult-unset, which is what a failed disk write or
+  -- a runtime fault in our hasher is.
+  local local_patterns = {
+    "no space left on device",
+    "rocksdb error: io error",
+    "read%-only file system",
+    "readonly file system",
+    "enospc",
+    "edquot",
+    "userdata expected",
+    "bad argument #1 to '__index'",
+    "bad argument #%d+ to '__index'",
+    "crypto%.lua:",
+    "attempt to get length of",
+    "attempt to index",
+    "attempt to call",
+  }
+  for _, pat in ipairs(local_patterns) do
+    if s:find(pat) then return "local" end
+  end
+
   return "unknown"
+end
+
+-- Whether main.lua's "block" handler should add_ban_score the sending
+-- peer. Mirrors net_processing.cpp MaybePunishNodeForBlock:
+--   punish  BLOCK_CONSENSUS / MUTATED / INVALID_HEADER / INVALID_PREV /
+--           MISSING_PREV (and anything else we have not classified as
+--           local — keeping the pre-fix default).
+--   skip    deserialize failed (wire noise) and "local" IO/FFI (this node).
+function M.should_punish_peer_for_block_error(err)
+  if err == nil then return false end
+  local s = tostring(err)
+  if s == "deserialize failed" then return false end
+  if M.classify_callback_error(err) == "local" then return false end
+  return true
 end
 
 --------------------------------------------------------------------------------

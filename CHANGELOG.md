@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-17
 
+- fix: cache SHA-256 FFI symbols; do not punish --connect peers for local LuaJIT/FFI or RocksDB ENOSPC (900619 range stall)
 - 748cab7 fix: T1/T2 R5 probe parity (error codes, ConstructTransaction, missing methods)
 - 509702a feat: FFI BIP143 preimage and one checker per P2WPKH
 - 87ee013 feat: P2PKH-template fast path and HASH160 oneshot

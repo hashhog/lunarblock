@@ -6,6 +6,14 @@ local M = {}
 local sha256_accel_lib = nil
 local sha256_hw_type = nil  -- "sha_ni", "avx2", or "generic"
 local hash160_oneshot = false
+-- Cached C function pointers. Indexing `sha256_accel_lib.sha256_accel` on
+-- every digest was crypto.lua:149 of the 900619 connect failure
+-- (`bad argument #1 to '__index' (userdata expected, got number)`): after
+-- hundreds of blocks LuaJIT traces mixed that library upvalue with a Lua
+-- number. Resolve the symbols once at init; the hot path only calls.
+local sha256_accel_fn = nil
+local sha256d_accel_fn = nil
+local hash160_accel_fn = nil
 
 -- OpenSSL FFI declarations
 ffi.cdef[[
@@ -95,6 +103,8 @@ local function init_sha256_accel()
     local ok, lib = pcall(ffi.load, path)
     if ok then
       sha256_accel_lib = lib
+      sha256_accel_fn = lib.sha256_accel
+      sha256d_accel_fn = lib.sha256d_accel
       local accel_type = lib.sha256_accel_init()
       if accel_type == 1 then
         sha256_hw_type = "sha_ni"
@@ -109,6 +119,9 @@ local function init_sha256_accel()
       hash160_oneshot = pcall(function()
         lib.hash160_accel("", 0, probe)
       end)
+      if hash160_oneshot then
+        hash160_accel_fn = lib.hash160_accel
+      end
       return sha256_accel_lib
     end
   end
@@ -145,12 +158,16 @@ local EVP_CTRL_AEAD_SET_TAG = 0x11
 
 -- SHA-256: single hash (uses hardware acceleration if available)
 function M.sha256(data)
-  if sha256_accel_lib then
-    sha256_accel_lib.sha256_accel(data, #data, sha256_out)
+  if type(data) ~= "string" then
+    error("sha256: expected string, got " .. type(data))
+  end
+  local n = #data
+  if sha256_accel_fn then
+    sha256_accel_fn(data, n, sha256_out)
     return ffi.string(sha256_out, 32)
   end
   libcrypto.EVP_DigestInit_ex(sha256_evp_ctx, libcrypto.EVP_sha256(), nil)
-  libcrypto.EVP_DigestUpdate(sha256_evp_ctx, data, #data)
+  libcrypto.EVP_DigestUpdate(sha256_evp_ctx, data, n)
   libcrypto.EVP_DigestFinal_ex(sha256_evp_ctx, evp_out32, evp_md_len)
   return ffi.string(evp_out32, 32)
 end
@@ -208,8 +225,12 @@ end
 
 -- Double SHA-256: hash256 used for block hashes, txids (uses hardware acceleration if available)
 function M.hash256(data)
-  if sha256_accel_lib then
-    sha256_accel_lib.sha256d_accel(data, #data, sha256_out)
+  if type(data) ~= "string" then
+    error("hash256: expected string, got " .. type(data))
+  end
+  local n = #data
+  if sha256d_accel_fn then
+    sha256d_accel_fn(data, n, sha256_out)
     return ffi.string(sha256_out, 32)
   end
   -- Fallback to two OpenSSL calls
@@ -223,8 +244,8 @@ end
 -- @param len number: byte count (may be 0)
 -- @return string: 32-byte digest
 function M.hash256_ptr(ptr, len)
-  if sha256_accel_lib then
-    sha256_accel_lib.sha256d_accel(ptr, len, sha256_out)
+  if sha256d_accel_fn then
+    sha256d_accel_fn(ptr, len, sha256_out)
     return ffi.string(sha256_out, 32)
   end
   return M.hash256(ffi.string(ptr, len))
@@ -256,8 +277,11 @@ end
 -- When lib/sha256_accel.so exports hash160_accel this is one C call
 -- (SHA-NI SHA-256 + OpenSSL RIPEMD-160) instead of two Lua digest calls.
 function M.hash160(data)
-  if hash160_oneshot then
-    sha256_accel_lib.hash160_accel(data, #data, hash160_out)
+  if type(data) ~= "string" then
+    error("hash160: expected string, got " .. type(data))
+  end
+  if hash160_accel_fn then
+    hash160_accel_fn(data, #data, hash160_out)
     return ffi.string(hash160_out, 20)
   end
   return M.ripemd160(M.sha256(data))
