@@ -1391,7 +1391,8 @@ local function main()
   chain_state:set_pruner(pruner)
 
   -- Initialize block downloader for IBD
-  local block_downloader = sync_mod.new_block_downloader(header_chain, db, network)
+  local block_downloader = sync_mod.new_block_downloader(
+    header_chain, db, network, { dbcache = args.dbcache })
   -- Same parity concern on the P2P download path: an archive node must fetch a
   -- deep competing fork's bridging bodies down to the true fork point so the
   -- reorg can fire (mirrors the orchestrator's unbounded archive walk).
@@ -3201,7 +3202,7 @@ local function main()
     local now = socket.gettime()
     if now - last_status > 60 then
       local peers = peer_manager:get_established_peers()
-      print(string.format("[%s] Height: %d | Headers: %d | Peers: %d | Mempool: %d txs (%d bytes) | Pending: %d | Inflight: %d",
+      print(string.format("[%s] Height: %d | Headers: %d | Peers: %d | Mempool: %d txs (%d bytes) | Pending: %d (%d bytes / %d cap) | Inflight: %d",
         os.date("%Y-%m-%d %H:%M:%S"),
         chain_state.tip_height or 0,
         header_chain.header_tip_height,
@@ -3209,6 +3210,8 @@ local function main()
         mempool.tx_count,
         mempool.total_size,
         block_downloader:get_pending_count(),
+        block_downloader:get_pending_bytes(),
+        block_downloader.pending_bytes_cap or 0,
         block_downloader:get_inflight_count()
       ))
 
@@ -3250,10 +3253,12 @@ local function main()
         since_connect_s = now - block_downloader.last_connect_advance
       end
       print(string.format(
-        "[DIAG] gc_kb=%d rss_kb=%d dl_conn_gap=%d since_connect_s=%.0f peers=%d pending=%d inflight=%d",
+        "[DIAG] gc_kb=%d rss_kb=%d dl_conn_gap=%d since_connect_s=%.0f peers=%d pending=%d pending_bytes=%d pending_cap=%d inflight=%d",
         math.floor(gc_kb), rss_kb, dl_conn_gap, since_connect_s,
         #peers,
         block_downloader:get_pending_count(),
+        block_downloader:get_pending_bytes(),
+        block_downloader.pending_bytes_cap or 0,
         block_downloader:get_inflight_count()))
 
       last_status = now

@@ -2427,8 +2427,16 @@ BlockDownloader.__index = BlockDownloader
 -- @param header_chain HeaderChain: The header chain for block ordering
 -- @param storage table: Storage backend
 -- @param network table: Network configuration
+-- @param opts table|nil: {dbcache=MB, pending_bytes_cap=bytes}. The catch-up
+--   working set (decoded Lua blocks + serialized prefetch) is bounded by
+--   dbcache, not by how far behind the node is. Observed 2026-09-18: a
+--   1,130-block resume filled a 12 G cgroup, then a 20 G cgroup, because
+--   pending_blocks retained up to download_window (1024) fully decoded
+--   Lua block objects. Core writes the body to disk on receipt and does
+--   not keep a CBlock per in-flight height.
 -- @return BlockDownloader: New block downloader instance
-function M.new_block_downloader(header_chain, storage, network)
+function M.new_block_downloader(header_chain, storage, network, opts)
+  opts = opts or {}
   local self = setmetatable({}, BlockDownloader)
   self.header_chain = header_chain
   self.storage = storage
@@ -2437,7 +2445,15 @@ function M.new_block_downloader(header_chain, storage, network)
   self.blocks_per_peer = 16         -- Max blocks requested per peer at once
   self.next_download_height = 0     -- Next block height to request
   self.next_connect_height = 0      -- Next block height to connect to chain
-  self.pending_blocks = {}          -- hash_hex -> {block, height, hash}
+  -- Prefetch holds serialized wire bytes, never the decoded Lua table.
+  -- pending_bytes_cap is the operator-visible contract: a node 1,000
+  -- blocks behind must not need more RAM here than one 10 blocks behind.
+  -- Default = --dbcache (Core's coins-cache budget), overridable in tests.
+  local dbcache_mb = opts.dbcache or 450
+  if dbcache_mb < 1 then dbcache_mb = 1 end
+  self.pending_bytes_cap = opts.pending_bytes_cap or (dbcache_mb * 1024 * 1024)
+  self.pending_bytes = 0
+  self.pending_blocks = {}          -- hash_hex -> {block_data, height, hash}
   self.inflight = {}                -- hash_hex -> {peer, request_time, timeout}
   self.peer_inflight = {}           -- peer -> count of in-flight requests
   -- Base timeout before considering stalled. W65 raised 20 -> 60: a 20 s
@@ -3051,11 +3067,17 @@ function BlockDownloader:schedule_downloads(peers)
     end
   end
 
-  -- Calculate how many more blocks we can request
+  -- Calculate how many more blocks we can request. Count pending against
+  -- the window so a 1,000-block catch-up cannot have 1024 decoded/serialized
+  -- pending AND 1024 more in-flight (the live 12 G / 20 G plateau). Do not
+  -- return early when available==0: W46 still has to request the cursor
+  -- block if pending is full of far-ahead bodies.
   local inflight_count = 0
   for _ in pairs(self.inflight) do inflight_count = inflight_count + 1 end
-  local available = self.download_window - inflight_count
-  if available <= 0 then return end
+  local pending_count = 0
+  for _ in pairs(self.pending_blocks) do pending_count = pending_count + 1 end
+  local available = self.download_window - inflight_count - pending_count
+  if available < 0 then available = 0 end
 
   -- Reset download cursor when there are gaps between the connection cursor
   -- and the download cursor but nothing is in-flight. This ensures blocks
@@ -3123,7 +3145,7 @@ function BlockDownloader:schedule_downloads(peers)
     local evicted = 0
     for k, p in pairs(self.pending_blocks) do
       if p.height < self.next_connect_height then
-        self.pending_blocks[k] = nil
+        self:_drop_pending(k)
         evicted = evicted + 1
       end
     end
@@ -3149,7 +3171,10 @@ function BlockDownloader:schedule_downloads(peers)
     -- Recalculate inflight count after clearing
     inflight_count = 0
     for _ in pairs(self.inflight) do inflight_count = inflight_count + 1 end
-    available = self.download_window - inflight_count
+    pending_count = 0
+    for _ in pairs(self.pending_blocks) do pending_count = pending_count + 1 end
+    available = self.download_window - inflight_count - pending_count
+    if available < 0 then available = 0 end
   end
 
   -- Filter peers with available slots AND that can actually serve blocks
@@ -3286,7 +3311,13 @@ function BlockDownloader:schedule_downloads(peers)
       tostring(had_stalls)))
   end
 
-  -- Don't download too far ahead of connection cursor
+  -- Don't download too far ahead of connection cursor. Byte cap is the
+  -- prefetch bound: once pending serialized bytes hit --dbcache, stop
+  -- fetching more bodies. W46 above may already have requested the one
+  -- block at the cursor; that is the only exception.
+  if (self.pending_bytes or 0) >= (self.pending_bytes_cap or 0) then
+    available = 0
+  end
   local max_ahead = self.next_connect_height + self.download_window
   while height <= tip and height <= max_ahead and available > 0 do
     -- Never re-request already-connected blocks (below the connect cursor). The
@@ -3526,18 +3557,21 @@ function BlockDownloader:handle_block(peer, block_data)
     return true
   end
 
-  -- Bound the pending buffer to prevent OOM. At ~500KB per mainnet block,
-  -- 1024 blocks ≈ 512MB. The cap MUST match download_window — otherwise
-  -- prefetched blocks at the far end of the window get evicted back to the
-  -- network, and when next_connect_height advances near them, they must be
-  -- re-requested (adding ~1-3 min per-block latency at the cursor).
-  -- Observed in Wave 32: pending=512 with window=1024 caused per-block
-  -- stalls every ~1 min, throttling IBD to ~1,500 blk/hr.
-  local pending_cap = self.download_window  -- match download_window (1024)
-  local pending_count = 0
-  for _ in pairs(self.pending_blocks) do pending_count = pending_count + 1 end
-  if pending_count >= pending_cap then
-    -- Evict the block furthest from the connection cursor
+  -- Bound the pending buffer by serialized bytes (--dbcache) AND by
+  -- download_window count. Pre-2026-09-18 the comment claimed
+  -- "1024 × ~500KB ≈ 512MB" and stored the fully decoded Lua table;
+  -- a recent mainnet block is tens of MB as Lua objects, so 1024 of
+  -- them filled the 12 G then 20 G cgroup on catch-up. Prefetch now
+  -- keeps wire bytes only. The cursor block is always accepted even
+  -- if it alone exceeds the byte cap (otherwise IBD wedges); prefetch
+  -- of far-ahead bodies is what the cap sheds.
+  if self.pending_blocks[hash_hex] then
+    self:_drop_pending(hash_hex)
+  end
+  local incoming = #block_data
+  local at_cursor = (entry.height == self.next_connect_height)
+  local pending_cap = self.download_window
+  local function furthest()
     local max_height_hex, max_height = nil, -1
     for k, p in pairs(self.pending_blocks) do
       if p.height > max_height then
@@ -3545,21 +3579,58 @@ function BlockDownloader:handle_block(peer, block_data)
         max_height_hex = k
       end
     end
-    if max_height_hex and entry.height < max_height then
-      self.pending_blocks[max_height_hex] = nil
+    return max_height_hex, max_height
+  end
+  local pending_count = self:get_pending_count()
+  while pending_count > 0 do
+    local over_bytes = ((self.pending_bytes or 0) + incoming)
+      > (self.pending_bytes_cap or 0)
+    local over_count = pending_count >= pending_cap
+    if not over_bytes and not over_count then break end
+    -- Cursor block is the one we have to connect: evict others but do
+    -- not drop it, even if it is over the byte cap by itself.
+    if at_cursor and not over_count and over_bytes then
+      local max_height_hex, max_height = furthest()
+      if not max_height_hex or max_height <= entry.height then break end
+      self:_drop_pending(max_height_hex)
+      pending_count = pending_count - 1
     else
-      print(string.format("[BLOCK-DROP] BUFFER_FULL pending=%d cap=%d height=%d max_in_buf=%d hash=%s",
-        pending_count, pending_cap, entry.height, max_height, hash_hex:sub(1, 16)))
-      return true  -- This block is even further ahead, drop it
+      local max_height_hex, max_height = furthest()
+      if not max_height_hex then break end
+      if entry.height >= max_height then
+        -- Rate-limit: once the byte cap is hit, every far-ahead body
+        -- takes this path. A 1,000-block catch-up would otherwise print
+        -- a line per drop.
+        self._buffer_full_drops = (self._buffer_full_drops or 0) + 1
+        local _bf_now = require("socket").gettime()
+        if not self._last_buffer_full_log
+            or _bf_now - self._last_buffer_full_log > 30 then
+          print(string.format(
+            "[BLOCK-DROP] BUFFER_FULL pending=%d cap=%d bytes=%d byte_cap=%d height=%d max_in_buf=%d hash=%s drops=%d",
+            pending_count, pending_cap, self.pending_bytes or 0,
+            self.pending_bytes_cap or 0, entry.height, max_height,
+            hash_hex:sub(1, 16), self._buffer_full_drops))
+          self._last_buffer_full_log = _bf_now
+          self._buffer_full_drops = 0
+        end
+        return true  -- This block is even further ahead, drop it
+      end
+      self:_drop_pending(max_height_hex)
+      pending_count = pending_count - 1
     end
   end
 
-  -- Store in pending
+  -- Store serialized wire bytes only. The decoded Lua table is a
+  -- transient of deserialize above and is not retained; connect
+  -- materializes it for the one height it is about to apply.
   self.pending_blocks[hash_hex] = {
-    block = block,
     height = entry.height,
     hash = hash,
+    block_data = block_data,
   }
+  self.pending_bytes = (self.pending_bytes or 0) + incoming
+  block = nil
+  collectgarbage("step", 150)
 
   -- Try to connect blocks in order
   return self:connect_pending_blocks()
@@ -3675,6 +3746,7 @@ function BlockDownloader:_connect_pending_blocks_inner()
               block = block,
               height = entry.height,
               hash = block_hash,
+              block_data = block_data,
             }
             print(string.format("Recovered block %d from storage (was stored but not connected)",
               entry.height))
@@ -3711,6 +3783,21 @@ function BlockDownloader:_connect_pending_blocks_inner()
       break
     end
 
+    -- Decode on demand. handle_block no longer retains the Lua table.
+    if not pending.block then
+      local materialized = self:_materialize_pending(pending)
+      if not materialized then
+        print(string.format(
+          "connect_pending_blocks: pending body at height %d failed to deserialize, skipping",
+          self.next_connect_height))
+        self:_drop_pending(hash_hex)
+        self.next_connect_height = self.next_connect_height + 1
+        local _sock = require("socket")
+        self.last_connect_advance = _sock.gettime()
+        goto continue_loop
+      end
+    end
+
     -- GAP3 fix — reorg-drop part 2.  The connect cursor walks
     -- height_to_hash[next_connect_height], which accept_header rewrites along
     -- the HEAVIER header chain (sync.lua:1342/1346).  So once a competing fork
@@ -3732,7 +3819,7 @@ function BlockDownloader:_connect_pending_blocks_inner()
         -- Reorg fired; _route_fork_body re-anchored next_connect_height past
         -- the new tip.  Drop this block from pending and continue the loop
         -- from the re-anchored cursor (do NOT run the legacy +1 advance).
-        self.pending_blocks[hash_hex] = nil
+        self:_drop_pending(hash_hex)
         blocks_this_call = blocks_this_call + 1
         goto continue_loop
       elseif sb_result == "stored" then
@@ -3755,7 +3842,7 @@ function BlockDownloader:_connect_pending_blocks_inner()
         -- ABOVE the active tip is a not-yet-connectable future block; the
         -- cursor must stay at the frontier so the downloader keeps fetching
         -- the missing parents.
-        self.pending_blocks[hash_hex] = nil
+        self:_drop_pending(hash_hex)
         if pending.height == nil or pending.height == self.next_connect_height then
           -- Advance ONLY for a stored body AT the cursor: that is the sole
           -- case where standing still re-requests and re-routes the same
@@ -3817,7 +3904,7 @@ function BlockDownloader:_connect_pending_blocks_inner()
       -- Invalid block, remove from pending and skip this height.
       -- Incrementing next_connect_height prevents permanent stall on a
       -- block that repeatedly fails context-free validation.
-      self.pending_blocks[hash_hex] = nil
+      self:_drop_pending(hash_hex)
       print(string.format("Skipping invalid block at height %d: %s",
         self.next_connect_height, tostring(err)))
       self.next_connect_height = self.next_connect_height + 1
@@ -3846,7 +3933,11 @@ function BlockDownloader:_connect_pending_blocks_inner()
     -- before this fix is now removed: chain_tip is already in the atomic
     -- batch and writing it a second time async would re-introduce the very
     -- non-atomic ordering this fix is closing.
-    local pending_block_bytes = serialize.serialize_block(pending.block)
+    -- Prefer the wire bytes we already hold; re-serializing a 2 MB
+    -- decoded Lua block inside the connect_callback window was extra
+    -- CPU on the 15 s path.
+    local pending_block_bytes = pending.block_data
+      or serialize.serialize_block(pending.block)
     local pending_hash_bytes = pending.hash.bytes
     local block_storage_fn = function(batch)
       batch.put(self.storage.CF.BLOCKS, pending_hash_bytes, pending_block_bytes)
@@ -3886,7 +3977,7 @@ function BlockDownloader:_connect_pending_blocks_inner()
         -- Callback failed (e.g., UTXO validation error). Remove from pending
         -- but do NOT advance height — the block may need to be retried after
         -- fixing state. Do NOT store to disk so the scheduler re-downloads it.
-        self.pending_blocks[hash_hex] = nil
+        self:_drop_pending(hash_hex)
 
         -- Track per-hash callback failures (Fix #4 from BUG-REPORT.md).
         -- A bounded retry budget: if the same block fails to connect
@@ -3998,7 +4089,7 @@ function BlockDownloader:_connect_pending_blocks_inner()
       tx._cached_wtxid = nil
     end
 
-    self.pending_blocks[hash_hex] = nil
+    self:_drop_pending(hash_hex)
     self.next_connect_height = self.next_connect_height + 1
     blocks_this_call = blocks_this_call + 1
 
@@ -4069,10 +4160,12 @@ function BlockDownloader:_connect_pending_blocks_inner()
       end
     end
 
-    -- Periodic incremental GC to prevent LuaJIT table bloat
-    if self.next_connect_height % 1000 == 0 then
-      collectgarbage("step", 100)
-    end
+    -- Incremental GC every connected block. Pre-fix this ran every 1000
+    -- heights, so a 1,130-block catch-up never collected the decoded
+    -- tables sitting in pending_blocks and RSS climbed to the cgroup cap.
+    -- The decoded table for THIS block is already dropped by _drop_pending;
+    -- a small step here reclaims it before the next height allocates.
+    collectgarbage("step", 150)
 
     -- Log progress periodically
     if self.next_connect_height % 10000 == 0 then
@@ -4172,6 +4265,59 @@ function BlockDownloader:get_pending_count()
   local count = 0
   for _ in pairs(self.pending_blocks) do count = count + 1 end
   return count
+end
+
+--- Serialized bytes currently held in pending_blocks.
+-- Falls back to a recount if the running counter is missing (test injects).
+-- @return number
+function BlockDownloader:get_pending_bytes()
+  if self.pending_bytes and self.pending_bytes > 0 then
+    return self.pending_bytes
+  end
+  local n = 0
+  for _, p in pairs(self.pending_blocks) do
+    if p.block_data then n = n + #p.block_data end
+  end
+  return n
+end
+
+--- Drop a pending entry and release its serialized-byte budget.
+-- Also nils the decoded Lua table so the GC can reclaim it. Used by every
+-- path that previously did `self.pending_blocks[k] = nil` so the byte
+-- counter cannot drift.
+-- @param hash_hex string
+-- @return table|nil the dropped entry
+function BlockDownloader:_drop_pending(hash_hex)
+  local p = self.pending_blocks[hash_hex]
+  if not p then return nil end
+  self.pending_blocks[hash_hex] = nil
+  local n = (p.block_data and #p.block_data) or 0
+  if n > 0 then
+    self.pending_bytes = (self.pending_bytes or 0) - n
+    if self.pending_bytes < 0 then self.pending_bytes = 0 end
+  end
+  p.block = nil
+  p.block_data = nil
+  return p
+end
+
+--- Decode a pending entry on demand (connect path only).
+-- handle_block stores wire bytes; connect is the only place that needs the
+-- Lua table, and it is dropped again when the height advances. Returns nil
+-- if there is no body to decode.
+-- @param pending table
+-- @return table|nil decoded block
+function BlockDownloader:_materialize_pending(pending)
+  if not pending then return nil end
+  if pending.block then return pending.block end
+  if pending.block_data then
+    local ok, block = pcall(serialize.deserialize_block, pending.block_data)
+    if ok and block then
+      pending.block = block
+      return block
+    end
+  end
+  return nil
 end
 
 -- Export the BlockDownloader class

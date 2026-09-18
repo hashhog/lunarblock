@@ -12173,7 +12173,11 @@ end
         rpc.block_downloader.next_download_height = new_height + 1
         -- Clear any pending/inflight for the block we just connected
         local connected_hex = types.hash256_hex(block_hash)
-        rpc.block_downloader.pending_blocks[connected_hex] = nil
+        if rpc.block_downloader._drop_pending then
+          rpc.block_downloader:_drop_pending(connected_hex)
+        else
+          rpc.block_downloader.pending_blocks[connected_hex] = nil
+        end
         if rpc.block_downloader.inflight[connected_hex] then
           local inf = rpc.block_downloader.inflight[connected_hex]
           if rpc.block_downloader.peer_inflight[inf.peer] then
