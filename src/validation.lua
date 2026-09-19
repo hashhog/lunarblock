@@ -35,23 +35,117 @@ ffi.cdef[[
     int result;
   } sig_verify_job;
 
+  /* Full per-input script check (must match csrc/parallel_verify.c) */
+  typedef struct {
+    const uint8_t *tx_bytes;
+    const uint8_t *prev_script;
+    const uint8_t *prevouts_blob;
+    size_t tx_len;
+    size_t prev_script_len;
+    size_t prevouts_len;
+    int64_t amount;
+    uint32_t input_index;
+    uint32_t flags;
+    int result;
+    char error[196];
+  } script_check_job;
+
   int pv_init(int num_threads);
   int pv_verify_batch(verify_job *jobs, int count);
   int pv_verify_signatures(sig_verify_job *jobs, int count);
+  int pv_verify_script_checks(script_check_job *jobs, int count);
   int pv_get_num_workers(void);
+  int pv_get_script_workers(void);
+  int pv_set_lua_paths(const char *path, const char *cpath);
+  const char *pv_get_boot_error(void);
   void pv_shutdown(void);
 ]]
 
 -- Parallel verification library (lazy loaded)
 local pv_lib = nil
 local pv_available = nil
+-- nil = auto (pv_init(0)); a number is passed straight to pv_init.
+local requested_workers = nil
+
+-- SCRIPT_VERIFY bit packing for the C job. TAPROOT_ACTIVE is a deployment
+-- gate (height >= taproot_height), not a Core SCRIPT_VERIFY_* flag.
+M.SCRIPT_FLAG_BITS = {
+  verify_p2sh                = 1,
+  verify_dersig              = 2,
+  verify_checklocktimeverify = 4,
+  verify_checksequenceverify = 8,
+  verify_witness             = 16,
+  verify_nulldummy           = 32,
+  verify_taproot             = 64,
+  verify_strictenc           = 128,
+  verify_low_s               = 256,
+  verify_sigpushonly         = 512,
+  verify_minimaldata         = 1024,
+  verify_cleanstack          = 2048,
+  verify_nullfail            = 4096,
+  verify_witness_pubkeytype  = 8192,
+  verify_minimalif           = 16384,
+  verify_const_scriptcode    = 32768,
+}
+M.FLAG_TAPROOT_ACTIVE = 65536
+
+function M.script_flags_to_bits(flags, taproot_active)
+  local bits = 0
+  flags = flags or {}
+  for name, bitv in pairs(M.SCRIPT_FLAG_BITS) do
+    if flags[name] then
+      bits = bit.bor(bits, bitv)
+    end
+  end
+  if taproot_active then
+    bits = bit.bor(bits, M.FLAG_TAPROOT_ACTIVE)
+  end
+  return bits
+end
+
+function M.script_flags_from_bits(bits)
+  bits = tonumber(bits) or 0
+  local flags = {}
+  for name, bitv in pairs(M.SCRIPT_FLAG_BITS) do
+    if bit.band(bits, bitv) ~= 0 then
+      flags[name] = true
+    end
+  end
+  return flags
+end
+
+function M.script_flags_taproot_active(bits)
+  return bit.band(tonumber(bits) or 0, M.FLAG_TAPROOT_ACTIVE) ~= 0
+end
+
+function M.encode_prevouts(prev_outputs)
+  if not prev_outputs then return "" end
+  local w = serialize.buffer_writer()
+  w.write_u32le(#prev_outputs)
+  for i = 1, #prev_outputs do
+    local po = prev_outputs[i]
+    w.write_i64le(po.value)
+    w.write_varstr(po.script_pubkey or "")
+  end
+  return w.result()
+end
+
+function M.decode_prevouts(blob)
+  if not blob or #blob == 0 then return nil end
+  local r = serialize.buffer_reader(blob)
+  local n = r.read_u32le()
+  local out = {}
+  for i = 1, n do
+    out[i] = { value = r.read_i64le(), script_pubkey = r.read_varstr() }
+  end
+  return out
+end
 
 -- Try to load the parallel verification library
-local function init_parallel_verify()
-  if pv_available ~= nil then
-    return pv_available
+local function load_pv_lib()
+  if pv_lib then
+    return true
   end
-
   local paths = {
     "./lib/parallel_verify.so",
     "lunarblock/parallel_verify",
@@ -59,25 +153,41 @@ local function init_parallel_verify()
     "./parallel_verify.so",
     "parallel_verify",
   }
-
   for _, path in ipairs(paths) do
     local ok, lib = pcall(ffi.load, path)
     if ok then
       pv_lib = lib
-      -- Initialize worker pool
-      local num_workers = lib.pv_init(0)  -- Auto-detect thread count
-      if num_workers > 0 then
-        pv_available = true
-        return true
-      end
+      return true
     end
   end
+  return false
+end
 
+local function init_parallel_verify()
+  if pv_available ~= nil then
+    return pv_available
+  end
+  if requested_workers == 0 then
+    pv_available = false
+    return false
+  end
+  if not load_pv_lib() then
+    pv_available = false
+    return false
+  end
+  pv_lib.pv_set_lua_paths(package.path, package.cpath)
+  local n = requested_workers
+  if n == nil then n = 0 end  -- 0 = auto (ncpus-1, cap 15)
+  local num_workers = pv_lib.pv_init(n)
+  if num_workers > 0 then
+    pv_available = true
+    return true
+  end
   pv_available = false
   return false
 end
 
--- Threshold for using parallel verification
+-- Threshold for using parallel ECDSA verification (legacy collector path)
 local PARALLEL_THRESHOLD = 16
 
 --- Check if parallel verification is available.
@@ -98,10 +208,168 @@ end
 --- Shutdown parallel verification workers.
 -- Call this before exit to clean up resources.
 function M.parallel_verify_shutdown()
-  if pv_lib and pv_available then
+  if pv_lib then
     pv_lib.pv_shutdown()
-    pv_available = false
   end
+  pv_available = nil
+end
+
+--- Set the script-check worker count (C lua_State threads).
+-- 0 = auto (ncpus-1, capped at 15). n>=1 = exactly n workers.
+-- Recreates the pool. Returns true if the C library loaded and pv_init
+-- created at least one thread.
+function M.set_script_check_workers(n)
+  assert(type(n) == "number", "set_script_check_workers expects a number")
+  requested_workers = n
+  if pv_lib then
+    pv_lib.pv_shutdown()
+  end
+  if n == 0 then
+    -- Explicit serial: do not auto-start the pool.
+    pv_available = false
+    return true
+  end
+  pv_available = nil
+  return init_parallel_verify()
+end
+
+--- Number of workers whose lua_State bootstrapped (full VerifyScript).
+function M.script_check_workers()
+  if not init_parallel_verify() then
+    return 0
+  end
+  return tonumber(pv_lib.pv_get_script_workers()) or 0
+end
+
+--- Last worker-bootstrap error string (empty if none).
+function M.script_check_boot_error()
+  if not pv_lib then
+    return "parallel_verify.so not loaded"
+  end
+  return ffi.string(pv_lib.pv_get_boot_error())
+end
+
+local function tx_force_witness(tx)
+  if tx.segwit then return end
+  for _, inp in ipairs(tx.inputs) do
+    if inp.witness and #inp.witness > 0 then
+      tx.segwit = true
+      return
+    end
+  end
+end
+
+--- Run a batch of per-input script checks.
+-- Decision identity: the first (lowest-index) failure is the reported
+-- reason, whether the pool has 1 worker or N.
+-- @param jobs array of {tx, input_index, amount, script_pubkey, flags,
+--   taproot_active, prev_outputs?}
+-- @return boolean, string|nil
+function M.verify_script_checks(jobs)
+  if not jobs or #jobs == 0 then
+    return true
+  end
+
+  local function run_one(job)
+    return M.verify_input_script(
+      job.tx, job.input_index, job.amount, job.script_pubkey, job.flags,
+      {
+        taproot_active = job.taproot_active,
+        prev_outputs = job.prev_outputs,
+        cache = job.cache,
+      })
+  end
+
+  local nworkers = 0
+  if init_parallel_verify() then
+    nworkers = tonumber(pv_lib.pv_get_script_workers()) or 0
+  end
+
+  if nworkers < 1 then
+    for i, job in ipairs(jobs) do
+      local ok, err = run_one(job)
+      if not ok then
+        return false, string.format("input %d: %s", i, tostring(err or "script check failed"))
+      end
+    end
+    return true
+  end
+
+  local n = #jobs
+  local cjobs = ffi.new("script_check_job[?]", n)
+  local keep = { cjobs = cjobs }
+  local tx_cdata = {}
+  local prev_cdata = {}
+
+  for i, job in ipairs(jobs) do
+    local j = i - 1
+    local tx = job.tx
+    tx_force_witness(tx)
+    if not tx_cdata[tx] then
+      local bytes = serialize.serialize_transaction(tx, true)
+      local buf = ffi.new("uint8_t[?]", #bytes)
+      ffi.copy(buf, bytes, #bytes)
+      tx_cdata[tx] = { buf = buf, len = #bytes }
+    end
+    local txb = tx_cdata[tx]
+    cjobs[j].tx_bytes = txb.buf
+    cjobs[j].tx_len = txb.len
+    cjobs[j].input_index = job.input_index
+    cjobs[j].amount = job.amount
+    cjobs[j].flags = M.script_flags_to_bits(job.flags, job.taproot_active)
+
+    local spk = job.script_pubkey or ""
+    local spk_len = #spk
+    local spkbuf = ffi.new("uint8_t[?]", spk_len > 0 and spk_len or 1)
+    if spk_len > 0 then ffi.copy(spkbuf, spk, spk_len) end
+    keep[#keep + 1] = spkbuf
+    cjobs[j].prev_script = spkbuf
+    cjobs[j].prev_script_len = spk_len
+
+    local prevouts = job.prev_outputs
+    if prevouts then
+      if not prev_cdata[prevouts] then
+        local blob = M.encode_prevouts(prevouts)
+        local blen = #blob
+        local buf = ffi.new("uint8_t[?]", blen > 0 and blen or 1)
+        if blen > 0 then ffi.copy(buf, blob, blen) end
+        prev_cdata[prevouts] = { buf = buf, len = blen }
+      end
+      local pb = prev_cdata[prevouts]
+      cjobs[j].prevouts_blob = pb.buf
+      cjobs[j].prevouts_len = pb.len
+    else
+      cjobs[j].prevouts_blob = nil
+      cjobs[j].prevouts_len = 0
+    end
+    cjobs[j].result = 0
+    cjobs[j].error[0] = 0
+  end
+  keep.tx = tx_cdata
+  keep.prev = prev_cdata
+
+  local failures = pv_lib.pv_verify_script_checks(cjobs, n)
+  if failures == -2 then
+    -- Workers exist but none bootstrapped a lua_State.
+    for i, job in ipairs(jobs) do
+      local ok, err = run_one(job)
+      if not ok then
+        return false, string.format("input %d: %s", i, tostring(err or "script check failed"))
+      end
+    end
+    return true
+  elseif failures < 0 then
+    return false, "parallel script verification error"
+  end
+
+  for i = 0, n - 1 do
+    if cjobs[i].result ~= 1 then
+      local err = ffi.string(cjobs[i].error)
+      if err == "" then err = "script check failed" end
+      return false, string.format("input %d: %s", i + 1, err)
+    end
+  end
+  return true
 end
 
 --- Verify a batch of signatures in parallel.
@@ -2522,6 +2790,231 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
   end
 
   return checker
+end
+
+local function copy_flags(flags)
+  local f = {}
+  flags = flags or {}
+  for k, v in pairs(flags) do f[k] = v end
+  return f
+end
+
+local function verify_input_script_inner(tx, input_index, utxo_value, script_pubkey, flags, opts)
+  opts = opts or {}
+  flags = flags or {}
+  local inp = tx.inputs[input_index + 1]
+  assert(inp, "missing input")
+  local taproot_active = opts.taproot_active
+  if taproot_active == nil then
+    taproot_active = flags.verify_taproot and true or false
+  end
+  local cache = opts.cache
+  local prev_outputs = opts.prev_outputs
+  local collector = opts.collector
+
+  local function get_cache()
+    if cache then return cache end
+    cache = M.precomputed_tx_data(tx, prev_outputs)
+    return cache
+  end
+
+  local function get_prev_outputs()
+    if prev_outputs then return prev_outputs end
+    -- Taproot key-path needs every input's prevout. Best-effort from this
+    -- single spent output when the caller did not supply the vector.
+    prev_outputs = { { value = utxo_value, script_pubkey = script_pubkey } }
+    return prev_outputs
+  end
+
+  local script_type = script.classify_script(script_pubkey)
+
+  if script_type == "p2wpkh" or script_type == "p2wsh" then
+    assert(#inp.script_sig == 0, "SegWit input must have empty scriptSig")
+    local witness_stack = inp.witness or {}
+    local wflags = copy_flags(flags)
+    wflags.is_segwit = true
+    wflags.is_witness_v0 = true
+    if script_type == "p2wpkh" then
+      local ok, err = M.verify_native_p2wpkh(
+        tx, input_index, utxo_value, script_pubkey, wflags, collector, get_cache())
+      assert(ok, err or "P2WPKH script verification failed")
+      return true
+    end
+    -- P2WSH
+    assert(#witness_stack >= 1, "WITNESS_PROGRAM_WITNESS_EMPTY")
+    local witness_script = witness_stack[#witness_stack]
+    local script_hash = crypto.sha256(witness_script)
+    assert(script_hash == script_pubkey:sub(3, 34), "P2WSH script hash mismatch")
+    local stack = {}
+    for i = 1, #witness_stack - 1 do
+      stack[i] = witness_stack[i]
+    end
+    wflags.witness_script = witness_script
+    local p2wsh_needs_inline = script.has_multisig_op(witness_script)
+      or not script.is_deferrable_sig_template(witness_script)
+    local segwit_checker
+    if collector then
+      segwit_checker = M.make_collecting_sig_checker(
+        tx, input_index, utxo_value, script_pubkey, wflags, collector,
+        nil, p2wsh_needs_inline, get_cache())
+    else
+      segwit_checker = M.make_sig_checker(
+        tx, input_index, utxo_value, script_pubkey, wflags,
+        nil, get_cache())
+    end
+    local ok, err = script.execute_witness_script(witness_script, stack, wflags, segwit_checker)
+    assert(ok, err or "P2WSH script verification failed")
+    return true
+  end
+
+  if script_type == "p2tr" and taproot_active then
+    assert(#inp.script_sig == 0, "Taproot input must have empty scriptSig")
+    local witness = inp.witness or {}
+    assert(#witness > 0, "taproot witness empty")
+    local full_witness = inp.witness or {}
+    local witness_program = script_pubkey:sub(3, 34)
+
+    local annex = nil
+    if #witness >= 2 then
+      local last = witness[#witness]
+      if #last > 0 and string.byte(last, 1) == 0x50 then
+        annex = last
+        local trimmed = {}
+        for wi = 1, #witness - 1 do
+          trimmed[wi] = witness[wi]
+        end
+        witness = trimmed
+      end
+    end
+
+    local prev_outs = get_prev_outputs()
+
+    if #witness == 1 then
+      local sig = witness[1]
+      assert(#sig == 64 or #sig == 65, "taproot invalid signature length")
+      local hash_type = 0x00
+      local sig_bytes = sig
+      if #sig == 65 then
+        hash_type = string.byte(sig, 65)
+        sig_bytes = string.sub(sig, 1, 64)
+        assert(hash_type ~= 0x00, "taproot invalid hash type with 65-byte sig")
+        assert(M.is_valid_taproot_hash_type(hash_type), "taproot invalid hash type")
+      end
+      local sighash, sh_err = M.signature_hash_taproot(
+        tx, input_index, hash_type, prev_outs, 0, annex, nil, nil, get_cache())
+      assert(sighash, "taproot sighash failed: " .. tostring(sh_err))
+      local ok = crypto.schnorr_verify(witness_program, sig_bytes, sighash)
+      assert(ok, "taproot key-path signature verification failed")
+      return true
+    end
+
+    local control_block = witness[#witness]
+    local tapscript = witness[#witness - 1]
+    assert(#control_block >= 33, "taproot invalid control block size")
+    assert(#control_block <= 4129, "taproot invalid control block size")
+    assert((#control_block - 33) % 32 == 0, "taproot invalid control block size")
+
+    local leaf_version = bit.band(string.byte(control_block, 1), 0xFE)
+    local control_parity = bit.band(string.byte(control_block, 1), 0x01)
+    local internal_key = string.sub(control_block, 2, 33)
+    local leaf_hash = crypto.tagged_hash("TapLeaf",
+      string.char(leaf_version) .. crypto.compact_size(#tapscript) .. tapscript)
+    local current = leaf_hash
+    for mi = 34, #control_block, 32 do
+      local sibling = string.sub(control_block, mi, mi + 31)
+      if current < sibling then
+        current = crypto.tagged_hash("TapBranch", current .. sibling)
+      else
+        current = crypto.tagged_hash("TapBranch", sibling .. current)
+      end
+    end
+    local tweak = crypto.tagged_hash("TapTweak", internal_key .. current)
+    local tweaked_key, tweaked_parity = crypto.tweak_pubkey(internal_key, tweak)
+    assert(tweaked_key and tweaked_key == witness_program, "taproot commitment mismatch")
+    assert(tweaked_parity == control_parity, "taproot parity mismatch")
+
+    if leaf_version == 0xC0 then
+      local script_witness = {}
+      for wi = 1, #witness - 2 do
+        script_witness[wi] = witness[wi]
+      end
+      local tapscript_checker = M.make_tapscript_checker(
+        tx, input_index, prev_outs, leaf_hash, annex, get_cache())
+      local validation_weight =
+        script.serialized_witness_stack_size(full_witness) + 50
+      local ok, err = script.verify_tapscript(
+        tapscript, script_witness, tapscript_checker, validation_weight)
+      assert(ok, "tapscript execution failed: " .. (err or "unknown"))
+    end
+    return true
+  end
+
+  -- Legacy or P2SH.
+  local lflags = copy_flags(flags)
+  local legacy_has_multisig = false
+  if script.has_multisig_op(inp.script_sig) then
+    legacy_has_multisig = true
+  elseif script.has_multisig_op(script_pubkey) then
+    legacy_has_multisig = true
+  elseif lflags.verify_p2sh and script_type == "p2sh" then
+    local redeem = script.extract_last_push(inp.script_sig)
+    if redeem then
+      if script.has_multisig_op(redeem) then
+        legacy_has_multisig = true
+      elseif lflags.verify_witness then
+        local wv, wp = script.is_witness_program(redeem)
+        if wv == 0 and wp and #wp == 32 then
+          local p2sh_witness_stack = inp.witness or {}
+          if #p2sh_witness_stack > 0 then
+            local inner_ws = p2sh_witness_stack[#p2sh_witness_stack]
+            if inner_ws and script.has_multisig_op(inner_ws) then
+              legacy_has_multisig = true
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local legacy_needs_inline = legacy_has_multisig
+  if not legacy_needs_inline then
+    local exec_script = script_pubkey
+    if lflags.verify_p2sh and script_type == "p2sh" then
+      local redeem = script.extract_last_push(inp.script_sig)
+      if redeem then exec_script = redeem end
+    end
+    if not (script.is_push_only(inp.script_sig)
+            and script.is_deferrable_sig_template(exec_script)) then
+      legacy_needs_inline = true
+    end
+  end
+
+  local checker
+  if collector then
+    checker = M.make_collecting_sig_checker(
+      tx, input_index, utxo_value, script_pubkey, lflags, collector,
+      get_prev_outputs(), legacy_needs_inline, get_cache())
+  else
+    checker = M.make_sig_checker(
+      tx, input_index, utxo_value, script_pubkey, lflags,
+      get_prev_outputs(), get_cache())
+  end
+  local ok, err = script.verify_script(inp.script_sig, script_pubkey, lflags, checker)
+  assert(ok, err or "verify_script returned false")
+  return true
+end
+
+--- Verify one input's script. Same accept/reject as connect_block's inline
+-- path. Throws from the interpreter are converted to (nil, err) so a
+-- worker lua_State can report them without killing the process.
+-- @return boolean|nil, string|nil
+function M.verify_input_script(tx, input_index, utxo_value, script_pubkey, flags, opts)
+  local ok, a, b = pcall(verify_input_script_inner,
+    tx, input_index, utxo_value, script_pubkey, flags, opts)
+  if not ok then
+    return nil, tostring(a)
+  end
+  return a, b
 end
 
 --- Verify a native P2WPKH input (connect_block hot path at 900k).

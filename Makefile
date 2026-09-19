@@ -37,11 +37,20 @@ help:
 # 272, 325) and sha256_accel_init() probes CPUID at runtime, returning
 # 1=SHA-NI, 2=AVX2, 0=generic. So the .so is safe to build and ship on hosts
 # without the instructions — it just reports generic.
-build: lib/sha256_accel.so
+build: lib/sha256_accel.so lib/parallel_verify.so
 
 lib/sha256_accel.so: csrc/sha256_accel.c
 	@mkdir -p lib
 	$(CC) -O3 -fPIC -shared -o $@ $< -lcrypto
+	@echo "built $@"
+
+# CCheckQueue-shaped worker pool: ECDSA jobs plus full VerifyScript jobs
+# on a per-thread lua_State. Linked against libluajit so workers own
+# independent states (the host luajit lua_State is not thread-safe).
+lib/parallel_verify.so: csrc/parallel_verify.c
+	@mkdir -p lib
+	$(CC) -O3 -fPIC -shared -I/usr/include/luajit-2.1 -o $@ $< \
+	  -lpthread -lsecp256k1 -lluajit-5.1
 	@echo "built $@"
 
 # busted is installed under ~/.luarocks but its own modules are NOT on the

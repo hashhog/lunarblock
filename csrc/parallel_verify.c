@@ -24,8 +24,13 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <unistd.h>
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
 
 /*
  * secp256k1 declarations (avoiding header dependency)
@@ -97,12 +102,35 @@ typedef struct {
     int result;                   /* 1 = valid, 0 = invalid */
 } sig_verify_job;
 
+/*
+ * Full per-input script check (Core CScriptCheck).
+ *
+ * Layout must match the LuaJIT FFI cdef in src/validation.lua exactly.
+ * Pointers first, then size_t, then int64, then uint32s, then result,
+ * then a 196-byte error buffer (total 264 bytes on LP64).
+ */
+typedef struct {
+    const uint8_t *tx_bytes;
+    const uint8_t *prev_script;
+    const uint8_t *prevouts_blob;
+    size_t tx_len;
+    size_t prev_script_len;
+    size_t prevouts_len;
+    int64_t amount;
+    uint32_t input_index;
+    uint32_t flags;
+    int result;                   /* 1 = valid, 0 = invalid */
+    char error[196];
+} script_check_job;
+
 /* Worker thread state */
 typedef struct {
     pthread_t thread;
     secp256k1_context *ctx;
+    lua_State *L;                 /* per-thread lua_State; NULL if bootstrap failed */
     int id;
     int running;
+    int script_ready;
 } worker_t;
 
 /* Unified job-queue entry.
@@ -113,8 +141,9 @@ typedef struct {
  * single worker function dispatch to either kind.
  */
 typedef enum {
-    PV_JOB_INPUT = 1,   /* verify_job *      (placeholder framework) */
-    PV_JOB_SIG   = 2    /* sig_verify_job *  (production hot path)   */
+    PV_JOB_INPUT  = 1,   /* verify_job *       (placeholder framework) */
+    PV_JOB_SIG    = 2,   /* sig_verify_job *   (ECDSA-only hot path)   */
+    PV_JOB_SCRIPT = 3    /* script_check_job * (full VerifyScript)     */
 } pv_job_kind;
 
 /* Global state */
@@ -133,10 +162,21 @@ static int next_job = 0;
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t work_available = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t work_done = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t workers_ready_cv = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t lua_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int shutdown_flag = 0;
+static int workers_ready = 0;
 
-/* Minimum inputs to use parallel verification (overhead not worth it below this) */
+/* Minimum inputs to use parallel ECDSA verification (overhead not worth it below this) */
 #define MIN_PARALLEL_INPUTS 16
+
+/* Core MAX_SCRIPTCHECK_THREADS (validation.h). Additional worker threads. */
+#define MAX_SCRIPTCHECK_THREADS 15
+
+/* package.path / package.cpath copied from the host lua_State before pv_init. */
+static char g_lua_path[8192];
+static char g_lua_cpath[8192];
+static char g_boot_err[512];
 
 /*
  * Lax DER parser for ECDSA signatures.
@@ -333,6 +373,102 @@ static void process_sig_job(worker_t *worker, sig_verify_job *job) {
 }
 
 /*
+ * Create a dedicated lua_State for one worker and load the script-check
+ * entry point. Each state is used only by this thread. Failure is not
+ * fatal for ECDSA jobs (those use the secp256k1 context); script jobs
+ * then fall back to serial on the Lua side if no worker is script-ready.
+ */
+static lua_State *create_worker_state(int id) {
+    lua_State *L = luaL_newstate();
+    if (!L) {
+        snprintf(g_boot_err, sizeof(g_boot_err), "luaL_newstate failed (id=%d)", id);
+        return NULL;
+    }
+    luaL_openlibs(L);
+
+    const char *path = g_lua_path[0] ? g_lua_path : "src/?.lua;lunarblock/?.lua;;";
+    const char *cpath = g_lua_cpath[0] ? g_lua_cpath : "./lib/?.so;;";
+
+    lua_getglobal(L, "package");
+    if (!lua_istable(L, -1)) {
+        snprintf(g_boot_err, sizeof(g_boot_err), "worker %d: package table missing", id);
+        lua_close(L);
+        return NULL;
+    }
+    lua_pushstring(L, path);
+    lua_setfield(L, -2, "path");
+    lua_pushstring(L, cpath);
+    lua_setfield(L, -2, "cpath");
+    lua_pop(L, 1);
+
+    static const char *boot =
+        "local ok, worker = pcall(require, 'lunarblock.script_check_worker')\n"
+        "if not ok then error(worker) end\n"
+        "if type(worker) ~= 'table' or type(worker.run) ~= 'function' then\n"
+        "  error('script_check_worker.run missing')\n"
+        "end\n"
+        "_G.__script_check_run = worker.run\n";
+
+    if (luaL_loadstring(L, boot) != 0 || lua_pcall(L, 0, 0, 0) != 0) {
+        const char *err = lua_tostring(L, -1);
+        snprintf(g_boot_err, sizeof(g_boot_err), "worker %d bootstrap: %s",
+                 id, err ? err : "?");
+        lua_close(L);
+        return NULL;
+    }
+    lua_getglobal(L, "__script_check_run");
+    if (!lua_isfunction(L, -1)) {
+        snprintf(g_boot_err, sizeof(g_boot_err),
+                 "worker %d: __script_check_run not a function", id);
+        lua_close(L);
+        return NULL;
+    }
+    lua_pop(L, 1);
+    return L;
+}
+
+static void set_job_error(script_check_job *job, const char *msg) {
+    job->result = 0;
+    if (!msg) msg = "script check failed";
+    snprintf(job->error, sizeof(job->error), "%s", msg);
+}
+
+static void process_script_job(worker_t *worker, script_check_job *job) {
+    lua_State *L = worker->L;
+    if (!L) {
+        set_job_error(job, "no lua_State on worker");
+        return;
+    }
+    lua_settop(L, 0);
+    lua_getglobal(L, "__script_check_run");
+    lua_pushlstring(L, (const char *)job->tx_bytes, job->tx_len);
+    lua_pushinteger(L, (lua_Integer)job->input_index);
+    lua_pushlstring(L, (const char *)job->prev_script, job->prev_script_len);
+    lua_pushnumber(L, (lua_Number)job->amount);
+    lua_pushinteger(L, (lua_Integer)job->flags);
+    if (job->prevouts_blob && job->prevouts_len > 0) {
+        lua_pushlstring(L, (const char *)job->prevouts_blob, job->prevouts_len);
+    } else {
+        lua_pushnil(L);
+    }
+    if (lua_pcall(L, 6, 2, 0) != 0) {
+        const char *err = lua_tostring(L, -1);
+        set_job_error(job, err);
+        lua_settop(L, 0);
+        return;
+    }
+    int ok = lua_toboolean(L, -2);
+    if (ok) {
+        job->result = 1;
+        job->error[0] = '\0';
+    } else {
+        const char *err = lua_tostring(L, -1);
+        set_job_error(job, err);
+    }
+    lua_settop(L, 0);
+}
+
+/*
  * Unified worker thread function.
  *
  * Waits on the unified queue, dispatches per current_kind, signals
@@ -342,6 +478,18 @@ static void process_sig_job(worker_t *worker, sig_verify_job *job) {
  */
 static void *worker_func(void *arg) {
     worker_t *worker = (worker_t *)arg;
+
+    /* One lua_State per worker. Serialise bootstrap so concurrent
+     * require/ffi.load of the same C libraries is not a data race. */
+    pthread_mutex_lock(&lua_init_mutex);
+    worker->L = create_worker_state(worker->id);
+    worker->script_ready = (worker->L != NULL);
+    pthread_mutex_unlock(&lua_init_mutex);
+
+    pthread_mutex_lock(&queue_mutex);
+    workers_ready++;
+    pthread_cond_signal(&workers_ready_cv);
+    pthread_mutex_unlock(&queue_mutex);
 
     while (1) {
         void *job_ptr = NULL;
@@ -363,8 +511,10 @@ static void *worker_func(void *arg) {
             kind = current_kind;
             if (kind == PV_JOB_INPUT) {
                 job_ptr = &((verify_job *)job_queue)[job_idx];
-            } else {
+            } else if (kind == PV_JOB_SIG) {
                 job_ptr = &((sig_verify_job *)job_queue)[job_idx];
+            } else {
+                job_ptr = &((script_check_job *)job_queue)[job_idx];
             }
         }
 
@@ -373,8 +523,10 @@ static void *worker_func(void *arg) {
         if (job_ptr != NULL) {
             if (kind == PV_JOB_INPUT) {
                 process_input_job(worker, (verify_job *)job_ptr);
-            } else {
+            } else if (kind == PV_JOB_SIG) {
                 process_sig_job(worker, (sig_verify_job *)job_ptr);
+            } else {
+                process_script_job(worker, (script_check_job *)job_ptr);
             }
 
             pthread_mutex_lock(&queue_mutex);
@@ -408,9 +560,10 @@ int pv_init(int num_threads) {
         num_threads = (int)(ncpus > 1 ? ncpus - 1 : 1);
     }
 
-    /* Cap at reasonable maximum */
-    if (num_threads > 64) {
-        num_threads = 64;
+    /* Cap at Core's MAX_SCRIPTCHECK_THREADS. Excess threads contend on
+     * the queue mutex and on secp256k1 / lua_State memory. */
+    if (num_threads > MAX_SCRIPTCHECK_THREADS) {
+        num_threads = MAX_SCRIPTCHECK_THREADS;
     }
 
     workers = (worker_t *)calloc(num_threads, sizeof(worker_t));
@@ -420,6 +573,8 @@ int pv_init(int num_threads) {
 
     num_workers = num_threads;
     shutdown_flag = 0;
+    workers_ready = 0;
+    g_boot_err[0] = '\0';
 
     /* Create worker threads */
     for (int i = 0; i < num_workers; i++) {
@@ -457,7 +612,17 @@ int pv_init(int num_threads) {
         }
 
         workers[i].running = 1;
+        workers[i].L = NULL;
+        workers[i].script_ready = 0;
     }
+
+    /* Wait until every worker has finished lua_State bootstrap (or failed
+     * it) so the first script-check batch cannot run against a NULL L. */
+    pthread_mutex_lock(&queue_mutex);
+    while (workers_ready < num_workers && !shutdown_flag) {
+        pthread_cond_wait(&workers_ready_cv, &queue_mutex);
+    }
+    pthread_mutex_unlock(&queue_mutex);
 
     initialized = 1;
     return num_workers;
@@ -564,6 +729,11 @@ void pv_shutdown(void) {
             secp256k1_context_destroy(workers[i].ctx);
             workers[i].ctx = NULL;
         }
+        if (workers[i].L) {
+            lua_close(workers[i].L);
+            workers[i].L = NULL;
+        }
+        workers[i].script_ready = 0;
     }
 
     free(workers);
@@ -571,6 +741,87 @@ void pv_shutdown(void) {
     num_workers = 0;
     initialized = 0;
     shutdown_flag = 0;
+    workers_ready = 0;
+}
+
+int pv_set_lua_paths(const char *path, const char *cpath) {
+    if (path) {
+        strncpy(g_lua_path, path, sizeof(g_lua_path) - 1);
+        g_lua_path[sizeof(g_lua_path) - 1] = '\0';
+    }
+    if (cpath) {
+        strncpy(g_lua_cpath, cpath, sizeof(g_lua_cpath) - 1);
+        g_lua_cpath[sizeof(g_lua_cpath) - 1] = '\0';
+    }
+    return 0;
+}
+
+const char *pv_get_boot_error(void) {
+    return g_boot_err;
+}
+
+int pv_get_script_workers(void) {
+    if (!initialized || !workers) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < num_workers; i++) {
+        if (workers[i].script_ready) n++;
+    }
+    return n;
+}
+
+/*
+ * Verify a batch of full per-input script checks in parallel.
+ *
+ * Each worker runs VerifyScript on its own lua_State. The reported failure
+ * is the lowest-index job that did not return 1, so the reject reason does
+ * not depend on which worker ran which check.
+ *
+ * @return number of failures (0 = all valid), -1 on init error, -2 if no
+ *         worker has a lua_State (caller should run serial).
+ */
+int pv_verify_script_checks(script_check_job *jobs, int count) {
+    if (!initialized) {
+        if (pv_init(0) < 0) {
+            return -1;
+        }
+    }
+
+    if (count <= 0) {
+        return 0;
+    }
+
+    int script_n = pv_get_script_workers();
+    if (script_n < 1) {
+        return -2;
+    }
+
+    pthread_mutex_lock(&queue_mutex);
+
+    current_kind = PV_JOB_SCRIPT;
+    job_queue = jobs;
+    job_count = count;
+    jobs_completed = 0;
+    next_job = 0;
+
+    pthread_cond_broadcast(&work_available);
+
+    while (jobs_completed < job_count) {
+        pthread_cond_wait(&work_done, &queue_mutex);
+    }
+
+    job_queue = NULL;
+
+    pthread_mutex_unlock(&queue_mutex);
+
+    int failures = 0;
+    for (int i = 0; i < count; i++) {
+        if (jobs[i].result != 1) {
+            failures++;
+        }
+    }
+    return failures;
 }
 
 /*

@@ -31,6 +31,12 @@ local function default_args()
     bind = nil,  -- nil = all interfaces (0.0.0.0 and [::]); --bind restricts
     maxpeers = 125,
     dbcache = 450,
+    -- Script-check threads. Mirrors Bitcoin Core -par (init.cpp /
+    -- chainstatemanager_args.cpp). 0 = auto (ncpus-1, cap 15);
+    -- 1 = serial (no extra workers); N = N-1 extra workers after the
+    -- Core "main thread counts" subtraction, which we implement as
+    -- N C lua_State workers when N>=1 (the host lua_State waits).
+    par = 0,
     connect = nil,
     testnet = false,
     regtest = false,
@@ -117,6 +123,7 @@ local function parse_args(argv)
       print("      --maxpeers N        Maximum peer connections (default: 125)")
       print("      --maxconnections N  Alias for --maxpeers (Bitcoin Core name)")
       print("      --dbcache MB        Database cache size in MB (default: 450)")
+      print("      --par N             Script-verification threads (0=auto, 1=serial, default 0)")
       print("      --connect IP:PORT   Connect to specific peer")
       print("      --testnet           Use testnet")
       print("      --regtest           Use regtest")
@@ -212,6 +219,15 @@ local function parse_args(argv)
     elseif arg == "--dbcache" then
       i = i + 1
       args.dbcache = tonumber(argv[i])
+    elseif arg == "--par" or arg:match("^%-%-par=") then
+      -- Core -par: 0=auto, negative=leave that many cores free, positive=
+      -- script thread count. Lunarblock: set_script_check_workers gets
+      -- the extra-worker count (par<=0 auto, par==1 serial=0 workers,
+      -- par>=2 → par-1 C workers) matching Core's
+      -- worker_threads_num = script_threads - 1.
+      local v = arg:match("^%-%-par=(.*)$")
+      if v == nil then i = i + 1; v = argv[i] end
+      args.par = tonumber(v)
     elseif arg == "--connect" then
       i = i + 1
       args.connect = argv[i]
@@ -1026,6 +1042,50 @@ local function main()
               .. "lib/sha256_accel.so; measured ~2.9x on double-SHA")
       else
         print("SHA-256: hardware-accelerated (" .. hw .. ")")
+      end
+    end
+  end
+
+  -- Script verification worker pool (Core CCheckQueue). LuaJIT cannot
+  -- share a lua_State across threads, so each worker owns one and runs
+  -- the same verify_input_script as the serial path. --par matches Core:
+  -- 0=auto, 1=no extra workers, N=N-1 extra, negative=leave cores free.
+  do
+    local par = args.par or 0
+    local ncpus = tonumber(os.getenv("LUNARBLOCK_NCPU"))
+    if not ncpus then
+      local f = io.open("/proc/cpuinfo", "r")
+      local n = 0
+      if f then
+        for line in f:lines() do
+          if line:match("^processor") then n = n + 1 end
+        end
+        f:close()
+      end
+      ncpus = n > 0 and n or 1
+    end
+    local script_threads = par
+    if script_threads <= 0 then
+      -- 0 = auto (ncpus); -k = ncpus - k
+      script_threads = script_threads + ncpus
+    end
+    -- Subtract 1: the host lua_State counts as one script thread (it waits
+    -- rather than helping, because FFI cannot re-enter the host state).
+    local extra = script_threads - 1
+    if extra < 0 then extra = 0 end
+    if extra > 15 then extra = 15 end
+    if extra == 0 then
+      validation.set_script_check_workers(0)
+      print("Script verification uses 0 additional threads (serial)")
+    else
+      local ok = validation.set_script_check_workers(extra)
+      local got = validation.script_check_workers()
+      if not ok or got < 1 then
+        print("Script verification: worker lua_State bootstrap failed ("
+          .. tostring(validation.script_check_boot_error())
+          .. ") — serial fallback")
+      else
+        print("Script verification uses " .. tostring(got) .. " additional threads")
       end
     end
   end
@@ -3350,6 +3410,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --maxpeers N        Maximum peer connections (default: 125)")
       print("      --maxconnections N  Alias for --maxpeers (Bitcoin Core name)")
       print("      --dbcache MB        Database cache size in MB (default: 450)")
+      print("      --par N             Script-verification threads (0=auto, 1=serial, default 0)")
       print("      --connect IP:PORT   Connect to specific peer")
       print("      --testnet           Use testnet")
       print("      --regtest           Use regtest")
