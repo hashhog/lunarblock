@@ -131,6 +131,7 @@ typedef struct {
     int id;
     int running;
     int script_ready;
+    int gc_kb;                    /* last lua_gc(LUA_GCCOUNT); worker thread only */
 } worker_t;
 
 /* Unified job-queue entry.
@@ -424,7 +425,25 @@ static lua_State *create_worker_state(int id) {
         return NULL;
     }
     lua_pop(L, 1);
+    /* Pace GC against interned unique tx bytes. Default pause=200 lets the
+     * heap double before a cycle; on a range that is the par_avg climb
+     * (133ms → 263ms over 1,000 blocks) as interned serializations and
+     * deserialized tables accumulate. 110 starts a cycle at +10%. */
+    lua_gc(L, LUA_GCSETPAUSE, 110);
+    lua_gc(L, LUA_GCSETSTEPMUL, 400);
     return L;
+}
+
+static void worker_gc_step(worker_t *worker) {
+    if (!worker->L) return;
+    lua_gc(worker->L, LUA_GCSTEP, 40);
+    worker->gc_kb = lua_gc(worker->L, LUA_GCCOUNT, 0);
+}
+
+static void worker_gc_idle(worker_t *worker) {
+    if (!worker->L) return;
+    lua_gc(worker->L, LUA_GCCOLLECT, 0);
+    worker->gc_kb = lua_gc(worker->L, LUA_GCCOUNT, 0);
 }
 
 static void set_job_error(script_check_job *job, const char *msg) {
@@ -498,7 +517,17 @@ static void *worker_func(void *arg) {
         pthread_mutex_lock(&queue_mutex);
 
         while (next_job >= job_count && !shutdown_flag) {
-            pthread_cond_wait(&work_available, &queue_mutex);
+            /* Full collect while idle. Unlock first so we cannot miss a
+             * broadcast: after GC we re-check next_job and only wait if
+             * the queue is still empty. Host has usually already been
+             * signalled (jobs_completed == job_count), so this overlaps
+             * undo/flush rather than inflating par_avg. */
+            pthread_mutex_unlock(&queue_mutex);
+            worker_gc_idle(worker);
+            pthread_mutex_lock(&queue_mutex);
+            if (next_job >= job_count && !shutdown_flag) {
+                pthread_cond_wait(&work_available, &queue_mutex);
+            }
         }
 
         if (shutdown_flag) {
@@ -527,6 +556,7 @@ static void *worker_func(void *arg) {
                 process_sig_job(worker, (sig_verify_job *)job_ptr);
             } else {
                 process_script_job(worker, (script_check_job *)job_ptr);
+                worker_gc_step(worker);
             }
 
             pthread_mutex_lock(&queue_mutex);
@@ -769,6 +799,19 @@ int pv_get_script_workers(void) {
         if (workers[i].script_ready) n++;
     }
     return n;
+}
+
+/* Sum of per-worker lua_gc(LUA_GCCOUNT). Each worker publishes gc_kb from
+ * its own thread; the host only reads the int. Not a lua_State access. */
+int pv_script_worker_gc_kb(void) {
+    if (!initialized || !workers) {
+        return 0;
+    }
+    int kb = 0;
+    for (int i = 0; i < num_workers; i++) {
+        kb += workers[i].gc_kb;
+    }
+    return kb;
 }
 
 /*

@@ -56,6 +56,7 @@ ffi.cdef[[
   int pv_verify_script_checks(script_check_job *jobs, int count);
   int pv_get_num_workers(void);
   int pv_get_script_workers(void);
+  int pv_script_worker_gc_kb(void);
   int pv_set_lua_paths(const char *path, const char *cpath);
   const char *pv_get_boot_error(void);
   void pv_shutdown(void);
@@ -249,6 +250,33 @@ function M.script_check_boot_error()
   return ffi.string(pv_lib.pv_get_boot_error())
 end
 
+--- Sum of per-worker LuaJIT heap (lua_gc count), kilobytes.
+-- Each worker publishes the figure from its own thread; this is a read of
+-- an int, not a lua_State access from the host.
+function M.script_check_worker_gc_kb()
+  if not pv_lib then
+    return 0
+  end
+  return tonumber(pv_lib.pv_script_worker_gc_kb()) or 0
+end
+
+-- Grow-only script_check_job array. ffi.new of a per-block array was the
+-- par_avg leak: LuaJIT's GC is not paced against cdata, so 50 batches of
+-- 256 jobs added 30 MB RSS and the range-scale [W77-CB] par_avg doubled.
+local script_job_arr = nil
+local script_job_cap = 0
+local function script_job_buffer(n)
+  if script_job_cap < n then
+    local cap = n
+    if script_job_cap > 0 then
+      cap = math.max(n, math.floor(script_job_cap * 3 / 2))
+    end
+    script_job_arr = ffi.new("script_check_job[?]", cap)
+    script_job_cap = cap
+  end
+  return script_job_arr
+end
+
 local function tx_force_witness(tx)
   if tx.segwit then return end
   for _, inp in ipairs(tx.inputs) do
@@ -296,48 +324,52 @@ function M.verify_script_checks(jobs)
   end
 
   local n = #jobs
-  local cjobs = ffi.new("script_check_job[?]", n)
-  local keep = { cjobs = cjobs }
-  local tx_cdata = {}
-  local prev_cdata = {}
+  local cjobs = script_job_buffer(n)
+  -- Pin Lua strings for the C call. Do NOT ffi.copy them into uint8_t[?]:
+  -- that cdata is what LuaJIT's GC failed to pace, and it is what made
+  -- par_avg grow with blocks processed.
+  local keep = { cjobs }
+  local tx_ptr = {}
+  local prev_ptr = {}
 
   for i, job in ipairs(jobs) do
     local j = i - 1
     local tx = job.tx
     tx_force_witness(tx)
-    if not tx_cdata[tx] then
-      local bytes = serialize.serialize_transaction(tx, true)
-      local buf = ffi.new("uint8_t[?]", #bytes)
-      ffi.copy(buf, bytes, #bytes)
-      tx_cdata[tx] = { buf = buf, len = #bytes }
+    if not tx_ptr[tx] then
+      local bytes = tx._cached_witness_data
+      if not bytes then
+        bytes = serialize.serialize_transaction(tx, true)
+        tx._cached_witness_data = bytes
+      end
+      tx_ptr[tx] = bytes
+      keep[#keep + 1] = bytes
     end
-    local txb = tx_cdata[tx]
-    cjobs[j].tx_bytes = txb.buf
-    cjobs[j].tx_len = txb.len
+    local bytes = tx_ptr[tx]
+    cjobs[j].tx_bytes = ffi.cast("const uint8_t *", bytes)
+    cjobs[j].tx_len = #bytes
     cjobs[j].input_index = job.input_index
     cjobs[j].amount = job.amount
     cjobs[j].flags = M.script_flags_to_bits(job.flags, job.taproot_active)
 
     local spk = job.script_pubkey or ""
-    local spk_len = #spk
-    local spkbuf = ffi.new("uint8_t[?]", spk_len > 0 and spk_len or 1)
-    if spk_len > 0 then ffi.copy(spkbuf, spk, spk_len) end
-    keep[#keep + 1] = spkbuf
-    cjobs[j].prev_script = spkbuf
-    cjobs[j].prev_script_len = spk_len
+    keep[#keep + 1] = spk
+    cjobs[j].prev_script = ffi.cast("const uint8_t *", spk)
+    cjobs[j].prev_script_len = #spk
 
-    local prevouts = job.prev_outputs
+    -- Prevouts are BIP341-only. Encoding them for every pre-taproot input
+    -- interned a blob the worker then decoded per input, for no consensus
+    -- reason. Skip unless this job is actually taproot.
+    local prevouts = job.taproot_active and job.prev_outputs or nil
     if prevouts then
-      if not prev_cdata[prevouts] then
-        local blob = M.encode_prevouts(prevouts)
-        local blen = #blob
-        local buf = ffi.new("uint8_t[?]", blen > 0 and blen or 1)
-        if blen > 0 then ffi.copy(buf, blob, blen) end
-        prev_cdata[prevouts] = { buf = buf, len = blen }
+      local blob = prev_ptr[prevouts]
+      if not blob then
+        blob = M.encode_prevouts(prevouts)
+        prev_ptr[prevouts] = blob
+        keep[#keep + 1] = blob
       end
-      local pb = prev_cdata[prevouts]
-      cjobs[j].prevouts_blob = pb.buf
-      cjobs[j].prevouts_len = pb.len
+      cjobs[j].prevouts_blob = ffi.cast("const uint8_t *", blob)
+      cjobs[j].prevouts_len = #blob
     else
       cjobs[j].prevouts_blob = nil
       cjobs[j].prevouts_len = 0
@@ -345,8 +377,6 @@ function M.verify_script_checks(jobs)
     cjobs[j].result = 0
     cjobs[j].error[0] = 0
   end
-  keep.tx = tx_cdata
-  keep.prev = prev_cdata
 
   local failures = pv_lib.pv_verify_script_checks(cjobs, n)
   if failures == -2 then

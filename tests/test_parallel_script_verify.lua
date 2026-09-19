@@ -108,6 +108,9 @@ local function make_p2wpkh_job(i, corrupt)
   tx.segwit = true
   tx.inputs[1] = types.txin(types.outpoint(prev, 0), "", 0xFFFFFFFE)
   tx.outputs[1] = types.txout(50000, script.make_p2wpkh_script(string.rep("\x11", 20)))
+  -- 512-byte OP_RETURN so interned tx bytes aren't microbench-tiny. Must
+  -- be present BEFORE signing: hashOutputs covers every output.
+  tx.outputs[2] = types.txout(0, "\x6a" .. string.rep("p", 512))
   local value = 100000
   local cache = validation.precomputed_tx_data(tx)
   local sh = validation.signature_hash_segwit_v0(
@@ -354,6 +357,97 @@ test("empty batch is success at any worker count", function()
   expect_true(validation.set_script_check_workers(4))
   local ok, err = validation.verify_script_checks({})
   expect_true(ok, "empty batch failed: " .. tostring(err))
+end)
+
+--------------------------------------------------------------------------------
+-- (5) par_avg growth — the 2,048-input microbench cannot see this.
+-- Range 600000→632000: par_avg 133.5ms @ 500 blk → 263.7ms @ 1500 blk
+-- because verify_script_checks ffi.copied every tx into a fresh uint8_t[?]
+-- and LuaJIT's GC is not paced against cdata. Control: 50 batches of 256
+-- P2WPKH on a header-sized host heap; RSS must stay flat.
+--------------------------------------------------------------------------------
+
+test("par window RSS stays bounded across many batches (range-scale leak)", function()
+  expect_true(validation.set_script_check_workers(4))
+  -- Header-sized ballast: the range-runner host heap is hundreds of MB of
+  -- header tables by the time par_avg doubled. Tiny heaps hide the leak.
+  local ballast = {}
+  for i = 1, 200000 do
+    ballast[i] = { i, string.rep("h", 80) }
+  end
+  local jobs = {}
+  for i = 1, 256 do
+    jobs[i] = make_p2wpkh_job(90000 + i, false)
+  end
+  local wok, werr = validation.verify_script_checks(jobs)
+  expect_true(wok, "warmup failed: " .. tostring(werr))
+  collectgarbage("collect")
+  -- Stop the HOST GC so a per-batch ffi.new leak cannot hide behind a
+  -- cycle. Worker lua_States have their own GC; this only freezes the
+  -- state that packs the job array. 94e8a32 grew 12–30 MB here.
+  collectgarbage("stop")
+  local rss0 = rss_kb()
+  expect_true(rss0 ~= nil, "/proc/self/status VmRSS unreadable")
+  local PASSES = 50
+  local times = {}
+  local ok_run, err_run
+  local function wavg(a, b)
+    local s = 0
+    for i = a, b do s = s + times[i] end
+    return s / (b - a + 1)
+  end
+  ok_run, err_run = pcall(function()
+    for p = 1, PASSES do
+      local t0 = wall_now()
+      local ok, err = validation.verify_script_checks(jobs)
+      expect_true(ok, "batch " .. p .. " failed: " .. tostring(err))
+      times[p] = wall_now() - t0
+    end
+  end)
+  local rss1 = rss_kb()
+  collectgarbage("restart")
+  collectgarbage("collect")
+  expect_true(ok_run, tostring(err_run))
+  local first = wavg(1, 8)
+  local last = wavg(PASSES - 7, PASSES)
+  local drss = rss1 - rss0
+  local wgc = 0
+  if validation.script_check_worker_gc_kb then
+    wgc = validation.script_check_worker_gc_kb()
+  end
+  print(string.format(
+    "    50x256: first8=%.2fms last8=%.2fms ratio=%.2fx drss=%d kB worker_gc=%d kB",
+    first * 1000, last * 1000, last / first, drss, wgc))
+  expect_true(last / first < 1.45,
+    string.format("par time grew %.2fx across 50 batches (pool overhead unbounded?)",
+      last / first))
+  -- Unfixed (GC stopped): +12–30 MB of uint8_t[?] copies. Cap at 8 MB.
+  expect_true(drss < 8 * 1024,
+    string.format("RSS grew %d kB over 50 batches (ffi.new cdata leak?)", drss))
+  -- Keep ballast live so LuaJIT cannot reclaim it mid-loop and flatten RSS.
+  expect_true(ballast[1] ~= nil and ballast[200000] ~= nil, "ballast collected")
+end)
+
+test("worker heap stays bounded after many unique batches", function()
+  expect_true(type(validation.script_check_worker_gc_kb) == "function",
+    "script_check_worker_gc_kb missing")
+  expect_true(validation.set_script_check_workers(4))
+  local function batch(off)
+    local jobs = {}
+    for i = 1, 32 do jobs[i] = make_p2wpkh_job(off + i, false) end
+    return jobs
+  end
+  expect_true(validation.verify_script_checks(batch(110000)))
+  local kb0 = validation.script_check_worker_gc_kb()
+  for p = 1, 24 do
+    local ok, err = validation.verify_script_checks(batch(120000 + p * 32))
+    expect_true(ok, "unique batch " .. p .. ": " .. tostring(err))
+  end
+  local kb1 = validation.script_check_worker_gc_kb()
+  print(string.format("    worker_gc after warmup=%d kB after 24 unique=%d kB", kb0, kb1))
+  -- Idle full-collect should keep this from tracking unique interned txs.
+  expect_true(kb1 < kb0 + 32 * 1024,
+    string.format("worker lua_State heap grew %d kB over 24 unique batches", kb1 - kb0))
 end)
 
 --------------------------------------------------------------------------------

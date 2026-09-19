@@ -2989,7 +2989,9 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             script_pubkey = utxo.script_pubkey,
             flags = block_script_flags,
             taproot_active = taproot_active,
-            prev_outputs = get_tx_prev_outputs(),
+            -- Prevouts are BIP341-only; skip the encode/decode round-trip
+            -- on the worker for every pre-taproot input.
+            prev_outputs = taproot_active and get_tx_prev_outputs() or nil,
             cache = get_tx_cache(),
           }
           if script_jobs then
