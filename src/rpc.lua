@@ -1734,9 +1734,21 @@ function RPCServer:get_request_wallet(name)
       end
       return wallet
     end
-    -- Use request context wallet if set
+    -- Use request context wallet if set (/wallet/<name> on the HTTP path).
     if self.request_wallet then
       return self.request_wallet
+    end
+    -- Core GetWalletForJSONRPCRequest: an endpoint-less wallet call is only
+    -- routed when exactly one wallet is loaded. The auto-created default plus
+    -- a createwallet name is two wallets, and Core answers -19
+    -- RPC_WALLET_NOT_SPECIFIED so the client uses /wallet/<name>.
+    local n_loaded = 0
+    for _ in pairs(self.wallet_manager.wallets) do
+      n_loaded = n_loaded + 1
+    end
+    if n_loaded > 1 then
+      error({code = -19,
+             message = "Wallet file not specified (must request wallet RPC through /wallet/<filename> uri-path)."})
     end
     -- Use default wallet
     local wallet, _ = self.wallet_manager:get_default_wallet()
@@ -8088,9 +8100,19 @@ end
     return invalid_response()
   end
 
-  self.methods["stop"] = function(_rpc, _params)
-    -- Signal shutdown
-    return "LunarBlock stopping..."
+  self.methods["stop"] = function(_rpc, params)
+    -- Hidden optional `wait` (milliseconds) is a number. A wrong JSON type
+    -- is RPC_TYPE_ERROR (-3), which the arity check must not swallow: stop
+    -- declares one optional argument (rpc/server.cpp).
+    local wait = params[1]
+    if wait ~= nil and wait ~= cjson.null then
+      if type(wait) ~= "number" then
+        error({code = M.ERROR.TYPE_ERROR,
+               message = "JSON value of type " .. core_json_type_name(wait) ..
+                         " is not of expected type number"})
+      end
+    end
+    return "LunarBlock stopping"
   end
 
   self.methods["jitprofileflush"] = function(_rpc, _params)
@@ -8723,6 +8745,182 @@ end
     return psbt_mod.to_base64(psbt)
   end
 
+  -- Rebuild the wallet ledger from chainstate before a read or a spend.
+  -- scan_utxos / scan_history no-op while wallet.scanned is false (seed
+  -- restore); a createwallet wallet is born scanned, so this credits coins
+  -- that arrived after it was created.
+  local function sync_wallet_ledger(rpc, wallet)
+    if not wallet then return end
+    if rpc.chain_state and wallet.scan_utxos then
+      wallet:scan_utxos(rpc.chain_state)
+      if wallet.scan_history then
+        wallet:scan_history(rpc.chain_state, rpc.mempool)
+      end
+      local tip = rpc.chain_state.tip_height or 0
+      if tip > (wallet.last_synced_height or 0) then
+        wallet.last_synced_height = tip
+      end
+    end
+    if rpc.mempool and wallet.scan_mempool then
+      wallet:scan_mempool(rpc.mempool)
+    end
+  end
+
+  local function wallet_tx_count(wallet)
+    local n = 0
+    if wallet.tx_history then
+      for _ in pairs(wallet.tx_history) do n = n + 1 end
+    end
+    return n
+  end
+
+  local function last_processed_block(rpc, wallet)
+    local height = (wallet and wallet.last_synced_height) or 0
+    local hash = string.rep("0", 64)
+    if rpc.chain_state then
+      if rpc.chain_state.tip_height ~= nil then
+        height = rpc.chain_state.tip_height
+      end
+      if rpc.chain_state.tip_hash then
+        hash = types.hash256_hex(rpc.chain_state.tip_hash)
+      end
+    end
+    return {hash = hash, height = height}
+  end
+
+  -- Descriptor string for an owned key. The probe only requires a string;
+  -- the body matches the key's output type so getaddressinfo/listunspent
+  -- can show what the wallet would spend.
+  local function descriptor_for_key(key_info)
+    if not key_info or not key_info.pubkey or #key_info.pubkey == 0 then
+      return nil
+    end
+    local pk = M.hex_encode(key_info.pubkey)
+    local t = key_info.type or "p2wpkh"
+    local body
+    if t == "p2pkh" then
+      body = "pkh(" .. pk .. ")"
+    elseif t == "p2sh-p2wpkh" then
+      body = "sh(wpkh(" .. pk .. "))"
+    elseif t == "p2tr" then
+      local xonly = (#key_info.pubkey == 33) and M.hex_encode(key_info.pubkey:sub(2)) or pk
+      body = "tr(" .. xonly .. ")"
+    else
+      body = "wpkh(" .. pk .. ")"
+    end
+    local csum = address_mod.descriptor_checksum(body)
+    if csum and csum ~= "" then return body .. "#" .. csum end
+    return body
+  end
+
+  local function script_hex_for_address(addr, network_name)
+    local t, data = address_mod.decode_address(addr, network_name)
+    if not t or not data then return "" end
+    local spk
+    if t == "p2pkh" then spk = script_mod.make_p2pkh_script(data)
+    elseif t == "p2sh" then spk = script_mod.make_p2sh_script(data)
+    elseif t == "p2wpkh" then spk = script_mod.make_p2wpkh_script(data)
+    elseif t == "p2wsh" then spk = script_mod.make_p2wsh_script(data)
+    elseif t == "p2tr" then spk = script_mod.make_p2tr_script(data)
+    else return "" end
+    return M.hex_encode(spk)
+  end
+
+  -- send_to / fund errors that are "not enough money" are -6, not -4.
+  local function spend_failure(err)
+    local msg = err or "Failed to create transaction"
+    if type(msg) == "string" and (msg:find("nsufficient") or msg:find("No available UTXO")) then
+      return {code = M.ERROR.INSUFFICIENT_FUNDS, message = msg}
+    end
+    return {code = M.ERROR.WALLET_ERROR, message = msg}
+  end
+
+  local function wallet_name_of(rpc, wallet)
+    if rpc.wallet_manager then
+      for name, w in pairs(rpc.wallet_manager.wallets) do
+        if w == wallet then return name end
+      end
+    end
+    return ""
+  end
+
+  local function copy_file(src, dst)
+    local inp = io.open(src, "rb")
+    if not inp then return false, "cannot read " .. src end
+    local data = inp:read("*a")
+    inp:close()
+    local out = io.open(dst, "wb")
+    if not out then return false, "cannot write " .. dst end
+    out:write(data)
+    out:close()
+    return true
+  end
+
+  local function path_is_dir(path)
+    if type(path) ~= "string" or path == "" then return false end
+    local r1, _, r3 = os.execute("test -d " .. string.format("%q", path))
+    return r1 == true or r1 == 0 or r3 == 0
+  end
+
+  -- Parse send/walletcreatefundedpsbt outputs. Empty -> -8. A bad address
+  -- -> -5. Returns a list of {address, amount} in satoshis.
+  local function parse_recipients(rpc, outputs_raw)
+    if type(outputs_raw) ~= "table" then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Invalid parameter, outputs must be an array"})
+    end
+    local n = 0
+    for _ in pairs(outputs_raw) do n = n + 1 end
+    if n == 0 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Invalid parameter, transaction must have at least one output"})
+    end
+    local network_name = (rpc.network and rpc.network.name) or "mainnet"
+    local recipients = {}
+    local function add_pair(key, val)
+      if key == "data" then return end
+      local addr_type = address_mod.decode_address(tostring(key), network_name)
+      if not addr_type then
+        error({code = M.ERROR.INVALID_ADDRESS,
+               message = "Invalid Bitcoin address: " .. tostring(key)})
+      end
+      if type(val) ~= "number" then
+        error({code = M.ERROR.TYPE_ERROR, message = "Amount is not a number or string"})
+      end
+      if val <= 0 or val ~= val then
+        error({code = M.ERROR.TYPE_ERROR, message = "Amount out of range"})
+      end
+      recipients[#recipients + 1] = {
+        address = key,
+        amount = math.floor(val * consensus.COIN + 0.5),
+      }
+    end
+    if #outputs_raw > 0 then
+      for _, spec in ipairs(outputs_raw) do
+        if type(spec) ~= "table" then
+          error({code = M.ERROR.INVALID_PARAMETER, message = "Invalid parameter, output must be an object"})
+        end
+        local any = false
+        for key, val in pairs(spec) do
+          any = true
+          add_pair(key, val)
+        end
+        if not any then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, transaction must have at least one output"})
+        end
+      end
+    else
+      for key, val in pairs(outputs_raw) do
+        add_pair(key, val)
+      end
+    end
+    if #recipients == 0 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Invalid parameter, transaction must have at least one output"})
+    end
+    return recipients
+  end
+
   self.methods["walletprocesspsbt"] = function(rpc, params)
     local psbt_mod = require("lunarblock.psbt")
     local psbt_b64 = params[1]
@@ -8761,10 +8959,13 @@ end
     -- came back unsigned (complete=false) even for a plain p2wpkh input that
     -- signrawtransactionwithwallet signs fine. Populate its UTXO ledger too.
     local wallet = rpc:get_request_wallet() or rpc.wallet
-    if wallet and rpc.chain_state then wallet:scan_utxos(rpc.chain_state) end
+    if wallet then sync_wallet_ledger(rpc, wallet) end
 
-    -- Update UTXOs from wallet's known UTXOs
+    -- Update UTXOs from wallet's known UTXOs, then the chainstate. Core's
+    -- createpsbt (how the lane builds %OWNPSBT%) carries no witness_utxo;
+    -- FillPSBT looks the prevout up itself.
     if wallet then
+      local utxo_mod = require("lunarblock.utxo")
       for i, tx_input in ipairs(psbt.tx.inputs) do
         local inp = psbt.inputs[i]
 
@@ -8782,6 +8983,13 @@ end
         )
 
         local utxo = wallet.utxos[key]
+        if not utxo and rpc.storage then
+          local raw = rpc.storage.get(storage_mod.CF.UTXO, key)
+          if raw then
+            local entry = utxo_mod.deserialize_utxo_entry(raw)
+            utxo = {value = entry.value, script_pubkey = entry.script_pubkey}
+          end
+        end
         if utxo then
           inp.witness_utxo = {
             value = utxo.value,
@@ -8867,10 +9075,19 @@ end
       complete = psbt_mod.is_complete(psbt)
     end
 
-    return {
+    local result = {
       psbt = psbt_mod.to_base64(psbt),
-      complete = complete,
+      complete = complete and true or false,
     }
+    -- Core includes `hex` only once the PSBT is fully finalized
+    -- (FinalizeAndExtractPSBT). The success probe requires the field.
+    if result.complete then
+      local ok_ex, tx = pcall(psbt_mod.extract, psbt)
+      if ok_ex and tx then
+        result.hex = M.hex_encode(serialize.serialize_transaction(tx, true))
+      end
+    end
+    return result
   end
 
   self.methods["converttopsbt"] = function(rpc, params)
@@ -9351,8 +9568,15 @@ end
              message = "JSON value of type " .. core_json_type_name(passphrase) ..
                        " is not of expected type string"})
     end
-    -- params[5] descriptors (ignored, always true)
-    -- params[6] load_on_startup (ignored in our implementation)
+    -- Core arg order (1-based): 5 avoid_reuse, 6 descriptors, 7 load_on_startup,
+    -- 8 external_signer. descriptors defaults to true; an explicit false is
+    -- the legacy-wallet refusal (wallet.cpp) and is RPC_WALLET_ERROR (-4).
+    local descriptors = params[6]
+    if descriptors == nil then descriptors = params.descriptors end
+    if descriptors == false then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet."})
+    end
 
     local options = {
       disable_private_keys = disable_private_keys,
@@ -9364,6 +9588,17 @@ end
     if not wallet then
       error({code = M.ERROR.WALLET_ERROR, message = err or "Failed to create wallet"})
     end
+
+    -- A wallet created here is born at the chain tip and credits coins that
+    -- arrive afterwards (Core CreateWallet + blockConnected). The unscanned
+    -- gate is for seed-restore, which does not come through this RPC. The
+    -- auto-created startup wallet stays unscanned; only this RPC sets the flag.
+    wallet.scanned = true
+    if rpc.chain_state then
+      wallet.last_synced_height = rpc.chain_state.tip_height or 0
+    end
+    wallet:mark_dirty()
+    if wallet.save_if_dirty then wallet:save_if_dirty() end
 
     local warnings = {}
     if passphrase and passphrase == "" then
@@ -9498,22 +9733,18 @@ end
       error({code = M.ERROR.WALLET_ERROR, message = err})
     end
 
+    sync_wallet_ledger(rpc, wallet)
+
     -- Find wallet name
-    local wallet_name = ""
-    if rpc.wallet_manager then
-      for name, w in pairs(rpc.wallet_manager.wallets) do
-        if w == wallet then
-          wallet_name = name
-          break
-        end
-      end
-    end
+    local wallet_name = wallet_name_of(rpc, wallet)
+
+    local flags = setmetatable({"descriptors"}, cjson.empty_array_mt)
 
     return {
       walletname = wallet_name,
-      walletversion = 1,
+      walletversion = 169900,
       format = "json",
-      txcount = 0,  -- TODO: track transactions
+      txcount = wallet_tx_count(wallet),
       keypoolsize = wallet.gap_limit - wallet.next_external_index,
       keypoolsize_hd_internal = wallet.gap_limit - wallet.next_internal_index,
       -- Core (rpc/wallet.cpp:98): private_keys_enabled = !IsWalletFlagSet(
@@ -9530,6 +9761,8 @@ end
       descriptors = true,
       external_signer = false,
       blank = wallet.master_key == nil and wallet.encrypted_master_key == nil,
+      flags = flags,
+      lastprocessedblock = last_processed_block(rpc, wallet),
     }
   end
 
@@ -9560,15 +9793,38 @@ end
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
     end
 
-    -- params[1] is label (ignored), params[2] is address_type
-    local address_type = params[2] or params.address_type
-    if address_type and address_type ~= wallet.address_type then
-      -- Temporarily change address type
-      local old_type = wallet.address_type
-      wallet.address_type = address_type
-      local addr = wallet:get_new_address()
-      wallet.address_type = old_type
-      return addr
+    -- params[1] is label (ignored), params[2] is address_type.
+    -- Validate BEFORE touching wallet.address_type: an unknown type used to
+    -- stick (the assignment happened before get_new_address threw), and the
+    -- next spend then crashed in generate_address.
+    local address_type = params[2]
+    if address_type == nil then address_type = params.address_type end
+    if address_type == cjson.null or address_type == "" then
+      address_type = nil
+    end
+    if address_type ~= nil then
+      if type(address_type) ~= "string" then
+        error({code = M.ERROR.TYPE_ERROR,
+               message = "JSON value of type " .. core_json_type_name(address_type) ..
+                         " is not of expected type string"})
+      end
+      local wallet_mod = require("lunarblock.wallet")
+      if not wallet_mod.purpose_for_address_type(address_type) then
+        error({code = M.ERROR.INVALID_ADDRESS,
+               message = "Unknown address type '" .. address_type .. "'"})
+      end
+      local canonical = wallet_mod.canonical_address_type(address_type)
+      if canonical ~= wallet.address_type then
+        local old_type = wallet.address_type
+        wallet.address_type = canonical
+        local ok_addr, addr_or_err = pcall(function() return wallet:get_new_address() end)
+        wallet.address_type = old_type
+        if not ok_addr then
+          if type(addr_or_err) == "table" and addr_or_err.code then error(addr_or_err) end
+          error({code = M.ERROR.INTERNAL_ERROR, message = tostring(addr_or_err)})
+        end
+        return addr_or_err
+      end
     end
 
     return wallet:get_new_address()
@@ -9599,13 +9855,7 @@ end
       error({code = M.ERROR.WALLET_ERROR, message = err})
     end
 
-    -- Rescan UTXOs if chain_state is available
-    if rpc.chain_state then
-      wallet:scan_utxos(rpc.chain_state)
-    end
-    if rpc.mempool then
-      wallet:scan_mempool(rpc.mempool)
-    end
+    sync_wallet_ledger(rpc, wallet)
 
     local details = wallet:get_balance_details()
     return {
@@ -9622,6 +9872,7 @@ end
         untrusted_pending = 0,
         immature = 0,
       },
+      lastprocessedblock = last_processed_block(rpc, wallet),
     }
   end
 
@@ -9633,32 +9884,74 @@ end
       error({code = M.ERROR.WALLET_ERROR, message = err})
     end
 
-    -- Rescan UTXOs if chain_state is available
-    if rpc.chain_state then
-      wallet:scan_utxos(rpc.chain_state)
+    sync_wallet_ledger(rpc, wallet)
+
+    -- `params[1] or 1` treats a real 0 as missing. Core's default minconf is
+    -- 1 and maxconf is 9999999; an explicit 0 must survive.
+    local min_conf = 1
+    if params[1] ~= nil and params[1] ~= cjson.null then min_conf = params[1] end
+    local max_conf = 9999999
+    if params[2] ~= nil and params[2] ~= cjson.null then max_conf = params[2] end
+
+    local network_name = (rpc.network and rpc.network.name) or "mainnet"
+    local filter = nil
+    local addr_list = params[3]
+    if addr_list == nil then addr_list = params.addresses end
+    if addr_list ~= nil and addr_list ~= cjson.null then
+      if type(addr_list) ~= "table" then
+        error({code = M.ERROR.TYPE_ERROR,
+               message = "JSON value of type " .. core_json_type_name(addr_list) ..
+                         " is not of expected type array"})
+      end
+      filter = {}
+      local seen = {}
+      for _, a in ipairs(addr_list) do
+        if type(a) ~= "string" then
+          error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid Bitcoin address: " .. tostring(a)})
+        end
+        local ok_addr = address_mod.decode_address(a, network_name)
+        if not ok_addr then
+          error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid Bitcoin address: " .. a})
+        end
+        if seen[a] then
+          error({code = M.ERROR.INVALID_PARAMETER,
+                 message = "Invalid parameter, duplicated address: " .. a})
+        end
+        seen[a] = true
+        filter[a] = true
+      end
     end
 
-    local min_conf = params[1] or params.minconf or 1
     local include_unconfirmed = min_conf == 0
-
     local utxos = wallet:list_unspent(include_unconfirmed)
     local result = setmetatable({}, cjson.empty_array_mt)
     for _, u in ipairs(utxos) do
-      -- wallet:list_unspent() entries carry the amount in `satoshis` (and a
-      -- pre-divided `amount` in BTC); the field is NOT named `value`. The old
-      -- `u.value / 100000000` therefore did arithmetic on nil and crashed
-      -- (rpc.lua "arithmetic on field 'value' (a nil value)"). Convert from
-      -- the satoshi field so the BTC amount is computed here consistently.
-      result[#result + 1] = {
-        txid = u.txid,
-        vout = u.vout,
-        address = u.address,
-        amount = (u.satoshis or 0) / 100000000,
-        confirmations = u.confirmations or 0,
-        spendable = u.spendable ~= false,
-        solvable = true,
-        safe = u.safe == true and (u.confirmations or 0) >= min_conf,
-      }
+      local conf = u.confirmations or 0
+      if conf >= min_conf and conf <= max_conf and (not filter or filter[u.address]) then
+        local key_info = wallet.keys and wallet.keys[u.address]
+        local desc = descriptor_for_key(key_info)
+        local parent_descs = setmetatable({}, cjson.empty_array_mt)
+        if desc then parent_descs[1] = desc end
+        -- wallet:list_unspent() entries carry the amount in `satoshis` (and a
+        -- pre-divided `amount` in BTC); the field is NOT named `value`. The old
+        -- `u.value / 100000000` therefore did arithmetic on nil and crashed
+        -- (rpc.lua "arithmetic on field 'value' (a nil value)"). Convert from
+        -- the satoshi field so the BTC amount is computed here consistently.
+        result[#result + 1] = {
+          txid = u.txid,
+          vout = u.vout,
+          address = u.address,
+          label = "",
+          scriptPubKey = script_hex_for_address(u.address, network_name),
+          amount = (u.satoshis or 0) / 100000000,
+          confirmations = conf,
+          spendable = u.spendable ~= false,
+          solvable = true,
+          desc = desc or "",
+          parent_descs = parent_descs,
+          safe = u.safe == true,
+        }
+      end
     end
 
     return result
@@ -9688,28 +9981,35 @@ end
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
     end
 
-    -- A wallet that spends is live: mark it scanned so the scan_utxos below
+    local addr = params[1] or params.address
+    local amount = params[2] or params.amount
+
+    if type(addr) ~= "string" or addr == "" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(addr) ..
+                       " is not of expected type string"})
+    end
+    local network_name = (rpc.network and rpc.network.name) or "mainnet"
+    local addr_type = address_mod.decode_address(addr, network_name)
+    if not addr_type then
+      error({code = M.ERROR.INVALID_ADDRESS, message = "Invalid Bitcoin address: " .. addr})
+    end
+    if type(amount) ~= "number" then
+      error({code = M.ERROR.TYPE_ERROR, message = "Amount is not a number or string"})
+    end
+    if amount < 0 or amount ~= amount or amount > (consensus.MAX_MONEY / consensus.COIN) then
+      error({code = M.ERROR.TYPE_ERROR, message = "Amount out of range"})
+    end
+
+    -- A wallet that spends is live: mark it scanned so the scan below
     -- credits its coins (a wallet that funded itself + sends does not require an
     -- explicit rescan first).
     if wallet.mark_scanned then wallet:mark_scanned() end
 
-    local addr = params[1] or params.address
-    local amount = params[2] or params.amount
-
-    if not addr then
-      error({code = M.ERROR.INVALID_PARAMS, message = "address is required"})
-    end
-    if not amount then
-      error({code = M.ERROR.INVALID_PARAMS, message = "amount is required"})
-    end
-
     -- Convert BTC to satoshis
-    local amount_sat = math.floor(amount * 100000000 + 0.5)
+    local amount_sat = math.floor(amount * consensus.COIN + 0.5)
 
-    -- Rescan UTXOs
-    if rpc.chain_state then
-      wallet:scan_utxos(rpc.chain_state)
-    end
+    sync_wallet_ledger(rpc, wallet)
 
     -- Set mempool for transaction submission
     if rpc.mempool then
@@ -9720,7 +10020,7 @@ end
     local recipients = {{address = addr, amount = amount_sat}}
     local tx, err = wallet:send_to(recipients)
     if not tx then
-      error({code = M.ERROR.WALLET_ERROR, message = err or "Failed to create transaction"})
+      error(spend_failure(err))
     end
 
     -- Return txid as hex. Use the canonical txid path (hash256 over the
@@ -9739,6 +10039,143 @@ end
       wallet:save_if_dirty()
     end
     return types.hash256_hex(txid)
+  end
+
+  --- send: send to one or more outputs. Core wallet/rpc/spend.cpp send().
+  -- Positional: outputs, conf_target, estimate_mode, fee_rate, options.
+  -- Returns {complete, txid} when the wallet signs and broadcasts.
+  self.methods["send"] = function(rpc, params)
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+    if wallet.private_keys_enabled == false then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Error: Private keys are disabled for this wallet"})
+    end
+    if wallet.is_locked then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
+    end
+
+    local recipients = parse_recipients(rpc, params[1])
+    local fee_rate = params[4]
+    if fee_rate == cjson.null then fee_rate = nil end
+    if fee_rate ~= nil and type(fee_rate) ~= "number" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(fee_rate) ..
+                       " is not of expected type number"})
+    end
+    local options = params[5]
+    if type(options) == "table" and options.fee_rate ~= nil and fee_rate == nil then
+      fee_rate = tonumber(options.fee_rate)
+    end
+
+    if wallet.mark_scanned then wallet:mark_scanned() end
+    sync_wallet_ledger(rpc, wallet)
+    if rpc.mempool then wallet:set_mempool(rpc.mempool) end
+
+    local send_opts = {}
+    if fee_rate ~= nil then send_opts.fee_rate = fee_rate end
+    local tx, err = wallet:send_to(recipients, send_opts)
+    if not tx then error(spend_failure(err)) end
+
+    if wallet.save_if_dirty then
+      wallet:mark_dirty()
+      wallet:save_if_dirty()
+    end
+    return {
+      complete = true,
+      txid = types.hash256_hex(validation.compute_txid(tx)),
+    }
+  end
+
+  --- backupwallet: copy the current wallet file to `destination`.
+  -- Core returns JSON null. A destination whose parent directory does not
+  -- exist is RPC_WALLET_ERROR (-4).
+  self.methods["backupwallet"] = function(rpc, params)
+    local dest = params[1]
+    if dest == nil then dest = params.destination end
+    if type(dest) ~= "string" or dest == "" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(dest) ..
+                       " is not of expected type string"})
+    end
+    local wallet, werr = rpc:get_request_wallet()
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR, message = werr})
+    end
+    local parent = dest:match("^(.*)/[^/]+$")
+    if parent and parent ~= "" and not path_is_dir(parent) then
+      error({code = M.ERROR.WALLET_ERROR, message = "Error: Wallet backup failed!"})
+    end
+    local name = wallet_name_of(rpc, wallet)
+    local src
+    if rpc.wallet_manager then
+      src = rpc.wallet_manager:get_wallet_path(name)
+    end
+    src = wallet._save_path or src
+    if not src then
+      error({code = M.ERROR.WALLET_ERROR, message = "Error: Wallet backup failed!"})
+    end
+    if wallet.save then wallet:save(src) end
+    local ok, copy_err = copy_file(src, dest)
+    if not ok then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Error: Wallet backup failed! " .. tostring(copy_err)})
+    end
+    return cjson.null
+  end
+
+  --- restorewallet: load a backup file under a new wallet name.
+  -- Missing backup is -8 (checked before the name-exists check, matching
+  -- RestoreWallet). A name that already has a wallet file is -36.
+  self.methods["restorewallet"] = function(rpc, params)
+    if not rpc.wallet_manager then
+      error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
+    end
+    local wallet_name = params[1]
+    local backup = params[2]
+    if type(wallet_name) ~= "string" or wallet_name == "" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(wallet_name) ..
+                       " is not of expected type string"})
+    end
+    if type(backup) ~= "string" or backup == "" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(backup) ..
+                       " is not of expected type string"})
+    end
+    local bf = io.open(backup, "rb")
+    if not bf then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Backup file does not exist"})
+    end
+    bf:close()
+
+    local wallet_mod = require("lunarblock.wallet")
+    local dest = rpc.wallet_manager:get_wallet_path(wallet_name)
+    if rpc.wallet_manager:get_wallet(wallet_name) or wallet_mod.exists(dest) then
+      error({code = -36,
+             message = "Failed to restore wallet. Database file exists."})
+    end
+    if wallet_name:find("[/\\:*?\"<>|]") then
+      error({code = M.ERROR.WALLET_ERROR, message = "Invalid wallet name"})
+    end
+    local dir = rpc.wallet_manager:get_wallet_dir(wallet_name)
+    os.execute("mkdir -p " .. string.format("%q", dir))
+    local ok, copy_err = copy_file(backup, dest)
+    if not ok then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Failed to restore wallet: " .. tostring(copy_err)})
+    end
+    local wallet, load_err = rpc.wallet_manager:load_wallet(wallet_name)
+    if not wallet then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = load_err or "Failed to load restored wallet"})
+    end
+    return {
+      name = wallet_name,
+      warnings = setmetatable({}, cjson.empty_array_mt),
+    }
   end
 
   --- bumpfee: BIP-125 RBF fee bump of an own wallet transaction.
@@ -10770,6 +11207,14 @@ end
     if key_info and key_info.pubkey then
       result.pubkey = M.hex_encode(key_info.pubkey)
     end
+    if key_info then
+      local desc = descriptor_for_key(key_info)
+      if desc then
+        result.desc = desc
+        result.parent_desc = desc
+      end
+      if key_info.change == 1 then result.ischange = true end
+    end
     if watch_info and watch_info.label and watch_info.label ~= "" then
       result.labels[1] = watch_info.label
     end
@@ -11461,12 +11906,20 @@ end
     if type(inputs_raw) ~= "table" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Inputs must be an array"})
     end
+    -- Empty outputs is -8, before coin selection turns it into "Insufficient
+    -- funds" (-4). Core: "transaction must have at least one output".
+    local nout = 0
+    for _ in pairs(outputs_raw) do nout = nout + 1 end
+    if nout == 0 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+             message = "Invalid parameter, transaction must have at least one output"})
+    end
 
     local wallet, werr = rpc:get_request_wallet()
     if not wallet then
       error({code = M.ERROR.WALLET_ERROR, message = werr})
     end
-    if rpc.chain_state then wallet:scan_utxos(rpc.chain_state) end
+    sync_wallet_ledger(rpc, wallet)
 
     -- 1. Build outputs, tally total-out and find OP_RETURN positions.
     local outputs = {}
@@ -12388,6 +12841,14 @@ end
   -- @param skip number: Number to skip (default 0)
   self.methods["listtransactions"] = function(rpc, params)
     local _label = (params[1] ~= nil and params[1] ~= cjson.null) and params[1] or "*"
+    -- Core listtransactions: a negative count/skip is RPC_INVALID_PARAMETER
+    -- (-8), not a silent clamp (transactions.cpp).
+    if type(params[2]) == "number" and params[2] < 0 then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Negative count"})
+    end
+    if type(params[3]) == "number" and params[3] < 0 then
+      error({code = M.ERROR.INVALID_PARAMETER, message = "Negative from"})
+    end
     local count = (params[2] ~= nil and params[2] ~= cjson.null) and tonumber(params[2]) or 10
     local skip = (params[3] ~= nil and params[3] ~= cjson.null) and tonumber(params[3]) or 0
 
@@ -12400,10 +12861,7 @@ end
     -- (same on-demand pattern as getbalance/listunspent). scan_utxos must run
     -- first so scan_history's owned-output detection (and the listunspent the
     -- caller will use) see a consistent view.
-    if rpc.chain_state then
-      wallet:scan_utxos(rpc.chain_state)
-      wallet:scan_history(rpc.chain_state, rpc.mempool)
-    end
+    sync_wallet_ledger(rpc, wallet)
 
     if wallet.get_transactions then
       local tip = rpc.chain_state and rpc.chain_state.tip_height or 0

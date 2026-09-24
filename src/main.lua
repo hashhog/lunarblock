@@ -2803,9 +2803,9 @@ local function main()
   wallet_manager:ensure_wallets_dir()
   -- Wire chain context so load_wallet (e.g. a named watch-only wallet pulled in
   -- via /wallet/<name> or loadwallet after a restart) can reconcile the loaded
-  -- wallet's ledger up to the current tip. Named wallets are not fed by the
-  -- per-block hook below, so this is what keeps a reloaded watch-only wallet's
-  -- balance / listunspent live without an explicit rescanblockchain.
+  -- wallet's ledger up to the current tip. The per-block hook below feeds every
+  -- loaded wallet, not only the default; this startup reconcile covers the gap
+  -- a wallet spent offline.
   wallet_manager:set_chain_context(chain_state, mempool)
 
   -- Load or create default wallet (backward compatible)
@@ -2882,11 +2882,18 @@ local function main()
       end
       local ok, err = pcall(function()
         local height = chain_state.tip_height
-        wallet:scan_block(chain_state, block, height, mempool)
+        -- Every loaded wallet, not just the startup default. createwallet
+        -- adds named wallets after this hook is installed; they have to see
+        -- the blocks that pay them or listunspent stays empty.
+        for _, w in pairs(wallet_manager.wallets) do
+          w:scan_block(chain_state, block, height, mempool)
+        end
         wallet_blocks_since_flush = wallet_blocks_since_flush + 1
         if wallet_blocks_since_flush >= WALLET_FLUSH_BLOCKS then
           wallet_blocks_since_flush = 0
-          wallet:save_if_dirty()
+          for _, w in pairs(wallet_manager.wallets) do
+            if w.save_if_dirty then w:save_if_dirty() end
+          end
         end
       end)
       if not ok then

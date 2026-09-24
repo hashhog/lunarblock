@@ -4197,10 +4197,9 @@ function WalletManager:load_wallet(name, passphrase)
   end
 
   -- Reconcile a freshly-loaded wallet to the chain tip so its ledger is rebuilt
-  -- from the (persisted) owned-script + watch-only set. Named wallets are NOT
-  -- fed by the per-block hook (main.lua wires it to the default wallet only), so
-  -- without this a reloaded watch-only wallet shows balance 0 / empty listunspent
-  -- until an explicit rescanblockchain — the restart-survival hole. Cheap no-op
+  -- from the (persisted) owned-script + watch-only set. The per-block hook feeds
+  -- every loaded wallet; this still closes the gap a wallet spent offline.
+  -- Cheap no-op
   -- when not scanned or already at tip. Isolated under pcall (a reconcile hiccup
   -- must not fail the load). last_synced_height is intentionally NOT forced to 0:
   -- reconcile_to_tip rebuilds the whole ledger from chainstate idempotently.
