@@ -167,9 +167,38 @@ ffi.cdef[[
     rocksdb_block_based_table_options_t* options,
     rocksdb_filterpolicy_t* policy
   );
+
+  /* csrc/coin_prefetch.c (lib/coin_prefetch.so) */
+  int coin_prefetch_get(rocksdb_t* db, const rocksdb_readoptions_t* ro,
+                        rocksdb_column_family_handle_t* cf,
+                        const char* keys, size_t keylen, int n,
+                        char** vals, size_t* lens, int nthreads);
 ]]
 
 local librocksdb = ffi.load("rocksdb")
+
+-- Optional parallel point-read helper (csrc/coin_prefetch.c).  Built by
+-- `make build`; when absent, dbobj.parallel_get returns nil and callers keep
+-- their serial reads (identical results, just slower).
+local prefetch_lib = nil
+do
+  local paths = {
+    "./lib/coin_prefetch.so",
+    "lunarblock/coin_prefetch",
+    "./lunarblock/coin_prefetch.so",
+    "./coin_prefetch.so",
+    "coin_prefetch",
+  }
+  for _, path in ipairs(paths) do
+    local ok, lib = pcall(ffi.load, path)
+    if ok then
+      local ok_sym = pcall(function() return lib.coin_prefetch_get end)
+      if ok_sym then prefetch_lib = lib; break end
+    end
+  end
+end
+M.parallel_get_available = prefetch_lib ~= nil
+local SIZE_MAX_CDATA = ffi.cast("size_t", -1)
 
 -- Column family names
 M.CF = {
@@ -729,6 +758,51 @@ function M.open(path, cache_size_mb)
     local result = ffi.string(val, vallen[0])
     librocksdb.rocksdb_free(val)
     return result
+  end
+
+  -- Parallel point reads (csrc/coin_prefetch.c).  keys: array of strings,
+  -- all exactly keylen bytes.  Returns an array aligned with keys whose
+  -- entries are the value string (present), false (absent) or nil (RocksDB
+  -- error for that key — the caller must not treat it as absent).  Returns
+  -- nil when the helper library is not built.  Pure read: nothing is written.
+  local pg_cap = 0
+  local pg_keybuf, pg_vals, pg_lens
+  function dbobj.parallel_get(cf, keys, keylen, nthreads)
+    if not prefetch_lib then return nil end
+    local handle = dbobj._handles[cf]
+    if not handle then
+      error("Unknown column family: " .. tostring(cf))
+    end
+    local n = #keys
+    local out = {}
+    if n == 0 then return out end
+    if n > pg_cap then
+      pg_cap = math.max(n, 2 * pg_cap, 1024)
+      pg_keybuf = ffi.new("char[?]", pg_cap * keylen)
+      pg_vals = ffi.new("char*[?]", pg_cap)
+      pg_lens = ffi.new("size_t[?]", pg_cap)
+    end
+    for i = 1, n do
+      local k = keys[i]
+      if #k ~= keylen then
+        error("parallel_get: key " .. i .. " has length " .. #k)
+      end
+      ffi.copy(pg_keybuf + (i - 1) * keylen, k, keylen)
+    end
+    prefetch_lib.coin_prefetch_get(dbobj._db, dbobj._read_opts, handle,
+      pg_keybuf, keylen, n, pg_vals, pg_lens, nthreads or 16)
+    for i = 0, n - 1 do
+      local v = pg_vals[i]
+      if v ~= nil then
+        out[i + 1] = ffi.string(v, pg_lens[i])
+        librocksdb.rocksdb_free(v)
+      elseif pg_lens[i] == SIZE_MAX_CDATA then
+        out[i + 1] = nil  -- error: unknown, not absent
+      else
+        out[i + 1] = false
+      end
+    end
+    return out
   end
 
   -- Put a value into a column family

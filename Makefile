@@ -37,11 +37,20 @@ help:
 # 272, 325) and sha256_accel_init() probes CPUID at runtime, returning
 # 1=SHA-NI, 2=AVX2, 0=generic. So the .so is safe to build and ship on hosts
 # without the instructions — it just reports generic.
-build: lib/sha256_accel.so lib/parallel_verify.so
+build: lib/sha256_accel.so lib/parallel_verify.so lib/coin_prefetch.so
 
 lib/sha256_accel.so: csrc/sha256_accel.c
 	@mkdir -p lib
 	$(CC) -O3 -fPIC -shared -o $@ $< -lcrypto
+	@echo "built $@"
+
+# Parallel coin prefetch for connect_block (see csrc/coin_prefetch.c): n
+# concurrent rocksdb_get_cf point reads, results returned to the one Lua
+# thread. Optional at runtime -- src/storage.lua falls back to serial reads
+# when the library is missing.
+lib/coin_prefetch.so: csrc/coin_prefetch.c
+	@mkdir -p lib
+	$(CC) -O2 -fPIC -shared -o $@ $< -lpthread -lrocksdb
 	@echo "built $@"
 
 # CCheckQueue-shaped worker pool: ECDSA jobs plus full VerifyScript jobs

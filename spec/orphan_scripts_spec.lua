@@ -39,6 +39,7 @@ local INCLUDED = {
   "tests/test_assumeutxo_work_gate.lua",
   "tests/test_bip155_services_compactsize.lua",
   "tests/test_chain_sync_probe_locator.lua",
+  "tests/test_coin_prefetch.lua",
   "tests/test_dispatcher_arity.lua",
   "tests/test_fix37_bloom_wiring.lua",
   "tests/test_fix_3g_addr_timestamp_clamp.lua",

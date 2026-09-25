@@ -39,6 +39,11 @@ end
 M._PROF_ON = PROF_ON
 M._prof_add = prof_add
 
+-- Threads for connect_block's parallel coin prefetch (CoinView:prefetch).
+-- 0 disables it (serial reads, the pre-2026-09-24 behaviour).
+local PREFETCH_THREADS = tonumber(os.getenv("LUNARBLOCK_PREFETCH_THREADS") or "") or 16
+function M.set_prefetch_threads(n) PREFETCH_THREADS = n end
+
 -- BIP-68 applies only when version >= 2. Core stores version as uint32_t and
 -- compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
 -- high-bit version (e.g. 0x80000002) STILL enforces BIP-68. lunarblock reads the
@@ -1289,13 +1294,20 @@ end
 -- @param txid hash256: transaction ID
 -- @param vout number: output index
 -- @return boolean
-function CoinView:have(txid, vout)
+function CoinView:have(txid, vout, known_absent)
   local key = M.outpoint_key(txid, vout)
 
   -- Check cache first
   local entry = self.cache[key]
   if entry then
     return not entry.spent
+  end
+
+  -- known_absent: set of keys a CoinView:prefetch in this same connect_block
+  -- found absent on disk (disk cannot change until the block's flush), so
+  -- the answer is the one the disk read below would give.
+  if known_absent and known_absent[key] then
+    return false
   end
 
   -- Check disk
@@ -1310,7 +1322,7 @@ end
 -- @param txid hash256: transaction ID
 -- @param vout number: output index
 -- @param entry table: UTXO entry (value, script_pubkey, height, is_coinbase)
-function CoinView:add(txid, vout, entry)
+function CoinView:add(txid, vout, entry, known_absent)
   -- W93 Gate 16 (Core: coins.cpp:91 CCoinsViewCache::AddCoin):
   -- `if (coin.out.scriptPubKey.IsUnspendable()) return;`.
   -- Defence-in-depth: connect_block's per-tx loop already filters provably
@@ -1362,8 +1374,14 @@ function CoinView:add(txid, vout, entry)
     -- is provably absent from the store, so probe it — Core's replay path
     -- does the same (AddCoins check_for_overwrite; clearbit fb4051b and
     -- beamchain 8cfc3d3 are the fleet siblings of this fix).
+    --
+    -- known_absent (see CoinView:prefetch) is the same disk probe, issued in
+    -- parallel before the tx loop: disk is not written between the two, so
+    -- a key found absent there is absent here and mark_fresh stays true.
     local _p0 = PROF_ON and perf.now()
-    if self:_fetch_from_disk(key) ~= nil then
+    if known_absent and known_absent[key] then
+      -- provably absent from the store: FRESH is safe
+    elseif self:_fetch_from_disk(key) ~= nil then
       mark_fresh = false
     end
     if _p0 then prof_add("add_probe", perf.now() - _p0) end
@@ -1426,6 +1444,64 @@ function CoinView:spend(txid, vout)
   end
 
   return undo_entry
+end
+
+--- Prefetch a block's coins from disk with parallel point reads.
+-- Reads, concurrently, every key in input_keys / output_keys that is not
+-- already in the cache (a cached entry or tombstone is authoritative and is
+-- never overridden).  Present input coins are inserted into the cache as
+-- CLEAN entries, exactly as CoinView:get's miss path would insert them
+-- (same deserializer, flags = 0, same memory accounting).  Keys found absent
+-- are returned as a set; CoinView:add / :have consult it in place of their
+-- own disk probe.  Output keys found PRESENT are not cached (the serial
+-- probe runs for them as before).
+--
+-- Verdict-neutral by construction: it only moves reads the serial pass would
+-- make anyway to an earlier point with no intervening disk write (the block's
+-- writes land in its single flush at the end of connect_block), and a key
+-- whose parallel read errored is left to the serial path.
+-- @return set (key -> true) of keys absent on disk, or nil if unavailable
+function CoinView:prefetch(input_keys, output_keys, nthreads)
+  local storage = self.storage
+  if not storage.parallel_get then return nil end
+  local cache = self.cache
+  local keys, kinds, seen = {}, {}, {}
+  local n = 0
+  for i = 1, #input_keys do
+    local k = input_keys[i]
+    if cache[k] == nil and not seen[k] then
+      seen[k] = true
+      n = n + 1; keys[n] = k; kinds[n] = true
+    end
+  end
+  for i = 1, #output_keys do
+    local k = output_keys[i]
+    if cache[k] == nil and not seen[k] then
+      seen[k] = true
+      n = n + 1; keys[n] = k; kinds[n] = false
+    end
+  end
+  local absent = {}
+  if n == 0 then return absent end
+  local res = storage.parallel_get(storage_mod.CF.UTXO, keys, 36, nthreads)
+  if not res then return nil end
+  for i = 1, n do
+    local v = res[i]
+    if v == false then
+      absent[keys[i]] = true
+    elseif v and kinds[i] then
+      -- A record that fails to decode is left uncached so the serial get
+      -- raises the same error at the same point it always did.
+      local ok, entry = pcall(M.deserialize_utxo_entry, v)
+      if ok and entry then
+        self.stats.disk_reads = self.stats.disk_reads + 1
+        entry.flags = 0
+        cache[keys[i]] = entry
+        self.cached_memory_usage = self.cached_memory_usage + estimate_entry_memory(entry)
+      end
+    end
+  end
+  return absent
 end
 
 --- Check if cache should be flushed based on memory usage.
@@ -2729,6 +2805,43 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     end
   end
 
+  -- Coin prefetch: issue every disk read the tx loop below will make (input
+  -- coins via CoinView:get, output FRESH probes via CoinView:add, and the
+  -- BIP30 HaveCoin probes) up front, in parallel.  MEASURED 2026-09-24: on
+  -- the live 650000->675000 R4 slice the validation thread was in pread64
+  -- in 234 of 400 /proc samples; [CB-PROF] over 650001-650300 put the serial
+  -- input fetch at 1.2-3.8 s and the BIP30 probes at 1.4-3.2 s of a
+  -- 3.2-7.0 s connect_block (81-89% of it).  (BIP30 runs there at h>650000 because a
+  -- snapshot-booted height index has no block at BIP34 height 227931, so
+  -- bip34_bypasses_bip30 cannot confirm the bypass: stricter than Core,
+  -- never looser, and now one parallel read per output.)  All decisions
+  -- stay in the serial loop; see CoinView:prefetch for why this is
+  -- verdict-neutral.  Skipped in shared-batch reorg mode (disk lags the
+  -- cache there) and when LUNARBLOCK_PREFETCH_THREADS=0.
+  local known_absent = nil
+  if not reorg_batch and PREFETCH_THREADS > 0 and #block.transactions > 1
+      and self.coin_view.prefetch then
+    local _pf0 = PROF_ON and perf.now()
+    local in_keys, out_keys = {}, {}
+    local ni, no = 0, 0
+    local outpoint_key = M.outpoint_key
+    for tx_idx, tx in ipairs(block.transactions) do
+      if tx_idx > 1 then
+        for _, inp in ipairs(tx.inputs) do
+          ni = ni + 1
+          in_keys[ni] = outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+        end
+      end
+      local txid = validation.compute_txid(tx)
+      for vout_idx = 1, #tx.outputs do
+        no = no + 1
+        out_keys[no] = outpoint_key(txid, vout_idx - 1)
+      end
+    end
+    known_absent = self.coin_view:prefetch(in_keys, out_keys, PREFETCH_THREADS)
+    if _pf0 then prof_add("prefetch", perf.now() - _pf0, ni + no) end
+  end
+
   -- BIP-30: tx-overwrite prevention. Per Core validation.cpp:2402-2476,
   -- ConnectBlock enforces "no transaction in this block may have a txid
   -- whose outputs already exist as UTXOs", with two known mainnet
@@ -2764,7 +2877,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     for _, tx in ipairs(block.transactions) do
       local check_txid = validation.compute_txid(tx)
       for vout_idx = 1, #tx.outputs do
-        if self.coin_view:have(check_txid, vout_idx - 1) then
+        if self.coin_view:have(check_txid, vout_idx - 1, known_absent) then
           return nil, "bad-txns-BIP30: tried to overwrite transaction"
         end
       end
@@ -3085,7 +3198,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       if not is_unspendable(out.script_pubkey) then
         self.coin_view:add(txid, vout_idx - 1, M.utxo_entry(
           out.value, out.script_pubkey, height, is_coinbase
-        ))
+        ), known_absent)
       end
     end
     if _pp then local n = perf.now(); prof_add("outputs_add", n - _pp, #tx.outputs); _pp = n end
