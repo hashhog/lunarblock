@@ -159,6 +159,14 @@ ffi.cdef[[
 
   /* Memory */
   void rocksdb_free(void* ptr);
+
+  /* Bloom filter policy (block-based tables) */
+  typedef struct rocksdb_filterpolicy_t rocksdb_filterpolicy_t;
+  rocksdb_filterpolicy_t* rocksdb_filterpolicy_create_bloom_full(double bits_per_key);
+  void rocksdb_block_based_options_set_filter_policy(
+    rocksdb_block_based_table_options_t* options,
+    rocksdb_filterpolicy_t* policy
+  );
 ]]
 
 local librocksdb = ffi.load("rocksdb")
@@ -569,6 +577,20 @@ function M.open(path, cache_size_mb)
   local table_options = librocksdb.rocksdb_block_based_options_create()
   librocksdb.rocksdb_block_based_options_set_block_cache(table_options, cache)
   librocksdb.rocksdb_block_based_options_set_block_size(table_options, 16 * 1024)  -- 16KB
+  -- Full bloom filters, 10 bits/key (~1% false positives).  Without a filter
+  -- policy (filter_policy=nullptr, observed in the OPTIONS file of the live
+  -- 650000->675000 range slice) a Get for a key that is NOT in an SST must
+  -- read and search a data block in every level it could live in.
+  -- connect_block does one such negative lookup per created output (the BIP30
+  -- HaveCoin probe and CoinView:add's FRESH probe); MEASURED with [CB-PROF]
+  -- at 650000-650300 on a 67M-coin chainstate: 0.28-0.64 ms per negative
+  -- probe, 1.4-3.2 s per block.  Filters are per-SST and recorded in the SST, so this
+  -- only affects files written from now on (flushes/compactions/imports);
+  -- existing SSTs stay readable.  Storage-engine knob only: the bytes stored
+  -- and every Get result are unchanged.  (Core's LevelDB coins DB sets the
+  -- same thing: dbwrapper.cpp GetOptions, NewBloomFilterPolicy(10).)
+  librocksdb.rocksdb_block_based_options_set_filter_policy(
+    table_options, librocksdb.rocksdb_filterpolicy_create_bloom_full(10))
   librocksdb.rocksdb_options_set_block_based_table_factory(options, table_options)
 
   -- Check if the database already exists by looking for CURRENT file
