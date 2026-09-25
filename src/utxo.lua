@@ -19,6 +19,26 @@ local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 local MIN_BLOCKS_TO_KEEP = prune_mod.MIN_BLOCKS_TO_KEEP
 local M = {}
 
+-- [CB-PROF] wall-clock breakdown of connect_block, OFF unless
+-- LUNARBLOCK_CB_PROFILE=1.  Measurement only: every timed region runs the
+-- same code whether the flag is on or off.  Emitted every PROF.every blocks.
+local PROF_ON = os.getenv("LUNARBLOCK_CB_PROFILE") == "1"
+local PROF = {
+  every = tonumber(os.getenv("LUNARBLOCK_CB_PROFILE_EVERY") or "") or 100,
+}
+local function prof_reset()
+  PROF.n = 0
+  PROF.t = {}
+  PROF.c = {}
+end
+prof_reset()
+local function prof_add(k, dt, cnt)
+  PROF.t[k] = (PROF.t[k] or 0) + dt
+  PROF.c[k] = (PROF.c[k] or 0) + (cnt or 1)
+end
+M._PROF_ON = PROF_ON
+M._prof_add = prof_add
+
 -- BIP-68 applies only when version >= 2. Core stores version as uint32_t and
 -- compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
 -- high-bit version (e.g. 0x80000002) STILL enforces BIP-68. lunarblock reads the
@@ -1216,7 +1236,11 @@ end
 -- @param key string: outpoint key
 -- @return table|nil: UTXO entry or nil
 function CoinView:_fetch_from_disk(key)
+  local _p0 = PROF_ON and perf.now()
   local data = self.storage.get(storage_mod.CF.UTXO, key)
+  if _p0 then
+    prof_add(data and "disk_hit" or "disk_miss", perf.now() - _p0)
+  end
   if not data then return nil end
 
   self.stats.disk_reads = self.stats.disk_reads + 1
@@ -1275,7 +1299,9 @@ function CoinView:have(txid, vout)
   end
 
   -- Check disk
+  local _p0 = PROF_ON and perf.now()
   local data = self.storage.get(storage_mod.CF.UTXO, key)
+  if _p0 then prof_add("have_disk", perf.now() - _p0) end
   return data ~= nil
 end
 
@@ -1336,9 +1362,11 @@ function CoinView:add(txid, vout, entry)
     -- is provably absent from the store, so probe it — Core's replay path
     -- does the same (AddCoins check_for_overwrite; clearbit fb4051b and
     -- beamchain 8cfc3d3 are the fleet siblings of this fix).
+    local _p0 = PROF_ON and perf.now()
     if self:_fetch_from_disk(key) ~= nil then
       mark_fresh = false
     end
+    if _p0 then prof_add("add_probe", perf.now() - _p0) end
   end
 
   -- Set flags
@@ -2694,6 +2722,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   else
     lock_time_cutoff = block.header.timestamp
   end
+  local _pp = PROF_ON and perf.now()
   for _, tx in ipairs(block.transactions) do
     if not mining.is_final_tx(tx, height, lock_time_cutoff) then
       return nil, "non-final transaction: bad-txns-nonfinal"
@@ -2818,6 +2847,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- below, alongside the UTXO/undo/chain_tip mutations.  An empty list
   -- when txindex is disabled costs nothing.
   local block_txid_bytes = self.txindex_enabled and {} or nil
+  if _pp then local n = perf.now(); prof_add("pre", n - _pp); _pp = n end
 
   for tx_idx, tx in ipairs(block.transactions) do
     local txid = validation.compute_txid(tx)
@@ -2841,6 +2871,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       -- We need to look up all UTXOs before we can check sequence locks
       local utxo_cache = {}  -- inp_idx -> utxo
 
+      if _pp then local n = perf.now(); prof_add("misc", n - _pp); _pp = n end
       for inp_idx, inp in ipairs(tx.inputs) do
         -- Look up the UTXO being spent
         local utxo = self.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
@@ -2861,6 +2892,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
         local idx = inp_to_idx[inp]
         return idx and utxo_cache[idx] or nil
       end
+      if _pp then local n = perf.now(); prof_add("inputs_get", n - _pp, #tx.inputs); _pp = n end
       local tx_sigop_cost = validation.get_transaction_sigop_cost(tx, get_prev_output, sigop_flags)
       total_sigop_cost = total_sigop_cost + tx_sigop_cost
 
@@ -2898,6 +2930,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             types.hash256_hex(txid), min_height, height, min_time, prev_block_mtp))
       end
 
+      if _pp then local n = perf.now(); prof_add("sigops_bip68", n - _pp); _pp = n end
       -- Second pass: validate each input and collect undo data
       local input_total = 0
       local tx_undo = M.tx_undo({})
@@ -3044,6 +3077,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
       total_fees = total_fees + tx_fee
     end
 
+    if _pp then local n = perf.now(); prof_add("inputs_loop", n - _pp); _pp = n end
     -- Add outputs to UTXO set
     for vout_idx, out in ipairs(tx.outputs) do
       -- Don't add provably unspendable outputs (OP_RETURN or over-size).
@@ -3054,6 +3088,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
         ))
       end
     end
+    if _pp then local n = perf.now(); prof_add("outputs_add", n - _pp, #tx.outputs); _pp = n end
   end
 
   local _cb_t_tx = perf.now()
@@ -3475,6 +3510,26 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     if flush > w.flush_max then w.flush_max = flush end
     if total > w.total_max then w.total_max = total end
     self.cb_lifetime = self.cb_lifetime + 1
+    if PROF_ON then
+      prof_add("par_wait", par); prof_add("undo_ser", undo)
+      prof_add("flush", flush); prof_add("callback", cb)
+      prof_add("total", total)
+      prof_add("txs", 0, #block.transactions)
+      PROF.n = PROF.n + 1
+      if PROF.n >= PROF.every then
+        local keys = {}
+        for k in pairs(PROF.t) do keys[#keys + 1] = k end
+        table.sort(keys)
+        local parts = {}
+        for _, k in ipairs(keys) do
+          parts[#parts + 1] = string.format("%s=%.1fms/%.0f", k,
+            PROF.t[k] / PROF.n * 1000, PROF.c[k] / PROF.n)
+        end
+        print(string.format("[CB-PROF] h=%d blocks=%d per-block: %s",
+          height, PROF.n, table.concat(parts, " ")))
+        prof_reset()
+      end
+    end
     if w.n >= self.cb_log_every then
       print(string.format(
         "[W77-CB] window=%d total=%d tx_avg=%.1fms par_avg=%.1fms undo_avg=%.1fms flush_avg=%.1fms cb_avg=%.1fms total_avg=%.1fms tx_max=%.0fms flush_max=%.0fms total_max=%.0fms",
