@@ -10,12 +10,14 @@ local validation = require("lunarblock.validation")
 
 local M = {}
 
--- connect_block pushes every input of a tx consecutively, so the same
--- interned tx_bytes string arrives N times. Deserialize + BIP143 midstate
+-- connect_block pushes every input of a tx consecutively, and the C pool
+-- hands each worker a contiguous tx-grouped chunk (pv_script_chunk_len), so
+-- the same interned tx_bytes string arrives back-to-back on ONE worker. Deserialize + BIP143 midstate
 -- once; reuse for the rest of the tx. Without this, a 1000-input
 -- consolidation is 1000 deserializations of the same blob — the worker
 -- analogue of the host O(N^2) prev_outputs bug that made [W77-CB] 12-25s.
 local last_bytes, last_tx, last_prevouts, last_cache
+local last_flag_bits, last_flags, last_taproot
 
 --- Run one CScriptCheck-equivalent.
 -- @param tx_bytes string serialized transaction (with witness)
@@ -43,8 +45,18 @@ function M.run(tx_bytes, input_index, prev_script, amount, flags_bits, prevouts_
     last_prevouts = prev_outputs
     last_cache = cache
   end
-  local flags = validation.script_flags_from_bits(flags_bits)
-  local taproot_active = validation.script_flags_taproot_active(flags_bits)
+  -- One flags table per distinct bits value (a block has exactly one).
+  -- verify_input_script never mutates the table it is given (every path
+  -- that adds keys works on copy_flags(flags)), so sharing it is safe.
+  local flags, taproot_active
+  if flags_bits == last_flag_bits then
+    flags = last_flags
+    taproot_active = last_taproot
+  else
+    flags = validation.script_flags_from_bits(flags_bits)
+    taproot_active = validation.script_flags_taproot_active(flags_bits)
+    last_flag_bits, last_flags, last_taproot = flags_bits, flags, taproot_active
+  end
   local ok, err = validation.verify_input_script(
     tx, input_index, amount, prev_script, flags,
     { taproot_active = taproot_active, prev_outputs = prev_outputs, cache = cache })

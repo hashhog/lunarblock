@@ -425,12 +425,17 @@ static lua_State *create_worker_state(int id) {
         return NULL;
     }
     lua_pop(L, 1);
-    /* Pace GC against interned unique tx bytes. Default pause=200 lets the
-     * heap double before a cycle; on a range that is the par_avg climb
-     * (133ms → 263ms over 1,000 blocks) as interned serializations and
-     * deserialized tables accumulate. 110 starts a cycle at +10%. */
-    lua_gc(L, LUA_GCSETPAUSE, 110);
-    lua_gc(L, LUA_GCSETSTEPMUL, 400);
+    /* GC pacing. Workers now claim tx-grouped chunks (claim_chunk), so the
+     * allocation rate per input is far lower than when every input
+     * re-deserialized its tx. The old schedule (pause 110 / stepmul 400, a
+     * GCSTEP after every job, a FULL collect on every idle transition) spent
+     * a measurable share of worker CPU in the collector. Now: LuaJIT's
+     * standard incremental pacing slightly tightened (pause 150 = next cycle
+     * at +50% of live heap), one GCSTEP per chunk, and a full collect at idle
+     * only when the heap has grown past WORKER_IDLE_COLLECT_KB. Memory stays
+     * bounded by ~1.5x live + the idle-collect ceiling. */
+    lua_gc(L, LUA_GCSETPAUSE, 150);
+    lua_gc(L, LUA_GCSETSTEPMUL, 200);
     return L;
 }
 
@@ -440,10 +445,19 @@ static void worker_gc_step(worker_t *worker) {
     worker->gc_kb = lua_gc(worker->L, LUA_GCCOUNT, 0);
 }
 
+/* Idle-time full collect ceiling per worker lua_State (KiB). Below it the
+ * incremental collector alone paces the heap; above it the worker does one
+ * full collect while it has nothing else to do. */
+#define WORKER_IDLE_COLLECT_KB (48 * 1024)
+
 static void worker_gc_idle(worker_t *worker) {
     if (!worker->L) return;
-    lua_gc(worker->L, LUA_GCCOLLECT, 0);
-    worker->gc_kb = lua_gc(worker->L, LUA_GCCOUNT, 0);
+    int kb = lua_gc(worker->L, LUA_GCCOUNT, 0);
+    if (kb > WORKER_IDLE_COLLECT_KB) {
+        lua_gc(worker->L, LUA_GCCOLLECT, 0);
+        kb = lua_gc(worker->L, LUA_GCCOUNT, 0);
+    }
+    worker->gc_kb = kb;
 }
 
 static void set_job_error(script_check_job *job, const char *msg) {
@@ -485,6 +499,60 @@ static void process_script_job(worker_t *worker, script_check_job *job) {
         set_job_error(job, err);
     }
     lua_settop(L, 0);
+}
+
+/*
+ * Chunk sizing for PV_JOB_SCRIPT batches (Core CCheckQueue::Loop shape).
+ *
+ * Pre-2026-09-26 every worker claimed ONE job (next_job++). connect_block
+ * queues a tx's inputs consecutively, so a 2..15-input tx scattered across
+ * as many workers, and each of them deserialized the whole tx and rebuilt
+ * its sighash midstates -- the single-entry same-tx cache on the worker
+ * almost never hit.
+ *
+ * Now a worker claims [start, start+len):
+ *   target = clamp(remaining / (2 * nworkers), 1, PV_MAX_CHUNK)
+ *     (Core: nNow = max(1, min(nBatchSize, queue.size() / (nTotal + nIdle + 1))))
+ *   - if the target cuts a tx in two and there is an earlier tx boundary
+ *     inside the chunk, end the chunk at that boundary instead;
+ *   - if the chunk is a single tx, extend it to that tx's end, up to
+ *     2 * target, so a small tx is never split by the tail rounding.
+ * Chunks are contiguous and disjoint and every index in [0, count) is
+ * claimed exactly once (next_job advances by exactly len >= 1). Which
+ * worker runs which job never affects the verdict: each job writes only
+ * its own result, and the host reports the lowest failing index.
+ *
+ * Tx identity is the tx_bytes pointer: validation.verify_script_checks
+ * passes the same interned Lua string for every input of one tx.
+ *
+ * Exposed (non-static) so tests can check the partition directly.
+ */
+#define PV_MAX_CHUNK 128
+
+int pv_script_chunk_len(const script_check_job *jobs, int start, int count,
+                        int nworkers) {
+    int remaining = count - start;
+    if (remaining <= 0) return 0;
+    if (nworkers < 1) nworkers = 1;
+    int target = remaining / (2 * nworkers);
+    if (target < 1) target = 1;
+    if (target > PV_MAX_CHUNK) target = PV_MAX_CHUNK;
+    if (target > remaining) target = remaining;
+    int end = start + target;
+    if (end < count && jobs[end].tx_bytes == jobs[end - 1].tx_bytes) {
+        /* The chunk would split a tx. Prefer the last boundary inside it. */
+        int b = end - 1;
+        while (b > start && jobs[b].tx_bytes == jobs[b - 1].tx_bytes) b--;
+        if (b > start) {
+            end = b;
+        } else {
+            /* Whole chunk is one tx: take the rest of it, bounded. */
+            int hard = start + 2 * target;
+            if (hard > count) hard = count;
+            while (end < hard && jobs[end].tx_bytes == jobs[end - 1].tx_bytes) end++;
+        }
+    }
+    return end - start;
 }
 
 /*
@@ -535,16 +603,22 @@ static void *worker_func(void *arg) {
             break;
         }
 
+        int n_claimed = 0;
         if (next_job < job_count) {
-            int job_idx = next_job++;
+            int job_idx = next_job;
             kind = current_kind;
             if (kind == PV_JOB_INPUT) {
                 job_ptr = &((verify_job *)job_queue)[job_idx];
+                n_claimed = 1;
             } else if (kind == PV_JOB_SIG) {
                 job_ptr = &((sig_verify_job *)job_queue)[job_idx];
+                n_claimed = 1;
             } else {
                 job_ptr = &((script_check_job *)job_queue)[job_idx];
+                n_claimed = pv_script_chunk_len((script_check_job *)job_queue,
+                                                job_idx, job_count, num_workers);
             }
+            next_job = job_idx + n_claimed;
         }
 
         pthread_mutex_unlock(&queue_mutex);
@@ -555,12 +629,19 @@ static void *worker_func(void *arg) {
             } else if (kind == PV_JOB_SIG) {
                 process_sig_job(worker, (sig_verify_job *)job_ptr);
             } else {
-                process_script_job(worker, (script_check_job *)job_ptr);
+                /* A contiguous, tx-grouped run: the worker's same-tx cache
+                 * (script_check_worker.lua) deserializes each tx and builds
+                 * its PrecomputedTransactionData once per chunk instead of
+                 * once per input. Every job still gets its own result. */
+                script_check_job *sj = (script_check_job *)job_ptr;
+                for (int k = 0; k < n_claimed; k++) {
+                    process_script_job(worker, &sj[k]);
+                }
                 worker_gc_step(worker);
             }
 
             pthread_mutex_lock(&queue_mutex);
-            jobs_completed++;
+            jobs_completed += n_claimed;
             if (jobs_completed == job_count) {
                 pthread_cond_signal(&work_done);
             }

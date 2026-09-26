@@ -2150,6 +2150,17 @@ end
 -- blockSinceLastRollingFeeBump=true).
 -- @param block block: The connected block
 function Mempool:on_block_connected(block)
+  -- Fast path (IBD): with no entries, no spent-outpoint index and no
+  -- prioritisation deltas, the loop below can neither remove a tx, find a
+  -- conflict, nor clear a delta -- it would only hex-encode every txid and
+  -- build an outpoint key per input.  Skip straight to the fee-clock reset,
+  -- which is the only state change it could make.
+  if next(self.entries) == nil and next(self.outpoint_to_tx) == nil
+      and next(self.map_deltas) == nil then
+    self.last_rolling_fee_update = os.time()
+    self.block_since_last_rolling_fee_bump = true
+    return
+  end
   for _, tx in ipairs(block.transactions) do
     local txid = validation.compute_txid(tx)
     local txid_hex = types.hash256_hex(txid)
@@ -3512,6 +3523,9 @@ end
 -- @return list of removed orphan entries (for caller's re-feed loop)
 function OrphanPool:on_block_connected(block)
   if not block or not block.transactions then return {} end
+  -- Empty pool: children_of can only return {} (it filters on entries), so
+  -- skip hex-encoding every txid of the block.
+  if next(self.entries) == nil then return {} end
   local resolved = {}
   for _, tx in ipairs(block.transactions) do
     local txid = validation.compute_txid(tx)

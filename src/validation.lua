@@ -57,6 +57,7 @@ ffi.cdef[[
   int pv_get_num_workers(void);
   int pv_get_script_workers(void);
   int pv_script_worker_gc_kb(void);
+  int pv_script_chunk_len(const script_check_job *jobs, int start, int count, int nworkers);
   int pv_set_lua_paths(const char *path, const char *cpath);
   const char *pv_get_boot_error(void);
   void pv_shutdown(void);
@@ -250,6 +251,29 @@ function M.script_check_boot_error()
   return ffi.string(pv_lib.pv_get_boot_error())
 end
 
+--- Test hook: the C pool's chunk partition of a script-check batch.
+-- @param tx_ids array of integers, one per job; equal ids = same tx
+-- @param nworkers number
+-- @return array of {start, len} (0-based start), or nil if the lib is absent
+function M._script_chunk_partition(tx_ids, nworkers)
+  if not load_pv_lib() then return nil end
+  local n = #tx_ids
+  local arr = ffi.new("script_check_job[?]", math.max(n, 1))
+  local base = ffi.new("uint8_t[?]", 1)  -- pointer identity only; never dereferenced
+  for i = 1, n do
+    arr[i - 1].tx_bytes = ffi.cast("const uint8_t *", ffi.cast("uintptr_t", base) + tx_ids[i])
+  end
+  local out = {}
+  local start = 0
+  while start < n do
+    local len = pv_lib.pv_script_chunk_len(arr, start, n, nworkers)
+    if len < 1 then break end
+    out[#out + 1] = { start, len }
+    start = start + len
+  end
+  return out
+end
+
 --- Sum of per-worker LuaJIT heap (lua_gc count), kilobytes.
 -- Each worker publishes the figure from its own thread; this is a read of
 -- an int, not a lua_State access from the host.
@@ -330,6 +354,7 @@ function M.verify_script_checks(jobs)
   -- par_avg grow with blocks processed.
   local keep = { cjobs }
   local tx_ptr = {}
+  local last_flags_tbl, last_flags_tap, last_flags_bits = nil, nil, 0
   local prev_ptr = {}
 
   for i, job in ipairs(jobs) do
@@ -350,7 +375,13 @@ function M.verify_script_checks(jobs)
     cjobs[j].tx_len = #bytes
     cjobs[j].input_index = job.input_index
     cjobs[j].amount = job.amount
-    cjobs[j].flags = M.script_flags_to_bits(job.flags, job.taproot_active)
+    -- connect_block shares one flags table per block; pack it once.
+    local jflags, jtap = job.flags, job.taproot_active and true or false
+    if jflags ~= last_flags_tbl or jtap ~= last_flags_tap then
+      last_flags_tbl, last_flags_tap = jflags, jtap
+      last_flags_bits = M.script_flags_to_bits(jflags, jtap)
+    end
+    cjobs[j].flags = last_flags_bits
 
     local spk = job.script_pubkey or ""
     keep[#keep + 1] = spk

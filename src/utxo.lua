@@ -231,8 +231,12 @@ end
 -- @param get_ancestor_hash function(height) -> hash256|nil: look up a block hash
 -- @return boolean: true if BIP30 enforcement should be skipped
 local function bip34_bypasses_bip30(network, height, get_ancestor_hash)
-  -- Only applicable if BIP34 has activated at this height.
-  if not network.bip34_height or height < network.bip34_height then
+  -- Core: pindex->pprev->GetAncestor(BIP34Height) is nullptr unless the
+  -- PARENT is at or above BIP34Height, i.e. height - 1 >= bip34_height.
+  -- So the block AT the BIP34 height itself still enforces BIP30 (this used
+  -- to be `height < bip34_height`, which let block 227,931 match its OWN
+  -- hash and skip the check -- looser than Core at exactly one height).
+  if not network.bip34_height or height - 1 < network.bip34_height then
     return false
   end
   -- If the network has no canonical BIP34 hash, can't confirm the bypass.
@@ -2711,6 +2715,73 @@ function ChainState:has_invalid_ancestor(block_hash)
 end
 
 --------------------------------------------------------------------------------
+-- BIP30/BIP34 ancestor lookup (Core: pindex->pprev->GetAncestor(BIP34Height))
+--------------------------------------------------------------------------------
+
+--- Does the header ancestry of `prev_hash` (at `prev_height`) run through the
+-- pinned snapshot base at `base`?  Walks stored headers down to the base once
+-- and memoizes the last verified hash, so the steady state (each block's
+-- parent is the previously verified block) is O(1).
+-- @return boolean
+function ChainState:_descends_from_snapshot_base(prev_hash, prev_height, base)
+  if not prev_hash or prev_height < base then return false end
+  local memo = self._bip30_lineage_ok
+  if memo and memo == prev_hash.bytes then return true end
+  local au_data = consensus.assumeutxo_for_height(self.network, base)
+  if not au_data or type(au_data.blockhash) ~= "string" then return false end
+  local cur_hash, cur_height = prev_hash, prev_height
+  while cur_height > base do
+    if memo and cur_hash.bytes == memo then
+      self._bip30_lineage_ok = prev_hash.bytes
+      return true
+    end
+    local hdr = self.storage.get_header(cur_hash)
+    if not hdr then return false end
+    cur_hash = hdr.prev_hash
+    cur_height = cur_height - 1
+  end
+  if types.hash256_hex(cur_hash) ~= au_data.blockhash then return false end
+  self._bip30_lineage_ok = prev_hash.bytes
+  return true
+end
+
+--- Hash of the ancestor at height `h` of the block being connected at
+-- `height` whose parent is `prev_hash` (Core pindex->pprev->GetAncestor(h)).
+-- Only used for the BIP34 hash comparison that decides whether BIP30 runs.
+--
+-- 1. The connected-block height index.  On a genesis-synced chainstate it
+--    holds the active chain, which the block extends.
+-- 2. SNAPSHOT CHAINSTATE (2026-09-26).  An assumeutxo-bootstrapped datadir
+--    never downloads headers below the base (the header chain forward-syncs
+--    from the base; only a short pinned tail is grafted), so step 1 misses
+--    for BIP34 height 227,931 and BIP30 used to fail OPEN into a HaveCoin
+--    probe for every output of every block -- stricter than Core, and a
+--    large per-block cost.  Core, which always holds the full header tree,
+--    resolves the ancestor through the block's own ancestry.  We do the same
+--    as far as our headers go: the block's parent must descend (stored-header
+--    walk) from the pinned, hash-verified snapshot base.  That base is a
+--    block of this network's canonical chain above the BIP34 height -- the
+--    same trust that makes its UTXO set usable at all -- so its (and hence
+--    this block's) ancestor at the BIP34 height is the network's BIP34 hash.
+--    Any gap in the walk, a base below `h`, a lineage that does not pass
+--    through the pinned base, or a network without a BIP34 hash returns nil,
+--    which keeps BIP30 enforced (fail-closed, never looser than Core).
+-- @return hash256|nil
+function ChainState:bip30_ancestor_hash(prev_hash, height, h)
+  if height - 1 < h then return nil end
+  local stored = self.storage.get_hash_by_height(h)
+  if stored then return stored end
+  local net = self.network
+  if h ~= net.bip34_height or not net.bip34_hash then return nil end
+  local base = self:get_snapshot_base_height()
+  if not base or base <= h or height <= base then return nil end
+  if not self:_descends_from_snapshot_base(prev_hash, height - 1, base) then
+    return nil
+  end
+  return types.hash256_from_hex(net.bip34_hash)
+end
+
+--------------------------------------------------------------------------------
 -- Connect Block
 --------------------------------------------------------------------------------
 
@@ -2811,10 +2882,10 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   -- the live 650000->675000 R4 slice the validation thread was in pread64
   -- in 234 of 400 /proc samples; [CB-PROF] over 650001-650300 put the serial
   -- input fetch at 1.2-3.8 s and the BIP30 probes at 1.4-3.2 s of a
-  -- 3.2-7.0 s connect_block (81-89% of it).  (BIP30 runs there at h>650000 because a
-  -- snapshot-booted height index has no block at BIP34 height 227931, so
-  -- bip34_bypasses_bip30 cannot confirm the bypass: stricter than Core,
-  -- never looser, and now one parallel read per output.)  All decisions
+  -- 3.2-7.0 s connect_block (81-89% of it).  (BIP30 ran there at h>650000 because a
+  -- snapshot-booted height index has no block at BIP34 height 227931; since
+  -- 2026-09-26 bip30_ancestor_hash resolves it through the pinned snapshot
+  -- base lineage, so post-BIP34 blocks skip the BIP30 probes as in Core.)  All decisions
   -- stay in the serial loop; see CoinView:prefetch for why this is
   -- verdict-neutral.  Skipped in shared-batch reorg mode (disk lags the
   -- cache there) and when LUNARBLOCK_PREFETCH_THREADS=0.
@@ -2863,11 +2934,13 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   if enforce_bip30 then
     -- BIP34 bypass: if BIP34 is confirmed active at the canonical hash for
     -- this chain, skip BIP30 for blocks below BIP34_IMPLIES_BIP30_LIMIT.
-    -- Provide a get_ancestor_hash closure that looks up the block hash at
-    -- a given height from the height index.
-    local storage_ref = self.storage
+    -- get_ancestor_hash is Core's pindex->pprev->GetAncestor(h): the
+    -- height index, or on a snapshot chainstate the pinned-base lineage
+    -- (ChainState:bip30_ancestor_hash).
+    local self_ref = self
+    local prev_hash = block.header and block.header.prev_hash
     local function get_ancestor_hash(h)
-      return storage_ref.get_hash_by_height(h)
+      return self_ref:bip30_ancestor_hash(prev_hash, height, h)
     end
     if bip34_bypasses_bip30(self.network, height, get_ancestor_hash) then
       enforce_bip30 = false

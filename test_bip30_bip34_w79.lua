@@ -101,10 +101,17 @@ local WRONG_HASH = h("1111111111111111111111111111111111111111111111111111111111
 check("at BIP34 height, wrong ancestor hash → does not bypass",
   not utxo.bip34_bypasses_bip30(mainnet, 227931, function() return WRONG_HASH end))
 
--- At BIP34 height, correct canonical hash: bypass
+-- At BIP34 height itself: Core computes pindex->pprev->GetAncestor(227931)
+-- from a parent at 227930, which is nullptr, so BIP30 is still ENFORCED at
+-- 227931 even though the block's own hash is the BIP34 hash.
 local BIP34_HASH_MAINNET = h("000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8")
-check("at BIP34 height, correct canonical hash → bypasses BIP30",
-  utxo.bip34_bypasses_bip30(mainnet, 227931, function(h_arg)
+check("at BIP34 height, correct canonical hash → still enforces (pprev below BIP34 height)",
+  not utxo.bip34_bypasses_bip30(mainnet, 227931, function(h_arg)
+    if h_arg == mainnet.bip34_height then return BIP34_HASH_MAINNET end
+    return nil
+  end))
+check("at BIP34 height + 1, correct canonical ancestor → bypasses BIP30",
+  utxo.bip34_bypasses_bip30(mainnet, 227932, function(h_arg)
     if h_arg == mainnet.bip34_height then return BIP34_HASH_MAINNET end
     return nil
   end))

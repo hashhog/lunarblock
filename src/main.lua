@@ -1825,7 +1825,9 @@ local function main()
   chain_state.callbacks.on_block_connected = function(block_hash, block)
     -- Feed the fee estimator: record confirmations for tracked txs
     local height = chain_state.tip_height
-    if block and block.transactions then
+    -- tx_confirmed is a no-op for a txid the estimator is not tracking, so
+    -- with nothing tracked (IBD: empty mempool) skip hex-encoding every txid.
+    if block and block.transactions and next(fee_estimator.unconfirmed) ~= nil then
       for _, tx in ipairs(block.transactions) do
         local txid = validation.compute_txid(tx)
         local txid_hex = types.hash256_hex(txid)
