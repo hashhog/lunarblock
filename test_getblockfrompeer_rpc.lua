@@ -70,9 +70,10 @@ local mock_storage = {
 }
 
 -- Mock peer: captures every send_message call.
-local function make_mock_peer(ip, port)
+local function make_mock_peer(ip, port, services)
   return {
     ip = ip, port = port, sent = {},
+    services = services or 9,  -- NODE_NETWORK|NODE_WITNESS
     send_message = function(self, command, payload)
       self.sent[#self.sent + 1] = { command = command, payload = payload }
       return true
@@ -166,6 +167,18 @@ test("success -> getdata(block) sent to resolved peer, returns {}", function()
   -- Confirm round-trip back to the display hex.
   assert(types.hash256_hex(item.hash) == KNOWN_HEX,
     "getdata hash hex mismatch: got " .. types.hash256_hex(item.hash))
+end)
+
+-- (e) Core FetchBlock: a peer without NODE_WITNESS -> "Pre-SegWit peer" (-1),
+-- and no getdata is sent (we only ever request MSG_WITNESS_BLOCK).
+test("non-witness peer -> 'Pre-SegWit peer' (-1), no getdata", function()
+  local peer = make_mock_peer("10.0.0.3", 8333, 1)  -- NODE_NETWORK only
+  local server = make_server({ peer })
+  local ok, err = pcall(server.methods.getblockfrompeer, server, { KNOWN_HEX, 0 })
+  assert(not ok, "expected error, got success")
+  assert(err.code == -1 and err.message == "Pre-SegWit peer",
+    "expected 'Pre-SegWit peer', got " .. tostring(err and err.message))
+  assert(#peer.sent == 0, "no getdata may be sent to a non-witness peer")
 end)
 
 print("")

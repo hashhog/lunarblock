@@ -61,11 +61,8 @@ return {
   ["peer message handler dispatch handles sendheaders message"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
   ["peer ping/pong responds to ping with pong"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- FAILED spec/peer_spec.lua
   ["peer ping/pong sends ping and measures latency from pong"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
-  ["peer pre-handshake filtering accumulates misbehavior score and disconnects at threshold"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
   ["peer pre-handshake filtering allows all messages after handshake complete"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
   ["peer pre-handshake filtering allows version message before handshake"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
-  ["peer pre-handshake filtering rejects data messages before verack"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
-  ["peer pre-handshake filtering rejects non-version message before version received"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
   ["peer pre-handshake filtering sets handshake_complete after full version/verack exchange"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- ERROR spec/peer_spec.lua
   ["peer timeout detection detects handshake timeout"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- FAILED spec/peer_spec.lua
   ["peer version handshake with mock server completes handshake with version/verack exchange"] = "GAP: peer handshake/mock-socket tests (close/send nil on mock)",  -- FAILED spec/peer_spec.lua

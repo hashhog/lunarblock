@@ -7041,6 +7041,13 @@ end
     if not target_peer then
       error({code = M.ERROR.MISC_ERROR, message = "Peer does not exist"})
     end
+    -- (4b) Core FetchBlock (net_processing.cpp:1968-1969): "Ignore pre-segwit
+    -- peers" — we only ever request MSG_WITNESS_BLOCK, which a peer without
+    -- NODE_WITNESS cannot serve.  Such peers can complete the handshake
+    -- (inbound, Core parity), so this must be checked explicitly.
+    if bit.band(target_peer.services or 0, p2p.SERVICES.NODE_WITNESS) == 0 then
+      error({code = M.ERROR.MISC_ERROR, message = "Pre-SegWit peer"})
+    end
 
     -- (5) Send a block getdata to that peer and return {} immediately.
     -- MSG_WITNESS_BLOCK mirrors Core's MSG_BLOCK | MSG_WITNESS_FLAG and matches

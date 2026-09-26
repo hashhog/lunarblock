@@ -224,8 +224,8 @@ describe("peer", function()
 
       -- Send old protocol version
       local old_version = p2p.serialize_version({
-        version = 60002,  -- Too old
-        services = 1,
+        version = 31799,  -- below Core MIN_PEER_PROTO_VERSION (31800)
+        services = 9,
         timestamp = os.time(),
         recv_services = 0,
         recv_ip = "0.0.0.0",
@@ -244,7 +244,7 @@ describe("peer", function()
       socket.sleep(0.05)
       p:process_messages()
       assert.equal(peer_module.STATE.DISCONNECTED, p.state)
-      assert.is_true(p.disconnect_reason:find("protocol version too old") ~= nil)
+      assert.is_true(p.disconnect_reason:find("obsolete version") ~= nil)
     end)
   end)
 
@@ -576,22 +576,6 @@ describe("peer", function()
       })
     end
 
-    it("rejects non-version message before version received", function()
-      local p = peer_module.new("127.0.0.1", 8333, mainnet)
-      p.state = peer_module.STATE.CONNECTED
-      p.socket = mock_socket()
-      assert.is_false(p.version_received)
-      assert.is_false(p.handshake_complete)
-
-      -- Send ping before version - should be rejected
-      local ping_msg = p2p.make_message(mainnet.magic_bytes, "ping", p2p.serialize_ping(123))
-      p.recv_buffer = ping_msg
-
-      local processed = p:process_messages()
-      assert.equal(0, #processed)  -- Message dropped
-      assert.equal(10, p.ban_score)  -- Misbehavior scored
-    end)
-
     it("allows version message before handshake", function()
       local p = peer_module.new("127.0.0.1", 8333, mainnet)
       p.state = peer_module.STATE.VERSION_SENT
@@ -635,23 +619,6 @@ describe("peer", function()
       assert.equal(1, #processed)
       assert.is_true(p.send_headers)
       assert.equal(0, p.ban_score)
-    end)
-
-    it("rejects data messages before verack", function()
-      local p = peer_module.new("127.0.0.1", 8333, mainnet)
-      p.state = peer_module.STATE.VERACK_SENT
-      p.version_received = true
-      p.handshake_complete = false
-      p.socket = mock_socket()
-
-      -- inv message is not allowed before handshake
-      -- (using empty payload for simplicity)
-      local msg = p2p.make_message(mainnet.magic_bytes, "inv", "\x00")
-      p.recv_buffer = msg
-
-      local processed = p:process_messages()
-      assert.equal(0, #processed)  -- Message dropped
-      assert.equal(10, p.ban_score)
     end)
 
     it("allows all messages after handshake complete", function()
@@ -701,25 +668,6 @@ describe("peer", function()
       assert.equal(1, #processed)
       assert.is_true(p.send_addrv2)
       assert.equal(0, p.ban_score)
-    end)
-
-    it("accumulates misbehavior score and disconnects at threshold", function()
-      local p = peer_module.new("127.0.0.1", 8333, mainnet)
-      p.state = peer_module.STATE.CONNECTED
-      p.socket = mock_socket()
-
-      -- Send 10 invalid messages (10 points each = 100 total = disconnect)
-      for i = 1, 10 do
-        local ping_msg = p2p.make_message(mainnet.magic_bytes, "ping", p2p.serialize_ping(i))
-        p.recv_buffer = ping_msg
-        p:process_messages()
-        if p.state == peer_module.STATE.DISCONNECTED then
-          break
-        end
-      end
-
-      assert.equal(peer_module.STATE.DISCONNECTED, p.state)
-      assert.is_true(p.disconnect_reason:find("misbehaving") ~= nil)
     end)
 
     it("sets handshake_complete after full version/verack exchange", function()

@@ -171,6 +171,7 @@ local function mock_peer()
     addr = "127.0.0.1:1",
     address = "127.0.0.1",
     start_height = 100000,
+    services = 9,  -- NODE_NETWORK|NODE_WITNESS (block download requires witness)
   }
 end
 

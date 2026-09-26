@@ -1,6 +1,7 @@
 local types = require("lunarblock.types")
 local serialize = require("lunarblock.serialize")
 local p2p = require("lunarblock.p2p")
+local bit = require("bit")
 local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
 local crypto = require("lunarblock.crypto")
@@ -2970,6 +2971,13 @@ end
 -- Uses round-robin assignment with per-peer in-flight tracking.
 -- @param peers table: list of established peers with NODE_NETWORK service
 function BlockDownloader:schedule_downloads(peers)
+  -- Core CanServeWitnesses gate (net_processing.cpp:1501 FindNextBlocks,
+  -- :2854 direct fetch): every body below is requested as MSG_WITNESS_BLOCK, so
+  -- a peer that did not advertise NODE_WITNESS is never asked for a block.
+  -- Such peers can now complete the handshake (inbound, Core parity), so this
+  -- filter is what keeps them out of block download — both the W46 cursor
+  -- re-request and the round-robin window below draw only from `peers`.
+  peers = M.witness_capable_peers(peers or {})
   if #peers == 0 then return end
   -- Wave 8 defensive un-latch: if ibd_complete was set but headers now
   -- extend past best_block, clear it so we resume scheduling.  Belt-and-
@@ -3425,6 +3433,20 @@ function BlockDownloader:schedule_downloads(peers)
       end
     end
   end
+end
+
+--- Filter a peer list down to peers that can serve witness blocks
+-- (Core CanServeWitnesses: services & NODE_WITNESS).
+-- @param peers table: list of peer objects
+-- @return table: new list (order preserved)
+function M.witness_capable_peers(peers)
+  local out = {}
+  for _, p in ipairs(peers) do
+    if bit.band(p.services or 0, p2p.SERVICES.NODE_WITNESS) ~= 0 then
+      out[#out + 1] = p
+    end
+  end
+  return out
 end
 
 --------------------------------------------------------------------------------

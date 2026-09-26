@@ -741,7 +741,8 @@ describe("sync", function()
       local peer = {
         id = id or 1,
         messages_sent = {},
-        start_height = start_height or 100
+        start_height = start_height or 100,
+        services = 9,  -- NODE_NETWORK|NODE_WITNESS (block download requires witness)
       }
 
       function peer:send_message(cmd, payload)
@@ -878,6 +879,36 @@ describe("sync", function()
 
         -- Should not exceed per-peer limit
         assert.is_true(total_items <= downloader.blocks_per_peer)
+      end)
+
+      it("never requests a block from a peer without NODE_WITNESS (CanServeWitnesses)", function()
+        local parent_hash = chain:get_tip_hash()
+        local timestamp = consensus.networks.regtest.genesis.timestamp
+        for i = 1, 5 do
+          timestamp = timestamp + 600
+          local header = create_valid_header(parent_hash, timestamp)
+          assert.is_true(find_valid_nonce(header))
+          chain:accept_header(header)
+          parent_hash = validation.compute_block_hash(header)
+        end
+
+        -- Only a non-witness peer: nothing is requested at all (incl. the W46
+        -- cursor re-request and the empty-gate fallback).
+        local downloader = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        local legacy = create_mock_peer(1)
+        legacy.services = 1  -- NODE_NETWORK only
+        downloader:schedule_downloads({legacy})
+        assert.equals(0, #legacy.messages_sent)
+        assert.equals(0, downloader:get_inflight_count())
+
+        -- Mixed: every getdata goes to the witness peer.
+        local downloader2 = sync.new_block_downloader(chain, storage, consensus.networks.regtest)
+        local legacy2 = create_mock_peer(2)
+        legacy2.services = 1
+        local witness = create_mock_peer(3)
+        downloader2:schedule_downloads({legacy2, witness})
+        assert.equals(0, #legacy2.messages_sent)
+        assert.is_true(#witness.messages_sent > 0)
       end)
 
       it("does nothing with no peers", function()

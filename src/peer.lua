@@ -101,9 +101,21 @@ M.PRE_HANDSHAKE_ALLOWED = {
   verack = true,
   wtxidrelay = true,   -- BIP 339: Must be sent before VERACK
   sendaddrv2 = true,   -- BIP 155: Must be sent before VERACK
-  sendheaders = true,  -- BIP 130: Accepted pre-handshake
+  sendheaders = true,  -- BIP 130: Core processes it pre-verack (net_processing.cpp:3896)
+  sendcmpct = true,    -- BIP 152: Core processes it pre-verack (net_processing.cpp:3901)
   sendtxrcncl = true,  -- BIP 330: Must be sent before VERACK
 }
+
+-- Protocol-version gates (Bitcoin Core node/protocol_version.h).
+-- MIN_PEER_PROTO_VERSION is the ONLY version floor Core applies to a peer, for
+-- inbound and outbound alike (net_processing.cpp:3619).  Everything newer than
+-- that is a per-feature gate on the negotiated (common) version, never a
+-- reason to drop the connection.
+M.MIN_PEER_PROTO_VERSION = 31800
+M.SENDHEADERS_VERSION = 70012
+M.FEEFILTER_VERSION = 70013
+M.SHORT_IDS_BLOCKS_VERSION = 70014
+M.WTXID_RELAY_VERSION = 70016
 
 -- Handshake timeout in seconds (60 seconds per spec)
 M.HANDSHAKE_TIMEOUT = 60
@@ -709,11 +721,32 @@ function Peer:handle_version(payload)
   self.start_height = ver.start_height
   self.user_agent = ver.user_agent
   self.version_received = true
-  -- Check minimum protocol version (70015 for segwit)
-  if ver.version < 70015 then
-    self:disconnect("protocol version too old: " .. ver.version)
+  -- Outbound "desirable services" (Core net_processing.cpp:3610-3617,
+  -- ExpectServicesFromConn + HasAllDesirableServiceFlags): only peers WE chose
+  -- to connect to automatically are held to a service requirement.  Inbound,
+  -- manual (-connect/-addnode) and feeler connections are exempt, exactly as in
+  -- Core (ExpectServicesFromConn is false for INBOUND/MANUAL/FEELER).
+  -- Core's GetDesirableServiceFlags also refuses a NODE_NETWORK_LIMITED-only
+  -- peer while in IBD; the peer object does not know IBD state, so a LIMITED
+  -- peer is accepted here (a strict subset of Core's disconnects) — block
+  -- download additionally never asks a non-witness peer (can_serve_witnesses).
+  if not self.inbound and not self.is_manual and not self.is_feeler
+     and not M.has_all_desirable_services(ver.services) then
+    self:disconnect(string.format(
+      "peer does not offer the expected services (%08x offered)", ver.services or 0))
     return
   end
+  -- Minimum protocol version: Core's ONLY version floor is
+  -- MIN_PEER_PROTO_VERSION = 31800 (net_processing.cpp:3619), applied to every
+  -- peer.  This used to be a hard-coded 70015 in both directions, which
+  -- dropped inbound peers Core keeps (e.g. a 70002 client).
+  if (ver.version or 0) < M.MIN_PEER_PROTO_VERSION then
+    self:disconnect("peer using obsolete version " .. tostring(ver.version))
+    return
+  end
+  -- Negotiated version (Core SetCommonVersion(min(nVersion, PROTOCOL_VERSION))).
+  -- Every feature message we send or honour is gated on this.
+  self.common_version = math.min(ver.version, p2p.PROTOCOL_VERSION)
   -- Check for self-connection via nonce
   -- (caller should check nonce against known connections)
 
@@ -755,8 +788,8 @@ function Peer:handle_version(payload)
 
   -- Feature negotiation AFTER version, BEFORE verack (BIP155, BIP330).
   -- SENDADDRV2 (BIP155): signal addrv2 support so the peer relays Tor/I2P/CJDNS;
-  -- empty payload; only when peer protocol >= 70016 (Core net_processing.cpp).
-  if ver.version >= 70016 then
+  -- empty payload; only when common version >= 70016 (Core net_processing.cpp:3716).
+  if self.common_version >= 70016 then
     self:send_message("sendaddrv2", p2p.serialize_sendaddrv2())
   end
 
@@ -784,9 +817,18 @@ function Peer:handle_verack()
   if self.state == M.STATE.VERACK_SENT or self.state == M.STATE.VERSION_SENT then
     self.state = M.STATE.ESTABLISHED
     self.handshake_complete = true
-    -- Send post-handshake messages
-    self:send_message("sendheaders", "")
-    self:send_message("sendcmpct", p2p.serialize_sendcmpct(false, 2))
+    -- Send post-handshake messages, each gated on the negotiated version like
+    -- Core (a 70002 peer must never receive a message it cannot parse):
+    --   sendcmpct  >= SHORT_IDS_BLOCKS_VERSION (net_processing.cpp:3864)
+    --   sendheaders >= SENDHEADERS_VERSION     (net_processing.cpp:5525)
+    --   feefilter  >= FEEFILTER_VERSION        (net_processing.cpp:5543)
+    local cv = self.common_version or p2p.PROTOCOL_VERSION
+    if cv >= M.SENDHEADERS_VERSION then
+      self:send_message("sendheaders", "")
+    end
+    if cv >= M.SHORT_IDS_BLOCKS_VERSION then
+      self:send_message("sendcmpct", p2p.serialize_sendcmpct(false, 2))
+    end
     -- BIP-133 feefilter floor, in sat/kvB. MUST match what our mempool actually
     -- enforces (mempool.lua:210 DEFAULT_MIN_RELAY_FEE = 100, Core
     -- policy/policy.h:70) — Core seeds its FeeFilterRounder from the very same
@@ -799,8 +841,35 @@ function Peer:handle_verack()
     -- to send us almost nothing: measured 9 transactions in the mempool on 8
     -- peers at tip. Kept as a literal (not a require of mempool.lua) to avoid
     -- adding a dependency edge to peer.lua; keep the two in step.
-    self:send_message("feefilter", p2p.serialize_feefilter(100)) -- 100 sat/kvB = 0.1 sat/vB
+    if cv >= M.FEEFILTER_VERSION then
+      self:send_message("feefilter", p2p.serialize_feefilter(100)) -- 100 sat/kvB = 0.1 sat/vB
+    end
   end
+end
+
+--- Core HasAllDesirableServiceFlags (protocol.cpp GetDesirableServiceFlags),
+-- minus the IBD-only NODE_NETWORK_LIMITED refinement (see handle_version):
+-- the peer must offer NODE_WITNESS and serve blocks (NODE_NETWORK or
+-- NODE_NETWORK_LIMITED).  Used ONLY for outbound peers we picked.
+-- @param services number: peer's advertised service bits
+-- @return boolean
+function M.has_all_desirable_services(services)
+  services = services or 0
+  if bit.band(services, p2p.SERVICES.NODE_WITNESS) == 0 then return false end
+  return bit.band(services, bit.bor(p2p.SERVICES.NODE_NETWORK,
+                                    p2p.SERVICES.NODE_NETWORK_LIMITED)) ~= 0
+end
+
+--- Core CanServeWitnesses (net_processing.cpp:1166): the peer advertised
+-- NODE_WITNESS.  Block bodies are always requested as MSG_WITNESS_BLOCK, so
+-- this is the gate for EVERY block-request path now that non-witness inbound
+-- peers are allowed to complete the handshake.
+-- @return boolean
+function Peer:can_serve_witnesses()
+  return bit.band(self.services or 0, p2p.SERVICES.NODE_WITNESS) ~= 0
+end
+M.can_serve_witnesses = function(p)
+  return bit.band((p and p.services) or 0, p2p.SERVICES.NODE_WITNESS) ~= 0
 end
 
 --------------------------------------------------------------------------------
@@ -844,6 +913,15 @@ end
 --------------------------------------------------------------------------------
 -- Message Dispatch
 --------------------------------------------------------------------------------
+
+--- Log (rate-limited per peer) a pre-handshake message we ignore, Core-style.
+function Peer:_log_ignored_prehandshake(what, command)
+  self.prehandshake_ignored = (self.prehandshake_ignored or 0) + 1
+  if self.prehandshake_ignored <= 5 then
+    io.stderr:write(string.format("[peer] %s:%s %s: %q (ignored)\n",
+      tostring(self.ip), tostring(self.port), what, tostring(command)))
+  end
+end
 
 --- Check if a message is allowed before handshake completion.
 -- @param command string: message command
@@ -915,18 +993,19 @@ function Peer:process_messages()
     -- Pre-handshake filtering (Bitcoin Core: fSuccessfullyConnected check)
     -- Before version: only version allowed
     -- Before verack: only PRE_HANDSHAKE_ALLOWED messages
+    -- Core LOGS AND IGNORES these (no disconnect, no misbehaviour, no cap):
+    --   net_processing.cpp:3810-3814 "non-version message before version handshake"
+    --   net_processing.cpp:4010-4012 "Unsupported message ... prior to verack"
+    -- Previously both paths called misbehaving(), which disconnects on the
+    -- first event — so a peer that pinged between VERSION and VERACK was dropped.
     if not self.version_received then
-      -- Must receive version first (Bitcoin Core: pfrom.nVersion == 0 check)
       if msg.command ~= "version" then
-        -- Increment misbehavior score and drop message
-        self:misbehaving(10, "non-version message before version: " .. msg.command)
+        self:_log_ignored_prehandshake("non-version message before version handshake", msg.command)
         goto continue
       end
     elseif not self.handshake_complete then
-      -- After version but before verack: only allow specific messages
       if not self:is_pre_handshake_allowed(msg.command) then
-        -- Increment misbehavior score and drop message
-        self:misbehaving(10, "unsupported message prior to verack: " .. msg.command)
+        self:_log_ignored_prehandshake("unsupported message prior to verack", msg.command)
         goto continue
       end
     end
@@ -957,9 +1036,12 @@ function Peer:process_messages()
     elseif msg.command == "feefilter" then
       self.fee_filter = p2p.deserialize_feefilter(msg.payload)
     elseif msg.command == "wtxidrelay" then
-      -- BIP 339: wtxidrelay must be sent before verack
-      -- Just acknowledge, no payload
-      self.wtxid_relay = true
+      -- BIP 339: wtxidrelay must be sent before verack.  Core only honours it
+      -- when the common version >= WTXID_RELAY_VERSION (net_processing.cpp:3923),
+      -- otherwise it is ignored (not a disconnect).
+      if (self.common_version or p2p.PROTOCOL_VERSION) >= M.WTXID_RELAY_VERSION then
+        self.wtxid_relay = true
+      end
     elseif msg.command == "sendaddrv2" then
       -- BIP 155: sendaddrv2 must be sent before verack
       self.send_addrv2 = true
