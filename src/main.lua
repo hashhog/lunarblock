@@ -1623,15 +1623,10 @@ local function main()
     if pruner.enabled then
       pruner:maybe_prune(height)
     end
-    -- Announce newly connected blocks to peers (skip during IBD).
-    -- BIP-130: peers that sent `sendheaders` get a `headers` announce.
-    -- BIP-152: HB peers (high_bandwidth=true) get an unsolicited cmpctblock.
-    -- Everyone else gets the legacy `inv` announce.
-    -- W112 BUG-5/BUG-6 fix: pass full block so announce_block can build
-    -- cmpctblock payloads for HB peers (was passing only block_hash+header).
-    if block_downloader.ibd_complete then
-      peer_manager:announce_block(block_hash, block.header, block)
-    end
+    -- Block announcement to peers moved to the on_block_connected chokepoint
+    -- (see "Announce every newly connected tip" below) so it also covers the
+    -- submitblock/generate and reorg connect paths, and is gated on Core's
+    -- IsInitialBlockDownload rather than block_downloader.ibd_complete.
   end
 
   -- Initialize mempool
@@ -2074,46 +2069,11 @@ local function main()
       return  -- malformed; ignore (Core also tolerates a bad locator)
     end
 
-    -- Locate the fork point: the highest active-chain block whose hash appears
-    -- in the locator.  Core walks the locator (ordered tip→genesis) and picks
-    -- the first hash that is on the active chain (CChain::FindFork); we mirror
-    -- that by scanning the locator in order and matching against our in-memory
-    -- header entry's height + the active height_to_hash at that height.
-    local start_height = 1  -- default: peer shares only genesis with us
-    for _, loc_hash in ipairs(req.block_locator_hashes or {}) do
-      local entry = header_chain:get_header(loc_hash)
-      if entry then
-        -- The locator hash must be on OUR ACTIVE chain at its height, not a
-        -- stale fork header we happen to know — check height_to_hash agrees.
-        local active_hex = header_chain.height_to_hash[entry.height]
-        if active_hex == types.hash256_hex(loc_hash) then
-          start_height = entry.height + 1
-          break
-        end
-      end
-    end
-
-    -- Walk our active chain from start_height up to the tip, collecting up to
-    -- MAX_HEADERS_RESULTS headers, stopping early at the requested stop hash.
-    local stop_hash = req.hash_stop
-    local stop_is_zero = stop_hash and stop_hash.bytes == string.rep("\0", 32)
-    local headers = {}
-    local tip_h = header_chain.header_tip_height or 0
-    local h = start_height
-    while h <= tip_h and #headers < p2p.MAX_HEADERS_RESULTS do
-      local entry = header_chain:get_header_at_height(h)
-      if not entry then break end  -- gap (e.g. snapshot base) — stop here
-      headers[#headers + 1] = entry.header
-      if not stop_is_zero and stop_hash then
-        local hh = validation.compute_block_hash(entry.header)
-        if types.hash256_eq(hh, stop_hash) then break end
-      end
-      h = h + 1
-    end
-
-    if #headers > 0 then
-      peer:send_message("headers", p2p.serialize_headers(headers))
-    end
+    -- Core ProcessGetHeaders parity (peerman.getheaders_response): serve our
+    -- ACTIVE chain after the locator fork point, and ALWAYS reply — an empty
+    -- `headers` when there is nothing to send.
+    peer:send_message("headers",
+      peerman_mod.getheaders_response(req, header_chain, chain_state.tip_height))
   end)
 
   peer_manager:register_handler("block", function(peer, payload)
@@ -2552,7 +2512,16 @@ local function main()
     -- MSG_WITNESS_BLOCK) are answered by peerman.getdata_response, which
     -- mirrors Core's ProcessGetData: MSG_WTX is looked up by WTXID, and the
     -- plain MSG_TX / MSG_BLOCK types are served without witness data.
-    local getdata_deps = { mempool = mempool, get_block = db.get_block }
+    local getdata_deps = {
+      mempool = mempool, get_block = db.get_block,
+      -- MSG_CMPCT_BLOCK depth gate (Core: pindex->nHeight >= tip->nHeight -
+      -- MAX_CMPCTBLOCK_DEPTH); nil when the block is not on our header chain.
+      block_depth = function(hash)
+        local entry = header_chain:get_header(hash)
+        if not (entry and entry.height) then return nil end
+        return (chain_state.tip_height or 0) - entry.height
+      end,
+    }
     for _, item in ipairs(items) do
       local cmd, data, status = peerman_mod.getdata_response(item, getdata_deps)
       if status == "served" then
@@ -2977,6 +2946,44 @@ local function main()
         -- Best-effort: log once, keep connecting blocks.
         io.stderr:write("wallet block-connect hook error (non-fatal): " ..
           tostring(err) .. "\n")
+      end
+    end
+  end
+
+  -- Announce every newly connected tip to peers (Core UpdatedBlockTip ->
+  -- m_blocks_for_headers_relay -> SendMessages). BIP-130: peers that sent
+  -- `sendheaders` get a `headers` announce; BIP-152 HB peers get an
+  -- unsolicited cmpctblock; everyone else gets `inv` (announce_block).
+  -- Fires on every connect path (P2P, submitblock/generate, reorg), after
+  -- the atomic chainstate write, so a getdata for the block can be served.
+  -- Gate = Core's post-connect IsInitialBlockDownload (tip recent AND
+  -- chainwork >= min_chain_work, latched), via should_announce_new_tip.
+  -- It was previously `block_downloader.ibd_complete` inside the P2P
+  -- connect_callback, which is never true there: sync.lua's IBD-RELATCH
+  -- clears it as soon as a new block's header arrives and it is re-set only
+  -- after connect_pending_blocks returns — so no block was ever announced.
+  do
+    local consensus_c = require("lunarblock.consensus")
+    local min_work = network.min_chain_work
+      and consensus_c.work_from_hex(network.min_chain_work) or nil
+    local prev_conn = chain_state.callbacks.on_block_connected
+    chain_state.callbacks.on_block_connected = function(block_hash, block)
+      if prev_conn then prev_conn(block_hash, block) end
+      local ok, err = pcall(function()
+        if not (block and block.header) then return end
+        local work_ok = nil
+        local entry = (not peer_manager._block_relay_ibd_latched_out)
+          and header_chain:get_header(block_hash) or nil
+        if min_work and entry and type(entry.total_work) == "string"
+            and #entry.total_work == 32 then
+          work_ok = consensus_c.work_compare(entry.total_work, min_work) >= 0
+        end
+        if peer_manager:should_announce_new_tip(block.header.timestamp, work_ok) then
+          peer_manager:announce_block(block_hash, block.header, block)
+        end
+      end)
+      if not ok then
+        io.stderr:write("block announce error (non-fatal): " .. tostring(err) .. "\n")
       end
     end
   end

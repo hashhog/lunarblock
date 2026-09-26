@@ -354,12 +354,21 @@ end
 --   MSG_WTX (BIP-339) lookup by WTXID, serialize WITH witness
 --   MSG_BLOCK         serialize WITHOUT witness
 --   MSG_WITNESS_BLOCK serialize WITH witness
+--   MSG_CMPCT_BLOCK   (BIP-152) `cmpctblock` when the block is within
+--                     MAX_CMPCTBLOCK_DEPTH of our tip, else the full witness
+--                     `block` (Core ProcessGetBlockData IsMsgCmpctBlk branch).
+--                     Core asks for this on the first block of a headers
+--                     announce from a compact-block peer (HeadersDirectFetch-
+--                     Blocks); leaving it unanswered stalled that block until
+--                     the peer's block-download timeout.
 --
 -- A tx item that cannot be served goes into the peer's `notfound` batch so the
 -- peer re-requests elsewhere instead of waiting out GETDATA_TX_INTERVAL.
 --
 -- @param item table {type=, hash=hash256}
--- @param deps table {mempool=Mempool, get_block=function(hash)->block|nil}
+-- @param deps table {mempool=Mempool, get_block=function(hash)->block|nil,
+--   block_depth=function(hash)->number|nil (tip_height - block height;
+--   nil/absent = unknown, treated as too deep -> full block)}
 -- @return command string|nil, payload string|nil, status string:
 --   "served"   -> send (command, payload)
 --   "notfound" -> append item to the notfound reply
@@ -390,8 +399,81 @@ function M.getdata_response(item, deps)
       return "block", serialize.serialize_block(blk), "served"
     end
     return "block", serialize.serialize_block_without_witness(blk), "served"
+  elseif t == T.MSG_CMPCT_BLOCK then
+    local blk = deps.get_block and deps.get_block(item.hash)
+    if not blk then return nil, nil, "notfound" end
+    local cb_mod = require("lunarblock.compact_block")
+    local depth = deps.block_depth and deps.block_depth(item.hash)
+    if type(depth) == "number" and depth <= cb_mod.MAX_CMPCTBLOCK_DEPTH then
+      local cb = cb_mod.create_compact_block(blk, math.random(0, 2^52))
+      return "cmpctblock", p2p.serialize_cmpctblock(
+        cb.header, cb.nonce, cb.short_ids, cb.prefilled_txns), "served"
+    end
+    return "block", serialize.serialize_block(blk), "served"
   end
   return nil, nil, "unhandled"
+end
+
+--- Build the `headers` reply payload for a getheaders request (Core
+-- ProcessGetHeaders, bitcoin-core/src/net_processing.cpp).
+--
+-- Locate the fork point: the highest active-chain block whose hash appears in
+-- the locator. Core walks the locator (ordered tip->genesis) and picks the
+-- first hash on the active chain (CChain::FindFork); we mirror that by
+-- scanning the locator in order and matching the header entry's height against
+-- the active height_to_hash at that height (a stale fork header we happen to
+-- know does not count). Then walk forward collecting up to MAX_HEADERS_RESULTS
+-- headers, stopping early at hash_stop.
+--
+-- Two Core-parity rules the inline handler used to break:
+--   * serve the ACTIVE chain only (Core walks ActiveChain().Next), i.e. stop at
+--     the connected block tip, not the header tip. Headers whose bodies were
+--     not yet connected drew `notfound` on the peer's follow-up getdata, and a
+--     Core peer then sat out its block-download timeout instead of syncing.
+--   * ALWAYS reply, with an empty `headers` when there is nothing to send. The
+--     requester clears its in-flight getheaders marker only on a `headers`
+--     reply (m_last_getheaders_timestamp, HEADERS_RESPONSE_TIME = 2 min);
+--     staying silent made a Core peer ignore our block invs for 2 minutes.
+--
+-- @param req table: deserialized getheaders {block_locator_hashes, hash_stop}
+-- @param header_chain table: HeaderChain (get_header, get_header_at_height,
+--   height_to_hash, header_tip_height)
+-- @param active_tip_height number|nil: connected block tip height
+-- @return string: serialized `headers` payload (never nil; may be empty)
+function M.getheaders_response(req, header_chain, active_tip_height)
+  local types = require("lunarblock.types")
+  local validation = require("lunarblock.validation")
+  local start_height = 1  -- default: peer shares only genesis with us
+  for _, loc_hash in ipairs(req.block_locator_hashes or {}) do
+    local entry = header_chain:get_header(loc_hash)
+    if entry then
+      local active_hex = header_chain.height_to_hash[entry.height]
+      if active_hex == types.hash256_hex(loc_hash) then
+        start_height = entry.height + 1
+        break
+      end
+    end
+  end
+
+  local stop_hash = req.hash_stop
+  local stop_is_zero = stop_hash and stop_hash.bytes == string.rep("\0", 32)
+  local headers = {}
+  local tip_h = header_chain.header_tip_height or 0
+  if type(active_tip_height) == "number" and active_tip_height < tip_h then
+    tip_h = active_tip_height
+  end
+  local h = start_height
+  while h <= tip_h and #headers < p2p.MAX_HEADERS_RESULTS do
+    local entry = header_chain:get_header_at_height(h)
+    if not entry then break end  -- gap (e.g. snapshot base) — stop here
+    headers[#headers + 1] = entry.header
+    if not stop_is_zero and stop_hash then
+      local hh = validation.compute_block_hash(entry.header)
+      if types.hash256_eq(hh, stop_hash) then break end
+    end
+    h = h + 1
+  end
+  return p2p.serialize_headers(headers)
 end
 
 function M.shuffle(arr)
@@ -3538,6 +3620,36 @@ function PeerManager:announce_block(block_hash, header, full_block, filter_fn)
       end
     end
   end
+end
+
+--- Core DEFAULT_MAX_TIP_AGE (validation.h): 24h.
+M.DEFAULT_MAX_TIP_AGE = 24 * 60 * 60
+
+--- Block-relay IBD gate: should a newly connected tip be announced?
+-- Core parity: Chainstate::ActivateBestChain calls UpdatedBlockTip(...,
+-- fInitialDownload) with the IBD state computed AFTER the new tip is in
+-- place; PeerManagerImpl::UpdatedBlockTip returns early only while in IBD.
+-- ChainstateManager::UpdateIBDStatus latches IBD to false (never re-entered)
+-- once the tip is recent — CChain::IsTipRecent: chainwork >= minimum chain
+-- work AND tip time >= now - max_tip_age.
+--
+-- The previous gate (block_downloader.ibd_complete) was never true when a
+-- new tip block was connected: sync.lua's IBD-RELATCH clears ibd_complete as
+-- soon as the new block's header arrives, and it is only re-set after
+-- connect_pending_blocks finishes — so every block connected at tip, and
+-- every block of a fresh sync, was silently not announced to any peer.
+-- @param tip_timestamp number: header timestamp of the newly connected tip
+-- @param work_ok boolean: tip chainwork >= network min_chain_work (nil = true)
+-- @param now number: optional current unix time (default os.time())
+-- @return boolean: true when the tip must be announced to peers
+function PeerManager:should_announce_new_tip(tip_timestamp, work_ok, now)
+  if self._block_relay_ibd_latched_out then return true end
+  if work_ok == false then return false end
+  if type(tip_timestamp) ~= "number" then return false end
+  now = now or os.time()
+  if tip_timestamp < now - M.DEFAULT_MAX_TIP_AGE then return false end
+  self._block_relay_ibd_latched_out = true
+  return true
 end
 
 --- Get all established peers.
