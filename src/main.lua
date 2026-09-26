@@ -2548,24 +2548,17 @@ local function main()
     -- behaviour.  An honest peer respecting our NODE_NETWORK_LIMITED
     -- bit should not request these in the first place; the not_found
     -- reply is the per-protocol fallback for misbehaving peers.
+    -- Tx and block items (MSG_TX / MSG_WITNESS_TX / MSG_WTX / MSG_BLOCK /
+    -- MSG_WITNESS_BLOCK) are answered by peerman.getdata_response, which
+    -- mirrors Core's ProcessGetData: MSG_WTX is looked up by WTXID, and the
+    -- plain MSG_TX / MSG_BLOCK types are served without witness data.
+    local getdata_deps = { mempool = mempool, get_block = db.get_block }
     for _, item in ipairs(items) do
-      if item.type == p2p.INV_TYPE.MSG_WITNESS_TX or item.type == p2p.INV_TYPE.MSG_TX then
-        local txid_hex = types.hash256_hex(item.hash)
-        local entry = mempool:get_entry(txid_hex)
-        if entry then
-          local data = serialize.serialize_transaction(entry.tx, true)
-          peer:send_message("tx", data)
-        else
-          not_found[#not_found + 1] = item
-        end
-      elseif item.type == p2p.INV_TYPE.MSG_BLOCK or item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
-        local blk = db.get_block(item.hash)
-        if blk then
-          local data = serialize.serialize_block(blk)
-          peer:send_message("block", data)
-        else
-          not_found[#not_found + 1] = item
-        end
+      local cmd, data, status = peerman_mod.getdata_response(item, getdata_deps)
+      if status == "served" then
+        peer:send_message(cmd, data)
+      elseif status == "notfound" then
+        not_found[#not_found + 1] = item
       elseif item.type == p2p.INV_TYPE.MSG_FILTERED_BLOCK then
         -- BIP-37 Step 5: serve merkleblock for MSG_FILTERED_BLOCK (=3).
         -- Reference: bitcoin-core/src/net_processing.cpp:2438-2458.

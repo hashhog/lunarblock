@@ -1046,6 +1046,11 @@ function M.new(chain_state, config)
     self.fullrbf = M.DEFAULT_MEMPOOL_FULL_RBF
   end
   self.entries = {}            -- txid_hex -> MempoolEntry
+  -- wtxid_hex -> txid_hex for segwit entries (BIP-339 getdata(MSG_WTX) lookup;
+  -- Core indexes the mempool by wtxid too — txmempool.h `index_by_wtxid`).
+  -- Maintained at the single insert/remove sites below; lookups re-verify
+  -- against self.entries, so a stale row can never serve the wrong tx.
+  self.wtxid_index = {}
   -- map_deltas: user-set fee-priority deltas, keyed by display-order txid_hex
   -- (same key space as self.entries and the persist layer).  Mirrors Core's
   -- CTxMemPool::mapDeltas (std::map<Txid, CAmount>).  A delta may exist for a
@@ -1905,6 +1910,10 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   entry.ancestor_fees = ancestor_fees - fee  -- exclude self
   entry.ancestors = ancestors
   self.entries[txid_hex] = entry
+  if entry.wtxid then
+    local wtxid_hex = types.hash256_hex(entry.wtxid)
+    if wtxid_hex ~= txid_hex then self.wtxid_index[wtxid_hex] = txid_hex end
+  end
   self.tx_count = self.tx_count + 1
   self.total_size = self.total_size + entry.size
 
@@ -2114,6 +2123,10 @@ function Mempool:remove_transaction(txid_hex, reason)
   self.total_size = self.total_size - entry.size
   self.tx_count = self.tx_count - 1
   self.entries[txid_hex] = nil
+  if entry.wtxid and self.wtxid_index then
+    local wtxid_hex = types.hash256_hex(entry.wtxid)
+    if self.wtxid_index[wtxid_hex] == txid_hex then self.wtxid_index[wtxid_hex] = nil end
+  end
 
   -- Cluster mempool: remove from union-find
   uf_parent[txid_hex] = nil
@@ -2614,6 +2627,31 @@ function Mempool:get_prioritised_transactions()
     }
   end
   return result
+end
+
+--- Look up a mempool entry by wtxid (BIP-339 getdata(MSG_WTX)).
+-- Core: FindTxForGetData -> m_mempool.info_for_relay(Wtxid) (net_processing.cpp).
+-- Non-segwit txs have wtxid == txid, so they are found under their txid key;
+-- segwit txs go through wtxid_index.  Every hit is re-verified against the
+-- entry's own wtxid so neither path can hand back a different transaction.
+-- @param wtxid_hex string: wtxid as display-order hex
+-- @return MempoolEntry|nil
+function Mempool:get_entry_by_wtxid(wtxid_hex)
+  local function matches(entry)
+    if not entry then return false end
+    if not entry.wtxid then
+      -- Legacy/synthetic entry without a cached wtxid: compute it.
+      local _validation = require("lunarblock.validation")
+      entry.wtxid = _validation.compute_wtxid(entry.tx)
+    end
+    return types.hash256_hex(entry.wtxid) == wtxid_hex
+  end
+  local direct = self.entries[wtxid_hex]
+  if matches(direct) then return direct end
+  local txid_hex = self.wtxid_index and self.wtxid_index[wtxid_hex]
+  local indexed = txid_hex and self.entries[txid_hex]
+  if matches(indexed) then return indexed end
+  return nil
 end
 
 --- Check if a transaction is in the mempool by wtxid.

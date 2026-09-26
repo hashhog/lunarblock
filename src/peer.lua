@@ -786,7 +786,17 @@ function Peer:handle_version(payload)
     self.state = M.STATE.VERSION_SENT
   end
 
-  -- Feature negotiation AFTER version, BEFORE verack (BIP155, BIP330).
+  -- Feature negotiation AFTER version, BEFORE verack (BIP339, BIP155, BIP330).
+  -- WTXIDRELAY (BIP339): Core sends it first, when the common version is
+  -- >= WTXID_RELAY_VERSION (net_processing.cpp:3710-3712).  wtxid relay is only
+  -- on when BOTH sides send it: Core drops every MSG_WTX inv from a peer that
+  -- did not send wtxidrelay ("Ignore INVs that don't match wtxidrelay
+  -- setting", net_processing.cpp:4056-4063).  lunarblock never sent it, yet it
+  -- switched to MSG_WTX announcements as soon as the PEER sent wtxidrelay — so
+  -- every tx lunarblock relayed to Core was silently discarded at the inv.
+  if self.common_version >= M.WTXID_RELAY_VERSION then
+    self:send_message("wtxidrelay", "")
+  end
   -- SENDADDRV2 (BIP155): signal addrv2 support so the peer relays Tor/I2P/CJDNS;
   -- empty payload; only when common version >= 70016 (Core net_processing.cpp:3716).
   if self.common_version >= 70016 then

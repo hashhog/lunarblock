@@ -574,13 +574,15 @@ describe("W103 tx relay flow audit", function()
       assert.equals(p2p.INV_TYPE.MSG_WITNESS_TX, 0x40000001)
     end)
     it("XFAIL: getdata for MSG_WTX must look up by wtxid not txid", function()
-      -- main.lua:1398: `if item.type == MSG_WITNESS_TX or MSG_TX`
-      -- MSG_WTX (5) is not handled separately; if it somehow reached this
-      -- branch the hash would be treated as a txid but it's a wtxid.
-      -- Core: MSG_WTX → tx lookup by wtxid; MSG_TX → tx lookup by txid.
-      local lunarblock_has_wtxid_getdata_lookup = false  -- BUG: no wtxid path
-      assert.is_true(lunarblock_has_wtxid_getdata_lookup,
-        "BUG G12: getdata handler must support wtxid (MSG_WTX) lookup separately from txid")
+      -- FIXED: main.lua's getdata handler now routes through
+      -- peerman.getdata_response, which looks MSG_WTX up by wtxid via
+      -- Mempool:get_entry_by_wtxid.  Full per-type coverage lives in
+      -- spec/getdata_wtx_spec.lua.
+      local peerman = require("lunarblock.peerman")
+      local mempool_mod = require("lunarblock.mempool")
+      assert.is_function(peerman.getdata_response)
+      local mp = mempool_mod.new({ coin_view = { get = function() return nil end }, tip_height = 0 })
+      assert.is_function(mp.get_entry_by_wtxid)
     end)
   end)
 
@@ -991,16 +993,13 @@ describe("W103 tx relay flow audit", function()
       -- The function exists and would send messages if connected
     end)
     it("XFAIL: outbound handshake must send wtxidrelay to peer before verack", function()
-      -- Core: immediately before sending verack, Core nodes send wtxidrelay
-      --   to indicate they want to receive wtxid-based announcements.
-      -- Lunarblock peer.lua:720-724: handle_verack only sends sendheaders,
-      --   sendcmpct, feefilter — no wtxidrelay message to the outbound peer.
-      -- Effect: outbound peers never see our wtxidrelay, so they default to
-      --   txid-based relay for us. We only get wtxid relay from peers that
-      --   SEND us wtxidrelay (and we track that inbound message correctly).
-      local lunarblock_sends_wtxidrelay_to_outbound_peers = false  -- BUG
-      assert.is_true(lunarblock_sends_wtxidrelay_to_outbound_peers,
-        "BUG G25: outbound handshake must send wtxidrelay pre-verack (Core:3919)")
+      -- FIXED: peer.lua handle_version sends wtxidrelay (common version
+      -- >= 70016) before sendaddrv2/verack, like Core :3710-3712.  Wire-level
+      -- coverage: spec/handshake_core_parity_spec.lua "BIP339 wtxidrelay is
+      -- SENT, not only received".
+      local src = io.open("src/peer.lua"):read("*a")
+      assert.truthy(src:find('send_message("wtxidrelay"', 1, true),
+        "BUG G25: outbound handshake must send wtxidrelay pre-verack (Core:3710)")
     end)
   end)
 

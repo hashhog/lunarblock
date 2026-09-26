@@ -284,6 +284,44 @@ describe("handshake Core parity", function()
     end)
   end)
 
+  describe("BIP339 wtxidrelay is SENT, not only received", function()
+    -- Core sends WTXIDRELAY before SENDADDRV2 and VERACK when the common
+    -- version is >= 70016 (net_processing.cpp:3710-3712), and ignores every
+    -- MSG_WTX inv from a peer that did not send it (:4056-4063).
+    local function index_of(list, x)
+      for i, v in ipairs(list) do if v == x then return i end end
+      return nil
+    end
+
+    it("inbound: sends wtxidrelay after version, before sendaddrv2 and verack", function()
+      local p = new_inbound()
+      p.recv_buffer = version_msg(70016, 9)
+      p:process_messages()
+      local cmds = sent_commands(p.socket)
+      local v, w, a, k = index_of(cmds, "version"), index_of(cmds, "wtxidrelay"),
+                         index_of(cmds, "sendaddrv2"), index_of(cmds, "verack")
+      assert.is_not_nil(w, "wtxidrelay not sent")
+      assert.is_true(v < w and w < a and a < k)
+    end)
+
+    it("outbound: sends wtxidrelay before verack", function()
+      local p = new_outbound()
+      p.recv_buffer = version_msg(70016, 9)
+      p:process_messages()
+      local cmds = sent_commands(p.socket)
+      local w, k = index_of(cmds, "wtxidrelay"), index_of(cmds, "verack")
+      assert.is_not_nil(w, "wtxidrelay not sent")
+      assert.is_true(w < k)
+    end)
+
+    it("does not send wtxidrelay below 70016", function()
+      local p = new_inbound()
+      p.recv_buffer = version_msg(70015, 9)
+      p:process_messages()
+      assert.is_false(has(sent_commands(p.socket), "wtxidrelay"))
+    end)
+  end)
+
   describe("block download only from witness peers (CanServeWitnesses)", function()
     it("peer:can_serve_witnesses follows NODE_WITNESS", function()
       local p = new_inbound()

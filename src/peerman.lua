@@ -346,6 +346,54 @@ end
 --- Shuffle an array in-place using Fisher-Yates algorithm.
 -- @param arr table: array to shuffle
 -- @return table: the same array, now shuffled
+--- Decide how to answer one getdata item (Core ProcessGetData /
+-- FindTxForGetData, bitcoin-core/src/net_processing.cpp).
+--
+--   MSG_TX            lookup by txid,  serialize WITHOUT witness
+--   MSG_WITNESS_TX    lookup by txid,  serialize WITH witness
+--   MSG_WTX (BIP-339) lookup by WTXID, serialize WITH witness
+--   MSG_BLOCK         serialize WITHOUT witness
+--   MSG_WITNESS_BLOCK serialize WITH witness
+--
+-- A tx item that cannot be served goes into the peer's `notfound` batch so the
+-- peer re-requests elsewhere instead of waiting out GETDATA_TX_INTERVAL.
+--
+-- @param item table {type=, hash=hash256}
+-- @param deps table {mempool=Mempool, get_block=function(hash)->block|nil}
+-- @return command string|nil, payload string|nil, status string:
+--   "served"   -> send (command, payload)
+--   "notfound" -> append item to the notfound reply
+--   "unhandled" -> caller handles (e.g. MSG_FILTERED_BLOCK) or ignores
+function M.getdata_response(item, deps)
+  local serialize = require("lunarblock.serialize")
+  local types = require("lunarblock.types")
+  local T = p2p.INV_TYPE
+  local t = item.type
+  if t == T.MSG_TX or t == T.MSG_WITNESS_TX or t == T.MSG_WTX then
+    local hash_hex = types.hash256_hex(item.hash)
+    local entry
+    if deps.mempool then
+      if t == T.MSG_WTX then
+        entry = deps.mempool:get_entry_by_wtxid(hash_hex)
+      else
+        entry = deps.mempool:get_entry(hash_hex)
+      end
+    end
+    if not entry then return nil, nil, "notfound" end
+    -- WTX and WITNESS_TX imply witness serialization; plain MSG_TX is stripped.
+    local with_witness = (t ~= T.MSG_TX)
+    return "tx", serialize.serialize_transaction(entry.tx, with_witness), "served"
+  elseif t == T.MSG_BLOCK or t == T.MSG_WITNESS_BLOCK then
+    local blk = deps.get_block and deps.get_block(item.hash)
+    if not blk then return nil, nil, "notfound" end
+    if t == T.MSG_WITNESS_BLOCK then
+      return "block", serialize.serialize_block(blk), "served"
+    end
+    return "block", serialize.serialize_block_without_witness(blk), "served"
+  end
+  return nil, nil, "unhandled"
+end
+
 function M.shuffle(arr)
   local n = #arr
   for i = n, 2, -1 do
