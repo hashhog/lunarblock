@@ -2656,21 +2656,25 @@ end
 
 --- Check if a transaction is in the mempool by wtxid.
 -- Used by the MSG_WTX inv handler (BIP-339): the hash in a MSG_WTX inv is
--- the wtxid, not the txid.  For non-segwit txs wtxid == txid so has()
--- suffices; for segwit we must scan the wtxid field of each entry.
+-- the wtxid, not the txid.  Core: AlreadyHaveTx -> m_mempool.exists(Wtxid),
+-- an indexed lookup.
+--
+-- O(1): non-segwit txs are keyed by txid == wtxid; segwit txs go through
+-- wtxid_index (maintained at the single insert/remove sites), and every hit
+-- is re-verified by get_entry_by_wtxid.
+--
+-- This USED to be a full scan of self.entries that hex-encoded every entry's
+-- wtxid (~33 ms per call at 7k entries, ~110 ms at 20k).  It runs once per
+-- MSG_WTX inv item not already in the mempool, i.e. for nearly every tx
+-- announcement once c95cd22 made peers switch to MSG_WTX.  On mainnet that
+-- saturated the single-threaded event loop: sockets were read at 64 KiB per
+-- peer per multi-second pass, Recv-Q grew to MB, the requested block sat
+-- behind the tx backlog past every stall timeout, and RPC timed out (stalls
+-- at 968709 and 968725, 2026-09-26).
 -- @param wtxid_hex string: Witness transaction id as hex string
 -- @return boolean: True if transaction is in mempool
 function Mempool:has_wtxid(wtxid_hex)
-  -- Fast path: for non-segwit txs txid == wtxid, so check txid index first.
-  if self.entries[wtxid_hex] then return true end
-  -- Slow path: scan for segwit transactions whose wtxid matches.
-  for _, entry in pairs(self.entries) do
-    if entry.wtxid then
-      local entry_wtxid_hex = types.hash256_hex(entry.wtxid)
-      if entry_wtxid_hex == wtxid_hex then return true end
-    end
-  end
-  return false
+  return self:get_entry_by_wtxid(wtxid_hex) ~= nil
 end
 
 --- Iterate over all mempool transactions yielding (wtxid_bytes, tx) pairs.
