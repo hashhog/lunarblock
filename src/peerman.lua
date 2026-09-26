@@ -472,6 +472,16 @@ function M.new(network, storage, config)
   self.v1_only_addrs = {}      -- "ip:port" -> timestamp of last v2 failure
   self.V2_RETRY_AFTER = 24 * 3600  -- 24h before re-trying v2 on a v1-only addr
 
+  -- Self-address advertisement (see the "Self-address advertisement" section).
+  -- _local_addrs: canonical ip -> entry (Core mapLocalHost).  discover: Core
+  -- -discover (default on; main.lua turns it off when --externalip is given
+  -- unless --discover is explicit).  is_ibd_func: optional () -> bool, set by
+  -- main.lua; the self-announcement is withheld while it returns true.
+  self._local_addrs = {}
+  self.discover = config.discover ~= false
+  self.is_ibd_func = config.is_ibd_func
+  self._last_local_addr_check = nil
+
   -- Initialize proxy if configured
   if config.proxy then
     self:_init_proxy(config)
@@ -546,15 +556,19 @@ function PeerManager:_init_proxy(config)
   end
 end
 
---- Get our advertised addresses for privacy networks.
--- @return table: {onion = ".onion addr", i2p = ".b32.i2p addr"}
+--- Our local addresses (getnetworkinfo.localaddresses, Core mapLocalHost):
+-- the --externalip / discovered IP table plus our I2P address when the SAM
+-- session has one (Core AddLocal(i2p, LOCAL_MANUAL), port 0 per I2P SAM 3.1).
+-- @return table: list of {address=string, port=number, score=number},
+--   highest score first
 function PeerManager:get_local_addresses()
-  local addresses = {}
+  local addresses = self:list_local_addresses()
 
   if self.proxy_config and self.proxy_config.i2p_sam then
     local i2p_addr = self.proxy_config.i2p_sam:get_my_address()
     if i2p_addr then
-      addresses.i2p = i2p_addr
+      addresses[#addresses + 1] = { address = i2p_addr, port = 0,
+                                    score = M.LOCAL_SCORE.MANUAL }
     end
   end
 
@@ -626,6 +640,448 @@ end
 
 -- Export for spec access
 M.is_routable = _is_routable
+
+--------------------------------------------------------------------------------
+-- Self-address advertisement (Bitcoin Core parity)
+--------------------------------------------------------------------------------
+-- A listening node must tell the network where it can be reached, or nobody
+-- ever dials it: peers learn addresses only from addr/addrv2 gossip, and the
+-- only gossip source for OUR address is us.  Core does this in three parts,
+-- mirrored here:
+--
+--  1. A table of local addresses (Core net.cpp mapLocalHost / AddLocal /
+--     SeenLocal).  Entries come from --externalip (score LOCAL_MANUAL) and
+--     from discovery: an OUTBOUND peer's VERSION carries addr_recv, the
+--     address it sees us at.  A discovered entry's score is the number of
+--     DISTINCT peer netgroups that confirmed it, so one peer (or one /16)
+--     cannot talk us into advertising an address; it needs
+--     MIN_DISCOVERED_SCORE confirmations before it is advertised, and it ages
+--     out after DISCOVERED_TTL without a fresh confirmation so a changed
+--     public IP replaces the old one.  Inbound peers only bump an existing
+--     entry (SeenLocal).  Discovered entries are stored with OUR LISTEN PORT.
+--  2. The per-peer choice (Core net.cpp GetLocalAddrForPeer :240-268): the
+--     best table entry, but if the peer itself told us a routable address
+--     for us, use that when the table has nothing routable, and otherwise
+--     sometimes (1/2, or 1/8 when the best entry scores above LOCAL_MANUAL).
+--  3. The send (Core net_processing.cpp MaybeSendAddr :5445-5479): only when
+--     listening and out of IBD, one addr/addrv2 carrying just our address
+--     right after the handshake, then again on a Poisson timer averaging 24h
+--     (AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL).  Never to feeler connections
+--     (lunarblock has no block-relay-only connection type).  IBD leaves the
+--     per-peer timer untouched, so the first send goes out on the first
+--     CHECK_INTERVAL tick after IBD ends.
+--
+-- VERSION addr_from stays 0.0.0.0:0 (modern Core sends an empty CService).
+
+-- Local address scores (Core net.h enum LOCAL_NONE..LOCAL_MANUAL).
+M.LOCAL_SCORE = {
+  NONE   = 0,  -- unknown / discovered
+  IF     = 1,  -- address a local interface listens on
+  BIND   = 2,  -- address explicitly bound to
+  MAPPED = 3,  -- address reported by PCP/NAT-PMP
+  MANUAL = 4,  -- address explicitly specified (--externalip)
+}
+
+M.SELF_ADVERT = {
+  -- Mean of the exponential delay between self-announcements to one peer
+  -- (Core net_processing.cpp:158 AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL = 24h).
+  AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL = 24 * 3600,
+  -- How often tick() looks for peers whose next self-announcement is due.
+  CHECK_INTERVAL = 60,
+  -- A discovered entry not confirmed by any peer for this long is dropped.
+  DISCOVERED_TTL = 3 * 3600,
+  -- Distinct peer netgroups that must confirm a discovered address before
+  -- it is advertised to OTHER peers.
+  MIN_DISCOVERED_SCORE = 2,
+  -- Cap on discovered entries (weakest evicted) and per-entry confirmers.
+  MAX_DISCOVERED = 8,
+  MAX_CONFIRMERS = 64,
+}
+
+--- Parse an IPv6 literal (optionally bracketed, "::" compression, embedded
+-- dotted-quad tail, %zone suffix) to 16 raw bytes.  nil when invalid.
+local function _parse_ipv6_bytes(s)
+  if type(s) ~= "string" or not s:find(":", 1, true) then return nil end
+  s = s:match("^%[(.*)%]$") or s
+  s = s:gsub("%%.*$", "")
+  local head, v4 = s:match("^(.*:)(%d+%.%d+%.%d+%.%d+)$")
+  if v4 then
+    local a, b, c, d = v4:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+    s = head .. string.format("%x:%x", a * 256 + b, c * 256 + d)
+  end
+  local function split(part)
+    local out = {}
+    if part == "" then return out end
+    for g in (part .. ":"):gmatch("([^:]*):") do
+      if not g:match("^%x%x?%x?%x?$") then return nil end
+      out[#out + 1] = tonumber(g, 16)
+    end
+    return out
+  end
+  local groups
+  local dbl = s:find("::", 1, true)
+  if dbl then
+    if s:find("::", dbl + 1, true) then return nil end
+    local left, right = split(s:sub(1, dbl - 1)), split(s:sub(dbl + 2))
+    if not left or not right or #left + #right > 7 then return nil end
+    groups = {}
+    for _, g in ipairs(left) do groups[#groups + 1] = g end
+    for _ = 1, 8 - #left - #right do groups[#groups + 1] = 0 end
+    for _, g in ipairs(right) do groups[#groups + 1] = g end
+  else
+    groups = split(s)
+    if not groups or #groups ~= 8 then return nil end
+  end
+  local bytes = {}
+  for i = 1, 8 do
+    bytes[#bytes + 1] = string.char(math.floor(groups[i] / 256), groups[i] % 256)
+  end
+  return table.concat(bytes)
+end
+
+--- RFC 5952 text form of 16 IPv6 bytes (lowercase, longest zero run as "::").
+local function _format_ipv6(b16)
+  local g = {}
+  for i = 1, 16, 2 do g[#g + 1] = b16:byte(i) * 256 + b16:byte(i + 1) end
+  local best_s, best_l, cur_s, cur_l = 0, 0, 0, 0
+  for i = 1, 8 do
+    if g[i] == 0 then
+      if cur_l == 0 then cur_s = i end
+      cur_l = cur_l + 1
+      if cur_l > best_l then best_s, best_l = cur_s, cur_l end
+    else
+      cur_l = 0
+    end
+  end
+  local parts = {}
+  for i = 1, 8 do parts[i] = string.format("%x", g[i]) end
+  if best_l < 2 then return table.concat(parts, ":") end
+  local left = table.concat(parts, ":", 1, best_s - 1)
+  local right = (best_s + best_l <= 8) and table.concat(parts, ":", best_s + best_l, 8) or ""
+  return left .. "::" .. right
+end
+
+--- Parse an IP literal into {family="ipv4"|"ipv6", str=canonical, bytes=raw}.
+-- IPv4 bytes are 4 long, IPv6 16; an IPv4-mapped IPv6 literal is IPv4.
+-- @return table|nil
+function M.parse_ip(s)
+  if type(s) ~= "string" then return nil end
+  local a, b, c, d = s:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+  if a then
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+    return { family = "ipv4", str = string.format("%d.%d.%d.%d", a, b, c, d),
+             bytes = string.char(a, b, c, d) }
+  end
+  local b16 = _parse_ipv6_bytes(s)
+  if not b16 then return nil end
+  if b16:sub(1, 12) == string.rep("\0", 10) .. "\xff\xff" then
+    local w, x, y, z = b16:byte(13, 16)
+    return M.parse_ip(string.format("%d.%d.%d.%d", w, x, y, z))
+  end
+  return { family = "ipv6", str = _format_ipv6(b16), bytes = b16 }
+end
+
+--- Publicly routable IPv4/IPv6 address (Core CNetAddr::IsRoutable).
+-- IPv4 reuses the addrman's _is_routable ranges; IPv6 rejects ::, ::1,
+-- link-local fe80::/10, ULA fc00::/7 (RFC4193, incl. Core's internal
+-- fd6b:88c0:8724::/48), documentation 2001:db8::/32 (RFC3849), ORCHID
+-- 2001:10::/28 (RFC4843) and ORCHIDv2 2001:20::/28 (RFC7343), multicast.
+-- Non-IP (onion/i2p/garbage) returns false: only IP is self-advertised here.
+-- @param ip string|table: literal, or a parse_ip() result
+-- @return boolean
+function M.is_publicly_routable(ip)
+  local info = type(ip) == "table" and ip or M.parse_ip(ip)
+  if not info then return false end
+  if info.family == "ipv4" then return _is_routable(info.str) end
+  local b = info.bytes
+  local b1, b2, b3, b4 = b:byte(1, 4)
+  if b == string.rep("\0", 16) then return false end
+  if b == string.rep("\0", 15) .. "\1" then return false end
+  if b1 == 0xfe and b2 >= 0x80 and b2 <= 0xbf then return false end
+  if b1 == 0xfc or b1 == 0xfd then return false end
+  if b1 == 0xff then return false end
+  if b1 == 0x20 and b2 == 0x01 then
+    if b3 == 0x0d and b4 == 0xb8 then return false end
+    if b3 == 0x00 and (b4 >= 0x10 and b4 <= 0x2f) then return false end
+  end
+  return true
+end
+
+--- Parse an --externalip value: "<ip>", "<ip>:<port>", "[<ipv6>]:<port>" or
+-- a bare IPv6 literal.  port nil means "use the P2P listen port".
+-- @return string ip, number|nil port   (nil, err on failure)
+function M.parse_external_ip(v)
+  if type(v) ~= "string" then return nil, "invalid address" end
+  v = v:match("^%s*(.-)%s*$")
+  if M.parse_ip(v) then return M.parse_ip(v).str, nil end
+  local host, port = v:match("^%[(.-)%]:(%d+)$")
+  if not host then host, port = v:match("^([^%[%]:]+):(%d+)$") end
+  if not host then
+    host = v:match("^%[(.-)%]$")
+    if host and M.parse_ip(host) then return M.parse_ip(host).str, nil end
+    return nil, "invalid address '" .. v .. "'"
+  end
+  local info = M.parse_ip(host)
+  if not info then return nil, "invalid IP '" .. host .. "'" end
+  port = tonumber(port)
+  if not port or port < 1 or port > 65535 then
+    return nil, "invalid port in '" .. v .. "'"
+  end
+  return info.str, port
+end
+
+--- The port we accept P2P connections on (Core GetListenPort); 0 when not
+-- listening.  Uses the actually-bound port of the first listen socket, so
+-- --port 0 / ephemeral binds advertise what peers can really dial.
+function PeerManager:get_listen_port()
+  local socks = self.listen_sockets
+  if socks and #socks > 0 then
+    return tonumber(socks[1].bound_port or socks[1].port) or 0
+  end
+  return 0
+end
+
+--- Mirrors Core's fListen.
+function PeerManager:is_listening()
+  return self:get_listen_port() ~= 0
+end
+
+--- Whether we are in initial block download (gates the self-announcement).
+function PeerManager:_in_ibd()
+  if type(self.is_ibd_func) ~= "function" then return false end
+  local ok, v = pcall(self.is_ibd_func)
+  if not ok then return true end  -- unknown state: stay quiet
+  return v and true or false
+end
+
+local function _local_entry_score(e)
+  return e.base_score + e.n_confirmers
+end
+
+local function _local_entry_usable(e)
+  return e.manual or e.n_confirmers >= M.SELF_ADVERT.MIN_DISCOVERED_SCORE
+end
+
+function PeerManager:_expire_local_addrs(now)
+  for k, e in pairs(self._local_addrs) do
+    if not e.manual and (now - e.last_seen) > M.SELF_ADVERT.DISCOVERED_TTL then
+      self._local_addrs[k] = nil
+    end
+  end
+end
+
+--- Record an operator-specified address (--externalip, score LOCAL_MANUAL).
+-- @param ip string: IP literal
+-- @param port number|nil: nil = the P2P listen port (resolved at send time)
+-- @return boolean: false for an invalid or non-routable address (Core AddLocal)
+function PeerManager:add_external_ip(ip, port)
+  local info = M.parse_ip(ip)
+  if not info or not M.is_publicly_routable(info) then return false end
+  local e = self._local_addrs[info.str]
+  if not e then
+    e = { info = info, confirmers = {}, n_confirmers = 0, last_seen = os.time() }
+    self._local_addrs[info.str] = e
+  end
+  e.manual = true
+  e.base_score = M.LOCAL_SCORE.MANUAL
+  e.port = port
+  return true
+end
+
+--- A peer in netgroup `group` sees us at `info`.  With create=false (inbound,
+-- Core SeenLocal) only an existing entry is scored; with create=true
+-- (outbound addr_recv discovery) a new entry is made (stored with our listen
+-- port: e.port stays nil).
+function PeerManager:_confirm_local_addr(info, group, create, now)
+  if not M.is_publicly_routable(info) then return false end
+  self:_expire_local_addrs(now)
+  local e = self._local_addrs[info.str]
+  if not e then
+    if not create then return false end
+    -- Evict the weakest discovered entry (lowest score, then oldest) when full.
+    local n, worst_k, worst = 0, nil, nil
+    for k, x in pairs(self._local_addrs) do
+      if not x.manual then
+        n = n + 1
+        if not worst or _local_entry_score(x) < _local_entry_score(worst)
+            or (_local_entry_score(x) == _local_entry_score(worst)
+                and x.last_seen < worst.last_seen) then
+          worst_k, worst = k, x
+        end
+      end
+    end
+    if n >= M.SELF_ADVERT.MAX_DISCOVERED and worst_k then
+      self._local_addrs[worst_k] = nil
+    end
+    e = { info = info, manual = false, base_score = M.LOCAL_SCORE.NONE,
+          confirmers = {}, n_confirmers = 0, last_seen = now }
+    self._local_addrs[info.str] = e
+  end
+  if not e.confirmers[group] and e.n_confirmers < M.SELF_ADVERT.MAX_CONFIRMERS then
+    e.confirmers[group] = true
+    e.n_confirmers = e.n_confirmers + 1
+  end
+  e.last_seen = now
+  return true
+end
+
+--- Learn from a peer's VERSION addr_recv (Core ProcessMessage VERSION:
+-- SetAddrLocal / SeenLocal, gated like IsPeerAddrLocalGood): only with
+-- discovery on, only while listening, only when BOTH the peer and the
+-- address it reports are publicly routable.
+-- @return boolean: true when the table was updated
+function PeerManager:note_version_addr_recv(p, now)
+  if not self.discover or not self:is_listening() then return false end
+  local ver = p and p.version_info
+  if not ver or not ver.recv_ip then return false end
+  local peer_info = M.parse_ip(p.ip)
+  local seen = M.parse_ip(ver.recv_ip)
+  if not peer_info or not seen then return false end
+  if not M.is_publicly_routable(peer_info) or not M.is_publicly_routable(seen) then
+    return false
+  end
+  local group = M.get_addr_group(peer_info.str)
+  return self:_confirm_local_addr(seen, group, not p.inbound, now or os.time())
+end
+
+--- Best usable local address for a peer (Core GetLocal): same address family
+-- as the peer first, then the highest score, then the most recently seen.
+-- @return table|nil entry
+function PeerManager:_best_local_addr(peer_info, now)
+  self:_expire_local_addrs(now)
+  local function reach(e)
+    if peer_info and e.info.family == peer_info.family then return 1 end
+    return 0
+  end
+  local best
+  for _, e in pairs(self._local_addrs) do
+    if _local_entry_usable(e) then
+      if not best or reach(e) > reach(best)
+          or (reach(e) == reach(best)
+              and (_local_entry_score(e) > _local_entry_score(best)
+                   or (_local_entry_score(e) == _local_entry_score(best)
+                       and e.last_seen > best.last_seen))) then
+        best = e
+      end
+    end
+  end
+  return best
+end
+
+--- Our local address table for getnetworkinfo.localaddresses, highest score
+-- first: list of {address, port, score}.
+function PeerManager:list_local_addresses(now)
+  now = now or os.time()
+  self:_expire_local_addrs(now)
+  local out = {}
+  local lport = self:get_listen_port()
+  for _, e in pairs(self._local_addrs) do
+    out[#out + 1] = { address = e.info.str, port = e.port or lport,
+                      score = _local_entry_score(e) }
+  end
+  table.sort(out, function(x, y)
+    if x.score ~= y.score then return x.score > y.score end
+    return x.address < y.address
+  end)
+  return out
+end
+
+--- Pick the address to advertise to peer p (Core GetLocalAddrForPeer,
+-- net.cpp:240-268).
+-- @return table|nil info, number port
+function PeerManager:local_addr_for_peer(p, now)
+  now = now or os.time()
+  local peer_info = M.parse_ip(p.ip)
+  local best = self:_best_local_addr(peer_info, now)
+  local info, port
+  if best then
+    info, port = best.info, best.port or self:get_listen_port()
+  else
+    port = self:get_listen_port()
+  end
+  local seen = p.version_info and M.parse_ip(p.version_info.recv_ip)
+  local peer_good = self.discover and peer_info and seen
+    and M.is_publicly_routable(peer_info) and M.is_publicly_routable(seen)
+  if peer_good then
+    local bits = (best and _local_entry_score(best) > M.LOCAL_SCORE.MANUAL) and 3 or 1
+    if not best or math.random(0, 2 ^ bits - 1) == 0 then
+      info = seen
+      if p.inbound then
+        -- The peer dialed our listening port, so it saw that too.
+        port = p.version_info.recv_port or port
+      end
+    end
+  end
+  if not info or not M.is_publicly_routable(info) or not port or port == 0 then
+    return nil
+  end
+  return info, port
+end
+
+--- Build the one-entry addr/addrv2 payload that announces `info:port`.
+-- @return string payload, string command
+function PeerManager:build_self_addr_message(p, info, port, now)
+  local services = p.our_services
+  if services == nil then
+    services = p2p.our_services(self.config.peerbloomfilters, self.config.prune_mode,
+                                nil, not self.config.nov2transport)
+  end
+  local entry = {
+    timestamp = now,
+    services = services,
+    ip = info.str,
+    port = port,
+    network_id = (info.family == "ipv4") and p2p.NET_ID.IPV4 or p2p.NET_ID.IPV6,
+    addr_bytes = info.bytes,
+  }
+  if p.send_addrv2 then
+    return p2p.serialize_addrv2({ entry }), "addrv2"
+  end
+  if info.family == "ipv6" then entry.addr16 = info.bytes end
+  return p2p.serialize_addr({ entry }), "addr"
+end
+
+--- Core MaybeSendAddr's self-announcement block: if peer p is due, send it
+-- our address in its own addr/addrv2.  Never to feelers; not while in IBD
+-- (the per-peer timer is left untouched, so the first send happens on the
+-- first tick after IBD ends).
+-- @return boolean: true when a message was sent
+function PeerManager:maybe_send_local_addr(p, now)
+  now = now or os.time()
+  if not p or p.is_feeler or not self:is_listening() then return false end
+  if p.state ~= peer_mod.STATE.ESTABLISHED then return false end
+  if self:_in_ibd() then return false end
+  local next_send = p._next_local_addr_send
+  if next_send and now < next_send then return false end
+  p._next_local_addr_send = now
+    + M.poisson_delay(M.SELF_ADVERT.AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL)
+  local info, port = self:local_addr_for_peer(p, now)
+  if not info then return false end
+  local payload, cmd = self:build_self_addr_message(p, info, port, now)
+  p:send_message(cmd, payload)
+  local shown = info.family == "ipv6" and ("[" .. info.str .. "]") or info.str
+  print(string.format("[SELF-ADVERT] advertising %s:%d to peer %s:%s via %s",
+    shown, port, tostring(p.ip), tostring(p.port), cmd))
+  return true
+end
+
+--- Periodic self-announcement sweep (runs from tick every CHECK_INTERVAL).
+function PeerManager:_process_local_addr_timers(now)
+  now = now or os.time()
+  if self._last_local_addr_check
+      and (now - self._last_local_addr_check) < M.SELF_ADVERT.CHECK_INTERVAL then
+    return
+  end
+  self._last_local_addr_check = now
+  for _, p in ipairs(self.peer_list) do
+    if p._established_notified then
+      self:maybe_send_local_addr(p, now)
+    end
+  end
+end
 
 --------------------------------------------------------------------------------
 -- Address Manager Initialization (Eclipse Attack Mitigation)
@@ -2841,6 +3297,12 @@ function PeerManager:tick()
       -- Check if state became ESTABLISHED (newly completed handshake)
       if p.state == peer_mod.STATE.ESTABLISHED and not p._established_notified then
         p._established_notified = true
+        -- Learn our own address from the peer's VERSION addr_recv (Core
+        -- SeenLocal / discovery).  Feelers are outbound peers too.
+        local okd, errd = pcall(self.note_version_addr_recv, self, p)
+        if not okd then
+          io.stderr:write("self-advert discovery error (non-fatal): " .. tostring(errd) .. "\n")
+        end
         -- Feeler: the handshake SUCCEEDED -> mark for disconnect.  The promotion
         -- NEW->TRIED happens in disconnect_peer (_move_to_tried for ESTABLISHED
         -- outbound peers), so a feeler that reaches ESTABLISHED is promoted and
@@ -2854,6 +3316,11 @@ function PeerManager:tick()
           self:_init_peer_trickle(p)
           if self.callbacks.on_peer_established then
             self.callbacks.on_peer_established(p)
+          end
+          -- Initial self-announcement (Core MaybeSendAddr, first SendMessages).
+          local oks, errs = pcall(self.maybe_send_local_addr, self, p)
+          if not oks then
+            io.stderr:write("self-advert send error (non-fatal): " .. tostring(errs) .. "\n")
           end
         end
       end
@@ -2874,6 +3341,15 @@ function PeerManager:tick()
 
   -- Process transaction trickling (batched, randomized inv sending)
   self:_process_trickle()
+
+  -- Periodic self-address re-announcement (Core MaybeSendAddr Poisson timer;
+  -- also delivers the first announcement once IBD ends).
+  do
+    local ok, err = pcall(self._process_local_addr_timers, self)
+    if not ok then
+      io.stderr:write("self-advert timer error (non-fatal): " .. tostring(err) .. "\n")
+    end
+  end
 
   -- Check for stale tip and evict extra outbound peers
   self:check_for_stale_tip_and_evict_peers()

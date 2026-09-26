@@ -5278,6 +5278,26 @@ end
       net_entry("cjdns", true),
     }, OJ_ARRAY)
 
+    -- localaddresses: our own advertised addresses (--externalip + addresses
+    -- discovered from outbound peers' VERSION addr_recv + I2P), Core
+    -- rpc/net.cpp getnetworkinfo: [{address, port, score}], highest score
+    -- first.  Always an array.
+    local localaddresses = oj_array_empty()
+    if rpc.peer_manager and type(rpc.peer_manager.get_local_addresses) == "function" then
+      local ok, list = pcall(rpc.peer_manager.get_local_addresses, rpc.peer_manager)
+      if ok and type(list) == "table" and #list > 0 then
+        local items = {}
+        for i, la in ipairs(list) do
+          items[i] = oj({
+            "address", la.address,
+            "port",    la.port,
+            "score",   la.score,
+          })
+        end
+        localaddresses = oj_array(items)
+      end
+    end
+
     return oj_result(oj({
       "version",            250000,                  -- masked (software identity)
       "subversion",         "/LunarBlock:0.1.0/",    -- masked (software identity)
@@ -5293,7 +5313,7 @@ end
       "networks",           networks,
       "relayfee",           oj_amount(relay_floor),
       "incrementalfee",     oj_amount(incremental_fee),
-      "localaddresses",     oj_array_empty(),        -- masked
+      "localaddresses",     localaddresses,
       "warnings",           oj_array_empty(),        -- ARRAY (Core v31.99)
     }))
   end

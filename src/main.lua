@@ -94,7 +94,28 @@ local function default_args()
     -- nodes already have; it closes lunarblock's zero replay-coverage gap.
     noassumevalid = false,   -- true = disable assumevalid entirely (full script verify)
     assumevalid = nil,       -- optional hex override for the assumevalid hash; "0" == disable
+    -- Self-address advertisement (Bitcoin Core -externalip / -discover).
+    -- externalip: list of "<ip>[:port]" (repeatable / comma-separated); a bare
+    -- IP is advertised with the P2P listen port.  discover: nil = default
+    -- (on, but off when --externalip is given, Core init.cpp:815 soft-set).
+    externalip = nil,
+    discover = nil,
   }
+end
+
+--- Normalise args.externalip (CLI list and/or conf string, comma-separated)
+-- into a flat list of trimmed, non-empty specs.
+local function externalip_list(v)
+  local out = {}
+  if v == nil then return out end
+  local items = type(v) == "table" and v or { v }
+  for _, item in ipairs(items) do
+    for part in tostring(item):gmatch("[^,]+") do
+      part = part:match("^%s*(.-)%s*$")
+      if part ~= "" then out[#out + 1] = part end
+    end
+  end
+  return out
 end
 
 local function parse_args(argv)
@@ -162,6 +183,8 @@ local function parse_args(argv)
       print("      --mempool-fullrbf BOOL      Mempool full-RBF policy (default: 1 = on, Core v28+ default)")
       print("      --noassumevalid             Disable assumevalid: verify every script/signature from genesis (AV=0 parity)")
       print("      --assumevalid HASH          Override assumevalid block hash; 0 disables (full script verification)")
+      print("      --externalip IP[:PORT]      Own public address to advertise to peers (repeatable; bare IP = P2P listen port; implies --discover=0)")
+      print("      --discover[=0|1]            Learn own public address from outbound peers (default: 1 unless --externalip)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)
@@ -421,6 +444,19 @@ local function parse_args(argv)
         end
       end
       args.mempool_fullrbf = (v == "1" or v == "true" or v == "yes" or v == "on")
+    elseif arg == "--externalip" or arg:match("^%-%-externalip=") then
+      -- Core -externalip=<ip>[:port]: our own public address to advertise.
+      -- Repeatable and comma-separated.
+      local v = arg:match("^%-%-externalip=(.*)$")
+      if v == nil then i = i + 1; v = argv[i] end
+      if not args.externalip then args.externalip = {} end
+      args.externalip[#args.externalip + 1] = v
+    elseif arg == "--discover" or arg:match("^%-%-discover=") then
+      -- Core -discover: learn our public address from outbound peers.
+      local v = arg:match("^%-%-discover=(.*)$")
+      args.discover = (v == nil) or v == "1" or v == "true" or v == "yes" or v == "on"
+    elseif arg == "--nodiscover" then
+      args.discover = false
     elseif arg == "--noassumevalid" or arg:match("^%-%-noassumevalid=") then
       -- Full-script-verification parity with Bitcoin Core's -assumevalid=0.
       -- Bare "--noassumevalid" enables; "--noassumevalid=BOOL" is explicit.
@@ -470,6 +506,13 @@ local function parse_args(argv)
       end
       ops.apply_conf_to_args(args, defaults, conf)
     end
+  end
+
+  -- Self-advertisement: flatten --externalip and resolve the -discover
+  -- default (Core init.cpp:815: -externalip soft-sets -discover=0).
+  args.externalip = externalip_list(args.externalip)
+  if args.discover == nil then
+    args.discover = (#args.externalip == 0)
   end
 
   return args
@@ -1881,8 +1924,49 @@ local function main()
     peerblockfilters = args.peerblockfilters,
     blockfilterindex_enabled = args.blockfilterindex,
     data_dir = datadir,
+    -- Self-address advertisement (Core -discover).
+    discover = args.discover,
   })
   peer_manager.our_height = header_chain.header_tip_height
+
+  -- Core -externalip: advertised with score LOCAL_MANUAL.  An unparseable
+  -- value is fatal (Core InitError "Cannot resolve -externalip address");
+  -- a non-routable one is ignored with a warning (Core AddLocal refuses it).
+  for _, spec in ipairs(args.externalip or {}) do
+    local ext_ip, ext_port = peerman_mod.parse_external_ip(spec)
+    if not ext_ip then
+      io.stderr:write("Error: cannot parse --externalip address '" .. spec .. "': "
+        .. tostring(ext_port) .. "\n")
+      os.exit(1)
+    end
+    if peer_manager:add_external_ip(ext_ip, ext_port) then
+      print("externalip: advertising " .. spec)
+    else
+      print("WARNING: --externalip=" .. spec .. " is not publicly routable; ignored")
+    end
+  end
+
+  -- IBD gate for the self-announcement (Core MaybeSendAddr checks
+  -- !IsInitialBlockDownload()).  Core's IsInitialBlockDownload latches to
+  -- false once the active tip has caught up AND is younger than
+  -- DEFAULT_MAX_TIP_AGE (24h), and never re-enters IBD.  Same shape here:
+  -- "caught up" is the block downloader's reached_tip/ibd_complete latch.
+  do
+    local ibd_latched_out = false
+    peer_manager.is_ibd_func = function()
+      if ibd_latched_out then return false end
+      if not (block_downloader.reached_tip or block_downloader.ibd_complete) then
+        return true
+      end
+      local entry = header_chain:get_header_at_height(chain_state.tip_height or 0)
+      local ts = entry and entry.header and entry.header.timestamp
+      if not ts or (os.time() - ts) > 24 * 60 * 60 then
+        return true
+      end
+      ibd_latched_out = true
+      return false
+    end
+  end
   -- Chain-sync-timeout probe locator (#72 row (4)): Core anchors this
   -- getheaders one block BELOW the work header (GetLocator(pprev),
   -- net_processing.cpp:5248) so a same-tip honest peer still answers
@@ -3448,6 +3532,8 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --mempool-fullrbf BOOL      Mempool full-RBF policy (default: 1 = on, Core v28+ default)")
       print("      --noassumevalid             Disable assumevalid: verify every script/signature from genesis (AV=0 parity)")
       print("      --assumevalid HASH          Override assumevalid block hash; 0 disables (full script verification)")
+      print("      --externalip IP[:PORT]      Own public address to advertise to peers (repeatable; bare IP = P2P listen port; implies --discover=0)")
+      print("      --discover[=0|1]            Learn own public address from outbound peers (default: 1 unless --externalip)")
       print("      --version           Print version and exit")
       print("  -h, --help              Show this help message")
       os.exit(0)

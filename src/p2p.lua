@@ -699,7 +699,9 @@ function M.serialize_addr(addresses)
   for _, addr in ipairs(addresses) do
     w.write_u32le(addr.timestamp or os.time())
     w.write_u64le(addr.services or 0)
-    w.write_bytes(M.ip_to_bytes(addr.ip or "0.0.0.0"))
+    -- addr16: optional pre-encoded 16-byte address (IPv6; ip_to_bytes only
+    -- understands dotted-quad IPv4).
+    w.write_bytes(addr.addr16 or M.ip_to_bytes(addr.ip or "0.0.0.0"))
     w.write_u16be(addr.port or 8333)
   end
   return w.result()

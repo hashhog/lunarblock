@@ -535,6 +535,25 @@ describe("rpc", function()
       assert.is_table(decoded.result.networks)
       assert.is_number(decoded.result.relayfee)
     end)
+
+    it("localaddresses is an empty array with no peer manager", function()
+      local server = rpc.new({network = consensus.networks.mainnet})
+      local response = server:handle_request('{"method":"getnetworkinfo","params":[],"id":1}')
+      assert.truthy(response:find('"localaddresses":[]', 1, true))
+    end)
+
+    it("localaddresses lists {address, port, score} from the peer manager", function()
+      local peerman = require("lunarblock.peerman")
+      local tmp = os.tmpname(); os.remove(tmp); os.execute("mkdir -p " .. tmp)
+      local pm = peerman.new(consensus.networks.mainnet, nil, {data_dir = tmp})
+      pm.listen_sockets = { { host = "0.0.0.0", port = 8342, bound_port = 8342 } }
+      assert.is_true(pm:add_external_ip("1.2.3.4"))
+      local server = rpc.new({network = consensus.networks.mainnet, peer_manager = pm})
+      local response = server:handle_request('{"method":"getnetworkinfo","params":[],"id":1}')
+      os.execute("rm -rf " .. tmp)
+      assert.truthy(response:find(
+        '"localaddresses":[{"address":"1.2.3.4","port":8342,"score":4}]', 1, true), response)
+    end)
   end)
 
   describe("getconnectioncount", function()

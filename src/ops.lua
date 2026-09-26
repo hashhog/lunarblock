@@ -158,6 +158,10 @@ function M.apply_conf_to_args(args, defaults, conf)
     -- Wired in main.lua right after network selection.
     noassumevalid = {"noassumevalid", "bool"},
     assumevalid   = {"assumevalid",   "string"},
+    -- Self-address advertisement (Core -externalip / -discover); main.lua
+    -- splits externalip on commas and resolves the discover default.
+    externalip    = {"externalip",    "string"},
+    discover      = {"discover",      "bool"},
   }
   for k, v in pairs(conf) do
     local entry = schema[k]
