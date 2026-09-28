@@ -549,7 +549,8 @@ local function run_import_blocks(args)
     args.network, datadir, args.import_blocks))
 
   -- Initialize database
-  local db = storage_mod.open(datadir .. "/chainstate", args.dbcache)
+  local db = storage_mod.open(datadir .. "/chainstate", args.dbcache,
+    { prune = (args.prune or 0) > 0 })
 
   -- Initialize chain state
   local chain_state = utxo_mod.new_chain_state(db, network)
@@ -1220,7 +1221,8 @@ local function main()
 
   -- Initialize database
   io.stdout:write("Opening database...\n"); io.stdout:flush()
-  local db = storage_mod.open(datadir .. "/chainstate", args.dbcache)
+  local db = storage_mod.open(datadir .. "/chainstate", args.dbcache,
+    { prune = (args.prune or 0) > 0 })
   io.stdout:write("Database opened.\n"); io.stdout:flush()
 
   -- Initialize chain state
@@ -2920,9 +2922,25 @@ local function main()
     -- never wedge chain connection. A periodic flush (every WALLET_FLUSH_BLOCKS
     -- blocks) bounds fsync cost on the hot IBD path; a clean shutdown flushes the
     -- rest. last_synced_height is advanced every block so a SIGKILL loses at
-    -- most WALLET_FLUSH_BLOCKS blocks of reconcile progress, never any keys.
+    -- most one flush interval of reconcile progress, never any keys.
+    --
+    -- The flush is also rate-limited in wall-clock time.  Each save is a
+    -- tmp-file write + fsync + rename + directory fsync; MEASURED on the
+    -- 725000 range slice and on 651100->653000 replay arms (main thread
+    -- sampled from /proc, 2026-09-27/28) the every-50-blocks save of an
+    -- otherwise idle wallet cost ~4-10% of the connect loop's wall time
+    -- (~13 s per save), because on this box's ext4 each fsync waits
+    -- for a journal commit behind the whole machine's dirty data.  Nothing
+    -- is lost by saving less often: keys and keypool advances save
+    -- immediately (Wallet:save_if_dirty at the mutation), the ledger is
+    -- re-derived from the chainstate (scan_utxos / scan_history are
+    -- idempotent), and reconcile_to_tip closes any gap on restart.  Core's
+    -- wallet likewise writes its best-block locator only when the
+    -- chainstate is flushed, not per block.
     local WALLET_FLUSH_BLOCKS = 50
+    local WALLET_FLUSH_MIN_SECONDS = 600
     local wallet_blocks_since_flush = 0
+    local wallet_last_flush_time = require("socket").gettime()
     local prev_cb_for_wallet = chain_state.callbacks.on_block_connected
     chain_state.callbacks.on_block_connected = function(block_hash, block)
       if prev_cb_for_wallet then
@@ -2937,8 +2955,11 @@ local function main()
           w:scan_block(chain_state, block, height, mempool)
         end
         wallet_blocks_since_flush = wallet_blocks_since_flush + 1
-        if wallet_blocks_since_flush >= WALLET_FLUSH_BLOCKS then
+        local wnow = require("socket").gettime()
+        if wallet_blocks_since_flush >= WALLET_FLUSH_BLOCKS
+            and wnow - wallet_last_flush_time >= WALLET_FLUSH_MIN_SECONDS then
           wallet_blocks_since_flush = 0
+          wallet_last_flush_time = wnow
           for _, w in pairs(wallet_manager.wallets) do
             if w.save_if_dirty then w:save_if_dirty() end
           end

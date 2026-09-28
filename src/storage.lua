@@ -160,6 +160,27 @@ ffi.cdef[[
   /* Memory */
   void rocksdb_free(void* ptr);
 
+  /* Write-path durability model (see M.open "Durability model") */
+  typedef struct rocksdb_flushoptions_t rocksdb_flushoptions_t;
+  rocksdb_flushoptions_t* rocksdb_flushoptions_create(void);
+  void rocksdb_flushoptions_destroy(rocksdb_flushoptions_t* options);
+  void rocksdb_flushoptions_set_wait(rocksdb_flushoptions_t* options, unsigned char v);
+  void rocksdb_flush_cfs(rocksdb_t* db, const rocksdb_flushoptions_t* options,
+                         rocksdb_column_family_handle_t** column_family,
+                         int num_column_families, char** errptr);
+  void rocksdb_flush_wal(rocksdb_t* db, unsigned char sync, char** errptr);
+  void rocksdb_writeoptions_disable_WAL(rocksdb_writeoptions_t* opt, int disable);
+  void rocksdb_options_set_atomic_flush(rocksdb_options_t* opt, unsigned char v);
+  void rocksdb_options_set_bytes_per_sync(rocksdb_options_t* opt, uint64_t v);
+  char* rocksdb_property_value(rocksdb_t* db, const char* propname);
+
+  /* Integrated BlobDB (block bodies, see blocks_cf_options) */
+  void rocksdb_options_set_enable_blob_files(rocksdb_options_t* opt, unsigned char val);
+  void rocksdb_options_set_min_blob_size(rocksdb_options_t* opt, uint64_t val);
+  void rocksdb_options_set_blob_file_size(rocksdb_options_t* opt, uint64_t val);
+  void rocksdb_options_set_blob_compression_type(rocksdb_options_t* opt, int val);
+  void rocksdb_options_set_enable_blob_gc(rocksdb_options_t* opt, unsigned char val);
+
   /* Bloom filter policy (block-based tables) */
   typedef struct rocksdb_filterpolicy_t rocksdb_filterpolicy_t;
   rocksdb_filterpolicy_t* rocksdb_filterpolicy_create_bloom_full(double bits_per_key);
@@ -521,6 +542,13 @@ function M.new_memory_storage()
     return iter
   end
 
+  -- Durability hooks (see M.open): nothing to persist for a memory store.
+  dbobj.wal_enabled = false
+  dbobj.stats = { checkpoints = 0, durable_flushes = 0 }
+  function dbobj.checkpoint(_wait)
+    dbobj.stats.checkpoints = dbobj.stats.checkpoints + 1
+  end
+
   function dbobj.close()
     dbobj._cfs = nil
     for k in pairs(cfs) do cfs[k] = nil end
@@ -530,73 +558,163 @@ function M.new_memory_storage()
 end
 
 -- Open a RocksDB database
-function M.open(path, cache_size_mb)
+--------------------------------------------------------------------------------
+-- Durability model (write path).
+--
+-- DEFAULT ("memtable-checkpoint", Core-style):
+--   * Every write goes to the memtables only -- the RocksDB WAL is disabled
+--     (WriteOptions.disableWAL).  connect_block's per-block atomic WriteBatch
+--     (UTXO delta + undo + block body + index entries + chain_tip LAST) is
+--     applied to memory; nothing is written to a file and nothing is fsync'd
+--     on the block-connect path.
+--   * atomic_flush=true: whenever RocksDB flushes (a memtable filled, an
+--     explicit checkpoint, shutdown), ALL column families are flushed together
+--     at one sequence number and installed with a single MANIFEST record.  A
+--     memtable switch only happens between write groups, so every durable
+--     state is exactly the state after some complete WriteBatch -- chain_tip,
+--     the UTXO set, undo data and block bodies always agree.  This is the
+--     same property the old WAL + kPointInTimeRecovery path provided after a
+--     power loss, and the same model Bitcoin Core uses for its coins cache:
+--     mutations accumulate in memory and are committed in large atomic
+--     batches (FlushStateToDisk), not per block.
+--   * A crash (SIGKILL, OOM, power loss) rolls the chainstate back to the last
+--     flush; the node re-downloads and reconnects from there.  Bounded by the
+--     memtable size (~256 MB of writes) and by sync.lua's periodic
+--     checkpoint() (time/block triggered).
+--   * Callers that ask for durability (put/delete/batch.write with sync=true:
+--     reorg commit, snapshot activation, header-tip anchors) get a blocking
+--     atomic flush after the write, so "returned => durable" still holds.
+--   * dbobj.close() flushes (waits) before closing.
+--
+-- LEGACY (LUNARBLOCK_DB_WAL=1): the previous behaviour -- every write appended
+-- to the WAL, sync=true => WAL fdatasync.  Kept as an operator escape hatch
+-- and as the A/B control; same on-disk format, switchable between restarts
+-- in either direction (a WAL left by legacy mode is replayed on open).
+--
+-- Why: MEASURED on the 725000 range slice (main thread sampled from /proc,
+-- 2026-09-27): ~35% of the connect loop's wall time was the main thread
+-- blocked in the kernel on WAL write() (ext4 journal waits) and WAL/dir
+-- fdatasync (jbd2 commit waits), because on this box's ext4 every append that
+-- touches inode metadata and every fsync waits for a journal commit that is
+-- itself stuck behind the whole machine's dirty data.  Removing the WAL takes
+-- those syscalls off the block-connect path entirely and also stops writing
+-- every byte twice (WAL + SST).
+--------------------------------------------------------------------------------
+M.wal_enabled_default = (os.getenv("LUNARBLOCK_DB_WAL") == "1")
+
+-- open_opts (optional table):
+--   prune = bool  -- enable blob GC on the blocks CF so pruned bodies are
+--                    reclaimed (off otherwise: no rewrite of live bodies).
+--   wal   = bool  -- override the durability model (default: env / no WAL).
+function M.open(path, cache_size_mb, open_opts)
   cache_size_mb = cache_size_mb or 2048
+  open_opts = open_opts or {}
+  local wal_enabled = M.wal_enabled_default
+  if open_opts.wal ~= nil then wal_enabled = open_opts.wal and true or false end
   local errptr = ffi.new("char*[1]")
 
-  -- Create main options
-  local options = librocksdb.rocksdb_options_create()
-  librocksdb.rocksdb_options_set_create_if_missing(options, 1)
-  librocksdb.rocksdb_options_set_create_missing_column_families(options, 1)
-  librocksdb.rocksdb_options_set_max_open_files(options, 1000)
-  librocksdb.rocksdb_options_set_write_buffer_size(options, 256 * 1024 * 1024)  -- 256MB
-  librocksdb.rocksdb_options_set_max_write_buffer_number(options, 4)
-  -- Snappy compression (RocksDB type 1).
-  --
-  -- The old comment "(LZ4 not linked)" was stale: the librocksdb.so on this
-  -- platform links snappy, lz4, zlib AND zstd (verified via `ldd librocksdb.so`
-  -- + `nm -D`).  Running uncompressed was the dominant cause of the AssumeUTXO
-  -- snapshot-import throughput collapse: the chainstate grew to ~45GB (≈4× Core's
-  -- ~11GB LevelDB chainstate for the same ~190M-coin set) and the resulting
-  -- write-amplification overwhelmed RocksDB's leveled compaction, eventually
-  -- backing L0 up to the stop-writes trigger so `rocksdb_write` stalled and the
-  -- loader rate collapsed to ~0 around the 45GB mark.
-  --
-  -- A bounded repro on UTXO-shaped data measured ~5.8× smaller SSTs with Snappy
-  -- (58.0 → 10.0 bytes/coin post-compaction; zstd reaches 6.9 but costs more
-  -- CPU).  On-disk SST size is a direct proxy for bytes-rewritten-per-compaction,
-  -- so this cuts compaction write volume by the same factor and relieves the
-  -- stall.  Compression is per-SST (codec recorded in the SST footer), so this
-  -- is backward-compatible: existing uncompressed SSTs stay readable; only new
-  -- writes/compactions use Snappy.  No consensus surface — the serialized bytes
-  -- handed to RocksDB are byte-identical; compression is fully transparent below
-  -- the get/put boundary.
-  --
-  -- Snappy chosen over lz4/zstd for the lowest CPU overhead (GB/s) so it cannot
-  -- reintroduce a CPU ceiling on the per-coin import loop that commit 72af3ce
-  -- just removed.
-  librocksdb.rocksdb_options_set_compression(options, 1)  -- 1 = Snappy
+  -- Every CF gets the same engine options; the blocks CF additionally stores
+  -- its values in blob files (see blocks_options below).  Built by a
+  -- function so the blocks CF can get its own options object.
+  local function new_base_options()
+    local options = librocksdb.rocksdb_options_create()
+    librocksdb.rocksdb_options_set_create_if_missing(options, 1)
+    librocksdb.rocksdb_options_set_create_missing_column_families(options, 1)
+    librocksdb.rocksdb_options_set_max_open_files(options, 1000)
+    librocksdb.rocksdb_options_set_write_buffer_size(options, 256 * 1024 * 1024)  -- 256MB
+    librocksdb.rocksdb_options_set_max_write_buffer_number(options, 4)
+    -- Snappy compression (RocksDB type 1).
+    --
+    -- The old comment "(LZ4 not linked)" was stale: the librocksdb.so on this
+    -- platform links snappy, lz4, zlib AND zstd (verified via `ldd librocksdb.so`
+    -- + `nm -D`).  Running uncompressed was the dominant cause of the AssumeUTXO
+    -- snapshot-import throughput collapse: the chainstate grew to ~45GB (≈4× Core's
+    -- ~11GB LevelDB chainstate for the same ~190M-coin set) and the resulting
+    -- write-amplification overwhelmed RocksDB's leveled compaction, eventually
+    -- backing L0 up to the stop-writes trigger so `rocksdb_write` stalled and the
+    -- loader rate collapsed to ~0 around the 45GB mark.
+    --
+    -- A bounded repro on UTXO-shaped data measured ~5.8× smaller SSTs with Snappy
+    -- (58.0 → 10.0 bytes/coin post-compaction; zstd reaches 6.9 but costs more
+    -- CPU).  On-disk SST size is a direct proxy for bytes-rewritten-per-compaction,
+    -- so this cuts compaction write volume by the same factor and relieves the
+    -- stall.  Compression is per-SST (codec recorded in the SST footer), so this
+    -- is backward-compatible: existing uncompressed SSTs stay readable; only new
+    -- writes/compactions use Snappy.  No consensus surface — the serialized bytes
+    -- handed to RocksDB are byte-identical; compression is fully transparent below
+    -- the get/put boundary.
+    --
+    -- Snappy chosen over lz4/zstd for the lowest CPU overhead (GB/s) so it cannot
+    -- reintroduce a CPU ceiling on the per-coin import loop that commit 72af3ce
+    -- just removed.
+    librocksdb.rocksdb_options_set_compression(options, 1)  -- 1 = Snappy
 
-  -- Leveled-compaction tuning for the bulk AssumeUTXO snapshot import.
-  --
-  -- Snappy (above) cut SST size ~4-6x, but the default LSM shape still drives
-  -- avoidable write-amplification during a ~190M-coin bulk load:
-  --
-  --  * max_bytes_for_level_base defaults to 256MB == write_buffer_size, so L1's
-  --    size target equals a SINGLE memtable. With L0 holding 256MB-worth of
-  --    files before compaction, that forces near-constant L0->L1 churn and a
-  --    deep level cascade. Raising the L1 target to 1GB lets each level hold
-  --    more before cascading, so a given coin is rewritten through fewer
-  --    levels (lower write-amp). (default multiplier 10 keeps the per-level
-  --    growth, so total levels for the final ~10-15GB set stay small.)
-  --
-  --  * level0_slowdown/stop default to 20/36 in modern RocksDB, but were the
-  --    historical 8/12 — we pin the higher values explicitly so a transient
-  --    compaction backlog during the import does NOT trip the stop-writes
-  --    trigger and stall rocksdb_write (the original ~45GB rate-collapse
-  --    symptom). 20/36 is RocksDB's own current default; we just make it
-  --    non-version-dependent.
-  --
-  --  * max_background_jobs raised to 6 so flushes + compactions run in
-  --    parallel on this 16C/32T box and keep up with the single writer thread,
-  --    instead of serializing behind it.
-  --
-  -- All of these are storage-engine knobs only: they change how SSTs are laid
-  -- out and compacted, never the bytes stored. No consensus surface.
-  librocksdb.rocksdb_options_set_max_bytes_for_level_base(options, 1024 * 1024 * 1024)  -- 1GB L1 target
-  librocksdb.rocksdb_options_set_level0_slowdown_writes_trigger(options, 20)
-  librocksdb.rocksdb_options_set_level0_stop_writes_trigger(options, 36)
-  librocksdb.rocksdb_options_set_max_background_jobs(options, 6)
+    -- Leveled-compaction tuning for the bulk AssumeUTXO snapshot import.
+    --
+    -- Snappy (above) cut SST size ~4-6x, but the default LSM shape still drives
+    -- avoidable write-amplification during a ~190M-coin bulk load:
+    --
+    --  * max_bytes_for_level_base defaults to 256MB == write_buffer_size, so L1's
+    --    size target equals a SINGLE memtable. With L0 holding 256MB-worth of
+    --    files before compaction, that forces near-constant L0->L1 churn and a
+    --    deep level cascade. Raising the L1 target to 1GB lets each level hold
+    --    more before cascading, so a given coin is rewritten through fewer
+    --    levels (lower write-amp). (default multiplier 10 keeps the per-level
+    --    growth, so total levels for the final ~10-15GB set stay small.)
+    --
+    --  * level0_slowdown/stop default to 20/36 in modern RocksDB, but were the
+    --    historical 8/12 — we pin the higher values explicitly so a transient
+    --    compaction backlog during the import does NOT trip the stop-writes
+    --    trigger and stall rocksdb_write (the original ~45GB rate-collapse
+    --    symptom). 20/36 is RocksDB's own current default; we just make it
+    --    non-version-dependent.
+    --
+    --  * max_background_jobs raised to 6 so flushes + compactions run in
+    --    parallel on this 16C/32T box and keep up with the single writer thread,
+    --    instead of serializing behind it.
+    --
+    -- All of these are storage-engine knobs only: they change how SSTs are laid
+    -- out and compacted, never the bytes stored. No consensus surface.
+    librocksdb.rocksdb_options_set_max_bytes_for_level_base(options, 1024 * 1024 * 1024)  -- 1GB L1 target
+    librocksdb.rocksdb_options_set_level0_slowdown_writes_trigger(options, 20)
+    librocksdb.rocksdb_options_set_level0_stop_writes_trigger(options, 36)
+    librocksdb.rocksdb_options_set_max_background_jobs(options, 6)
+    -- Atomic flush: see "Durability model" above.  Required for crash
+    -- consistency across column families once the WAL is off; harmless (and
+    -- still consistent) in legacy WAL mode.
+    librocksdb.rocksdb_options_set_atomic_flush(options, 1)
+    -- Incremental background writeback of SST/blob files as they are written
+    -- (sync_file_range every 1 MB, RocksDB tuning-guide default) instead of
+    -- leaving hundreds of MB dirty for one large fsync at file close.  Runs on
+    -- flush/compaction threads only.
+    librocksdb.rocksdb_options_set_bytes_per_sync(options, 1024 * 1024)
+    return options
+  end
+  local options = new_base_options()
+
+  -- Block bodies (CF.BLOCKS) are large (~1-2 MB), written once and never
+  -- modified.  In an LSM they were nevertheless rewritten by every compaction
+  -- they passed through: MEASURED on the 725000 range slice's RocksDB LOG,
+  -- the blocks CF had ingested 21.1 GB but compaction had written 118.6 GB
+  -- (and read 97.5 GB) -- ~75% of all chainstate write traffic.  Integrated
+  -- BlobDB stores each value >= min_blob_size in an append-only blob file at
+  -- flush time; the LSM then holds only the key -> blob-reference, so
+  -- compactions move ~50-byte references instead of megabyte bodies.  This is
+  -- Core's layout in spirit (bodies appended once to blk*.dat, the index in
+  -- a small KV store).  Reads are transparent (same Get / iterator API, same
+  -- bytes).  Blob GC stays off unless pruning (GC would rewrite live bodies);
+  -- with --prune it is on so deleted bodies are reclaimed.  Existing SST-
+  -- resident bodies stay readable; only new flushes produce blobs.
+  local blocks_options = new_base_options()
+  librocksdb.rocksdb_options_set_enable_blob_files(blocks_options, 1)
+  librocksdb.rocksdb_options_set_min_blob_size(blocks_options, 4096)
+  librocksdb.rocksdb_options_set_blob_file_size(blocks_options, 256 * 1024 * 1024)
+  librocksdb.rocksdb_options_set_blob_compression_type(blocks_options, 1)  -- Snappy
+  librocksdb.rocksdb_options_set_enable_blob_gc(blocks_options, open_opts.prune and 1 or 0)
+  local function cf_opts(cf_name)
+    if cf_name == M.CF.BLOCKS then return blocks_options end
+    return options
+  end
 
   -- Create LRU block cache
   local cache_size = cache_size_mb * 1024 * 1024
@@ -621,6 +739,7 @@ function M.open(path, cache_size_mb)
   librocksdb.rocksdb_block_based_options_set_filter_policy(
     table_options, librocksdb.rocksdb_filterpolicy_create_bloom_full(10))
   librocksdb.rocksdb_options_set_block_based_table_factory(options, table_options)
+  librocksdb.rocksdb_options_set_block_based_table_factory(blocks_options, table_options)
 
   -- Check if the database already exists by looking for CURRENT file
   local db_exists = false
@@ -642,7 +761,7 @@ function M.open(path, cache_size_mb)
     -- Create all other column families
     for _, cf_name in ipairs(CF_LIST) do
       if cf_name ~= M.CF.DEFAULT then
-        local handle = librocksdb.rocksdb_create_column_family(db, options, cf_name, errptr)
+        local handle = librocksdb.rocksdb_create_column_family(db, cf_opts(cf_name), cf_name, errptr)
         check_error(errptr)
         handles[cf_name] = handle
       end
@@ -693,7 +812,7 @@ function M.open(path, cache_size_mb)
 
     for i, cf_name in ipairs(cfs_to_open) do
       cf_names[i - 1] = cf_name
-      cf_options[i - 1] = options
+      cf_options[i - 1] = cf_opts(cf_name)
     end
 
     -- Open database with column families
@@ -711,7 +830,7 @@ function M.open(path, cache_size_mb)
     -- Create any missing column families
     for _, cf_name in ipairs(CF_LIST) do
       if not handles[cf_name] then
-        local handle = librocksdb.rocksdb_create_column_family(db, options, cf_name, errptr)
+        local handle = librocksdb.rocksdb_create_column_family(db, cf_opts(cf_name), cf_name, errptr)
         check_error(errptr)
         handles[cf_name] = handle
       end
@@ -722,7 +841,48 @@ function M.open(path, cache_size_mb)
   local read_opts = librocksdb.rocksdb_readoptions_create()
   local write_opts = librocksdb.rocksdb_writeoptions_create()
   local write_opts_sync = librocksdb.rocksdb_writeoptions_create()
-  librocksdb.rocksdb_writeoptions_set_sync(write_opts_sync, 1)
+  if wal_enabled then
+    librocksdb.rocksdb_writeoptions_set_sync(write_opts_sync, 1)
+  else
+    -- Memtable-only writes; sync=true callers get a blocking atomic flush
+    -- after the write instead (after_sync_write).  RocksDB rejects
+    -- sync=true together with disableWAL, so write_opts_sync is identical to
+    -- write_opts in this mode.
+    librocksdb.rocksdb_writeoptions_disable_WAL(write_opts, 1)
+    librocksdb.rocksdb_writeoptions_disable_WAL(write_opts_sync, 1)
+  end
+  local flush_opts_wait = librocksdb.rocksdb_flushoptions_create()
+  librocksdb.rocksdb_flushoptions_set_wait(flush_opts_wait, 1)
+  local flush_opts_nowait = librocksdb.rocksdb_flushoptions_create()
+  librocksdb.rocksdb_flushoptions_set_wait(flush_opts_nowait, 0)
+  -- The non-blocking checkpoint must also not wait for stall conditions.
+  -- With FlushOptions.allow_write_stall=false (the default) RocksDB's
+  -- Flush() first blocks the CALLER in WaitUntilFlushWouldNotStallWrites
+  -- until compaction has drained L0 / the immutable memtables -- even with
+  -- wait=false.  MEASURED 2026-09-28 (arm C2, 651100->652000): one periodic
+  -- checkpoint blocked the connect loop for 428 s ("[utxo]
+  -- WaitUntilFlushWouldNotStallWrites waiting on stall conditions to clear"
+  -- in the RocksDB LOG).  allow_write_stall=true schedules the flush at once;
+  -- any resulting backpressure is RocksDB's normal delayed-write rate, the
+  -- same as for an automatic memtable-full flush.  The C API has no setter,
+  -- so set the field directly (c.cc: struct rocksdb_flushoptions_t
+  -- { FlushOptions rep; }, FlushOptions = { bool wait; bool
+  -- allow_write_stall; }) -- but only after probing that byte 0 tracks
+  -- set_wait and byte 1 holds the documented default (false).  If the probe
+  -- fails the field is left alone and checkpoint() falls back to skipping
+  -- when a flush is already running (below).
+  local nowait_allows_stall = false
+  do
+    local b = ffi.cast("unsigned char*", flush_opts_nowait)
+    librocksdb.rocksdb_flushoptions_set_wait(flush_opts_nowait, 1)
+    local w1 = b[0]
+    librocksdb.rocksdb_flushoptions_set_wait(flush_opts_nowait, 0)
+    local w0 = b[0]
+    if w1 == 1 and w0 == 0 and b[1] == 0 then
+      b[1] = 1
+      nowait_allows_stall = true
+    end
+  end
 
   -- Build the database object
   local dbobj = {
@@ -737,9 +897,82 @@ function M.open(path, cache_size_mb)
     _read_opts = read_opts,
     _write_opts = write_opts,
     _write_opts_sync = write_opts_sync,
+    _flush_opts_wait = flush_opts_wait,
+    _flush_opts_nowait = flush_opts_nowait,
+    _nowait_allows_stall = nowait_allows_stall,
+    _blocks_options = blocks_options,
     _handles = handles,
+    -- true: legacy WAL durability; false: memtable-checkpoint model (default).
+    wal_enabled = wal_enabled,
+    -- Counters for instrumentation ([CB-PROF] / tests).
+    stats = { checkpoints = 0, durable_flushes = 0 },
     CF = M.CF,
   }
+
+  -- Atomic flush of every column family (one MANIFEST commit).  wait=true
+  -- blocks until the SSTs/blobs are durable; wait=false only schedules it.
+  local function flush_all(wait)
+    local n = 0
+    for _ in pairs(dbobj._handles) do n = n + 1 end
+    local arr = ffi.new("rocksdb_column_family_handle_t*[?]", n)
+    local i = 0
+    for _, h in pairs(dbobj._handles) do arr[i] = h; i = i + 1 end
+    librocksdb.rocksdb_flush_cfs(dbobj._db,
+      wait and dbobj._flush_opts_wait or dbobj._flush_opts_nowait, arr, n, errptr)
+    check_error(errptr)
+  end
+
+  -- Called after every write that asked for sync=true.  Legacy WAL mode: the
+  -- write itself was a synced WAL append, nothing to do.  Checkpoint mode:
+  -- make everything written so far durable before returning.
+  local function after_sync_write()
+    if not dbobj.wal_enabled then
+      flush_all(true)
+      dbobj.stats.durable_flushes = dbobj.stats.durable_flushes + 1
+    end
+  end
+
+  -- Periodic durability point for the IBD / block-connect loop (sync.lua).
+  -- Replaces the old "rewrite chain_tip with sync=true" WAL fdatasync.
+  --   checkpoint mode: request an atomic flush of all memtables; with
+  --     wait=false this returns immediately and the flush runs on a RocksDB
+  --     background thread -- the main thread never blocks on file IO.
+  --   legacy WAL mode: fdatasync the WAL (what the sync=true write did).
+  --   A non-blocking checkpoint is skipped (returns false) while a flush is
+  --   already running: that flush is itself making the state durable, and
+  --   stacking more small memtables behind it only adds L0 files.
+  function dbobj.checkpoint(wait)
+    if dbobj.wal_enabled then
+      librocksdb.rocksdb_flush_wal(dbobj._db, 1, errptr)
+      check_error(errptr)
+    else
+      if not wait then
+        local running = dbobj.property("rocksdb.num-running-flushes")
+        if running and running ~= "0" then
+          dbobj.stats.checkpoints_skipped = (dbobj.stats.checkpoints_skipped or 0) + 1
+          return false
+        end
+      end
+      flush_all(wait and true or false)
+    end
+    dbobj.stats.checkpoints = dbobj.stats.checkpoints + 1
+    return true
+  end
+
+  -- Explicit atomic flush of every memtable, regardless of mode (tests,
+  -- maintenance).  wait=true blocks until durable.
+  function dbobj.flush(wait)
+    flush_all(wait and true or false)
+  end
+
+  -- Integer DB property (e.g. "rocksdb.num-running-flushes"); nil if absent.
+  function dbobj.property(name)
+    local v = librocksdb.rocksdb_property_value(dbobj._db, name)
+    if v == nil then return nil end
+    local r = ffi.string(v)
+    librocksdb.rocksdb_free(v)
+    return r
+  end
 
   -- Get a value from a column family
   function dbobj.get(cf, key)
@@ -816,6 +1049,7 @@ function M.open(path, cache_size_mb)
       dbobj._db, opts, handle, key, #key, value, #value, errptr
     )
     check_error(errptr)
+    if sync then after_sync_write() end
   end
 
   -- Delete a key from a column family
@@ -827,6 +1061,7 @@ function M.open(path, cache_size_mb)
     local opts = sync and dbobj._write_opts_sync or dbobj._write_opts
     librocksdb.rocksdb_delete_cf(dbobj._db, opts, handle, key, #key, errptr)
     check_error(errptr)
+    if sync then after_sync_write() end
   end
 
   -- Create a write batch
@@ -854,6 +1089,7 @@ function M.open(path, cache_size_mb)
       local opts = sync and dbobj._write_opts_sync or dbobj._write_opts
       librocksdb.rocksdb_write(dbobj._db, opts, batch._wb, errptr)
       check_error(errptr)
+      if sync then after_sync_write() end
     end
 
     function batch.clear()
@@ -935,6 +1171,15 @@ function M.open(path, cache_size_mb)
 
   -- Close the database
   function dbobj.close()
+    -- Checkpoint mode: memtables hold everything since the last flush; make
+    -- it durable before closing (RocksDB would also flush unpersisted data on
+    -- close, but do it explicitly and surface errors).
+    if not dbobj.wal_enabled and dbobj._db ~= nil then
+      local ok, err = pcall(flush_all, true)
+      if not ok then
+        io.stderr:write("storage.close: final flush failed: " .. tostring(err) .. "\n")
+      end
+    end
     -- Destroy column family handles
     for _, handle in pairs(dbobj._handles) do
       librocksdb.rocksdb_column_family_handle_destroy(handle)
@@ -945,6 +1190,8 @@ function M.open(path, cache_size_mb)
     librocksdb.rocksdb_readoptions_destroy(dbobj._read_opts)
     librocksdb.rocksdb_writeoptions_destroy(dbobj._write_opts)
     librocksdb.rocksdb_writeoptions_destroy(dbobj._write_opts_sync)
+    librocksdb.rocksdb_flushoptions_destroy(dbobj._flush_opts_wait)
+    librocksdb.rocksdb_flushoptions_destroy(dbobj._flush_opts_nowait)
 
     -- Destroy table options and cache
     librocksdb.rocksdb_block_based_options_destroy(dbobj._table_options)
@@ -952,6 +1199,7 @@ function M.open(path, cache_size_mb)
 
     -- Destroy main options
     librocksdb.rocksdb_options_destroy(dbobj._options)
+    librocksdb.rocksdb_options_destroy(dbobj._blocks_options)
 
     -- Close the database
     librocksdb.rocksdb_close(dbobj._db)

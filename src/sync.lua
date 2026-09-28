@@ -2520,6 +2520,19 @@ function M.new_block_downloader(header_chain, storage, network, opts)
   -- last sync, so a slow IBD stretch can't extend the loss window.
   self.utxo_flush_interval = 200
   self.utxo_flush_max_seconds = 60
+  -- Checkpoint durability model (storage.lua "Durability model"; the
+  -- default): per-block batches live in the memtables and the durable
+  -- commit is an atomic flush of every column family.  RocksDB already
+  -- flushes whenever a 256 MB memtable fills (~150-200 blocks at 2020s
+  -- sizes); this periodic checkpoint only bounds the redo after a crash
+  -- when blocks are small or slow.  It is non-blocking (flush runs on a
+  -- RocksDB thread), so the cadence can be Core-like rather than the
+  -- 60 s WAL fdatasync the legacy mode needs.  Legacy WAL mode keeps the
+  -- 200-block / 60 s cadence above.
+  if storage and storage.checkpoint and storage.wal_enabled == false then
+    self.utxo_flush_interval = 1000
+    self.utxo_flush_max_seconds = 300
+  end
   self.last_flush_height = 0
   self.last_flush_time = 0
   self.peer_round_robin = 1         -- Persistent round-robin index across schedule_downloads calls
@@ -4138,10 +4151,24 @@ function BlockDownloader:_connect_pending_blocks_inner()
       local time_trigger = _now - self.last_flush_time >= self.utxo_flush_max_seconds
       if block_trigger or time_trigger then
         local _fp0 = perf.now()
-        self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
+        local done = true
+        if self.storage.checkpoint then
+          -- chain_tip is already in the atomic per-block batch; make it (and
+          -- everything before it) durable.  Checkpoint mode: schedule an
+          -- atomic memtable flush (non-blocking).  Legacy WAL mode:
+          -- fdatasync the WAL, exactly what the sync chain_tip rewrite did.
+          -- checkpoint() returns false when it skipped because a flush is
+          -- still running; keep the trigger armed so the next block retries
+          -- as soon as that flush has finished.
+          done = self.storage.checkpoint(false) ~= false
+        else
+          self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
+        end
         _flush_t = perf.now() - _fp0
-        self.last_flush_height = self.next_connect_height
-        self.last_flush_time = _now
+        if done then
+          self.last_flush_height = self.next_connect_height
+          self.last_flush_time = _now
+        end
       end
     end
 

@@ -1547,6 +1547,7 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
   end
   local writes = 0
   local deletes = 0
+  local _pf0 = PROF_ON and perf.now()
 
   for key, _ in pairs(self.dirty_list) do
     local entry = self.cache[key]
@@ -1598,8 +1599,16 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
   -- Execute batch — UNLESS we're in Pattern D deferred mode, where the
   -- caller (accept_side_branch_block) commits the shared batch once at
   -- the end of the multi-block reorg.
+  local _pf1 = _pf0 and perf.now()
   if not reorg_batch then
     batch.write(sync or false)
+  end
+  if _pf0 then
+    -- [CB-PROF] split of the per-block flush: Lua side (dirty-set walk,
+    -- serialization, batch building incl. caller extras) vs the RocksDB
+    -- write call itself (WAL append / memtable insert).
+    prof_add("flush_lua", _pf1 - _pf0, writes + deletes)
+    prof_add("flush_dbwrite", perf.now() - _pf1)
   end
 
   -- Update stats
