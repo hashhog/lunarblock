@@ -2327,6 +2327,108 @@ local function verify_base_tail_headers(raw_list, base_height, base_blockhash,
   return { start_height = start_height, anchor = anchor }
 end
 
+--- Merge a campaign entry that CONFIRMS an existing assumeutxo row (identical
+-- height/blockhash/hash_serialized/m_chain_tx_count -- checked by the caller)
+-- into that row.
+--
+-- The commitment fields are never touched.  Supplemental fields the campaign
+-- entry carries (header, chain_work, base_mtp, base_tail_headers,
+-- pre_base_ancestors) fill ONLY gaps in the existing row; a value that
+-- differs from one the row already pins is a contradiction and refuses.  All
+-- checks run before the first write, so a refused merge leaves the row as it
+-- was.  A supplied base_header must also hash to the row's blockhash: it is
+-- about to make a production row injectable, so it is not taken on faith.
+--
+-- @param existing table: the existing assumeutxo row (mutated on success)
+-- @param entry table: the parsed campaign entry (same shape as a row)
+-- @param base_header_hex string|nil: the fixture's raw base_header hex
+-- @return table|nil, string|nil: list of filled field names, or nil + reason
+local function merge_campaign_confirmation(existing, entry, base_header_hex)
+  local function lower(v)
+    if type(v) == "string" then return v:lower() end
+    return v
+  end
+
+  if base_header_hex then
+    local crypto_mod = require("lunarblock.crypto")
+    local types_mod  = require("lunarblock.types")
+    local raw = base_header_hex:gsub("%x%x",
+      function(byte_hex) return string.char(tonumber(byte_hex, 16)) end)
+    local got = types_mod.hash256_hex(crypto_mod.hash256_type(raw))
+    if got:lower() ~= existing.blockhash:lower() then
+      return nil, string.format(
+        "its base_header hashes to %s, not the entry blockhash %s",
+        got, existing.blockhash)
+    end
+  end
+
+  if entry.header and existing.header then
+    for _, k in ipairs({ "version", "prev_hash", "merkle_root",
+                         "timestamp", "bits", "nonce" }) do
+      if lower(existing.header[k]) ~= lower(entry.header[k]) then
+        return nil, string.format(
+          "its base_header contradicts the existing row's header (field %s)", k)
+      end
+    end
+  end
+  if entry.chain_work and existing.chain_work
+     and lower(existing.chain_work) ~= lower(entry.chain_work) then
+    return nil, string.format(
+      "its chainwork %s contradicts the existing row's chain_work %s",
+      entry.chain_work, existing.chain_work)
+  end
+  if entry.base_mtp and existing.base_mtp
+     and existing.base_mtp ~= entry.base_mtp then
+    return nil, string.format(
+      "its base_mtp %s contradicts the existing row's base_mtp %s",
+      tostring(entry.base_mtp), tostring(existing.base_mtp))
+  end
+  if entry.base_tail_headers and existing.base_tail_headers then
+    local a, b = existing.base_tail_headers, entry.base_tail_headers
+    if #a ~= #b then
+      return nil, "its base_tail_headers contradict the existing row's band (length)"
+    end
+    for idx = 1, #a do
+      if lower(a[idx]) ~= lower(b[idx]) then
+        return nil, string.format(
+          "its base_tail_headers contradict the existing row's band (element %d)", idx)
+      end
+    end
+  end
+  if entry.pre_base_ancestors and existing.pre_base_ancestors then
+    for h, a in pairs(entry.pre_base_ancestors) do
+      local pinned = existing.pre_base_ancestors[h]
+      if pinned and (lower(pinned.blockhash) ~= lower(a.blockhash)
+                     or pinned.timestamp ~= a.timestamp
+                     or pinned.bits ~= a.bits) then
+        return nil, string.format(
+          "its pre-base ancestor at height %d (%s) contradicts the existing "
+          .. "row's pinned ancestor (%s)", h, tostring(a.blockhash),
+          tostring(pinned.blockhash))
+      end
+    end
+  end
+
+  -- No contradiction anywhere: fill the gaps.
+  local filled = {}
+  for _, k in ipairs({ "header", "chain_work", "base_mtp", "base_tail_headers" }) do
+    if entry[k] ~= nil and existing[k] == nil then
+      existing[k] = entry[k]
+      filled[#filled + 1] = k
+    end
+  end
+  if entry.pre_base_ancestors then
+    existing.pre_base_ancestors = existing.pre_base_ancestors or {}
+    for h, a in pairs(entry.pre_base_ancestors) do
+      if existing.pre_base_ancestors[h] == nil then
+        existing.pre_base_ancestors[h] = a
+        filled[#filled + 1] = "pre_base_ancestors[" .. tostring(h) .. "]"
+      end
+    end
+  end
+  return filled
+end
+
 --- Load campaign-only assumeutxo entries from HASHHOG_CAMPAIGN_ASSUMEUTXO and
 -- append them to `network`'s assumeutxo allowlist. Read ONCE at startup, after
 -- network-params selection (see main.lua's main()). Unset or empty ⇒ this
@@ -2347,10 +2449,14 @@ end
 -- byte-order conversion here; campaign hex is stored as-is.
 --
 -- Refuses (returns nil, error) on: missing/unreadable file, invalid JSON, a
--- malformed entry (bad hex length/height), or a collision with an existing
--- entry (same height or same blockhash already present, built-in or
--- previously loaded from the same file) -- campaign data may never override
--- a whitelisted production hash.
+-- malformed entry (bad hex length/height), a duplicate within the file, or a
+-- collision with an existing entry (same height or same blockhash already
+-- present) -- campaign data may never override a whitelisted production hash.
+-- The one exception is an entry whose commitment (height, blockhash,
+-- hash_serialized, m_chain_tx_count) is IDENTICAL to the existing row: that
+-- is a confirmation, accepted without touching the commitment, and its
+-- verified ancestry fills gaps in the row (merge_campaign_confirmation; any
+-- contradiction with a value the row already pins still refuses).
 --
 -- @param network table: the network config to append into (the RUNNING
 --                        network's table, already selected by the caller).
@@ -2382,6 +2488,8 @@ function M.load_campaign_assumeutxo(network)
   if not network.assumeutxo then network.assumeutxo = {} end
 
   local loaded_heights = {}
+  local confirmed_heights = {}
+  local file_seen = {}
   for i, e in ipairs(entries) do
     if type(e) ~= "table" then
       return nil, string.format(
@@ -2408,17 +2516,56 @@ function M.load_campaign_assumeutxo(network)
         i, height)
     end
 
-    -- Refuse on collision: campaign data may never override a production
-    -- hash. Checks both height (direct key collision) and blockhash (in case
-    -- the campaign fixture disagrees with a built-in entry at a DIFFERENT
-    -- height -- e.g. a stale/wrong fixture).
-    if network.assumeutxo[height] then
-      return nil, string.format(
-        "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d collides with existing height %d "
-        .. "-- refusing to start", i, height)
+    -- Refuse a duplicate inside the campaign file itself (by height OR
+    -- blockhash), before any comparison with the existing table.
+    local bh_lower = e.blockhash:lower()
+    for _, prev in ipairs(file_seen) do
+      if prev.height == height or prev.blockhash == bh_lower then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) duplicates an "
+          .. "earlier entry in the same campaign file -- refusing to start",
+          i, height)
+      end
+    end
+    file_seen[#file_seen + 1] = { height = height, blockhash = bh_lower }
+
+    -- Collision with an existing (built-in) entry: campaign data may never
+    -- override a production hash. Checks both height (direct key collision)
+    -- and blockhash (in case the campaign fixture disagrees with a built-in
+    -- entry at a DIFFERENT height -- e.g. a stale/wrong fixture).
+    --
+    -- The ONE non-refusal: an entry whose whole commitment -- height,
+    -- blockhash, hash_serialized AND m_chain_tx_count -- is IDENTICAL to the
+    -- built-in row is not an override but a second source agreeing with the
+    -- first (Core: an m_assumeutxo_data row is keyed by height+blockhash and
+    -- the snapshot is checked against its hash_serialized; a byte-identical
+    -- row adds no new trust). R4's rung at 910,000 was minted by dumping a
+    -- Core clone there and came out equal to Core's own hardcoded anchor;
+    -- refusing it BLOCKED the slice with the best provenance of any rung.
+    -- Such an entry is a `confirms` of the existing row: the commitment is
+    -- kept from the built-in, and only supplemental ancestry the built-in row
+    -- lacks is filled in (see merge below) -- anything that contradicts a
+    -- value the row already pins is still refused.
+    local confirms = nil
+    local existing_at_height = network.assumeutxo[height]
+    if existing_at_height then
+      local identical =
+        type(existing_at_height.blockhash) == "string"
+        and existing_at_height.blockhash:lower() == bh_lower
+        and type(existing_at_height.hash_serialized) == "string"
+        and existing_at_height.hash_serialized:lower() == e.hash_serialized:lower()
+        and existing_at_height.m_chain_tx_count == e.m_chain_tx_count
+      if not identical then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d collides with existing height %d "
+          .. "(blockhash/hash_serialized/m_chain_tx_count differ from the existing "
+          .. "entry) -- refusing to start", i, height)
+      end
+      confirms = existing_at_height
     end
     for existing_height, existing in pairs(network.assumeutxo) do
-      if existing.blockhash == e.blockhash then
+      if existing_height ~= height and type(existing.blockhash) == "string"
+         and existing.blockhash:lower() == bh_lower then
         return nil, string.format(
           "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d blockhash %s collides with "
           .. "existing height %d -- refusing to start",
@@ -2585,16 +2732,37 @@ function M.load_campaign_assumeutxo(network)
     end
     if ancestors then entry.pre_base_ancestors = ancestors end
 
-    network.assumeutxo[height] = entry
+    if confirms then
+      local filled, merr = merge_campaign_confirmation(confirms, entry, e.base_header)
+      if not filled then
+        return nil, string.format(
+          "HASHHOG_CAMPAIGN_ASSUMEUTXO: entry %d (height %d) matches the existing "
+          .. "commitment but %s -- refusing to start", i, height, merr)
+      end
+      io.stdout:write(string.format(
+        "[CAMPAIGN-ASSUMEUTXO] entry height %d is IDENTICAL to the existing "
+        .. "assumeutxo commitment (blockhash, hash_serialized, m_chain_tx_count) "
+        .. "-- accepted as a confirmation; commitment kept, filled: [%s]\n",
+        height, table.concat(filled, ",")))
+      io.stdout:flush()
+      confirmed_heights[#confirmed_heights + 1] = height
+    else
+      network.assumeutxo[height] = entry
+    end
     loaded_heights[#loaded_heights + 1] = height
   end
 
   table.sort(loaded_heights)
   local height_strs = {}
   for i, h in ipairs(loaded_heights) do height_strs[i] = tostring(h) end
+  table.sort(confirmed_heights)
+  local confirmed_strs = {}
+  for i, h in ipairs(confirmed_heights) do confirmed_strs[i] = tostring(h) end
   io.stdout:write(string.format(
-    "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=[%s]\n",
-    #loaded_heights, path, table.concat(height_strs, ",")))
+    "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=[%s] "
+    .. "(confirming existing: [%s])\n",
+    #loaded_heights, path, table.concat(height_strs, ","),
+    table.concat(confirmed_strs, ",")))
   io.stdout:flush()
 
   return #loaded_heights
