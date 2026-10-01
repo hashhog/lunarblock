@@ -12471,7 +12471,7 @@ end
         local result, sb_err = rpc.chain_state:accept_side_branch_block(
           block, block_hash,
           { skip_scripts = false, nosync = false, mempool = rpc.mempool,
-            check_diffbits = true }
+            check_diffbits = true, check_block = true }
         )
         if result == "connected" then
           -- Reorg succeeded; B3 is now the active tip.  Sync the
@@ -12503,6 +12503,10 @@ end
           -- bad-version — the gates Core runs in AcceptBlockHeader) and the
           -- connect failures indicate an invalid candidate and must surface the
           -- canonical BIP22 reject reason instead of "inconclusive".
+          if sb_err and sb_err:find("^check%-block: ") then
+            -- CheckBlock / ContextualCheckBlock at the real height failed.
+            return bip22_result(sb_err:sub(#"check-block: " + 1))
+          end
           if sb_err and (sb_err:find("^reorg%-connect%-failed")
                          or sb_err:find("^bad%-diffbits")
                          or sb_err:find("^time%-too%-old")

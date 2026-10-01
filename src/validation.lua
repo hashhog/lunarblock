@@ -2123,10 +2123,21 @@ function M.check_block(block, network, height, check_pow)
   -- not incorrectly rejected for lacking a witness commitment.
   -- Core: ContextualCheckBlock calls CheckWitnessMalleation with
   --   DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT).
-  local segwit_active = height ~= nil and network.segwit_height ~= nil and
-                        height >= network.segwit_height
-  local wit_ok, wit_err = M.check_witness_malleation(block, segwit_active)
-  assert(wit_ok, wit_err or "witness commitment mismatch")
+  --
+  -- CheckWitnessMalleation is CONTEXTUAL (it needs the block's height to know
+  -- whether segwit is active), so a nil-height (context-free) call skips it,
+  -- exactly like the BIP34 arm below.  It used to run with segwit_active=false
+  -- for nil height, which turned every witness-carrying block into
+  -- "unexpected-witness": the submitblock side-branch pre-check (rpc.lua) passes
+  -- nil, so lunarblock rejected VALID side-branch blocks (2026-10-01 reorg probe:
+  -- 176B unexpected-witness).  The side-branch path re-runs check_block at the
+  -- real height (accept_side_branch_block Stage 2b).
+  if height ~= nil then
+    local segwit_active = network.segwit_height ~= nil and
+                          height >= network.segwit_height
+    local wit_ok, wit_err = M.check_witness_malleation(block, segwit_active)
+    assert(wit_ok, wit_err or "witness commitment mismatch")
+  end
 
   -- BIP34: coinbase scriptSig must start with the byte-exact canonical
   -- encoding of the block height.

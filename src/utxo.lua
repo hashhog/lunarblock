@@ -4272,6 +4272,21 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     end
   end
 
+  -- (f) CheckBlock + ContextualCheckBlock at the REAL height (Core AcceptBlock
+  -- runs both for every block, side branch included, with pindexPrev = the
+  -- block's own parent).  The rpc.lua submitblock pre-check runs check_block
+  -- with a nil height, which is context-free: it skips BIP34 bad-cb-height and
+  -- the BIP141 witness-commitment / unexpected-witness check, so the submitblock
+  -- arm sets opts.check_block and they run here.  (The P2P arm, main.lua
+  -- side_branch_callback, already ran check_block at the fork height.)
+  if opts.check_block then
+    local ok_cb, cb_err = pcall(validation.check_block, block, self.network,
+                                side_chain[1].height)
+    if not ok_cb then
+      return nil, "check-block: " .. tostring(cb_err)
+    end
+  end
+
   -- ── Stage 3: guard — reject side branches that descend from an
   -- invalidated block.  Core's FindMostWorkChain (validation.cpp:3139-3164)
   -- skips any candidate whose ancestor chain contains BLOCK_FAILED_VALID.
@@ -4489,13 +4504,35 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
       batch.put(storage_mod.CF.HEIGHT_INDEX, height_key, sb_hash.bytes)
     end
 
-    -- prev_block_mtp / get_block_mtp = nil → skip BIP-68 sequence-lock
-    -- enforcement on the reconnect path (the original-acceptance path
-    -- already validated these for B1/B2/B3, and CSV is not active in
-    -- the regtest reorg corpus).  This matches reapply_disconnected.
+    -- ConnectBlock of a side-branch block needs the MTP of ITS OWN ancestors:
+    -- the parent's MTP is the BIP-113 IsFinalTx cutoff, and BIP-68 time-based
+    -- sequence locks need the MTP of the block before each input's coin
+    -- (Core validation.cpp ContextualCheckBlock + SequenceLocks, both keyed
+    -- off pindex->pprev).  These were passed as nil ("the original-acceptance
+    -- path already validated these"), but a side-branch block is never
+    -- connected before the reorg: nil degraded the cutoff to the block's own
+    -- nTime and skipped time-based BIP-68 entirely — a false-ACCEPT on the
+    -- attacker-steerable reorg path.  Heights <= common_height resolve on the
+    -- active chain map; above it, on the side chain (the height index for
+    -- those heights is only rewritten inside the uncommitted reorg batch).
+    local branch_hash_at = function(hh)
+      if hh <= common_height then return active_height_to_hash[hh] end
+      local idx = side_len - (hh - common_height) + 1
+      local e = side_chain[idx]
+      return e and e.hash or nil
+    end
+    local sb_prev_mtp = compute_mtp_from_storage(self.storage, sb_block.header.prev_hash)
+    local sb_get_block_mtp = function(hh)
+      local hh_hash = branch_hash_at(hh)
+      if not hh_hash then
+        hh_hash = self.storage.get_hash_by_height and self.storage.get_hash_by_height(hh)
+      end
+      if not hh_hash then return 0 end
+      return compute_mtp_from_storage(self.storage, hh_hash)
+    end
     local ok_conn, err_conn = self:connect_block(
       sb_block, entry.height, entry.hash,
-      nil, nil,
+      sb_prev_mtp, sb_get_block_mtp,
       opts.skip_scripts, false,
       opts.nosync, store_batch_fn,
       reorg_batch
