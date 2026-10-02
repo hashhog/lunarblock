@@ -8139,6 +8139,14 @@ end
                          " is not of expected type number"})
       end
     end
+    -- Core rpc/server.cpp stop -> StartShutdown(): the process exits via
+    -- the SIGTERM path.  Before gate 5 this only answered, so the node kept
+    -- running (crash-restart-harness: rpc-stop-ignored).  raise_signal sets
+    -- the SIGTERM pending flag; the main loop's next poll_signals() runs the
+    -- same handler `kill -TERM` does (running=false -> cleanup).  The reply
+    -- is written first: the RPC server is serviced synchronously inside the
+    -- main loop tick, before the next poll.
+    require("lunarblock.ops").raise_signal(15)  -- SIGTERM
     return "LunarBlock stopping"
   end
 

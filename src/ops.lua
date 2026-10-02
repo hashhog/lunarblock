@@ -457,6 +457,7 @@ end
 local _signal_flags = {}
 local _signal_callbacks = {}
 local _signal_handlers = {}  -- Keep ffi.cast'd handlers alive for GC.
+local _raised = {}           -- In-process raises (M.raise_signal), pending.
 
 local function _install(signum)
   if _signal_flags[signum] then return end  -- idempotent
@@ -476,13 +477,28 @@ function M.set_signal_handler(signum, fn)
   _signal_callbacks[signum] = fn
 end
 
+--- Raise a signal in-process, through the same path a delivered signal takes.
+-- Marks the signal pending exactly as the C-level handler does; the next
+-- poll_signals() runs the SAME Lua callback an external `kill -<signum>`
+-- would.  No kill(getpid()): that would put a LuaJIT FFI callback in signal
+-- context, and with no handler installed yet the default disposition would
+-- terminate the process without the graceful path.  A raise that lands
+-- before set_signal_handler stays pending until a callback exists.  Used by
+-- RPC `stop` (gate 5): Core's stop -> StartShutdown(), the process exits via
+-- the SIGTERM path.
+-- @param signum number
+function M.raise_signal(signum)
+  _raised[signum] = true
+end
+
 --- Drain pending signals and invoke their Lua callbacks.
 -- Call this once per main-loop tick.  Cheap (just int compares) when no
 -- signals are pending.
 function M.poll_signals()
   for signum, flag in pairs(_signal_flags) do
-    if flag[0] ~= 0 then
+    if flag[0] ~= 0 or (_raised[signum] and _signal_callbacks[signum]) then
       flag[0] = 0
+      _raised[signum] = nil
       local cb = _signal_callbacks[signum]
       if cb then
         local ok, err = pcall(cb)
@@ -505,6 +521,7 @@ function M.reset_signal_handlers()
   _signal_flags = {}
   _signal_callbacks = {}
   _signal_handlers = {}
+  _raised = {}
 end
 
 --------------------------------------------------------------------------------

@@ -595,6 +595,34 @@ describe("rpc", function()
       assert.is_string(decoded.result)
       assert.truthy(decoded.result:match("stopping"))
     end)
+
+    -- Gate 5: stop must actually request shutdown through the SIGTERM path
+    -- (Core: stop -> StartShutdown()).  Install a SIGTERM handler exactly
+    -- like main.lua does, call stop, poll: the handler must fire.  A wrongly
+    -- typed `wait` must NOT request shutdown.
+    it("requests shutdown via the SIGTERM handler (gate 5)", function()
+      local ops = require("lunarblock.ops")
+      ops.reset_signal_handlers()  -- drop raises left by earlier stop tests
+      local fired = false
+      ops.set_signal_handler(ops.SIGTERM, function() fired = true end)
+      local ok, err = pcall(function()
+        local server = rpc.new({network = consensus.networks.mainnet})
+        local bad = cjson.decode((server:handle_request(
+          '{"method":"stop","params":["x"],"id":1}')))
+        assert.is_not_nil(bad.error)
+        assert.equal(-3, bad.error.code)
+        ops.poll_signals()
+        assert.is_false(fired)
+
+        local good = cjson.decode((server:handle_request(
+          '{"method":"stop","params":[],"id":2}')))
+        assert.truthy(good.result:match("stopping"))
+        ops.poll_signals()
+        assert.is_true(fired)
+      end)
+      ops.reset_signal_handlers()
+      assert(ok, err)
+    end)
   end)
 
   describe("addnode", function()
