@@ -14113,6 +14113,19 @@ function RPCServer:setup_w47b_methods()
       pcall(pump)
       rpc._in_utxo_walk_pump = false
     end
+    -- Core flushes the chainstate before it walks it
+    -- (rpc/blockchain.cpp gettxoutsetinfo: ForceFlushStateToDisk). Here:
+    -- push the coin cache into RocksDB and schedule the atomic memtable
+    -- flush. Non-blocking, so the main loop does not stall on file IO; the
+    -- flush lands while the walk runs. Without it a SIGKILL after
+    -- gettxoutsetinfo lost every block since the last periodic checkpoint
+    -- (crash-restart harness, flush_hint iterations), where Core loses none.
+    if rpc.chain_state.coin_view and rpc.chain_state.coin_view.flush then
+      rpc.chain_state.coin_view:flush()
+    end
+    if rpc.storage and rpc.storage.checkpoint then
+      pcall(rpc.storage.checkpoint, false)
+    end
     rpc._utxo_walk_active = true
     local ok_stats, stats = pcall(rpc.chain_state.compute_utxo_stats,
                                  rpc.chain_state, hash_type, {
