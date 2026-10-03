@@ -1589,6 +1589,10 @@ function HeaderChain:process_prebase_batch(peer, headers)
       return accepted, nil
     end
     self.prebase_gap = nil
+    -- Release a forward-sync latch parked on a missing-ancestor-header reply
+    -- (main.lua headers handler) so the tick re-arms getheaders now that every
+    -- parent MTP window above the base is complete.
+    self:stop_sync()
     io.stdout:write(string.format(
       "[prebase-backfill] linked genesis..%d to the snapshot band; chainwork "
       .. "re-derived and matches; block connection released\n", gap.root_height - 1))

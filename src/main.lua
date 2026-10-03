@@ -2043,7 +2043,19 @@ local function main()
     local accepted, err = header_chain:handle_headers(peer, payload)
     if err then
       print("Invalid headers from " .. peer.ip .. ": " .. err)
-      if headers_err_is_banworthy(err) then
+      if header_chain.prebase_gap
+         and string.find(err, "missing-ancestor-header", 1, true) then
+        -- OUR gap, not the peer's fault: a header within 10 above the snapshot
+        -- base needs a parent MTP window that lies below the band, and the
+        -- pre-base backfill has not linked yet.  Keep the peer -- it is also
+        -- the backfill source -- and keep the forward-sync latch on it, so
+        -- the tick re-arm does not spin getheaders every loop.  Dropping it
+        -- here made a band-less snapshot boot loop forever: every peer was
+        -- disconnected right after its first headers reply, before the
+        -- backfill could finish (regtest repro 2026-10-03).
+        -- process_prebase_batch releases the latch once the backfill links,
+        -- and forward sync re-arms with complete windows.
+      elseif headers_err_is_banworthy(err) then
         -- genuine consensus-invalid header -> ban (Core Misbehaving)
         peer_manager:add_ban_score(peer, 100, err)
       else
