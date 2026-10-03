@@ -1524,6 +1524,22 @@ local function main()
     return chain_state.tip_hash, chain_state.tip_height
   end
 
+  -- Consensus-invalid blocks (Core BLOCK_FAILED_VALID / FAILED_CHILD).  The
+  -- downloader marks them in the header chain on a P2P verdict; persist the
+  -- marks in ChainState.invalid_blocks (the set invalidateblock /
+  -- reconsiderblock / has_invalid_ancestor already use) so a restart never
+  -- re-fetches them, and seed the header chain from that set at boot.
+  block_downloader.invalid_block_callback = function(hashes)
+    for _, h in ipairs(hashes) do
+      chain_state.invalid_blocks[h.bytes] = true
+    end
+    chain_state:save_invalid_blocks()
+  end
+  for hash_bytes in pairs(chain_state.invalid_blocks or {}) do
+    header_chain.failed[types.hash256_hex(types.hash256(hash_bytes))] = true
+  end
+  header_chain:recalculate_best_header()
+
   -- Build assumevalid callbacks once; they close over header_chain which is
   -- updated in-place as new headers arrive, so the lookup is always current.
   local av_in_index, av_is_ancestor, av_on_best_chain =
@@ -2030,6 +2046,7 @@ local function main()
     "time-timewarp",
     "bad-diffbits",
     "bad-version",
+    "bad-prevblk",            -- builds on a failed block (Core BLOCK_INVALID_PREV)
   }
   local function headers_err_is_banworthy(err)
     for _, s in ipairs(HEADERS_BAN_SUBSTRINGS) do

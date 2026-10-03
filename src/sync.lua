@@ -87,6 +87,15 @@ function M.classify_callback_error(err)
     "[Bb][Ii][Pp]34",
     "bad%-txns",
     "bad%-blk",
+    -- Core ConnectBlock coinbase tokens (bad-cb-amount, bad-cb-length, ...).
+    -- bad-cb-amount used to fall through to "unknown", so the bounded-retry
+    -- banner and the invalid-block verdict both missed it.
+    "bad%-cb%-",
+    "script%-verify%-flag",
+    -- BIP68 sequence-lock failure (Core: bad-txns-nonfinal).  The assert
+    -- text carries no reject token, so it classified "unknown".  The
+    -- cannot-decide case is missing-ancestor-header, filed "local" above.
+    "sequence locks not satisfied",
     "non%-final",
     "bad sigops",
   }
@@ -150,6 +159,48 @@ function M.should_punish_peer_for_block_error(err)
   if M.classify_callback_error(err) == "local" then return false end
   return true
 end
+
+-- Errors that are a consensus failure but NOT a verdict on the block hash.
+-- Core InvalidBlockFound (validation.cpp) skips BLOCK_FAILED_VALID for
+-- BLOCK_MUTATED: a malleated body (bad merkle root, witness malleation,
+-- duplicate-tx mutation) says nothing about the block the header commits to,
+-- and an honest peer can still serve it.  "missing utxo" is excluded because
+-- on this node it has also been a symptom of LOCAL chainstate loss (the
+-- 2026-04-28 wedge); marking on it would persist a verdict against a valid
+-- block that --reindex-chainstate could not undo.
+local NON_VERDICT_PATTERNS = {
+  "merkle root mismatch",
+  "bad%-txnmrklroot",
+  "witness commitment mismatch",
+  "bad%-witness%-merkle",
+  "bad%-witness%-nonce",
+  "unexpected%-witness",
+  "bad%-txns%-duplicate",
+  "missing utxo",
+}
+
+--- Is `err` a consensus VERDICT on the block (Core: BlockValidationState
+--- invalid with a result other than BLOCK_MUTATED, from ConnectBlock /
+--- CheckBlock / ContextualCheckBlock)?  Only a verdict may mark the block
+--- failed (Chainstate::InvalidBlockFound).  Everything else -- our own missing
+--- data (missing-ancestor-header), local I/O, chainstate integrity, a parent
+--- that is not connected, an unclassified error -- is "cannot decide": no mark,
+--- retry later.
+function M.is_invalid_block_verdict(err)
+  if err == nil then return false end
+  if M.classify_callback_error(err) ~= "consensus" then return false end
+  local s = tostring(err):lower()
+  for _, pat in ipairs(NON_VERDICT_PATTERNS) do
+    if s:find(pat) then return false end
+  end
+  return true
+end
+
+-- Seconds a block whose connect failed WITHOUT a verdict is kept out of the
+-- normal download walk.  Without this the walk re-requested it on the very
+-- next scheduler tick (thousands of getdata a minute).  The W46 cursor path
+-- re-requests it after its own 30 s rate limit.
+M.NON_VERDICT_RETRY_BACKOFF = 10
 
 --------------------------------------------------------------------------------
 -- HeadersSyncState: Anti-DoS header synchronization (PRESYNC/REDOWNLOAD)
@@ -680,7 +731,107 @@ function M.new_header_chain(network, storage)
   -- CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
   -- (Pattern B), extended to Part-2 impls.
   self.unconnecting_headers_count = {}
+  -- hash_hex -> true for blocks with a consensus-invalid verdict and their
+  -- known descendants (Core BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD).  A
+  -- failed block is never the header tip, never downloaded again, and a
+  -- header building on one is refused (bad-prevblk).  Seeded at boot from
+  -- ChainState.invalid_blocks, which persists it.
+  self.failed = {}
   return self
+end
+
+--- Is this header failed (consensus-invalid itself or descends from one)?
+-- @param hash_hex string
+-- @return boolean
+function HeaderChain:is_failed(hash_hex)
+  return hash_hex ~= nil and self.failed[hash_hex] == true
+end
+
+--- Mark a block failed and every known descendant failed-child, then move the
+--- header tip off the failed branch if it was on it.
+--- Core: Chainstate::InvalidBlockFound -> InvalidChainFound ->
+--- SetBlockFailureFlags + RecalculateBestHeader.
+-- @param hash_hex string: the block that failed validation
+-- @return table: list of hash_hex newly marked (the block first)
+function HeaderChain:mark_failed(hash_hex)
+  local marked = {}
+  if not self.failed[hash_hex] then
+    self.failed[hash_hex] = true
+    marked[1] = hash_hex
+  end
+  -- Descendants among resident headers.  Only entries ABOVE the failed
+  -- height can descend from it, and each walk stops at that height, so this
+  -- is O(resident headers above it x depth) -- small at tip, rare event.
+  local root = self.headers[hash_hex]
+  if root then
+    for hx, e in pairs(self.headers) do
+      if not self.failed[hx] and e.height > root.height then
+        local cur = e
+        while cur and cur.height > root.height do
+          local phx = types.hash256_hex(cur.header.prev_hash)
+          if phx == hash_hex or self.failed[phx] then
+            self.failed[hx] = true
+            marked[#marked + 1] = hx
+            break
+          end
+          cur = self.headers[phx]
+        end
+      end
+    end
+  end
+  self:recalculate_best_header()
+  return marked
+end
+
+--- If the header tip is failed, move it to the most-work resident header that
+--- is not, and repoint height_to_hash along that header's ancestry.  Core
+--- RecalculateBestHeader.  A tie keeps the lowest height, then any (lunarblock
+--- has no nSequenceId); the competitor then wins by arriving with more work.
+function HeaderChain:recalculate_best_header(force)
+  local tip_hex = self.header_tip_hash and types.hash256_hex(self.header_tip_hash)
+  if not tip_hex or (not force and not self.failed[tip_hex]) then return false end
+  local old_tip_height = self.header_tip_height
+  local best_hex, best = nil, nil
+  -- The current tip, when still valid (force mode), wins ties.
+  if not self.failed[tip_hex] and self.headers[tip_hex]
+      and self.headers[tip_hex].total_work then
+    best_hex, best = tip_hex, self.headers[tip_hex]
+  end
+  for hx, e in pairs(self.headers) do
+    if not self.failed[hx] and e.total_work then
+      if not best then
+        best_hex, best = hx, e
+      else
+        local c = consensus.work_compare(e.total_work, best.total_work)
+        if c > 0 or (c == 0 and best_hex ~= tip_hex and e.height < best.height) then
+          best_hex, best = hx, e
+        end
+      end
+    end
+  end
+  if not best or best_hex == tip_hex then return false end
+  self.header_tip_hash = validation.compute_block_hash(best.header)
+  self.header_tip_height = best.height
+  -- Clear heights above the new tip that pointed into the failed branch,
+  -- then repoint the new tip's ancestry until it rejoins the map.
+  for h = best.height + 1, (old_tip_height or best.height) do
+    local hx = self.height_to_hash[h]
+    if hx and self.failed[hx] then self.height_to_hash[h] = nil end
+  end
+  local cur_hex, cur = best_hex, best
+  while cur and self.height_to_hash[cur.height] ~= cur_hex do
+    self.height_to_hash[cur.height] = cur_hex
+    if self.storage.put_height_index then
+      self.storage.put_height_index(cur.height, validation.compute_block_hash(cur.header))
+    end
+    cur_hex = types.hash256_hex(cur.header.prev_hash)
+    cur = self.headers[cur_hex]
+  end
+  self:set_header_tip(self.header_tip_hash, self.header_tip_height, false)
+  print(string.format(
+    "[INVALID-BLOCK] header tip moved off failed branch: h=%d -> h=%d %s",
+    old_tip_height or -1, best.height, best_hex))
+  return true
 end
 
 -- Bitcoin Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS (net_processing.cpp).
@@ -1747,8 +1898,11 @@ function HeaderChain:accept_header(header, opts)
   local hash = validation.compute_block_hash(header)
   local hash_hex = types.hash256_hex(hash)
 
-  -- 2. Check if we already have this header
-  if self.headers[hash_hex] then
+  -- 2. Check if we already have this header.  A known-FAILED header is also
+  --    a no-op: Core answers it BLOCK_CACHED_INVALID ("duplicate-invalid"),
+  --    which does not punish an inbound peer, and the block is never
+  --    fetched again (the download walk skips failed hashes).
+  if self.headers[hash_hex] or self.failed[hash_hex] then
     return true  -- Already known, skip
   end
 
@@ -1757,6 +1911,13 @@ function HeaderChain:accept_header(header, opts)
   local parent = self.headers[prev_hex]
   if not parent then
     return false, "unknown parent: " .. prev_hex
+  end
+
+  -- 3b. Core AcceptBlockHeader: a header whose parent is BLOCK_FAILED_MASK is
+  --     BLOCK_INVALID_PREV "bad-prevblk" (Misbehaving in
+  --     MaybePunishNodeForBlock).  Not stored, never becomes the header tip.
+  if self.failed[prev_hex] then
+    return false, "bad-prevblk"
   end
 
   -- 4. Validate proof of work
@@ -2806,6 +2967,15 @@ function M.new_block_downloader(header_chain, storage, network, opts)
   -- When nil (test scaffolding without a chainstate) the fork-body routing is
   -- inert and the legacy LATE_ARRIVAL / connect_block behaviour is preserved.
   self.side_branch_callback = nil
+  -- Called with (hash256_list) after a consensus-invalid verdict marked
+  -- blocks failed in the header chain, so main.lua can persist them in
+  -- ChainState.invalid_blocks (Core writes BLOCK_FAILED_VALID to the block
+  -- index).  nil in test scaffolding.
+  self.invalid_block_callback = nil
+  -- hash_hex -> earliest time the normal download walk may re-request a
+  -- block whose connect failed WITHOUT a verdict (see
+  -- M.NON_VERDICT_RETRY_BACKOFF).
+  self._cb_retry_after = {}
   -- Optional block pruner (lunarblock.prune), set by main.lua.  nil ⇒ archive
   -- node (pruning disabled = default).  _apply_fork_aware_floor consults it to
   -- decide how deep to bridge a competing fork's bodies: archive nodes fetch
@@ -3296,6 +3466,97 @@ function BlockDownloader:_route_fork_body(block, hash, entry)
   end
 end
 
+--- Record a consensus-invalid verdict on a block (Core
+--- Chainstate::InvalidBlockFound + InvalidChainFound).  Marks it and its known
+--- descendants failed in the header chain (which moves the header tip to the
+--- most-work valid header), drops them from in-flight / pending so they are
+--- never requested or connected again, persists the marks via
+--- invalid_block_callback, and re-anchors the cursors on the active tip so
+--- the competitor at the same height is fetched next.
+-- @param hash_hex string: the block that failed
+-- @param err any: the verdict (for the log)
+-- @return table: list of hash_hex marked
+function BlockDownloader:mark_block_invalid(hash_hex, err)
+  local hc = self.header_chain
+  local marked = hc:mark_failed(hash_hex)
+  local hashes = {}
+  for _, hx in ipairs(marked) do
+    local info = self.inflight[hx]
+    if info then
+      self.inflight[hx] = nil
+      if self.peer_inflight[info.peer] then
+        self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+        if self.peer_inflight[info.peer] <= 0 then
+          self.peer_inflight[info.peer] = nil
+        end
+      end
+    end
+    if self.pending_blocks[hx] then self:_drop_pending(hx) end
+    if self._cb_fail_count then self._cb_fail_count[hx] = nil end
+    self._cb_retry_after[hx] = nil
+    local e = hc.headers[hx]
+    if e then hashes[#hashes + 1] = validation.compute_block_hash(e.header) end
+  end
+  if #hashes == 0 then
+    -- Not resident (should not happen for a block we just tried to connect);
+    -- still persist the primary hash so a restart does not re-fetch it.
+    local ok_h, h = pcall(types.hash256_from_hex, hash_hex)
+    if ok_h and h then hashes[1] = h end
+  end
+  print(string.format(
+    "[INVALID-BLOCK] %s marked failed (+%d descendant(s)); never re-requested "
+      .. "(reconsiderblock to undo): %s",
+    hash_hex, math.max(#marked - 1, 0), tostring(err)))
+  if self.invalid_block_callback then
+    local ok_cb, cb_err = pcall(self.invalid_block_callback, hashes)
+    if not ok_cb then
+      print("[INVALID-BLOCK] persisting invalid mark failed (non-fatal): "
+        .. tostring(cb_err))
+    end
+  end
+  -- Cursors back onto the active validated tip: the failed branch may have
+  -- lowered them (fork floor) and the replacement at the same height must be
+  -- fetched from there.
+  if self.active_tip_provider then
+    local _, at_h = self.active_tip_provider()
+    if at_h then
+      self.next_connect_height = at_h + 1
+      if self.next_download_height > at_h + 1 then
+        self.next_download_height = at_h + 1
+      end
+    end
+  end
+  return marked
+end
+
+--- Which block does a side-branch orchestrator error condemn?
+--   "invalid-ancestor"                         -> the routed block (FAILED_CHILD)
+--   "check_block: <verdict>"                   -> the routed block
+--   "reorg-connect-failed at height H: <verdict>" -> the routed block's
+--                                                ancestor at height H
+-- Anything that is not a verdict (missing body, MTP unresolvable,
+-- missing-ancestor-header, mutated, I/O) returns nil: no mark.
+-- @return string|nil hash_hex of the failed block
+function BlockDownloader:_side_branch_failed_hex(hash_hex, pending, sb_err)
+  if type(sb_err) ~= "string" then return nil end
+  if sb_err == "invalid-ancestor" then return hash_hex end
+  local cb = sb_err:match("^check_block: (.*)$")
+  if cb then
+    return M.is_invalid_block_verdict(cb) and hash_hex or nil
+  end
+  local h, rest = sb_err:match("^reorg%-connect%-failed at height (%d+): (.*)$")
+  if not h or not M.is_invalid_block_verdict(rest) then return nil end
+  h = tonumber(h)
+  local hc = self.header_chain
+  local cur_hex, cur = hash_hex, hc.headers[hash_hex]
+  while cur and cur.height > h do
+    cur_hex = types.hash256_hex(cur.header.prev_hash)
+    cur = hc.headers[cur_hex]
+  end
+  if cur and cur.height == h then return cur_hex end
+  return nil
+end
+
 --- Schedule block downloads across available peers.
 -- Uses round-robin assignment with per-peer in-flight tracking.
 -- @param peers table: list of established peers with NODE_NETWORK service
@@ -3585,7 +3846,8 @@ function BlockDownloader:schedule_downloads(peers)
     if entry
       and not self.inflight[stuck_hash_hex]
       and not self.pending_blocks[stuck_hash_hex]
-      and not stuck_in_storage then
+      and not stuck_in_storage
+      and not self.header_chain:is_failed(stuck_hash_hex) then
       self._force_rerequest_last = self._force_rerequest_last or {}
       local last = self._force_rerequest_last[stuck_hash_hex] or 0
       if now - last >= 30 then
@@ -3670,8 +3932,18 @@ function BlockDownloader:schedule_downloads(peers)
     local hash_hex = self.header_chain.height_to_hash[height]
     if not hash_hex then break end
 
-    -- Skip if already downloaded or in-flight
-    if not self.pending_blocks[hash_hex] and not self.inflight[hash_hex] then
+    -- Skip if already downloaded or in-flight.  Never request a FAILED block
+    -- (Core never re-requests BLOCK_FAILED_VALID), and hold off a block whose
+    -- connect just failed without a verdict until its retry backoff expires
+    -- (W46 re-requests it at the cursor on its own 30 s cadence).
+    local retry_after = self._cb_retry_after[hash_hex]
+    if retry_after and now >= retry_after then
+      self._cb_retry_after[hash_hex] = nil
+      retry_after = nil
+    end
+    if self.header_chain:is_failed(hash_hex) or retry_after then
+      -- skip
+    elseif not self.pending_blocks[hash_hex] and not self.inflight[hash_hex] then
       -- Check if block already in storage. For blocks near the connection
       -- cursor, skip the storage check — connect_pending_blocks will load
       -- them from storage if needed. Only skip downloads for blocks well
@@ -3881,6 +4153,14 @@ function BlockDownloader:handle_block(peer, block_data)
   local entry = self.header_chain.headers[hash_hex]
   if not entry then
     -- Unknown block, ignore
+    return true
+  end
+
+  -- A block already judged consensus-invalid (or descending from one) is
+  -- never connected again (Core: AcceptBlockHeader -> BLOCK_CACHED_INVALID).
+  -- Dropped without punishing: re-sending a cached-invalid block is not a
+  -- fresh offence for an inbound peer.
+  if self.header_chain:is_failed(hash_hex) then
     return true
   end
 
@@ -4255,7 +4535,18 @@ function BlockDownloader:_connect_pending_blocks_inner()
           end
           break
         end
-        -- (b) Genuine reject: fall through to the normal connect path below.
+        -- (b) A consensus verdict from the orchestrator: mark the block that
+        --     actually failed (Core InvalidBlockFound inside
+        --     ActivateBestChainStep) and stop -- falling through to the
+        --     normal connect only produced a "prev_hash mismatch" that hid
+        --     the verdict and left the branch requestable.
+        local failed_hex = self:_side_branch_failed_hex(hash_hex, pending, sb_err)
+        if failed_hex then
+          self:_drop_pending(hash_hex)
+          self:mark_block_invalid(failed_hex, sb_err)
+          return false, sb_err
+        end
+        -- (c) Anything else: fall through to the normal connect path below.
       end
       -- sb_result == "extend" → block extends the active tip; fall through to
       -- the unchanged normal connect path below.
@@ -4346,6 +4637,26 @@ function BlockDownloader:_connect_pending_blocks_inner()
         -- but do NOT advance height — the block may need to be retried after
         -- fixing state. Do NOT store to disk so the scheduler re-downloads it.
         self:_drop_pending(hash_hex)
+
+        -- Consensus verdict (Core ConnectBlock -> InvalidBlockFound): mark
+        -- the block and its descendants failed so it is never requested or
+        -- connected again, and move the header tip to the most-work valid
+        -- header so the competitor is fetched.  Before this, nothing
+        -- recorded the failure and the download walk re-requested the block
+        -- on the very next tick -- 7,249 getdata in ~60 s on regtest, once
+        -- more from every peer that re-announced it.
+        if M.is_invalid_block_verdict(cb_err) then
+          print(string.format("Block %d connect callback failed: %s",
+            self.next_connect_height, tostring(cb_err)))
+          self:mark_block_invalid(hash_hex, cb_err)
+          return false, cb_err
+        end
+        -- No verdict (our missing data, I/O, chainstate): keep it
+        -- requestable but not on the next tick.
+        local _nv_now = require("socket").gettime()
+        self._cb_retry_after[hash_hex] = _nv_now + M.NON_VERDICT_RETRY_BACKOFF
+        self._force_rerequest_last = self._force_rerequest_last or {}
+        self._force_rerequest_last[hash_hex] = _nv_now
 
         -- Track per-hash callback failures (Fix #4 from BUG-REPORT.md).
         -- A bounded retry budget: if the same block fails to connect
