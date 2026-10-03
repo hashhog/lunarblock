@@ -2157,11 +2157,9 @@ end
 -- "snapshot_base_height" as a u32 LE.  Returns the height, or nil for a
 -- genesis-synced / production node that never imported a snapshot.
 --
--- Used by the BIP68 time-lock relaxation in connect_block: coins created
--- within the first (MEDIAN_TIME_PAST_BLOCKS-1) blocks above the snapshot base
--- have a truncated MTP window (the pre-base headers are absent by design), so
--- their relative-TIME sequence lock cannot be recomputed exactly and is
--- treated as trivially satisfied.  See validation.lua::calculate_sequence_locks.
+-- (Formerly drove a BIP68 time-lock relaxation for coins at or below
+-- base+10, which skipped the lock -- fail-open.  Removed: the pre-base header
+-- backfill supplies the window, and a missing one now fails closed.)
 function ChainState:get_snapshot_base_height()
   -- _snapshot_base_height: nil = not yet read; false = read, none present.
   if self._snapshot_base_height == nil then
@@ -3109,11 +3107,9 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
           return idx and utxo_cache[idx].height or nil
         end
 
-        -- Calculate and check sequence locks.  snapshot_base_height lets
-        -- calculate_sequence_locks relax the relative-TIME lock for coins in
-        -- the snapshot-frontier zone whose MTP window underflows the base
-        -- (the pre-base headers are absent on an assumeUTXO-bootstrapped node).
-        -- nil for genesis-synced / production nodes → no relaxation.
+        -- Calculate and check sequence locks.  No snapshot relaxation: a coin
+        -- MTP that cannot be computed exactly raises MISSING_ANCESTOR (no
+        -- verdict) inside calculate_sequence_locks.
         local snapshot_base_height = self:get_snapshot_base_height()
         local min_height, min_time = validation.calculate_sequence_locks(
           tx, height, get_utxo_height, get_block_mtp, enforce_bip68,
@@ -3789,16 +3785,31 @@ local function compute_mtp_from_storage(storage, tip_hash)
   if not storage or not tip_hash then
     return os.time()
   end
+  -- FAIL CLOSED on a partial window.  Core's GetMedianTimePast always reads
+  -- min(11, height+1) headers; the window may only be short because it
+  -- reached GENESIS.  On a snapshot-booted node whose pre-base headers are not
+  -- held, the walk stops early at a missing header: answering from the
+  -- headers that happen to be present biases the median late (mainnet
+  -- 932256: 1765808303 from 5 headers vs Core 1765804000), and answering
+  -- os.time() for an absent tip is worse.  Return nil + reason instead.
   local timestamps = {}
   local current_hash = tip_hash
+  local reached_genesis = false
   for _ = 1, 11 do
     local header = storage.get_header(current_hash)
     if not header then break end
     timestamps[#timestamps + 1] = header.timestamp
     current_hash = header.prev_hash
+    if types.hash256_eq(current_hash, types.hash256_zero()) then
+      reached_genesis = true
+      break
+    end
   end
-  if #timestamps == 0 then
-    return os.time()
+  if #timestamps < 11 and not reached_genesis then
+    return nil, string.format(
+      "%s: MTP window of %s has %d of 11 headers (header %s not held)",
+      validation.MISSING_ANCESTOR, types.hash256_hex(tip_hash), #timestamps,
+      types.hash256_hex(current_hash))
   end
   table.sort(timestamps)
   -- Bitcoin Core: pbegin[(pend-pbegin)/2] (upper-middle for even n).
@@ -3806,6 +3817,31 @@ local function compute_mtp_from_storage(storage, tip_hash)
   local n = #timestamps
   return timestamps[math.floor(n / 2) + 1]
 end
+M.compute_mtp_from_storage = compute_mtp_from_storage
+
+--- get_block_mtp(h) for BIP-68: MTP of the active-chain block AT height h,
+--- via the height index.  nil + reason (fail closed) if not computable.
+function M.make_get_block_mtp(storage_ref)
+  return function(h)
+    -- Look up the block hash at height h from the height index.
+    local h_key = string.char(
+      math.floor(h / 16777216) % 256,
+      math.floor(h / 65536) % 256,
+      math.floor(h / 256) % 256,
+      h % 256
+    )
+    local hash_bytes = storage_ref.get(storage_ref.CF.HEIGHT_INDEX, h_key)
+    -- FAIL CLOSED: a missing ancestor is NOT time 0 (which satisfies every
+    -- relative time lock).  calculate_sequence_locks raises on nil.
+    if not hash_bytes then
+      return nil, string.format("%s: no header at height %d",
+        validation.MISSING_ANCESTOR, h)
+    end
+    local h_hash = types.hash256(hash_bytes)
+    return compute_mtp_from_storage(storage_ref, h_hash)
+  end
+end
+
 
 --- Contextual difficulty (nBits) check — Core ContextualCheckBlockHeader
 -- (bitcoin-core/src/validation.cpp:4088-4089): a block's declared nBits MUST
@@ -3973,25 +4009,17 @@ function ChainState:accept_block(block, height, block_hash, opts)
   local prev_block_mtp = nil
   local get_block_mtp = nil
   if self.tip_hash and height > 0 then
-    prev_block_mtp = compute_mtp_from_storage(self.storage, self.tip_hash)
+    local mtp_err
+    prev_block_mtp, mtp_err = compute_mtp_from_storage(self.storage, self.tip_hash)
+    if prev_block_mtp == nil then
+      -- No verdict: the BIP-113 cutoff is not computable (fail closed).
+      return nil, mtp_err
+    end
     -- get_block_mtp(h) returns the MTP of the block AT height h.
     -- BIP-68 calls this for the block that confirmed each input's UTXO.
     -- We walk storage to find the block hash at height h, then compute
     -- its 11-block MTP window.
-    local storage_ref = self.storage
-    get_block_mtp = function(h)
-      -- Look up the block hash at height h from the height index.
-      local h_key = string.char(
-        math.floor(h / 16777216) % 256,
-        math.floor(h / 65536) % 256,
-        math.floor(h / 256) % 256,
-        h % 256
-      )
-      local hash_bytes = storage_ref.get(storage_ref.CF.HEIGHT_INDEX, h_key)
-      if not hash_bytes then return 0 end
-      local h_hash = types.hash256(hash_bytes)
-      return compute_mtp_from_storage(storage_ref, h_hash)
-    end
+    get_block_mtp = M.make_get_block_mtp(self.storage)
   end
 
   -- Stage 3: contextual validation + UTXO mutations.
@@ -4222,7 +4250,10 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     -- (a) time-too-old: timestamp must be strictly greater than the parent's
     -- median-time-past.  Parent = new_entry.header.prev_hash (== prev_header).
     -- Core validation.cpp:4092; tip-extend rpc.lua:11299-11304; P2P sync.lua:1173.
-    local parent_mtp = compute_mtp_from_storage(self.storage, h.prev_hash)
+    local parent_mtp, parent_mtp_err = compute_mtp_from_storage(self.storage, h.prev_hash)
+    if parent_mtp == nil then
+      return nil, parent_mtp_err
+    end
     if h.timestamp <= parent_mtp then
       return nil, "time-too-old"
     end
@@ -4521,13 +4552,21 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
       local e = side_chain[idx]
       return e and e.hash or nil
     end
-    local sb_prev_mtp = compute_mtp_from_storage(self.storage, sb_block.header.prev_hash)
+    local sb_prev_mtp, sb_mtp_err = compute_mtp_from_storage(self.storage, sb_block.header.prev_hash)
+    if sb_prev_mtp == nil then
+      return abort_reorg(string.format(
+        "reorg-connect-failed at height %d: %s", entry.height, tostring(sb_mtp_err)))
+    end
     local sb_get_block_mtp = function(hh)
       local hh_hash = branch_hash_at(hh)
       if not hh_hash then
         hh_hash = self.storage.get_hash_by_height and self.storage.get_hash_by_height(hh)
       end
-      if not hh_hash then return 0 end
+      if not hh_hash then
+        -- FAIL CLOSED (was `return 0`: every time lock satisfied).
+        return nil, string.format("%s: no header at height %d",
+          validation.MISSING_ANCESTOR, hh)
+      end
       return compute_mtp_from_storage(self.storage, hh_hash)
     end
     local ok_conn, err_conn = self:connect_block(

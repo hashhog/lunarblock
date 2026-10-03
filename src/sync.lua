@@ -50,6 +50,12 @@ function M.classify_callback_error(err)
   if err == nil then return "unknown" end
   local s = tostring(err):lower()
 
+  -- A needed ancestor header is not held (snapshot-booted node before the
+  -- pre-base header backfill completes).  The block has NO verdict yet:
+  -- this node's missing data, never the peer's fault, never an invalid mark.
+  -- Checked first so no consensus token later in the message can win.
+  if s:find("missing%-ancestor%-header") then return "local" end
+
   -- Consensus / script / tx-validation rule failures. These are
   -- deterministic mismatches with Core's rules and indicate a bug in
   -- script.lua / utxo.lua / validation.lua, not a corrupt chainstate.
@@ -1316,6 +1322,292 @@ function HeaderChain:get_snapshot_base_height()
 end
 
 --------------------------------------------------------------------------------
+-- Pre-base header backfill (snapshot boot -> Core's full header chain)
+--------------------------------------------------------------------------------
+--
+-- WHY.  Bitcoin Core never validates a block without the FULL header chain:
+-- headers-first sync builds it before any block is connected, and
+-- loadtxoutset refuses a snapshot whose base is not already in it
+-- (validation.cpp ActivateSnapshot).  A snapshot-booted lunarblock instead
+-- holds only base_tail_headers (~2,026 headers below the base) and nothing
+-- under them.  Every consensus value that reaches below that band -- BIP68's
+-- coin MTP (GetAncestor(coin_height-1)->GetMedianTimePast()) above all --
+-- was then answered from a partial window (median biased late -> false
+-- reject: mainnet 932256 coin 927979, 942168 coin 937977), from 0 (every
+-- time lock satisfied -> false accept), or by skipping the lock outright.
+--
+-- WHAT.  While the chain below the held band does not reach genesis
+-- (`self.prebase_gap`), fetch headers 1..root-1 from peers with
+-- getheaders(locator = staged frontier, hashStop = the band's lowest header's
+-- prev hash).  Each header gets the full contextual check against the staged
+-- chain (PoW <= its own target <= powLimit, exact nBits from
+-- get_next_work_required, time-too-old against a COMPLETE window, BIP94
+-- timewarp, time-too-new, bad-version, checkpoints).  Staged headers touch
+-- neither `headers`, `height_to_hash` nor storage until the staged header at
+-- root-1 HASHES TO the held band's root prev_hash -- i.e. the staged chain is
+-- anchored to the band we already verified against the pinned entry.  A
+-- valid-PoW chain that arrives anywhere else is discarded and staging
+-- restarts from genesis.  On link: headers + height index are committed in
+-- ascending order (a crash mid-commit leaves the gap detectable and the
+-- commit idempotent), chainwork is re-derived from genesis and must equal the
+-- assumeutxo chain_work the base was seeded with, otherwise the gap stays
+-- open and block connection stays held (fail closed, ALERT).
+--
+-- BlockDownloader holds block CONNECTION (downloads continue) while a gap is
+-- open, and every ancestor lookup on the connect/submit/reorg paths fails
+-- closed with validation.MISSING_ANCESTOR instead of guessing.
+
+HeaderChain.PREBASE_RETRY_SECONDS = 30
+
+--- Locate the genesis header (memory, then storage).
+local function find_genesis(self)
+  local gen_hex = self.network.genesis_hash
+  if not gen_hex then return nil end
+  local e = self.headers[gen_hex]
+  if e and e.header then return e.header, gen_hex end
+  local hdr = self.storage.get_header(types.hash256_from_hex(gen_hex))
+  if hdr and types.hash256_hex(validation.compute_block_hash(hdr)) == gen_hex then
+    return hdr, gen_hex
+  end
+  return nil
+end
+
+--- (Re)compute whether the held chain below the snapshot base reaches genesis.
+--- Sets self.prebase_gap (or nil) and returns it.
+function HeaderChain:refresh_prebase_gap()
+  self.prebase_gap = nil
+  local base = self.snapshot_base_height
+  if not base or base <= 0 then return nil end
+  local base_hex = self.height_to_hash[base]
+  local cur = base_hex and self.headers[base_hex]
+  if not cur then return nil end  -- base not injected (genesis-synced node)
+  -- Parent-pointer walk (never height_to_hash) down to the lowest held header.
+  while cur.height > 0 do
+    local prev = self.headers[types.hash256_hex(cur.header.prev_hash)]
+    if not prev then break end
+    cur = prev
+  end
+  if cur.height == 0 then return nil end
+
+  local gen_hdr, gen_hex = find_genesis(self)
+  local gap = {
+    root_height = cur.height,
+    root_prev_hex = types.hash256_hex(cur.header.prev_hash),
+    staged = {},
+    staged_hex = {},
+    frontier_height = 0,
+    frontier_hex = gen_hex,
+    inflight_peer = nil,
+    inflight_at = 0,
+    error = nil,
+  }
+  if gen_hdr then
+    gap.staged[0] = gen_hdr
+    gap.staged_hex[0] = gen_hex
+  else
+    gap.error = "genesis header not held; cannot anchor pre-base backfill"
+  end
+  self.prebase_gap = gap
+  io.stdout:write(string.format(
+    "[prebase-backfill] header chain below snapshot base %d stops at height %d; "
+    .. "fetching headers 1..%d before connecting blocks (Core: full header chain "
+    .. "before validation)\n", base, cur.height, cur.height - 1))
+  io.stdout:flush()
+  return gap
+end
+
+local function reset_staging(gap)
+  local g0, h0 = gap.staged[0], gap.staged_hex[0]
+  gap.staged, gap.staged_hex = { [0] = g0 }, { [0] = h0 }
+  gap.frontier_height, gap.frontier_hex = 0, h0
+  gap.inflight_peer = nil
+  gap.inflight_at = 0
+end
+
+--- Send the next backfill getheaders to `peer` if none is in flight (or the
+--- previous one is older than PREBASE_RETRY_SECONDS).
+-- @return boolean: true if a request was sent
+function HeaderChain:maybe_request_prebase(peer, now)
+  local gap = self.prebase_gap
+  if not gap or gap.error or not peer or not gap.frontier_hex then return false end
+  now = now or os.time()
+  if gap.inflight_peer and now - gap.inflight_at < HeaderChain.PREBASE_RETRY_SECONDS then
+    return false
+  end
+  local payload = p2p.serialize_getheaders(
+    p2p.PROTOCOL_VERSION,
+    { types.hash256_from_hex(gap.frontier_hex) },
+    types.hash256_from_hex(gap.root_prev_hex))
+  if peer:send_message("getheaders", payload) then
+    gap.inflight_peer = peer
+    gap.inflight_at = now
+    return true
+  end
+  return false
+end
+
+--- Full contextual check of one staged pre-base header at height h.
+--- The staged chain 0..h-1 is complete, so every lookup is exact.
+local function check_prebase_header(self, gap, header, hash, hash_hex, h)
+  local net = self.network
+  -- CheckProofOfWork: target <= powLimit and hash <= target.
+  local target = consensus.bits_to_target(header.bits)
+  local pow_limit = consensus.bits_to_target(net.pow_limit_bits)
+  if consensus.compare_targets(target, pow_limit) > 0
+     or not consensus.hash_meets_target(hash.bytes, target) then
+    return false, "insufficient proof of work (pre-base backfill)"
+  end
+  -- bad-diffbits: exact GetNextWorkRequired over the staged chain.
+  local staged = gap.staged
+  local expected_bits, why = consensus.get_next_work_required(
+    h, header.timestamp, net,
+    function(x)
+      local sh = staged[x]
+      if sh then return { header = sh, height = x } end
+      return nil
+    end)
+  if not expected_bits then
+    return false, string.format("%s: pre-base nBits for height %d: %s",
+      validation.MISSING_ANCESTOR, h, tostring(why))
+  end
+  if header.bits ~= expected_bits then
+    return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x (height %d)",
+      expected_bits, header.bits, h)
+  end
+  -- time-too-old against the complete window min(11, h) ending at h-1.
+  local ts = {}
+  for x = h - 1, math.max(0, h - consensus.MEDIAN_TIME_PAST_BLOCKS), -1 do
+    ts[#ts + 1] = staged[x].timestamp
+  end
+  if header.timestamp <= consensus.get_median_time_past(ts) then
+    return false, string.format("time-too-old (height %d)", h)
+  end
+  if net.enforce_bip94 and h % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0
+     and header.timestamp < staged[h - 1].timestamp - consensus.MAX_TIMEWARP then
+    return false, "time-timewarp-attack"
+  end
+  if header.timestamp > os.time() + consensus.MAX_FUTURE_BLOCK_TIME then
+    return false, "time-too-new"
+  end
+  if (header.version < 2 and net.bip34_height and h >= net.bip34_height)
+     or (header.version < 3 and net.bip66_height and h >= net.bip66_height)
+     or (header.version < 4 and net.bip65_height and h >= net.bip65_height) then
+    return false, string.format("bad-version(0x%08x)", header.version % 0x100000000)
+  end
+  local ok, cp_err = consensus.check_checkpoint(net, h, hash_hex)
+  if not ok then return false, cp_err end
+  return true
+end
+
+--- Commit a linked staged chain 1..root-1 (see section comment).
+-- @return boolean, string|nil
+function HeaderChain:commit_prebase(gap)
+  local root = gap.root_height
+  -- Chainwork from genesis through the band to the base must equal the
+  -- assumeutxo chain_work every post-base header's total_work is built on.
+  local cum = consensus.work_zero()
+  local works = {}
+  for x = 0, root - 1 do
+    cum = consensus.work_add(cum, self:work_for_bits(gap.staged[x].bits))
+    works[x] = cum
+  end
+  local band = {}
+  local base = self.snapshot_base_height
+  local band_cum = cum
+  for x = root, base do
+    local hex = self.height_to_hash[x]
+    local e = hex and self.headers[hex]
+    if not e then
+      return false, string.format("band header at height %d not held", x)
+    end
+    band_cum = consensus.work_add(band_cum, self:work_for_bits(e.header.bits))
+    band[x] = { entry = e, work = band_cum }
+  end
+  local base_entry = band[base].entry
+  if consensus.work_compare(band_cum, base_entry.total_work) ~= 0 then
+    return false, string.format(
+      "header-derived chainwork at base %d (%s) != seeded assumeutxo chain_work (%s)",
+      base, consensus.work_to_hex(band_cum), consensus.work_to_hex(base_entry.total_work))
+  end
+  -- Ascending: the root-1 header (which completes the parent walk) lands last.
+  for x = 0, root - 1 do
+    local hex = gap.staged_hex[x]
+    local hash = types.hash256_from_hex(hex)
+    self.storage.put_header(hash, gap.staged[x])
+    self.storage.put_height_index(x, hash)
+    self.headers[hex] = { header = gap.staged[x], height = x, total_work = works[x] }
+    self.height_to_hash[x] = hex
+  end
+  for x = root, base - 1 do
+    band[x].entry.total_work = band[x].work
+  end
+  return true
+end
+
+--- Handle a headers message that extends the staged pre-base chain.
+-- @return number, string|nil: accepted count (or -1) and error
+function HeaderChain:process_prebase_batch(peer, headers)
+  local gap = self.prebase_gap
+  local accepted = 0
+  for _, header in ipairs(headers) do
+    local h = gap.frontier_height + 1
+    if h >= gap.root_height then break end  -- past hashStop; ignore the rest
+    if types.hash256_hex(header.prev_hash) ~= gap.frontier_hex then
+      gap.inflight_peer = nil
+      return -1, "non-continuous header (pre-base backfill)"
+    end
+    local hash = validation.compute_block_hash(header)
+    local hash_hex = types.hash256_hex(hash)
+    local ok, err = check_prebase_header(self, gap, header, hash, hash_hex, h)
+    if not ok then
+      gap.inflight_peer = nil
+      return -1, err
+    end
+    gap.staged[h] = header
+    gap.staged_hex[h] = hash_hex
+    gap.frontier_height, gap.frontier_hex = h, hash_hex
+    accepted = accepted + 1
+  end
+  gap.inflight_peer = nil
+
+  if gap.frontier_height == gap.root_height - 1 then
+    if gap.frontier_hex ~= gap.root_prev_hex then
+      -- A contextually valid chain that is NOT the one our verified band
+      -- descends from: discard it entirely and start over from genesis.
+      local got = gap.frontier_hex
+      reset_staging(gap)
+      return -1, string.format(
+        "pre-base backfill chain ends at %s, not the snapshot band root parent %s "
+        .. "(staging discarded)", got, gap.root_prev_hex)
+    end
+    local ok, err = self:commit_prebase(gap)
+    if not ok then
+      gap.error = err
+      io.stderr:write("[ALERT] [prebase-backfill] linked but NOT committed; block "
+        .. "connection stays held: " .. tostring(err) .. "\n")
+      io.stderr:flush()
+      return accepted, nil
+    end
+    self.prebase_gap = nil
+    io.stdout:write(string.format(
+      "[prebase-backfill] linked genesis..%d to the snapshot band; chainwork "
+      .. "re-derived and matches; block connection released\n", gap.root_height - 1))
+    io.stdout:flush()
+    return accepted, nil
+  end
+
+  if accepted > 0 then
+    if gap.frontier_height % 100000 < accepted then
+      io.stdout:write(string.format("[prebase-backfill] staged %d/%d\n",
+        gap.frontier_height, gap.root_height - 1))
+      io.stdout:flush()
+    end
+    self:maybe_request_prebase(peer)
+  end
+  return accepted, nil
+end
+
+--------------------------------------------------------------------------------
 -- Work Calculation
 --------------------------------------------------------------------------------
 
@@ -1560,6 +1852,16 @@ function HeaderChain:accept_header(header, opts)
   --     (time-too-old gate).
   --     Bitcoin Core validation.cpp:4091-4093.
   local mtp_timestamps = self:get_past_timestamps(prev_hex, consensus.MEDIAN_TIME_PAST_BLOCKS)
+  -- FAIL CLOSED on a partial window: the parent at height-1 has
+  -- min(11, height) ancestors-inclusive in Core's index.  Fewer here means a
+  -- header in the window is not held (pre-base gap), and a short-window
+  -- median is not Core's value.  No verdict, no ban token.
+  if #mtp_timestamps < math.min(consensus.MEDIAN_TIME_PAST_BLOCKS, height) then
+    return false, string.format(
+      "%s: parent MTP window for height %d has %d of %d headers",
+      validation.MISSING_ANCESTOR, height, #mtp_timestamps,
+      math.min(consensus.MEDIAN_TIME_PAST_BLOCKS, height))
+  end
   local mtp = consensus.get_median_time_past(mtp_timestamps)
   if header.timestamp <= mtp then
     return false, "time-too-old"
@@ -2157,6 +2459,16 @@ end
 function HeaderChain:handle_headers(peer, payload)
   -- Deserialize headers
   local headers = p2p.deserialize_headers(payload)
+
+  -- Pre-base backfill response: extends the staged chain below the band.
+  local gap = self.prebase_gap
+  if gap and not gap.error and #headers > 0
+     and types.hash256_hex(headers[1].prev_hash) == gap.frontier_hex then
+    return self:process_prebase_batch(peer, headers)
+  end
+  if gap and #headers == 0 and gap.inflight_peer == peer then
+    gap.inflight_peer = nil  -- peer had nothing past our frontier; retry later
+  end
 
   if #headers == 0 then
     -- Sync complete - we're caught up
@@ -3734,6 +4046,23 @@ end
 -- loop can service RPC requests between batches (prevents event-loop starvation).
 -- @return boolean, string|nil: success flag, error message
 function BlockDownloader:_connect_pending_blocks_inner()
+  -- Snapshot boot: hold block CONNECTION (downloads continue) until the
+  -- pre-base header backfill links genesis to the snapshot band.  Core never
+  -- validates a block without the full header chain; deciding BIP68/BIP113
+  -- from a partial window is exactly the bug this hold closes.
+  local gap = self.header_chain.prebase_gap
+  if gap then
+    local now = os.time()
+    if not self._last_prebase_hold_log or now - self._last_prebase_hold_log >= 60 then
+      self._last_prebase_hold_log = now
+      print(string.format(
+        "connect_pending_blocks: HELD for pre-base header backfill (staged %d/%d)%s",
+        gap.frontier_height or 0, (gap.root_height or 1) - 1,
+        gap.error and (" ERROR: " .. tostring(gap.error)) or ""))
+    end
+    return true
+  end
+
   -- Connect blocks in height order starting from next_connect_height
   local blocks_this_call = 0
   -- At tip (reached_tip) connect ONE block per call so the event loop services

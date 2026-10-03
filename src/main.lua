@@ -1419,6 +1419,11 @@ local function main()
     end
   end
 
+  -- Snapshot-booted datadir (fresh inject above, or restart): if the held
+  -- header chain below the base does not reach genesis, open the pre-base
+  -- backfill; block connection is held until it links (sync.lua).
+  header_chain:refresh_prebase_gap()
+
   -- --reindex (full): Bitcoin Core re-reads every blk*.dat file from disk
   -- and rebuilds BOTH the block index AND the chainstate (init.cpp
   -- LoadBlocksFromDisk → ActivateBestChain).  In lunarblock today, the
@@ -3297,6 +3302,15 @@ local function main()
           header_chain:start_sync(p)
           break
         end
+      end
+    end
+
+    -- Snapshot boot: drive the pre-base header backfill (sync.lua
+    -- refresh_prebase_gap).  Independent of the forward-sync latch above.
+    if header_chain.prebase_gap then
+      local peers = peer_manager:get_established_peers()
+      if #peers > 0 then
+        pcall(function() header_chain:maybe_request_prebase(peers[1]) end)
       end
     end
 

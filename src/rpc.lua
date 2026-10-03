@@ -165,6 +165,14 @@ local function bip22_result(err)
   if err == nil then return nil end  -- success
   local s = tostring(err):lower()
 
+  -- A needed ancestor header is not held (snapshot boot before the pre-base
+  -- backfill completes): no verdict.  Core cannot reach this state; the
+  -- honest answer is "inconclusive", never a reject token.  Checked first so
+  -- no rule token inside the detail text can win.
+  if s:find("missing%-ancestor%-header") then
+    return "inconclusive"
+  end
+
   -- Strip any leading Lua position prefix ("src/validation.lua:246: ") that
   -- assert()/error(level>0) prepends. Bare BIP-22 tokens raised via
   -- assert(cond, "bad-cb-length") arrive as "…/validation.lua:246: bad-cb-length";
@@ -2658,22 +2666,15 @@ function RPCServer:register_methods()
     -- Compute the median-time-past of the block at `h` from LIVE storage
     -- headers (read-only). Used to feed connect_block's BIP68/BIP113 checks
     -- in the level-4 sandbox without mutating anything.
+    -- FAIL CLOSED: a missing ancestor / partial window yields nil (+ reason),
+    -- never os.time() or a short-window median (see utxo.compute_mtp_from_storage).
     local function mtp_at_height(h)
       local hh = rpc.storage.get_hash_by_height(h)
-      if not hh then return os.time() end
-      local timestamps = {}
-      local cur = hh
-      for _ = 1, 11 do
-        local hdr = rpc.storage.get_header(cur)
-        if not hdr then break end
-        timestamps[#timestamps + 1] = hdr.timestamp
-        if not hdr.prev_hash or types.hash256_eq(hdr.prev_hash, types.hash256_zero()) then
-          break
-        end
-        cur = hdr.prev_hash
+      if not hh then
+        return nil, string.format("%s: no header at height %d",
+          validation.MISSING_ANCESTOR, h)
       end
-      if #timestamps == 0 then return os.time() end
-      return consensus.get_median_time_past(timestamps)
+      return utxo_mod.compute_mtp_from_storage(rpc.storage, hh)
     end
 
     -- Re-run the FULL block-connection validator on a throwaway in-memory
@@ -2726,6 +2727,7 @@ function RPCServer:register_methods()
       local get_block_mtp = nil
       if height > 0 then
         prev_block_mtp = mtp_at_height(height - 1)
+        if prev_block_mtp == nil then return false end
         get_block_mtp = function(h) return mtp_at_height(h) end
       end
 
@@ -12544,7 +12546,12 @@ end
     -- for IsFinalTx and BIP-68, so the two computations are consistent.
     -- Reference: bitcoin-core/src/validation.cpp:4092
     if rpc.chain_state and rpc.chain_state.tip_height and rpc.chain_state.tip_height >= 0 then
-      local prev_mtp = get_median_time_past(rpc.storage, rpc.chain_state.tip_hash)
+      -- Checked lookup: a partial window is not Core's MTP (fail closed).
+      local prev_mtp = require("lunarblock.utxo").compute_mtp_from_storage(
+        rpc.storage, rpc.chain_state.tip_hash)
+      if prev_mtp == nil then
+        return "inconclusive"
+      end
       if block.header.timestamp <= prev_mtp then
         return "time-too-old"
       end
