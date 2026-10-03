@@ -213,20 +213,38 @@ if type(res) == "string" then
   sf:close()
   os.exit(0)
 end
+-- Wait for the scheduled flush to be INSTALLED for the META column family
+-- (chain_tip). db.property() reads the default CF, which holds nothing here,
+-- so its counters are zero before the background flush has even started;
+-- under load that let SIGKILL land first (height 0). The non-blocking
+-- checkpoint switches the memtables before it returns, so META's
+-- immutable-memtable count is >= 1 until the flush is durable.
+ffi.cdef("char* rocksdb_property_value_cf(void* db, void* cf, const char* name); void rocksdb_free(void* p);")
+local rlib = ffi.load("rocksdb")
+local function meta_prop(name)
+  local v = rlib.rocksdb_property_value_cf(db._db, db._handles[storage.CF.META], name)
+  if v == nil then return nil end
+  local s = ffi.string(v)
+  rlib.rocksdb_free(v)
+  return s
+end
 local start = socket.gettime()
-local deadline = start + 3
+local deadline = start + 30
+local polls, saw_imm = 0, "?"
 while socket.gettime() < deadline do
+  polls = polls + 1
   local cps = db.stats.checkpoints or 0
-  local running = db.property("rocksdb.num-running-flushes")
-  local pending = db.property("rocksdb.mem-table-flush-pending")
-  local imm = db.property("rocksdb.num-immutable-mem-table")
-  if cps >= 1 and running == "0" and pending == "0" and imm == "0" then
+  if polls == 1 then saw_imm = tostring(meta_prop("rocksdb.num-immutable-mem-table")) end
+  if cps == 0 and socket.gettime() > start + 0.2 then break end
+  if cps >= 1 and meta_prop("rocksdb.num-immutable-mem-table") == "0"
+     and meta_prop("rocksdb.mem-table-flush-pending") == "0"
+     and db.property("rocksdb.num-running-flushes") == "0" then
     break
   end
-  if cps == 0 and socket.gettime() > start + 0.2 then break end
   socket.sleep(0.01)
 end
-sf:write("checkpoints=" .. tostring(db.stats.checkpoints or 0))
+sf:write("checkpoints=" .. tostring(db.stats.checkpoints or 0)
+  .. " meta_imm_first_poll=" .. saw_imm .. " polls=" .. polls)
 sf:close()
 ffi.C.kill(ffi.C.getpid(), 9)
 ]=],

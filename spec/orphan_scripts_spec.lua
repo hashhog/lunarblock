@@ -105,6 +105,8 @@ local INCLUDED = {
   "tests/test_w141_zmq_rest_notify.lua",
   "tests/test_w156_bip152_uint16_caps.lua",
   "tests/test_w157_feeler_anti_eclipse.lua",
+  "tests/test_walk_snapshot_consistency.lua",
+  "tests/test_walk_yield_submitblock_checkpoint.lua",
   "tests/test_witness_malleated_p2sh.lua",
   "test_accept_block.lua",
   "test_bip141_witness_commitment.lua",
