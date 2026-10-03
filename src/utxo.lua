@@ -5497,6 +5497,13 @@ end
 --                    blocks connected from on_slice are NOT part of this
 --                    walk. A throw from on_slice is swallowed so a pump
 --                    fault cannot abort the hash.
+--   interruption_point
+--                    -- called once before the first coin, after each yield,
+--                    and once after the last group. Core's RpcInterruptionPoint
+--                    runs per coin; checking at the yield (between txs, ~50ms)
+--                    is the same shutdown abort. One wide tx is not split — a
+--                    30k-output tx walks without a yield. A throw aborts the
+--                    walk and is not swallowed, unlike on_slice.
 --
 -- @return coins_emitted, peak_group_size
 function M.stream_utxo_groups(storage, write_group, opts)
@@ -5507,6 +5514,7 @@ function M.stream_utxo_groups(storage, write_group, opts)
   local slice_groups = opts.slice_groups
   local slice_seconds = opts.slice_seconds or 0
   local on_slice = opts.on_slice
+  local interruption_point = opts.interruption_point
   local since = 0
   local gettime, slice_t0
   if on_slice and slice_seconds > 0 then
@@ -5519,6 +5527,10 @@ function M.stream_utxo_groups(storage, write_group, opts)
   local outputs = {}
   local sorted_vouts = {}
   local n_vouts = 0
+
+  local function note_interrupt()
+    if interruption_point then interruption_point() end
+  end
 
   local function flush()
     if current_txid == nil or n_vouts == 0 then return end
@@ -5542,13 +5554,18 @@ function M.stream_utxo_groups(storage, write_group, opts)
           end
         end
         since = 0
-        if yield then pcall(on_slice) end
+        if yield then
+          pcall(on_slice)
+          -- stop() accepted by this slice must abort before the next group.
+          note_interrupt()
+        end
       end
     end
   end
 
   local iter = storage.iterator(storage_mod.CF.UTXO)
   local ok, err = xpcall(function()
+    note_interrupt()
     iter.seek_to_first()
     while iter.valid() do
       local key = iter.key()
@@ -5570,6 +5587,8 @@ function M.stream_utxo_groups(storage, write_group, opts)
       iter.next()
     end
     flush()
+    -- A stop that landed in the tail (no yield left) still aborts.
+    note_interrupt()
   end, debug.traceback)
   iter.destroy()
   if not ok then error(err) end

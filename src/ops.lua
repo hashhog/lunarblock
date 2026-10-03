@@ -459,6 +459,11 @@ local _signal_callbacks = {}
 local _signal_handlers = {}  -- Keep ffi.cast'd handlers alive for GC.
 local _raised = {}           -- In-process raises (M.raise_signal), pending.
 
+-- Set when SIGTERM/SIGINT is dispatched. Long RPC walks (gettxoutsetinfo)
+-- poll this and abort; Core's RpcInterruptionPoint throws once InterruptRPC
+-- has cleared g_rpc_running. Stays set for the rest of the process.
+M.shutting_down = false
+
 local function _install(signum)
   if _signal_flags[signum] then return end  -- idempotent
   local flag = ffi.new("int[1]", 0)
@@ -499,6 +504,11 @@ function M.poll_signals()
     if flag[0] ~= 0 or (_raised[signum] and _signal_callbacks[signum]) then
       flag[0] = 0
       _raised[signum] = nil
+      -- Latch before the callback so a walk's interruption point observes
+      -- shutdown even if the callback only flips the main loop's `running`.
+      if signum == M.SIGTERM or signum == M.SIGINT then
+        M.shutting_down = true
+      end
       local cb = _signal_callbacks[signum]
       if cb then
         local ok, err = pcall(cb)
@@ -509,6 +519,25 @@ function M.poll_signals()
       end
     end
   end
+end
+
+--- True when shutdown has been requested.
+-- If SIGTERM/SIGINT is pending but not yet dispatched, dispatch it first
+-- (the same poll the main loop does) so a walk aborted mid-slice still
+-- runs the handler that clears `running`. Common path is a few loads:
+-- nothing pending, return false. A raised signal with no handler installed
+-- stays pending (stop before set_signal_handler) and does not latch.
+-- @return boolean
+function M.poll_shutdown()
+  if M.shutting_down then return true end
+  local term_flag = _signal_flags[M.SIGTERM]
+  local int_flag = _signal_flags[M.SIGINT]
+  local pending = _raised[M.SIGTERM] or _raised[M.SIGINT]
+      or (term_flag and term_flag[0] ~= 0)
+      or (int_flag and int_flag[0] ~= 0)
+  if not pending then return false end
+  M.poll_signals()
+  return M.shutting_down and true or false
 end
 
 --- Tear down all installed handlers.  Used by tests so the busted runner
@@ -522,6 +551,7 @@ function M.reset_signal_handlers()
   _signal_callbacks = {}
   _signal_handlers = {}
   _raised = {}
+  M.shutting_down = false
 end
 
 --------------------------------------------------------------------------------

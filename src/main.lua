@@ -3363,6 +3363,9 @@ local function main()
     if not rpc_ok then
       print(string.format("RPC tick error: %s", tostring(rpc_err)))
     end
+    -- Long-polls deferred during a gettxoutsetinfo walk. A block connected
+    -- above may be the tip they were waiting on; shutdown answers the rest.
+    pcall(function() rpc_server:drain_deferred_waits() end)
 
     -- Process REST
     if rest_server then
@@ -3476,6 +3479,9 @@ local function main()
 
   -- Cleanup
   print("Shutting down...")
+  -- Core's waitfor* returns the current block on shutdown. Do this before
+  -- the RPC socket is closed so a deferred long-poll still gets a reply.
+  pcall(function() rpc_server:drain_deferred_waits() end)
 
   -- Stop JIT profiling
   if args.jitprofile then

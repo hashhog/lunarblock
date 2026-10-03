@@ -484,6 +484,9 @@ M.ERROR = {
   INSUFFICIENT_FUNDS = -6,
   OUT_OF_MEMORY = -7,
   INVALID_PARAMETER = -8,  -- RPC_INVALID_PARAMETER (Core: protocol.h)
+  -- RpcInterruptionPoint (rpc/server.cpp) throws this once shutdown has
+  -- started: "Shutting down". Not the same as CLIENT_NODE_NOT_CONNECTED.
+  CLIENT_NOT_CONNECTED = -9,  -- RPC_CLIENT_NOT_CONNECTED (protocol.h)
   -- P2P client-side error codes (Core protocol.h:60-63).  These mirror
   -- bitcoin-core/src/rpc/net.cpp's addnode/disconnectnode/setban handlers
   -- exactly: a duplicate `addnode "add"` -> -23, a stale `addnode "remove"`
@@ -1890,6 +1893,16 @@ function RPCServer:handle_single_request(request)
     }
   end
 
+  -- Long-poll deferred across a gettxoutsetinfo walk. Not a JSON result;
+  -- tick() holds the socket and drain_deferred_waits writes the reply.
+  if type(result) == "table" and result._defer_longpoll then
+    local waits = self._deferred_waits
+    if waits and #waits > 0 then
+      waits[#waits].id = id
+    end
+    return { _defer_longpoll = true, id = id }
+  end
+
   -- W51: handlers that need Core-byte-exact JSON (e.g. decodepsbt) can
   -- return {_raw_json = "<pre-encoded result string>"} to bypass cjson's
   -- float serialisation.  We embed the raw fragment directly instead of
@@ -1925,17 +1938,23 @@ function RPCServer:handle_request(request_body)
   -- Check for batch request: array with numeric keys
   -- JSON arrays in cjson have consecutive integer keys starting at 1
   if type(parsed) == "table" and parsed[1] ~= nil then
-    -- This is a batch request
+    -- This is a batch request. Wait-family calls inside a batch stay
+    -- inline: one body cannot grow a second response later.
+    self._in_batch = true
+    local function finish_batch(body, status)
+      self._in_batch = false
+      return body, status
+    end
     local batch_size = #parsed
 
     -- Enforce max batch size
     if batch_size > M.MAX_BATCH_SIZE then
-      return cjson.encode({
+      return finish_batch(cjson.encode({
         result = cjson.null,
         error = {code = M.ERROR.INVALID_REQUEST,
                  message = "Batch request exceeds maximum size of " .. M.MAX_BATCH_SIZE},
         id = cjson.null,
-      }), 400
+      }), 400)
     end
 
     -- Process each request in the batch
@@ -1961,7 +1980,7 @@ function RPCServer:handle_request(request_body)
 
     -- If all requests were notifications, return no content
     if #responses == 0 and batch_size > 0 then
-      return "", 204
+      return finish_batch("", 204)
     end
 
     -- W51: splice any _raw_json_result fragments into the batch output.
@@ -1981,10 +2000,10 @@ function RPCServer:handle_request(request_body)
           parts[#parts + 1] = cjson.encode(r)
         end
       end
-      return "[" .. table.concat(parts, ",") .. "]", nil
+      return finish_batch("[" .. table.concat(parts, ",") .. "]", nil)
     end
 
-    return cjson.encode(responses), nil
+    return finish_batch(cjson.encode(responses), nil)
   end
 
   -- Singleton request
@@ -1993,6 +2012,12 @@ function RPCServer:handle_request(request_body)
   -- Handle notification (no response)
   if response == nil then
     return "", 204
+  end
+
+  -- Long-poll held open across a gettxoutsetinfo walk. tick() keeps the
+  -- socket; there is no body yet.
+  if response._defer_longpoll then
+    return nil, "deferred"
   end
 
   -- W51: if the handler produced a pre-encoded result fragment, splice it
@@ -2936,6 +2961,34 @@ function RPCServer:register_methods()
       return {hash = display, height = height}
     end
 
+    -- A wait that arrives on the nested tick inside gettxoutsetinfo must
+    -- not run this loop: the walk is the caller, so the loop pauses the
+    -- walk until a block arrives. Core's long-poll does not share the
+    -- walk's thread. Defer the response; drain_deferred_waits answers it
+    -- when the tip matches, the timeout elapses, or shutdown is requested.
+    -- Batches stay inline (one HTTP body, no second response to send).
+    if rpc._utxo_walk_active and not rpc._in_batch then
+      local deadline = nil
+      if timeout_ms and timeout_ms > 0 then
+        deadline = socket.gettime() + (timeout_ms / 1000.0)
+      end
+      local waits = rpc._deferred_waits
+      if not waits then
+        waits = {}
+        rpc._deferred_waits = waits
+      end
+      waits[#waits + 1] = {
+        predicate = predicate,
+        deadline = deadline,
+        tip = function()
+          return wait_current_tip(rpc)
+        end,
+        id = nil,
+        client = nil,
+      }
+      return { _defer_longpoll = true }
+    end
+
     -- Re-entrancy guard: the pump runs a nested rpc_server:tick(), which could
     -- dispatch ANOTHER wait RPC.  A nested wait must NOT recurse into the pump
     -- (unbounded recursion / re-entrant accept loop); it falls into the
@@ -2975,6 +3028,15 @@ function RPCServer:register_methods()
         -- Best-effort: a pump fault must not abort the wait — we still
         -- re-check the predicate and the deadline.
         pcall(pump)
+
+        -- Core returns the current block on shutdown (blockchain.cpp
+        -- "Return current block upon shutdown") instead of waiting out
+        -- the timeout. stop() during this pump latches SIGTERM; poll it
+        -- here so we don't sleep until the next slice to notice.
+        if require("lunarblock.ops").poll_shutdown() then
+          display, height = wait_current_tip(rpc)
+          return {hash = display, height = height}
+        end
 
         -- If the pump advanced the tip (generation bumped), loop immediately
         -- without sleeping so the response is prompt (sub-second wake).  Only
@@ -14106,12 +14168,26 @@ function RPCServer:setup_w47b_methods()
     if slice_groups == nil then slice_groups = 2048 end
     local slice_seconds = rpc._utxo_walk_slice_seconds
     if slice_seconds == nil then slice_seconds = 0.05 end
+    local ops_mod = require("lunarblock.ops")
+    -- Core RpcInterruptionPoint: a shutdown request aborts the cursor
+    -- instead of running the walk to completion (stop_mainnet's grace
+    -- would otherwise SIGKILL a ~1500s mainnet walk).
+    local function interruption_point()
+      if ops_mod.poll_shutdown() then
+        error({code = M.ERROR.CLIENT_NOT_CONNECTED, message = "Shutting down"})
+      end
+    end
     local function pump_slice()
       local pump = rpc.tip_pump
       if not pump or rpc._in_utxo_walk_pump then return end
       rpc._in_utxo_walk_pump = true
       pcall(pump)
       rpc._in_utxo_walk_pump = false
+      -- waitfornewblock accepted by the nested tick is deferred; answer it
+      -- on this slice if the tip already moved (or shutdown landed).
+      if rpc.drain_deferred_waits then
+        pcall(function() rpc:drain_deferred_waits() end)
+      end
     end
     -- Core flushes the chainstate before it walks it
     -- (rpc/blockchain.cpp gettxoutsetinfo: ForceFlushStateToDisk). Here:
@@ -14132,9 +14208,16 @@ function RPCServer:setup_w47b_methods()
       slice_groups = slice_groups,
       slice_seconds = slice_seconds,
       on_slice = rpc.tip_pump and pump_slice or nil,
+      interruption_point = interruption_point,
     })
     rpc._utxo_walk_active = false
-    if not (ok_stats and type(stats) == "table") then
+    if not ok_stats then
+      -- Preserve the shutdown abort (-9 "Shutting down"). Anything else
+      -- is still a failed read of the set.
+      if type(stats) == "table" and stats.code then error(stats) end
+      error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
+    end
+    if type(stats) ~= "table" then
       error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
     end
 
@@ -15218,6 +15301,15 @@ function RPCServer:tick()
   -- Handle JSON-RPC
   if method == "POST" then
     local response_body, status_override = self:handle_request(body, wallet_name)
+    if status_override == "deferred" then
+      -- waitfor* arrived during a gettxoutsetinfo walk. The handler stashed
+      -- a waiter; hold this socket until drain_deferred_waits replies.
+      local waits = self._deferred_waits
+      local w = waits and waits[#waits]
+      if w and w.client == nil then w.client = client end
+      self.request_wallet = nil
+      return
+    end
     local status = status_override or 200
     client:send(M.build_http_response(status, response_body))
   else
@@ -15228,6 +15320,49 @@ function RPCServer:tick()
   self.request_wallet = nil
 
   client:close()
+end
+
+--- Answer waitfornewblock / waitforblock / waitforblockheight calls that
+-- were deferred because they arrived mid-gettxoutsetinfo. Called after
+-- each walk slice and once per main-loop turn. Core returns the current
+-- tip on predicate match, timeout, or shutdown.
+function RPCServer:drain_deferred_waits()
+  local waits = self._deferred_waits
+  if not waits or #waits == 0 then return end
+  local ops_mod = require("lunarblock.ops")
+  local now = socket.gettime()
+  local shutting = ops_mod.shutting_down
+  local i = 1
+  while i <= #waits do
+    local w = waits[i]
+    local display, height = w.tip()
+    local ready = shutting or (w.predicate and w.predicate(display, height))
+    if not ready and w.deadline ~= nil and now >= w.deadline then
+      ready = true
+    end
+    if ready then
+      local result = {hash = display, height = height}
+      w.result = result
+      if not self._completed_waits then self._completed_waits = {} end
+      self._completed_waits[#self._completed_waits + 1] = result
+      if w.client then
+        local body = cjson.encode({
+          result = result,
+          error = cjson.null,
+          id = (w.id ~= nil) and w.id or cjson.null,
+        })
+        local client = w.client
+        w.client = nil
+        pcall(function()
+          client:send(M.build_http_response(200, body))
+          client:close()
+        end)
+      end
+      table.remove(waits, i)
+    else
+      i = i + 1
+    end
+  end
 end
 
 function RPCServer:stop()
