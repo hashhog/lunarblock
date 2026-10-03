@@ -3322,7 +3322,13 @@ local function main()
     if header_chain.prebase_gap then
       local peers = peer_manager:get_established_peers()
       if #peers > 0 then
-        pcall(function() header_chain:maybe_request_prebase(peers[1]) end)
+        -- Rotate the backfill peer every retry window: a peer that silently
+        -- ignores getheaders (Core does while its own chain is below
+        -- MinimumChainWork; crawlers/light clients do too) must not pin the
+        -- hold forever just because it sorts first.
+        local win = header_chain.PREBASE_RETRY_SECONDS or 30
+        local i = (math.floor(os.time() / win) % #peers) + 1
+        pcall(function() header_chain:maybe_request_prebase(peers[i]) end)
       end
     end
 
