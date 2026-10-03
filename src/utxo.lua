@@ -5448,10 +5448,31 @@ end
 --   outputs is a map vout -> raw on-disk value bytes; valid only during
 --   the callback. Malformed keys (not 36 bytes) are skipped.
 --
+-- opts (optional):
+--   slice_groups  -- call on_slice after this many txid groups
+--   slice_seconds -- if > 0, also wait until this much wall time has
+--                    elapsed since the last yield (checked every
+--                    slice_groups). 0 yields on the group count alone.
+--   on_slice      -- cooperative yield. The iterator stays open and is a
+--                    point-in-time snapshot (RocksDB sequence at creation);
+--                    blocks connected from on_slice are NOT part of this
+--                    walk. A throw from on_slice is swallowed so a pump
+--                    fault cannot abort the hash.
+--
 -- @return coins_emitted, peak_group_size
-function M.stream_utxo_groups(storage, write_group)
+function M.stream_utxo_groups(storage, write_group, opts)
   if not storage or not storage.iterator then
     return 0, 0
+  end
+  opts = opts or {}
+  local slice_groups = opts.slice_groups
+  local slice_seconds = opts.slice_seconds or 0
+  local on_slice = opts.on_slice
+  local since = 0
+  local gettime, slice_t0
+  if on_slice and slice_seconds > 0 then
+    gettime = require("socket").gettime
+    slice_t0 = gettime()
   end
   local coins = 0
   local peak = 0
@@ -5469,6 +5490,22 @@ function M.stream_utxo_groups(storage, write_group)
     outputs = {}
     sorted_vouts = {}
     n_vouts = 0
+    if on_slice and slice_groups and slice_groups >= 1 then
+      since = since + 1
+      if since >= slice_groups then
+        local yield = true
+        if slice_seconds > 0 then
+          local now = gettime()
+          if now - slice_t0 < slice_seconds then
+            yield = false
+          else
+            slice_t0 = now
+          end
+        end
+        since = 0
+        if yield then pcall(on_slice) end
+      end
+    end
   end
 
   local iter = storage.iterator(storage_mod.CF.UTXO)
@@ -5505,8 +5542,9 @@ end
 --            "muhash" (MuHash3072 of the same per-coin bytes),
 --            "none" (counts/amounts only).
 -- Holds one txid group. ApplyStats + ApplyHash per group, then FinalizeHash.
+-- opts is forwarded to stream_utxo_groups (slice yield for gettxoutsetinfo).
 -- @return {hash, txouts, transactions, bogosize, total_amount, peak}
-function ChainState:compute_utxo_stats(hash_type)
+function ChainState:compute_utxo_stats(hash_type, opts)
   hash_type = hash_type or "hash_serialized_3"
   self.coin_view:flush()
 
@@ -5549,7 +5587,7 @@ function ChainState:compute_utxo_stats(hash_type)
       local vout = vouts[i]
       apply_coin(txid, vout, outputs[vout])
     end
-  end)
+  end, opts)
 
   local hash
   if hasher then

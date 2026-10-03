@@ -12482,8 +12482,14 @@ end
             check_diffbits = true, check_block = true }
         )
         if result == "connected" then
-          -- Reorg succeeded; B3 is now the active tip.  Sync the
-          -- block_downloader / mempool just like the best-chain path.
+          -- Reorg succeeded; B3 is now the active tip.  The reorg connect
+          -- itself syncs (nosync=false).  Also arm the shared periodic
+          -- checkpoint so the window matches the P2P connect loop.
+          if rpc.storage and rpc.storage.maybe_periodic_checkpoint then
+            local new_h = rpc.chain_state.tip_height or 0
+            pcall(rpc.storage.maybe_periodic_checkpoint, new_h + 1, socket.gettime())
+          end
+          -- Sync the block_downloader / mempool just like the best-chain path.
           if rpc.block_downloader and rpc.block_downloader.next_connect_height then
             local new_h = rpc.chain_state.tip_height or 0
             if new_h >= rpc.block_downloader.next_connect_height then
@@ -12555,12 +12561,13 @@ end
     -- Block/header/height_index storage writes are included in the same atomic
     -- WriteBatch as the UTXO flush and chain tip update via caller_batch_fn.
     if rpc.chain_state and rpc.chain_state.accept_block then
-      -- During bulk import (many sequential submitblock calls), skip fsync on
-      -- most blocks and only sync every 500 blocks to amortize the cost.
-      -- After IBD, post-tip blocks are rare enough that always syncing is fine,
-      -- but the height check below handles both cases.
-      rpc._submitblock_count = (rpc._submitblock_count or 0) + 1
-      local nosync = (rpc._submitblock_count % 500 ~= 0)
+      -- Durability is storage.maybe_periodic_checkpoint (same block/time
+      -- window as the P2P connect loop), not a blocking fsync every 500
+      -- blocks. The every-500 sync never fired on a slow miner (one block
+      -- per 10 minutes loses days of work on SIGKILL) and stalled this
+      -- thread when it did. nosync stays true; the checkpoint is non-blocking
+      -- and is a no-op until the window is due.
+      local nosync = true
 
       -- Use the original raw bytes instead of re-serializing the block
       local block_data = raw
@@ -12686,6 +12693,15 @@ end
     -- Notify mempool of new block
     if rpc.mempool then
       rpc.mempool:on_block_connected(block)
+    end
+
+    -- Same periodic checkpoint the P2P connect loop uses. Without this a
+    -- submitblock-fed node never reaches storage.checkpoint(), and with the
+    -- WAL off SIGKILL drops every block since the last flush. The coin set
+    -- that remains is consistent (atomic flush); the loss window is the
+    -- checkpoint cadence, not "everything since process start".
+    if rpc.storage and rpc.storage.maybe_periodic_checkpoint then
+      pcall(rpc.storage.maybe_periodic_checkpoint, new_height + 1, socket.gettime())
     end
 
     return cjson.null  -- success
@@ -14059,6 +14075,15 @@ function RPCServer:setup_w47b_methods()
     -- STREAMING-UTXO-GROUPS: coinstats.cpp:111-146 (one std::map per txid,
     -- ApplyStats + ApplyHash) then FinalizeHash SHA256d at 161-163, 182-184.
     -- Peak is the widest tx, not the set.
+    --
+    -- The walk used to run to completion inside this tick, so peers, other
+    -- RPC, and block connect froze for the whole coin set (mainnet is
+    -- ~1500s). It now yields to rpc.tip_pump between slices — the same
+    -- cooperative pump the wait-family RPCs use — while the iterator stays
+    -- a point-in-time snapshot. height/bestblock below are the tip from
+    -- BEFORE the walk, so they still name the set that was hashed even if
+    -- a slice connects a block. A second gettxoutsetinfo during the walk
+    -- is refused; the outer walk is the one pumping.
     local tip_height  = rpc.chain_state.tip_height or 0
     local tip_hash    = rpc.chain_state.tip_hash
     local tip_hash_hex = tip_hash and types.hash256_hex(tip_hash) or string.rep("0", 64)
@@ -14066,8 +14091,29 @@ function RPCServer:setup_w47b_methods()
     if not (rpc.chain_state.compute_utxo_stats) then
       error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
     end
+    if rpc._utxo_walk_active then
+      error({code = M.ERROR.MISC_ERROR,
+             message = "gettxoutsetinfo already in progress"})
+    end
+    local slice_groups = rpc._utxo_walk_slice_groups
+    if slice_groups == nil then slice_groups = 2048 end
+    local slice_seconds = rpc._utxo_walk_slice_seconds
+    if slice_seconds == nil then slice_seconds = 0.05 end
+    local function pump_slice()
+      local pump = rpc.tip_pump
+      if not pump or rpc._in_utxo_walk_pump then return end
+      rpc._in_utxo_walk_pump = true
+      pcall(pump)
+      rpc._in_utxo_walk_pump = false
+    end
+    rpc._utxo_walk_active = true
     local ok_stats, stats = pcall(rpc.chain_state.compute_utxo_stats,
-                                 rpc.chain_state, hash_type)
+                                 rpc.chain_state, hash_type, {
+      slice_groups = slice_groups,
+      slice_seconds = slice_seconds,
+      on_slice = rpc.tip_pump and pump_slice or nil,
+    })
+    rpc._utxo_walk_active = false
     if not (ok_stats and type(stats) == "table") then
       error({code = M.ERROR.INTERNAL_ERROR, message = "Unable to read UTXO set"})
     end

@@ -4135,39 +4135,50 @@ function BlockDownloader:_connect_pending_blocks_inner()
     -- Flush UTXO set periodically during IBD. The sync=true write of
     -- chain_tip fsyncs the WAL up to that point, durably persisting
     -- ALL prior writes (the per-block atomic batch from connect_block,
-    -- which ran with sync=false). Two trigger conditions:
+    -- which ran with sync=false). Two trigger conditions, evaluated by
+    -- storage.maybe_periodic_checkpoint so submitblock (which never
+    -- enters this loop) shares the same window:
     --   1. utxo_flush_interval blocks since last sync (bounds loss-by-block)
     --   2. utxo_flush_max_seconds wall-clock since last sync (bounds
     --      loss-by-time, in case IBD is slow due to disk pressure /
     --      compaction lag, which is exactly the regime where a crash
     --      becomes more likely).
+    -- checkpoint() returns false when it skipped because a flush is still
+    -- running; the helper leaves the trigger armed so the next block retries.
     local _flush_t = 0
     do
       local _now = require("socket").gettime()
       if self.last_flush_time == 0 then
         self.last_flush_time = _now
       end
-      local block_trigger = self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval
-      local time_trigger = _now - self.last_flush_time >= self.utxo_flush_max_seconds
-      if block_trigger or time_trigger then
+      if self.storage.maybe_periodic_checkpoint then
+        self.storage.checkpoint_interval = self.utxo_flush_interval
+        self.storage.checkpoint_max_seconds = self.utxo_flush_max_seconds
         local _fp0 = perf.now()
-        local done = true
-        if self.storage.checkpoint then
-          -- chain_tip is already in the atomic per-block batch; make it (and
-          -- everything before it) durable.  Checkpoint mode: schedule an
-          -- atomic memtable flush (non-blocking).  Legacy WAL mode:
-          -- fdatasync the WAL, exactly what the sync chain_tip rewrite did.
-          -- checkpoint() returns false when it skipped because a flush is
-          -- still running; keep the trigger armed so the next block retries
-          -- as soon as that flush has finished.
-          done = self.storage.checkpoint(false) ~= false
-        else
-          self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
+        local result = self.storage.maybe_periodic_checkpoint(self.next_connect_height, _now)
+        if result ~= nil then
+          _flush_t = perf.now() - _fp0
+          if result ~= false then
+            self.last_flush_height = self.next_connect_height
+            self.last_flush_time = _now
+          end
         end
-        _flush_t = perf.now() - _fp0
-        if done then
-          self.last_flush_height = self.next_connect_height
-          self.last_flush_time = _now
+      else
+        local block_trigger = self.next_connect_height - self.last_flush_height >= self.utxo_flush_interval
+        local time_trigger = _now - self.last_flush_time >= self.utxo_flush_max_seconds
+        if block_trigger or time_trigger then
+          local _fp0 = perf.now()
+          local done = true
+          if self.storage.checkpoint then
+            done = self.storage.checkpoint(false) ~= false
+          elseif self.storage.set_chain_tip then
+            self.storage.set_chain_tip(pending.hash, pending.height, true)  -- sync write
+          end
+          _flush_t = perf.now() - _fp0
+          if done then
+            self.last_flush_height = self.next_connect_height
+            self.last_flush_time = _now
+          end
         end
       end
     end

@@ -411,6 +411,52 @@ local function attach_high_level_helpers(dbobj)
 end
 
 --------------------------------------------------------------------------------
+-- Periodic durability point shared by the P2P connect loop and submitblock.
+--
+-- checkpoint() itself is the flush. This decides WHEN, so a miner-style
+-- node (blocks only via submitblock, never the P2P connect loop) bounds
+-- SIGKILL loss the same way IBD does: checkpoint_interval blocks or
+-- checkpoint_max_seconds, whichever comes first. A non-blocking checkpoint
+-- that finds a flush already running returns false and leaves the window
+-- armed for the next block. nil means "not due" (no flush was attempted).
+-- First call arms the timer without counting as a time trigger, matching
+-- the old sync.lua latch.
+--------------------------------------------------------------------------------
+local function attach_periodic_checkpoint(dbobj, wal_enabled)
+  if wal_enabled then
+    dbobj.checkpoint_interval = 200
+    dbobj.checkpoint_max_seconds = 60
+  else
+    dbobj.checkpoint_interval = 1000
+    dbobj.checkpoint_max_seconds = 300
+  end
+  dbobj.checkpoint_last_height = 0
+  dbobj.checkpoint_last_time = 0
+  function dbobj.maybe_periodic_checkpoint(height, now)
+    now = now or os.time()
+    height = height or 0
+    if (dbobj.checkpoint_last_time or 0) == 0 then
+      dbobj.checkpoint_last_time = now
+    end
+    local interval = dbobj.checkpoint_interval or 1000
+    if interval < 1 then interval = 1 end
+    local max_s = dbobj.checkpoint_max_seconds or 300
+    local block_trigger = height - (dbobj.checkpoint_last_height or 0) >= interval
+    local time_trigger = (now - dbobj.checkpoint_last_time) >= max_s
+    if not block_trigger and not time_trigger then
+      return nil
+    end
+    -- false: a flush is already running; caller keeps the trigger armed.
+    local done = dbobj.checkpoint(false) ~= false
+    if done then
+      dbobj.checkpoint_last_height = height
+      dbobj.checkpoint_last_time = now
+    end
+    return done
+  end
+end
+
+--------------------------------------------------------------------------------
 -- In-memory storage backend.
 --
 -- Implements the exact same dbobj interface as M.open (get/put/delete/batch/
@@ -548,6 +594,7 @@ function M.new_memory_storage()
   function dbobj.checkpoint(_wait)
     dbobj.stats.checkpoints = dbobj.stats.checkpoints + 1
   end
+  attach_periodic_checkpoint(dbobj, false)
 
   function dbobj.close()
     dbobj._cfs = nil
@@ -579,8 +626,9 @@ end
 --     batches (FlushStateToDisk), not per block.
 --   * A crash (SIGKILL, OOM, power loss) rolls the chainstate back to the last
 --     flush; the node re-downloads and reconnects from there.  Bounded by the
---     memtable size (~256 MB of writes) and by sync.lua's periodic
---     checkpoint() (time/block triggered).
+--     memtable size (~256 MB of writes) and by maybe_periodic_checkpoint()
+--     (time/block triggered), called from the P2P connect loop AND from
+--     submitblock — a miner-style node has no P2P connect loop.
 --   * Callers that ask for durability (put/delete/batch.write with sync=true:
 --     reorg commit, snapshot activation, header-tip anchors) get a blocking
 --     atomic flush after the write, so "returned => durable" still holds.
@@ -958,6 +1006,7 @@ function M.open(path, cache_size_mb, open_opts)
     dbobj.stats.checkpoints = dbobj.stats.checkpoints + 1
     return true
   end
+  attach_periodic_checkpoint(dbobj, wal_enabled)
 
   -- Explicit atomic flush of every memtable, regardless of mode (tests,
   -- maintenance).  wait=true blocks until durable.
