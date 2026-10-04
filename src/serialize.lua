@@ -6,24 +6,42 @@ local _ffi64 = ffi_ok and _ffi or nil
 -- ReadCompactSize rejects any value above this.
 local MAX_SIZE = 0x02000000
 
+-- Readers return 64-bit fields (read_u64le, a 0xFF CompactSize, services
+-- in version/addr/addrv2) as uint64_t cdata, and those values flow back into
+-- writers: a peer's services stored in addrman and echoed in an addrv2 reply
+-- reached write_varint -> write_u16le -> math.floor(cdata), which raises
+-- "bad argument #1 to 'floor' (number expected, got cdata)".  On mainnet
+-- that failed EVERY addrv2 getaddr reply (1,076 in restart.log, 2026-09-26..
+-- 10-04) and disconnected the asking peer.  The narrow writers accept a
+-- cdata integer by converting it to a Lua number first (exact: every value
+-- they encode is < 2^32).
+local function _num(val)
+  if type(val) == "cdata" then return tonumber(val) end
+  return val
+end
+
 -- BufferWriter: accumulates binary data for serialization
 function M.buffer_writer()
   local parts = {}
   local writer = {}
 
   function writer.write_u8(val)
+    val = _num(val)
     parts[#parts + 1] = string.char(val % 256)
   end
 
   function writer.write_u16le(val)
+    val = _num(val)
     parts[#parts + 1] = string.char(val % 256, math.floor(val / 256) % 256)
   end
 
   function writer.write_u16be(val)
+    val = _num(val)
     parts[#parts + 1] = string.char(math.floor(val / 256) % 256, val % 256)
   end
 
   function writer.write_u32le(val)
+    val = _num(val)
     parts[#parts + 1] = string.char(
       val % 256,
       math.floor(val / 256) % 256,
@@ -33,6 +51,7 @@ function M.buffer_writer()
   end
 
   function writer.write_i32le(val)
+    val = _num(val)
     if val < 0 then val = val + 4294967296 end
     writer.write_u32le(val)
   end
@@ -60,6 +79,13 @@ function M.buffer_writer()
   function writer.write_i64le(val)
     -- Handle negative values: convert to unsigned representation
     -- For 64-bit, we split into two 32-bit parts
+    if type(val) == "cdata" and _ffi64 then
+      -- int64_t/uint64_t cdata: store the two's-complement bit pattern.
+      local buf = _ffi64.new("uint8_t[8]")
+      _ffi64.cast("int64_t*", buf)[0] = _ffi64.cast("int64_t", val)
+      writer.write_bytes(_ffi64.string(buf, 8))
+      return
+    end
     if val < 0 then
       -- Two's complement: add 2^64
       -- Since we can't represent 2^64 directly, we handle it by adding to each part
@@ -81,6 +107,14 @@ function M.buffer_writer()
 
   -- Bitcoin compact size encoding (varint)
   function writer.write_varint(val)
+    if type(val) == "cdata" then
+      if val > 0xFFFFFFFF then
+        writer.write_u8(0xFF)
+        writer.write_u64le(val)
+        return
+      end
+      val = tonumber(val)
+    end
     if val < 0xFD then
       writer.write_u8(val)
     elseif val <= 0xFFFF then
