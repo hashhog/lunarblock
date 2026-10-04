@@ -43,8 +43,6 @@ pcall(ffi.cdef, [[
   int    write(int fd, const void *buf, unsigned long count);
   int    isatty(int fd);
   unsigned int umask(unsigned int mask);
-  typedef void (*sighandler_t)(int);
-  sighandler_t signal(int signum, sighandler_t handler);
 ]])
 
 local O_RDWR  = 2
@@ -441,81 +439,171 @@ end
 -- Signals  (SIGHUP, SIGINT, SIGTERM)
 --------------------------------------------------------------------------------
 --
--- LuaJIT FFI signal handlers run in a *signal context*, which is hostile to
--- Lua callbacks (no GC alloc, no string concat, etc).  The standard pattern
--- is to set a flag in C-callable code and have the main loop poll it.
+-- NO FFI CALLBACK IS EVER INSTALLED AS A SIGNAL HANDLER.
 --
--- We allocate a single `volatile int` per signal (via ffi.new("int[1]"))
--- and wire `signal(N, handler)` where `handler` is an FFI callback that
--- writes to the int.  The main loop then calls poll_signals() every tick
--- and dispatches Lua callbacks on flagged signals.
+-- The previous design wired signal(N, ffi.cast("sighandler_t", lua_fn)).
+-- A LuaJIT FFI callback entered while the VM is executing a compiled trace
+-- aborts the process: lj_ccallback_enter() sees g->jit_base set, pushes
+-- LJ_ERR_FFI_BADCBACK and calls the panic handler, which prints
+--   PANIC: unprotected error in call to Lua API (bad callback)
+-- and exit(1)s -- no pcall can catch it, because the panic happens before
+-- the callback body runs.  A busy node is almost always inside a trace, so
+-- SIGTERM (stop_mainnet, systemctl stop) aborted it without a flush: 9
+-- mainnet aborts 2026-09-26..10-04, each at an operator stop.  A signal
+-- delivered to a non-main thread (RocksDB, coin prefetch, script workers)
+-- would also have entered the main lua_State from a foreign thread.
 --
--- ffi.cast("sighandler_t", lua_fn) does not work safely in all LuaJIT 2.1
--- versions, so we use ffi.cast("void(*)(int)", lua_fn) with a Lua closure
--- that ONLY mutates a preallocated int[1] flag — no string formatting,
--- no error(), no GC.
-local _signal_flags = {}
+-- Instead the shutdown signals are BLOCKED and collected synchronously:
+--   * block_shutdown_signals() blocks SIGHUP/SIGINT/SIGTERM in the calling
+--     thread.  main() calls it before any thread exists, so every thread
+--     created later (RocksDB background pool, coin_prefetch, parallel_verify
+--     workers) inherits the block and the kernel keeps the signal PENDING
+--     on the process instead of delivering it anywhere.
+--   * poll_signals() drains pending signals with sigtimedwait(zero timeout)
+--     -- a plain syscall from Lua context, no callback, no signal context --
+--     and runs the Lua callbacks.  Same observable semantics as before
+--     (one main-loop tick of latency), the same shape as Core, whose
+--     handlers only set a flag the main thread polls.
+-- Signals that arrive before the main loop polls stay pending until then
+-- (Core likewise finishes the current init step before honouring shutdown).
+local _sigset_ok = pcall(ffi.cdef, [[
+  typedef struct { unsigned long val[16]; } lb_sigset_t;
+  struct lb_sig_timespec { long tv_sec; long tv_nsec; };
+]])
+local function _decl(decl) pcall(ffi.cdef, decl) end
+_decl("int sigemptyset(lb_sigset_t *set);")
+_decl("int sigaddset(lb_sigset_t *set, int signum);")
+_decl("int sigismember(const lb_sigset_t *set, int signum);")
+_decl("int pthread_sigmask(int how, const lb_sigset_t *set, lb_sigset_t *old);")
+_decl("int sigtimedwait(const lb_sigset_t *set, void *info, const struct lb_sig_timespec *timeout);")
+
+local SIG_BLOCK   = 0   -- Linux
+local SIG_UNBLOCK = 1
+
 local _signal_callbacks = {}
-local _signal_handlers = {}  -- Keep ffi.cast'd handlers alive for GC.
+local _blocked = {}          -- signum -> true once blocked in this thread
+local _pending = {}          -- kernel-delivered, drained, not yet dispatched
 local _raised = {}           -- In-process raises (M.raise_signal), pending.
+local _wait_set = nil        -- lb_sigset_t of every blocked signal
+local _zero_ts = nil
 
 -- Set when SIGTERM/SIGINT is dispatched. Long RPC walks (gettxoutsetinfo)
 -- poll this and abort; Core's RpcInterruptionPoint throws once InterruptRPC
 -- has cleared g_rpc_running. Stays set for the rest of the process.
 M.shutting_down = false
 
-local function _install(signum)
-  if _signal_flags[signum] then return end  -- idempotent
-  local flag = ffi.new("int[1]", 0)
-  _signal_flags[signum] = flag
-  local handler = ffi.cast("sighandler_t",
-    function(_) flag[0] = 1 end)
-  _signal_handlers[signum] = handler
-  ffi.C.signal(signum, handler)
+local function _thread_count()
+  local n = 0
+  local ok = pcall(function()
+    local f = io.open("/proc/self/status", "r")
+    if not f then return end
+    local s = f:read("*a")
+    f:close()
+    n = tonumber(s:match("\nThreads:%s*(%d+)")) or 0
+  end)
+  return ok and n or 0
+end
+
+local function _rebuild_wait_set()
+  local set = ffi.new("lb_sigset_t")
+  ffi.C.sigemptyset(set)
+  for signum, _ in pairs(_blocked) do ffi.C.sigaddset(set, signum) end
+  _wait_set = set
+  _zero_ts = _zero_ts or ffi.new("struct lb_sig_timespec", 0, 0)
+end
+
+--- Block `signums` in the calling thread so they are collected by
+--- poll_signals() instead of being delivered.  Returns true on success.
+--- Threads created AFTER this call inherit the block; call it before any
+--- thread exists (main() does, ahead of the script-worker pool and storage).
+-- @param signums table|nil: defaults to {SIGHUP, SIGINT, SIGTERM}
+-- @return boolean ok, string|nil warning
+function M.block_shutdown_signals(signums)
+  if not _sigset_ok then return false, "sigset cdef unavailable" end
+  signums = signums or { M.SIGHUP, M.SIGINT, M.SIGTERM }
+  local set = ffi.new("lb_sigset_t")
+  ffi.C.sigemptyset(set)
+  local fresh = false
+  for _, signum in ipairs(signums) do
+    ffi.C.sigaddset(set, signum)
+    if not _blocked[signum] then fresh = true end
+  end
+  if not fresh then return true end
+  if ffi.C.pthread_sigmask(SIG_BLOCK, set, nil) ~= 0 then
+    return false, "pthread_sigmask(SIG_BLOCK) failed"
+  end
+  for _, signum in ipairs(signums) do _blocked[signum] = true end
+  _rebuild_wait_set()
+  local threads = _thread_count()
+  if threads > 1 then
+    -- Threads that already exist keep the signal unblocked: a signal the
+    -- kernel routes to one of them takes the default action (terminate).
+    return true, string.format(
+      "signals blocked with %d threads already running; a signal routed to "
+      .. "one of them terminates the process without a flush", threads)
+  end
+  return true
+end
+
+-- Move every kernel-pending blocked signal into _pending.  Never raises.
+local function _drain()
+  if not _wait_set then return end
+  for _ = 1, 64 do
+    local signum = ffi.C.sigtimedwait(_wait_set, nil, _zero_ts)
+    if signum <= 0 then break end
+    _pending[signum] = true
+  end
 end
 
 --- Install a signal handler.
 -- @param signum number: SIGHUP/SIGINT/SIGTERM
 -- @param fn function: Lua callback to invoke when the signal is polled
 function M.set_signal_handler(signum, fn)
-  _install(signum)
+  if not _blocked[signum] then
+    local ok, warn = M.block_shutdown_signals({ signum })
+    if not ok then
+      io.stderr:write(string.format(
+        "[signal] cannot collect signal %d (%s); default disposition stays\n",
+        signum, tostring(warn)))
+    elseif warn then
+      io.stderr:write("[signal] WARNING: " .. warn .. "\n")
+    end
+  end
   _signal_callbacks[signum] = fn
 end
 
 --- Raise a signal in-process, through the same path a delivered signal takes.
--- Marks the signal pending exactly as the C-level handler does; the next
+-- Marks the signal pending exactly as a delivered one; the next
 -- poll_signals() runs the SAME Lua callback an external `kill -<signum>`
--- would.  No kill(getpid()): that would put a LuaJIT FFI callback in signal
--- context, and with no handler installed yet the default disposition would
--- terminate the process without the graceful path.  A raise that lands
--- before set_signal_handler stays pending until a callback exists.  Used by
--- RPC `stop` (gate 5): Core's stop -> StartShutdown(), the process exits via
--- the SIGTERM path.
+-- would.  A raise that lands before set_signal_handler stays pending until a
+-- callback exists.  Used by RPC `stop` (gate 5): Core's stop ->
+-- StartShutdown(), the process exits via the SIGTERM path.
 -- @param signum number
 function M.raise_signal(signum)
   _raised[signum] = true
 end
 
 --- Drain pending signals and invoke their Lua callbacks.
--- Call this once per main-loop tick.  Cheap (just int compares) when no
--- signals are pending.
+-- Call this once per main-loop tick.  One sigtimedwait syscall when nothing
+-- is pending.  Never raises: a throwing callback is reported and swallowed.
 function M.poll_signals()
-  for signum, flag in pairs(_signal_flags) do
-    if flag[0] ~= 0 or (_raised[signum] and _signal_callbacks[signum]) then
-      flag[0] = 0
+  _drain()
+  for _, signum in ipairs({ M.SIGTERM, M.SIGINT, M.SIGHUP }) do
+    local cb = _signal_callbacks[signum]
+    -- A signal with no callback yet stays pending (blocked early in main(),
+    -- delivered during startup) and is dispatched once a handler exists.
+    if cb and (_pending[signum] or _raised[signum]) then
+      _pending[signum] = nil
       _raised[signum] = nil
       -- Latch before the callback so a walk's interruption point observes
       -- shutdown even if the callback only flips the main loop's `running`.
       if signum == M.SIGTERM or signum == M.SIGINT then
         M.shutting_down = true
       end
-      local cb = _signal_callbacks[signum]
-      if cb then
-        local ok, err = pcall(cb)
-        if not ok then
-          io.stderr:write(string.format(
-            "signal handler for %d threw: %s\n", signum, tostring(err)))
-        end
+      local ok, err = pcall(cb)
+      if not ok then
+        pcall(io.stderr.write, io.stderr, string.format(
+          "signal handler for %d threw: %s\n", signum, tostring(err)))
       end
     end
   end
@@ -524,33 +612,34 @@ end
 --- True when shutdown has been requested.
 -- If SIGTERM/SIGINT is pending but not yet dispatched, dispatch it first
 -- (the same poll the main loop does) so a walk aborted mid-slice still
--- runs the handler that clears `running`. Common path is a few loads:
--- nothing pending, return false. A raised signal with no handler installed
--- stays pending (stop before set_signal_handler) and does not latch.
+-- runs the handler that clears `running`. Common path: one sigtimedwait
+-- syscall, nothing pending, return false. A raised signal with no handler
+-- installed stays pending (stop before set_signal_handler) and does not latch.
 -- @return boolean
 function M.poll_shutdown()
   if M.shutting_down then return true end
-  local term_flag = _signal_flags[M.SIGTERM]
-  local int_flag = _signal_flags[M.SIGINT]
-  local pending = _raised[M.SIGTERM] or _raised[M.SIGINT]
-      or (term_flag and term_flag[0] ~= 0)
-      or (int_flag and int_flag[0] ~= 0)
+  _drain()
+  local pending = (_signal_callbacks[M.SIGTERM]
+                    and (_raised[M.SIGTERM] or _pending[M.SIGTERM]))
+      or (_signal_callbacks[M.SIGINT]
+          and (_raised[M.SIGINT] or _pending[M.SIGINT]))
   if not pending then return false end
   M.poll_signals()
   return M.shutting_down and true or false
 end
 
---- Tear down all installed handlers.  Used by tests so the busted runner
---- isn't left with FFI callbacks pointing into freed Lua state.
+--- Tear down all installed handlers: discard pending signals and unblock.
+--- Used by tests so the busted runner is left with the default dispositions.
 function M.reset_signal_handlers()
-  for signum, _ in pairs(_signal_flags) do
-    -- SIG_DFL = default disposition (0 cast to a function pointer).
-    ffi.C.signal(signum, ffi.cast("sighandler_t", 0))
+  _drain()
+  if _wait_set and next(_blocked) then
+    ffi.C.pthread_sigmask(SIG_UNBLOCK, _wait_set, nil)
   end
-  _signal_flags = {}
   _signal_callbacks = {}
-  _signal_handlers = {}
+  _blocked = {}
+  _pending = {}
   _raised = {}
+  _wait_set = nil
   M.shutting_down = false
 end
 

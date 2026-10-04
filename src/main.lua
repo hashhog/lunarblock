@@ -994,6 +994,21 @@ local function main()
     return
   end
 
+  -- Block SIGHUP/SIGINT/SIGTERM BEFORE any thread exists (script-worker
+  -- pool, storage, coin prefetch below): every later thread inherits the
+  -- block, the kernel keeps the signal pending, and the main loop collects
+  -- it with ops.poll_signals().  No FFI callback runs in signal context --
+  -- that is what aborted the node with "PANIC: ... (bad callback)" on stop.
+  do
+    local sig_ok, sig_warn = require("lunarblock.ops").block_shutdown_signals()
+    if not sig_ok then
+      io.stderr:write("[signal] cannot block shutdown signals: "
+        .. tostring(sig_warn) .. "\n")
+    elseif sig_warn then
+      io.stderr:write("[signal] WARNING: " .. sig_warn .. "\n")
+    end
+  end
+
   -- Load modules
   local consensus_mod = require("lunarblock.consensus")
   local storage_mod = require("lunarblock.storage")
