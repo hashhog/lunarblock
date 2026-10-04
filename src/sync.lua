@@ -1980,8 +1980,9 @@ function HeaderChain:accept_header(header, opts)
   --     a difficulty-1 header there for free -- and the resulting fork is
   --     self-sustaining, because the NEXT retarget is then computed along the
   --     attacker's own lineage.  The admitted header did not even need to
-  --     become the tip to do damage: step 9 below writes height_to_hash and
-  --     CF.HEIGHT_INDEX unconditionally.
+  --     become the tip to do damage: step 9 below then wrote height_to_hash
+  --     and CF.HEIGHT_INDEX unconditionally (since 2026-10-04 it writes them
+  --     only along the best header chain).
   --
   --     The relaxation was never necessary.  The retarget needs exactly two
   --     inputs -- the parent (locally held) and the period-first block's TIME
@@ -2152,16 +2153,15 @@ function HeaderChain:accept_header(header, opts)
 
   -- 9. Accept the header
   local work = candidate_work
-  self.headers[hash_hex] = {
+  local entry = {
     header = header,
     height = height,
     total_work = work,
   }
-  self.height_to_hash[height] = hash_hex
+  self.headers[hash_hex] = entry
 
   -- Store in database
   self.storage.put_header(hash, header)
-  self.storage.put_height_index(height, hash)
 
   -- Update tip if this chain has more total work (exact 256-bit comparison, B1 fix).
   local current_tip_work = consensus.work_zero()
@@ -2172,12 +2172,49 @@ function HeaderChain:accept_header(header, opts)
     end
   end
 
+  -- height_to_hash (and CF.HEIGHT_INDEX) is the BEST HEADER CHAIN by height:
+  -- Core's m_best_header->GetAncestor(h) (validation.cpp:4919-4920 moves
+  -- m_best_header only on strictly more work; every by-height question is
+  -- answered from its ancestry).  It is written ONLY when this header becomes
+  -- the new best header, and then along its whole ancestry until it rejoins
+  -- the map.
+  --
+  -- It used to be written for EVERY accepted header.  At the 2026-10-04
+  -- mainnet fork (969888) that let the losing sibling's header (0211bf2a..,
+  -- equal work, not the tip) overwrite height_to_hash[969888] after the
+  -- winner (9c4117..) had been accepted: the node downloaded and connected
+  -- the stale block, and when 969889 arrived on the winner the tip moved
+  -- while height_to_hash[969888] still named the stale block — so the fork
+  -- floor's "same chain" fast path said "no fork", the height-keyed download
+  -- walk never asked for the winner's 969888, and the reorg waited on that
+  -- bridging body for 35+ min (QUEUES lunarblock item 0, gate 7).
   if consensus.work_compare(work, current_tip_work) > 0 then
     self.header_tip_hash = hash
     self.header_tip_height = height
+    self:_point_heights_at(hash_hex, entry)
   end
 
   return true
+end
+
+--- Re-point height_to_hash (and the persisted height index) along the
+--- ancestry of a NEW best header until it rejoins the map.  O(1) for a header
+--- that extends the current best chain; O(fork depth) on a best-header switch.
+--- Stops at the first ancestor missing from the in-memory map (the map is
+--- partial after a restart).
+-- @param tip_hex string: hex hash of the new best header
+-- @param tip_entry table: its headers[] entry
+function HeaderChain:_point_heights_at(tip_hex, tip_entry)
+  local cur_hex, cur = tip_hex, tip_entry
+  while cur and self.height_to_hash[cur.height] ~= cur_hex do
+    self.height_to_hash[cur.height] = cur_hex
+    if self.storage.put_height_index then
+      self.storage.put_height_index(cur.height, validation.compute_block_hash(cur.header))
+    end
+    if cur.height == 0 then break end
+    cur_hex = types.hash256_hex(cur.header.prev_hash)
+    cur = self.headers[cur_hex]
+  end
 end
 
 --- Advance the in-memory header chain to a block WE just produced + connected
@@ -2233,15 +2270,16 @@ function HeaderChain:add_mined_tip(header, height)
   end
   local work = consensus.work_add(parent_work, self:work_for_bits(header.bits))
 
-  self.headers[hash_hex] = {
+  local entry = {
     header = header,
     height = height,
     total_work = work,
   }
-  self.height_to_hash[height] = hash_hex
+  self.headers[hash_hex] = entry
 
   -- Header + height-index are already persisted by the mining/submitblock
-  -- atomic batch; do not double-write here.
+  -- atomic batch.  height_to_hash follows the best header chain only (see
+  -- accept_header step 9): it is re-pointed below when this becomes the tip.
 
   local current_tip_work = consensus.work_zero()
   if self.header_tip_hash then
@@ -2253,6 +2291,7 @@ function HeaderChain:add_mined_tip(header, height)
   if consensus.work_compare(work, current_tip_work) > 0 then
     self.header_tip_hash = hash
     self.header_tip_height = height
+    self:_point_heights_at(hash_hex, entry)
   end
   return true
 end
@@ -3315,11 +3354,21 @@ function BlockDownloader:_apply_fork_aware_floor()
 
   local new_floor = fork_point_height + 1
   local lowered = false
+  -- The floor is re-applied on every scheduler pass while a bridging body is
+  -- outstanding (the forward walk moves next_download_height back up each
+  -- time), so log it once per (fork point, header tip) or once a minute --
+  -- not ~500 lines/s (observed in the 2026-10-04 regtest repro).
+  local log_key = fork_point_height .. ":" .. tostring(tip_hex)
+  local log_now = require("socket").gettime()
+  local fl = self._fork_floor_log
+  local log_it = not fl or fl.key ~= log_key or log_now - fl.t >= 60
   if new_floor < self.next_download_height then
-    print(string.format(
-      "[FORK-DL] heavier fork pending: lowering download floor %d -> %d (fork point %d, header tip h=%d active tip h=%d)",
-      self.next_download_height, new_floor, fork_point_height,
-      hc.header_tip_height, active_tip_height))
+    if log_it then
+      print(string.format(
+        "[FORK-DL] heavier fork pending: lowering download floor %d -> %d (fork point %d, header tip h=%d active tip h=%d)",
+        self.next_download_height, new_floor, fork_point_height,
+        hc.header_tip_height, active_tip_height))
+    end
     self.next_download_height = new_floor
     lowered = true
   end
@@ -3337,11 +3386,16 @@ function BlockDownloader:_apply_fork_aware_floor()
   -- that otherwise half-reorgs the active chain down to the fork point and
   -- wedges).  This mirrors blockbrew's part-2 in-order connectPendingBlocks.
   if new_floor < self.next_connect_height then
-    print(string.format(
-      "[FORK-DL] lowering connect cursor %d -> %d to walk the fork in order",
-      self.next_connect_height, new_floor))
+    if log_it then
+      print(string.format(
+        "[FORK-DL] lowering connect cursor %d -> %d to walk the fork in order",
+        self.next_connect_height, new_floor))
+    end
     self.next_connect_height = new_floor
     lowered = true
+  end
+  if lowered and log_it then
+    self._fork_floor_log = { key = log_key, t = log_now }
   end
 
   return lowered
@@ -3654,6 +3708,7 @@ function BlockDownloader:schedule_downloads(peers)
       -- minutes (W21 RPC starvation fix). Instead, just re-request from
       -- other peers by leaving had_stalls=true (cursor reset below).
       -- Stalled request - remove from inflight and peer tracking
+      self:_note_undelivered(hash_hex, info.peer)
       self.inflight[hash_hex] = nil
       if self.peer_inflight[info.peer] then
         self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
@@ -3732,6 +3787,7 @@ function BlockDownloader:schedule_downloads(peers)
             self.peer_inflight[info.peer] = nil
           end
         end
+        self:_note_undelivered(stuck_hash_hex, info.peer)
         self.inflight[stuck_hash_hex] = nil
         cleared = 1
       end
@@ -3854,25 +3910,52 @@ function BlockDownloader:schedule_downloads(peers)
         -- Prefer a peer with a free window slot; if all are saturated (single
         -- slow replay peer) give this critical block a priority slot on the
         -- least-loaded serving peer so the cursor cannot be starved by one peer.
-        local picked = nil
-        for _, p in ipairs(available_peers) do
-          local pc = self.peer_inflight[p] or 0
-          if pc < self.blocks_per_peer then
-            picked = p
-            break
-          end
+        --
+        -- ROTATE: never hand the block back to a peer that was already asked
+        -- for it and did not deliver, while another peer is available.  The
+        -- pick used to be "first peer in the list with a free slot", so after
+        -- every timeout / STALL RECOVERY / notfound the SAME peer got the
+        -- re-request: on 2026-10-04 mainnet the 969888 body was re-requested
+        -- from one peer (101.98.27.97) for 18 min and never arrived.  Core
+        -- never re-asks a staller: it disconnects it (net_processing.cpp:6094
+        -- BLOCK_STALLING_TIMEOUT, :6117 block download timeout) and
+        -- FindNextBlocksToDownload hands the block to another peer.  When
+        -- every available peer has been tried, the round starts over.
+        self._force_rerequest_tried = self._force_rerequest_tried or {}
+        local tried = self._force_rerequest_tried[stuck_hash_hex]
+        if not tried then
+          tried = {}
+          self._force_rerequest_tried[stuck_hash_hex] = tried
         end
-        if not picked then
-          local best_pc = nil
+        local function pick(skip_tried)
+          local picked = nil
           for _, p in ipairs(available_peers) do
             local pc = self.peer_inflight[p] or 0
-            if best_pc == nil or pc < best_pc then
-              best_pc = pc
+            if pc < self.blocks_per_peer and not (skip_tried and tried[p]) then
               picked = p
+              break
             end
           end
+          if not picked then
+            local best_pc = nil
+            for _, p in ipairs(available_peers) do
+              local pc = self.peer_inflight[p] or 0
+              if not (skip_tried and tried[p]) and (best_pc == nil or pc < best_pc) then
+                best_pc = pc
+                picked = p
+              end
+            end
+          end
+          return picked
+        end
+        local picked = pick(true)
+        if not picked then
+          -- every available peer already had its chance: start a new round
+          for k in pairs(tried) do tried[k] = nil end
+          picked = pick(false)
         end
         if picked then
+          tried[picked] = true
           self._force_rerequest_last[stuck_hash_hex] = now
           local stuck_block_hash = validation.compute_block_hash(entry.header)
           peer_requests[picked][#peer_requests[picked] + 1] = {
@@ -4054,6 +4137,28 @@ end
 -- Block Receipt Handling
 --------------------------------------------------------------------------------
 
+--- Remember that `peer` was asked for `hash_hex` and did not deliver it
+--- (timed out, cleared by STALL RECOVERY, or answered notfound), so the W46
+--- cursor re-request hands the block to a DIFFERENT peer next time.  Cleared
+--- when the block arrives.
+function BlockDownloader:_note_undelivered(hash_hex, peer)
+  if not peer then return end
+  self._force_rerequest_tried = self._force_rerequest_tried or {}
+  local t = self._force_rerequest_tried[hash_hex]
+  if not t then
+    -- Bound: entries are cleared on receipt; blocks that are never received
+    -- (abandoned side branches) must not accumulate without limit.
+    self._force_rerequest_tried_n = (self._force_rerequest_tried_n or 0) + 1
+    if self._force_rerequest_tried_n > 4096 then
+      self._force_rerequest_tried = {}
+      self._force_rerequest_tried_n = 1
+    end
+    t = {}
+    self._force_rerequest_tried[hash_hex] = t
+  end
+  t[peer] = true
+end
+
 --- Handle a notfound response for a block hash.
 -- Removes the block from inflight so it can be re-requested from a different peer.
 -- @param hash_hex string: hex hash of the block not found
@@ -4061,6 +4166,7 @@ end
 function BlockDownloader:handle_notfound(hash_hex, peer)
   local info = self.inflight[hash_hex]
   if info then
+    self:_note_undelivered(hash_hex, info.peer)
     self.inflight[hash_hex] = nil
     if self.peer_inflight[info.peer] then
       self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
@@ -4136,6 +4242,12 @@ function BlockDownloader:handle_block(peer, block_data)
     -- Success: reduce timeout toward base
     info.timeout = math.max(self.base_stall_timeout, info.timeout / 2)
   end
+
+  if self._force_rerequest_tried then
+    self._force_rerequest_tried[hash_hex] = nil
+  end
+  -- New body in hand: a parked heavier-fork body may now be connectable.
+  self._rx_count = (self._rx_count or 0) + 1
 
   -- Remove from inflight and update peer tracking
   if self.inflight[hash_hex] then
@@ -4460,6 +4572,20 @@ function BlockDownloader:_connect_pending_blocks_inner()
     -- case (block parent == active tip), in which case we fall through to the
     -- unchanged normal connect below — so IBD / steady-state extension is
     -- byte-for-byte unaffected.
+    -- A heavier-fork body parked on a missing bridging body (case (a) below)
+    -- is not re-routed until a new block body has arrived (or 30 s pass):
+    -- re-running check_block + the orchestrator on every main-loop pass while
+    -- nothing can have changed only burns the event loop the RPC server
+    -- shares.  Core likewise re-tries a chain only when a missing body lands
+    -- (validation.cpp ReceivedBlockTransactions -> m_blocks_unlinked).
+    if self.side_branch_callback then
+      local fw = self._fork_wait
+      if fw and fw.hash == hash_hex and fw.rx == (self._rx_count or 0)
+          and require("socket").gettime() - fw.t < 30 then
+        break
+      end
+    end
+
     if self.side_branch_callback then
       local sb_result, sb_err = self:_route_fork_body(
         pending.block, pending.hash, pending)
@@ -4526,6 +4652,8 @@ function BlockDownloader:_connect_pending_blocks_inner()
         --       logging for this block.
         if type(sb_err) == "string" and sb_err:find("missing at height") then
           -- (a) Transient: a bridging fork body is still in flight.  Wait.
+          self._fork_wait = { hash = hash_hex, rx = self._rx_count or 0,
+                              t = require("socket").gettime() }
           if not self._last_fork_wait_log or
               require("socket").gettime() - self._last_fork_wait_log > 30 then
             self._last_fork_wait_log = require("socket").gettime()

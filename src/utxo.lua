@@ -4567,6 +4567,42 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     return "stored"
   end
 
+  -- ── Stage 4b: every bridging body must already be on disk BEFORE anything
+  -- destructive happens.  Core never starts a reorg toward a chain with a
+  -- missing body: FindMostWorkChain (validation.cpp:3140-3156) drops a
+  -- candidate whose ancestry lacks BLOCK_HAVE_DATA and parks it in
+  -- m_blocks_unlinked until the body arrives.  This used to be discovered
+  -- only INSIDE the connect loop below — after rollback_chain_to had
+  -- disconnected the active tip (undo reads, UTXO writes, and
+  -- block_disconnected re-feeding every tx into the mempool) — and then
+  -- abort_reorg undid it.  The P2P connect drive retries the parked fork body
+  -- on every main-loop pass, so while a bridging body was missing the node
+  -- ran a full disconnect/rollback of its tip in a loop and starved the RPC
+  -- server (2026-10-04 mainnet, 969888: RPC unresponsive for 35+ min).
+  -- Same error string as before, so callers' "missing at height" handling
+  -- (sync.lua connect_pending_blocks) is unchanged.
+  do
+    local blocks_cf = self.storage.CF and self.storage.CF.BLOCKS
+    local function have_body(h)
+      if self.storage.get and blocks_cf then
+        return self.storage.get(blocks_cf, h.bytes) ~= nil
+      end
+      return self.storage.get_block(h) ~= nil
+    end
+    for i = side_len, 2, -1 do  -- side_chain[1] is this block (in hand)
+      local entry = side_chain[i]
+      if not have_body(entry.hash) then
+        if not have_body(block_hash) then
+          self.storage.put_block(block_hash, block)
+          self.storage.put_header(block_hash, block.header)
+        end
+        return nil, string.format(
+          "reorg-connect-failed: side-branch block missing at height %d",
+          entry.height)
+      end
+    end
+  end
+
   -- ── Stage 5 (formerly Stage 3): store the new block + header as a
   -- side-branch.  We are about to reorg, so the block must be in storage
   -- before the connect loop re-loads it.  height-index is NOT written here;
