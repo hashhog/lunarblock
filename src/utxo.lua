@@ -511,7 +511,11 @@ end
 
 -- Serialize BlockUndo (undo data for a full block).
 -- Format: varint(num_tx) | tx_undo | tx_undo | ... | checksum (32 bytes SHA256)
-function M.serialize_block_undo(block_undo)
+-- Reference implementation (the pre-2026-10-04 path, built from the
+-- per-entry buffer_writer helpers above).  Kept as the byte-for-byte oracle
+-- for the fast path below (spec/undo_serialize_fast_spec.lua) and as its
+-- fallback.  Not on the block-connect path.
+function M._serialize_block_undo_reference(block_undo)
   local w = serialize.buffer_writer()
   w.write_varint(#block_undo.tx_undo)
   for _, txu in ipairs(block_undo.tx_undo) do
@@ -522,6 +526,7 @@ function M.serialize_block_undo(block_undo)
   local checksum = crypto.sha256(data)
   return data .. checksum
 end
+
 
 -- Deserialize BlockUndo.
 -- Verifies the SHA256 checksum at the end.
@@ -931,6 +936,183 @@ end
 -- Mirrors compressor.cpp:GetSpecialScriptSize.
 -- @param nSize number type indicator (already in [0..5])
 -- @return number raw payload length
+-- Fast BlockUndo serializer (ARCH-2, 2026-10-04).  Same bytes as
+-- _serialize_block_undo_reference, written in one pass into a reused FFI
+-- buffer.  MEASURED ([CB-PROF] undo_ser, 650001-650100): the reference path
+-- cost ~180 ms/block, because buffer_writer keeps one Lua string per byte
+-- and every serialize_undo_entry built a fresh writer (≈20 closures), a
+-- uint8_t[10] cdata per VARINT and uint64 cdata arithmetic in
+-- compress_amount -- tens of thousands of allocations per block.  Core
+-- writes the same CBlockUndo with one stream (undo.h TxInUndoFormatter,
+-- node/blockstorage.cpp WriteBlockUndo).
+--
+-- Exactness: amounts and VARINT codes are computed in doubles only while
+-- every intermediate stays below 2^53 (value < 1e14 sat => CompressAmount
+-- result < 1e16/... see AMOUNT_FAST_MAX); anything else -- a cdata value,
+-- a larger amount, a non-integer -- takes the reference uint64 helpers for
+-- that one field.  Scripts use the reference shape tests (_is_p2pkh, ...),
+-- including the decompress_pubkey validity check for uncompressed P2PK.
+local AMOUNT_FAST_MAX = 1e14          -- 90 * 1e14 < 2^53
+local VARINT_FAST_MAX = 2^53
+local _undo_buf, _undo_cap = nil, 0
+
+local function _undo_reserve(off, need)
+  if off + need <= _undo_cap then return end
+  local cap = math.max(65536, _undo_cap * 2, off + need)
+  local nb = ffi.new("uint8_t[?]", cap)
+  if _undo_buf ~= nil and off > 0 then ffi.copy(nb, _undo_buf, off) end
+  _undo_buf, _undo_cap = nb, cap
+end
+
+local function _undo_put_str(off, s)
+  local n = #s
+  _undo_reserve(off, n)
+  ffi.copy(_undo_buf + off, s, n)
+  return off + n
+end
+
+-- Core MSB base-128 VARINT (serialize.h WriteVarInt) of a non-negative
+-- integer < 2^53 held in a double.
+local _vtmp = ffi.new("uint8_t[10]")
+local function _undo_put_corevarint(off, n)
+  if type(n) ~= "number" or n < 0 or n >= VARINT_FAST_MAX or n ~= math.floor(n) then
+    -- Reference path for anything the double path cannot prove exact.
+    local w = serialize.buffer_writer()
+    M.write_corevarint(w, n)
+    return _undo_put_str(off, w.result())
+  end
+  local len = 0
+  while true do
+    local low7 = n % 128
+    _vtmp[len] = low7 + (len > 0 and 0x80 or 0)
+    if n <= 0x7F then break end
+    n = (n - low7) / 128 - 1
+    len = len + 1
+  end
+  _undo_reserve(off, len + 1)
+  local buf = _undo_buf
+  for i = len, 0, -1 do
+    buf[off] = _vtmp[i]
+    off = off + 1
+  end
+  return off
+end
+
+-- CompactSize (serialize.h WriteCompactSize) of a Lua count.
+local function _undo_put_compactsize(off, v)
+  _undo_reserve(off, 9)
+  local buf = _undo_buf
+  if v < 0xFD then
+    buf[off] = v
+    return off + 1
+  elseif v <= 0xFFFF then
+    buf[off] = 0xFD
+    buf[off + 1] = v % 256
+    buf[off + 2] = math.floor(v / 256) % 256
+    return off + 3
+  elseif v <= 0xFFFFFFFF then
+    buf[off] = 0xFE
+    buf[off + 1] = v % 256
+    buf[off + 2] = math.floor(v / 256) % 256
+    buf[off + 3] = math.floor(v / 65536) % 256
+    buf[off + 4] = math.floor(v / 16777216) % 256
+    return off + 5
+  end
+  -- Not reachable for array lengths; keep the reference encoding.
+  local w = serialize.buffer_writer()
+  w.write_varint(v)
+  return _undo_put_str(off, w.result())
+end
+
+-- CompressAmount (compressor.cpp) in doubles; nil when not provably exact.
+local function _compress_amount_fast(n)
+  if type(n) ~= "number" or n < 0 or n >= AMOUNT_FAST_MAX or n ~= math.floor(n) then
+    return nil
+  end
+  if n == 0 then return 0 end
+  local e = 0
+  while n % 10 == 0 and e < 9 do
+    n = n / 10
+    e = e + 1
+  end
+  if e < 9 then
+    local d = n % 10
+    n = (n - d) / 10
+    return 1 + (n * 9 + d - 1) * 10 + e
+  end
+  return 1 + (n - 1) * 10 + 9
+end
+
+local function _undo_put_entry(off, entry)
+  local height = entry.height
+  local code
+  if type(height) == "number" then
+    code = height * 2 + (entry.is_coinbase and 1 or 0)
+  else
+    code = _to_u64(height) * u64_t(2) + u64_t(entry.is_coinbase and 1 or 0)
+  end
+  off = _undo_put_corevarint(off, code)
+  if height > 0 then
+    _undo_reserve(off, 1)
+    _undo_buf[off] = 0          -- version dummy VARINT(0)
+    off = off + 1
+  end
+  local ca = _compress_amount_fast(entry.value)
+  if ca then
+    off = _undo_put_corevarint(off, ca)
+  else
+    local w = serialize.buffer_writer()
+    M.write_corevarint(w, M.compress_amount(entry.value))
+    off = _undo_put_str(off, w.result())
+  end
+  -- ScriptCompression (compressor.cpp CompressScript), same shape tests and
+  -- order as M.compress_script.
+  local s = entry.script_pubkey
+  local slen = #s
+  local h = (slen == 25 and _is_p2pkh(s)) or nil
+  if h then
+    _undo_reserve(off, 21); _undo_buf[off] = 0x00
+    return _undo_put_str(off + 1, h)
+  end
+  h = (slen == 23 and _is_p2sh(s)) or nil
+  if h then
+    _undo_reserve(off, 21); _undo_buf[off] = 0x01
+    return _undo_put_str(off + 1, h)
+  end
+  if slen == 35 then
+    local prefix, x = _is_p2pk_compressed(s)
+    if prefix then
+      _undo_reserve(off, 33); _undo_buf[off] = prefix
+      return _undo_put_str(off + 1, x)
+    end
+  end
+  if slen == 67 then
+    local tag, x = _is_p2pk_uncompressed(s)
+    if tag then
+      _undo_reserve(off, 33); _undo_buf[off] = tag
+      return _undo_put_str(off + 1, x)
+    end
+  end
+  off = _undo_put_corevarint(off, slen + M.N_SPECIAL_SCRIPTS)
+  return _undo_put_str(off, s)
+end
+
+function M.serialize_block_undo(block_undo)
+  local off = 0
+  local txs = block_undo.tx_undo
+  off = _undo_put_compactsize(off, #txs)
+  for i = 1, #txs do
+    local prev = txs[i].prev_outputs
+    off = _undo_put_compactsize(off, #prev)
+    for j = 1, #prev do
+      off = _undo_put_entry(off, prev[j])
+    end
+  end
+  local data = ffi.string(_undo_buf, off)
+  -- Append SHA256 checksum of the data
+  return data .. crypto.sha256(data)
+end
+
 local function _special_script_size(nSize)
   if nSize == 0 or nSize == 1 then return 20 end
   if nSize >= 2 and nSize <= 5 then return 32 end
