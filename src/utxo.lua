@@ -4570,7 +4570,7 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- ── Stage 4b: every bridging body must already be on disk BEFORE anything
   -- destructive happens.  Core never starts a reorg toward a chain with a
   -- missing body: FindMostWorkChain (validation.cpp:3140-3156) drops a
-  -- candidate whose ancestry lacks BLOCK_HAVE_DATA and parks it in
+  -- candidate whose ancestry lacks the have-data status bit and parks it in
   -- m_blocks_unlinked until the body arrives.  This used to be discovered
   -- only INSIDE the connect loop below — after rollback_chain_to had
   -- disconnected the active tip (undo reads, UTXO writes, and
