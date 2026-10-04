@@ -266,17 +266,19 @@ describe("W97 AcceptBlock/AcceptBlockHeader audit", function()
   -- entire branch into our index, wasting memory and (depending on later
   -- gates) potentially confusing downstream chainwork accounting.
   ----------------------------------------------------------------
-  it("G6 BUG: child of invalidated header is not rejected with bad-prevblk (CONSENSUS-DIVERGENT)", function()
-    -- This is a spec-encoding test; we cannot easily invalidate a header
-    -- via the public HeaderChain API today.  We assert that the symbol
-    -- "bad-prevblk" appears NOWHERE in sync.lua, which is the canonical
-    -- post-fix signal site.
-    local f = io.open("src/sync.lua", "r")
-    if f then
-      local src = f:read("*a"); f:close()
-      assert.is_nil(src:match("bad%-prevblk"),
-        "if this fails the bug is fixed — flip to is_not_nil")
-    end
+  -- FIXED (invalid-block-p2p): HeaderChain now keeps a `failed` set (seeded
+  -- from ChainState.invalid_blocks, extended on every P2P consensus verdict)
+  -- and accept_header rejects a child of a failed header with "bad-prevblk".
+  it("G6 FIXED: child of a failed header is rejected with bad-prevblk", function()
+    local chain = new_chain()
+    local parent = mine_header(chain:get_tip_hash(), os.time() - 120)
+    assert.is_true(chain:accept_header(parent))
+    local parent_hash = validation.compute_block_hash(parent)
+    chain:mark_failed(types.hash256_hex(parent_hash))
+    local child = mine_header(parent_hash, os.time() - 60)
+    local ok, err = chain:accept_header(child)
+    assert.is_false(ok)
+    assert.equals("bad-prevblk", err)
   end)
 
   ----------------------------------------------------------------

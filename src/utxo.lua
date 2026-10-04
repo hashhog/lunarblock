@@ -4466,10 +4466,16 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     -- the on-disk pre-reorg state is the only state visible.  No
     -- chain_tip mutation is committed (we never called batch.write).
     reorg_batch.destroy()
-    -- discard_dirty drops every dirty cache entry — both the entries
-    -- restored by partial disconnects and the entries spent/added by
-    -- partial connects.  Clean entries (read-only cache) are kept.
-    self.coin_view:discard_dirty()
+    -- Drop the WHOLE coin cache, not only the dirty entries.  In Pattern D
+    -- deferred mode CoinView:flush(.., reorg_batch) clears the dirty flag
+    -- on every entry it queues and KEEPS it in cache (spent markers for the
+    -- disconnected blocks' coins, re-added coins the disconnect restored),
+    -- so after the batch is destroyed those CLEAN entries describe a state
+    -- that never reached disk: discard_dirty() left the disconnected
+    -- tip's coinbase reading as spent and its spent inputs reading as
+    -- unspent.  Disk holds exactly the pre-reorg state (every block
+    -- connect commits its own batch), so an empty cache is correct.
+    self.coin_view:clear_cache()
     -- Restore in-memory tip to the on-disk truth (the pre-reorg active
     -- tip) so a later submitblock sees a consistent chain head.
     local restored_hash, restored_height = self.storage.get_chain_tip()
@@ -4569,13 +4575,24 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
       end
       return compute_mtp_from_storage(self.storage, hh_hash)
     end
-    local ok_conn, err_conn = self:connect_block(
+    -- connect_block reports some consensus failures by RAISING (assert:
+    -- BIP68 sequence locks, script checks) rather than returning (nil, err).
+    -- A raise used to escape this function past abort_reorg: the batch was
+    -- never destroyed, the dirty cache kept the half-applied reorg and the
+    -- in-memory tip stayed at the fork point -- the valid tip the node had
+    -- just disconnected was never restored (p2p-invalid-block-feed
+    -- after/bip68 "tip-disturbed").  Core's ActivateBestChainStep returns
+    -- to the valid chain on any ConnectTip failure.
+    local pc_ok, ok_conn, err_conn = pcall(self.connect_block, self,
       sb_block, entry.height, entry.hash,
       sb_prev_mtp, sb_get_block_mtp,
       opts.skip_scripts, false,
       opts.nosync, store_batch_fn,
       reorg_batch
     )
+    if not pc_ok then
+      ok_conn, err_conn = nil, ok_conn
+    end
     if not ok_conn then
       return abort_reorg(string.format(
         "reorg-connect-failed at height %d: %s",

@@ -3908,6 +3908,19 @@ function RPCServer:register_methods()
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to reconsider block"})
     end
 
+    -- The P2P download path keeps its own failed set (seeded from
+    -- invalid_blocks at boot, extended on each consensus verdict).  Re-derive
+    -- it from the now-cleared persistent set and let the header tip return
+    -- to the reconsidered branch if it has the most work.
+    if rpc.header_chain and rpc.header_chain.failed then
+      local failed = {}
+      for hb in pairs(rpc.chain_state.invalid_blocks or {}) do
+        failed[types.hash256_hex(types.hash256(hb))] = true
+      end
+      rpc.header_chain.failed = failed
+      rpc.header_chain:recalculate_best_header(true)
+    end
+
     return cjson.null
   end
 
