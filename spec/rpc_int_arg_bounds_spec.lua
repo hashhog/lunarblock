@@ -166,7 +166,10 @@ describe("RPC integer-argument bounds (Core getInt<T> parity)", function()
       })
       local resp = rpc_call(srv, "getnetworkhashps", {120})
       assert.equal(cjson.null, resp.error)
-      assert.equal(65, resp.result)  -- floor(0x10000 / (2000-1000))
+      -- Core returns a double: 0x10000 / (2000-1000), not its floor (the
+      -- floor is what zeroed every sub-1 H/s window; see
+      -- getnetworkhashps_core_values_spec.lua).
+      assert.equal(65.536, resp.result)
     end)
 
     it("type-errors a non-number instead of falling back to the default", function()

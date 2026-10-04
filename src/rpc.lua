@@ -14800,7 +14800,9 @@ function RPCServer:setup_w47b_methods()
     end
     if lookup > height then lookup = height end
 
-    -- window: [start_h .. height]
+    -- window: Core walks pb0 back `lookup` steps from pb, i.e. heights
+    -- [start_h .. height], tracking the MIN and MAX block time over the whole
+    -- window (block times are not monotonic).
     local start_h = height - lookup
 
     local function get_header_at(h)
@@ -14810,55 +14812,66 @@ function RPCServer:setup_w47b_methods()
     end
 
     local top_hdr, top_hh = get_header_at(height)
-    local bot_hdr, _      = get_header_at(start_h)
-    if not top_hdr or not bot_hdr then return 0 end
+    if not top_hdr then return 0 end
+    local min_time, max_time = top_hdr.timestamp, top_hdr.timestamp
+    local bot_hh
+    local bits_in_window = {}   -- bits of blocks (start_h, height]
+    bits_in_window[1] = top_hdr.bits
+    for h = height - 1, start_h, -1 do
+      local hdr, hh = get_header_at(h)
+      if not hdr then return 0 end
+      local t = hdr.timestamp
+      if t < min_time then min_time = t end
+      if t > max_time then max_time = t end
+      if h > start_h then bits_in_window[#bits_in_window + 1] = hdr.bits end
+      bot_hh = hh
+    end
+    -- Core: "In case there's a situation where minTime == maxTime, we don't
+    -- want a divide by zero exception."
+    if min_time == max_time then return 0 end
+    local time_diff = max_time - min_time
 
-    local time_diff = top_hdr.timestamp - bot_hdr.timestamp
-    if time_diff <= 0 then return 0 end
-
-    -- Chainwork diff via header_chain.headers entries.
+    -- workDiff = pb->nChainWork - pb0->nChainWork, as a 256-bit integer, then
+    -- arith_uint256::getdouble().  The old code took float chainworks (losing
+    -- the low bits of a ~2^95 value before subtracting), used only the two
+    -- endpoint timestamps, and math.floor()ed the quotient -- so any rate
+    -- below 1 H/s (a regtest/testnet window that reaches the 2011 genesis
+    -- timestamp: work ~2e2 over ~5e8 s) came back as 0.
     --
-    -- total_work has TWO representations in this codebase: a float from
-    -- HeaderChain:work_for_bits, and a 32-byte big-endian binary string from
-    -- consensus.work_zero/work_add (which is what a mainnet header chain
-    -- actually holds).  Subtracting the string form raised
-    --   "attempt to perform arithmetic on local 'work_top' (a string value)"
-    -- -> -32603 with a Lua source path on the wire, on EVERY mainnet call.
-    -- Normalise to the float form both sides understand.
-    local function work_number(w)
-      if type(w) == "number" then return w end
-      if type(w) == "string" and #w == 32 then
-        return consensus.work_float_from_hex(consensus.work_to_hex(w))
+    -- total_work has TWO representations here: a 32-byte big-endian string
+    -- (consensus.work_add, what a header chain actually holds) and a float
+    -- (HeaderChain:work_for_bits / an injected snapshot base).
+    local function entry_work(hh_val)
+      if not rpc.header_chain or not rpc.header_chain.headers then return nil end
+      local e = rpc.header_chain.headers[types.hash256_hex(hh_val)]
+      return e and e.total_work
+    end
+    -- Core arith_uint256::getdouble: 32-bit limbs, least significant first.
+    local function getdouble_be(w)
+      local ret, fact = 0.0, 1.0
+      for i = 0, 7 do
+        local o = 32 - 4 * i        -- last byte of limb i (1-based, BE)
+        local b0, b1, b2, b3 = w:byte(o - 3, o)
+        ret = ret + fact * (((b0 * 256 + b1) * 256 + b2) * 256 + b3)
+        fact = fact * 4294967296.0
       end
-      return 0
+      return ret
+    end
+    local work_diff
+    local wt, wb = entry_work(top_hh), entry_work(bot_hh)
+    if type(wt) == "string" and #wt == 32 and type(wb) == "string" and #wb == 32 then
+      work_diff = getdouble_be(consensus.work_sub(wt, wb))
+    else
+      -- No exact chainwork for one end: the difference is by definition the
+      -- summed work of the blocks in (pb0, pb], which the headers carry.
+      local sum = consensus.work_zero()
+      for _, bits in ipairs(bits_in_window) do
+        sum = consensus.work_add(sum, consensus.get_block_work(bits))
+      end
+      work_diff = getdouble_be(sum)
     end
 
-    local function get_work(hh_val)
-      if not rpc.header_chain then return 0 end
-      local hex = types.hash256_hex(hh_val)
-      local entry = rpc.header_chain.headers and rpc.header_chain.headers[hex]
-      return work_number(entry and entry.total_work or 0)
-    end
-
-    local work_top = get_work(top_hh)
-    local work_bot = get_work(
-      (function()
-        local _, bh = get_header_at(start_h)
-        return bh
-      end)()
-    )
-
-    local work_diff = work_top - work_bot
-    if work_diff <= 0 then
-      -- Fallback: estimate from difficulty at tip
-      local bits = top_hdr.bits or 0x1d00ffff
-      -- target = difficulty_1 / difficulty; hashes = 2^256 / target ≈ work per block
-      -- simple estimate: (height - start_h) * 2^32 / time_diff
-      local n_blocks = height - start_h
-      return math.floor(n_blocks * 4294967296 / time_diff)
-    end
-
-    return math.floor(work_diff / time_diff)
+    return work_diff / time_diff
   end
 
   -- gettxoutproof: produce a CMerkleBlock hex for the given txids in a block
