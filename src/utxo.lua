@@ -1374,6 +1374,14 @@ function M.new_coin_view(storage, opts)
   -- Track memory usage
   self.cached_memory_usage = 0
 
+  -- F0: keys whose put/delete sits in a caller-owned reorg batch that has
+  -- NOT been committed yet (CoinView:flush(.., reorg_batch)).  For these the
+  -- cache entry is the ONLY record of the coin's state -- the disk still
+  -- holds the pre-reorg value -- so eviction must never drop them.  Emptied
+  -- by reorg_batch_committed() after the shared batch is written and by
+  -- clear_cache() when the batch is abandoned.
+  self.batch_pending = {}
+
   -- Persistent write batch: reused across flushes to avoid create/destroy overhead
   self._persistent_batch = storage.batch()
 
@@ -1740,6 +1748,7 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
   -- read fell through to disk, where the coin was still unspent.
   local spent_keys = {}
   local written_entries = {}
+  local written_keys = {}
   for key, _ in pairs(self.dirty_list) do
     local entry = self.cache[key]
     if entry then
@@ -1754,6 +1763,7 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
         batch.put(storage_mod.CF.UTXO, key, data)
         writes = writes + 1
         written_entries[#written_entries + 1] = entry
+        written_keys[#written_keys + 1] = key
       end
     end
   end
@@ -1799,6 +1809,7 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
       -- doesn't double-emit the delete.
       if reorg_batch then
         clear_flags(entry)
+        self.batch_pending[key] = true
       else
         -- Non-deferred path: drop the entry from cache (the disk
         -- delete is committed, so the disk read fallback after this
@@ -1811,6 +1822,14 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
   end
   for i = 1, #written_entries do
     clear_flags(written_entries[i])
+  end
+  if reorg_batch then
+    -- The puts are only in the uncommitted shared batch: disk still holds
+    -- the pre-reorg state for these keys (absent, or a coin a disconnect
+    -- just restored), so their cache entries must survive eviction too.
+    for i = 1, #written_keys do
+      self.batch_pending[written_keys[i]] = true
+    end
   end
   if _pf0 then
     -- [CB-PROF] split of the per-block flush: Lua side (dirty-set walk,
@@ -1830,9 +1849,21 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
   self.dirty_count = 0
 
   -- Optionally reallocate (clear) the cache
+  local pending = self.batch_pending
   if reallocate then
-    self.cache = {}
-    self.cached_memory_usage = 0
+    -- F0: entries whose state lives only in an uncommitted reorg batch are
+    -- never dropped (Core: Uncache/Flush never forget a modification before
+    -- it is written to the parent view).
+    local kept, kept_usage = {}, 0
+    for key, _ in pairs(pending) do
+      local entry = self.cache[key]
+      if entry then
+        kept[key] = entry
+        kept_usage = kept_usage + estimate_entry_memory(entry)
+      end
+    end
+    self.cache = kept
+    self.cached_memory_usage = kept_usage
     -- Incremental GC step to nudge collection without traversing the
     -- entire heap (full collect on a multi-GB heap causes GC thrashing).
     collectgarbage("step", 100)
@@ -1846,7 +1877,14 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
       local new_usage = 0
       local target = self.max_cache_bytes / 4
       for key, entry in pairs(self.cache) do
-        if is_dirty(entry) or (new_usage < target and not entry.spent) then
+        -- F0: a spent tombstone or a written coin whose delete/put is
+        -- still only in an uncommitted reorg batch (pending[key]) differs
+        -- from disk; dropping it let the next get() read the PRE-reorg
+        -- disk record (double spend ACCEPTED inside a reorg branch, or a
+        -- restored coin reading as missing).  Only entries whose state
+        -- equals disk -- clean and not pending -- are evictable.
+        if is_dirty(entry) or pending[key]
+            or (new_usage < target and not entry.spent) then
           new_cache[key] = entry
           new_usage = new_usage + estimate_entry_memory(entry)
         end
@@ -1872,6 +1910,14 @@ function CoinView:clear_cache()
   self.dirty_list = {}
   self.dirty_count = 0
   self.cached_memory_usage = 0
+  self.batch_pending = {}
+end
+
+--- The caller-owned reorg batch has been written: every key it touched now
+-- reads the same from disk as from the cache, so those entries become
+-- ordinary (evictable) clean entries again.
+function CoinView:reorg_batch_committed()
+  self.batch_pending = {}
 end
 
 --- Discard all dirty (uncommitted) cache mutations.
@@ -4900,6 +4946,7 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     end
   end
   reorg_batch.destroy()
+  self.coin_view:reorg_batch_committed()
 
   -- The tip moved sideways: evict mempool entries that are no longer final /
   -- BIP-68-final / mature in the next block (Core MaybeUpdateMempoolForReorg
