@@ -1027,6 +1027,18 @@ Mempool.__index = Mempool
 -- @param chain_state table: The chain state (with coin_view and tip_height)
 -- @param config table: Optional configuration
 -- @return Mempool: New mempool instance
+--- Reject reason for a tx whose inputs are absent from the chain UTXO set
+-- AND the mempool — Core's TX_MISSING_INPUTS (validation.cpp PreChecks,
+-- "bad-txns-inputs-missingorspent").  The P2P tx handler routes exactly this
+-- result to the orphan pool (Core txdownloadman_impl.cpp MempoolRejectedTx);
+-- test it with M.is_missing_inputs() rather than a hand-typed string, which is
+-- how the old "missing inputs" token silently stopped matching.
+M.REJECT_MISSING_INPUTS = "bad-txns-inputs-missingorspent"
+
+function M.is_missing_inputs(reason)
+  return reason == M.REJECT_MISSING_INPUTS
+end
+
 function M.new(chain_state, config)
   local self = setmetatable({}, Mempool)
   self.chain_state = chain_state
@@ -1383,7 +1395,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
         end
       end
     end
-    return false, "bad-txns-inputs-missingorspent"
+    return false, M.REJECT_MISSING_INPUTS
   end
 
   -- 3c. IsWitnessStandard (Bitcoin Core policy/policy.cpp:265-352).

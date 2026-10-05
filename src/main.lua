@@ -1889,7 +1889,14 @@ local function main()
       local resolved = orphan_pool:on_block_connected(block)
       for _, c in ipairs(resolved) do
         orphan_pool:remove(c.wtxid_hex)
-        pcall(function() mempool:accept_transaction(c.tx) end)
+        pcall(function()
+          local accepted, reason = mempool:accept_transaction(c.tx)
+          if mempool_mod.is_missing_inputs(reason) and not accepted then
+            -- Still waiting on another parent: keep it orphaned.
+            orphan_pool:add(c.tx, c.wtxid_hex, c.peer_id,
+              mempool:missing_parents_for(c.tx))
+          end
+        end)
       end
       -- Time-based expiry: evict orphans older than ORPHAN_TX_EXPIRE_TIME
       -- (300 s / 5 min) whose parent chain never arrived.  Called here
@@ -2245,9 +2252,13 @@ local function main()
         -- parent may now be admissible.  Iterates with cycle protection
         -- via the orphan_pool's removal on each loop.
         try_resolve_orphans(txid_hex)
-      elseif reason == "missing inputs" then
-        -- Buffer in orphan pool so that when the parent arrives we can
-        -- re-evaluate.  Bounded; rejections are silent.
+      elseif mempool_mod.is_missing_inputs(reason) then
+        -- TX_MISSING_INPUTS (Core txdownloadman_impl.cpp MempoolRejectedTx):
+        -- buffer in the orphan pool so that when the parent arrives we can
+        -- re-evaluate.  Bounded; rejections are silent.  This used to test
+        -- the stale token "missing inputs" after mempool switched to Core's
+        -- "bad-txns-inputs-missingorspent", so every child-before-parent tx
+        -- was dropped and never retried.
         -- Use wtxid as primary key (BIP-339 / W99 G14): two transactions
         -- with the same txid but different witnesses are distinct orphans.
         local wtxid = validation.compute_wtxid(tx)
@@ -2290,9 +2301,19 @@ local function main()
           -- Remove by wtxid_hex (primary key); add txid_hex to worklist
           -- so subsequent children_of() calls resolve grandchildren.
           orphan_pool:remove(c.wtxid_hex)
-          local accepted = mempool:accept_transaction(c.tx)
+          local accepted, reason = mempool:accept_transaction(c.tx)
           if accepted then
             worklist[#worklist + 1] = c.txid_hex
+            -- Core ProcessOrphanTx → RelayTransaction: an orphan that
+            -- becomes valid is relayed like any other accepted tx.
+            local txid = validation.compute_txid(c.tx)
+            local wtxid = validation.compute_wtxid(c.tx)
+            peer_manager:queue_tx_announcement(txid, wtxid, c.tx)
+          elseif mempool_mod.is_missing_inputs(reason) then
+            -- Another parent is still missing (Core keeps such a tx in the
+            -- orphanage): re-buffer with the updated missing-parent set.
+            orphan_pool:add(c.tx, c.wtxid_hex, c.peer_id,
+              mempool:missing_parents_for(c.tx))
           end
         end
       end
