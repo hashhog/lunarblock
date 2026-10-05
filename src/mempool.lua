@@ -20,13 +20,23 @@ local function get_tip_mtp(chain_state)
   end
   local timestamps = {}
   local current_hash = tip_hash
+  local reached_genesis = false
   for _ = 1, 11 do
     local header = storage.get_header(current_hash)
     if not header then break end
     timestamps[#timestamps + 1] = header.timestamp
     current_hash = header.prev_hash
+    if types.hash256_eq(current_hash, types.hash256_zero()) then
+      reached_genesis = true
+      break
+    end
   end
   if #timestamps == 0 then return os.time() end
+  -- FAIL CLOSED on a window cut short by a missing header (snapshot boot
+  -- before the pre-base headers are backfilled): the median of the headers
+  -- that happen to be present is biased LATE, which would admit time-locked
+  -- txs early.  nil -> the caller refuses every time-locked tx.
+  if #timestamps < 11 and not reached_genesis then return nil end
   table.sort(timestamps)
   -- Bitcoin Core: pbegin[(pend-pbegin)/2] (0-indexed, integer division picks
   -- upper-middle for even n).  Lua 1-indexed: floor(n/2)+1.
@@ -34,6 +44,105 @@ local function get_tip_mtp(chain_state)
   local n = #timestamps
   return timestamps[math.floor(n / 2) + 1]
 end
+
+-- Fail-closed MTP of the 11-header window ending at block_hash (Core
+-- CBlockIndex::GetMedianTimePast).  The window may only be short because it
+-- reached genesis; a window cut short by a missing header returns nil + reason
+-- (a snapshot-booted node before its pre-base headers are backfilled).
+local function mtp_at_hash(storage, block_hash)
+  local timestamps = {}
+  local current_hash = block_hash
+  local reached_genesis = false
+  for _ = 1, 11 do
+    local header = storage.get_header(current_hash)
+    if not header then break end
+    timestamps[#timestamps + 1] = header.timestamp
+    current_hash = header.prev_hash
+    if types.hash256_eq(current_hash, types.hash256_zero()) then
+      reached_genesis = true
+      break
+    end
+  end
+  if #timestamps < 11 and not reached_genesis then
+    return nil, string.format("%s: MTP window of %s has %d of 11 headers",
+      validation.MISSING_ANCESTOR, types.hash256_hex(block_hash), #timestamps)
+  end
+  table.sort(timestamps)
+  return timestamps[math.floor(#timestamps / 2) + 1]
+end
+
+--- Build get_block_mtp(h) for mempool BIP-68: the MTP of the ACTIVE-chain
+-- block at height h.  Core CalculateSequenceLocks evaluates a time lock as
+-- block.GetAncestor(coin_height - 1)->GetMedianTimePast() where block is the
+-- next block on top of the active tip (CalculateLockPointsAtTip), so a coin
+-- confirmed at height H is measured from MTP(H-1) of the active chain; a
+-- mempool coin (height tip+1) is measured from the tip MTP.
+--
+-- The persisted height index (CF.HEIGHT_INDEX) follows the BEST HEADER chain,
+-- which can run ahead of / beside the active chain while a fork's headers are
+-- known but its bodies are not connected.  So the active chain is walked back
+-- from the real tip until it rejoins the index (normally zero steps); heights
+-- at or below that join point are answered from the index, heights above it
+-- from the walk.  Fail closed: nil + reason when a header is not held.
+local function make_active_get_block_mtp(chain_state, tip_mtp)
+  local storage = chain_state and chain_state.storage
+  local tip_hash = chain_state and chain_state.tip_hash
+  local tip_height = chain_state and chain_state.tip_height
+  if not storage or not tip_hash or not storage.get_header then
+    -- No header store (unit-test mocks only): the tip MTP is >= every
+    -- ancestor's MTP, so this can only refuse, never admit early.
+    return function(_h) return tip_mtp end
+  end
+  local walked = { [tip_height] = tip_hash }  -- active height -> hash (above join)
+  local walk_hash, walk_height = tip_hash, tip_height
+  local join = nil  -- highest height where index == active chain
+  local has_index = storage.get_hash_by_height ~= nil
+  local function step_down()
+    local hdr = storage.get_header(walk_hash)
+    if not hdr or walk_height <= 0 then return false end
+    walk_hash, walk_height = hdr.prev_hash, walk_height - 1
+    walked[walk_height] = walk_hash
+    return true
+  end
+  local function active_hash_at(h)
+    if h > tip_height or h < 0 then return nil end
+    if walked[h] then return walked[h] end
+    if has_index then
+      if join == nil then
+        -- Find the join point: walk down until the index names the active block.
+        while true do
+          local idx = storage.get_hash_by_height(walk_height)
+          if idx and types.hash256_eq(idx, walk_hash) then
+            join = walk_height
+            break
+          end
+          if not step_down() then join = -1; break end
+        end
+        if walked[h] then return walked[h] end
+      end
+      if join >= 0 and h <= join then
+        return storage.get_hash_by_height(h)
+      end
+    end
+    while walk_height > h do
+      if not step_down() then return nil end
+    end
+    return walked[h]
+  end
+  return function(h)
+    if h == tip_height then
+      if tip_mtp then return tip_mtp end
+      return nil, validation.MISSING_ANCESTOR .. ": tip MTP window not held"
+    end
+    local hash = active_hash_at(h)
+    if not hash then
+      return nil, string.format("%s: no active-chain header at height %d",
+        validation.MISSING_ANCESTOR, h)
+    end
+    return mtp_at_hash(storage, hash)
+  end
+end
+M._make_active_get_block_mtp = make_active_get_block_mtp
 
 -- Cluster mempool: union-find for tracking transaction clusters
 local uf_parent = {}
@@ -1308,9 +1417,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp ~line 819).
   -- nextHeight = tipHeight + 1; lockTimeCutoff = MTP of current tip (BIP-113).
   local tip_height = self.chain_state.tip_height
+  -- tip_mtp is nil only when the tip's MTP window is not held; 0 then makes
+  -- every time-based nLockTime non-final (refuse, never admit early), and the
+  -- BIP-68 resolver below refuses every time-type relative lock.
   local tip_mtp = get_tip_mtp(self.chain_state)
   local next_height = tip_height + 1
-  if not mining.is_final_tx(tx, next_height, tip_mtp) then
+  if not mining.is_final_tx(tx, next_height, tip_mtp or 0) then
     -- Core mempool token is "non-final" (validation.cpp:820); "bad-txns-nonfinal"
     -- is the block-level token (validation.cpp:4147).
     return false, "non-final"
@@ -1485,9 +1597,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   if tx.version >= 2 and tip_height >= csv_height then
     local enforce_bip68 = true
     -- get_utxo_height(inp): returns the height the UTXO was confirmed (or synthetic).
-    -- get_block_mtp(h): returns the MTP of block at height h; we use tip_mtp
-    --   conservatively for all heights (may false-reject time-locked txs near the
-    --   boundary but never false-admits).
+    -- get_block_mtp(h): the MTP of the ACTIVE-chain block at height h (Core
+    --   CalculateSequenceLocks: GetAncestor(coin_height-1)->GetMedianTimePast).
+    --   Was the tip MTP for every coin, so every time-type relative lock on a
+    --   confirmed coin was measured from the tip instead of from the coin's
+    --   block -- a matured lock was refused until (tip MTP - coin MTP) itself
+    --   exceeded the lock, i.e. never while the chain keeps moving.
     local function get_utxo_height_for_seq(inp)
       for j, inp2 in ipairs(tx.inputs) do
         if inp2 == inp then
@@ -1496,12 +1611,19 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       end
       return next_height
     end
-    local function get_block_mtp_conservative(_h)
-      return tip_mtp
+    local get_block_mtp = make_active_get_block_mtp(self.chain_state, tip_mtp)
+    local lk_ok, min_h, min_t = pcall(validation.calculate_sequence_locks,
+      tx, next_height, get_utxo_height_for_seq, get_block_mtp, enforce_bip68)
+    if not lk_ok then
+      -- A coin's MTP window is not held (snapshot boot before backfill):
+      -- refuse rather than guess.  Core always has the window.
+      local msg = tostring(min_h)
+      if msg:find(validation.MISSING_ANCESTOR, 1, true) then
+        return false, "non-BIP68-final"
+      end
+      error(min_h, 0)
     end
-    local min_h, min_t = validation.calculate_sequence_locks(
-      tx, next_height, get_utxo_height_for_seq, get_block_mtp_conservative, enforce_bip68)
-    if not validation.check_sequence_locks(min_h, min_t, next_height, tip_mtp) then
+    if not validation.check_sequence_locks(min_h, min_t, next_height, tip_mtp or 0) then
       return false, "non-BIP68-final"
     end
   end
