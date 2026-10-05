@@ -37,13 +37,22 @@ local function compute_mtp_from_storage(storage, tip_hash)
   end
   local timestamps = {}
   local current_hash = tip_hash
+  local reached_genesis = false
   for _ = 1, 11 do
     local header = storage.get_header(current_hash)
     if not header then break end
     timestamps[#timestamps + 1] = header.timestamp
     current_hash = header.prev_hash
+    if types.hash256_eq(current_hash, types.hash256_zero()) then
+      reached_genesis = true
+      break
+    end
   end
-  if #timestamps == 0 then
+  -- FAIL CLOSED: Core's window is min(11, height+1) headers; it is only short
+  -- at genesis.  A window cut short by a missing header (snapshot boot) would
+  -- bias the median late and let the template include txs whose nLockTime is
+  -- not yet final.
+  if #timestamps == 0 or (#timestamps < 11 and not reached_genesis) then
     return nil
   end
   table.sort(timestamps)
@@ -281,9 +290,17 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   local subsidy = consensus.get_block_subsidy(
     height, network.subsidy_halving_interval)
 
-  -- Get median time past for locktime checks
-  -- chain_state.mtp should be provided; fallback to current time - 3600 (1 hour ago)
-  local mtp = chain_state.mtp or (os.time() - 3600)
+  -- Lock-time cutoff = MTP of the block the template builds on (Core
+  -- BlockAssembler::CreateNewBlock: m_lock_time_cutoff =
+  -- pindexPrev->GetMedianTimePast(), node/miner.cpp; BIP-113).  This used to
+  -- read chain_state.mtp, which nothing in production ever assigned, so every
+  -- template used the wall clock minus one hour: txs whose time-based
+  -- nLockTime lay between the real MTP and now-1h were INCLUDED (an invalid
+  -- block: bad-txns-nonfinal), and mintime was now-1h+1 instead of MTP+1.
+  local mtp = compute_mtp_from_storage(chain_state.storage, prev_hash)
+  if not mtp then
+    error("block template: MTP of the tip is not computable (11-header window not held)", 0)
+  end
 
   -- Select transactions from mempool ordered by ancestor fee rate
   local sorted_entries = mempool:get_sorted_entries()
@@ -422,10 +439,9 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   -- its chain to R1), so the heavier-fork header tip never propagated and the
   -- reorg machinery never engaged.  Clamping to MTP+1 makes every mined block
   -- header-MTP-valid, exactly like Core's miner.
-  local real_mtp = compute_mtp_from_storage(chain_state.storage, prev_hash)
   local block_time = os.time()
-  if real_mtp and block_time <= real_mtp then
-    block_time = real_mtp + 1
+  if block_time <= mtp then
+    block_time = mtp + 1
   end
 
   -- Build block header
@@ -484,7 +500,9 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
     sigoplimit = consensus.MAX_BLOCK_SIGOPS_COST,
     sizelimit = consensus.MAX_BLOCK_SERIALIZED_SIZE,
     weightlimit = consensus.MAX_BLOCK_WEIGHT,
-    curtime = os.time(),
+    -- Core: curtime = pblock->GetBlockTime() after UpdateTime, i.e.
+    -- max(MTP+1, now) -- never below mintime.
+    curtime = block_time,
     bits = string.format("%08x", bits),
     height = height,
     default_witness_commitment = witness_commitment and

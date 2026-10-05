@@ -38,7 +38,13 @@ describe("mining", function()
   local function make_mock_chain_state(tip_height, tip_hash, bits)
     tip_hash = tip_hash or types.hash256(string.rep("\xab", 32))
     bits = bits or consensus.networks.regtest.pow_limit_bits
-    return {
+    -- The template's lock-time cutoff is now computed from the stored headers
+    -- (create_block_template no longer reads a chain_state.mtp field, which
+    -- production never set).  The mock tip header's prev is genesis-zero, so
+    -- the MTP window is this single header: tests that set `cs.mtp = X` get
+    -- MTP == X through the header timestamp.
+    local cs
+    cs = {
       tip_height = tip_height or 100,
       tip_hash = tip_hash,
       storage = {
@@ -47,13 +53,14 @@ describe("mining", function()
             version = 0x20000000,
             prev_hash = types.hash256_zero(),
             merkle_root = types.hash256_zero(),
-            timestamp = os.time() - 600,
+            timestamp = cs.mtp or (os.time() - 600),
             bits = bits,
             nonce = 0
           }
         end
       }
     }
+    return cs
   end
 
   -- Helper to create a mock mempool
