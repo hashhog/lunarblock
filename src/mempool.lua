@@ -1477,8 +1477,11 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       resolved_utxos[i] = utxo
       input_total = input_total + utxo.value
       -- Coinbase maturity
+      -- Judged at the spend height tip+1, like Core's CheckTxInputs
+      -- (nSpendHeight = m_chain.Height() + 1, consensus/tx_verify.cpp): was
+      -- tip - height, which refused a coinbase spend one block early.
       if utxo.is_coinbase then
-        if tip_height - utxo.height < consensus.COINBASE_MATURITY then
+        if next_height - utxo.height < consensus.COINBASE_MATURITY then
           -- Core token: consensus/tx_verify.cpp:180.
           return false, "bad-txns-premature-spend-of-coinbase"
         end
@@ -3254,7 +3257,7 @@ function Mempool:accept_package(txns, test_accept)
 
       -- Coinbase maturity check
       if utxo.is_coinbase then
-        if self.chain_state.tip_height - utxo.height < consensus.COINBASE_MATURITY then
+        if self.chain_state.tip_height + 1 - utxo.height < consensus.COINBASE_MATURITY then
           return false, "spending immature coinbase"
         end
       end
