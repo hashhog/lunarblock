@@ -26,7 +26,7 @@ local function get_tip_mtp(chain_state)
     if not header then break end
     timestamps[#timestamps + 1] = header.timestamp
     current_hash = header.prev_hash
-    if types.hash256_eq(current_hash, types.hash256_zero()) then
+    if current_hash == nil or types.hash256_eq(current_hash, types.hash256_zero()) then
       reached_genesis = true
       break
     end
@@ -58,7 +58,7 @@ local function mtp_at_hash(storage, block_hash)
     if not header then break end
     timestamps[#timestamps + 1] = header.timestamp
     current_hash = header.prev_hash
-    if types.hash256_eq(current_hash, types.hash256_zero()) then
+    if current_hash == nil or types.hash256_eq(current_hash, types.hash256_zero()) then
       reached_genesis = true
       break
     end

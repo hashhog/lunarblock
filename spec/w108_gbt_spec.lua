@@ -70,7 +70,12 @@ end
 local function make_mock_chain_state(tip_height, tip_hash, bits)
   tip_hash = tip_hash or types.hash256(string.rep("\xab", 32))
   bits = bits or consensus.networks.regtest.pow_limit_bits
-  return {
+  -- create_block_template now derives the MTP from the stored headers (it
+  -- no longer reads chain_state.mtp, which production never set).  The mock
+  -- tip's prev is genesis-zero, so the MTP window is this single header and
+  -- `cs.mtp = X` drives MTP == X through its timestamp.
+  local cs
+  cs = {
     tip_height = tip_height or 100,
     tip_hash   = tip_hash,
     mtp        = 1700000000,
@@ -80,13 +85,14 @@ local function make_mock_chain_state(tip_height, tip_hash, bits)
           version    = 0x20000000,
           prev_hash  = types.hash256_zero(),
           merkle_root = types.hash256_zero(),
-          timestamp  = os.time() - 600,
+          timestamp  = cs.mtp or (os.time() - 600),
           bits       = bits,
           nonce      = 0,
         }
       end,
     },
   }
+  return cs
 end
 
 local function make_mock_mempool(entries)
@@ -652,17 +658,23 @@ describe("W108 GBT/BlockTemplate 30-gate audit", function()
 
       local cs = make_mock_chain_state(2015)  -- next block = 2016 (retarget boundary)
       cs.mtp = mtp_val
+      -- Three-header chain: tip (prev_block_time) on two parents at mtp_val,
+      -- so the tip's MTP (median of the three) is mtp_val while the prev
+      -- block's own time is prev_block_time.
+      local tip_h = cs.tip_hash
+      local p1 = types.hash256(string.rep("\xb1", 32))
+      local p2 = types.hash256(string.rep("\xb2", 32))
+      local function hdr(prev, ts)
+        return { version = 0x20000000, prev_hash = prev, merkle_root = types.hash256_zero(),
+                 timestamp = ts, bits = consensus.networks.regtest.pow_limit_bits, nonce = 0 }
+      end
+      local chain = {
+        [tip_h.bytes] = hdr(p1, prev_block_time),  -- controls BIP94 clamp
+        [p1.bytes]    = hdr(p2, mtp_val),
+        [p2.bytes]    = hdr(types.hash256_zero(), mtp_val),
+      }
       cs.storage = {
-        get_header = function(_, _hash)
-          return {
-            version    = 0x20000000,
-            prev_hash  = types.hash256_zero(),
-            merkle_root = types.hash256_zero(),
-            timestamp  = prev_block_time,  -- controls BIP94 clamp
-            bits       = consensus.networks.regtest.pow_limit_bits,
-            nonce      = 0,
-          }
-        end,
+        get_header = function(hash) return chain[hash.bytes] end,
       }
       local net = consensus.networks.regtest
 
