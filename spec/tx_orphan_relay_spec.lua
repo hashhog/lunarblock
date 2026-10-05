@@ -165,3 +165,40 @@ describe("p2p tx handler (main.lua, live source)", function()
     assert.equal(0, pool:size())
   end)
 end)
+
+describe("p2p tx handler never punishes the relaying peer", function()
+  -- Core net_processing.cpp ProcessInvalidTx: no Misbehaving() for any
+  -- TxValidationResult; an exception in ProcessMessage is only logged.
+  local root = types.hash256(string.rep("\x33", 32))
+  local mp, pool, handle, pm
+
+  before_each(function()
+    mp = mempool_mod.new(chain_with_utxos({ { types.hash256_hex(root), 0, 100000 } }))
+    pool = mempool_mod.new_orphan_pool()
+    handle, pm = build_handler(mp, pool)
+  end)
+
+  it("does not punish a peer for a tx payload that fails to deserialize", function()
+    handle(PEER, "\x01\x00\x00\x00\xff")  -- truncated: the reader throws
+    assert.equal(0, #pm.bans)
+  end)
+
+  it("does not punish a peer when mempool admission throws a plain error", function()
+    mp.accept_transaction = function() error("internal bug in admission") end
+    handle(PEER, wire(spend(root, 0, 90000)))
+    assert.equal(0, #pm.bans)
+  end)
+
+  it("does not punish a peer for a system fault (control: already true on 86efc28)", function()
+    mp.accept_transaction = function() fault.raise("db write failed") end
+    handle(PEER, wire(spend(root, 0, 90000)))
+    assert.equal(0, #pm.bans)
+  end)
+
+  it("does not punish a peer for a consensus-invalid tx (control)", function()
+    -- outputs exceed inputs: bad-txns-in-belowout, a verdict, still no ban
+    handle(PEER, wire(spend(root, 0, 200000)))
+    assert.is_nil(mp:get_entry(txid_hex(spend(root, 0, 200000))))
+    assert.equal(0, #pm.bans)
+  end)
+end)

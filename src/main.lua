@@ -2273,12 +2273,17 @@ local function main()
       end
     end)
     if not ok then
-      -- A system fault (DB error, allocation failure, the AbortNode latch)
-      -- says nothing about the tx: never punish the relaying peer for it.
+      -- Never punish the relaying peer for a tx.  Current Core
+      -- (net_processing.cpp ProcessInvalidTx) calls Misbehaving() for no
+      -- TxValidationResult, and an exception while processing a message is
+      -- only logged (ProcessMessages catch).  A thrown error here is either a
+      -- system fault (DB error, allocation failure, the AbortNode latch —
+      -- says nothing about the tx) or a bug in our own handler/mempool code;
+      -- dropping an honest peer for either just sheds good peers.
       if fault.is_system_fault(err) then
         print("tx handler: system fault (no penalty): " .. tostring(err))
       else
-        peer_manager:add_ban_score(peer, 10, tostring(err))
+        print("tx handler: error processing tx (no penalty): " .. tostring(err))
       end
     end
   end)
