@@ -3887,6 +3887,15 @@ function RPCServer:register_methods()
     if not ok then
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to invalidate block"})
     end
+    -- The tip may have dropped: evict entries that are no longer final /
+    -- BIP-68-final / mature at the new tip+1 (Core InvalidateBlock ->
+    -- MaybeUpdateMempoolForReorg -> removeForReorg).
+    if rpc.mempool and rpc.mempool.remove_for_reorg then
+      local ok_rr, err_rr = pcall(rpc.mempool.remove_for_reorg, rpc.mempool)
+      if not ok_rr then
+        print("[invalidateblock] mempool remove_for_reorg failed (non-fatal): " .. tostring(err_rr))
+      end
+    end
 
     return cjson.null
   end

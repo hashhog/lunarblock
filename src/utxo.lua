@@ -4901,6 +4901,16 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   end
   reorg_batch.destroy()
 
+  -- The tip moved sideways: evict mempool entries that are no longer final /
+  -- BIP-68-final / mature in the next block (Core MaybeUpdateMempoolForReorg
+  -- -> removeForReorg).  In-memory only; never fails the reorg.
+  if opts.mempool and opts.mempool.remove_for_reorg then
+    local ok_rr, err_rr = pcall(opts.mempool.remove_for_reorg, opts.mempool)
+    if not ok_rr then
+      print("[REORG] mempool remove_for_reorg failed (non-fatal): " .. tostring(err_rr))
+    end
+  end
+
   return "connected"
 end
 

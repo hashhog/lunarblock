@@ -2388,6 +2388,76 @@ function Mempool:block_disconnected(block)
   end
 end
 
+--- Evict entries that are no longer valid in the NEXT block after the tip
+-- moved backwards or sideways (reorg / invalidateblock).
+--
+-- Core MaybeUpdateMempoolForReorg -> removeForReorg(filter_final_and_mature)
+-- (validation.cpp): for every entry, CheckFinalTxAtTip, recompute the lock
+-- points and CheckSequenceLocksAtTip (mempool coins at tip+1, confirmed coins
+-- at their own height / MTP(height-1)), and coinbase maturity at tip+1; a
+-- failing entry is removed with all its descendants.  Without this, a tx that
+-- was final on the old chain stays in the pool after the tip drops or its MTP
+-- falls, and the template (which re-checks only nLockTime) can include a
+-- BIP-68-non-final tx -> an invalid block.
+--
+-- An entry with an input that resolves neither to a coin nor to a mempool
+-- parent is left alone here (its inputs were just confirmed/spent by the
+-- new chain; on_block_connected removes it as confirmed/conflicting).
+-- @return number: entries evicted (including descendants)
+function Mempool:remove_for_reorg()
+  local cs = self.chain_state
+  if not cs or not cs.tip_height or next(self.entries) == nil then return 0 end
+  local tip_height = cs.tip_height
+  local next_height = tip_height + 1
+  local tip_mtp = get_tip_mtp(cs)
+  local csv_height = (cs.network and cs.network.csv_height) or 419328
+  local get_block_mtp = make_active_get_block_mtp(cs, tip_mtp)
+
+  local function still_valid(entry)
+    local tx = entry.tx
+    if not mining.is_final_tx(tx, next_height, tip_mtp or 0) then return false end
+    local heights = {}
+    for i, inp in ipairs(tx.inputs) do
+      local coin = cs.coin_view and cs.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+      if coin then
+        if coin.is_coinbase and next_height - coin.height < consensus.COINBASE_MATURITY then
+          return false
+        end
+        heights[i] = coin.height
+      elseif self.entries[types.hash256_hex(inp.prev_out.hash)] then
+        heights[i] = next_height
+      else
+        return nil  -- unresolved: not ours to judge here
+      end
+    end
+    if tx.version >= 2 and tip_height >= csv_height then
+      local idx = {}
+      for i, inp in ipairs(tx.inputs) do idx[inp] = i end
+      local ok, min_h, min_t = pcall(validation.calculate_sequence_locks, tx, next_height,
+        function(inp) return heights[idx[inp]] end, get_block_mtp, true)
+      if not ok then
+        if tostring(min_h):find(validation.MISSING_ANCESTOR, 1, true) then return false end
+        error(min_h, 0)
+      end
+      if not validation.check_sequence_locks(min_h, min_t, next_height, tip_mtp or 0) then
+        return false
+      end
+    end
+    return true
+  end
+
+  local ids = {}
+  for txid_hex in pairs(self.entries) do ids[#ids + 1] = txid_hex end
+  local before = self.tx_count
+  for _, txid_hex in ipairs(ids) do
+    local entry = self.entries[txid_hex]
+    if entry and still_valid(entry) == false then
+      self:remove_transaction(txid_hex, "reorg")
+    end
+  end
+  return before - self.tx_count
+end
+
 --------------------------------------------------------------------------------
 -- Mempool Trimming
 --------------------------------------------------------------------------------
