@@ -3114,6 +3114,19 @@ function M.verify_input_script(tx, input_index, utxo_value, script_pubkey, flags
     if internal then
       return nil, msg, true
     end
+    -- A verdict is the script error (Core's ScriptError), not a source
+    -- location.  The consensus asserts inside verify_input_script_inner
+    -- prepend their own ".../validation.lua:N: " marker; connect_block then
+    -- wraps the verdict in a second assert, and the BIP-22 mapper (rpc.lua
+    -- bip22_result) strips through the innermost marker -- leaving a bare
+    -- "SIG_DER" that maps to the generic "rejected" instead of Core's
+    -- "block-script-verify-flag-failed" (regression from 94e8a32; the
+    -- nightly dersig-non-canonical-signature differential).  Drop the
+    -- marker so the verdict reads exactly as it did when these checks were
+    -- inline in connect_block.
+    if type(msg) == "string" then
+      msg = msg:gsub("^[^\n]-%.lua:%d+:%s*", "", 1)
+    end
     return nil, msg
   end
   return a, b
