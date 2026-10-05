@@ -119,9 +119,20 @@ typedef struct {
     int64_t amount;
     uint32_t input_index;
     uint32_t flags;
-    int result;                   /* 1 = valid, 0 = invalid */
+    int result;                   /* PV_RESULT_* below */
     char error[196];
 } script_check_job;
+
+/* script_check_job.result.  Only PV_RESULT_OK and PV_RESULT_SCRIPT_ERROR are
+ * outcomes of the script; the other two mean the check did not complete
+ * (Core: a CScriptCheck either returns a ScriptError or the node aborts) and
+ * the host re-runs the check -- they are never a verdict on the block. */
+#define PV_RESULT_NOT_RUN      (-1)  /* host pre-fill; no worker wrote it   */
+#define PV_RESULT_SCRIPT_ERROR   0   /* consensus failure of the input      */
+#define PV_RESULT_OK             1
+#define PV_RESULT_INTERNAL       2   /* worker fault: no lua_State, Lua
+                                        error outside the interpreter,
+                                        allocation failure                  */
 
 /* Worker thread state */
 typedef struct {
@@ -460,8 +471,8 @@ static void worker_gc_idle(worker_t *worker) {
     worker->gc_kb = kb;
 }
 
-static void set_job_error(script_check_job *job, const char *msg) {
-    job->result = 0;
+static void set_job_result(script_check_job *job, int result, const char *msg) {
+    job->result = result;
     if (!msg) msg = "script check failed";
     snprintf(job->error, sizeof(job->error), "%s", msg);
 }
@@ -469,7 +480,11 @@ static void set_job_error(script_check_job *job, const char *msg) {
 static void process_script_job(worker_t *worker, script_check_job *job) {
     lua_State *L = worker->L;
     if (!L) {
-        set_job_error(job, "no lua_State on worker");
+        /* A worker without a lua_State cannot run the check.  This used to
+         * be result 0 -- a script failure -- so a pool that half-started
+         * (or lost the bootstrap race below) marked every multi-input block
+         * invalid. */
+        set_job_result(job, PV_RESULT_INTERNAL, "no lua_State on worker");
         return;
     }
     lua_settop(L, 0);
@@ -484,19 +499,23 @@ static void process_script_job(worker_t *worker, script_check_job *job) {
     } else {
         lua_pushnil(L);
     }
-    if (lua_pcall(L, 6, 2, 0) != 0) {
+    if (lua_pcall(L, 6, 3, 0) != 0) {
+        /* The worker entry point raised OUTSIDE the interpreter's classified
+         * call (tx deserialize, precompute, LUA_ERRMEM): the check did not
+         * complete.  Never a script failure. */
         const char *err = lua_tostring(L, -1);
-        set_job_error(job, err);
+        set_job_result(job, PV_RESULT_INTERNAL, err ? err : "worker lua_pcall failed");
         lua_settop(L, 0);
         return;
     }
-    int ok = lua_toboolean(L, -2);
+    int ok = lua_toboolean(L, -3);
     if (ok) {
-        job->result = 1;
+        job->result = PV_RESULT_OK;
         job->error[0] = '\0';
     } else {
-        const char *err = lua_tostring(L, -1);
-        set_job_error(job, err);
+        const char *err = lua_tostring(L, -2);
+        int internal = lua_toboolean(L, -1);
+        set_job_result(job, internal ? PV_RESULT_INTERNAL : PV_RESULT_SCRIPT_ERROR, err);
     }
     lua_settop(L, 0);
 }
@@ -722,9 +741,13 @@ int pv_init(int num_threads) {
             return -1;
         }
 
+        /* Do NOT write workers[i].L / script_ready here: the thread is
+         * already running and sets both itself under lua_init_mutex.  The
+         * unlocked "L = NULL; script_ready = 0" that used to follow
+         * pthread_create raced the worker's own bootstrap and could leave a
+         * worker counted as script-ready with L == NULL (calloc already
+         * zeroed both fields). */
         workers[i].running = 1;
-        workers[i].L = NULL;
-        workers[i].script_ready = 0;
     }
 
     /* Wait until every worker has finished lua_State bootstrap (or failed

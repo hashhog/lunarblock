@@ -5,6 +5,7 @@ local serialize = require("lunarblock.serialize")
 local crypto = require("lunarblock.crypto")
 local script = require("lunarblock.script")
 local consensus = require("lunarblock.consensus")
+local fault = require("lunarblock.fault")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -322,8 +323,15 @@ function M.verify_script_checks(jobs)
     return true
   end
 
-  local function run_one(job)
-    return M.verify_input_script(
+  local nworkers = 0
+  if init_parallel_verify() then
+    nworkers = tonumber(pv_lib.pv_get_script_workers()) or 0
+  end
+
+  -- run_one_checked: host-side CScriptCheck with Core's halt-on-internal semantics
+  -- (re-run once, then fault.latch + raise).  Returns true or (false, err).
+  local function run_one_checked(job)
+    return M.verify_input_script_checked(
       job.tx, job.input_index, job.amount, job.script_pubkey, job.flags,
       {
         taproot_active = job.taproot_active,
@@ -332,19 +340,18 @@ function M.verify_script_checks(jobs)
       })
   end
 
-  local nworkers = 0
-  if init_parallel_verify() then
-    nworkers = tonumber(pv_lib.pv_get_script_workers()) or 0
-  end
-
-  if nworkers < 1 then
+  local function run_serial()
     for i, job in ipairs(jobs) do
-      local ok, err = run_one(job)
+      local ok, err = run_one_checked(job)
       if not ok then
         return false, string.format("input %d: %s", i, tostring(err or "script check failed"))
       end
     end
     return true
+  end
+
+  if nworkers < 1 then
+    return run_serial()
   end
 
   local n = #jobs
@@ -405,29 +412,42 @@ function M.verify_script_checks(jobs)
       cjobs[j].prevouts_blob = nil
       cjobs[j].prevouts_len = 0
     end
-    cjobs[j].result = 0
+    -- PV_RESULT_NOT_RUN: a job no worker wrote a result for must read as
+    -- "did not complete", never as a pass or a script failure.
+    cjobs[j].result = -1
     cjobs[j].error[0] = 0
   end
+  if fault.hooks then fault.hook("script_jobs_built", cjobs, n, keep) end
 
   local failures = pv_lib.pv_verify_script_checks(cjobs, n)
-  if failures == -2 then
-    -- Workers exist but none bootstrapped a lua_State.
-    for i, job in ipairs(jobs) do
-      local ok, err = run_one(job)
-      if not ok then
-        return false, string.format("input %d: %s", i, tostring(err or "script check failed"))
-      end
-    end
-    return true
-  elseif failures < 0 then
-    return false, "parallel script verification error"
+  if fault.hooks then
+    local hf = fault.hook("script_jobs_done", cjobs, n, failures)
+    if hf ~= nil then failures = hf end
+  end
+  if failures < 0 then
+    -- -2: workers exist but none bootstrapped a lua_State.
+    -- -1: the pool could not start.  Neither says anything about the
+    -- block: run every check on the host.
+    return run_serial()
   end
 
+  -- Results: 1 = pass, 0 = SCRIPT_ERROR (verdict), anything else (2 =
+  -- INTERNAL, -1 = never run) = the check did not complete: re-run it on the
+  -- host (Core: a CScriptCheck either returns a ScriptError or the node
+  -- aborts).  Lowest index first, so the reported reason does not depend on
+  -- which worker ran what.
   for i = 0, n - 1 do
-    if cjobs[i].result ~= 1 then
+    local r = cjobs[i].result
+    if r == 0 then
       local err = ffi.string(cjobs[i].error)
       if err == "" then err = "script check failed" end
       return false, string.format("input %d: %s", i + 1, err)
+    elseif r ~= 1 then
+      local ok, err = run_one_checked(jobs[i + 1])
+      if not ok then
+        return false, string.format("input %d: %s", i + 1,
+          tostring(err or "script check failed"))
+      end
     end
   end
   return true
@@ -2865,6 +2885,10 @@ local function copy_flags(flags)
 end
 
 local function verify_input_script_inner(tx, input_index, utxo_value, script_pubkey, flags, opts)
+  -- Test-only injection point (fault.hooks is nil in production): a hook may
+  -- raise here exactly as an allocation failure / runtime fault inside the
+  -- interpreter would.
+  if fault.hooks then fault.hook("script_check", tx, input_index) end
   opts = opts or {}
   flags = flags or {}
   local inp = tx.inputs[input_index + 1]
@@ -3069,17 +3093,46 @@ local function verify_input_script_inner(tx, input_index, utxo_value, script_pub
   return true
 end
 
---- Verify one input's script. Same accept/reject as connect_block's inline
--- path. Throws from the interpreter are converted to (nil, err) so a
--- worker lua_State can report them without killing the process.
--- @return boolean|nil, string|nil
+--- Verify one input's script (Core CScriptCheck).  THREE outcomes:
+--   true                      the input's script passes
+--   nil|false, err            SCRIPT_ERROR: a consensus verdict on the input
+--   nil, err, true            INTERNAL: the check did not complete (allocation
+--                             failure, a runtime fault in the node's own code,
+--                             a missing secp context).  NOT a verdict -- the
+--                             caller re-runs it once and otherwise halts
+--                             (fault.latch), never marks or punishes.
+-- Core: CScriptCheck reports only ScriptError values; anything the
+-- interpreter throws is a node bug (bad_alloc terminates).  A raise is a
+-- verdict only when it is an explicit error()/assert() in the consensus
+-- modules (script.lua / validation.lua) -- see fault.script_raise_handler.
+-- @return boolean|nil, string|nil, boolean|nil
 function M.verify_input_script(tx, input_index, utxo_value, script_pubkey, flags, opts)
-  local ok, a, b = pcall(verify_input_script_inner,
+  local ok, a, b = xpcall(verify_input_script_inner, fault.script_raise_handler,
     tx, input_index, utxo_value, script_pubkey, flags, opts)
   if not ok then
-    return nil, tostring(a)
+    local internal, msg = fault.classify_script_raise(a)
+    if internal then
+      return nil, msg, true
+    end
+    return nil, msg
   end
   return a, b
+end
+
+--- verify_input_script with Core's halt-on-internal semantics: an INTERNAL
+-- result is re-run once; a second INTERNAL latches the node (AbortNode) and
+-- raises a system fault.  Returns only true or (nil, script_error).
+function M.verify_input_script_checked(tx, input_index, utxo_value, script_pubkey, flags, opts)
+  local ok, err, internal = M.verify_input_script(
+    tx, input_index, utxo_value, script_pubkey, flags, opts)
+  if not internal then return ok, err end
+  local ok2, err2, internal2 = M.verify_input_script(
+    tx, input_index, utxo_value, script_pubkey, flags, opts)
+  if not internal2 then return ok2, err2 end
+  local reason = string.format("script check of input %d did not complete twice: %s",
+    input_index, tostring(err2 or err))
+  fault.latch(reason)
+  fault.raise(reason)
 end
 
 --- Verify a native P2WPKH input (connect_block hot path at 900k).

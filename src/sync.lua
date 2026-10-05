@@ -6,6 +6,7 @@ local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
 local crypto = require("lunarblock.crypto")
 local perf = require("lunarblock.perf")
+local fault = require("lunarblock.fault")
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -48,6 +49,12 @@ local M = {}
 -- without a preceding script-rule failure in the same block, reclassify.
 function M.classify_callback_error(err)
   if err == nil then return "unknown" end
+  -- A tagged system fault (DB error, allocation failure, a script check
+  -- that did not complete) is this node's problem, whatever consensus-
+  -- looking words the wrapped message carries ("Script verification failed
+  -- for input 3: [SYSTEM-FAULT] ..."): checked FIRST so no pattern below can
+  -- turn it into a verdict.
+  if fault.is_system_fault(err) then return "local" end
   local s = tostring(err):lower()
 
   -- A needed ancestor header is not held (snapshot-booted node before the
@@ -152,12 +159,32 @@ end
 --           MISSING_PREV (and anything else we have not classified as
 --           local — keeping the pre-fix default).
 --   skip    deserialize failed (wire noise) and "local" IO/FFI (this node).
+-- Allow-list (gate 6): only an error that IS a consensus verdict on what the
+-- peer sent is punished.  "unknown" used to be punished (deny-list), so an
+-- unclassified local failure -- "not enough memory", a RocksDB Busy/
+-- Corruption -- banned the feeder at 100.  Core MaybePunishNodeForBlock acts
+-- only on a BlockValidationResult.
+local PUNISH_TOKENS = {
+  "bad%-prevblk",        -- BLOCK_INVALID_PREV
+  "high%-hash",          -- BLOCK_INVALID_HEADER (PoW)
+  "bad%-diffbits",       -- BLOCK_INVALID_HEADER
+  "time%-too%-old",      -- BLOCK_INVALID_HEADER
+  "bad%-version",        -- BLOCK_INVALID_HEADER
+  "checkpoint",          -- BLOCK_CHECKPOINT
+}
 function M.should_punish_peer_for_block_error(err)
   if err == nil then return false end
   local s = tostring(err)
   if s == "deserialize failed" then return false end
-  if M.classify_callback_error(err) == "local" then return false end
-  return true
+  if fault.is_system_fault(err) then return false end
+  local class = M.classify_callback_error(err)
+  if class == "consensus" then return true end
+  if class ~= "unknown" then return false end
+  local l = s:lower()
+  for _, pat in ipairs(PUNISH_TOKENS) do
+    if l:find(pat) then return true end
+  end
+  return false
 end
 
 -- Errors that are a consensus failure but NOT a verdict on the block hash.
@@ -188,6 +215,7 @@ local NON_VERDICT_PATTERNS = {
 --- retry later.
 function M.is_invalid_block_verdict(err)
   if err == nil then return false end
+  if fault.is_system_fault(err) then return false end
   if M.classify_callback_error(err) ~= "consensus" then return false end
   local s = tostring(err):lower()
   for _, pat in ipairs(NON_VERDICT_PATTERNS) do

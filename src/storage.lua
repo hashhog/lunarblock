@@ -1,4 +1,5 @@
 local ffi = require("ffi")
+local fault = require("lunarblock.fault")
 local serialize = require("lunarblock.serialize")
 local types = require("lunarblock.types")
 local M = {}
@@ -265,12 +266,26 @@ local CF_LIST = {
   M.CF.TXO_SPENDER,
 }
 
--- Helper: check error and throw if set
+-- Helper: check error and throw if set.
+-- Every RocksDB error (ENOSPC, EIO, EMFILE, corruption, a background error
+-- left by a failed flush) is a SYSTEM fault: it is raised with fault.TAG so
+-- no classifier on the way up can read it as a verdict on a block or a tx
+-- (Core: dbwrapper HandleError throws; CCoinsViewErrorCatcher aborts).
+local function raise_db_error(msg)
+  fault.raise("RocksDB error: " .. msg)
+end
+
 local function check_error(errptr)
   if errptr[0] ~= nil then
     local msg = ffi.string(errptr[0])
     librocksdb.rocksdb_free(errptr[0])
-    error("RocksDB error: " .. msg)
+    -- Reset the slot.  RocksDB's C API (SaveError) free()s a non-NULL
+    -- *errptr before storing the next error, so leaving the freed pointer
+    -- here turned the SECOND RocksDB error of the process into
+    -- "free(): double free detected" -> SIGABRT (seen on the first retry of
+    -- a disk-full write).
+    errptr[0] = nil
+    raise_db_error(msg)
   end
 end
 
@@ -989,10 +1004,27 @@ function M.open(path, cache_size_mb, open_opts)
   --   A non-blocking checkpoint is skipped (returns false) while a flush is
   --   already running: that flush is itself making the state durable, and
   --   stacking more small memtables behind it only adds L0 files.
+  -- A failed durability point is fatal (Core FlushStateToDisk ->
+  -- FatalError -> AbortNode): RocksDB is left in background-error state and
+  -- every later write fails; carrying on would only turn the failure into
+  -- something a classifier might read as a verdict.  Latch, then raise.
+  local function checkpoint_failed(err)
+    fault.latch("chainstate checkpoint (flush) failed: " .. tostring(err))
+    error(err, 0)
+  end
+
   function dbobj.checkpoint(wait)
+    if fault.hooks then
+      local inj = fault.hook("db_checkpoint", wait)
+      if inj then
+        local ok_i, err_i = pcall(raise_db_error, inj)
+        if not ok_i then checkpoint_failed(err_i) end
+      end
+    end
     if dbobj.wal_enabled then
       librocksdb.rocksdb_flush_wal(dbobj._db, 1, errptr)
-      check_error(errptr)
+      local ok_c, err_c = pcall(check_error, errptr)
+      if not ok_c then checkpoint_failed(err_c) end
     else
       if not wait then
         local running = dbobj.property("rocksdb.num-running-flushes")
@@ -1001,7 +1033,8 @@ function M.open(path, cache_size_mb, open_opts)
           return false
         end
       end
-      flush_all(wait and true or false)
+      local ok_f, err_f = pcall(flush_all, wait and true or false)
+      if not ok_f then checkpoint_failed(err_f) end
     end
     dbobj.stats.checkpoints = dbobj.stats.checkpoints + 1
     return true
@@ -1028,6 +1061,10 @@ function M.open(path, cache_size_mb, open_opts)
     local handle = dbobj._handles[cf]
     if not handle then
       error("Unknown column family: " .. tostring(cf))
+    end
+    if fault.hooks then
+      local inj = fault.hook("db_get", cf, key)
+      if inj then raise_db_error(inj) end
     end
     local vallen = ffi.new("size_t[1]")
     local val = librocksdb.rocksdb_get_cf(
@@ -1075,7 +1112,13 @@ function M.open(path, cache_size_mb, open_opts)
       pg_keybuf, keylen, n, pg_vals, pg_lens, nthreads or 16)
     for i = 0, n - 1 do
       local v = pg_vals[i]
-      if v ~= nil then
+      -- Test-only: an injected read error for this key reads as the C
+      -- helper's per-key error (unknown, not absent).
+      local inj = fault.hooks and fault.hook("db_get", cf, keys[i + 1])
+      if inj then
+        if v ~= nil then librocksdb.rocksdb_free(v) end
+        out[i + 1] = nil
+      elseif v ~= nil then
         out[i + 1] = ffi.string(v, pg_lens[i])
         librocksdb.rocksdb_free(v)
       elseif pg_lens[i] == SIZE_MAX_CDATA then
@@ -1135,6 +1178,12 @@ function M.open(path, cache_size_mb, open_opts)
     end
 
     function batch.write(sync)
+      -- Test-only injection (fault.hooks is nil in production): a hook
+      -- returning a message fails this write exactly as RocksDB would.
+      if fault.hooks then
+        local inj = fault.hook("db_write", sync)
+        if inj then raise_db_error(inj) end
+      end
       local opts = sync and dbobj._write_opts_sync or dbobj._write_opts
       librocksdb.rocksdb_write(dbobj._db, opts, batch._wb, errptr)
       check_error(errptr)
@@ -1227,6 +1276,10 @@ function M.open(path, cache_size_mb, open_opts)
       local ok, err = pcall(flush_all, true)
       if not ok then
         io.stderr:write("storage.close: final flush failed: " .. tostring(err) .. "\n")
+        -- The chainstate since the last checkpoint is lost (the on-disk
+        -- state is still a consistent earlier one).  Core: a failed final
+        -- FlushStateToDisk is a fatal error -> non-zero exit.
+        fault.latch("final chainstate flush failed at shutdown: " .. tostring(err))
       end
     end
     -- Destroy column family handles

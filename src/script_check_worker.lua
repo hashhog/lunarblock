@@ -26,7 +26,7 @@ local last_flag_bits, last_flags, last_taproot
 -- @param amount number satoshis
 -- @param flags_bits number packed SCRIPT_VERIFY flags + TAPROOT_ACTIVE
 -- @param prevouts_blob string|nil packed prevouts (taproot)
--- @return boolean, string|nil
+-- @return boolean, string|nil, boolean|nil (true = INTERNAL, not a verdict)
 function M.run(tx_bytes, input_index, prev_script, amount, flags_bits, prevouts_blob)
   local tx, prev_outputs, cache
   if last_bytes == tx_bytes then
@@ -57,13 +57,16 @@ function M.run(tx_bytes, input_index, prev_script, amount, flags_bits, prevouts_
     taproot_active = validation.script_flags_taproot_active(flags_bits)
     last_flag_bits, last_flags, last_taproot = flags_bits, flags, taproot_active
   end
-  local ok, err = validation.verify_input_script(
+  local ok, err, internal = validation.verify_input_script(
     tx, input_index, amount, prev_script, flags,
     { taproot_active = taproot_active, prev_outputs = prev_outputs, cache = cache })
   if ok then
     return true
   end
-  return false, err or "script check failed"
+  -- Third return: INTERNAL (the check did not complete).  The C pool maps
+  -- it to PV_RESULT_INTERNAL and the host re-runs the check; it is never a
+  -- script failure.
+  return false, err or "script check failed", internal and true or false
 end
 
 return M

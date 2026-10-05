@@ -1013,6 +1013,7 @@ local function main()
   local consensus_mod = require("lunarblock.consensus")
   local storage_mod = require("lunarblock.storage")
   local sync_mod = require("lunarblock.sync")
+  local fault = require("lunarblock.fault")
   local peerman_mod = require("lunarblock.peerman")
   local rpc_mod = require("lunarblock.rpc")
   local mempool_mod = require("lunarblock.mempool")
@@ -1145,6 +1146,13 @@ local function main()
           .. ") — serial fallback")
       else
         print("Script verification uses " .. tostring(got) .. " additional threads")
+        if got < extra then
+          -- A partially started pool is safe (a job claimed by a worker
+          -- without a lua_State reports INTERNAL and the host re-runs it --
+          -- never a script failure), but it is slower: say so.
+          print(string.format("WARNING: only %d of %d script-check workers bootstrapped (%s)",
+            got, extra, tostring(validation.script_check_boot_error())))
+        end
       end
     end
   end
@@ -2254,7 +2262,13 @@ local function main()
       end
     end)
     if not ok then
-      peer_manager:add_ban_score(peer, 10, tostring(err))
+      -- A system fault (DB error, allocation failure, the AbortNode latch)
+      -- says nothing about the tx: never punish the relaying peer for it.
+      if fault.is_system_fault(err) then
+        print("tx handler: system fault (no penalty): " .. tostring(err))
+      else
+        peer_manager:add_ban_score(peer, 10, tostring(err))
+      end
     end
   end)
 
@@ -3238,6 +3252,15 @@ local function main()
   -- SIGTERM/SIGINT → flip running=false; main loop exits, cleanup runs.
   -- SIGHUP        → reopen log file (logrotate compatibility).
   local running = true
+  -- AbortNode (Core node/abort.cpp): a fatal internal error -- a chainstate
+  -- write that failed twice, a script check that could not complete twice,
+  -- a second system fault on the same block -- stops the main loop.  The
+  -- cleanup below then skips the chainstate flush and the process exits 1
+  -- so systemd restarts it from the last durable state.
+  fault.on_latch(function(reason)
+    print("[FATAL] shutting down after fatal internal error: " .. tostring(reason))
+    running = false
+  end)
   ops.set_signal_handler(ops.SIGTERM, function()
     print("[signal] SIGTERM received, shutting down")
     running = false
@@ -3560,11 +3583,30 @@ local function main()
   else
     print("Warning: failed to dump mempool: " .. tostring(dump_count_or_err))
   end
+  if fault.is_latched() then
+    -- Do NOT close the DB: close() flushes the memtables, i.e. persists
+    -- whatever the failed connect left behind (Core: AbortNode skips the
+    -- coins-cache flush).  Exit without running destructors; the chainstate
+    -- reopens at its last durable checkpoint.
+    print("[FATAL] (AbortNode) exiting 1 without flushing the chainstate: "
+      .. tostring(fault.reason()))
+    ops.remove_pid_file(pid_path)
+    pcall(function() logger:close() end)
+    io.stdout:flush()
+    io.stderr:flush()
+    os.exit(1, false)
+  end
   db.close()
   -- Remove PID file (Bitcoin Core init.cpp does this in the Shutdown path).
   ops.remove_pid_file(pid_path)
   -- Close logger so the file gets fsynced before exit.
   logger:close()
+  if fault.is_latched() then
+    -- db.close()'s final flush failed: the node did not stop cleanly.
+    print("LunarBlock stopped WITH A FATAL ERROR (exit 1): " .. tostring(fault.reason()))
+    io.stdout:flush()
+    os.exit(1, false)
+  end
   print("LunarBlock stopped.")
 end
 

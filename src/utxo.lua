@@ -5,6 +5,7 @@ local crypto = require("lunarblock.crypto")
 local consensus = require("lunarblock.consensus")
 local validation = require("lunarblock.validation")
 local script = require("lunarblock.script")
+local fault = require("lunarblock.fault")
 local storage_mod = require("lunarblock.storage")
 local perf = require("lunarblock.perf")
 local sig_cache = require("lunarblock.sig_cache")
@@ -1731,6 +1732,14 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
   local deletes = 0
   local _pf0 = PROF_ON and perf.now()
 
+  -- WRITE BEFORE FORGET (Core CCoinsViewCache::Flush: the cache is cleared
+  -- only after BatchWrite succeeds).  Phase 1 builds the batch WITHOUT
+  -- touching the cache; phase 3 drops spent entries / clears dirty flags
+  -- only after the write returned.  Pre-fix the cache was mutated first, so
+  -- a failed write had already dropped spent entries from the cache: a later
+  -- read fell through to disk, where the coin was still unspent.
+  local spent_keys = {}
+  local written_entries = {}
   for key, _ in pairs(self.dirty_list) do
     local entry = self.cache[key]
     if entry then
@@ -1738,37 +1747,13 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
         -- Delete from disk (entry was spent and was on disk)
         batch.delete(storage_mod.CF.UTXO, key)
         deletes = deletes + 1
-        -- In Pattern D deferred mode, KEEP the spent entry in cache
-        -- (with spent=true) so subsequent CoinView:have / :get during
-        -- the same multi-block reorg see the spent state from cache
-        -- instead of falling through to disk — the disk delete is
-        -- queued in the shared batch and won't be visible until the
-        -- final commit.  Clear the dirty flag so the next flush
-        -- doesn't double-emit the delete.  Also keep the cache entry
-        -- so a subsequent re-add (e.g. UTXO created by side-branch
-        -- block) goes through CoinView:add's existing-entry path.
-        if reorg_batch then
-          clear_flags(entry)
-        else
-          -- Non-deferred path: drop the entry from cache (the disk
-          -- delete is being committed now, so the disk read fallback
-          -- after this point will correctly return nil).
-          self.cached_memory_usage = self.cached_memory_usage
-            - estimate_entry_memory(entry)
-          self.cache[key] = nil
-        end
+        spent_keys[#spent_keys + 1] = key
       else
         -- Write to disk
         local data = M.serialize_utxo_entry(entry)
         batch.put(storage_mod.CF.UTXO, key, data)
         writes = writes + 1
-        -- Clear flags - entry is now clean and not fresh.  In
-        -- non-deferred mode this is true on disk after the immediate
-        -- batch.write below; in Pattern D deferred mode the disk
-        -- write is queued in the shared batch.  Either way the cache
-        -- copy reflects the post-batch state, so subsequent reads
-        -- via cache hit return the correct value.
-        clear_flags(entry)
+        written_entries[#written_entries + 1] = entry
       end
     end
   end
@@ -1778,12 +1763,54 @@ function CoinView:flush(reallocate, extra_batch_fn, sync, reorg_batch)
     extra_batch_fn(batch)
   end
 
-  -- Execute batch — UNLESS we're in Pattern D deferred mode, where the
-  -- caller (accept_side_branch_block) commits the shared batch once at
+  -- Phase 2: execute batch — UNLESS we're in Pattern D deferred mode, where
+  -- the caller (accept_side_branch_block) commits the shared batch once at
   -- the end of the multi-block reorg.
+  -- A failed write is retried once; a second failure is a fatal internal
+  -- error (Core FatalError "Failed to write to coin database" -> AbortNode):
+  -- the latch stops every connect/submit/mempool path and the shutdown skips
+  -- the chainstate flush.  The cache is untouched either way.
   local _pf1 = _pf0 and perf.now()
   if not reorg_batch then
-    batch.write(sync or false)
+    local ok_w, err_w = pcall(batch.write, sync or false)
+    if not ok_w then
+      if not fault.is_system_fault(err_w) then error(err_w, 0) end
+      print("[CHAINSTATE-WRITE] coins/tip batch write failed, retrying once: "
+        .. tostring(err_w))
+      local ok_w2, err_w2 = pcall(batch.write, sync or false)
+      if not ok_w2 then
+        fault.latch("chainstate batch write failed twice: " .. tostring(err_w2))
+        fault.raise("chainstate batch write failed: " .. tostring(err_w2))
+      end
+    end
+  end
+
+  -- Phase 3: forget — only now that the write returned.
+  for i = 1, #spent_keys do
+    local key = spent_keys[i]
+    local entry = self.cache[key]
+    if entry then
+      -- In Pattern D deferred mode, KEEP the spent entry in cache
+      -- (with spent=true) so subsequent CoinView:have / :get during
+      -- the same multi-block reorg see the spent state from cache
+      -- instead of falling through to disk — the disk delete is
+      -- queued in the shared batch and won't be visible until the
+      -- final commit.  Clear the dirty flag so the next flush
+      -- doesn't double-emit the delete.
+      if reorg_batch then
+        clear_flags(entry)
+      else
+        -- Non-deferred path: drop the entry from cache (the disk
+        -- delete is committed, so the disk read fallback after this
+        -- point correctly returns nil).
+        self.cached_memory_usage = self.cached_memory_usage
+          - estimate_entry_memory(entry)
+        self.cache[key] = nil
+      end
+    end
+  end
+  for i = 1, #written_entries do
+    clear_flags(written_entries[i])
   end
   if _pf0 then
     -- [CB-PROF] split of the per-block flush: Lua side (dirty-set walk,
@@ -3408,7 +3435,10 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             }
             goto skip_verification
           end
-          local ok, err = validation.verify_input_script(
+          -- _checked: an INTERNAL result (the check did not complete) is
+          -- re-run once and otherwise latches + raises a system fault; only
+          -- a SCRIPT_ERROR comes back as (nil, err).
+          local ok, err = validation.verify_input_script_checked(
             job.tx, job.input_index, job.amount, job.script_pubkey, job.flags,
             {
               taproot_active = job.taproot_active,
@@ -4125,6 +4155,8 @@ end
 
 function ChainState:accept_block(block, height, block_hash, opts)
   opts = opts or {}
+  -- AbortNode latch: after a fatal internal error nothing is connected.
+  fault.check_latch("block connect")
 
   -- G19c (W97): fTooFarAhead gate (Core validation.cpp:4325 + 4339).
   -- An unrequested block more than MIN_BLOCKS_TO_KEEP (288) blocks ahead
@@ -4208,12 +4240,28 @@ function ChainState:accept_block(block, height, block_hash, opts)
   -- BIP-113 IsFinalTx, BIP-30, BIP-68 sequence locks, sigop-cost cap,
   -- coinbase maturity, per-input UTXO lookup + script verification,
   -- coinbase value cap.  All run inside connect_block.
-  return self:connect_block(
+  -- A system fault (DB read/write error, allocation failure, a script check
+  -- that did not complete) is NOT a verdict: drop the partial in-memory
+  -- mutations so the cache mirrors disk, record it, and re-raise the tagged
+  -- fault so no caller marks the block or punishes a peer.  The second
+  -- system fault on the same block latches the node (Core AbortNode).
+  local pc_ok, c_ok, c_err = pcall(self.connect_block, self,
     block, height, block_hash,
     prev_block_mtp, get_block_mtp,
     opts.skip_scripts, opts.use_parallel,
     opts.nosync, opts.caller_batch_fn
   )
+  if not pc_ok then
+    if fault.is_system_fault(c_ok) then
+      self.coin_view:discard_dirty()
+      fault.note_block_fault(types.hash256_hex(block_hash), c_ok)
+    end
+    error(c_ok, 0)
+  end
+  if c_ok then
+    fault.clear_block_fault(types.hash256_hex(block_hash))
+  end
+  return c_ok, c_err
 end
 
 --------------------------------------------------------------------------------
@@ -4248,6 +4296,7 @@ end
 --                  failure, reorg disconnect/connect aborted)
 --------------------------------------------------------------------------------
 function ChainState:accept_side_branch_block(block, block_hash, opts)
+  fault.check_latch("block connect")
   opts = opts or {}
 
   local prev_hash = block.header.prev_hash
@@ -4704,7 +4753,15 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     return nil, err_msg
   end
 
-  local disconnected, dc_err = self:rollback_chain_to(common_height, reorg_batch)
+  -- rollback_chain_to can RAISE (a system fault reading undo data / block
+  -- bodies): restore memory from disk before re-raising, exactly as for a
+  -- returned failure, so a half-disconnected in-memory tip never survives.
+  local rb_ok, disconnected, dc_err = pcall(self.rollback_chain_to, self,
+    common_height, reorg_batch)
+  if not rb_ok then
+    pcall(abort_reorg, tostring(disconnected))
+    error(disconnected, 0)
+  end
   if not disconnected then
     return abort_reorg("reorg-disconnect-failed: " .. tostring(dc_err))
   end
@@ -4823,7 +4880,25 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- crosses the chain head and is a low-frequency event, so the fsync
   -- cost is negligible and the durability guarantee is mandatory.
   -- After this returns, the tip flip is durable and crash-recoverable.
-  reorg_batch.write(true)
+  -- A failed commit leaves disk at the pre-reorg state but the in-memory
+  -- tip and the coin cache at the post-reorg state.  Restore memory from
+  -- disk (abort_reorg) BEFORE surfacing the fault, retry the commit once,
+  -- and otherwise latch (Core: FlushStateToDisk failure -> AbortNode).  It
+  -- is a system fault, never a verdict on the side branch.
+  local ok_w, err_w = pcall(reorg_batch.write, true)
+  if not ok_w then
+    if not fault.is_system_fault(err_w) then
+      pcall(abort_reorg, tostring(err_w))
+      error(err_w, 0)
+    end
+    print("[CHAINSTATE-WRITE] reorg commit failed, retrying once: " .. tostring(err_w))
+    local ok_w2, err_w2 = pcall(reorg_batch.write, true)
+    if not ok_w2 then
+      fault.latch("reorg commit failed twice: " .. tostring(err_w2))
+      pcall(abort_reorg, tostring(err_w2))
+      fault.raise("reorg commit failed: " .. tostring(err_w2))
+    end
+  end
   reorg_batch.destroy()
 
   return "connected"

@@ -2,6 +2,12 @@ local bit = require("bit")
 local crypto = require("lunarblock.crypto")
 local serialize = require("lunarblock.serialize")
 local types = require("lunarblock.types")
+-- A parse failure caught by pcall below is a property of the script; an
+-- allocation failure is not (gate 6) and must reach the caller unchanged.
+local function is_alloc_failure(e)
+  return type(e) == "string" and e:find("not enough memory", 1, true) ~= nil
+end
+
 local M = {}
 
 -- All Bitcoin Script opcodes
@@ -622,6 +628,7 @@ function M.parse_multisig_script(script_bytes)
   end
 
   local ok, ops = pcall(M.parse_script, script_bytes)
+  if not ok and is_alloc_failure(ops) then error(ops, 0) end
   if not ok or not ops or #ops < 4 then
     return nil, nil, nil
   end
@@ -1073,6 +1080,7 @@ function M.extract_last_push(script_bytes)
     return nil
   end
   local ok, ops = pcall(M.parse_script, script_bytes)
+  if not ok and is_alloc_failure(ops) then error(ops, 0) end
   if not ok or not ops or #ops == 0 then
     return nil
   end

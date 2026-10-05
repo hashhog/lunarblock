@@ -6,6 +6,7 @@ local cjson = require("cjson")
 local types = require("lunarblock.types")
 local serialize = require("lunarblock.serialize")
 local validation = require("lunarblock.validation")
+local fault = require("lunarblock.fault")
 local consensus = require("lunarblock.consensus")
 local p2p = require("lunarblock.p2p")
 local script_mod = require("lunarblock.script")
@@ -161,8 +162,18 @@ M.core_chain_name = core_chain_name
 --
 -- @param err string: internal error/exception message
 -- @return string: canonical BIP-22 result string
+-- Core RPC_VERIFY_ERROR.  A system fault (DB error, allocation failure, a
+-- script check that did not complete, the AbortNode latch) is answered as a
+-- JSON-RPC error, never as a BIP-22 reject token: the block was not judged.
+local RPC_VERIFY_ERROR = -25
+local function raise_system_fault_rpc(err)
+  error({ code = RPC_VERIFY_ERROR,
+          message = "block not judged: node system fault: " .. tostring(err) }, 0)
+end
+
 local function bip22_result(err)
   if err == nil then return nil end  -- success
+  if fault.is_system_fault(err) then raise_system_fault_rpc(err) end
   local s = tostring(err):lower()
 
   -- A needed ancestor header is not held (snapshot boot before the pre-base
@@ -12484,7 +12495,20 @@ end
 
   --- submitblock: Submit a new block to the network.
   -- @param hexdata string: Block data in hex
+  local submitblock_inner
   self.methods["submitblock"] = function(rpc, params)
+    if fault.is_latched() then
+      raise_system_fault_rpc("halted after a fatal internal error: " .. tostring(fault.reason()))
+    end
+    local ok_sb, res_sb = pcall(submitblock_inner, rpc, params)
+    if not ok_sb then
+      if fault.is_system_fault(res_sb) then raise_system_fault_rpc(res_sb) end
+      error(res_sb, 0)
+    end
+    return res_sb
+  end
+
+  submitblock_inner = function(rpc, params)
     -- NetworkDisable gate: refuse submissions while a `dumptxoutset
     -- rollback` rewind→dump→replay dance is in progress. Mirrors
     -- Bitcoin Core's NetworkDisable RAII around TemporaryRollback in

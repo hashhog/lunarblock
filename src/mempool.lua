@@ -3,6 +3,7 @@ local serialize = require("lunarblock.serialize")
 local validation = require("lunarblock.validation")
 local consensus = require("lunarblock.consensus")
 local script_mod = require("lunarblock.script")
+local fault = require("lunarblock.fault")
 local mining = require("lunarblock.mining")
 local M = {}
 
@@ -1109,6 +1110,9 @@ end
 --     PreChecks per member but applies the relay-fee floor at package level.
 -- @return boolean, string, number: success, txid_hex or error message, fee
 function Mempool:accept_transaction(tx, allow_rbf, opts)
+  -- AbortNode latch: after a fatal internal error the node admits nothing
+  -- (raises a system fault: no verdict on the tx, no punishment).
+  fault.check_latch("mempool admission")
   if allow_rbf == nil then allow_rbf = true end
   local package_member = opts and opts.package_member == true
   local txid = validation.compute_txid(tx)
@@ -1141,6 +1145,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- returns (false, err); strip any "file:line: " prefix belt-and-suspenders.
   local pcall_ok, check_ok, is_coinbase = pcall(validation.check_transaction, tx)
   if not pcall_ok then
+    if fault.is_system_fault(check_ok) then error(check_ok, 0) end
     local token = tostring(check_ok):gsub("^.-:%d+:%s*", "")
     return false, token
   end
@@ -1874,19 +1879,36 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
         if not is_witness_path then
           local ok_c, checker = pcall(validation.make_sig_checker,
             tx, i - 1, utxo.value, utxo.script_pubkey, script_flags, nil)
-          if ok_c then
+          if not ok_c then
+            -- The checker constructor failing is this node's fault, not a
+            -- property of the tx.  It used to SKIP the input's script check
+            -- (fail-open policy); now it is a system fault: no verdict, no
+            -- punishment, the tx is simply not admitted.
+            fault.raise("mempool: cannot build signature checker: " .. tostring(checker))
+          end
+          do
             -- verify_script returns:
             --   (true)            on success
             --   (false)           on script eval returning empty/false stack
             --   (nil, err_string) on hard script error
             -- We need to handle all three.  pcall adds a leading bool for the
             -- pcall outcome itself, so successful pcall + true = pass.
-            local ok_p, r1, r2 = pcall(script_mod.verify_script,
+            -- xpcall + fault.script_raise_handler: an explicit consensus
+            -- raise in script.lua/validation.lua is a script failure; a
+            -- runtime fault / allocation failure is NOT a verdict on the tx
+            -- (Core: only a ScriptError rejects).
+            local ok_p, r1, r2 = xpcall(script_mod.verify_script,
+              fault.script_raise_handler,
               inp.script_sig or "", utxo.script_pubkey, script_flags, checker)
             if not ok_p then
+              local internal, msg = fault.classify_script_raise(r1)
+              if internal then
+                fault.raise(string.format(
+                  "mempool script check of input %d did not complete: %s", i - 1, msg))
+              end
               return false, string.format(
                 "mandatory-script-verify-flag-failed (input %d: %s)",
-                i - 1, tostring(r1))
+                i - 1, msg)
             end
             if r1 == nil or r1 == false then
               return false, string.format(
