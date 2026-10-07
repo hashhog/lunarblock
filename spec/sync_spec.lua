@@ -1197,6 +1197,19 @@ describe("sync", function()
       -- marched the whole range classifying each body "stored" and connected
       -- nothing (Height 962722 -> cursors at 963394, "too-far-ahead").
       it("connects a fully pre-persisted heavier fork to its tip (no re-download)", function()
+        -- The fixture bodies are header-only (no transactions): check_block
+        -- rejects them with bad-blk-length.  This test used to pass only
+        -- because connect_pending_blocks SKIPPED a height whose body failed
+        -- check_block (LB-1, 2026-10-07): B5, B7, B9, B11 were never
+        -- validated, the cursor just jumped over them.  Body validity is not
+        -- what this test is about (the storage-load path of a pre-persisted
+        -- fork is), so stub the body gates for its duration.
+        local orig_cb, orig_mut = validation.check_block, validation.is_block_mutated
+        validation.check_block = function() return true end
+        validation.is_block_mutated = function() return false end
+        finally(function()
+          validation.check_block, validation.is_block_mutated = orig_cb, orig_mut
+        end)
         local function build_branch(parent_hash, n, ts0, ts_step, persist)
           local hashes = {}
           local parent, ts = parent_hash, ts0

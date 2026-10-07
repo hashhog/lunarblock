@@ -105,6 +105,14 @@ function M.classify_callback_error(err)
     "sequence locks not satisfied",
     "non%-final",
     "bad sigops",
+    -- CheckBlock size / sigops / coinbase-position verdicts (no reject token
+    -- in the assert text).
+    "block weight %d+ exceeds maximum",
+    "sigops cost %d+ exceeds maximum",
+    "first transaction is not coinbase",
+    -- A block (or a child of a block) already marked failed / invalidated
+    -- (Core BLOCK_CACHED_INVALID "duplicate-invalid").
+    "duplicate%-invalid",
   }
   for _, pat in ipairs(consensus_patterns) do
     if s:find(pat) then return "consensus" end
@@ -171,6 +179,13 @@ local PUNISH_TOKENS = {
   "time%-too%-old",      -- BLOCK_INVALID_HEADER
   "bad%-version",        -- BLOCK_INVALID_HEADER
   "checkpoint",          -- BLOCK_CHECKPOINT
+  -- BLOCK_MUTATED (Core: Misbehaving(peer, "mutated block") in ProcessMessage
+  -- and MaybePunishNodeForBlock): the body does not match its header.
+  "mutated block",
+  "bad%-txnmrklroot",
+  "bad%-txns%-duplicate",
+  "bad%-witness%-",
+  "unexpected%-witness",
 }
 function M.should_punish_peer_for_block_error(err)
   if err == nil then return false end
@@ -781,30 +796,63 @@ end
 --- SetBlockFailureFlags + RecalculateBestHeader.
 -- @param hash_hex string: the block that failed validation
 -- @return table: list of hash_hex newly marked (the block first)
+--- Every resident header that descends from `hash_hex` (not including it).
+--- One memoized pass: each resident header above the root is walked at most
+--- once (its verdict is cached for every header on the path), so the cost is
+--- O(resident headers above the root), not O(headers x depth) -- the old
+--- per-header walk was what made invalidateblock of a deep block run for
+--- hours (LB-2).  `also_failed` treats an already-failed header as a
+--- descendant root too (mark_failed semantics).
+-- @param hash_hex string
+-- @param also_failed boolean|nil
+-- @return table list of hash_hex
+function HeaderChain:collect_descendants(hash_hex, also_failed)
+  local out = {}
+  local root = self.headers[hash_hex]
+  if not root then return out end
+  local rh = root.height
+  local memo = { [hash_hex] = true }
+  local failed = self.failed
+  local headers = self.headers
+  local hexf = types.hash256_hex
+  for hx, e in pairs(headers) do
+    if e.height > rh and memo[hx] == nil then
+      local path, n = {}, 0
+      local cur_hx, cur = hx, e
+      local res
+      while true do
+        local m = memo[cur_hx]
+        if m ~= nil then res = m break end
+        if also_failed and failed[cur_hx] and cur_hx ~= hx then res = true break end
+        if cur.height <= rh then res = false break end
+        n = n + 1
+        path[n] = cur_hx
+        local phx = hexf(cur.header.prev_hash)
+        local pe = headers[phx]
+        if not pe then res = (phx == hash_hex) break end
+        cur_hx, cur = phx, pe
+      end
+      for i = 1, n do memo[path[i]] = res end
+    end
+  end
+  for hx, v in pairs(memo) do
+    if v and hx ~= hash_hex then out[#out + 1] = hx end
+  end
+  return out
+end
+
 function HeaderChain:mark_failed(hash_hex)
   local marked = {}
   if not self.failed[hash_hex] then
     self.failed[hash_hex] = true
     marked[1] = hash_hex
   end
-  -- Descendants among resident headers.  Only entries ABOVE the failed
-  -- height can descend from it, and each walk stops at that height, so this
-  -- is O(resident headers above it x depth) -- small at tip, rare event.
-  local root = self.headers[hash_hex]
-  if root then
-    for hx, e in pairs(self.headers) do
-      if not self.failed[hx] and e.height > root.height then
-        local cur = e
-        while cur and cur.height > root.height do
-          local phx = types.hash256_hex(cur.header.prev_hash)
-          if phx == hash_hex or self.failed[phx] then
-            self.failed[hx] = true
-            marked[#marked + 1] = hx
-            break
-          end
-          cur = self.headers[phx]
-        end
-      end
+  -- Descendants among resident headers (Core: InvalidChainFound /
+  -- SetBlockFailureFlags walk the in-memory block index).
+  for _, hx in ipairs(self:collect_descendants(hash_hex, true)) do
+    if not self.failed[hx] then
+      self.failed[hx] = true
+      marked[#marked + 1] = hx
     end
   end
   self:recalculate_best_header()
@@ -4187,6 +4235,75 @@ function BlockDownloader:_note_undelivered(hash_hex, peer)
   t[peer] = true
 end
 
+--- A body for `hash_hex` turned out to be malleated (Core BLOCK_MUTATED).
+--- Core: RemoveBlockRequest(hash, from_peer) -- only the SENDER's request is
+--- dropped, a request owned by another peer stays -- and the block stays
+--- requestable: FindNextBlocksToDownload hands it to another peer.  Nothing
+--- is marked failed and no cursor moves past it.
+-- @param hash_hex string
+-- @param entry table|nil header entry (for the height)
+-- @param peer table|nil the peer that sent the bad body
+-- @param why string|nil reason
+function BlockDownloader:_on_mutated_body(hash_hex, entry, peer, why)
+  local info = self.inflight[hash_hex]
+  if info and (peer == nil or info.peer == peer) then
+    self.inflight[hash_hex] = nil
+    if self.peer_inflight[info.peer] then
+      self.peer_inflight[info.peer] = self.peer_inflight[info.peer] - 1
+      if self.peer_inflight[info.peer] <= 0 then
+        self.peer_inflight[info.peer] = nil
+      end
+    end
+  end
+  -- Prefer another peer for the re-request (W46 rotation) and let it fire
+  -- on the next scheduler pass instead of after its 30 s rate limit.
+  self:_note_undelivered(hash_hex, peer)
+  -- Bounded: after a few bad copies of the same block fall back to W46's
+  -- normal 30 s cadence (a flood of bad copies must not become a getdata
+  -- storm).
+  self._mutated_count = self._mutated_count or {}
+  local mc = (self._mutated_count[hash_hex] or 0) + 1
+  self._mutated_count[hash_hex] = mc
+  if mc <= 3 and self._force_rerequest_last then
+    self._force_rerequest_last[hash_hex] = nil
+  end
+  if entry and entry.height and entry.height < self.next_download_height
+      and entry.height >= self.next_connect_height then
+    self.next_download_height = entry.height
+  end
+  self.mutated_bodies = (self.mutated_bodies or 0) + 1
+  print(string.format(
+    "[BLOCK-MUTATED] height=%s hash=%s peer=%s reason=%s -- body discarded, "
+      .. "block NOT marked invalid, re-requesting from another peer",
+    tostring(entry and entry.height), hash_hex,
+    tostring(peer and (peer.address or peer.ip) or "?"), tostring(why)))
+end
+
+--- A peer went away: free every block request in flight to it (Core
+--- FinalizeNode -> RemoveBlockRequest for each of its vBlocksInFlight) and
+--- pull the download cursor back so the walk re-requests them now.
+-- @param peer table
+-- @return number of requests freed
+function BlockDownloader:on_peer_disconnected(peer)
+  local freed = 0
+  local low = nil
+  for hx, info in pairs(self.inflight) do
+    if info.peer == peer then
+      self.inflight[hx] = nil
+      self:_note_undelivered(hx, peer)
+      if self._force_rerequest_last then self._force_rerequest_last[hx] = nil end
+      freed = freed + 1
+      local e = self.header_chain.headers[hx]
+      if e and e.height and (low == nil or e.height < low) then low = e.height end
+    end
+  end
+  self.peer_inflight[peer] = nil
+  if low and low < self.next_download_height then
+    self.next_download_height = math.max(low, self.next_connect_height)
+  end
+  return freed
+end
+
 --- Handle a notfound response for a block hash.
 -- Removes the block from inflight so it can be re-requested from a different peer.
 -- @param hash_hex string: hex hash of the block not found
@@ -4214,7 +4331,7 @@ end
 -- @param peer table: peer that sent the block
 -- @param block_data string: raw block message payload
 -- @return boolean, string|nil: success flag, error message
-function BlockDownloader:handle_block(peer, block_data)
+function BlockDownloader:handle_block(peer, block_data, opts)
   -- Deserialize the block + compute the block hash.  Timed for W72: the
   -- working hypothesis is that pure-Lua deserialize dominates the IBD
   -- per-block budget on 1 MB+ blocks; the sync-constructor comment on
@@ -4262,6 +4379,31 @@ function BlockDownloader:handle_block(peer, block_data)
       w.b / w.n, w.txs / w.n,
       w.d_max * 1000, w.h_max * 1000, mb_s))
     self.deser_win = { n = 0, t = 0, h_t = 0, b = 0, txs = 0, d_max = 0, h_max = 0 }
+  end
+
+  -- LB-1: a MALLEATED body (witness stripped, bad merkle root, duplicate-tx
+  -- mutation, 64-byte-tx) is checked BEFORE it can touch any download state.
+  -- Core ProcessMessage("block"): if the parent is known and
+  -- IsBlockMutated(block, segwit active after parent) -> Misbehaving(peer,
+  -- "mutated block"), RemoveBlockRequest(hash, peer) and return.  The block
+  -- is NOT marked invalid (the header's block may be perfectly valid) and the
+  -- height is fetched again from another peer.  Before this, the mutated body
+  -- replaced any honest pending copy, cleared the in-flight entry whoever owned
+  -- it, and connect_pending_blocks then SKIPPED the height for good.
+  do
+    local m_entry = self.header_chain.headers[hash_hex]
+    if m_entry and m_entry.height and m_entry.height > 0 then
+      local segwit_active = self.network and self.network.segwit_height ~= nil
+        and m_entry.height >= self.network.segwit_height
+      local ok_m, mutated, why = pcall(validation.is_block_mutated, block,
+        segwit_active, block_data)
+      if not ok_m then mutated, why = true, tostring(mutated) end
+      if mutated then
+        self:_on_mutated_body(hash_hex, m_entry, peer, why)
+        return false, "mutated block: " .. tostring(why)
+      end
+      if self._mutated_count then self._mutated_count[hash_hex] = nil end
+    end
   end
 
   -- Update adaptive timeout on success (decay toward base)
@@ -4398,6 +4540,8 @@ function BlockDownloader:handle_block(peer, block_data)
     height = entry.height,
     hash = hash,
     block_data = block_data,
+    peer = peer,   -- source, for a mutation found later (Core mapBlockSource)
+    via_compact = opts and opts.via_compact or nil,
   }
   self.pending_bytes = (self.pending_bytes or 0) + incoming
   block = nil
@@ -4535,6 +4679,7 @@ function BlockDownloader:_connect_pending_blocks_inner()
               height = entry.height,
               hash = block_hash,
               block_data = block_data,
+              from_storage = true,
             }
             print(string.format("Recovered block %d from storage (was stored but not connected)",
               entry.height))
@@ -4575,14 +4720,17 @@ function BlockDownloader:_connect_pending_blocks_inner()
     if not pending.block then
       local materialized = self:_materialize_pending(pending)
       if not materialized then
+        -- LB-1: an undecodable body is a bad COPY, not a verdict on the
+        -- block: drop it and fetch the height again.  The cursor used to
+        -- advance here, losing the height for good.
         print(string.format(
-          "connect_pending_blocks: pending body at height %d failed to deserialize, skipping",
+          "connect_pending_blocks: pending body at height %d failed to deserialize; "
+            .. "dropped, re-requesting (cursor stays)",
           self.next_connect_height))
         self:_drop_pending(hash_hex)
-        self.next_connect_height = self.next_connect_height + 1
-        local _sock = require("socket")
-        self.last_connect_advance = _sock.gettime()
-        goto continue_loop
+        self:_on_mutated_body(hash_hex, self.header_chain.headers[hash_hex],
+          pending.peer, "undecodable body")
+        break
       end
     end
 
@@ -4679,6 +4827,32 @@ function BlockDownloader:_connect_pending_blocks_inner()
         --       connect_block surfaces the real error + bounded-retry/wedge
         --       logging for this block.
         if type(sb_err) == "string" and sb_err:find("missing at height") then
+          -- LB-1 watchdog: "missing at height N" while the ACTIVE tip is
+          -- itself on the header chain is not a fork at all -- the cursor
+          -- has run ahead of a hole in the active header chain (the old
+          -- check_block skip produced exactly this, 2026-08-17 shape).  Core
+          -- derives downloads from the tip every pass (FindNextBlocksTo-
+          -- Download), so nothing can be stranded: re-anchor the cursors on
+          -- the active tip and let W46 fetch the hole.
+          if self.active_tip_provider then
+            local at_hash, at_h = self.active_tip_provider()
+            local at_hex = at_hash and (type(at_hash) == "string"
+              and at_hash or types.hash256_hex(at_hash))
+            if at_h and at_hex
+                and self.header_chain.height_to_hash[at_h] == at_hex
+                and self.next_connect_height > at_h + 1 then
+              print(string.format(
+                "[FORK-DL] cursor %d is ahead of a hole on the active header "
+                  .. "chain (tip %d, %s); re-anchoring to %d",
+                self.next_connect_height, at_h, tostring(sb_err), at_h + 1))
+              self.next_connect_height = at_h + 1
+              if self.next_download_height > at_h + 1 then
+                self.next_download_height = at_h + 1
+              end
+              self._fork_wait = nil
+              break
+            end
+          end
           -- (a) Transient: a bridging fork body is still in flight.  Wait.
           self._fork_wait = { hash = hash_hex, rx = self._rx_count or 0,
                               t = require("socket").gettime() }
@@ -4716,18 +4890,46 @@ function BlockDownloader:_connect_pending_blocks_inner()
     local _cp1 = perf.now()
 
     if not ok then
-      -- Invalid block, remove from pending and skip this height.
-      -- Incrementing next_connect_height prevents permanent stall on a
-      -- block that repeatedly fails context-free validation.
+      -- LB-1: NEVER skip the height.  The cursor used to advance past a body
+      -- that failed check_block, so one peer sending the next block witness-
+      -- stripped lost us that height until restart (the honest copy was then
+      -- dropped LATE_ARRIVAL and the next block parked in FORK-DL forever).
+      -- Core (validation.cpp AcceptBlock -> InvalidBlockFound):
+      --   * BLOCK_MUTATED (bad-txnmrklroot, bad-txns-duplicate,
+      --     bad-witness-*, unexpected-witness): the body is a bad copy; the
+      --     block is NOT marked failed; punish the sender, fetch it again.
+      --   * any other CheckBlock verdict: the header commits to an invalid
+      --     block -> BLOCK_FAILED_VALID (+ descendants), never re-requested.
+      local bad_block, bad_data = pending.block, pending.block_data
       self:_drop_pending(hash_hex)
-      print(string.format("Skipping invalid block at height %d: %s",
-        self.next_connect_height, tostring(err)))
-      self.next_connect_height = self.next_connect_height + 1
-      -- Reset stall-recovery timer: skipping is still cursor advance.
-      local _sock = require("socket")
-      self.last_connect_advance = _sock.gettime()
-      -- Continue loop to try next height rather than returning immediately
-      goto continue_loop
+      local err_s = tostring(err)
+      if pending.peer and self.punish_peer_callback
+          and not pending.via_compact then
+        pcall(self.punish_peer_callback, pending.peer, err_s)
+      end
+      local mutated = false
+      do
+        local segwit_active = self.network and self.network.segwit_height ~= nil
+          and pending.height >= self.network.segwit_height
+        local ok_m, m = pcall(validation.is_block_mutated, bad_block,
+          segwit_active, bad_data)
+        mutated = (not ok_m) or m
+      end
+      if not mutated and M.is_invalid_block_verdict(err_s) then
+        print(string.format("Block %d failed check_block: %s",
+          self.next_connect_height, err_s))
+        self:mark_block_invalid(hash_hex, err_s)
+        return false, err
+      end
+      -- Mutated (or no verdict): a stored copy is no better than the wire
+      -- copy, so remove it too, or the storage fallback / W46 storage check
+      -- would keep serving it back.
+      if pending.from_storage and self.storage.delete and self.storage.CF then
+        pcall(self.storage.delete, self.storage.CF.BLOCKS, pending.hash.bytes)
+      end
+      self:_on_mutated_body(hash_hex, self.header_chain.headers[hash_hex],
+        pending.peer, err_s)
+      break
     end
 
     -- Atomic write barrier per BUG-REPORT.md fix #2: the block body, undo

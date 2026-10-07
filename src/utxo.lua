@@ -2953,25 +2953,108 @@ function ChainState:is_block_invalid(block_hash)
   return self.invalid_blocks[block_hash.bytes] == true
 end
 
---- Check if a block has an invalid ancestor.
+--------------------------------------------------------------------------------
+-- Active-chain lookups in O(depth from the tip) (Core: CChain / FindFork)
+--------------------------------------------------------------------------------
+-- `self.header_index` (optional, wired by main.lua to the HeaderChain) gives
+-- in-memory {header, height} by hash hex.  Without it every lookup falls back
+-- to storage.get_header.  The active chain is walked DOWN from the tip lazily
+-- and memoized until the tip changes, so a question about height h costs
+-- O(tip - h) once -- never a walk to genesis per call (LB-2 / LB-4).
+
+local ZERO32 = string.rep("\0", 32)
+
+-- Parent of `hash` (hash256) and, when known, the height of `hash`.
+function ChainState:_parent_of(hash)
+  self.parent_steps = (self.parent_steps or 0) + 1
+  local hi = self.header_index
+  if hi and hi.headers then
+    local e = hi.headers[types.hash256_hex(hash)]
+    if e then return e.header.prev_hash, e.height end
+  end
+  self.header_storage_reads = (self.header_storage_reads or 0) + 1
+  local hdr = self.storage.get_header(hash)
+  return hdr and hdr.prev_hash or nil, nil
+end
+
+function ChainState:_active_memo()
+  local tip_b = self.tip_hash and self.tip_hash.bytes
+  local m = self._amemo
+  if not m or m.tip ~= tip_b or m.tip_h ~= self.tip_height then
+    m = { tip = tip_b, tip_h = self.tip_height or -1, h2b = {}, b2h = {},
+          low = nil, cur = self.tip_hash, cur_h = self.tip_height, done = false }
+    self._amemo = m
+  end
+  return m
+end
+
+-- Extend the memoized active-chain walk down to height `h` (inclusive).
+function ChainState:_active_extend(m, h)
+  while not m.done and (m.low == nil or m.low > h) do
+    local cur, ch = m.cur, m.cur_h
+    if not cur or not ch or ch < 0 then m.done = true break end
+    m.h2b[ch] = cur
+    m.b2h[cur.bytes] = ch
+    m.low = ch
+    if ch == 0 then m.done = true break end
+    local prev = self:_parent_of(cur)
+    if not prev then m.done = true break end
+    m.cur, m.cur_h = prev, ch - 1
+  end
+end
+
+--- Active-chain block at height h (hash256) or nil.
+function ChainState:active_hash_at(h)
+  if not h or not self.tip_hash then return nil end
+  local m = self:_active_memo()
+  if h > m.tip_h or h < 0 then return nil end
+  self:_active_extend(m, h)
+  return m.h2b[h]
+end
+
+--- Height of `hash` if it is on the active chain, else nil.  `floor` bounds
+--- the fallback walk for a hash whose height is not in memory.
+function ChainState:active_height_of(hash, floor)
+  if not hash or not self.tip_hash then return nil end
+  local m = self:_active_memo()
+  local h = m.b2h[hash.bytes]
+  if h then return h end
+  local hi = self.header_index
+  local e = hi and hi.headers and hi.headers[types.hash256_hex(hash)]
+  if e then
+    local a = self:active_hash_at(e.height)
+    if a and a.bytes == hash.bytes then return e.height end
+    return nil
+  end
+  self:_active_extend(m, floor or 0)
+  return m.b2h[hash.bytes]
+end
+
+--- Check if a block has an invalid ancestor (itself included).
+--- Walks parents only until the first ACTIVE-chain ancestor: blocks on the
+--- active chain are valid and so are all of their ancestors, so nothing
+--- below the fork point can be invalid.  Cost O(fork depth) (Core: the
+--- BLOCK_FAILED_MASK on pprev is checked in O(1); this is the nearest
+--- equivalent without a per-entry status word).  Used to walk to genesis on
+--- every call (~970k storage reads per side-branch accept, LB-4).
 -- @param block_hash hash256: The block hash to check
 -- @return boolean: true if any ancestor is invalid
 function ChainState:has_invalid_ancestor(block_hash)
   local current_hash = block_hash
+  local use_active = self.header_index ~= nil and self.tip_hash ~= nil
   while current_hash do
     if self:is_block_invalid(current_hash) then
       return true
     end
-    -- Get parent
-    local header = self.storage.get_header(current_hash)
-    if not header then
+    local prev, h = self:_parent_of(current_hash)
+    if use_active and h then
+      local a = self:active_hash_at(h)
+      if a and a.bytes == current_hash.bytes then return false end
+    end
+    if not prev or prev.bytes == ZERO32 then
       break
     end
-    -- Check if we've reached genesis (all-zero prev_hash)
-    if header.prev_hash.bytes == string.rep("\0", 32) then
-      break
-    end
-    current_hash = header.prev_hash
+    current_hash = prev
   end
   return false
 end
@@ -4204,6 +4287,20 @@ function ChainState:accept_block(block, height, block_hash, opts)
   -- AbortNode latch: after a fatal internal error nothing is connected.
   fault.check_latch("block connect")
 
+  -- LB-3: a block marked invalid (invalidateblock, or an earlier verdict) or
+  -- a child of one is never connected (Core AcceptBlockHeader:
+  -- BLOCK_FAILED_MASK -> "duplicate-invalid" / BLOCK_INVALID_PREV
+  -- "bad-prevblk"; FindMostWorkChain skips failed entries).  Without this
+  -- the P2P drive reconnected an invalidated block it recovered from
+  -- storage at the next block.
+  if block_hash and self.invalid_blocks[block_hash.bytes] then
+    return nil, "duplicate-invalid"
+  end
+  if block and block.header and block.header.prev_hash
+      and self.invalid_blocks[block.header.prev_hash.bytes] then
+    return nil, "bad-prevblk (duplicate-invalid parent)"
+  end
+
   -- G19c (W97): fTooFarAhead gate (Core validation.cpp:4325 + 4339).
   -- An unrequested block more than MIN_BLOCKS_TO_KEEP (288) blocks ahead
   -- of the active tip is dropped without storing.  This prevents an
@@ -4424,7 +4521,40 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- which already refuses to trust the height index for the same reason.
   local active_hash_to_height = {}
   local active_height_to_hash = {}
-  do
+  if self.header_index and self.header_index.headers then
+    -- LB-4: the same maps, built LAZILY.  On an archive node lo = 0, so the
+    -- eager build below read every header from the tip to GENESIS on every
+    -- side-branch accept (every stale-block race, non-tip submitblock,
+    -- preciousblock, FORK-DL retry).  Core's FindFork costs O(fork depth).
+    -- The lazy walk still starts at the REAL active tip and follows parent
+    -- links (never the polluted height index), and is snapshotted at entry
+    -- so the reorg below cannot change its answers mid-flight.
+    local lo = math.max(0, self.tip_height - MAX_REORG_DEPTH)
+    local m = { tip = self.tip_hash and self.tip_hash.bytes, tip_h = self.tip_height,
+                h2b = {}, b2h = {}, low = nil, cur = self.tip_hash,
+                cur_h = self.tip_height, done = false }
+    local cs = self
+    local hi = self.header_index
+    setmetatable(active_height_to_hash, { __index = function(_, h)
+      if type(h) ~= "number" or h < lo or h > m.tip_h then return nil end
+      cs:_active_extend(m, h)
+      return m.h2b[h]
+    end })
+    setmetatable(active_hash_to_height, { __index = function(_, b)
+      if type(b) ~= "string" then return nil end
+      local h = m.b2h[b]
+      if h then return h end
+      local e = hi.headers[types.hash256_hex(types.hash256(b))]
+      if e then
+        if e.height < lo or e.height > m.tip_h then return nil end
+        cs:_active_extend(m, e.height)
+        local a = m.h2b[e.height]
+        return (a and a.bytes == b) and e.height or nil
+      end
+      cs:_active_extend(m, lo)
+      return m.b2h[b]
+    end })
+  else
     local lo = math.max(0, self.tip_height - MAX_REORG_DEPTH)
     local cur_hash = self.tip_hash
     local cur_height = self.tip_height
@@ -5530,40 +5660,54 @@ end
 -- descendant (including out-of-chain ones) so they cannot be promoted later.
 -- @param block_hash hash256: The ancestor block whose descendants to mark
 function ChainState:mark_descendant_invalid(block_hash)
-  -- Iterate over ALL stored headers to find blocks that have block_hash as
-  -- an ancestor.  The walk is O(n * depth) but invalidateblock is a rare
-  -- operator action, not a hot path.
+  -- LB-2: this used to iterate EVERY stored header and walk up to 10,000
+  -- parents from each with storage.get_header -- ~970k x 10,000 = ~9.7e9
+  -- reads on mainnet, on the only event loop, never polling SIGTERM (so
+  -- stop_mainnet SIGKILLed it and the invalid set, saved only after the walk,
+  -- was lost).  Core walks its IN-MEMORY block index.  Here:
+  --   * with the in-memory header index (the live node): one memoized pass
+  --     over resident headers above the block (HeaderChain:collect_descendants);
+  --     stored side headers that are not resident are caught lazily by
+  --     has_invalid_ancestor when anything tries to accept them;
+  --   * without it (tests / tools): the storage pass, memoized so every
+  --     header is read once (O(headers), not O(headers x depth)).
+  local hi = self.header_index
+  if hi and hi.collect_descendants and hi.headers
+      and hi.headers[types.hash256_hex(block_hash)] then
+    for _, hx in ipairs(hi:collect_descendants(types.hash256_hex(block_hash))) do
+      self.invalid_blocks[types.hash256_from_hex(hx).bytes] = true
+    end
+    return
+  end
+  local memo = { [block_hash.bytes] = true }
   local iter = self.storage.iterator(storage_mod.CF.HEADERS)
   iter.seek_to_first()
   while iter.valid() do
     local candidate_bytes = iter.key()
-    -- Skip the block itself (already marked) and already-invalid blocks.
-    if candidate_bytes ~= block_hash.bytes and not self.invalid_blocks[candidate_bytes] then
-      local candidate_hash = types.hash256(candidate_bytes)
-      -- Walk the candidate's ancestor chain looking for block_hash.
-      local cur = candidate_hash
-      local found = false
+    if memo[candidate_bytes] == nil and not self.invalid_blocks[candidate_bytes] then
+      local path, n = {}, 0
+      local cur = types.hash256(candidate_bytes)
+      local res = false
       local limit = 10000  -- prevent infinite loop on malformed storage
       while cur and limit > 0 do
         limit = limit - 1
+        local m = memo[cur.bytes]
+        if m ~= nil then res = m break end
+        n = n + 1
+        path[n] = cur.bytes
+        self.header_storage_reads = (self.header_storage_reads or 0) + 1
         local h = self.storage.get_header(cur)
-        if not h then break end
-        if types.hash256_eq(h.prev_hash, block_hash) then
-          found = true
-          break
-        end
-        if h.prev_hash.bytes == string.rep("\0", 32) then
-          break
-        end
+        if not h or h.prev_hash.bytes == ZERO32 then res = false break end
         cur = h.prev_hash
       end
-      if found then
-        self.invalid_blocks[candidate_bytes] = true
-      end
+      for i = 1, n do memo[path[i]] = res end
     end
     iter.next()
   end
   iter.destroy()
+  for b, v in pairs(memo) do
+    if v and b ~= block_hash.bytes then self.invalid_blocks[b] = true end
+  end
 end
 
 --- Invalidate a block and all its descendants, triggering a reorg if needed.
@@ -5597,10 +5741,19 @@ function ChainState:invalidate_block(block_hash)
   local block_in_chain = false
   local block_height = nil
 
-  -- Find the height of this block by searching from tip
+  -- Find the height of this block by searching from tip.  With the in-memory
+  -- header index this is O(tip - height) (the blocks about to be
+  -- disconnected); the storage walk below is the fallback.
+  local fast_h = self.header_index and self:active_height_of(block_hash, self.tip_height + 1)
   if self.tip_hash and types.hash256_eq(self.tip_hash, block_hash) then
     block_in_chain = true
     block_height = self.tip_height
+  elseif self.header_index and self.header_index.headers
+      and self.header_index.headers[types.hash256_hex(block_hash)] then
+    if fast_h then
+      block_in_chain = true
+      block_height = fast_h
+    end
   else
     -- Check if the block is an ancestor of the current tip
     local current_hash = self.tip_hash
@@ -5664,15 +5817,21 @@ function ChainState:reconsider_block(block_hash)
   -- Remove invalid flag from this block
   self.invalid_blocks[block_hash.bytes] = nil
 
-  -- Also clear invalid flags from all ancestors
+  -- Also clear invalid flags from all ancestors -- down to the first
+  -- active-chain ancestor (nothing at or below it can be invalid); the walk
+  -- used to read every header down to genesis.
   local current_hash = header.prev_hash
   while current_hash and current_hash.bytes ~= string.rep("\0", 32) do
     self.invalid_blocks[current_hash.bytes] = nil
-    local h = self.storage.get_header(current_hash)
-    if not h then
+    local prev, h = self:_parent_of(current_hash)
+    if not prev then
       break
     end
-    current_hash = h.prev_hash
+    if h and self.header_index then
+      local a = self:active_hash_at(h)
+      if a and a.bytes == current_hash.bytes then break end
+    end
+    current_hash = prev
   end
 
   -- Clear invalid flags from all descendants
@@ -5686,40 +5845,41 @@ function ChainState:reconsider_block(block_hash)
 end
 
 --- Clear invalid flags from all descendants of a block.
+-- Only members of the invalid set can need clearing, so walk from each of
+-- THOSE (memoized) instead of from every stored header (the old shape of
+-- LB-2: O(headers x depth) storage reads).
 -- @param block_hash hash256: The parent block hash
 function ChainState:clear_descendant_invalid_flags(block_hash)
-  -- Iterate through all headers and check if they descend from block_hash
-  local iter = self.storage.iterator(storage_mod.CF.HEADERS)
-  iter.seek_to_first()
-
+  local memo = { [block_hash.bytes] = true }
   local descendants = {}
-  while iter.valid() do
-    local hash_bytes = iter.key()
-    if self.invalid_blocks[hash_bytes] then
-      -- Check if this is a descendant of block_hash
-      local candidate_hash = types.hash256(hash_bytes)
-      local current = candidate_hash
-      while current do
-        local h = self.storage.get_header(current)
-        if not h then
-          break
+  for hash_bytes in pairs(self.invalid_blocks) do
+    if memo[hash_bytes] == nil then
+      local path, n = {}, 0
+      local cur = types.hash256(hash_bytes)
+      local res = false
+      local limit = 1000000
+      while cur and limit > 0 do
+        limit = limit - 1
+        local m = memo[cur.bytes]
+        if m ~= nil then res = m break end
+        n = n + 1
+        path[n] = cur.bytes
+        local prev, h = self:_parent_of(cur)
+        if not prev or prev.bytes == ZERO32 then res = false break end
+        -- Below an active-chain block nothing can descend from an
+        -- invalidated (hence non-active) block.
+        if h and self.header_index then
+          local a = self:active_hash_at(h)
+          if a and a.bytes == cur.bytes then res = false break end
         end
-        if types.hash256_eq(h.prev_hash, block_hash) then
-          -- This is a descendant
-          descendants[hash_bytes] = true
-          break
-        end
-        if h.prev_hash.bytes == string.rep("\0", 32) then
-          break
-        end
-        current = h.prev_hash
+        cur = prev
       end
+      for i = 1, n do memo[path[i]] = res end
     end
-    iter.next()
   end
-  iter.destroy()
-
-  -- Clear the invalid flag for all descendants
+  for hb, v in pairs(memo) do
+    if v and hb ~= block_hash.bytes then descendants[hb] = true end
+  end
   for hash_bytes, _ in pairs(descendants) do
     self.invalid_blocks[hash_bytes] = nil
   end

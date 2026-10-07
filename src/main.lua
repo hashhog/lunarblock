@@ -1343,6 +1343,10 @@ local function main()
   io.stdout:write("Initializing header chain...\n"); io.stdout:flush()
   local header_chain = sync_mod.new_header_chain(network, db)
   header_chain:init()
+  -- LB-2/LB-4: ChainState answers active-chain / ancestry questions
+  -- (invalidateblock, has_invalid_ancestor, reconsiderblock) from the
+  -- in-memory header index instead of walking storage to genesis.
+  chain_state.header_index = header_chain
 
   -- Snapshot-boundary boot audit (sync.lua HeaderChain:audit_snapshot_boundary).
   -- accept_header only ever gates NEW headers, so a datadir that admitted a
@@ -2085,9 +2089,58 @@ local function main()
     return false
   end
 
+  -- LB-5: feed Core's stale-tip / chain-sync-eviction machinery
+  -- (CheckForStaleTipAndEvictPeers, ConsiderEviction).  Before this nothing
+  -- in src/ called record_tip_update / set_peer_best_block / the in-flight
+  -- tracker, so every peer's best block read as height 0 and every outbound
+  -- peer was disconnected "outbound peer has old chain" ~22 min after it
+  -- connected, and the tip looked stale forever (extra-outbound churn).
+  peer_manager.active_tip_info = function()
+    local th = chain_state.tip_hash
+    local hx = th and (type(th) == "string" and th or types.hash256_hex(th)) or nil
+    local e = hx and header_chain.headers[hx]
+    return chain_state.tip_height, hx, e and e.total_work or nil
+  end
+  peer_manager.block_inflight_source = block_downloader
+  -- A peer has shown us block `hx` (header known): raise its best known
+  -- block (Core UpdateBlockAvailability).  `announce` = it was NEW to us and
+  -- has more work than our tip (Core m_last_block_announcement).
+  local function note_peer_has_block(peer, hx, announce)
+    local e = hx and header_chain.headers[hx]
+    if not e then return end
+    peer_manager:note_peer_best_block(peer, e.height, hx, e.total_work)
+    if announce then
+      local tip = peer_manager:_our_tip()
+      if peerman_mod._best_ge({ height = e.height, work = e.total_work }, tip)
+          and not (tip.hash == hx) then
+        peer_manager:record_peer_block_announcement(peer, hx)
+      end
+    end
+  end
+  -- Last header of a `headers` payload, as hex (nil for an empty message).
+  local function last_header_hex(payload)
+    local ok, n, off = pcall(function()
+      local b = payload:byte(1)
+      if not b then return 0, 1 end
+      if b < 0xFD then return b, 2 end
+      if b == 0xFD then return payload:byte(2) + payload:byte(3) * 256, 4 end
+      return nil
+    end)
+    if not ok or not n or n == 0 then return nil end
+    local start = off + (n - 1) * 81
+    local hdr = payload:sub(start, start + 79)
+    if #hdr ~= 80 then return nil end
+    return types.hash256_hex(crypto.hash256_type(hdr))
+  end
+
   -- Register P2P message handlers
   peer_manager:register_handler("headers", function(peer, payload)
     local accepted, err = header_chain:handle_headers(peer, payload)
+    if not err then
+      local ok_n, nerr = pcall(note_peer_has_block, peer, last_header_hex(payload),
+        accepted and accepted > 0)
+      if not ok_n then print("peer best-block note failed: " .. tostring(nerr)) end
+    end
     if err then
       print("Invalid headers from " .. peer.ip .. ": " .. err)
       if header_chain.prebase_gap
@@ -2143,6 +2196,17 @@ local function main()
     peer:send_message("headers",
       peerman_mod.getheaders_response(req, header_chain, chain_state.tip_height))
   end)
+
+  -- LB-1: a body found bad at CONNECT time (mutated copy recovered from
+  -- pending, or a CheckBlock verdict) punishes the peer that SENT it (Core
+  -- BlockChecked -> MaybePunishNodeForBlock via mapBlockSource), not the peer
+  -- whose block happened to trigger the connect pass.
+  block_downloader.punish_peer_callback = function(src_peer, reason)
+    if src_peer and src_peer.state == "established"
+        and sync_mod.should_punish_peer_for_block_error(reason) then
+      peer_manager:add_ban_score(src_peer, 100, reason)
+    end
+  end
 
   peer_manager:register_handler("block", function(peer, payload)
     -- Process blocks both during IBD and at tip (for new blocks
@@ -2200,6 +2264,9 @@ local function main()
           }
         end
       elseif item.type == p2p.INV_TYPE.MSG_BLOCK or item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
+        -- Core UpdateBlockAvailability: an inv for a block we know raises the
+        -- peer's best known block (LB-5).
+        pcall(note_peer_has_block, peer, types.hash256_hex(item.hash), false)
         -- Request new block headers
         header_chain:start_sync(peer)
       end
@@ -2467,6 +2534,34 @@ local function main()
   -- BIP 152: Compact block message handlers
   local compact_block = require("lunarblock.compact_block")
 
+  -- LB-12: Core PartiallyDownloadedBlock::FillBlock runs IsBlockMutated on
+  -- the reconstructed block (blockencodings.cpp) and returns
+  -- READ_STATUS_FAILED; net_processing then falls back to a full getdata
+  -- ("Might have collided, fall back to getdata now").  A short-id collision
+  -- or a forged prefilled tx must never reach the connect path as if it
+  -- were the block.
+  local function cmpct_check_mutated(block_hash)
+    return function(blk)
+      local entry = header_chain:get_header(block_hash)
+      local h = entry and entry.height
+      if not h then
+        local pe = header_chain.headers[types.hash256_hex(blk.header.prev_hash)]
+        h = pe and (pe.height + 1) or nil
+      end
+      if not h then return false end   -- unknown parent: Core skips the check
+      local segwit_active = network.segwit_height ~= nil and h >= network.segwit_height
+      local ok_m, m = pcall(validation.is_block_mutated, blk, segwit_active)
+      return (not ok_m) or m
+    end
+  end
+  local function cmpct_fallback_getdata(peer, block_hash, why)
+    if not block_hash then return end
+    print(string.format("compact block for %s did not reconstruct (%s); "
+      .. "requesting the full block", types.hash256_hex(block_hash), tostring(why)))
+    peer:send_message("getdata", p2p.serialize_inv({
+      { type = p2p.INV_TYPE.MSG_WITNESS_BLOCK, hash = block_hash } }))
+  end
+
   peer_manager:register_handler("cmpctblock", function(peer, payload)
     local ok, err = pcall(function()
       local cmpctblock = p2p.deserialize_cmpctblock(payload)
@@ -2489,6 +2584,7 @@ local function main()
 
       print(string.format("Received compact block from %s:%d (short_ids=%d, prefilled=%d)",
         peer.ip, peer.port, #cmpctblock.short_ids, #cmpctblock.prefilled_txns))
+      pcall(note_peer_has_block, peer, types.hash256_hex(block_hash), true)
 
       -- Create a partial block and try to reconstruct
       local partial = compact_block.new_partial_block()
@@ -2501,14 +2597,15 @@ local function main()
 
       if partial:is_complete() then
         -- All transactions available (all prefilled or from mempool)
-        local blk, recon_err = partial:reconstruct()
+        local blk, recon_err = partial:reconstruct(cmpct_check_mutated(block_hash))
         if blk then
           print("Compact block fully reconstructed")
           -- Serialize and pass through normal block handling
           local blk_data = serialize.serialize_block(blk)
-          block_downloader:handle_block(peer, blk_data)
+          block_downloader:handle_block(peer, blk_data, { via_compact = true })
         else
           print("Compact block reconstruction failed: " .. (recon_err or "unknown"))
+          cmpct_fallback_getdata(peer, block_hash, recon_err)
         end
       else
         -- Request missing transactions via getblocktxn
@@ -2547,14 +2644,16 @@ local function main()
         return
       end
 
-      local blk, recon_err = partial:reconstruct()
+      local blk, recon_err = partial:reconstruct(
+        cmpct_check_mutated(blocktxn.block_hash))
       peer.pending_compact[hash_hex] = nil
       if blk then
         print("Compact block reconstructed from blocktxn")
           local blk_data = serialize.serialize_block(blk)
-          block_downloader:handle_block(peer, blk_data)
+          block_downloader:handle_block(peer, blk_data, { via_compact = true })
       else
         print("Compact block reconstruction failed: " .. (recon_err or "unknown"))
+        cmpct_fallback_getdata(peer, blocktxn.block_hash, recon_err)
       end
     end)
     if not ok then
@@ -2912,6 +3011,15 @@ local function main()
   -- equivalent of that SendMessages re-arm.
   peer_manager.callbacks.on_peer_disconnected = function(peer, reason)
     local was_sync_peer = header_chain:on_peer_disconnected(peer)
+    -- LB-6: Core FinalizeNode frees the peer's blocks in flight so they are
+    -- re-requested at once.  They used to sit until the stall timeout -- and
+    -- with one remaining peer (single-peer mode never times out) forever,
+    -- one STALL RECOVERY (90 s) per height.
+    local freed = block_downloader:on_peer_disconnected(peer)
+    if freed > 0 then
+      print(string.format("Freed %d block request(s) in flight from disconnected peer %s:%d",
+        freed, peer.ip or "?", peer.port or 0))
+    end
     if was_sync_peer then
       print(string.format(
         "Header sync peer %s:%d disconnected (%s); released sync latch",

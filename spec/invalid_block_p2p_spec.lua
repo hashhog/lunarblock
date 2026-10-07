@@ -113,7 +113,7 @@ local function body(header)
 end
 
 describe("invalid block over P2P (Core InvalidBlockFound parity)", function()
-  local orig_check_block
+  local orig_check_block, orig_is_mutated
   local storage, chain, dl, genesis_hash, t0
   local cb_err            -- error the connect callback raises for B1
   local connects          -- hash_hex -> times connect_callback ran
@@ -121,6 +121,12 @@ describe("invalid block over P2P (Core InvalidBlockFound parity)", function()
 
   before_each(function()
     orig_check_block = validation.check_block
+    -- The bodies here are placeholders that do not match their headers
+    -- (merkle root zero).  The verdict under test comes from the connect
+    -- callback, so the receipt-time mutation gate (LB-1, its own spec in
+    -- audit_liveness_spec.lua) is stubbed along with check_block.
+    orig_is_mutated = validation.is_block_mutated
+    validation.is_block_mutated = function() return false end
     validation.check_block = function() return true end
     storage = create_storage()
     chain = sync.new_header_chain(REGTEST, storage)
@@ -144,6 +150,7 @@ describe("invalid block over P2P (Core InvalidBlockFound parity)", function()
 
   after_each(function()
     validation.check_block = orig_check_block
+    validation.is_block_mutated = orig_is_mutated
   end)
 
   it("marks a consensus-invalid block failed, never re-requests it, and fetches the competitor", function()

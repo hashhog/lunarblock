@@ -3957,11 +3957,10 @@ function PeerManager:tip_may_be_stale()
   local pow_target_spacing = self.network and self.network.pow_target_spacing or 600
   local stale_threshold = pow_target_spacing * 3  -- 30 minutes for mainnet
 
+  self:_poll_tip_change()
   -- Tip is stale if no update in 3x block interval and no blocks in flight
-  local blocks_in_flight_count = 0
-  for _ in pairs(self._blocks_in_flight) do
-    blocks_in_flight_count = blocks_in_flight_count + 1
-  end
+  -- (Core: mapBlocksInFlight.empty()).
+  local blocks_in_flight_count = self:get_blocks_in_flight_count()
 
   return (now - self._last_tip_update) > stale_threshold and blocks_in_flight_count == 0
 end
@@ -3979,6 +3978,55 @@ function PeerManager:set_peer_best_block(p, height, hash, work)
     hash = hash,
     work = work or 0,
   }
+end
+
+--- Is block info `b` ({height, work}) at least as good as `ref`?  Work when
+--- both carry it (Core compares nChainWork), height otherwise.
+local function best_ge(b, ref)
+  if not b or not ref then return false end
+  if b.work and ref.work and type(b.work) == "string" and type(ref.work) == "string"
+      and #b.work == 32 and #ref.work == 32 then
+    return require("lunarblock.consensus").work_compare(b.work, ref.work) >= 0
+  end
+  return (b.height or -1) >= (ref.height or math.huge)
+end
+M._best_ge = best_ge
+
+--- Our ACTIVE tip as {height, hash, work} (Core ActiveChain().Tip()).  Fed by
+--- main.lua's active_tip_info provider; falls back to our_height.
+function PeerManager:_our_tip()
+  if self.active_tip_info then
+    local ok, h, hash, work = pcall(self.active_tip_info)
+    if ok and h then return { height = h, hash = hash, work = work } end
+  end
+  return { height = self.our_height or 0 }
+end
+
+--- LB-5: a peer has shown us a block (headers / inv of a known block /
+--- cmpctblock / block).  Core UpdateBlockAvailability -> ProcessBlockAvailability:
+--- pindexBestKnownBlock only ever moves to MORE work.  Also Core's
+--- m_chain_sync.m_protect for up to MAX_OUTBOUND_PEERS_TO_PROTECT outbound
+--- full-relay peers whose best known block has at least our tip's work
+--- (net_processing.cpp UpdatePeerStateForReceivedHeaders).
+-- @param p Peer
+-- @param height number
+-- @param hash string|nil
+-- @param work string|nil 32-byte big-endian cumulative work
+function PeerManager:note_peer_best_block(p, height, hash, work)
+  if not p or not p.ip or not height then return end
+  local key = p.ip .. ":" .. p.port
+  local cur = self._peer_best_block[key]
+  local new = { height = height, hash = hash, work = work }
+  if cur and best_ge(cur, new) then return end
+  self._peer_best_block[key] = new
+  local cs = self._peer_chain_sync[key]
+  if cs and not cs.protect and not p.inbound and not p.is_feeler
+      and (self._protected_outbound or 0) < M.STALE_TIP.MAX_OUTBOUND_PEERS_TO_PROTECT
+      and best_ge(new, self:_our_tip()) then
+    cs.protect = true
+    cs.protect_by_work = true
+    self._protected_outbound = (self._protected_outbound or 0) + 1
+  end
 end
 
 --- Get a peer's best known block info.
@@ -4025,6 +4073,10 @@ end
 -- @param p Peer: the peer
 function PeerManager:_cleanup_peer_chain_sync(p)
   local key = p.ip .. ":" .. p.port
+  local cs = self._peer_chain_sync[key]
+  if cs and cs.protect_by_work then
+    self._protected_outbound = math.max((self._protected_outbound or 1) - 1, 0)
+  end
   self._peer_chain_sync[key] = nil
   self._peer_best_block[key] = nil
   self._peer_last_block_ann[key] = nil
@@ -4058,10 +4110,12 @@ function PeerManager:consider_eviction(p, now)
   end
 
   local peer_best = self._peer_best_block[key]
-  local peer_height = peer_best and peer_best.height or 0
+  -- Core compares the peer's best known block with our ACTIVE tip's work
+  -- (ActiveChain().Tip()->nChainWork), not with our header tip.
+  local our_tip = self:_our_tip()
 
   -- If peer's best known block >= our tip, reset timeout
-  if peer_height >= self.our_height then
+  if best_ge(peer_best, our_tip) then
     if sync_state.timeout ~= 0 then
       sync_state.timeout = 0
       sync_state.work_header = nil
@@ -4072,10 +4126,10 @@ function PeerManager:consider_eviction(p, now)
 
   -- Peer's best block is behind our tip
   if sync_state.timeout == 0 or
-     (sync_state.work_header and peer_height >= sync_state.work_header.height) then
+     (sync_state.work_header and best_ge(peer_best, sync_state.work_header)) then
     -- Set/reset timeout based on current tip
     sync_state.timeout = now + M.STALE_TIP.CHAIN_SYNC_TIMEOUT
-    sync_state.work_header = {height = self.our_height}
+    sync_state.work_header = our_tip
     sync_state.sent_getheaders = false
   elseif sync_state.timeout > 0 and now > sync_state.timeout then
     -- Timeout exceeded
@@ -4181,13 +4235,7 @@ function PeerManager:evict_extra_outbound_peers(now)
     -- Only disconnect if connected for minimum time and no blocks in-flight
     if (now - connect_time) > M.STALE_TIP.MINIMUM_CONNECT_TIME then
       -- Check no blocks in-flight from this peer
-      local has_inflight = false
-      for _, info in pairs(self._blocks_in_flight) do
-        if info.peer == worst_peer then
-          has_inflight = true
-          break
-        end
-      end
+      local has_inflight = self:peer_has_block_in_flight(worst_peer)
 
       if not has_inflight then
         self:disconnect_peer(worst_peer, "evicting extra outbound peer")
@@ -4202,6 +4250,7 @@ end
 -- Reference: Bitcoin Core net_processing.cpp CheckForStaleTipAndEvictPeers()
 function PeerManager:check_for_stale_tip_and_evict_peers()
   local now = socket.gettime()
+  self:_poll_tip_change()
 
   -- Run eviction check every EXTRA_PEER_CHECK_INTERVAL
   if now >= self._extra_peer_check_time then
@@ -4264,14 +4313,52 @@ function PeerManager:is_block_in_flight(hash)
   return self._blocks_in_flight[hash] ~= nil
 end
 
---- Get count of blocks in-flight.
+--- Get count of blocks in-flight (own table + the block downloader's
+--- in-flight map, Core mapBlocksInFlight).
 -- @return number: count
 function PeerManager:get_blocks_in_flight_count()
   local count = 0
   for _ in pairs(self._blocks_in_flight) do
     count = count + 1
   end
+  local src = self.block_inflight_source
+  if src and src.inflight then
+    for _ in pairs(src.inflight) do count = count + 1 end
+  end
   return count
+end
+
+--- Does `p` have a block request in flight?  (Core: vBlocksInFlight)
+function PeerManager:peer_has_block_in_flight(p)
+  for _, info in pairs(self._blocks_in_flight) do
+    if info.peer == p then return true end
+  end
+  local src = self.block_inflight_source
+  if src and src.peer_inflight and (src.peer_inflight[p] or 0) > 0 then
+    return true
+  end
+  if src and src.inflight then
+    for _, info in pairs(src.inflight) do
+      if info.peer == p then return true end
+    end
+  end
+  return false
+end
+
+--- LB-5: the stale-tip clock follows our ACTIVE tip (Core m_last_tip_update,
+--- set when a block is connected to the active chain).  Polled from the
+--- tick, so every path that moves the tip (P2P connect, submitblock, reorg,
+--- invalidateblock, reconsiderblock) counts without each one remembering to
+--- call record_tip_update.
+function PeerManager:_poll_tip_change()
+  if not self.active_tip_info then return end
+  local ok, h, hash = pcall(self.active_tip_info)
+  if not ok or not h then return end
+  local id = tostring(hash) .. "@" .. tostring(h)
+  if self._last_tip_id ~= id then
+    if self._last_tip_id ~= nil then self:record_tip_update() end
+    self._last_tip_id = id
+  end
 end
 
 --------------------------------------------------------------------------------

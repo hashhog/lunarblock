@@ -3887,6 +3887,26 @@ function RPCServer:register_methods()
     if not ok then
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to invalidate block"})
     end
+    -- LB-3 (Core InvalidateBlock -> InvalidChainFound -> RecalculateBestHeader):
+    -- the header/download layer must learn of it too, or the P2P drive keeps
+    -- height_to_hash pointing at the invalidated block, recovers its body
+    -- from storage and reconnects it at the next block (invalidation silently
+    -- undone within one block interval).  mark_block_invalid marks it and its
+    -- resident descendants failed, moves the header tip to the best valid
+    -- header, drops their in-flight / pending entries and re-anchors the
+    -- cursors on the (now lower) active tip.
+    local hx = types.hash256_hex(hash)
+    if rpc.block_downloader and rpc.block_downloader.mark_block_invalid
+        and rpc.header_chain and rpc.header_chain.headers
+        and rpc.header_chain.headers[hx] then
+      local ok_m, err_m = pcall(rpc.block_downloader.mark_block_invalid,
+        rpc.block_downloader, hx, "invalidateblock")
+      if not ok_m then
+        print("[invalidateblock] header-layer mark failed (non-fatal): " .. tostring(err_m))
+      end
+    elseif rpc.header_chain and rpc.header_chain.mark_failed then
+      pcall(rpc.header_chain.mark_failed, rpc.header_chain, hx)
+    end
     -- The tip may have dropped: evict entries that are no longer final /
     -- BIP-68-final / mature at the new tip+1 (Core InvalidateBlock ->
     -- MaybeUpdateMempoolForReorg -> removeForReorg).
