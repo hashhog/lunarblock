@@ -1828,7 +1828,7 @@ end
 -- @param expect_witness_commitment boolean: true when segwit deployment is active
 --        (mirrors Core's DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT))
 -- @return boolean, string|nil: true on success; false + error string on failure
-function M.check_witness_malleation(block, expect_witness_commitment)
+function M.check_witness_malleation(block, expect_witness_commitment, wtxids)
   if expect_witness_commitment then
     -- Segwit is active: look for witness commitment in coinbase.
     -- Core asserts block is non-empty + coinbase has at least one input here;
@@ -1860,7 +1860,8 @@ function M.check_witness_malleation(block, expect_witness_commitment)
       local witness_hashes = {}
       witness_hashes[1] = types.hash256_zero()  -- coinbase wtxid = 0x000...0
       for i = 2, #block.transactions do
-        witness_hashes[i] = M.compute_wtxid(block.transactions[i])
+        witness_hashes[i] = (wtxids and wtxids[i])
+          or M.compute_wtxid(block.transactions[i])
       end
       local witness_root = crypto.compute_merkle_root(witness_hashes)
 
@@ -1902,6 +1903,139 @@ end
 function M.check_witness_commitment(block)
   local ok, _err = M.check_witness_malleation(block, true)
   return ok
+end
+
+--------------------------------------------------------------------------------
+-- Block mutation (Core IsBlockMutated, validation.cpp)
+--------------------------------------------------------------------------------
+
+-- Read a CompactSize at 1-based `pos` of `s`; returns value, next pos (nil on
+-- truncation).
+local function raw_varint(s, pos)
+  local b = s:byte(pos)
+  if not b then return nil end
+  if b < 0xFD then return b, pos + 1 end
+  local n = (b == 0xFD) and 2 or ((b == 0xFE) and 4 or 8)
+  if pos + n > #s then return nil end
+  local v = 0
+  for i = n, 1, -1 do v = v * 256 + s:byte(pos + i) end
+  return v, pos + 1 + n
+end
+
+--- Per-transaction txid / wtxid / stripped size straight from the wire bytes
+--- of a block (no Lua re-serialization: on a 1.4 MB mainnet block the
+--- serialize-per-tx route costs ~125 ms, this ~ the hashing alone).
+--- Returns nil when the bytes do not parse cleanly; callers then fall back to
+--- the object route.
+-- @param raw string: serialized block (header + txs)
+-- @return table|nil txids, table wtxids, table base_sizes
+function M.block_tx_hashes_from_raw(raw)
+  if type(raw) ~= "string" or #raw < 81 then return nil end
+  local ntx, pos = raw_varint(raw, 81)
+  if not ntx or ntx > 1000000 then return nil end
+  local txids, wtxids, sizes = {}, {}, {}
+  local len = #raw
+  for i = 1, ntx do
+    local s = pos
+    if s + 4 > len then return nil end
+    local p = s + 4
+    local segwit = false
+    if raw:byte(p) == 0 then
+      local flag = raw:byte(p + 1)
+      if flag ~= 1 then return nil end   -- 0-input/flag-0 oddities: slow path
+      segwit = true
+      p = p + 2
+    end
+    local body_start = p
+    local nin; nin, p = raw_varint(raw, p)
+    if not nin then return nil end
+    for _ = 1, nin do
+      p = p + 36
+      local sl; sl, p = raw_varint(raw, p)
+      if not sl then return nil end
+      p = p + sl + 4
+    end
+    local nout; nout, p = raw_varint(raw, p)
+    if not nout then return nil end
+    for _ = 1, nout do
+      p = p + 8
+      local sl; sl, p = raw_varint(raw, p)
+      if not sl then return nil end
+      p = p + sl
+    end
+    local body_end = p - 1
+    if segwit then
+      for _ = 1, nin do
+        local items; items, p = raw_varint(raw, p)
+        if not items then return nil end
+        for _ = 1, items do
+          local il; il, p = raw_varint(raw, p)
+          if not il then return nil end
+          p = p + il
+        end
+      end
+    end
+    if p + 3 > len then return nil end
+    local e = p + 3                      -- last byte of nLockTime
+    local base
+    if segwit then
+      base = raw:sub(s, s + 3) .. raw:sub(body_start, body_end) .. raw:sub(e - 3, e)
+      wtxids[i] = crypto.hash256_type(raw:sub(s, e))
+    else
+      base = raw:sub(s, e)
+    end
+    txids[i] = crypto.hash256_type(base)
+    if not segwit then wtxids[i] = txids[i] end
+    sizes[i] = #base
+    pos = e + 1
+  end
+  if pos ~= len + 1 then return nil end
+  return txids, wtxids, sizes
+end
+
+--- Is the block body malleated relative to its header?  Mirrors Core
+--- IsBlockMutated (validation.cpp): CheckMerkleRoot (root mismatch or
+--- CVE-2012-2459 duplicate), the 64-byte-tx rule for a block without a
+--- coinbase first, and CheckWitnessMalleation.  A mutated block says NOTHING
+--- about the block its header commits to: Core punishes the sender and
+--- re-requests it, it never marks the hash invalid (BLOCK_MUTATED).
+-- @param block table: decoded block
+-- @param check_witness_root boolean: segwit active for this block
+-- @param raw string|nil: the wire bytes, when available (fast hash route)
+-- @return boolean mutated, string|nil reason
+function M.is_block_mutated(block, check_witness_root, raw)
+  local txs = block.transactions or {}
+  local txids, wtxids, sizes
+  if raw then txids, wtxids, sizes = M.block_tx_hashes_from_raw(raw) end
+  if txids and #txids ~= #txs then txids, wtxids, sizes = nil, nil, nil end
+  if not txids then
+    txids, wtxids, sizes = {}, {}, {}
+    for i, tx in ipairs(txs) do
+      txids[i] = M.compute_txid(tx)
+      wtxids[i] = M.compute_wtxid(tx)
+      sizes[i] = #(tx._cached_base_data or serialize.serialize_transaction(tx, false))
+    end
+  end
+  local root, dup = crypto.compute_merkle_root(txids)
+  if not types.hash256_eq(root, block.header.merkle_root) then
+    return true, "bad-txnmrklroot"
+  end
+  if dup then return true, "bad-txns-duplicate" end
+  local first = txs[1]
+  local null_hash = string.rep("\0", 32)
+  local first_is_cb = first and #first.inputs == 1
+    and first.inputs[1].prev_out.hash.bytes == null_hash
+    and first.inputs[1].prev_out.index == 0xFFFFFFFF
+  if not first_is_cb then
+    for i = 1, #sizes do
+      if sizes[i] == 64 then return true, "mutated-64-byte-tx" end
+    end
+    -- Core: checks witness malleation only with a coinbase present (asserted).
+    return false
+  end
+  local ok, reason = M.check_witness_malleation(block, check_witness_root, wtxids)
+  if not ok then return true, reason end
+  return false
 end
 
 --------------------------------------------------------------------------------
