@@ -615,8 +615,9 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
   -- ── BUG-12: nchaintx returns UTXO count not m_chain_tx_count ────────────────
   -- Core blockchain.cpp:3346: result.pushKV("nchaintx", tip->m_chain_tx_count).
   -- lunarblock rpc.lua:7278: nchaintx = result.coins_count  (wrong field).
-  describe("BUG-12: dumptxoutset nchaintx returns UTXO count instead of m_chain_tx_count", function()
-    it("nchaintx equals coins_written (wrong — should be cumulative tx count)", function()
+  -- FIXED (dumptxoutset-fix): nchaintx is the base's m_chain_tx_count.
+  describe("BUG-12 (fixed): dumptxoutset nchaintx is m_chain_tx_count, not the UTXO count", function()
+    it("nchaintx == cumulative tx count of the base (genesis included)", function()
       local db, cs = build_chain(3)
       local snap   = "/tmp/lb_w102_bug12_" .. os.time() .. "_" .. math.random(1000000) .. ".dat"
 
@@ -626,6 +627,12 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
         network     = consensus.networks.regtest,
       })
 
+      -- Pin the source: a distinctive cumulative count at the tip that no
+      -- coin count could equal.  Core reads tip->m_chain_tx_count.
+      local tip_h = cs.tip_height
+      assert.equal(tip_h + 1, db.get_chaintx_at_height(tip_h))
+      db.put_chaintx_at_height(tip_h, 777, true)
+
       local req  = '{"method":"dumptxoutset","params":["' .. snap .. '"],"id":1}'
       local _bug12raw = server:handle_request(req)
       local resp = cjson.decode(_bug12raw)
@@ -633,14 +640,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       assert.is_true(resp.error == nil or resp.error == cjson.null)
       local r = resp.result
 
-      -- BUG: nchaintx == coins_written (both are UTXO count).
-      -- Core's nchaintx is cumulative tx count (m_chain_tx_count), which
-      -- counts every transaction ever included in the chain, not just UTXOs.
+      -- Core: nchaintx = tip->m_chain_tx_count (every tx genesis..base).
+      -- build_chain(3) is coinbase-only: genesis + 3 blocks = 4 txs.
       assert.is_not_nil(r.nchaintx)
-      assert.is_not_nil(r.coins_written)
-      -- Document: they are equal in lunarblock (both use UTXO count)
-      assert.equal(r.coins_written, r.nchaintx,
-        "BUG-12: nchaintx == coins_written (UTXO count); Core uses m_chain_tx_count")
+      assert.equal(tip_h, r.base_height)
+      assert.equal(777, r.nchaintx,
+        "nchaintx must be the base's stored m_chain_tx_count, not the coin count")
+      assert.not_equal(r.coins_written, r.nchaintx)
 
       os.remove(snap)
       db.close()
@@ -650,8 +656,9 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
   -- ── BUG-13: txoutset_hash byte order wrong (LE not reversed to BE) ───────────
   -- Core uint256::ToString() reverses bytes (big-endian display).
   -- lunarblock rpc.lua:7268-7270: iterates i=1..32 (natural LE order).
-  describe("BUG-13: dumptxoutset txoutset_hash uses LE byte order, Core uses BE", function()
-    it("txoutset_hash from dumptxoutset is not reversed relative to compute_utxo_hash LE output", function()
+  -- FIXED (dumptxoutset-fix): txoutset_hash is emitted in Core's display order.
+  describe("BUG-13 (fixed): dumptxoutset txoutset_hash uses Core's BE display order", function()
+    it("txoutset_hash equals the byte-reversed compute_utxo_hash digest", function()
       local db, cs = build_chain(2)
       local snap   = "/tmp/lb_w102_bug13_" .. os.time() .. "_" .. math.random(1000000) .. ".dat"
 
@@ -685,11 +692,9 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
       end
       local le_hex = table.concat(le_hex_chars)
 
-      -- BUG: lunarblock returns LE (matches le_hex, not core_compatible_hex)
-      assert.equal(le_hex, returned_hash_hex,
-        "BUG-13: dumptxoutset txoutset_hash is in LE byte order (not reversed)")
-      assert.not_equal(core_compatible_hex, returned_hash_hex,
-        "BUG-13: txoutset_hash should match Core BE display but doesn't")
+      assert.equal(core_compatible_hex, returned_hash_hex,
+        "txoutset_hash must match Core's uint256 display (byte-reversed)")
+      assert.not_equal(le_hex, returned_hash_hex)
 
       os.remove(snap)
       db.close()

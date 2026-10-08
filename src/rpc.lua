@@ -13564,9 +13564,21 @@ end
     end
 
     local base_hash_hex = types.hash256_hex(result.base_blockhash)
+    -- txoutset_hash: Core prints hashSerialized as a uint256 (GetHex =
+    -- byte-reversed), the same display form gettxoutsetinfo's
+    -- hash_serialized_3 uses.  result.hash is the raw SHA256d digest, so
+    -- emit it reversed (Core rpc/blockchain.cpp WriteUTXOSnapshot:
+    -- result.pushKV("txoutset_hash", maybe_stats->hashSerialized.ToString())).
     local hash_hex = ""
-    for i = 1, 32 do
+    for i = 32, 1, -1 do
       hash_hex = hash_hex .. string.format("%02x", result.hash:byte(i))
+    end
+    -- nchaintx: Core = tip->m_chain_tx_count of the BASE block (cumulative
+    -- txs genesis..base, genesis included) -- NOT the coin count.
+    local nchaintx = 0
+    if rpc.storage and rpc.storage.get_chaintx_at_height then
+      local okc, c = pcall(rpc.storage.get_chaintx_at_height, result.base_height)
+      if okc and c then nchaintx = c end
     end
     return {
       coins_written = result.coins_count,
@@ -13574,7 +13586,7 @@ end
       base_height   = result.base_height,
       path          = path,
       txoutset_hash = hash_hex,
-      nchaintx      = result.coins_count,  -- caller can read m_chain_tx_count from chainparams
+      nchaintx      = nchaintx,
     }
   end
 
