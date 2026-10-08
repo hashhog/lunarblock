@@ -1643,7 +1643,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- aggregate feerate was already validated by accept_package, so a low-fee
   -- parent paid for by a high-fee child must still enter (CPFP). All the
   -- standardness/script gates above still ran.
-  if (not package_member) and fee_rate_per_kb < self.min_relay_fee then
+  -- bypass_limits (Core MemPoolAccept::ATMPArgs::m_bypass_limits, set only for
+  -- the reorg re-admission in MaybeUpdateMempoolForReorg): skip the static
+  -- relay-fee floor, the rolling minimum fee and LimitMempoolSize; every other
+  -- check still runs (validation.cpp CheckFeeRate is gated on !bypass_limits).
+  local bypass_limits = opts and opts.bypass_limits == true
+  if (not package_member) and (not bypass_limits) and fee_rate_per_kb < self.min_relay_fee then
     -- Core reject-reason for the static min-relay floor is "min relay fee not
     -- met" (validation.cpp:709); the numeric detail is Core's reject-details,
     -- which this RPC path does not surface.
@@ -1657,7 +1662,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- each block is connected, approaching zero when the pool is well below max.
   -- Reference: CTxMemPool::GetMinFee (txmempool.cpp:829-851);
   --             validation.cpp:703-705 (CheckFeeRate).
-  if not package_member then
+  if not package_member and not bypass_limits then
     local min_fee_rate_kvb = self:get_min_fee()  -- sat/kvB
     if min_fee_rate_kvb > 0 then
       -- fee_rate_per_kb is in sat/kvB (fee*1000/vsize = sat*1000/(virtual-bytes) = sat/kvB)
@@ -2153,8 +2158,10 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- Core's LimitMempoolSize (validation.cpp:271-276) calls Expire() then
   -- TrimToSize().  We mirror that order: first expire old txs, then trim
   -- by size so that the freshest high-feerate txs survive.
-  self:expire()
-  self:trim()
+  if not bypass_limits then
+    self:expire()
+    self:trim()
+  end
 
   return true, txid_hex, fee
 end
@@ -2302,6 +2309,33 @@ end
 -- Block Connection
 --------------------------------------------------------------------------------
 
+--- Remove a tx that a connected block confirmed, KEEPING its in-mempool
+-- descendants: Core removeForBlock -> removeUnchecked (txmempool.cpp) removes
+-- only the confirmed entry; its children stay, now spending a confirmed
+-- output, and lose it from their ancestor state.  remove_transaction would
+-- take the whole descendant tree with it (right for conflicts / eviction,
+-- wrong here: a block that confirms a parent but not its child must not
+-- empty the child out of the pool).
+-- @param txid_hex string
+function Mempool:remove_confirmed(txid_hex)
+  local entry = self.entries[txid_hex]
+  if not entry then return end
+  for desc_hex in pairs(entry.descendants) do
+    local de = self.entries[desc_hex]
+    if de and de.ancestors[txid_hex] then
+      de.ancestors[txid_hex] = nil
+      de.ancestor_count = de.ancestor_count - 1
+      de.ancestor_size = de.ancestor_size - entry.vsize
+      de.ancestor_fees = de.ancestor_fees - entry.fee
+      for k, parent_hex in pairs(de.spends_from) do
+        if parent_hex == txid_hex then de.spends_from[k] = nil end
+      end
+    end
+  end
+  entry.descendants = {}
+  self:remove_transaction(txid_hex, "confirmed")
+end
+
 --- Handle block connection (remove confirmed transactions).
 -- Also resets the rolling fee decay clock: after a block is connected,
 -- the rolling minimum fee is eligible to decay toward zero (Bitcoin Core
@@ -2324,7 +2358,7 @@ function Mempool:on_block_connected(block)
     local txid = validation.compute_txid(tx)
     local txid_hex = types.hash256_hex(txid)
     if self.entries[txid_hex] then
-      self:remove_transaction(txid_hex, "confirmed")
+      self:remove_confirmed(txid_hex)
     end
     -- A confirmed tx's priority delta is dropped (Core removeForBlock →
     -- ClearPrioritisation, txmempool.cpp:420) so it isn't re-applied to a
@@ -2353,39 +2387,123 @@ end
 -- Block Disconnection (reorg refill)
 --------------------------------------------------------------------------------
 
---- Handle block disconnection during a reorg: re-add the block's
--- non-coinbase transactions to the mempool, best-effort.
+--- Remove every in-mempool spender of `tx`'s outputs, with all of its
+-- descendants.  Core CTxMemPool::removeRecursive when origTx itself is NOT in
+-- the pool: "be sure to remove any children that are in the pool" (txmempool.cpp
+-- removeRecursive).  Used when a disconnected tx fails re-admission: its
+-- in-mempool children are now orphans spending an output that does not exist.
+function Mempool:remove_spenders_of(tx, reason)
+  local txid = validation.compute_txid(tx)
+  for i = 0, #tx.outputs - 1 do
+    local child_hex = self.outpoint_to_tx[M.outpoint_key(txid, i)]
+    if child_hex and self.entries[child_hex] then
+      self:remove_transaction(child_hex, reason or "reorg")
+    end
+  end
+end
+
+--- Link in-mempool children to a just-(re)added parent.  Core
+-- CTxMemPool::UpdateTransactionsFromBlock: a tx re-added from a disconnected
+-- block may already have children in the pool (they were admitted while it was
+-- confirmed, so their parent was a UTXO); their ancestor state and the parent's
+-- descendant state must include each other, or a later conflict / removal of
+-- the parent leaves the child behind spending a non-existent output.
+function Mempool:link_mempool_children(parent_hex)
+  local parent = self.entries[parent_hex]
+  if not parent then return end
+  for i = 0, #parent.tx.outputs - 1 do
+    local key = M.outpoint_key(parent.txid, i)
+    local child_hex = self.outpoint_to_tx[key]
+    local child = child_hex and self.entries[child_hex]
+    if child and child_hex ~= parent_hex then
+      child.spends_from[key] = parent_hex
+      local upper = { [parent_hex] = true }
+      for a in pairs(parent.ancestors) do upper[a] = true end
+      local lower = { [child_hex] = true }
+      for d in pairs(child.descendants) do lower[d] = true end
+      for l in pairs(lower) do
+        local le = self.entries[l]
+        if le then
+          for u in pairs(upper) do
+            local ue = self.entries[u]
+            if ue and u ~= l then
+              if not le.ancestors[u] then
+                le.ancestors[u] = true
+                le.ancestor_count = le.ancestor_count + 1
+                le.ancestor_size = le.ancestor_size + ue.vsize
+                le.ancestor_fees = le.ancestor_fees + ue.fee
+              end
+              if not ue.descendants[l] then
+                ue.descendants[l] = true
+                ue.descendant_count = ue.descendant_count + 1
+                ue.descendant_size = ue.descendant_size + le.vsize
+                ue.descendant_fees = ue.descendant_fees + le.fee
+              end
+            end
+          end
+        end
+      end
+      uf_union(child_hex, parent_hex)
+    end
+  end
+end
+
+--- Bring the mempool in line with the chain after blocks were disconnected
+-- (and possibly others connected): Core MaybeUpdateMempoolForReorg
+-- (validation.cpp), called by InvalidateBlock after EACH disconnected block and
+-- by ActivateBestChainStep ONCE after the whole disconnect+connect has
+-- committed -- never before, so an aborted reorg leaves the pool untouched.
 --
--- This is the lunarblock analog of Bitcoin Core's
--- `MaybeUpdateMempoolForReorg` (validation.cpp), invoked from
--- `Chainstate::DisconnectTip`.  When a block is disconnected during a
--- reorg the txs it contained leave the chain — to avoid silently
--- dropping them we try to re-admit each one to the mempool.  The full
--- `accept_transaction` pipeline runs against the new tip's UTXO state
--- (BIP-113 IsFinalTx, BIP-68 SequenceLocks, standardness, conflicts
--- against new-chain UTXOs), so a tx that's no longer valid against the
--- post-reorg chain is correctly rejected here.  Coinbase txs are
--- skipped — coinbase outputs were unspent at disconnect (the undo
--- restored them) and coinbase is a non-standard mempool entry by
--- definition (`accept_transaction` rejects `is_coinbase`).
+--   1. Re-admit the disconnected txs EARLIEST FIRST (Core iterates the
+--      DisconnectedBlockTransactions pool in reverse) with bypass_limits.  A
+--      tx confirmed again by a connected block was already dropped from Core's
+--      disconnect pool by ConnectTip -> removeForBlock; `confirmed` (txid_hex
+--      set) is that filter here.
+--   2. A tx that does not make it back in is removeRecursive'd: its
+--      in-mempool children go too (remove_spenders_of).
+--   3. A re-added tx with children already in the pool is linked to them
+--      (UpdateTransactionsFromBlock).
+--   4. removeForReorg: drop entries non-final / BIP68-locked / spending an
+--      immature coinbase at tip+1, with descendants.
+--   5. LimitMempoolSize (Expire + TrimToSize).
 --
--- Reference: bitcoin-core/src/validation.cpp DisconnectTip +
--- MaybeUpdateMempoolForReorg.  Camlcoin parity: lib/sync.ml:2354-2363.
---
+-- @param disconnected table: blocks in DISCONNECT order (newest first)
+-- @param confirmed table|nil: txid_hex -> true for txs in the connected blocks
+-- @return number: txs re-admitted
+function Mempool:update_for_reorg(disconnected, confirmed)
+  confirmed = confirmed or {}
+  local readded = 0
+  for b = #(disconnected or {}), 1, -1 do
+    local block = disconnected[b]
+    if block and block.transactions then
+      for i = 2, #block.transactions do  -- [1] is the coinbase
+        local tx = block.transactions[i]
+        local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+        if not confirmed[txid_hex] then
+          local ok, accepted = pcall(self.accept_transaction, self, tx, true,
+            { bypass_limits = true })
+          if ok and accepted then
+            readded = readded + 1
+            self:link_mempool_children(txid_hex)
+          elseif not self.entries[txid_hex] then
+            pcall(self.remove_spenders_of, self, tx, "reorg")
+          end
+        end
+      end
+    end
+  end
+  self:remove_for_reorg()
+  self:expire()
+  self:trim()
+  return readded
+end
+
+--- Single-block form kept for callers/tests: re-admit one disconnected block's
+-- txs and re-check the pool against the current tip.
 -- @param block block: The disconnected block
 function Mempool:block_disconnected(block)
   if not block or not block.transactions then return end
-  -- Skip transactions[1] (coinbase): coinbase has no inputs to admit
-  -- and accept_transaction explicitly rejects coinbase txs.
-  for i = 2, #block.transactions do
-    local tx = block.transactions[i]
-    -- Best-effort: ignore failures (tx may now conflict with the new
-    -- chain, exceed mempool size, etc.).  Core's removeForReorg has
-    -- the same swallow-and-continue policy.
-    pcall(function()
-      self:accept_transaction(tx)
-    end)
-  end
+  self:update_for_reorg({ block })
 end
 
 --- Evict entries that are no longer valid in the NEXT block after the tip

@@ -3883,7 +3883,7 @@ function RPCServer:register_methods()
     end
 
     -- Invalidate the block
-    local ok, err = rpc.chain_state:invalidate_block(hash)
+    local ok, err = rpc.chain_state:invalidate_block(hash, rpc.mempool)
     if not ok then
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to invalidate block"})
     end

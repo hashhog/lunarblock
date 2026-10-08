@@ -319,61 +319,99 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   -- within BLOCK_FULL_ENOUGH_WEIGHT_DELTA (4000) of the weight cap, stop.
   local consecutive_failed = 0
 
+  local function sigops_of(tx)
+    local n = 0
+    for _, inp in ipairs(tx.inputs) do
+      n = n + validation.count_script_sigops(inp.script_sig, true) * consensus.WITNESS_SCALE_FACTOR
+    end
+    for _, out in ipairs(tx.outputs) do
+      n = n + validation.count_script_sigops(out.script_pubkey, true) * consensus.WITNESS_SCALE_FACTOR
+    end
+    return n
+  end
+
   for _, entry in ipairs(sorted_entries) do
     local txid_hex = types.hash256_hex(entry.txid)
 
     -- Skip if already selected
     if selected_set[txid_hex] then goto continue end
 
-    -- Skip transactions that are not final (locktime not satisfied)
-    if not M.is_final_tx(entry.tx, height, mtp) then goto continue end
-
-    -- Compute this entry's sigops cost
-    local tx_sigops = 0
-    for _, inp in ipairs(entry.tx.inputs) do
-      tx_sigops = tx_sigops + validation.count_script_sigops(inp.script_sig, true) * consensus.WITNESS_SCALE_FACTOR
-    end
-    for _, out in ipairs(entry.tx.outputs) do
-      tx_sigops = tx_sigops + validation.count_script_sigops(out.script_pubkey, true) * consensus.WITNESS_SCALE_FACTOR
-    end
-
-    -- Check weight limit: >= mirrors Core's TestChunkBlockLimits (miner.cpp:241).
-    -- BUG FIX: was > (off-by-one allowed weight == max_weight through).
-    local weight_fits  = (total_weight + entry.weight < max_weight)
-    -- Check sigops limit: >= mirrors Core miner.cpp:244.
-    -- BUG FIX: was > (off-by-one allowed sigops == max_sigops through).
-    local sigops_fits  = (total_sigops + tx_sigops < max_sigops)
-
-    -- Ensure all ancestors are already selected
-    local ancestors_ok = true
-    for _, inp in ipairs(entry.tx.inputs) do
-      local prev_hex = types.hash256_hex(inp.prev_out.hash)
-      if mempool:has(prev_hex) and not selected_set[prev_hex] then
-        ancestors_ok = false
-        break
+    do
+      -- The candidate is a PACKAGE: the tx plus its not-yet-selected
+      -- in-mempool ancestors, parents first (Core BlockAssembler::addPackageTxs
+      -- selects an ancestor set at the ancestor feerate and SortForBlock's
+      -- the members).  Selecting the bare tx only when every parent happened
+      -- to sort ahead of it dropped a child whose parent was ranked after it
+      -- (equal ancestor feerate) -- the child was never revisited, so a
+      -- parent+child pair re-added by a reorg left the child out of the
+      -- template.  An ancestor has strictly fewer ancestors than its
+      -- descendant, so ascending ancestor_count is a topological order.
+      local pkg = {}
+      for anc_hex in pairs(entry.ancestors or {}) do
+        if not selected_set[anc_hex] then
+          local ae = mempool:get_entry(anc_hex)
+          if ae then pkg[#pkg + 1] = ae end
+        end
       end
-    end
+      table.sort(pkg, function(a, b)
+        local ca, cb = a.ancestor_count or 0, b.ancestor_count or 0
+        if ca ~= cb then return ca < cb end
+        return a.txid.bytes < b.txid.bytes
+      end)
+      pkg[#pkg + 1] = entry
 
-    if not weight_fits or not sigops_fits or not ancestors_ok then
-      -- BUG FIX: track consecutive failures and give up early when close to
-      -- full.  Core miner.cpp:313-318.
-      consecutive_failed = consecutive_failed + 1
-      if consecutive_failed > MAX_CONSECUTIVE_FAILURES and
-         total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > max_weight then
-        break
+      local pkg_weight, pkg_sigops, pkg_fees = 0, 0, 0
+      local in_pkg = {}
+      local pkg_ok = true
+      for _, pe in ipairs(pkg) do
+        -- Skip transactions that are not final (locktime not satisfied)
+        if not M.is_final_tx(pe.tx, height, mtp) then pkg_ok = false; break end
+        -- every in-mempool parent must be selected already or earlier in the
+        -- package (a stale ancestor set must never yield a missing input)
+        for _, inp in ipairs(pe.tx.inputs) do
+          local prev_hex = types.hash256_hex(inp.prev_out.hash)
+          if mempool:has(prev_hex) and not selected_set[prev_hex] and not in_pkg[prev_hex] then
+            pkg_ok = false
+            break
+          end
+        end
+        if not pkg_ok then break end
+        in_pkg[types.hash256_hex(pe.txid)] = true
+        pkg_weight = pkg_weight + pe.weight
+        pkg_sigops = pkg_sigops + sigops_of(pe.tx)
+        pkg_fees = pkg_fees + pe.fee
       end
-      goto continue
+
+      -- Check weight limit: >= mirrors Core's TestChunkBlockLimits (miner.cpp:241).
+      -- BUG FIX: was > (off-by-one allowed weight == max_weight through).
+      local weight_fits  = (total_weight + pkg_weight < max_weight)
+      -- Check sigops limit: >= mirrors Core miner.cpp:244.
+      -- BUG FIX: was > (off-by-one allowed sigops == max_sigops through).
+      local sigops_fits  = (total_sigops + pkg_sigops < max_sigops)
+
+      if not weight_fits or not sigops_fits or not pkg_ok then
+        -- BUG FIX: track consecutive failures and give up early when close to
+        -- full.  Core miner.cpp:313-318.
+        consecutive_failed = consecutive_failed + 1
+        if consecutive_failed > MAX_CONSECUTIVE_FAILURES and
+           total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > max_weight then
+          break
+        end
+        goto continue
+      end
+
+      -- Chunk accepted: reset consecutive-failure counter.
+      consecutive_failed = 0
+
+      -- Add to block, parents first
+      for _, pe in ipairs(pkg) do
+        selected[#selected + 1] = pe
+        selected_set[types.hash256_hex(pe.txid)] = true
+      end
+      total_fees = total_fees + pkg_fees
+      total_weight = total_weight + pkg_weight
+      total_sigops = total_sigops + pkg_sigops
     end
-
-    -- Chunk accepted: reset consecutive-failure counter.
-    consecutive_failed = 0
-
-    -- Add to block
-    selected[#selected + 1] = entry
-    selected_set[txid_hex] = true
-    total_fees = total_fees + entry.fee
-    total_weight = total_weight + entry.weight
-    total_sigops = total_sigops + tx_sigops
 
     ::continue::
   end
