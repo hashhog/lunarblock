@@ -1643,7 +1643,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- aggregate feerate was already validated by accept_package, so a low-fee
   -- parent paid for by a high-fee child must still enter (CPFP). All the
   -- standardness/script gates above still ran.
-  if (not package_member) and fee_rate_per_kb < self.min_relay_fee then
+  -- bypass_limits (Core MemPoolAccept::ATMPArgs::m_bypass_limits, set only for
+  -- the reorg re-admission in MaybeUpdateMempoolForReorg): skip the static
+  -- relay-fee floor, the rolling minimum fee and LimitMempoolSize; every other
+  -- check still runs (validation.cpp CheckFeeRate is gated on !bypass_limits).
+  local bypass_limits = opts and opts.bypass_limits == true
+  if (not package_member) and (not bypass_limits) and fee_rate_per_kb < self.min_relay_fee then
     -- Core reject-reason for the static min-relay floor is "min relay fee not
     -- met" (validation.cpp:709); the numeric detail is Core's reject-details,
     -- which this RPC path does not surface.
@@ -1657,7 +1662,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- each block is connected, approaching zero when the pool is well below max.
   -- Reference: CTxMemPool::GetMinFee (txmempool.cpp:829-851);
   --             validation.cpp:703-705 (CheckFeeRate).
-  if not package_member then
+  if not package_member and not bypass_limits then
     local min_fee_rate_kvb = self:get_min_fee()  -- sat/kvB
     if min_fee_rate_kvb > 0 then
       -- fee_rate_per_kb is in sat/kvB (fee*1000/vsize = sat*1000/(virtual-bytes) = sat/kvB)
@@ -2153,8 +2158,10 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- Core's LimitMempoolSize (validation.cpp:271-276) calls Expire() then
   -- TrimToSize().  We mirror that order: first expire old txs, then trim
   -- by size so that the freshest high-feerate txs survive.
-  self:expire()
-  self:trim()
+  if not bypass_limits then
+    self:expire()
+    self:trim()
+  end
 
   return true, txid_hex, fee
 end
@@ -2302,6 +2309,33 @@ end
 -- Block Connection
 --------------------------------------------------------------------------------
 
+--- Remove a tx that a connected block confirmed, KEEPING its in-mempool
+-- descendants: Core removeForBlock -> removeUnchecked (txmempool.cpp) removes
+-- only the confirmed entry; its children stay, now spending a confirmed
+-- output, and lose it from their ancestor state.  remove_transaction would
+-- take the whole descendant tree with it (right for conflicts / eviction,
+-- wrong here: a block that confirms a parent but not its child must not
+-- empty the child out of the pool).
+-- @param txid_hex string
+function Mempool:remove_confirmed(txid_hex)
+  local entry = self.entries[txid_hex]
+  if not entry then return end
+  for desc_hex in pairs(entry.descendants) do
+    local de = self.entries[desc_hex]
+    if de and de.ancestors[txid_hex] then
+      de.ancestors[txid_hex] = nil
+      de.ancestor_count = de.ancestor_count - 1
+      de.ancestor_size = de.ancestor_size - entry.vsize
+      de.ancestor_fees = de.ancestor_fees - entry.fee
+      for k, parent_hex in pairs(de.spends_from) do
+        if parent_hex == txid_hex then de.spends_from[k] = nil end
+      end
+    end
+  end
+  entry.descendants = {}
+  self:remove_transaction(txid_hex, "confirmed")
+end
+
 --- Handle block connection (remove confirmed transactions).
 -- Also resets the rolling fee decay clock: after a block is connected,
 -- the rolling minimum fee is eligible to decay toward zero (Bitcoin Core
@@ -2324,7 +2358,7 @@ function Mempool:on_block_connected(block)
     local txid = validation.compute_txid(tx)
     local txid_hex = types.hash256_hex(txid)
     if self.entries[txid_hex] then
-      self:remove_transaction(txid_hex, "confirmed")
+      self:remove_confirmed(txid_hex)
     end
     -- A confirmed tx's priority delta is dropped (Core removeForBlock →
     -- ClearPrioritisation, txmempool.cpp:420) so it isn't re-applied to a
@@ -2353,39 +2387,501 @@ end
 -- Block Disconnection (reorg refill)
 --------------------------------------------------------------------------------
 
---- Handle block disconnection during a reorg: re-add the block's
--- non-coinbase transactions to the mempool, best-effort.
+--- Remove every in-mempool spender of `tx`'s outputs, with all of its
+-- descendants.  Core CTxMemPool::removeRecursive when origTx itself is NOT in
+-- the pool: "be sure to remove any children that are in the pool" (txmempool.cpp
+-- removeRecursive).  Used when a disconnected tx fails re-admission: its
+-- in-mempool children are now orphans spending an output that does not exist.
+function Mempool:remove_spenders_of(tx, reason)
+  local txid = validation.compute_txid(tx)
+  for i = 0, #tx.outputs - 1 do
+    local child_hex = self.outpoint_to_tx[M.outpoint_key(txid, i)]
+    if child_hex and self.entries[child_hex] then
+      self:remove_transaction(child_hex, reason or "reorg")
+    end
+  end
+end
+
+-- Sign of fee_a*size_b - fee_b*size_a, exact for integers (FeeFrac's cross
+-- multiply; the product does not fit in a double).  Positive means
+-- fee_a/size_a is the higher feerate.
+local CROSS_BASE = 16777216 -- 2^24; limb products stay inside 2^53
+local function cross_limbs(n)
+  n = math.floor(math.abs(n))
+  if n == 0 then return {0} end
+  local p, i = {}, 1
+  while n > 0 do
+    p[i] = n % CROSS_BASE
+    n = math.floor(n / CROSS_BASE)
+    i = i + 1
+  end
+  return p
+end
+
+local function cross_mul(a, b)
+  local r = {}
+  for i = 1, #a do
+    for j = 1, #b do
+      local k = i + j - 1
+      r[k] = (r[k] or 0) + a[i] * b[j]
+    end
+  end
+  local carry = 0
+  for i = 1, #r do
+    local v = r[i] + carry
+    r[i] = v % CROSS_BASE
+    carry = math.floor(v / CROSS_BASE)
+  end
+  while carry > 0 do
+    r[#r + 1] = carry % CROSS_BASE
+    carry = math.floor(carry / CROSS_BASE)
+  end
+  return r
+end
+
+local function cross_cmp_mag(x, y)
+  if #x ~= #y then return #x < #y and -1 or 1 end
+  for i = #x, 1, -1 do
+    if x[i] ~= y[i] then return x[i] < y[i] and -1 or 1 end
+  end
+  return 0
+end
+
+local function cross_cmp(fee_a, size_b, fee_b, size_a)
+  local function mag()
+    return cross_cmp_mag(
+      cross_mul(cross_limbs(fee_a), cross_limbs(size_b)),
+      cross_mul(cross_limbs(fee_b), cross_limbs(size_a)))
+  end
+  local sa = fee_a < 0 and -1 or (fee_a > 0 and 1 or 0)
+  local sb = fee_b < 0 and -1 or (fee_b > 0 and 1 or 0)
+  if sa == 0 and sb == 0 then return 0 end
+  if sa == 0 then return -sb end
+  if sb == 0 then return sa end
+  if sa > 0 and sb > 0 then return mag() end
+  if sa < 0 and sb < 0 then return -mag() end
+  if sa > 0 then return 1 end
+  return -1
+end
+
+-- True when chunk (fee_a, size_a) sorts strictly after (fee_b, size_b) in
+-- FeeFrac order: higher feerate, then smaller size.
+local function chunk_better(fee_a, size_a, fee_b, size_b)
+  local c = cross_cmp(fee_a, size_b, fee_b, size_a)
+  if c ~= 0 then return c > 0 end
+  return size_a < size_b
+end
+
+-- Chunk-linearize one pre-link cluster.  The next chunk is the highest-feerate
+-- ancestor set of a remaining transaction (parents before children inside it).
+-- Singletons — the reorg case, where each in-pool child was its own cluster —
+-- are one chunk at the transaction's own feerate.
+local function chunk_linearize(txids, entries)
+  local remaining, nrem = {}, 0
+  for i = 1, #txids do
+    remaining[txids[i]] = true
+    nrem = nrem + 1
+  end
+  local function anc_set(id, acc)
+    if acc[id] then return end
+    acc[id] = true
+    local e = entries[id]
+    if not e then return end
+    for _, p in pairs(e.spends_from or {}) do
+      if remaining[p] then anc_set(p, acc) end
+    end
+  end
+  local out = {}
+  while nrem > 0 do
+    local best_fee, best_size, best_ids, best_key
+    for id in pairs(remaining) do
+      local set = {}
+      anc_set(id, set)
+      local fee, size, ids = 0, 0, {}
+      for s in pairs(set) do
+        local e = entries[s]
+        fee = fee + (e.modified_fee or e.fee or 0)
+        size = size + entry_cluster_weight(e)
+        ids[#ids + 1] = s
+      end
+      local take = best_ids == nil
+        or chunk_better(fee, size, best_fee, best_size)
+        or (fee == best_fee and size == best_size and id < best_key)
+      if take then
+        best_fee, best_size, best_ids, best_key = fee, size, ids, id
+      end
+    end
+    table.sort(best_ids, function(a, b)
+      local ca = entries[a].ancestor_count or 0
+      local cb = entries[b].ancestor_count or 0
+      if ca ~= cb then return ca < cb end
+      return a < b
+    end)
+    for i = 1, #best_ids do
+      local id = best_ids[i]
+      out[#out + 1] = {
+        txid = id,
+        chunk_fee = best_fee,
+        chunk_size = best_size,
+        tx_size = entry_cluster_weight(entries[id]),
+      }
+      remaining[id] = nil
+      nrem = nrem - 1
+    end
+  end
+  return out
+end
+
+-- TxGraphImpl::Trim for one would-be cluster: walk eligible transactions in
+-- chunk-feerate order (dependencies first) and keep a tx only when adding it
+-- stays within both limits.  A skipped tx takes its descendants with it,
+-- because they never become eligible.
+local function trim_keep_set(txids, info, dep_edges)
+  local deps_left, dependents, parents_of = {}, {}, {}
+  local function add_dep(p, c)
+    if not p or not c or p == c then return end
+    if not info[p] or not info[c] then return end
+    deps_left[c] = (deps_left[c] or 0) + 1
+    local d = dependents[p]
+    if not d then d = {}; dependents[p] = d end
+    d[#d + 1] = c
+    local ps = parents_of[c]
+    if not ps then ps = {}; parents_of[c] = ps end
+    ps[#ps + 1] = p
+  end
+  for i = 1, #dep_edges do
+    add_dep(dep_edges[i][1], dep_edges[i][2])
+  end
+
+  local included, rejected = {}, {}
+  local uf_p, uf_count, uf_size = {}, {}, {}
+  local function ffind(x)
+    local p = uf_p[x]
+    while p ~= x do
+      local gp = uf_p[p]
+      if gp then uf_p[x] = gp end
+      x = p
+      p = uf_p[x]
+    end
+    return x
+  end
+  local function funion(a, b)
+    a, b = ffind(a), ffind(b)
+    if a == b then return a end
+    if uf_count[a] < uf_count[b] then a, b = b, a end
+    uf_p[b] = a
+    uf_count[a] = uf_count[a] + uf_count[b]
+    uf_size[a] = uf_size[a] + uf_size[b]
+    return a
+  end
+
+  local eligible = {}
+  local function consider(txid)
+    if included[txid] or rejected[txid] then return end
+    if (deps_left[txid] or 0) ~= 0 then return end
+    local inf = info[txid]
+    if not inf or inf.tx_size > MAX_CLUSTER_WEIGHT then return end
+    eligible[#eligible + 1] = txid
+  end
+  for i = 1, #txids do consider(txids[i]) end
+
+  local guard = #txids + 1
+  while #eligible > 0 and guard > 0 do
+    guard = guard - 1
+    local best_i, best
+    for i = 1, #eligible do
+      local txid = eligible[i]
+      if not included[txid] and not rejected[txid] then
+        local inf = info[txid]
+        if not best or chunk_better(inf.chunk_fee, inf.chunk_size, best.chunk_fee, best.chunk_size)
+            or (inf.chunk_fee == best.chunk_fee and inf.chunk_size == best.chunk_size
+                and txid < best.txid) then
+          best, best_i = inf, i
+        end
+      end
+    end
+    if not best then break end
+    eligible[best_i] = eligible[#eligible]
+    eligible[#eligible] = nil
+    local txid = best.txid
+
+    uf_p[txid] = txid
+    uf_count[txid] = 1
+    uf_size[txid] = best.tx_size
+    local reps = {}
+    local ps = parents_of[txid]
+    if ps then
+      for i = 1, #ps do
+        if included[ps[i]] then reps[ffind(ps[i])] = true end
+      end
+    end
+    local new_count, new_size = 1, best.tx_size
+    for r in pairs(reps) do
+      new_count = new_count + uf_count[r]
+      new_size = new_size + uf_size[r]
+    end
+    if new_count > MAX_CLUSTER_COUNT or new_size > MAX_CLUSTER_WEIGHT then
+      rejected[txid] = true
+      uf_p[txid] = nil
+    else
+      local rep = txid
+      for r in pairs(reps) do rep = funion(rep, r) end
+      included[txid] = true
+      local kids = dependents[txid]
+      if kids then
+        for i = 1, #kids do
+          local ch = kids[i]
+          deps_left[ch] = (deps_left[ch] or 1) - 1
+          if deps_left[ch] == 0 then consider(ch) end
+        end
+      end
+    end
+  end
+
+  local drop = {}
+  for i = 1, #txids do
+    if not included[txids[i]] then drop[#drop + 1] = txids[i] end
+  end
+  return drop
+end
+
+--- Link in-mempool children to a just-(re)added parent.  Core
+-- CTxMemPool::UpdateTransactionsFromBlock: a tx re-added from a disconnected
+-- block may already have children in the pool (they were admitted while it was
+-- confirmed, so their parent was a UTXO); their ancestor state and the parent's
+-- descendant state must include each other, or a later conflict / removal of
+-- the parent leaves the child behind spending a non-existent output.
 --
--- This is the lunarblock analog of Bitcoin Core's
--- `MaybeUpdateMempoolForReorg` (validation.cpp), invoked from
--- `Chainstate::DisconnectTip`.  When a block is disconnected during a
--- reorg the txs it contained leave the chain — to avoid silently
--- dropping them we try to re-admit each one to the mempool.  The full
--- `accept_transaction` pipeline runs against the new tip's UTXO state
--- (BIP-113 IsFinalTx, BIP-68 SequenceLocks, standardness, conflicts
--- against new-chain UTXOs), so a tx that's no longer valid against the
--- post-reorg chain is correctly rejected here.  Coinbase txs are
--- skipped — coinbase outputs were unspent at disconnect (the undo
--- restored them) and coinbase is a non-standard mempool entry by
--- definition (`accept_transaction` rejects `is_coinbase`).
+-- The union-find merge is deferred to _finalize_reorg_cluster_links.  Core
+-- adds every dependency first, then TxGraphImpl::Trim drops whatever would
+-- put the merged cluster over cluster_count / cluster size
+-- (txmempool.cpp UpdateTransactionsFromBlock -> m_txgraph->Trim).
+function Mempool:link_mempool_children(parent_hex)
+  local parent = self.entries[parent_hex]
+  if not parent then return end
+  for i = 0, #parent.tx.outputs - 1 do
+    local key = M.outpoint_key(parent.txid, i)
+    local child_hex = self.outpoint_to_tx[key]
+    local child = child_hex and self.entries[child_hex]
+    if child and child_hex ~= parent_hex then
+      child.spends_from[key] = parent_hex
+      local upper = { [parent_hex] = true }
+      for a in pairs(parent.ancestors) do upper[a] = true end
+      local lower = { [child_hex] = true }
+      for d in pairs(child.descendants) do lower[d] = true end
+      for l in pairs(lower) do
+        local le = self.entries[l]
+        if le then
+          for u in pairs(upper) do
+            local ue = self.entries[u]
+            if ue and u ~= l then
+              if not le.ancestors[u] then
+                le.ancestors[u] = true
+                le.ancestor_count = le.ancestor_count + 1
+                le.ancestor_size = le.ancestor_size + ue.vsize
+                le.ancestor_fees = le.ancestor_fees + ue.fee
+              end
+              if not ue.descendants[l] then
+                ue.descendants[l] = true
+                ue.descendant_count = ue.descendant_count + 1
+                ue.descendant_size = ue.descendant_size + le.vsize
+                ue.descendant_fees = ue.descendant_fees + le.fee
+              end
+            end
+          end
+        end
+      end
+      -- Record the edge; union after Trim so a child that does not survive
+      -- is not left bridging its parents in the union-find.
+      if self._pending_cluster_links then
+        local n = #self._pending_cluster_links
+        self._pending_cluster_links[n + 1] = {parent_hex, child_hex}
+      else
+        uf_union(child_hex, parent_hex)
+      end
+    end
+  end
+end
+
+--- Apply the parent/child edges recorded by link_mempool_children and, when
+-- the merged cluster exceeds a limit, drop transactions the way
+-- TxGraphImpl::Trim does (txgraph.cpp).  Called once per update_for_reorg,
+-- after every disconnected tx has been re-admitted — the same point as
+-- UpdateTransactionsFromBlock's single Trim.
+function Mempool:_finalize_reorg_cluster_links()
+  local links = self._pending_cluster_links
+  self._pending_cluster_links = nil
+  if not links or #links == 0 then return end
+
+  local live = {}
+  for i = 1, #links do
+    local p, c = links[i][1], links[i][2]
+    if p ~= c and self.entries[p] and self.entries[c] then
+      live[#live + 1] = {p, c}
+    end
+  end
+  if #live == 0 then return end
+
+  local root_of = {}
+  local function proot(txid)
+    local r = root_of[txid]
+    if r then return r end
+    r = uf_find(txid)
+    root_of[txid] = r
+    return r
+  end
+
+  local gp, gr = {}, {}
+  local function gfind(r)
+    if gp[r] == nil then gp[r] = r; gr[r] = 0; return r end
+    while gp[r] ~= r do
+      gp[r] = gp[gp[r]]
+      r = gp[r]
+    end
+    return r
+  end
+  local function gunion(a, b)
+    a, b = gfind(a), gfind(b)
+    if a == b then return end
+    if (gr[a] or 0) < (gr[b] or 0) then a, b = b, a end
+    gp[b] = a
+    if gr[a] == gr[b] then gr[a] = gr[a] + 1 end
+  end
+  for i = 1, #live do
+    gunion(proot(live[i][1]), proot(live[i][2]))
+  end
+
+  local by_root = {}
+  local keys, nkeys = uf_snapshot_keys()
+  for i = 1, nkeys do
+    local txid = keys[i]
+    if self.entries[txid] then
+      local r = proot(txid)
+      if gp[r] then
+        local list = by_root[r]
+        if not list then list = {}; by_root[r] = list end
+        list[#list + 1] = txid
+      end
+    end
+  end
+
+  local groups = {}
+  for r, list in pairs(by_root) do
+    local g = gfind(r)
+    local G = groups[g]
+    if not G then
+      G = {txids = {}, weight = 0, count = 0, roots = {}}
+      groups[g] = G
+    end
+    G.roots[#G.roots + 1] = r
+    for j = 1, #list do
+      local txid = list[j]
+      G.txids[#G.txids + 1] = txid
+      G.count = G.count + 1
+      G.weight = G.weight + entry_cluster_weight(self.entries[txid])
+    end
+  end
+
+  local remove_set = {}
+  for _, G in pairs(groups) do
+    if G.count > MAX_CLUSTER_COUNT or G.weight > MAX_CLUSTER_WEIGHT then
+      local info, edges = {}, {}
+      for i = 1, #G.roots do
+        local r = G.roots[i]
+        local seq = chunk_linearize(by_root[r], self.entries)
+        for k = 1, #seq do
+          info[seq[k].txid] = seq[k]
+          if k > 1 then
+            edges[#edges + 1] = {seq[k - 1].txid, seq[k].txid}
+          end
+        end
+      end
+      for i = 1, #live do
+        local p, c = live[i][1], live[i][2]
+        if info[p] and info[c] and proot(p) ~= proot(c) then
+          edges[#edges + 1] = {p, c}
+        end
+      end
+      local drop = trim_keep_set(G.txids, info, edges)
+      for i = 1, #drop do remove_set[drop[i]] = true end
+    end
+  end
+
+  for txid in pairs(remove_set) do
+    if self.entries[txid] then
+      self:remove_transaction(txid, "sizelimit")
+    end
+  end
+
+  for i = 1, #live do
+    local p, c = live[i][1], live[i][2]
+    if self.entries[p] and self.entries[c] then
+      uf_union(p, c)
+    end
+  end
+end
+
+--- Bring the mempool in line with the chain after blocks were disconnected
+-- (and possibly others connected): Core MaybeUpdateMempoolForReorg
+-- (validation.cpp), called by InvalidateBlock after EACH disconnected block and
+-- by ActivateBestChainStep ONCE after the whole disconnect+connect has
+-- committed -- never before, so an aborted reorg leaves the pool untouched.
 --
--- Reference: bitcoin-core/src/validation.cpp DisconnectTip +
--- MaybeUpdateMempoolForReorg.  Camlcoin parity: lib/sync.ml:2354-2363.
+--   1. Re-admit the disconnected txs EARLIEST FIRST (Core iterates the
+--      DisconnectedBlockTransactions pool in reverse) with bypass_limits.  A
+--      tx confirmed again by a connected block was already dropped from Core's
+--      disconnect pool by ConnectTip -> removeForBlock; `confirmed` (txid_hex
+--      set) is that filter here.
+--   2. A tx that does not make it back in is removeRecursive'd: its
+--      in-mempool children go too (remove_spenders_of).
+--   3. A re-added tx with children already in the pool is linked to them
+--      (UpdateTransactionsFromBlock).  Linking can merge clusters that were
+--      each within the limit; TxGraphImpl::Trim then keeps the
+--      highest-chunk-feerate dependency-closed prefix and drops the rest
+--      (with descendants) so count <= 64 and weight <= 404000.
+--   4. removeForReorg: drop entries non-final / BIP68-locked / spending an
+--      immature coinbase at tip+1, with descendants.
+--   5. LimitMempoolSize (Expire + TrimToSize).
 --
+-- @param disconnected table: blocks in DISCONNECT order (newest first)
+-- @param confirmed table|nil: txid_hex -> true for txs in the connected blocks
+-- @return number: txs re-admitted
+function Mempool:update_for_reorg(disconnected, confirmed)
+  confirmed = confirmed or {}
+  self._pending_cluster_links = {}
+  local readded = 0
+  for b = #(disconnected or {}), 1, -1 do
+    local block = disconnected[b]
+    if block and block.transactions then
+      for i = 2, #block.transactions do  -- [1] is the coinbase
+        local tx = block.transactions[i]
+        local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+        if not confirmed[txid_hex] then
+          local ok, accepted = pcall(self.accept_transaction, self, tx, true,
+            { bypass_limits = true })
+          if ok and accepted then
+            readded = readded + 1
+            self:link_mempool_children(txid_hex)
+          elseif not self.entries[txid_hex] then
+            pcall(self.remove_spenders_of, self, tx, "reorg")
+          end
+        end
+      end
+    end
+  end
+  self:_finalize_reorg_cluster_links()
+  self:remove_for_reorg()
+  self:expire()
+  self:trim()
+  return readded
+end
+
+--- Single-block form kept for callers/tests: re-admit one disconnected block's
+-- txs and re-check the pool against the current tip.
 -- @param block block: The disconnected block
 function Mempool:block_disconnected(block)
   if not block or not block.transactions then return end
-  -- Skip transactions[1] (coinbase): coinbase has no inputs to admit
-  -- and accept_transaction explicitly rejects coinbase txs.
-  for i = 2, #block.transactions do
-    local tx = block.transactions[i]
-    -- Best-effort: ignore failures (tx may now conflict with the new
-    -- chain, exceed mempool size, etc.).  Core's removeForReorg has
-    -- the same swallow-and-continue policy.
-    pcall(function()
-      self:accept_transaction(tx)
-    end)
-  end
+  self:update_for_reorg({ block })
 end
 
 --- Evict entries that are no longer valid in the NEXT block after the tip

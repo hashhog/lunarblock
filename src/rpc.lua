@@ -3883,7 +3883,7 @@ function RPCServer:register_methods()
     end
 
     -- Invalidate the block
-    local ok, err = rpc.chain_state:invalidate_block(hash)
+    local ok, err = rpc.chain_state:invalidate_block(hash, rpc.mempool)
     if not ok then
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to invalidate block"})
     end
@@ -4102,6 +4102,18 @@ function RPCServer:register_methods()
     }))
   end
 
+  -- Core getrawmempool / getmempoolentry wtxid is display-order hex.
+  -- entry.wtxid is a hash256 {bytes=...}; encoding that table puts raw
+  -- bytes in the JSON string and the response is not UTF-8.
+  local function mempool_wtxid_hex(entry, txid_hex)
+    local w = entry.wtxid
+    if type(w) == "table" and type(w.bytes) == "string" then
+      return types.hash256_hex(w)
+    end
+    if type(w) == "string" then return w end
+    return txid_hex
+  end
+
   self.methods["getrawmempool"] = function(rpc, params)
     local verbose = params[1] or false
     if not rpc.mempool then
@@ -4141,7 +4153,7 @@ function RPCServer:register_methods()
           descendantsize = entry.descendant_size or entry.vsize,
           ancestorcount = entry.ancestor_count or 1,
           ancestorsize = entry.ancestor_size or entry.vsize,
-          wtxid = entry.wtxid or txid_hex,
+          wtxid = mempool_wtxid_hex(entry, txid_hex),
           -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
           -- descendantfees/ancestorfees at the top level (removed to match
           -- Bitcoin Core rpc/mempool.cpp entryToJSON).
@@ -6785,7 +6797,7 @@ end
       descendantsize = entry.descendant_size or entry.vsize,
       ancestorcount = entry.ancestor_count or 1,
       ancestorsize = entry.ancestor_size or entry.vsize,
-      wtxid = entry.wtxid or txid_hex,
+      wtxid = mempool_wtxid_hex(entry, txid_hex),
       -- Core shape: fees is a NESTED object; flat fee/modifiedfee/
       -- descendantfees/ancestorfees are NOT top-level fields in Core's
       -- entryToJSON (bitcoin-core/src/rpc/mempool.cpp:508-568).
