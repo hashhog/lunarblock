@@ -4016,8 +4016,17 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   self.tip_hash = block_hash
   self.tip_height = height
 
-  -- Invoke callback if registered (for ZMQ notifications, etc.)
-  if self.callbacks.on_block_connected then
+  -- Invoke callback if registered (for ZMQ notifications, etc.).  Inside a
+  -- reorg (shared, not-yet-committed batch) the observers -- mempool
+  -- removeForBlock, fee estimator, orphan drain, wallet, announce, ZMQ, tip
+  -- notifier -- are QUEUED and fired by accept_side_branch_block only after
+  -- the batch commits; an aborted reorg drops them (LB-7).  Core fires the
+  -- validation-interface signals for a reorg after ActivateBestChainStep.
+  local deferred = reorg_batch and self._reorg_deferred
+  if deferred then
+    deferred[#deferred + 1] = { connected = true, hash = block_hash,
+      block = block, height = height }
+  elseif self.callbacks.on_block_connected then
     self.callbacks.on_block_connected(block_hash, block)
   end
   local _cb_t_cb = perf.now()
@@ -4909,6 +4918,10 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     -- the on-disk pre-reorg state is the only state visible.  No
     -- chain_tip mutation is committed (we never called batch.write).
     reorg_batch.destroy()
+    -- LB-7: the queued observer events describe blocks that never reached
+    -- disk.  Drop them: mempool, wallet, ZMQ, peers and the tip notifier
+    -- never saw the aborted branch, so they already match the restored chain.
+    self._reorg_deferred = nil
     -- Drop the WHOLE coin cache, not only the dirty entries.  In Pattern D
     -- deferred mode CoinView:flush(.., reorg_batch) clears the dirty flag
     -- on every entry it queues and KEEPS it in cache (spent markers for the
@@ -4932,6 +4945,7 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- rollback_chain_to can RAISE (a system fault reading undo data / block
   -- bodies): restore memory from disk before re-raising, exactly as for a
   -- returned failure, so a half-disconnected in-memory tip never survives.
+  self._reorg_deferred = {}
   local rb_ok, disconnected, dc_err = pcall(self.rollback_chain_to, self,
     common_height, reorg_batch)
   if not rb_ok then
@@ -4942,17 +4956,13 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     return abort_reorg("reorg-disconnect-failed: " .. tostring(dc_err))
   end
 
-  -- Refill the mempool with txs from the disconnected blocks BEFORE
-  -- the connect loop runs.  If a side-branch block confirms one of
-  -- the re-added txs, on_block_connected (called by the caller after
-  -- this returns) will remove it cleanly.  Coinbase txs are skipped
-  -- inside Mempool:block_disconnected.  Mempool is in-memory only so
-  -- it's outside the chainstate atomic batch.
-  if opts.mempool and disconnected_blocks then
-    for _, dblk in ipairs(disconnected_blocks) do
-      opts.mempool:block_disconnected(dblk)
-    end
-  end
+  -- NO mempool refill here.  Core (ActivateBestChainStep) accumulates the
+  -- disconnected txs and runs MaybeUpdateMempoolForReorg only after the
+  -- whole disconnect+connect has succeeded; refilling before the connect loop
+  -- (a) validated the re-added txs against the FORK-POINT tip, so anything
+  -- non-final / BIP68-locked / immature there, or spending a tx of a later
+  -- disconnected block, was lost for good, and (b) was never undone when
+  -- abort_reorg restored the old chain (LB-7).  See the post-commit block.
 
   -- side_chain is newest-first; iterate oldest → newest to connect in order.
   for i = side_len, 1, -1 do
@@ -5078,13 +5088,59 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   reorg_batch.destroy()
   self.coin_view:reorg_batch_committed()
 
-  -- The tip moved sideways: evict mempool entries that are no longer final /
-  -- BIP-68-final / mature in the next block (Core MaybeUpdateMempoolForReorg
-  -- -> removeForReorg).  In-memory only; never fails the reorg.
-  if opts.mempool and opts.mempool.remove_for_reorg then
-    local ok_rr, err_rr = pcall(opts.mempool.remove_for_reorg, opts.mempool)
-    if not ok_rr then
-      print("[REORG] mempool remove_for_reorg failed (non-fatal): " .. tostring(err_rr))
+  -- The reorg is durable: now publish it.  Replay the queued observer
+  -- events in chain order (disconnects newest-first, then connects oldest-
+  -- first), each with the in-memory tip set to the tip that event produced,
+  -- exactly as they would have seen it firing inline -- the fee estimator and
+  -- wallet read chain_state.tip_height.  The connect events run the mempool's
+  -- removeForBlock (confirmed txs + conflicts, main.lua), as Core's ConnectTip.
+  local final_hash, final_height = self.tip_hash, self.tip_height
+  local events = self._reorg_deferred or {}
+  self._reorg_deferred = nil
+  local confirmed = {}
+  for _, ev in ipairs(events) do
+    if ev.connected then
+      for _, tx in ipairs(ev.block.transactions or {}) do
+        confirmed[types.hash256_hex(validation.compute_txid(tx))] = true
+      end
+    end
+  end
+  for _, ev in ipairs(events) do
+    if ev.connected then
+      self.tip_hash, self.tip_height = ev.hash, ev.height
+      if self.callbacks.on_block_connected then
+        local ok_cb, err_cb = pcall(self.callbacks.on_block_connected, ev.hash, ev.block)
+        if not ok_cb then
+          print("[REORG] on_block_connected failed (non-fatal): " .. tostring(err_cb))
+        end
+      end
+    else
+      self.tip_hash, self.tip_height = ev.tip_hash, ev.height
+      if self.callbacks.on_block_disconnected then
+        local ok_cb, err_cb = pcall(self.callbacks.on_block_disconnected, ev.hash)
+        if not ok_cb then
+          print("[REORG] on_block_disconnected failed (non-fatal): " .. tostring(err_cb))
+        end
+      end
+    end
+  end
+  self.tip_hash, self.tip_height = final_hash, final_height
+
+  -- Core MaybeUpdateMempoolForReorg, once, at the committed tip: re-admit the
+  -- disconnected txs earliest-first (skipping those the new branch confirmed),
+  -- removeRecursive the failures, link re-added parents to in-pool children,
+  -- then removeForReorg + LimitMempoolSize.  In-memory only; never fails the
+  -- reorg.
+  if opts.mempool then
+    local ok_rr, err_rr
+    if opts.mempool.update_for_reorg then
+      ok_rr, err_rr = pcall(opts.mempool.update_for_reorg, opts.mempool,
+        disconnected_blocks or {}, confirmed)
+    elseif opts.mempool.remove_for_reorg then
+      ok_rr, err_rr = pcall(opts.mempool.remove_for_reorg, opts.mempool)
+    end
+    if ok_rr == false then
+      print("[REORG] mempool update_for_reorg failed (non-fatal): " .. tostring(err_rr))
     end
   end
 
@@ -5537,8 +5593,13 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     self.tip_hash = new_tip_hash
   end
 
-  -- Invoke callback if registered (for ZMQ notifications, etc.)
-  if self.callbacks.on_block_disconnected then
+  -- Invoke callback if registered (for ZMQ notifications, etc.); queued
+  -- until commit inside a reorg (see connect_block, LB-7).
+  local deferred = reorg_batch and self._reorg_deferred
+  if deferred then
+    deferred[#deferred + 1] = { connected = false, hash = block_hash,
+      tip_hash = self.tip_hash, height = self.tip_height }
+  elseif self.callbacks.on_block_disconnected then
     self.callbacks.on_block_disconnected(block_hash)
   end
 
@@ -5714,7 +5775,7 @@ end
 -- This marks the block as invalid and disconnects it from the active chain.
 -- @param block_hash hash256: The hash of the block to invalidate
 -- @return boolean, string|nil: success flag, error message on failure
-function ChainState:invalidate_block(block_hash)
+function ChainState:invalidate_block(block_hash, mempool)
   -- Cannot invalidate genesis block
   local header = self.storage.get_header(block_hash)
   if not header then
@@ -5793,6 +5854,16 @@ function ChainState:invalidate_block(block_hash)
       local ok, err = self:disconnect_block(tip_block, self.tip_height, self.tip_hash, prev_hash)
       if not ok then
         return nil, "Failed to disconnect block: " .. (err or "unknown error")
+      end
+      -- Core InvalidateBlock: after EACH DisconnectTip,
+      -- MaybeUpdateMempoolForReorg(disconnectpool, /*fAddToMempool=*/true):
+      -- the block's txs go back to the pool (earliest first), failures take
+      -- their in-pool children with them, then removeForReorg at the new tip.
+      if mempool and mempool.update_for_reorg then
+        local ok_mp, err_mp = pcall(mempool.update_for_reorg, mempool, { tip_block })
+        if not ok_mp then
+          print("[invalidateblock] mempool update_for_reorg failed (non-fatal): " .. tostring(err_mp))
+        end
       end
     end
   end
