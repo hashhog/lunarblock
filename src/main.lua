@@ -3463,6 +3463,11 @@ local function main()
     pcall(function() rpc_server:tick() end)
   end
   rpc_server.tip_pump = tip_pump
+  -- A dumptxoutset rollback rewinds the chain while tip_pump keeps the node
+  -- serving peers (LB-10): hold P2P block connection for its duration.
+  block_downloader.connect_hold = function()
+    return rpc_server.block_submission_paused == true
+  end
 
   -- Main event loop
   print("Entering main loop...")

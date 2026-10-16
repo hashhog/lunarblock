@@ -1867,6 +1867,14 @@ local function check_core_arity(method, params)
   return nil
 end
 
+-- Methods that move the active tip or rewrite chainstate; refused while a
+-- dumptxoutset rollback has the chain rewound (see handle_single_request).
+M.CHAIN_MUTATING_METHODS = {
+  generateblock = true, generatetoaddress = true, generatetodescriptor = true,
+  invalidateblock = true, reconsiderblock = true, preciousblock = true,
+  loadtxoutset = true, pruneblockchain = true,
+}
+
 function RPCServer:handle_single_request(request)
   local method = request.method
   local params = request.params or {}
@@ -1885,6 +1893,18 @@ function RPCServer:handle_single_request(request)
   local arity_err = check_core_arity(method, params)
   if arity_err then
     return {result = cjson.null, error = arity_err, id = id}
+  end
+
+  -- A dumptxoutset rollback keeps serving RPC between slices (LB-10) while the
+  -- chain is rewound; anything that would move the tip or the chainstate
+  -- waits its turn. (Core serializes these on cs_main.)
+  if self.block_submission_paused and M.CHAIN_MUTATING_METHODS[method] then
+    return {
+      result = cjson.null,
+      error = {code = M.ERROR.MISC_ERROR, message = method ..
+        ": refused while a dumptxoutset rollback has the chain rewound"},
+      id = id,
+    }
   end
 
   local success, result = pcall(handler, self, params)
@@ -2644,7 +2664,9 @@ function RPCServer:register_methods()
   --
   -- Returns true if every checked block passes, false on the first failure
   -- (false is also what Core returns; "check debug log for reason").
-  self.methods["verifychain"] = function(rpc, params)
+  -- LB-10: runs under rpc:long_rpc, so `yield` pumps peers/block connection and
+  -- aborts on shutdown between blocks instead of freezing the loop.
+  local function verifychain_impl(rpc, params, yield)
     local DEFAULT_CHECKLEVEL = 3
     local DEFAULT_CHECKBLOCKS = 6
 
@@ -2792,6 +2814,7 @@ function RPCServer:register_methods()
     local height = tip_height
     for _ = 1, walk do
       if height < 0 then break end
+      yield()
 
       local block_hash = rpc.storage.get_hash_by_height(height)
       if not block_hash then
@@ -2890,6 +2913,12 @@ function RPCServer:register_methods()
     end
 
     return true
+  end
+
+  self.methods["verifychain"] = function(rpc, params)
+    return rpc:long_rpc("verifychain", function(yield)
+      return verifychain_impl(rpc, params, yield)
+    end)
   end
 
   --------------------------------------------------------------------------------
@@ -10991,7 +11020,14 @@ end
     if start_height == cjson.null then start_height = nil end
     if stop_height == cjson.null then stop_height = nil end
 
-    local res, rerr = wallet:rescan(rpc.chain_state, rpc.mempool, start_height, stop_height)
+    if wallet._rescan_active then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Wallet is currently rescanning. Abort existing rescan or wait."})
+    end
+    local res, rerr = rpc:long_rpc("rescanblockchain", function(yield, every)
+      return wallet:rescan(rpc.chain_state, rpc.mempool, start_height, stop_height,
+                           {yield = yield, every = every})
+    end)
     if not res then
       error({code = M.ERROR.INVALID_PARAMS, message = rerr or "rescan failed"})
     end
@@ -13364,7 +13400,11 @@ end
   --     height (or to the block whose hash matches), dump, re-apply.
   -- Returns {coins_written, base_hash, base_height, path, txoutset_hash,
   -- nchaintx}.
-  self.methods["dumptxoutset"] = function(rpc, params)
+  --
+  -- LB-10: runs under rpc:long_rpc. `yield` pumps the main loop (peers, and
+  -- block connection unless a rollback has the chain rewound -- then
+  -- block_submission_paused holds connection) and aborts on shutdown.
+  local function dumptxoutset_impl(rpc, params, yield, every)
     if not rpc.chain_state then
       error({code = M.ERROR.MISC_ERROR, message = "Chain state not available"})
     end
@@ -13520,7 +13560,8 @@ end
       -- Stage 1: roll back if requested.
       local disconnected = nil
       if target_height ~= nil and target_height < (current_tip_height or 0) then
-        local list, rerr = rpc.chain_state:rollback_chain_to(target_height)
+        local list, rerr = rpc.chain_state:rollback_chain_to(
+          target_height, nil, yield)
         if not list then
           error({code = M.ERROR.MISC_ERROR,
             message = "Could not roll back to requested height: "
@@ -13532,15 +13573,29 @@ end
       -- Stage 2: dump.  If the dump fails we still try to re-apply the
       -- disconnected blocks so the node is left at the original tip.
       local tmppath = path .. ".incomplete"
-      local r, e = rpc.chain_state:dump_snapshot(tmppath)
-      result = r
-      err = e
+      local dok, r, e = pcall(rpc.chain_state.dump_snapshot, rpc.chain_state,
+                              tmppath, {yield = yield, every = every})
+      local dump_abort = nil
+      if dok then
+        result = r
+        err = e
+      else
+        dump_abort = r
+      end
+      -- Shutdown during the dump: leave the rewound chain as it is (every
+      -- disconnect is atomic, so the tip is consistent) rather than spend the
+      -- stop window re-validating the disconnected blocks; the node resyncs
+      -- them on the next start. Any other failure still re-applies below.
+      if type(dump_abort) == "table" and dump_abort.code == M.ERROR.CLIENT_NOT_CONNECTED then
+        os.remove(tmppath)
+        error(dump_abort, 0)
+      end
 
       -- Stage 3: re-apply if we rolled back.  This must run regardless of
       -- whether the dump succeeded, otherwise a failed dump would leave
       -- the node stuck at the rollback height.
       if disconnected and #disconnected > 0 then
-        local rok2, rerr = rpc.chain_state:reapply_disconnected(disconnected)
+        local rok2, rerr = rpc.chain_state:reapply_disconnected(disconnected, yield)
         if not rok2 then
           os.remove(tmppath)
           error({code = M.ERROR.MISC_ERROR,
@@ -13550,6 +13605,10 @@ end
         end
       end
 
+      if dump_abort ~= nil then
+        os.remove(tmppath)
+        error(dump_abort, 0)
+      end
       if not result then
         os.remove(tmppath)
         error({code = M.ERROR.MISC_ERROR, message = err or "dump failed"})
@@ -13600,6 +13659,12 @@ end
       txoutset_hash = hash_hex,
       nchaintx      = nchaintx,
     }
+  end
+
+  self.methods["dumptxoutset"] = function(rpc, params)
+    return rpc:long_rpc("dumptxoutset", function(yield, every)
+      return dumptxoutset_impl(rpc, params, yield, every)
+    end)
   end
 
   -- loadtxoutset: load a serialized UTXO snapshot file (Bitcoin Core wire
@@ -14254,6 +14319,11 @@ function RPCServer:setup_w47b_methods()
       error({code = M.ERROR.MISC_ERROR,
              message = "gettxoutsetinfo already in progress"})
     end
+    if rpc._long_rpc_active then
+      error({code = M.ERROR.MISC_ERROR, message = string.format(
+        "gettxoutsetinfo: another long-running RPC (%s) is in progress",
+        rpc._long_rpc_active)})
+    end
     local slice_groups = rpc._utxo_walk_slice_groups
     if slice_groups == nil then slice_groups = 2048 end
     local slice_seconds = rpc._utxo_walk_slice_seconds
@@ -14511,62 +14581,76 @@ function RPCServer:setup_w47b_methods()
     local total_sats = 0
     local unspents = {}
 
-    local iter = rpc.storage.iterator(storage_mod.CF.UTXO)
-    iter.seek_to_first()
-    while iter.valid() do
-      local k = iter.key()
-      local v = iter.value()
-      if k and v and #k == 36 then
-        local ok, entry = pcall(utxo_mod.deserialize_utxo_entry, v)
-        if ok and entry then
-          n_txouts = n_txouts + 1
-          local desc = needles[entry.script_pubkey]
-          if desc ~= nil then
-            total_sats = total_sats + (entry.value or 0)
-            -- Key layout: txid[32] (internal byte order) + vout[4] LE.
-            -- JSON-RPC reports txid in display order (reversed hex), matching
-            -- gettxout / Core's COutPoint::hash.GetHex().
-            local txid_internal = k:sub(1, 32)
-            local txid_display = types.hash256_hex(types.hash256(txid_internal))
-            local v0, v1, v2, v3 = k:byte(33, 36)
-            local vout = v0 + v1 * 256 + v2 * 65536 + v3 * 16777216
-            local coin_height = entry.height or 0
-            -- blockhash: hash of the block at the coin's height, big-endian
-            -- display hex. Mirrors Core's coinb_block.GetBlockHash().GetHex()
-            -- (tip->GetAncestor(coin.nHeight)). Guard for a missing index entry.
-            local coin_block_hash = rpc.storage.get_hash_by_height(coin_height)
-            local blockhash_hex
-            if coin_block_hash then
-              blockhash_hex = types.hash256_hex(coin_block_hash)
-            else
-              blockhash_hex = string.rep("0", 64)
-            end
-            unspents[#unspents + 1] = {
-              txid = txid_display,
-              vout = vout,
-              scriptPubKey = (function()
-                local hx = {}
-                for i = 1, #entry.script_pubkey do
-                  hx[i] = string.format("%02x", entry.script_pubkey:byte(i))
+    -- The iterator is a point-in-time snapshot, so slices that connect blocks
+    -- (LB-10) do not change what this scan sees; height/bestblock above are the
+    -- tip from before the scan and still name the set that was scanned.
+    rpc:long_rpc("scantxoutset", function(yield, every)
+        local iter = rpc.storage.iterator(storage_mod.CF.UTXO)
+        iter.seek_to_first()
+        local since_yield = 0
+        local scan_ok, scan_err = pcall(function()
+            while iter.valid() do
+              since_yield = since_yield + 1
+              if since_yield >= every then
+                since_yield = 0
+                yield()
+              end
+              local k = iter.key()
+              local v = iter.value()
+              if k and v and #k == 36 then
+                local ok, entry = pcall(utxo_mod.deserialize_utxo_entry, v)
+                if ok and entry then
+                  n_txouts = n_txouts + 1
+                  local desc = needles[entry.script_pubkey]
+                  if desc ~= nil then
+                    total_sats = total_sats + (entry.value or 0)
+                    -- Key layout: txid[32] (internal byte order) + vout[4] LE.
+                    -- JSON-RPC reports txid in display order (reversed hex), matching
+                    -- gettxout / Core's COutPoint::hash.GetHex().
+                    local txid_internal = k:sub(1, 32)
+                    local txid_display = types.hash256_hex(types.hash256(txid_internal))
+                    local v0, v1, v2, v3 = k:byte(33, 36)
+                    local vout = v0 + v1 * 256 + v2 * 65536 + v3 * 16777216
+                    local coin_height = entry.height or 0
+                    -- blockhash: hash of the block at the coin's height, big-endian
+                    -- display hex. Mirrors Core's coinb_block.GetBlockHash().GetHex()
+                    -- (tip->GetAncestor(coin.nHeight)). Guard for a missing index entry.
+                    local coin_block_hash = rpc.storage.get_hash_by_height(coin_height)
+                    local blockhash_hex
+                    if coin_block_hash then
+                      blockhash_hex = types.hash256_hex(coin_block_hash)
+                    else
+                      blockhash_hex = string.rep("0", 64)
+                    end
+                    unspents[#unspents + 1] = {
+                      txid = txid_display,
+                      vout = vout,
+                      scriptPubKey = (function()
+                        local hx = {}
+                        for i = 1, #entry.script_pubkey do
+                          hx[i] = string.format("%02x", entry.script_pubkey:byte(i))
+                        end
+                        return table.concat(hx)
+                      end)(),
+                      desc = desc,
+                      amount = btc_sentinel(entry.value or 0),
+                      coinbase = entry.is_coinbase and true or false,
+                      height = coin_height,
+                      blockhash = blockhash_hex,
+                      -- confirmations = active tip height - coin height + 1
+                      -- (Core: tip->nHeight - coin.nHeight + 1). Plain integer count,
+                      -- not a BTC amount, so no btc_sentinel wrapping.
+                      confirmations = tip_height - coin_height + 1,
+                    }
+                  end
                 end
-                return table.concat(hx)
-              end)(),
-              desc = desc,
-              amount = btc_sentinel(entry.value or 0),
-              coinbase = entry.is_coinbase and true or false,
-              height = coin_height,
-              blockhash = blockhash_hex,
-              -- confirmations = active tip height - coin height + 1
-              -- (Core: tip->nHeight - coin.nHeight + 1). Plain integer count,
-              -- not a BTC amount, so no btc_sentinel wrapping.
-              confirmations = tip_height - coin_height + 1,
-            }
-          end
-        end
-      end
-      iter.next()
-    end
-    iter.destroy()
+              end
+              iter.next()
+            end
+        end)
+        iter.destroy()
+        if not scan_ok then error(scan_err, 0) end
+    end)
 
     local result = {
       success = true,
@@ -15423,6 +15507,65 @@ function RPCServer:tick()
   self.request_wallet = nil
 
   client:close()
+end
+
+--- Run a long-running RPC body cooperatively (LB-10).
+-- lunarblock serves RPC on its single main loop, so a handler that loops over
+-- the chain or the UTXO set would freeze peers, block connection and SIGTERM
+-- for as long as it runs (Core runs these on RPC worker threads and aborts
+-- them at RpcInterruptionPoint). `fn(yield, every)` is called with a yield
+-- function to invoke from the handler's loops: it aborts with -9
+-- "Shutting down" once SIGTERM/SIGINT or `stop` has latched, and at most once
+-- per slice (`_long_rpc_slice_seconds`, default 50ms) pumps one slice of the
+-- main loop through rpc.tip_pump -- the same pump the wait-family RPCs and
+-- gettxoutsetinfo use. `every` is how many loop items to process between
+-- yield calls (`_long_rpc_check_every`, default 1024).
+-- One long RPC runs at a time: a nested one (accepted by the pump's RPC tick)
+-- is refused rather than recursing into another pump.
+-- @param name string: RPC name for the "in progress" error
+-- @param fn function: fn(yield, every) -> the RPC result
+function RPCServer:long_rpc(name, fn)
+  local ops_mod = require("lunarblock.ops")
+  local function interruption_point()
+    if ops_mod.poll_shutdown() then
+      error({code = M.ERROR.CLIENT_NOT_CONNECTED, message = "Shutting down"})
+    end
+  end
+  if self._long_rpc_active or self._utxo_walk_active then
+    error({code = M.ERROR.MISC_ERROR, message = string.format(
+      "%s: another long-running RPC (%s) is in progress", name,
+      self._long_rpc_active or "gettxoutsetinfo")})
+  end
+  interruption_point()
+  local slice_seconds = self._long_rpc_slice_seconds
+  if slice_seconds == nil then slice_seconds = 0.05 end
+  local every = self._long_rpc_check_every or 1024
+  local last_pump = socket.gettime()
+  local server = self
+  local function yield()
+    interruption_point()
+    local pump = server.tip_pump
+    if not pump or server._in_long_rpc_pump or server._in_utxo_walk_pump then
+      return
+    end
+    local now = socket.gettime()
+    if slice_seconds > 0 and now - last_pump < slice_seconds then return end
+    server._in_long_rpc_pump = true
+    pcall(pump)
+    server._in_long_rpc_pump = false
+    last_pump = socket.gettime()
+    -- waitfornewblock accepted by the nested tick is deferred; answer it on
+    -- this slice if the tip already moved (or shutdown landed).
+    pcall(function() server:drain_deferred_waits() end)
+    -- A stop accepted by this slice must abort before the next item.
+    interruption_point()
+  end
+  self._long_rpc_active = name
+  local ok, res = pcall(fn, yield, every)
+  self._long_rpc_active = nil
+  self._in_long_rpc_pump = false
+  if not ok then error(res, 0) end
+  return res
 end
 
 --- Answer waitfornewblock / waitforblock / waitforblockheight calls that
