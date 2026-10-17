@@ -3069,6 +3069,7 @@ function M.new_block_downloader(header_chain, storage, network, opts)
   self.validation_time_total = 0
   self.ibd_complete = false
   self.connect_callback = nil       -- Called when a block is connected: fn(block, height, hash)
+  self.connect_hold = nil           -- Optional fn() -> true to hold block connection (see _connect_pending_blocks_inner)
   -- GAP3 fix — reorg-drop part 2.  Called when a received block does NOT
   -- extend the active validated tip but IS a genuine competing-fork body
   -- (its parent is a known header below/beside the active tip).  Routes the
@@ -4614,6 +4615,15 @@ end
 -- loop can service RPC requests between batches (prevents event-loop starvation).
 -- @return boolean, string|nil: success flag, error message
 function BlockDownloader:_connect_pending_blocks_inner()
+  -- Embedder hold (main.lua wires it to rpc.block_submission_paused): while a
+  -- dumptxoutset rollback has the chain rewound, buffered bodies stay buffered
+  -- -- connecting one would extend the rewound tip and corrupt the rewind.
+  -- Downloads and peer service continue; the drain-drive in the main loop
+  -- connects them once the hold lifts.
+  if self.connect_hold and self.connect_hold() then
+    return true
+  end
+
   -- Snapshot boot: hold block CONNECTION (downloads continue) until the
   -- pre-base header backfill links genesis to the snapshot band.  Core never
   -- validates a block without the full header chain; deciding BIP68/BIP113

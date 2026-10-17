@@ -1456,14 +1456,21 @@ end
 
 --- Scan the UTXO set for wallet addresses (confirmed balance).
 -- @param chain_state table: Optional chain state for current tip info
-function Wallet:scan_utxos(chain_state)
-  self.utxos = {}
-  self.confirmed_balance = 0
+-- @param yield function|nil: called every `every` coins by a cooperative caller
+--   (rescanblockchain, LB-10); may pump the main loop or raise to abort. The
+--   ledger is built aside and swapped in at the end, so a nested RPC served by
+--   the pump never sees a half-built ledger.
+-- @param every number|nil: coins between yield calls (default 1024)
+function Wallet:scan_utxos(chain_state, yield, every)
   -- spendable_balance excludes immature coinbases; immature_balance is the sum
   -- of confirmed-but-immature coinbase values. Mirrors Bitcoin Core's split of
   -- the trusted/spendable balance vs. m_mine_immature (wallet/receive.cpp).
-  self.spendable_balance = 0
-  self.immature_balance = 0
+  local function clear_ledger()
+    self.utxos = {}
+    self.confirmed_balance = 0
+    self.spendable_balance = 0
+    self.immature_balance = 0
+  end
 
   -- A wallet that has never scanned the chain (fresh restore-from-seed / blank
   -- import) reports an empty ledger until rescanblockchain runs — Core parity
@@ -1471,10 +1478,12 @@ function Wallet:scan_utxos(chain_state)
   -- keeps getbalance / listunspent at 0 until the wallet is explicitly rescanned
   -- or performs a chain-mutating op (which flips self.scanned true).
   if not self.scanned then
+    clear_ledger()
     return
   end
 
   if not self.storage then
+    clear_ledger()
     return  -- No storage, skip scan
   end
 
@@ -1486,9 +1495,24 @@ function Wallet:scan_utxos(chain_state)
 
   local tip_height = chain_state and chain_state.tip_height or 0
 
+  local utxos, confirmed, spendable, immature = {}, 0, 0, 0
+  local since_yield = 0
+  every = every or 1024
+  local scan_ok, scan_err = pcall(function()
   while iter.valid() do
+    if yield then
+      since_yield = since_yield + 1
+      if since_yield >= every then
+        since_yield = 0
+        yield()
+      end
+    end
     local key = iter.key()
     local data = iter.value()
+    if not data then
+      iter.next()
+      goto continue
+    end
     local entry = utxo_mod.deserialize_utxo_entry(data)
 
     -- Check if this output's scriptPubKey matches any of our addresses
@@ -1518,7 +1542,7 @@ function Wallet:scan_utxos(chain_state)
         confirmations = tip_height - entry.height + 1
       end
 
-      self.utxos[key] = {
+      utxos[key] = {
         value = entry.value,
         script_pubkey = entry.script_pubkey,
         address = addr,
@@ -1528,21 +1552,28 @@ function Wallet:scan_utxos(chain_state)
         is_coinbase = entry.is_coinbase,
         confirmations = confirmations,
       }
-      self.confirmed_balance = self.confirmed_balance + entry.value
+      confirmed = confirmed + entry.value
       -- Split into spendable vs. immature. A coinbase is spendable only once
       -- it has COINBASE_MATURITY+1 (=101) confirmations; below that it is
       -- immature and excluded from the spendable/trusted balance (Core
       -- getbalance behaviour). Non-coinbase outputs are always spendable.
       if entry.is_coinbase and confirmations < consensus.COINBASE_MATURITY + 1 then
-        self.immature_balance = self.immature_balance + entry.value
+        immature = immature + entry.value
       else
-        self.spendable_balance = self.spendable_balance + entry.value
+        spendable = spendable + entry.value
       end
     end
 
     iter.next()
+    ::continue::
   end
+  end)
   iter.destroy()
+  if not scan_ok then error(scan_err, 0) end
+  self.utxos = utxos
+  self.confirmed_balance = confirmed
+  self.spendable_balance = spendable
+  self.immature_balance = immature
 end
 
 --- Scan mempool for unconfirmed transactions affecting the wallet.
@@ -1691,12 +1722,15 @@ end
 --   * "received" entries enumerate every output paying one of our keys.
 -- @param chain_state ChainState
 -- @param mempool table|nil (unused for confirmed history; reserved)
-function Wallet:scan_history(chain_state, mempool)
-  self.tx_history = {}
+-- @param yield function|nil: called once per block height by a cooperative caller
+--   (rescanblockchain, LB-10); history is built aside and swapped in at the end.
+function Wallet:scan_history(chain_state, mempool, yield)
   -- Same gate as scan_utxos: an unscanned wallet has no rediscovered history
   -- until rescanblockchain walks the chain (Core parity).
-  if not self.scanned then return end
-  if not self.storage or not chain_state then return end
+  if not self.scanned or not self.storage or not chain_state then
+    self.tx_history = {}
+    return
+  end
 
   local tip_height = chain_state.tip_height or 0
   if tip_height < 0 then tip_height = 0 end
@@ -1715,7 +1749,9 @@ function Wallet:scan_history(chain_state, mempool)
       bit.band(bit.rshift(vout, 24), 0xFF))
   end
 
+  local history = {}
   for height = 0, tip_height do
+    if yield then yield() end
     local bhash = self.storage.get_hash_by_height(height)
     if bhash then
       local block = self.storage.get_block(bhash)
@@ -1793,7 +1829,7 @@ function Wallet:scan_history(chain_state, mempool)
               end
             end
 
-            self.tx_history[txid_hex] = {
+            history[txid_hex] = {
               txid = txid,
               txid_hex = txid_hex,
               tx = tx,
@@ -1814,6 +1850,7 @@ function Wallet:scan_history(chain_state, mempool)
       end
     end
   end
+  self.tx_history = history
 end
 
 --- Mark the wallet as having scanned the chain. Called by rescanblockchain and
@@ -1849,7 +1886,7 @@ end
 -- @param start_height number|nil (default 0)
 -- @param stop_height  number|nil (default tip)
 -- @return table|nil {start_height, stop_height}, or nil + err string
-function Wallet:rescan(chain_state, mempool, start_height, stop_height)
+function Wallet:rescan(chain_state, mempool, start_height, stop_height, opts)
   if not chain_state then return nil, "no chain state available" end
   local tip = chain_state.tip_height or 0
   if tip < 0 then tip = 0 end
@@ -1876,15 +1913,35 @@ function Wallet:rescan(chain_state, mempool, start_height, stop_height)
 
   -- Rebuild the UTXO ledger + balances from the chainstate UTXO set, and the
   -- transaction history from the connected blocks. Both rebuild from scratch.
-  self:scan_utxos(chain_state)
-  self:scan_history(chain_state, mempool)
-  if mempool then
-    self:scan_mempool(mempool)
-  end
+  --
+  -- With opts.yield (rescanblockchain, LB-10) the passes hand control back to
+  -- the node between slices, so blocks can connect mid-rescan. The UTXO pass
+  -- reads a point-in-time snapshot, so a block that connects meanwhile is not
+  -- in the rebuilt ledger: scan_block parks it in _rescan_deferred and it is
+  -- replayed below against the finished ledger (the same relevance check and
+  -- rebuild it would have run had it connected after the rescan).
+  local yield = opts and opts.yield
+  local every = opts and opts.every
+  self._rescan_active = true
+  self._rescan_deferred = {}
+  local ok, err = pcall(function()
+    self:scan_utxos(chain_state, yield, every)
+    self:scan_history(chain_state, mempool, yield)
+    if mempool then
+      self:scan_mempool(mempool)
+    end
+  end)
+  local deferred = self._rescan_deferred
+  self._rescan_active = false
+  self._rescan_deferred = nil
+  if not ok then error(err, 0) end
 
   -- A from-tip rescan has reconciled the ledger up to `stop_height`.
   self.last_synced_height = stop_height
   self:mark_dirty()
+  for _, d in ipairs(deferred) do
+    self:scan_block(chain_state, d.block, d.height, mempool)
+  end
 
   return {start_height = start_height, stop_height = stop_height}
 end
@@ -1936,6 +1993,15 @@ end
 function Wallet:scan_block(chain_state, block, height, mempool)
   if type(height) ~= "number" then
     height = (chain_state and chain_state.tip_height) or self.last_synced_height
+  end
+
+  -- A yielding rescan is rebuilding the ledger: park the block for replay
+  -- once the rescan finishes (see Wallet:rescan) instead of interleaving a
+  -- second rebuild with it.
+  if self._rescan_active then
+    local deferred = self._rescan_deferred
+    deferred[#deferred + 1] = {block = block, height = height}
+    return false
   end
 
   -- A wallet that has never been scanned stays at balance 0 until an explicit

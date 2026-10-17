@@ -5638,7 +5638,7 @@ end
 --        write when the caller (accept_side_branch_block) finally
 --        executes batch.write().
 -- @return table|nil, string|nil: list of {hash, height} or nil and error
-function ChainState:rollback_chain_to(target_height, reorg_batch)
+function ChainState:rollback_chain_to(target_height, reorg_batch, step)
   if type(target_height) ~= "number" then
     return nil, "rollback_chain_to: target_height must be a number"
   end
@@ -5654,6 +5654,9 @@ function ChainState:rollback_chain_to(target_height, reorg_batch)
 
   local disconnected = {}
   while self.tip_height > target_height do
+    -- step: optional cooperative yield between blocks (dumptxoutset, LB-10).
+    -- It may raise to abort; the tip is consistent between disconnects.
+    if step then step() end
     local tip_hash = self.tip_hash
     local tip_height = self.tip_height
     local tip_block = self.storage.get_block(tip_hash)
@@ -5684,12 +5687,13 @@ end
 --- Re-apply a list of previously-disconnected blocks (LIFO).
 -- @param disconnected table: list returned by rollback_chain_to()
 -- @return boolean, string|nil: success flag, error message on failure
-function ChainState:reapply_disconnected(disconnected)
+function ChainState:reapply_disconnected(disconnected, step)
   if type(disconnected) ~= "table" then
     return nil, "reapply_disconnected: expected list"
   end
   -- disconnected[#] was the deepest (lowest height) block; reapply LIFO.
   for i = #disconnected, 1, -1 do
+    if step then step() end
     local entry = disconnected[i]
     local block = self.storage.get_block(entry.hash)
     if not block then
@@ -6326,15 +6330,30 @@ end
 -- @param file_path string: path to write snapshot file
 -- @return table|nil, string|nil: {coins_count, hash, base_blockhash,
 --                                  base_height, path} or nil, error message
-function ChainState:dump_snapshot(file_path)
+--
+-- opts.yield (rpc.lua dumptxoutset, LB-10) is called every opts.every
+-- (default 1024) coins while the set is read and while it is written. It may
+-- pump the main loop -- so blocks can connect mid-dump -- or raise to abort;
+-- on an abort the partial file is removed. The base block is captured after
+-- the flush, the iterator is a point-in-time view, and the commitment hash is
+-- computed from the very coins that are written, so a block that connects
+-- mid-dump moves the tip without making the file, its metadata or its hash
+-- disagree. Without opts.yield nothing can connect meanwhile and the hash is
+-- the usual compute_utxo_hash walk.
+function ChainState:dump_snapshot(file_path, opts)
+  local yield = opts and opts.yield
+  local every = (opts and opts.every) or 1024
+
   -- Ensure coin view is flushed so the iterator sees a consistent state.
   self.coin_view:flush()
+  local base_hash, base_height = self.tip_hash, self.tip_height
 
   -- Open output file
   local file, err = io.open(file_path, "wb")
   if not file then
     return nil, "failed to open file: " .. (err or "unknown error")
   end
+  local ok_dump, res_dump, err_dump = pcall(function()
 
   -- First pass: collect UTXOs grouped by txid.  The on-disk RocksDB key
   -- is already (txid || vout LE), so iterating the column family is
@@ -6372,9 +6391,22 @@ function ChainState:dump_snapshot(file_path)
   local iter = self.storage.iterator(storage_mod.CF.UTXO)
   iter.seek_to_first()
 
+  local since_yield = 0
+  local read_ok, read_err = pcall(function()
   while iter.valid() do
+    if yield then
+      since_yield = since_yield + 1
+      if since_yield >= every then
+        since_yield = 0
+        yield()
+      end
+    end
     local key = iter.key()
     local data = iter.value()
+    if not data then
+      iter.next()
+      goto continue
+    end
 
     local txid_bytes = key:sub(1, 32)
     local r = serialize.buffer_reader(key:sub(33, 36))
@@ -6393,14 +6425,17 @@ function ChainState:dump_snapshot(file_path)
     end
 
     iter.next()
+    ::continue::
   end
+  end)
   iter.destroy()
+  if not read_ok then error(read_err, 0) end
 
   -- Write metadata (51 bytes; serialize_snapshot_metadata matches
   -- SnapshotMetadata::Serialize byte-for-byte).
   local metadata = M.snapshot_metadata(
     self.network.magic_bytes,
-    self.tip_hash,
+    base_hash,
     total_count
   )
   file:write(M.serialize_snapshot_metadata(metadata))
@@ -6412,9 +6447,22 @@ function ChainState:dump_snapshot(file_path)
   end
   table.sort(sorted_txids)
 
+  -- With a yielding caller the commitment hash is taken over the coins as they
+  -- are written (HASH_SERIALIZED: SHA256d of each coin's TxOutSer in txid,vout
+  -- order -- the stream compute_utxo_stats hashes), because a fresh walk after
+  -- the dump could see a later tip.
+  local hasher = yield and crypto.sha256_init() or nil
+
   -- Body: for each txid, write txid raw + CompactSize(coins) + per-coin
   -- (CompactSize(vout) + serialize_snapshot_coin).
   for _, txid_bytes in ipairs(sorted_txids) do
+    if yield then
+      since_yield = since_yield + 1
+      if since_yield >= every then
+        since_yield = 0
+        yield()
+      end
+    end
     local outputs = utxos_by_txid[txid_bytes]
 
     local sorted_vouts = {}
@@ -6435,6 +6483,10 @@ function ChainState:dump_snapshot(file_path)
       ow.write_varint(vout)              -- CompactSize for vout index
       file:write(ow.result())
       file:write(M.serialize_snapshot_coin(entry))
+      if hasher then
+        hasher.update(_serialize_txoutser(
+          M.outpoint_key(types.hash256(txid_bytes), vout), entry))
+      end
     end
   end
 
@@ -6448,17 +6500,30 @@ function ChainState:dump_snapshot(file_path)
   _fsync_file(file)
 
   file:close()
+  file = nil
 
   -- Compute snapshot hash for verification.
-  local hash, _ = self:compute_utxo_hash()
+  local hash
+  if hasher then
+    hash = crypto.sha256(hasher.final())
+  else
+    hash = select(1, self:compute_utxo_hash())
+  end
 
   return {
     coins_count = total_count,
     hash = hash,
-    base_blockhash = self.tip_hash,
-    base_height = self.tip_height,
+    base_blockhash = base_hash,
+    base_height = base_height,
     path = file_path,
   }
+  end)
+  if file then file:close() end
+  if not ok_dump then
+    os.remove(file_path)
+    error(res_dump, 0)
+  end
+  return res_dump, err_dump
 end
 
 --- Build a buffer_reader-shaped object backed by a Lua file handle.
