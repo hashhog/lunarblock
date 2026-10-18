@@ -1,219 +1,133 @@
 # lunarblock
 
-A Bitcoin full node implementation in Lua, targeting LuaJIT 2.1.
+A Bitcoin full node written from scratch in Lua, running on LuaJIT 2.1. One of the ten [hashhog](https://github.com/hashhog) nodes.
 
-## Status — v1.0.2
+> **Experimental.** hashhog nodes are independent re-implementations of Bitcoin Core for research and testing. Do not use them with real funds.
 
-> **Every `receipts/…`, `tools/…`, `docs/…` and `CORE-PARITY-AUDIT/…` path cited in
-> this section is in the hashhog meta-repo, which is permanently private.** Those
-> citations are maintainer provenance, not evidence you can check. The full note on
-> what that does and does not leave verifiable is further down this section.
+## Status
 
-**Label: "Replay-verified"**
-(`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
-deliberately weaker than "Validated", and the scorecard spells out why: it means
-lunarblock agreed with Core on every block the nightly instruments showed it — 169
-distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
-nightly corpus sweep — and that the 26,067-height stateless replay has since
-COMPLETED: 26,067 distinct heights, `accept` on every one, 0 disagreements, 0
-harness-limit rows, against 51,512 rejected control twins (scorecard footnote
-[1], which also records that the first run silently compared only 65% of its
-input and had to be re-run).
-> **What that does and does not mean.** It is a *stateless* re-check of each block
-> against Core's rules with scripts on. It is **not** a from-genesis reproduction
-> of Core's UTXO set, and this node still has **no from-genesis evidence at all**. The git tag `v0.1.0-beta1`
-(`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
-is reserved for an independent from-genesis `--assumevalid=0` reproduction of
-Core's UTXO-set commitment, and `beta` means that receipt does not exist
-(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
-or fund-custody readiness — see `SECURITY.md`.
+| Area | State |
+|---|---|
+| Mainnet validation | Validated mainnet from genesis to height 958,794 with script checks on, in 48 consecutive ranges (each range starts from the UTXO set the previous one ended with). The final UTXO set matched Bitcoin Core's `gettxoutsetinfo` `hash_serialized_3` there (`29692050…6e7af0`, 166,180,925 coins). How to reproduce: [docs/status.md](docs/status.md). |
+| Consensus vectors | Passes all 1,222 entries of Bitcoin Core's `script_tests.json` and Core's `sighash.json` vectors. See [docs/status.md](docs/status.md#cores-test-vectors). |
+| RPC | 140 JSON-RPC methods: 127 with Core's names, plus 13 of lunarblock's own. Optional read-only REST. See [docs/rpc.md](docs/rpc.md). |
+| P2P | Headers-first sync, parallel block download, BIP-324 v2 transport, BIP-152 compact blocks, BIP-155 addrv2. |
+| Wallet | HD wallets (BIP-32/39/44/84/86), descriptors, PSBT, multi-wallet, encryption. No `sendmany`, `sendall`, `lockunspent` or labels. Not audited. |
+| Known limitations | No signet. Initial sync is much slower than Bitcoin Core's. See [docs/status.md](docs/status.md#known-limitations). |
 
-**lunarblock has not been shown to validate the chain from genesis, and on this
-hardware it cannot finish trying.** There is no lunarblock row in the
-reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`) and no lunarblock replay
-ledger in `CORE-PARITY-AUDIT/replay-ledgers/`. `CHARTER.md` (§"R4 — Proven
-validator", "Honest limit") measures lunarblock at ~609 blocks/hour, roughly two
-months per from-genesis pass, and records the rung as unreachable for it without
-different hardware or a native hot path; `receipts/TRUST-ANCHOR.md:172` says its genesis lineage is months out.
-`receipts/TRUST-ANCHOR.md:187-198` (correction, 2026-09-01) additionally
-retracts lunarblock's pre-2026-09-01 M2 boundary-campaign rows as script
-evidence — those window blocks were connected with scripts **skipped** under the
-default assumevalid: `submitblock` computes `skip_scripts` from
-`consensus.should_skip_script_validation`, whose first condition is that
-`network.assumevalid` is non-nil, and only `--noassumevalid` clears it
-(`receipts/TRUST-ANCHOR.md:225-228`). A reader of this repository alone should
-assume lunarblock's from-genesis validation is untested.
+Last updated: 2026-10-17.
 
-**Operator RPC parity: 56 of Bitcoin Core's 85.** From the 103-method R5
-operator probe run 2026-09-01T18:26:42Z
-(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): lunarblock 56 PASS
-/ 29 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
-(`SKIP-REGTEST`) for every node including Core. Cite the run, not "the score":
-the probe ten minutes earlier
-(`tools/diff-test-artifacts/r5-probe/20260901T181552Z.json`) scored lunarblock 58
-with no deploy in between. **Three** of lunarblock's 29 failures are RPC
-**timeouts** (`getblockheader`, `getblockchaininfo`, `getblock`) rather than wrong
-answers; the other 26 are wrong answers, wrong error codes or wrong shapes. An
-earlier draft said "several", which softened the score with a count the artifact
-does not support.
+## Quick start
 
-**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
-unit suite is *measured, not fixed*, and 2026-09-01 was the **first time it had
-ever been measured** — **256 failing tests** out of a total the baseline itself
-marks NOT VERIFIED. None were triaged as test-bug or node-bug. The same pass
-found the test runner writing `peers.dat`, `banlist.json`, `mempool.dat`,
-`fee_estimates.json` and `*.log` into the repository (`6e2b2d2`).
-
-**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the hashhog
-meta-repo, which is **not public** — see the note below.
-
-> **The cited paths are NOT publicly readable — do not treat them as evidence.**
-> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
-> the hashhog meta-repo, which is a **permanently private** repository, not to
-> this one. They are provenance for the maintainers. From outside, any claim
-> resting only on such a path is **unverified**, and you should read it as such.
->
-> Two of those paths are unreadable even with the meta-repo in hand: the R5 probe
-> JSON is gitignored (`.gitignore:60  tools/diff-test-artifacts/`) and so are the
-> nightly `diffguard-*.log` files (`.gitignore:43  *.log`). Regenerate the probe
-> JSON with `python3 tools/r5_probe.py` against a running fleet.
->
-> **What you can check from this repository alone:** build it, run its own test
-> suite, and reproduce its behaviour against Bitcoin Core yourself. That is the
-> evidence this repo actually ships.
-
-## Quick Start
-
-### Docker
+Needs LuaJIT 2.1, a C compiler, and the OpenSSL, libsecp256k1 and RocksDB libraries
+(loaded through LuaJIT's FFI), plus LuaSocket and lua-cjson. On Debian 13:
 
 ```bash
-docker build -t lunarblock .
-docker run -v lunarblock-data:/data -p 48351:48351 -p 48341:48341 lunarblock
+sudo apt-get install -y build-essential git luajit libluajit-5.1-dev lua-socket lua-cjson libssl-dev libsecp256k1-dev librocksdb-dev
+git clone https://github.com/hashhog/lunarblock.git
+cd lunarblock
+make build
+LD_LIBRARY_PATH=./lib luajit src/main.lua --version
 ```
 
-### From Source
+`make build` compiles three small C helpers into `lib/` (hardware SHA-256, parallel
+script checks, parallel UTXO reads). The node runs without them, only slower.
+
+Start a regtest node in a throwaway data directory and make an RPC call:
 
 ```bash
-# Required: luajit, luasocket, lua-cjson, libsecp256k1, openssl, rocksdb
-# Toolchain: LuaJIT 2.1 (rockspec: lua >= 5.1, luasocket >= 3.1.0, lua-cjson >= 2.1.0;
-#   Dockerfile builds on debian:bookworm-slim apt packages). System libs loaded via
-#   FFI: libcrypto (OpenSSL), libsecp256k1, librocksdb (C API) — Debian: apt install
-#   libssl-dev libsecp256k1-dev librocksdb-dev lua-cjson lua-socket. Then run
-#   `make build` to compile lib/sha256_accel.so (not tracked in git) before the
-#   LD_LIBRARY_PATH=./lib commands below.
-# Optional: lua-sec (luasec) — enables HTTPS/TLS termination on the
-#           RPC server when --rpc-tls-cert/--rpc-tls-key are passed.
-#           Install via `luarocks install luasec` or
-#           `apt install lua-sec` on Debian/Ubuntu.  Without luasec
-#           lunarblock runs fine in plaintext mode; the TLS flags
-#           simply produce a clear startup error if you try to use them.
-LD_LIBRARY_PATH=./lib luajit src/main.lua --help
-LD_LIBRARY_PATH=./lib luajit src/main.lua --network mainnet
-LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --nowalletcreate
+export DATADIR=$(mktemp -d)
+LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --datadir "$DATADIR" --rpcpassword changeme > "$DATADIR/node.log" 2>&1 &
+sleep 5
+curl -s --user lunarblock:changeme -d '{"method":"getblockchaininfo","params":[]}' http://127.0.0.1:18443/
+curl -s --user lunarblock:changeme -d '{"method":"stop","params":[]}' http://127.0.0.1:18443/
 ```
 
-## Features
+Other distributions, optional libraries (ZeroMQ, LuaSec for RPC over TLS) and the
+LuaRocks route are in [docs/building.md](docs/building.md).
 
-- Full block and transaction validation (SegWit, Taproot, BIP68 sequence locks, sigop counting, PoW, merkle root)
-- Script interpreter (stack-based VM, all standard opcodes, P2PKH, P2SH, P2WPKH, P2WSH, P2TR, BIP146 NULLFAIL)
-- Header-first sync with PoW validation and difficulty adjustment
-- Parallel block download with per-peer limits and adaptive stalling
-- UTXO set with CoinView cache (dirty/fresh flags, flush strategy, connect/disconnect blocks)
-- Mempool (tx acceptance, fee validation, RBF, CPFP, ancestor/descendant limits)
-- BIP-152 compact block relay (SipHash-2-4, short txids, high-bandwidth mode)
-- BIP-155 ADDRv2 (TorV3, I2P, CJDNS address support)
-- BIP-324 v2 encrypted transport (can be disabled with `--nov2transport`)
-- BIP-9 versionbits soft fork tracking
-- Eclipse attack mitigations (bucketed addrman, anchor connections, outbound diversity)
-- Peer misbehavior scoring and ban management
-- Output descriptors (BIP380-386 parsing, checksum validation, address derivation)
-- HD wallet (BIP-32/44/84, key derivation, tx signing, WIF import/export)
-- Multi-wallet support (createwallet, loadwallet, unloadwallet, listwallets)
-- Wallet encryption (AES-256-CBC with passphrase, walletpassphrase/walletlock)
-- PSBT (createpsbt, decodepsbt, walletprocesspsbt)
-- Fee estimation (bucketed tracking, decay weighting, confirmation targets)
-- Block template construction (BIP22 getblocktemplate, coinbase creation, CPU miner)
-- REST API (read-only, enabled with `--rest`)
-- ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics)
-- Block pruning (0=disabled, 1=manual, >=550=target MB)
-- Chain management (invalidateblock, reconsiderblock RPCs)
-- Flat file block storage (Bitcoin Core compatible format)
-- JIT profiling support (`--jitprofile`, `--jitverbose`)
-- FFI bindings for performance-critical crypto (libsecp256k1, OpenSSL)
+## Running
 
-## Configuration
+```bash
+LD_LIBRARY_PATH=./lib luajit src/main.lua --datadir "$HOME/.lunarblock" --rpcpassword changeme
+LD_LIBRARY_PATH=./lib luajit src/main.lua --network testnet4 --rpcpassword changeme
+LD_LIBRARY_PATH=./lib luajit src/main.lua --regtest --rpcpassword changeme
+```
 
-### CLI Flags
+Mainnet is the default. Flags take their value as the next argument (`--datadir DIR`);
+only some also accept `--flag=value`, so use the space form. The default data directory
+is `~/.lunarblock`; every network except mainnet uses a subdirectory named after it
+(`~/.lunarblock/testnet4`, `~/.lunarblock/regtest`). `--testnet` selects testnet3.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--datadir DIR` | `~/.lunarblock` | Data directory |
-| `--network NET` | `mainnet` | Network: mainnet, testnet, regtest |
-| `--rpcport PORT` | per-network | RPC server port |
-| `--rpcuser USER` | `lunarblock` | RPC username |
-| `--rpcpassword PW` | empty | RPC password |
-| `--rpc-tls-cert PATH` | none | PEM cert path — enables HTTPS RPC (pair with `--rpc-tls-key`; requires `luasec`) |
-| `--rpc-tls-key PATH` | none | PEM private-key path — pair with `--rpc-tls-cert` |
-| `--port PORT` | per-network | P2P listen port |
-| `--bind ADDR[:PORT]` | `0.0.0.0` and `[::]` | Bind P2P listen socket (repeatable; omit for all interfaces) |
-| `--maxpeers N` | `125` | Maximum peer connections |
-| `--maxconnections N` | `125` | Alias for `--maxpeers` |
-| `--dbcache MB` | `450` | Database cache size in MB |
-| `--connect IP:PORT` | none | Connect to specific peer |
-| `--testnet` | off | Use testnet |
-| `--regtest` | off | Use regtest |
-| `--printtoconsole` | off | Print log to console |
-| `--nowalletcreate` | off | Do not create wallet on first run |
-| `--reindex` | off | Rebuild UTXO set from blocks |
-| `--daemon` | off | Run as daemon |
-| `--prune N` | `0` | Prune mode: 0=disabled, 1=manual, >=550=target MB |
-| `--rest` | off | Enable REST API (no auth, read-only) |
-| `--restport PORT` | `8080` | REST server port |
-| `--zmqpubhashblock EP` | none | ZMQ endpoint for hashblock notifications |
-| `--zmqpubhashtx EP` | none | ZMQ endpoint for hashtx notifications |
-| `--zmqpubrawblock EP` | none | ZMQ endpoint for rawblock notifications |
-| `--zmqpubrawtx EP` | none | ZMQ endpoint for rawtx notifications |
-| `--zmqpubsequence EP` | none | ZMQ endpoint for sequence notifications |
-| `--zmqpubhwm N` | `1000` | ZMQ high water mark |
-| `--nov2transport` | off | Disable BIP-324 v2 encrypted transport |
-| `--jitprofile` | off | Enable JIT profiling output |
-| `--jitverbose` | off | Enable verbose JIT compilation logging |
-| `--import-blocks FILE` | none | Import blocks from framed file (`-` for stdin) |
-| `--import-utxo FILE` | none | Import UTXO snapshot from Core `dumptxoutset` file |
+| Network | P2P port | RPC port |
+|---|---|---|
+| mainnet | 8333 | 8332 |
+| testnet4 (`--network testnet4`) | 48333 | 48332 |
+| testnet3 (`--testnet`) | 18333 | 18332 |
+| regtest (`--regtest`) | 18444 | 18443 |
 
-## RPC API
+RPC binds to `127.0.0.1`. P2P listens on all interfaces. A Prometheus metrics endpoint
+listens on all interfaces, port 9332 (`--metricsport 0` turns it off; a busy port only
+logs a warning).
 
-JSON-RPC 1.0/2.0 over HTTP with Basic auth, modelled on Bitcoin Core's. Not behaviourally compatible: on the 2026-09-01T18:26:42Z operator probe lunarblock answers 56 of the 103 probed methods correctly against Core's 85, with 29 failures — several of them RPC timeouts (`getblockheader`, `getblockchaininfo`) rather than wrong answers (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
+Blocks are kept in RocksDB inside the data directory. An unpruned mainnet node stores
+every block, so plan for at least as much fast disk as Bitcoin Core needs, or use
+`--prune 550` (or larger, in MB). `--dbcache MB` sizes the RocksDB cache (default 450).
+`--noassumevalid` checks every script from genesis instead of trusting the built-in
+assume-valid block.
 
-| Category | Methods |
-|----------|---------|
-| Blockchain | `getblockchaininfo`, `getblock`, `getblockhash`, `getblockheader`, `getblockcount`, `getbestblockhash`, `getchaintips`, `getdifficulty` |
-| Transactions | `getrawtransaction`, `sendrawtransaction`, `decoderawtransaction` |
-| Mempool | `getmempoolinfo`, `getrawmempool` |
-| Mining | `getblocktemplate`, `submitblock`, `submitblocks`, `getmininginfo`, `generatetoaddress` |
-| Network | `getnetworkinfo`, `getpeerinfo`, `getconnectioncount` |
-| Wallet | `createwallet`, `loadwallet`, `unloadwallet`, `listwallets`, `listwalletdir`, `getwalletinfo`, `getnewaddress`, `getbalance`, `getbalances`, `listunspent`, `sendtoaddress`, `listtransactions`, `dumpprivkey` |
-| Wallet Security | `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange` |
-| Descriptors | `getdescriptorinfo`, `deriveaddresses` |
-| PSBT | `createpsbt`, `decodepsbt`, `walletprocesspsbt` |
-| Util | `validateaddress`, `estimatesmartfee`, `getinfo` |
-| Chain Mgmt | `invalidateblock`, `reconsiderblock` |
-| Control | `stop` |
+All flags, the config file, the data directory layout and logging are in
+[docs/running.md](docs/running.md).
 
-## Monitoring
+## RPC
 
-No built-in Prometheus exporter. Monitor via RPC calls to `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, and `getnetworkinfo`. JIT profiling output is available with `--jitprofile` for performance analysis.
+lunarblock aims to match Bitcoin Core's JSON-RPC interface: same method names,
+parameters, result shapes and error codes. It accepts HTTP Basic auth with user
+`lunarblock` (change with `--rpcuser`) and the password from `--rpcpassword`. There is no
+cookie file, and if `--rpcpassword` is empty (the default) the RPC port accepts requests
+without any authentication, so always set one.
 
-## Architecture
+```bash
+curl -s --user lunarblock:changeme \
+  -d '{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}' http://127.0.0.1:18443/
+```
 
-lunarblock is built on LuaJIT 2.1 and uses its trace-based JIT compiler for the hot validation loops. "Near-native" would be an overstatement: the project measures lunarblock at ~609 blocks/hour on the reference machine — roughly two months for a single from-genesis pass — and records a full from-genesis validation as unreachable for it without different hardware or a native hot path (`CHARTER.md`, §"R4 — Proven validator" and §"R5", which notes that lunarblock "cannot complete a from-genesis validation" while exposing more Core RPCs than the flagship). The FFI (Foreign Function Interface) provides zero-overhead bindings to libsecp256k1 for ECDSA/Schnorr signature verification and OpenSSL for SHA256/RIPEMD160 hashing, avoiding the Lua/C boundary overhead that standard `lua_CFunction` bindings would introduce. Buffer pools and LRU caches reduce GC pressure during block processing.
+The method list and known differences from Core are in [docs/rpc.md](docs/rpc.md).
 
-The node runs on a single-threaded event loop with a 20Hz tick rate, processing P2P messages, mempool transactions, and RPC requests in each cycle. The peer manager handles connection pooling, DNS seed discovery, and eclipse attack mitigations through bucketed address management with netgroup diversity enforcement. Block download uses a parallel sliding window with per-peer limits and adaptive stall detection.
+## Development
 
-The storage layer uses RocksDB via FFI bindings with column families to separate block headers, block data, UTXO set, and chain state metadata. The CoinView cache maintains dirty/fresh flags matching Bitcoin Core's design, flushing to disk periodically during IBD and on shutdown. Flat file block storage follows the Bitcoin Core blk*.dat format for cross-implementation compatibility.
+```bash
+make test
+```
 
-The wallet supports BIP-32/44/84 hierarchical deterministic key derivation with WIF import/export capability. Multi-wallet support allows creating, loading, and unloading named wallets at runtime. Wallet encryption uses AES-256-CBC with passphrase-based key derivation, and PSBT support enables multi-party signing workflows through createpsbt, decodepsbt, and walletprocesspsbt RPCs.
+The suite uses [busted](https://lunarmodules.github.io/busted/) and needs no network and no
+running node. Two tests read Bitcoin Core's script and sighash vectors, which are not
+vendored; [docs/status.md](docs/status.md#test-suite) shows how to fetch them and how to
+install busted.
+
+```
+src/main.lua          entry point, command-line flags, main loop
+src/validation.lua    block and transaction checks; src/script.lua is the interpreter
+src/consensus.lua     network parameters, deployments, assume-valid
+src/utxo.lua          chain state, UTXO cache, connect/disconnect, reorgs
+src/storage.lua       RocksDB (via FFI): blocks, headers, UTXO set, undo, indexes
+src/sync.lua          headers-first sync and block download
+src/peer.lua, src/peerman.lua, src/p2p.lua   P2P messages, peers, addrman
+src/mempool.lua       mempool policy, RBF, packages
+src/rpc.lua           JSON-RPC; src/rest.lua is REST
+src/wallet.lua        HD wallet; src/psbt.lua, src/miniscript.lua
+spec/, tests/, test_*.lua   test suite (spec/orphan_scripts_spec.lua runs the scripts)
+```
+
+`lunarblock/` holds generated shims that forward `require("lunarblock.<name>")` to `src/`
+(regenerate with `tools/regen-shims.sh`). The full map is
+in [docs/architecture.md](docs/architecture.md). See [CONTRIBUTING.md](CONTRIBUTING.md)
+before opening a pull request.
+
+## Security
+
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

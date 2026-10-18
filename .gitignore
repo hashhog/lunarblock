@@ -23,3 +23,8 @@ banlist.json
 mempool.dat
 fee_estimates.json
 *.log
+
+# Bitcoin Core test vectors fetched for tests/test_{script,sighash}_vectors.lua
+# (see docs/status.md); not vendored.
+resources/script_tests.json
+resources/sighash.json
