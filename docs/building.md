@@ -81,7 +81,10 @@ make test
 ```
 
 `make test` points busted at `~/.luarocks`; set `LUAROCKS_TREE=<dir>` if you installed it
-elsewhere.
+elsewhere. Run the suite through `make test` rather than calling `busted` directly: busted's
+own modules are not on LuaJIT's default search path, so a bare `busted` stops with
+`module 'busted.runner' not found` unless `LUA_PATH` and `LUA_CPATH` are set the way the
+`Makefile` sets them.
 
 ## Reproducible builds
 

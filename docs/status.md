@@ -34,8 +34,9 @@ restores the tip. Its result has `coins_written` and `txoutset_hash`; the latter
 `hash_serialized_3`. Run the same call on a Bitcoin Core node to get Core's value. At the
 tip, `gettxoutsetinfo` reports `hash_serialized_3` directly.
 
-The same calls work on regtest, which is a quick way to try them (with a regtest node
-running as in the README's quick start):
+The same calls work on regtest, which is a quick way to try them. Start a regtest node with
+the first two commands of the README's quick start (`export DATADIR=...` and the
+`luajit src/main.lua --regtest ...` line, not the `stop` call), then:
 
 ```bash
 curl -s --user lunarblock:changeme \
