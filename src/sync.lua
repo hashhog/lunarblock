@@ -2590,6 +2590,7 @@ end
 function HeaderChain:start_sync(peer)
   self.syncing = true
   self.sync_peer = peer
+  self.sync_request_time = os.time()
 
   -- Initialize per-peer sync state tracking if not present
   self.peer_sync_states = self.peer_sync_states or {}
@@ -2737,6 +2738,7 @@ end
 -- @param payload string: raw headers message payload
 -- @return number, string|nil: count accepted (-1 for error), error message
 function HeaderChain:handle_headers(peer, payload)
+  if self.sync_peer == peer then self.sync_request_time = os.time() end
   -- Deserialize headers
   local headers = p2p.deserialize_headers(payload)
 
@@ -2950,6 +2952,35 @@ end
 function HeaderChain:stop_sync()
   self.syncing = false
   self.sync_peer = nil
+  self.sync_request_time = nil
+end
+
+-- LB-5: Core HEADERS_DOWNLOAD_TIMEOUT_BASE (net_processing.cpp): the peer we
+-- sent the initial getheaders to has 15 minutes, plus 1 ms per header we still
+-- expect (one per 10 minutes of tip age), to answer.
+HeaderChain.HEADERS_DOWNLOAD_TIMEOUT_BASE = 15 * 60
+HeaderChain.HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER = 0.001
+
+--- Has the header-sync peer gone silent?  The latch (self.syncing) is only
+-- cleared by a headers message from the sync peer or its disconnect, so a peer
+-- that stays connected but never answers pinned header sync forever.  On
+-- timeout the latch is released and the silent peer is returned so the caller
+-- can disconnect it (Core: "Timeout downloading headers, disconnecting").
+-- @param now number|nil: clock override for tests (os.time() seconds)
+-- @return table|nil: the timed-out peer
+function HeaderChain:check_sync_timeout(now)
+  local peer = self.sync_peer
+  if not self.syncing or not peer or not self.sync_request_time then return nil end
+  now = now or os.time()
+  local tip_entry = self.header_tip_hash
+    and self.headers[types.hash256_hex(self.header_tip_hash)]
+  local tip_time = tip_entry and tip_entry.header and tip_entry.header.timestamp or now
+  local expected = math.max(0, (now - tip_time) / 600)
+  local limit = HeaderChain.HEADERS_DOWNLOAD_TIMEOUT_BASE
+              + HeaderChain.HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER * expected
+  if now - self.sync_request_time <= limit then return nil end
+  self:stop_sync()
+  return peer
 end
 
 --- Get the low-work sync state for a peer.

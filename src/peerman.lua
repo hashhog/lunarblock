@@ -3815,6 +3815,54 @@ function PeerManager:_cleanup_peer_trickle(p)
   end
 end
 
+-- LB-11: transaction request dedup (Core txdownloadman / TxRequestTracker).
+-- A tx announced by several peers, or announced again, used to draw one
+-- getdata per announcement.  Track what has been asked for: while a request is
+-- outstanding (GETDATA_TX_INTERVAL) further announcements of the same
+-- txid/wtxid are not requested again; the entry is cleared when the tx arrives
+-- or a peer answers notfound, and simply expires if the peer never answers.
+M.GETDATA_TX_INTERVAL = 60
+
+--- Claim the right to send a getdata for one announced transaction.
+-- @param kind string: "txid" or "wtxid" (the two hash spaces never mix)
+-- @param hash string: raw 32-byte hash
+-- @param now number|nil: clock override for tests
+-- @return boolean: true if the caller should request it now
+function PeerManager:claim_tx_request(kind, hash, now)
+  now = now or socket.gettime()
+  local reqs = self._tx_requested
+  if not reqs then
+    reqs = {}
+    self._tx_requested = reqs
+    self._tx_requested_n = 0
+  end
+  local key = kind .. hash
+  local at = reqs[key]
+  if at and now - at < M.GETDATA_TX_INTERVAL then return false end
+  if not at then
+    self._tx_requested_n = self._tx_requested_n + 1
+    if self._tx_requested_n > 50000 then
+      for k, t in pairs(reqs) do
+        if now - t >= M.GETDATA_TX_INTERVAL then
+          reqs[k] = nil
+          self._tx_requested_n = self._tx_requested_n - 1
+        end
+      end
+    end
+  end
+  reqs[key] = now
+  return true
+end
+
+--- Forget an outstanding tx request (tx received, or peer said notfound).
+function PeerManager:release_tx_request(kind, hash)
+  local reqs = self._tx_requested
+  if reqs and reqs[kind .. hash] then
+    reqs[kind .. hash] = nil
+    self._tx_requested_n = self._tx_requested_n - 1
+  end
+end
+
 --- Queue a transaction announcement for all established peers.
 -- Uses trickling: queues inv entries for later batched, randomized sending.
 -- BIP-37: if a peer has loaded a bloom filter (peer.bloom_filter ~= nil) the
