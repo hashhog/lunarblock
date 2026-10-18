@@ -2238,9 +2238,9 @@ local function main()
         local hash_hex = types.hash256_hex(item.hash)
         block_downloader:handle_notfound(hash_hex, peer)
       elseif item.type == p2p.INV_TYPE.MSG_TX or item.type == p2p.INV_TYPE.MSG_WITNESS_TX then
-        peer_manager:release_tx_request("txid", item.hash.bytes)
+        peer_manager:tx_request_notfound("txid", item.hash.bytes, peer)
       elseif item.type == p2p.INV_TYPE.MSG_WTX then
-        peer_manager:release_tx_request("wtxid", item.hash.bytes)
+        peer_manager:tx_request_notfound("wtxid", item.hash.bytes, peer)
       end
     end
   end)
@@ -2251,7 +2251,7 @@ local function main()
     for _, item in ipairs(items) do
       if item.type == p2p.INV_TYPE.MSG_TX or item.type == p2p.INV_TYPE.MSG_WITNESS_TX then
         local txid_hex = types.hash256_hex(item.hash)
-        if not mempool:has(txid_hex) and peer_manager:claim_tx_request("txid", item.hash.bytes) then
+        if not mempool:has(txid_hex) and peer_manager:claim_tx_request("txid", item.hash.bytes, peer) then
           to_request[#to_request + 1] = {
             type = p2p.INV_TYPE.MSG_WITNESS_TX,
             hash = item.hash,
@@ -2261,7 +2261,7 @@ local function main()
         -- BIP-339: wtxid-relay peers announce via MSG_WTX (=5); hash is wtxid.
         -- Look up by wtxid hex; if not in mempool, request via MSG_WTX getdata.
         local wtxid_hex = types.hash256_hex(item.hash)
-        if not mempool:has_wtxid(wtxid_hex) and peer_manager:claim_tx_request("wtxid", item.hash.bytes) then
+        if not mempool:has_wtxid(wtxid_hex) and peer_manager:claim_tx_request("wtxid", item.hash.bytes, peer) then
           to_request[#to_request + 1] = {
             type = p2p.INV_TYPE.MSG_WTX,
             hash = item.hash,
@@ -3508,12 +3508,16 @@ local function main()
     -- until a new peer connects or a block is announced, which may never
     -- happen on a -connect-pinned or otherwise-quiet node.
     -- LB-5: a sync peer that stays connected but answers nothing would pin the
-    -- latch forever; check_sync_timeout releases it and names the silent peer.
-    local silent = header_chain:check_sync_timeout()
+    -- latch forever; check_sync_timeout releases it, and says whether Core's
+    -- conditions for also disconnecting the silent peer hold.
+    local silent, drop = header_chain:check_sync_timeout(nil, peer_manager:get_established_peers())
     if silent then
-      print(string.format("Timeout downloading headers from %s:%d, disconnecting",
-        silent.ip or "?", silent.port or 0))
-      pcall(function() silent:disconnect("headers download timeout") end)
+      print(string.format("Timeout downloading headers from %s:%d, %s",
+        silent.ip or "?", silent.port or 0,
+        drop and "disconnecting" or "not disconnecting, retrying getheaders"))
+      if drop then
+        pcall(function() silent:disconnect("headers download timeout") end)
+      end
     end
     if not header_chain.syncing then
       local peers = peer_manager:get_established_peers()

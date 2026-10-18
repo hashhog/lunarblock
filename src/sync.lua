@@ -2960,15 +2960,35 @@ end
 -- expect (one per 10 minutes of tip age), to answer.
 HeaderChain.HEADERS_DOWNLOAD_TIMEOUT_BASE = 15 * 60
 HeaderChain.HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER = 0.001
+-- Core only treats a sync peer as stalling while the best header is older than
+-- this; once caught up the timeout is switched off.
+HeaderChain.HEADERS_SYNC_STALL_TIP_AGE = 24 * 3600
+
+-- Core fPreferredDownload: outbound (or noban), not a feeler, and able to
+-- serve blocks.
+local function is_preferred_download(p)
+  if p.is_feeler then return false end
+  if p.inbound and not p.noban then return false end
+  local svc = p.services or 0
+  return bit.band(svc, p2p.SERVICES.NODE_NETWORK) ~= 0
+      or bit.band(svc, p2p.SERVICES.NODE_NETWORK_LIMITED) ~= 0
+end
 
 --- Has the header-sync peer gone silent?  The latch (self.syncing) is only
 -- cleared by a headers message from the sync peer or its disconnect, so a peer
 -- that stays connected but never answers pinned header sync forever.  On
--- timeout the latch is released and the silent peer is returned so the caller
--- can disconnect it (Core: "Timeout downloading headers, disconnecting").
+-- timeout the latch is always released, so the main tick sends getheaders
+-- again (to this peer if it is the only candidate).  The peer is only to be
+-- disconnected under Core's SendMessages "Check for headers sync timeouts"
+-- conditions: the best header is more than 24 h old, the peer is not noban,
+-- and at least one other preferred-download peer exists.  (Core's third
+-- condition, nSyncStarted == 1, always holds: there is one sync peer here.)
+-- A --connect-pinned node, or one whose only outbound peer is itself in IBD
+-- and ignoring getheaders, keeps its peer.
 -- @param now number|nil: clock override for tests (os.time() seconds)
--- @return table|nil: the timed-out peer
-function HeaderChain:check_sync_timeout(now)
+-- @param peers table|nil: established peers, to look for an alternative
+-- @return table|nil, boolean: the timed-out peer, and whether to disconnect it
+function HeaderChain:check_sync_timeout(now, peers)
   local peer = self.sync_peer
   if not self.syncing or not peer or not self.sync_request_time then return nil end
   now = now or os.time()
@@ -2980,7 +3000,16 @@ function HeaderChain:check_sync_timeout(now)
               + HeaderChain.HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER * expected
   if now - self.sync_request_time <= limit then return nil end
   self:stop_sync()
-  return peer
+  local disconnect = false
+  if tip_time <= now - HeaderChain.HEADERS_SYNC_STALL_TIP_AGE and not peer.noban then
+    for _, p in ipairs(peers or {}) do
+      if p ~= peer and is_preferred_download(p) then
+        disconnect = true
+        break
+      end
+    end
+  end
+  return peer, disconnect
 end
 
 --- Get the low-work sync state for a peer.
