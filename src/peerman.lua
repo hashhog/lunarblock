@@ -2525,6 +2525,8 @@ function PeerManager:disconnect_peer(p, reason)
   self:_cleanup_peer_trickle(p)
   -- Clean up chain sync state
   self:_cleanup_peer_chain_sync(p)
+  -- Hand its outstanding tx requests to the other announcers (LB-11)
+  self:tx_requests_drop_peer(p)
   if self.callbacks.on_peer_disconnected then
     self.callbacks.on_peer_disconnected(p, reason)
   end
@@ -3472,6 +3474,9 @@ function PeerManager:tick()
   -- Process transaction trickling (batched, randomized inv sending)
   self:_process_trickle()
 
+  -- Re-route tx requests the asked peer did not answer in time (LB-11)
+  self:expire_tx_requests()
+
   -- Periodic self-address re-announcement (Core MaybeSendAddr Poisson timer;
   -- also delivers the first announcement once IBD ends).
   do
@@ -3813,6 +3818,149 @@ function PeerManager:_cleanup_peer_trickle(p)
   if self._peer_trickle then
     self._peer_trickle[key] = nil
   end
+end
+
+-- LB-11: transaction request dedup (Core txdownloadman / TxRequestTracker).
+-- A tx announced by several peers, or announced again, used to draw one
+-- getdata per announcement.  Now one peer is asked at a time; every other peer
+-- that announces the same txid/wtxid while that request is outstanding is
+-- remembered as a fallback.  When the requested peer does not deliver within
+-- GETDATA_TX_INTERVAL, answers notfound, or disconnects, the getdata goes to
+-- the next announcer still connected (Core: the announcement moves to
+-- COMPLETED and the next CANDIDATE becomes REQUESTED).  Without the fallback a
+-- silent first announcer would suppress the tx: honest peers announce it once.
+-- The entry is dropped when the tx arrives or no announcer is left.
+M.GETDATA_TX_INTERVAL = 60
+-- Fallback announcers remembered per tx (Core bounds per peer instead, at
+-- MAX_PEER_TX_ANNOUNCEMENTS; a per-tx bound keeps this table small).
+M.MAX_TX_ANNOUNCERS = 32
+-- Distinct txs tracked at once.  Past this, announcements are requested
+-- untracked (the pre-dedup behaviour) rather than dropped.
+M.MAX_TX_REQUESTS = 50000
+
+local function tx_request_inv_type(kind)
+  if kind == "wtxid" then return p2p.INV_TYPE.MSG_WTX end
+  return p2p.INV_TYPE.MSG_WITNESS_TX
+end
+
+local function tx_requests(self)
+  local reqs = self._tx_requested
+  if not reqs then
+    reqs = {}
+    self._tx_requested = reqs
+    self._tx_requested_n = 0
+  end
+  return reqs
+end
+
+local function tx_request_forget(self, key)
+  if self._tx_requested[key] then
+    self._tx_requested[key] = nil
+    self._tx_requested_n = self._tx_requested_n - 1
+  end
+end
+
+--- The outstanding request for `key` is over without the tx: ask the next
+-- announcer that is still connected, or forget the tx if none is left.
+function PeerManager:_tx_request_next(key, now)
+  local e = self._tx_requested[key]
+  if not e then return end
+  while #e.announcers > 0 do
+    local p = table.remove(e.announcers, 1)
+    if p.state == peer_mod.STATE.ESTABLISHED then
+      e.peer = p
+      e.expiry = now + M.GETDATA_TX_INTERVAL
+      p:send_message("getdata", p2p.serialize_inv({
+        { type = tx_request_inv_type(e.kind), hash = { bytes = e.hash } },
+      }))
+      return
+    end
+  end
+  tx_request_forget(self, key)
+end
+
+--- Record an announcement of a transaction and decide whether to request it.
+-- @param kind string: "txid" or "wtxid" (the two hash spaces never mix)
+-- @param hash string: raw 32-byte hash
+-- @param peer table: the announcing peer
+-- @param now number|nil: clock override for tests
+-- @return boolean: true if the caller should send the getdata to `peer` now
+function PeerManager:claim_tx_request(kind, hash, peer, now)
+  now = now or socket.gettime()
+  local reqs = tx_requests(self)
+  local key = kind .. hash
+  local e = reqs[key]
+  if e and now >= e.expiry then
+    self:_tx_request_next(key, now)
+    e = reqs[key]
+  end
+  if e then
+    if e.peer ~= peer and #e.announcers < M.MAX_TX_ANNOUNCERS then
+      for _, p in ipairs(e.announcers) do
+        if p == peer then return false end
+      end
+      e.announcers[#e.announcers + 1] = peer
+    end
+    return false
+  end
+  if self._tx_requested_n >= M.MAX_TX_REQUESTS then
+    self:expire_tx_requests(now, true)
+    if self._tx_requested_n >= M.MAX_TX_REQUESTS then return true end
+  end
+  reqs[key] = { kind = kind, hash = hash, peer = peer,
+                expiry = now + M.GETDATA_TX_INTERVAL, announcers = {} }
+  self._tx_requested_n = self._tx_requested_n + 1
+  return true
+end
+
+--- The transaction arrived: nothing more to request.
+function PeerManager:release_tx_request(kind, hash)
+  if self._tx_requested then tx_request_forget(self, kind .. hash) end
+end
+
+--- A peer answered notfound for a transaction.  If it was the peer we asked,
+-- move on to the next announcer; otherwise just drop its announcement.
+function PeerManager:tx_request_notfound(kind, hash, peer, now)
+  local e = self._tx_requested and self._tx_requested[kind .. hash]
+  if not e then return end
+  if e.peer == peer then
+    self:_tx_request_next(kind .. hash, now or socket.gettime())
+    return
+  end
+  for i, p in ipairs(e.announcers) do
+    if p == peer then table.remove(e.announcers, i); break end
+  end
+end
+
+--- Re-route every request outstanding to a peer that has disconnected.
+-- Its fallback announcements are skipped lazily by _tx_request_next.
+function PeerManager:tx_requests_drop_peer(peer, now)
+  local reqs = self._tx_requested
+  if not reqs then return end
+  now = now or socket.gettime()
+  local keys = {}
+  for key, e in pairs(reqs) do
+    if e.peer == peer then keys[#keys + 1] = key end
+  end
+  for _, key in ipairs(keys) do self:_tx_request_next(key, now) end
+end
+
+--- Move requests whose peer has not delivered within GETDATA_TX_INTERVAL on
+-- to the next announcer.  Swept at most once a second from tick().
+-- @param force boolean|nil: sweep even if one ran within the last second
+function PeerManager:expire_tx_requests(now, force)
+  local reqs = self._tx_requested
+  if not reqs then return end
+  now = now or socket.gettime()
+  if not force and self._tx_requested_swept and now - self._tx_requested_swept < 1 then
+    return
+  end
+  self._tx_requested_swept = now
+  local keys = {}
+  for key, e in pairs(reqs) do
+    if now >= e.expiry then keys[#keys + 1] = key end
+  end
+  for _, key in ipairs(keys) do self:_tx_request_next(key, now) end
 end
 
 --- Queue a transaction announcement for all established peers.

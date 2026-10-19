@@ -47,7 +47,10 @@ local function build_handler(mp, pool)
                     .. resolver_src
   local chunk = assert(loadstring(chunk_src, "=main.lua:tx-handler"))
 
-  local pm = { bans = {}, relayed = {}, handlers = {} }
+  local pm = { bans = {}, relayed = {}, released = {}, handlers = {} }
+  function pm:release_tx_request(kind, hash)
+    self.released[#self.released + 1] = kind
+  end
   function pm:register_handler(cmd, fn) self.handlers[cmd] = fn end
   function pm:add_ban_score(peer, score, reason)
     self.bans[#self.bans + 1] = { score = score, reason = reason }
@@ -126,6 +129,12 @@ describe("p2p tx handler (main.lua, live source)", function()
     assert.is_false(ok)
     assert.is_true(mempool_mod.is_missing_inputs(reason),
       "unexpected reject token: " .. tostring(reason))
+  end)
+
+  it("releases the outstanding getdata claim for a received tx (LB-11)", function()
+    local parent = spend(root, 0, 90000)
+    handle(PEER, wire(parent))
+    assert.same({ "txid", "wtxid" }, pm.released)
   end)
 
   it("orphans a child that arrives before its parent, then accepts it when the parent arrives", function()

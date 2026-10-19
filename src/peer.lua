@@ -117,6 +117,11 @@ M.FEEFILTER_VERSION = 70013
 M.SHORT_IDS_BLOCKS_VERSION = 70014
 M.WTXID_RELAY_VERSION = 70016
 
+-- Cap on bytes queued for a peer that is not draining its socket (LB-8).
+-- Core bounds this via -maxsendbuffer-style flow control; a peer more than this
+-- far behind is not keeping up and is dropped.
+M.MAX_SEND_BUFFER = 32 * 1024 * 1024
+
 -- Handshake timeout in seconds (60 seconds per spec)
 M.HANDSHAKE_TIMEOUT = 60
 
@@ -193,6 +198,7 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
   self.handshake_complete = false -- True after version/verack exchange
   self.version_received = false   -- True after receiving their version
   self.handshake_start_time = 0   -- When connection started (for timeout)
+  self.send_buffer = ""           -- Unsent tail of a partial non-blocking send (LB-8)
   self.wtxid_relay = false        -- BIP 339: peer wants wtxid for tx relay
   self.send_addrv2 = false        -- BIP 155: peer supports addrv2
   -- Services we advertised to this peer in our `version` message. Set in
@@ -567,13 +573,50 @@ function Peer:send_message(command, payload)
     msg = p2p.make_message(self.network.magic_bytes, command, payload)
   end
 
-  local sent, err = self.socket:send(msg)
-  if not sent then
+  -- LB-8: the socket is non-blocking, so luasocket's send() may accept only a
+  -- prefix of `msg` (nil, "timeout", last_index_sent).  That is back-pressure,
+  -- not a failure: queue the unsent tail and drain it on later ticks (Core
+  -- CNode::vSendMsg + SocketSendData).  Only a real socket error, or a peer
+  -- that lets the queue grow past MAX_SEND_BUFFER, drops the connection.
+  self.send_buffer = self.send_buffer or ""
+  if self.send_buffer ~= "" then
+    -- Earlier bytes are still queued: preserve message order.
+    self.send_buffer = self.send_buffer .. msg
+    if #self.send_buffer > M.MAX_SEND_BUFFER then
+      self:disconnect("send buffer overflow")
+      return false
+    end
+    return self:flush_send_buffer()
+  end
+  self.send_buffer = msg
+  return self:flush_send_buffer()
+end
+
+--- Write as much of the queued outbound data as the socket will take.
+-- @return boolean: false only if the peer was disconnected by a send error
+function Peer:flush_send_buffer()
+  local buf = self.send_buffer or ""
+  if buf == "" or not self.socket then return true end
+  local sent, err, last = self.socket:send(buf)
+  local n
+  if sent then
+    n = sent
+  elseif err == "timeout" or err == "wantwrite" then
+    n = last or 0
+  else
+    self.send_buffer = ""
     self:disconnect("send failed: " .. (err or "unknown"))
     return false
   end
-  self.last_send = socket.gettime()
-  self.bytes_sent = self.bytes_sent + #msg
+  if n > 0 then
+    self.last_send = socket.gettime()
+    self.bytes_sent = self.bytes_sent + n
+  end
+  self.send_buffer = buf:sub(n + 1)
+  if #self.send_buffer > M.MAX_SEND_BUFFER then
+    self:disconnect("send buffer overflow")
+    return false
+  end
   return true
 end
 
@@ -1157,6 +1200,7 @@ end
 --- Check for timeouts and send keepalive pings.
 function Peer:check_timeouts()
   local now = socket.gettime()
+  if (self.send_buffer or "") ~= "" and not self:flush_send_buffer() then return end
   -- Handshake timeout from connection start (default 60s; tests may
   -- shorten Peer.handshake_timeout so a half-open inbound is reaped
   -- without waiting a minute).
