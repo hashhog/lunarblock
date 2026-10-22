@@ -1545,6 +1545,27 @@ local function exact_block_proof(bits)
   return table.concat(out)
 end
 
+-- exact_block_proof is a byte-array long division; nBits only changes at a
+-- retarget, so memoize it. Bounded: testnet's min-difficulty blocks add a few
+-- extra distinct values, never thousands.
+local PROOF_MEMO_MAX = 4096
+local proof_memo, proof_memo_n = {}, 0
+local function block_proof_memo(bits)
+  local p = proof_memo[bits]
+  if p then return p end
+  p = exact_block_proof(bits)
+  if proof_memo_n >= PROOF_MEMO_MAX then proof_memo, proof_memo_n = {}, 0 end
+  proof_memo[bits] = p
+  proof_memo_n = proof_memo_n + 1
+  return p
+end
+
+-- Per-storage chainwork cache for compute_chainwork: cumulative work at every
+-- CHAINWORK_CHECKPOINT_INTERVAL-th height plus the last answer, keyed by hash.
+-- Weak-keyed so a closed storage object takes its cache with it.
+local CHAINWORK_CHECKPOINT_INTERVAL = 1000
+local chainwork_memo = setmetatable({}, { __mode = "k" })
+
 --- Cumulative chainwork at a block, computed natively (no external node).
 --- Walks the active-chain HEIGHT_INDEX from genesis to block_height, summing
 --- exact_block_proof for each block's nBits. Returns a 64-char big-endian hex
@@ -1591,14 +1612,87 @@ local function compute_chainwork(storage, block_height, network)
     end
   end
 
-  for h = start_h, block_height do
+  -- Resume from the best cached point instead of re-walking from start_h.
+  -- RPC runs on the single main loop, so a full walk (~28k headers on mainnet,
+  -- ~47 s) stalled every request queued behind getblockchaininfo /
+  -- getblockheader, getpeerinfo included. Cached work is keyed by block hash,
+  -- which commits to the whole ancestry, and is only used after confirming
+  -- that hash is still on the active chain at that height, so a reorg can
+  -- never serve the replaced branch's work.
+  local memo = chainwork_memo[storage]
+  if not memo then
+    memo = { checkpoints = {}, last = nil }
+    chainwork_memo[storage] = memo
+  end
+  local function active_at(h, hash_bytes)
+    local hh = storage.get_hash_by_height(h)
+    return hh ~= nil and hh.bytes == hash_bytes
+  end
+  local from_h, end_hash = start_h, nil
+  local last = memo.last
+  if last and last.height >= start_h and last.height <= block_height
+     and active_at(last.height, last.hash) then
+    from_h, work = last.height + 1, last.work
+    end_hash = last.hash
+  end
+  local c = block_height - (block_height % CHAINWORK_CHECKPOINT_INTERVAL)
+  while c >= start_h and c >= from_h do
+    local cp = memo.checkpoints[c]
+    if cp and active_at(c, cp.hash) then
+      from_h, work = c + 1, cp.work
+      end_hash = cp.hash
+      break
+    end
+    c = c - CHAINWORK_CHECKPOINT_INTERVAL
+  end
+
+  for h = from_h, block_height do
     local hh = storage.get_hash_by_height(h)
     if not hh then return nil end
     local hdr = storage.get_header(hh)
     if not hdr then return nil end
-    work = consensus.work_add(work, exact_block_proof(hdr.bits))
+    work = consensus.work_add(work, block_proof_memo(hdr.bits))
+    end_hash = hh.bytes
+    if h % CHAINWORK_CHECKPOINT_INTERVAL == 0 then
+      memo.checkpoints[h] = { hash = hh.bytes, work = work }
+    end
+  end
+  if end_hash then
+    memo.last = { height = block_height, hash = end_hash, work = work }
   end
   return consensus.work_to_hex(work)
+end
+
+--- Height of `hash` on the active chain, or nil if it is not on it.
+-- The header index knows each header's height, so confirm the active chain
+-- holds this hash there (one HEIGHT_INDEX read). Only when that cannot answer
+-- (no header index, header unknown to it, or a different block active at that
+-- height) fall back to scanning HEIGHT_INDEX from genesis, which on mainnet is
+-- ~970k iterator steps on the single main loop.
+local function active_height_of(rpc, hash)
+  local hc = rpc.header_chain
+  if hc and hc.get_header and rpc.storage.get_hash_by_height then
+    local ok, entry = pcall(hc.get_header, hc, hash)
+    if ok and type(entry) == "table" and type(entry.height) == "number" then
+      local hh = rpc.storage.get_hash_by_height(entry.height)
+      if hh and hh.bytes == hash.bytes then return entry.height end
+    end
+  end
+  local iter = rpc.storage.iterator and rpc.storage.iterator("height")
+  if not iter then return nil end
+  local found = nil
+  iter.seek_to_first()
+  while iter.valid() do
+    local v = iter.value()
+    if v and #v == 32 and v == hash.bytes then
+      local k = iter.key()
+      found = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
+      break
+    end
+    iter.next()
+  end
+  iter.destroy()
+  return found
 end
 
 --- On-disk footprint of the block/chainstate store, in bytes.
@@ -2353,22 +2447,7 @@ function RPCServer:register_methods()
     -- Get block height from height index (reverse lookup)
     local block_height = nil
     if rpc.chain_state and rpc.chain_state.tip_height then
-      -- Try to find height by iterating (expensive) or from chain state
-      -- For efficiency, we iterate height index
-      local iter = rpc.storage.iterator("height")
-      if iter then
-        iter.seek_to_first()
-        while iter.valid() do
-          local v = iter.value()
-          if v and #v == 32 and v == hash.bytes then
-            local k = iter.key()
-            block_height = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
-            break
-          end
-          iter.next()
-        end
-        iter.destroy()
-      end
+      block_height = active_height_of(rpc, hash)
     end
 
     -- Calculate confirmations
@@ -12354,24 +12433,10 @@ end
       return M.hex_encode(serialize.serialize_block_header(header))
     end
 
-    -- Look up height via HEIGHT_INDEX iterator (same approach as getblock).
+    -- Height on the active chain (nil if the block is not on it).
     local block_height = nil
     if rpc.chain_state and rpc.chain_state.tip_height then
-      local iter = rpc.storage.iterator("height")
-      if iter then
-        iter.seek_to_first()
-        while iter.valid() do
-          local v = iter.value()
-          if v and #v == 32 and v == hash.bytes then
-            local k = iter.key()
-            block_height = k:byte(1) * 16777216 + k:byte(2) * 65536
-                         + k:byte(3) * 256 + k:byte(4)
-            break
-          end
-          iter.next()
-        end
-        iter.destroy()
-      end
+      block_height = active_height_of(rpc, hash)
     end
 
     -- confirmations: ComputeNextBlockAndDepth (blockchain.cpp:116) ->
