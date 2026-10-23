@@ -13397,8 +13397,11 @@ end
           res.vsize = vsize
           res.fees = {
             base = fee_btc,
-            ["effective-feerate"] = feerate_btc_per_kvb,
-            ["effective-includes"] = {res.txid},
+            -- ValueFromAmount(CFeeRate(fee, vsize).GetFeePerK()): integer
+            -- sat/kvB, rendered with 8 decimals; includes are wtxids.
+            ["effective-feerate"] = (vsize > 0)
+              and (math.floor(atmp.fee * 1000 / vsize) / consensus.COIN) or 0,
+            ["effective-includes"] = {res.wtxid},
           }
         end
       else
