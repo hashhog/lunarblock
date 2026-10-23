@@ -2403,40 +2403,44 @@ function RPCServer:register_methods()
     local hash = types.hash256_from_hex(blockhash)
     local block = rpc.storage.get_block(hash)
     if not block then
-      -- Check whether this is a known-but-pruned block. We never delete
-      -- CF.HEADERS, so the header is still around even after the body
-      -- is pruned. If header exists AND its height has been pruned,
-      -- mirror Bitcoin Core's RPC_MISC_ERROR + "Block not available
-      -- (pruned data)" string (rpc/blockchain.cpp:677).
+      -- Core: LookupBlockIndex fails -> -5 "Block not found"; a block that IS
+      -- in the index but has no data -> CheckBlockDataAvailability
+      -- (rpc/blockchain.cpp:670): -1 "Block not available (pruned data)" when
+      -- it was really pruned, else -1 "Block not available (not fully
+      -- downloaded)".  The header store is our block index (CF.HEADERS is
+      -- never pruned), so a stored header without a body is the second case —
+      -- e.g. every block at or below a snapshot base (bodies never fetched).
+      local header = rpc.storage.get_header and rpc.storage.get_header(hash)
+      if not header then
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+      end
       if rpc.pruner and rpc.pruner.enabled then
-        local header = rpc.storage.get_header(hash)
-        if header then
-          -- Reverse-lookup height for this hash via the height index.
-          -- This is O(prune_height) worst case but only runs on the
-          -- error path; fast path (block present) never reaches here.
-          local found_height = nil
-          local iter = rpc.storage.iterator("height")
-          if iter then
-            iter.seek_to_first()
-            while iter.valid() do
-              local v = iter.value()
-              if v and #v == 32 and v == hash.bytes then
-                local k = iter.key()
-                found_height = k:byte(1) * 16777216 + k:byte(2) * 65536
-                  + k:byte(3) * 256 + k:byte(4)
-                break
-              end
-              iter.next()
+        -- Reverse-lookup height for this hash via the height index.
+        -- This is O(prune_height) worst case but only runs on the
+        -- error path; fast path (block present) never reaches here.
+        local found_height = nil
+        local iter = rpc.storage.iterator("height")
+        if iter then
+          iter.seek_to_first()
+          while iter.valid() do
+            local v = iter.value()
+            if v and #v == 32 and v == hash.bytes then
+              local k = iter.key()
+              found_height = k:byte(1) * 16777216 + k:byte(2) * 65536
+                + k:byte(3) * 256 + k:byte(4)
+              break
             end
-            iter.destroy()
+            iter.next()
           end
-          if found_height and rpc.pruner:is_pruned(found_height) then
-            error({code = M.ERROR.MISC_ERROR,
-                   message = "Block not available (pruned data)"})
-          end
+          iter.destroy()
+        end
+        if found_height and rpc.pruner:is_pruned(found_height) then
+          error({code = M.ERROR.MISC_ERROR,
+                 message = "Block not available (pruned data)"})
         end
       end
-      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+      error({code = M.ERROR.MISC_ERROR,
+             message = "Block not available (not fully downloaded)"})
     end
 
     -- Verbosity 0: return raw hex
@@ -3255,9 +3259,8 @@ function RPCServer:register_methods()
   --   headers      — best-header height seen so far (-1 if none; Core
   --                  chainman.m_best_header ? nHeight : -1)
   --   chainstates  — ARRAY ordered by work with the most-work (ACTIVE)
-  --                  chainstate LAST.  lunarblock has a single fully-validated
-  --                  chainstate (no AssumeUTXO snapshot active), so this is a
-  --                  1-element array.  Each entry:
+  --                  chainstate LAST.  lunarblock keeps a single live
+  --                  chainstate, so this is a 1-element array.  Each entry:
   --     blocks                — active chainstate tip height
   --     bestblockhash         — tip block hash hex
   --     bits                  — tip nBits, "%08x" (Core strprintf("%08x", nBits))
@@ -3265,15 +3268,18 @@ function RPCServer:register_methods()
   --     difficulty            — tip difficulty (Core GetDifficulty), %.16g
   --     verificationprogress  — progress towards the network tip [0..1]
   --     snapshot_blockhash    — OPTIONAL; emitted only for a from-snapshot
-  --                             chainstate.  OMITTED here (no snapshot active).
+  --                             chainstate (loadtxoutset this process, or a
+  --                             datadir bootstrapped with --import-utxo).
   --     coins_db_cache_bytes  — configured chainstate coins-DB cache (the
   --                             RocksDB LRU block cache, db._block_cache_bytes;
   --                             Core cs.m_coinsdb_cache_size_bytes)
   --     coins_tip_cache_bytes — configured coins-tip (UTXO) cache in bytes
   --                             (coin_view.max_cache_bytes; Core
   --                             cs.m_coinstip_cache_size_bytes)
-  --     validated             — true (single fully-validated chainstate; Core
-  --                             cs.m_assumeutxo == Assumeutxo::VALIDATED)
+  --     validated             — Core cs.m_assumeutxo == Assumeutxo::VALIDATED:
+  --                             true for a genesis-synced chainstate, false for
+  --                             a from-snapshot one until the background pass
+  --                             re-derived the base UTXO set.
   self.methods["getchainstates"] = function(rpc, _params)
     -- headers: best-header height seen so far.  Prefer the header chain's tip
     -- (Core chainman.m_best_header); fall back to chain_state's header tip,
@@ -3358,6 +3364,19 @@ function RPCServer:register_methods()
       elseif snap.chain_state and snap.chain_state.from_snapshot_blockhash then
         snapshot_blockhash_hex =
           types.hash256_hex(snap.chain_state.from_snapshot_blockhash)
+      end
+    else
+      -- A datadir bootstrapped with --import-utxo (or restarted after a
+      -- loadtxoutset) has no in-process SnapshotChainstate, but it persists
+      -- its snapshot record (utxo.read_snapshot_record).
+      -- No background chainstate ever re-derives the base UTXO set from
+      -- genesis on such a node, so the snapshot stays unvalidated: Core shows
+      -- m_from_snapshot_blockhash + validated:false until its background
+      -- download completes (measured on v31.1, also after a restart).
+      local base_hash = require("lunarblock.utxo").read_snapshot_record(rpc.storage)
+      if base_hash then
+        snapshot_blockhash_hex = types.hash256_hex(base_hash)
+        active_validated = false
       end
     end
 
@@ -5491,8 +5510,16 @@ end
     -- localservices: NODE_NETWORK(1) | NODE_WITNESS(8) | NODE_NETWORK_LIMITED(1024)
     -- | NODE_P2P_V2(2048) = 0xc09. Names mirror the set bits in Core's order.
     -- 1 + 8 + 1024 + 2048 = 0xc09.
+    -- NODE_NETWORK is dropped (0xc08) by the same gate the version message
+    -- uses (p2p.advertises_node_network): while block bodies below a snapshot
+    -- base are missing, or when pruning — Core init.cpp:1947 / loadtxoutset.
     local LOCAL_SERVICES = "0000000000000c09"
     local SERVICE_NAMES = {"NETWORK", "WITNESS", "NETWORK_LIMITED", "P2P_V2"}
+    local prune_mode = (rpc.pruner and rpc.pruner.enabled) and true or false
+    if not p2p.advertises_node_network(prune_mode) then
+      LOCAL_SERVICES = "0000000000000c08"
+      SERVICE_NAMES = {"WITNESS", "NETWORK_LIMITED", "P2P_V2"}
+    end
 
     -- networks[] in Core's GetNetworksInfo order: ipv4, ipv6, onion, i2p, cjdns.
     -- ipv4/ipv6 are reachable (limited=false); onion/i2p/cjdns are limited (no
@@ -14005,6 +14032,23 @@ end
       error({code = M.ERROR.MISC_ERROR,
         message = "Bad snapshot content hash (background re-validation): "
           .. tostring(bg_final.error)})
+    end
+
+    -- Service bits (Core rpc/blockchain.cpp loadtxoutset ~3432:
+    -- RemoveLocalServices(NODE_NETWORK) + AddLocalServices(NODE_NETWORK_LIMITED);
+    -- init.cpp:1368 re-adds NODE_NETWORK once the background download
+    -- completes).  Until the background pass has re-derived the base from
+    -- genesis we cannot serve the blocks below the base, so stop promising
+    -- NODE_NETWORK to peers.  When every historical block was already local
+    -- and the best-effort drive above validated the snapshot, history is
+    -- complete and NODE_NETWORK stays.
+    local history_incomplete = not rpc.snapshot_chainstate:is_validated()
+    p2p.set_history_incomplete(history_incomplete)
+    -- Persist the snapshot record so a restart keeps answering the same way
+    -- (Core keeps the snapshot chainstate and NODE_NETWORK off across a
+    -- restart until the background download completes).
+    if history_incomplete and rpc.storage and rpc.storage.CF then
+      utxo_mod.write_snapshot_record(rpc.storage, meta.base_blockhash)
     end
 
     return {

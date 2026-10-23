@@ -2432,6 +2432,50 @@ function ChainState:get_snapshot_base_height()
   return self._snapshot_base_height
 end
 
+--------------------------------------------------------------------------------
+-- Snapshot record (history below the base is not held)
+--------------------------------------------------------------------------------
+--
+-- A chainstate bootstrapped from a UTXO snapshot (--import-utxo, or the
+-- loadtxoutset RPC before its background pass validated) never holds the
+-- block bodies below the snapshot base.  Core keeps that fact on disk (the
+-- snapshot chainstate's base blockhash, m_from_snapshot_blockhash) and, while
+-- the historical chainstate is unfinished, reports getchainstates
+-- snapshot_blockhash + validated:false and advertises NODE_NETWORK_LIMITED
+-- without NODE_NETWORK, also after a restart (init.cpp:1947).
+--
+-- lunarblock persists the base blockhash under CF.META "snapshot_blockhash"
+-- (32 raw bytes).  Datadirs imported before that key existed are recognised
+-- by the snapshot base height HeaderChain:inject_snapshot_base persists
+-- (CF.META "snapshot_base_height") plus the base's height-index row.
+M.SNAPSHOT_BLOCKHASH_KEY = "snapshot_blockhash"
+
+--- Persist the snapshot base blockhash of this datadir.
+-- @param storage table: chainstate storage
+-- @param hash hash256: snapshot base block hash
+function M.write_snapshot_record(storage, hash)
+  storage.put(storage.CF.META, M.SNAPSHOT_BLOCKHASH_KEY, hash.bytes, true)
+end
+
+--- Read the snapshot base blockhash of this datadir (uncached).
+-- @param storage table: chainstate storage
+-- @return hash256|nil: the base hash, or nil for a genesis-synced datadir
+function M.read_snapshot_record(storage)
+  if not storage or not storage.get or not storage.CF or not storage.CF.META then
+    return nil
+  end
+  local data = storage.get(storage.CF.META, M.SNAPSHOT_BLOCKHASH_KEY)
+  if data and #data == 32 then
+    return types.hash256(data)
+  end
+  local hdata = storage.get(storage.CF.META, "snapshot_base_height")
+  if hdata and #hdata >= 4 and storage.get_hash_by_height then
+    local height = serialize.buffer_reader(hdata:sub(1, 4)).read_u32le()
+    return storage.get_hash_by_height(height)
+  end
+  return nil
+end
+
 function ChainState:init()
   local hash, height = self.storage.get_chain_tip()
   if hash then

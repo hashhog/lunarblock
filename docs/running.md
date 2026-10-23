@@ -48,7 +48,7 @@ the node with `Unknown option: ...`. Boolean values may be `1/0`, `true/false`,
 | `--coinstatsindex[=BOOL]` | off | Per-height UTXO statistics (`gettxoutsetinfo` at past heights). |
 | `--txospenderindex[=BOOL]` | off | Spent-outpoint index (`gettxspendingprevout` for confirmed spends). |
 | `--import-blocks FILE` | none | Import blocks from a framed file (`-` for stdin), then exit. Each frame is a 4-byte little-endian height, a 4-byte little-endian size and the raw block. |
-| `--import-utxo FILE` | none | Load a UTXO snapshot written by `dumptxoutset` (Core's format), then exit. If the snapshot's block is in the built-in assumeutxo table, the loaded set's hash must match it or the import fails. |
+| `--import-utxo FILE` | none | Load a UTXO snapshot written by `dumptxoutset` (Core's format), then exit. If the snapshot's block is in the built-in assumeutxo table, the loaded set's hash must match it or the import fails. The node never downloads the blocks below the snapshot, so, like Core, it then advertises `NODE_NETWORK_LIMITED` without `NODE_NETWORK`, `getblock` on those blocks answers -1 `Block not available (not fully downloaded)`, and `getchainstates` shows `snapshot_blockhash` with `validated: false`. |
 | `--mempool-fullrbf BOOL` (`=`) | `1` | Full replace-by-fee. `0` requires BIP-125 signalling. |
 
 ### Network
