@@ -2577,6 +2577,22 @@ function RPCServer:register_methods()
               }),
             }
             if txinwit then vseq[#vseq + 1] = "txinwitness"; vseq[#vseq + 1] = txinwit end
+            -- Core maps every verbosity above 2 to SHOW_DETAILS_AND_PREVOUT
+            -- (core_io.cpp TxToUniv): prevout {generated,height,value,scriptPubKey}
+            -- sits between txinwitness and sequence.
+            if verbosity >= 3 and block_undo then
+              local txu = block_undo.tx_undo[i - 1]
+              local po = txu and txu.prev_outputs and txu.prev_outputs[j]
+              if po then
+                vseq[#vseq + 1] = "prevout"
+                vseq[#vseq + 1] = M._oj({
+                  "generated",    po.is_coinbase and true or false,
+                  "height",       po.height,
+                  "value",        M._oj_amount(po.value),
+                  "scriptPubKey", M.scriptpubkey_oj(po.script_pubkey, rpc.network),
+                })
+              end
+            end
             vseq[#vseq + 1] = "sequence"; vseq[#vseq + 1] = inp.sequence
           end
           vin[j] = M._oj(vseq)
