@@ -4627,7 +4627,10 @@ function RPCServer:register_methods()
       local msg
       if blockhash_hex then
         msg = "No such transaction found in the provided block. Use gettransaction for wallet transactions."
-      elseif rpc.storage and rpc.storage.get then
+      elseif txindex_on then
+        -- Core (rpc/rawtransaction.cpp:322-327): the "or blockchain" wording is
+        -- only valid when g_txindex exists and is synced.  lunarblock's txindex
+        -- is inline, so it is always at the tip when enabled.
         msg = "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
       else
         msg = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
