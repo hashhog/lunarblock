@@ -930,6 +930,14 @@ describe("rpc", function()
             return false, accept_result or "validation failed"
           end
         end,
+        -- BroadcastTransaction's max-fee pre-check test-accepts without adding
+        -- the tx; a 100 vB tx, so fee 1000 sat = 10 sat/vB.
+        accept_to_memory_pool = function(self, tx, test_accept)
+          if accept_result == true then
+            return {accepted = true, fee = accept_fee or 1000, vsize = 100}
+          end
+          return {accepted = false, reject_reason = tostring(accept_result)}
+        end,
         remove_transaction = function(self, txid_hex, reason)
           self.entries[txid_hex] = nil
         end
@@ -1108,8 +1116,8 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("exceeds maxfeerate"))
+      assert.equal(rpc.ERROR.VERIFY_ERROR, decoded.error.code)
+      assert.truthy(decoded.error.message:match("Fee exceeds maximum configured"))
     end)
 
     it("accepts any fee when maxfeerate is 0", function()
@@ -1152,8 +1160,8 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("cannot exceed"))
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
+      assert.equal("Fee rates larger than or equal to 1BTC/kvB are not accepted", decoded.error.message)
     end)
 
     it("uses default maxfeerate of 0.10 BTC/kvB", function()

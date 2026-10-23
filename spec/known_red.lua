@@ -137,9 +137,6 @@ return {
   ["rpc reconsiderblock rejects invalid block hash format"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc savemempool writes mempool.dat and returns the filename"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc sendrawtransaction broadcasts inv to peers on success"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
-  ["rpc sendrawtransaction rejects maxfeerate > 1 BTC/kvB"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- ERROR spec/rpc_spec.lua
-  ["rpc sendrawtransaction rejects transaction exceeding maxfeerate"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- ERROR spec/rpc_spec.lua
-  ["rpc sendrawtransaction removes tx from mempool if maxfeerate check fails after acceptance"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc sendrawtransaction returns DESERIALIZATION_ERROR for empty hex"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc sendrawtransaction returns DESERIALIZATION_ERROR for invalid hex"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc sendrawtransaction returns VERIFY_ALREADY_IN_CHAIN when tx already in mempool"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- ERROR spec/rpc_spec.lua
