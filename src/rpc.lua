@@ -5966,9 +5966,8 @@ end
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
     -- BUG-22 fix (W115 FIX-50): include mapped_as field per peer.
-    -- Core: src/rpc/net.cpp getpeerinfo includes "mapped_as" (uint32) when
-    -- asmap is loaded.  We always include the field; it is 0 when no asmap
-    -- is loaded or the address has no mapping.
+    -- Core: src/rpc/net.cpp getpeerinfo includes "mapped_as" (uint32) only
+    -- when the peer maps to a non-zero AS (needs a loaded asmap).
     local ok_asmap, asmap_mod_rpc = pcall(require, "lunarblock.asmap")
     local ok_pm, pm_mod = pcall(require, "lunarblock.peerman")
     local loaded_asmap = (ok_pm and pm_mod._asmap_data) or nil
@@ -5996,9 +5995,31 @@ end
         if ok_asmap and loaded_asmap then
           peer_mapped_as = asmap_mod_rpc.get_mapped_as(loaded_asmap, p.ip)
         end
+        -- Core net.cpp:229-234: addrbind is our local socket address (when
+        -- valid); addrlocal is the address the peer reported seeing us at in
+        -- its version message (CNode::SetAddrLocal), omitted when empty/unset.
+        local function fmt_addr_port(ip, port)
+          if ip:find(":", 1, true) then return "[" .. ip .. "]:" .. port end
+          return ip .. ":" .. port
+        end
+        local peer_addrbind = nil
+        if p.socket and p.socket.getsockname then
+          local ok_sn, bind_ip, bind_port = pcall(p.socket.getsockname, p.socket)
+          bind_port = tonumber(bind_port)
+          if ok_sn and bind_ip and bind_port and bind_ip ~= "0.0.0.0" and bind_ip ~= "::" then
+            peer_addrbind = fmt_addr_port(bind_ip, bind_port)
+          end
+        end
+        local peer_addrlocal = nil
+        local vi = p.version_info
+        if vi and vi.recv_ip and vi.recv_ip ~= "0.0.0.0" and vi.recv_ip ~= "::" then
+          peer_addrlocal = fmt_addr_port(vi.recv_ip, vi.recv_port or 0)
+        end
         peers[#peers + 1] = {
           id = i - 1,
           addr = p.ip .. ":" .. p.port,
+          addrbind = peer_addrbind,
+          addrlocal = peer_addrlocal,
           network = _peer_network_from_ip(p.ip),
           services = string.format("%016x", svc),
           servicesnames = svc_names,
@@ -6054,7 +6075,8 @@ end
           connection_type = is_inbound and "inbound" or "outbound-full-relay",
           transport_protocol_type = "v1",
           session_id = "",
-          mapped_as = peer_mapped_as,
+          -- Core net.cpp:235: mapped_as only when the mapped AS is non-zero.
+          mapped_as = (peer_mapped_as ~= 0) and peer_mapped_as or nil,
         }
       end
     end
