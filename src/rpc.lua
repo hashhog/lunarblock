@@ -592,11 +592,27 @@ local function parse_hex_v(v, name)
 end
 M.parse_hex_v = parse_hex_v
 
---- DecodeHexTx: nil when the hex is not a complete transaction.
-local function decode_hex_tx(hex)
+--- DecodeHexTx (core_io.cpp DecodeTx): nil unless the hex is a transaction
+--- that consumes the WHOLE input.  try_witness (extended serialization) is
+--- tried first, then try_no_witness (legacy); Core's defaults for
+--- sendrawtransaction/testmempoolaccept are try_no_witness=false,
+--- try_witness=true.  decoderawtransaction derives both from `iswitness`.
+--- Deviation: Core's CheckTxScriptsSanity (HasValidOps) tie-break between two
+--- full decodes is not ported; the extended decode wins, which is Core's
+--- answer whenever the tie-break does not separate them.
+local function decode_hex_tx(hex, try_no_witness, try_witness)
   if not is_hex_str(hex) then return nil end
-  local ok, tx = pcall(serialize.deserialize_transaction, M.hex_decode(hex))
-  if not ok or not tx then return nil end
+  if try_witness == nil then try_witness = true end
+  local raw = M.hex_decode(hex)
+  local function attempt(allow_witness)
+    local reader = serialize.buffer_reader(raw)
+    local ok, tx = pcall(serialize.deserialize_transaction, reader, allow_witness)
+    if ok and tx and reader.is_eof() then return tx end
+    return nil
+  end
+  local tx
+  if try_witness then tx = attempt(true) end
+  if not tx and try_no_witness then tx = attempt(false) end
   return tx
 end
 
@@ -4845,7 +4861,18 @@ function RPCServer:register_methods()
     if type(hex) ~= "string" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Transaction hex required"})
     end
-    local tx = decode_hex_tx(hex)
+    -- rawtransaction.cpp: iswitness=true -> witness only, false -> legacy
+    -- only, absent -> both (heuristic).
+    local iswitness = params[2]
+    if iswitness == cjson.null then iswitness = nil end
+    local try_witness, try_no_witness = true, true
+    if iswitness ~= nil then
+      if type(iswitness) ~= "boolean" then
+        error({code = M.ERROR.INVALID_PARAMS, message = "iswitness must be boolean"})
+      end
+      try_witness, try_no_witness = iswitness, not iswitness
+    end
+    local tx = decode_hex_tx(hex, try_no_witness, try_witness)
     if not tx then
       error({code = M.ERROR.DESERIALIZATION_ERROR, message = "TX decode failed"})
     end
