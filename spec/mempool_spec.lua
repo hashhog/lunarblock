@@ -3110,7 +3110,10 @@ describe("mempool", function()
 
         local ok, err = mp:accept_transaction(tx)
         assert.is_false(ok)
-        assert.truthy(err:match("mandatory%-script%-verify%-flag%-failed"))
+        -- Core v31 CheckInputScripts under STANDARD flags: the mempool reject
+        -- is "mempool-script-verify-flag-failed (<ScriptErrorString>)"
+        -- (validation.cpp:2120); "mandatory-..." no longer exists in Core.
+        assert.truthy(err:match("^mempool%-script%-verify%-flag%-failed %("), err)
       end)
 
       it("does not run verify_script when gate is off (default)", function()

@@ -7870,47 +7870,65 @@ end
       error({code = M.ERROR.INVALID_PARAMS,
         message = "package-not-child-with-parents-tree: parents must not spend other parents in the package"})
     end
-    local accept_ok, err_or_results = rpc.mempool:accept_package(txs)
-    local tx_results = {}
-    -- accept_package returns (true, {...}) on success or (false, err_msg).
-    if accept_ok then
+    local state, results = rpc.mempool:process_new_package(txs, false)
+    local package_msg = "success"
+    if state then
+      package_msg = mempool_mod.validation_state_string(state.reason, state.details)
+    end
+
+    -- Broadcast what is in the mempool now (Core: every member that exists,
+    -- including ones that were already there).
+    if rpc.peer_manager then
+      local invs = {}
       for _, tx in ipairs(txs) do
         local txid = validation.compute_txid(tx)
-        local wtxid = validation.compute_wtxid(tx)
-        local txid_hex = types.hash256_hex(txid)
-        local wtxid_hex = types.hash256_hex(wtxid)
-        local entry = rpc.mempool:get_entry(txid_hex)
-        local fee_btc = entry and (entry.fee / consensus.COIN) or 0
-        local vsize = entry and entry.vsize or 0
-        tx_results[wtxid_hex] = {
-          txid = txid_hex,
-          vsize = vsize,
-          fees = {
-            base = fee_btc,
-          },
-        }
-      end
-      -- Broadcast via inv (matches sendrawtransaction).
-      if rpc.peer_manager then
-        local invs = {}
-        for _, tx in ipairs(txs) do
-          local txid = validation.compute_txid(tx)
+        if rpc.mempool.entries[types.hash256_hex(txid)] then
           invs[#invs + 1] = {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
         end
-        local inv_payload = p2p.serialize_inv(invs)
-        rpc.peer_manager:broadcast("inv", inv_payload)
       end
-      return {
-        package_msg = "success",
-        ["tx-results"] = tx_results,
-        ["replaced-transactions"] = {},
-      }
+      if #invs > 0 then
+        rpc.peer_manager:broadcast("inv", p2p.serialize_inv(invs))
+      end
     end
-    return {
-      package_msg = tostring(err_or_results),
-      ["tx-results"] = tx_results,
-      ["replaced-transactions"] = {},
-    }
+
+    -- Per-tx results keyed by wtxid, in Core's shape and pushKV order
+    -- (rpc/mempool.cpp:1457-1511).  Emitted as ordered JSON: the deployed
+    -- lua-cjson (2.1.0) has no empty_array_mt, so a plain {} would encode
+    -- replaced-transactions as an object.
+    local tx_results = {}
+    for _, tx in ipairs(txs) do
+      local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+      local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
+      local res = results[wtxid_hex]
+      local inner = { "txid", txid_hex }
+      if not res then
+        inner[#inner + 1] = "error"; inner[#inner + 1] = "package-not-validated"
+      elseif res.kind == "different_witness" then
+        inner[#inner + 1] = "other-wtxid"; inner[#inner + 1] = res.other_wtxid
+      elseif res.kind == "invalid" then
+        inner[#inner + 1] = "error"
+        inner[#inner + 1] = mempool_mod.validation_state_string(res.reason, res.details)
+      else
+        local fees = { "base", oj_amount(res.fee) }
+        if res.kind == "valid" then
+          -- Not reported for MEMPOOL_ENTRY: whether the package feerate was
+          -- used when it was first submitted is unknown.
+          fees[#fees + 1] = "effective-feerate"; fees[#fees + 1] = oj_amount(res.effective_feerate)
+          fees[#fees + 1] = "effective-includes"
+          fees[#fees + 1] = oj_array_of_strings(res.effective_includes)
+        end
+        inner[#inner + 1] = "vsize"; inner[#inner + 1] = res.vsize
+        inner[#inner + 1] = "fees"; inner[#inner + 1] = oj(fees)
+      end
+      tx_results[#tx_results + 1] = wtxid_hex
+      tx_results[#tx_results + 1] = oj(inner)
+    end
+    return oj_result(oj({
+      "package_msg", package_msg,
+      "tx-results", oj(tx_results),
+      -- No member replaces anything here (package RBF is not implemented).
+      "replaced-transactions", oj_array_empty(),
+    }))
   end
 
   -- generateblock <output> <transactions> [<submit>] -- regtest only.
@@ -13399,10 +13417,13 @@ end
         else
           res.allowed = true
           res.vsize = vsize
+          -- Core: effective-feerate is CFeeRate(fee, vsize).GetFeePerK()
+          -- (sat/kvB, rounded down) and effective-includes lists WTXIDs.
           res.fees = {
             base = fee_btc,
-            ["effective-feerate"] = feerate_btc_per_kvb,
-            ["effective-includes"] = {res.txid},
+            ["effective-feerate"] = (vsize > 0 and math.floor(atmp.fee * 1000 / vsize) or 0)
+                                    / consensus.COIN,
+            ["effective-includes"] = {res.wtxid},
           }
         end
       else
@@ -13418,57 +13439,51 @@ end
       return results
     end
 
-    -- Multi-tx (package) path: route through accept_package(txns, test_accept=true).
-    -- Collect decoded txs; decode failures already handled above.
-    local tx_list = {}
+    -- Multi-tx (package) path: Core ProcessNewPackage(test_accept=true), each
+    -- member at its own feerate (rpc/mempool.cpp:343-407).  A member with no
+    -- result was not validated (an earlier member failed) and gets only its
+    -- txid and wtxid; a package-level policy failure adds package-error.
+    local state, pkg_results = rpc.mempool:process_new_package(txs, true)
+    local package_error
+    if state and state.kind == "policy" then
+      package_error = mempool_mod.validation_state_string(state.reason, state.details)
+    end
+    -- maxfeerate (BTC/kvB, Core default DEFAULT_MAX_RAW_TX_FEE_RATE 0.10);
+    -- Core compares the fee with max_raw_tx_fee_rate.GetFee(vsize), and a
+    -- zero cap means no check.
+    local max_rate_sat_kvb = math.floor(
+      (maxfeerate_btc_per_kvb or 0.10) * consensus.COIN + 0.5)
+    local exit_early = false
     for i = 1, #txs do
-      tx_list[i] = txs[i]
-    end
-
-    -- Empty package: return empty results without calling accept_package.
-    if #tx_list == 0 then
-      return results
-    end
-
-    local pkg_ok, pkg_result = rpc.mempool:accept_package(tx_list, true)
-    if not pkg_ok then
-      -- Package-level failure: mark all txs with package-error.
-      for i = 1, #results do
-        results[i]["package-error"] = tostring(pkg_result)
-        results[i].allowed = false
-      end
-      return results
-    end
-
-    -- Package accepted (dry-run): populate per-tx results.
-    local pkg_total_fees = pkg_result.total_fees or 0
-    local pkg_total_vsize = pkg_result.total_vsize or 0
-    local pkg_feerate = (pkg_total_vsize > 0) and
-                        ((pkg_total_fees / consensus.COIN) / pkg_total_vsize * 1000) or 0
-
-    -- Build a txid→index map for effective-includes.
-    local txid_list = {}
-    for i, tx in ipairs(tx_list) do
-      txid_list[i] = results[i].txid
-    end
-
-    for i, tx in ipairs(tx_list) do
       local res = results[i]
-      local fee_btc = (pkg_result.fees and pkg_result.fees[i] or 0) / consensus.COIN
-      local weight = validation.get_tx_weight(tx)
-      local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
-      -- maxfeerate check uses package fee rate.
-      if maxfeerate_btc_per_kvb and pkg_feerate > maxfeerate_btc_per_kvb then
-        res.allowed = false
-        res["reject-reason"] = "max-fee-exceeded"
-      else
-        res.allowed = true
-        res.vsize = vsize
-        res.fees = {
-          base = fee_btc,
-          ["effective-feerate"] = pkg_feerate,
-          ["effective-includes"] = txid_list,
-        }
+      if package_error then res["package-error"] = package_error end
+      res.allowed = nil
+      local r = pkg_results[res.wtxid]
+      if r and not exit_early then
+        if r.kind == "valid" then
+          local max_fee = math.floor((max_rate_sat_kvb * r.vsize + 999) / 1000)
+          if max_fee > 0 and r.fee > max_fee then
+            res.allowed = false
+            res["reject-reason"] = "max-fee-exceeded"
+            exit_early = true
+          else
+            res.allowed = true
+            res.vsize = r.vsize
+            res.fees = {
+              base = r.fee / consensus.COIN,
+              ["effective-feerate"] = r.effective_feerate / consensus.COIN,
+              ["effective-includes"] = r.effective_includes,
+            }
+          end
+        else
+          res.allowed = false
+          if mempool_mod.is_missing_inputs(r.reason) then
+            res["reject-reason"] = "missing-inputs"
+          else
+            res["reject-reason"] = r.reason
+            res["reject-details"] = mempool_mod.validation_state_string(r.reason, r.details)
+          end
+        end
       end
     end
 
