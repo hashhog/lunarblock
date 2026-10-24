@@ -7870,7 +7870,55 @@ end
       error({code = M.ERROR.INVALID_PARAMS,
         message = "package-not-child-with-parents-tree: parents must not spend other parents in the package"})
     end
-    local accept_ok, err_or_results = rpc.mempool:accept_package(txs)
+    local accept_ok, err_or_results, rbf_info = rpc.mempool:accept_package(txs)
+    if accept_ok and err_or_results.rbf then rbf_info = err_or_results.rbf end
+    local function broadcast_package()
+      if rpc.peer_manager then
+        local invs = {}
+        for _, tx in ipairs(txs) do
+          local txid = validation.compute_txid(tx)
+          invs[#invs + 1] = {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
+        end
+        local inv_payload = p2p.serialize_inv(invs)
+        rpc.peer_manager:broadcast("inv", inv_payload)
+      end
+    end
+    -- replaced-transactions is a JSON array even when empty; cjson 2.1.0
+    -- would write an empty Lua table as {}.
+    local function replaced_json(list)
+      if list and #list > 0 then return oj_array_of_strings(list) end
+      return oj_array_empty()
+    end
+    if rbf_info then
+      -- Package RBF (Core AcceptPackage): per-tx results in Core's shape,
+      -- txid + error for a refused tx, vsize + fees otherwise.
+      local seq = {}
+      for _, tx in ipairs(txs) do
+        local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
+        local r = rbf_info.results[wtxid_hex]
+        if r then
+          local obj
+          if r.error then
+            obj = oj({"txid", r.txid, "error", r.error})
+          else
+            local fees = {base = r.fee / consensus.COIN}
+            if r.feerate_k then
+              fees["effective-feerate"] = r.feerate_k / consensus.COIN
+              fees["effective-includes"] = r.includes
+            end
+            obj = oj({"txid", r.txid, "vsize", r.vsize, "fees", fees})
+          end
+          seq[#seq + 1] = wtxid_hex
+          seq[#seq + 1] = obj
+        end
+      end
+      if accept_ok then broadcast_package() end
+      return oj_result(oj({
+        "package_msg", accept_ok and "success" or tostring(err_or_results),
+        "tx-results", oj(seq),
+        "replaced-transactions", replaced_json(rbf_info.replaced),
+      }))
+    end
     local tx_results = {}
     -- accept_package returns (true, {...}) on success or (false, err_msg).
     if accept_ok then
@@ -7891,26 +7939,18 @@ end
         }
       end
       -- Broadcast via inv (matches sendrawtransaction).
-      if rpc.peer_manager then
-        local invs = {}
-        for _, tx in ipairs(txs) do
-          local txid = validation.compute_txid(tx)
-          invs[#invs + 1] = {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
-        end
-        local inv_payload = p2p.serialize_inv(invs)
-        rpc.peer_manager:broadcast("inv", inv_payload)
-      end
-      return {
-        package_msg = "success",
-        ["tx-results"] = tx_results,
-        ["replaced-transactions"] = {},
-      }
+      broadcast_package()
+      return oj_result(oj({
+        "package_msg", "success",
+        "tx-results", tx_results,
+        "replaced-transactions", replaced_json(nil),
+      }))
     end
-    return {
-      package_msg = tostring(err_or_results),
-      ["tx-results"] = tx_results,
-      ["replaced-transactions"] = {},
-    }
+    return oj_result(oj({
+      "package_msg", tostring(err_or_results),
+      "tx-results", tx_results,
+      "replaced-transactions", replaced_json(nil),
+    }))
   end
 
   -- generateblock <output> <transactions> [<submit>] -- regtest only.
@@ -13401,8 +13441,11 @@ end
           res.vsize = vsize
           res.fees = {
             base = fee_btc,
-            ["effective-feerate"] = feerate_btc_per_kvb,
-            ["effective-includes"] = {res.txid},
+            -- ValueFromAmount(CFeeRate(fee, vsize).GetFeePerK()): integer
+            -- sat/kvB, rendered with 8 decimals; includes are wtxids.
+            ["effective-feerate"] = (vsize > 0)
+              and (math.floor(atmp.fee * 1000 / vsize) / consensus.COIN) or 0,
+            ["effective-includes"] = {res.wtxid},
           }
         end
       else
@@ -13414,6 +13457,11 @@ end
           reason = "missing-inputs"
         end
         res["reject-reason"] = reason
+        -- reject-details is state.ToString() (rpc/mempool.cpp:403); only the
+        -- rejects that carry their reason separately supply it.
+        if atmp.reject_details then
+          res["reject-details"] = atmp.reject_details
+        end
       end
       return results
     end

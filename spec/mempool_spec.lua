@@ -324,7 +324,7 @@ describe("mempool", function()
 
       local ok, err = mp:accept_transaction(tx2)
       assert.is_false(ok)
-      assert.truthy(err:match("replacement fee not higher"))
+      assert.truthy(err:match("^insufficient fee, rejecting replacement %x+, less fees than conflicting txs; "))
     end)
 
     it("rejects replacement when original does not signal RBF", function()
@@ -1368,7 +1368,11 @@ describe("mempool", function()
 
         local ok, err = mp:accept_transaction(tx2)
         assert.is_false(ok)
-        assert.truthy(err:match("replacement fee not higher"))
+        -- Core PaysForRBF (policy/rbf.cpp): "insufficient fee, rejecting
+        -- replacement <txid>, less fees than conflicting txs; <new> < <old>".
+        assert.equal("insufficient fee, rejecting replacement " ..
+          types.hash256_hex(validation.compute_txid(tx2)) ..
+          ", less fees than conflicting txs; 0.00005 < 0.0001", err)
       end)
 
       it("Rule #3: equal fee passes Rule #3, rejected by Rule #4 (incremental relay)", function()
@@ -1400,9 +1404,9 @@ describe("mempool", function()
 
         local ok, err = mp:accept_transaction(tx2)
         assert.is_false(ok)
-        -- Rule #4 fires: "insufficient fee for relay" (additional_fee=0 < required)
-        assert.truthy(err:match("insufficient fee for relay"),
-          "expected 'insufficient fee for relay' got: " .. tostring(err))
+        -- Rule #4 fires (additional fee 0 < incremental relay fee on vsize).
+        assert.truthy(err:match("^insufficient fee, rejecting replacement %x+, not enough additional fees to relay; 0%.00 < "),
+          "expected Core's Rule 4 reject, got: " .. tostring(err))
       end)
 
       it("requires incremental relay fee payment", function()
@@ -1427,7 +1431,7 @@ describe("mempool", function()
 
         local ok, err = mp:accept_transaction(tx2)
         assert.is_false(ok)
-        assert.truthy(err:match("insufficient fee for relay"))
+        assert.truthy(err:match("not enough additional fees to relay; 0%.00000001 < "))
       end)
 
       it("accepts replacement with sufficient incremental fee", function()
@@ -1457,7 +1461,10 @@ describe("mempool", function()
         assert.is_not_nil(mp:get_entry(txid2_hex))
       end)
 
-      it("rejects replacement with new unconfirmed inputs", function()
+      -- Core 31 has no BIP125 Rule 2 (HasNoNewUnconfirmed is gone from
+      -- policy/rbf.cpp): a replacement may spend a new unconfirmed output
+      -- when the staged feerate diagram improves.
+      it("accepts a replacement that adds a new unconfirmed input", function()
         local chain_state = make_mock_chain_state()
 
         local prev_txid = types.hash256(string.rep("\x01", 32))
@@ -1493,9 +1500,11 @@ describe("mempool", function()
         tx2.inputs[2] = make_input(parent_txid, 0, 0xFFFFFFFD)
         tx2.outputs[1] = make_output(170000)  -- Higher fee
 
-        local ok, err = mp:accept_transaction(tx2)
-        assert.is_false(ok)
-        assert.equal("replacement adds new unconfirmed input", err)
+        local ok, txid2_hex = mp:accept_transaction(tx2)
+        assert.is_true(ok, tostring(txid2_hex))
+        assert.is_nil(mp:get_entry(types.hash256_hex(validation.compute_txid(tx1))))
+        assert.is_not_nil(mp:get_entry(parent_hex))
+        assert.is_not_nil(mp:get_entry(txid2_hex))
       end)
 
       -- EntriesAndTxidsDisjoint (Bitcoin Core rbf.cpp:85-98):

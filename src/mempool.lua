@@ -1759,20 +1759,27 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
     end
   end
 
-  -- 7. Handle RBF conflicts (BIP125)
+  -- 7. Replacement checks (Core 31 MemPoolAccept::ReplacementChecks,
+  -- validation.cpp, and policy/rbf.cpp).  Cluster mempool replaced BIP125's
+  -- eviction-count Rule 5 and dropped Rule 2 (no new unconfirmed inputs);
+  -- what is left, in Core's order:
+  --   Rule 5   at most MAX_REPLACEMENT_CANDIDATES distinct CLUSTERS conflict
+  --            directly (GetEntriesForConflicts)
+  --   Rule 3/4 PaysForRBF on the modified fees of everything evicted
+  --   cluster limits on the staged graph (CheckMemPoolPolicyLimits)
+  --   the staged feerate diagram strictly beats the current one
+  --            (ImprovesFeerateDiagram)
+  -- then, after the cluster check, EntriesAndTxidsDisjoint.  Each reject
+  -- returns Core's state.ToString() ("<reason>, <details>") and, as a third
+  -- value, the bare reject reason.
+  --
+  -- Nothing is evicted here.  The conflicts leave the pool only once every
+  -- later check (TRUC, scripts) has passed, just before the replacement goes
+  -- in (step 9), and never for opts.test_accept.
   local all_conflicts = {}  -- All txs to be evicted (conflicts + descendants)
   if next(conflicts) then
-    -- BIP125 Rule #1: All conflicting transactions must be replaceable
-    -- (signal RBF directly or have an ancestor that does).
-    --
-    -- FIX-68 (W120 BUG-9): Skip Rule 1 when fullrbf is enabled.  Bitcoin
-    -- Core v28+ removed SignalsOptInRBF from src/validation.cpp
-    -- ReplacementChecks (cluster-mempool branch) — fullrbf default-on means
-    -- replacement acceptance no longer gates on opt-in signaling.  We keep
-    -- the check available behind self.fullrbf=false for operators who want
-    -- legacy strict-opt-in policy; getmempoolinfo.fullrbf reflects the
-    -- actual setting (no longer lies).  See policy/rbf.h
-    -- DEFAULT_MEMPOOL_FULL_RBF=true.
+    -- BIP125 Rule #1 (opt-in signaling) only under -mempoolfullrbf=0; Core
+    -- v28+ defaults full RBF on (policy/rbf.h DEFAULT_MEMPOOL_FULL_RBF).
     if not self.fullrbf then
       for conflict_txid_hex in pairs(conflicts) do
         if not self:is_replaceable(conflict_txid_hex) then
@@ -1781,172 +1788,87 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       end
     end
 
-    -- Collect all descendants of conflicting transactions
-    local conflict_descendants = {}  -- All descendants to be evicted
+    -- Rule #5: distinct conflicting clusters (policy/rbf.cpp:69).
+    local num_clusters = #self:conflict_clusters(conflicts)
+    if num_clusters > M.MAX_REPLACEMENT_CANDIDATES then
+      return false, string.format(
+        "too many potential replacements, rejecting replacement %s; too many conflicting clusters (%d > %d)",
+        txid_hex, num_clusters, M.MAX_REPLACEMENT_CANDIDATES),
+        "too many potential replacements"
+    end
+
     for conflict_txid_hex in pairs(conflicts) do
       all_conflicts[conflict_txid_hex] = true
       local conflict_entry = self.entries[conflict_txid_hex]
       if conflict_entry then
         for desc_hex in pairs(conflict_entry.descendants) do
-          conflict_descendants[desc_hex] = true
-        end
-      end
-    end
-    for desc_hex in pairs(conflict_descendants) do
-      all_conflicts[desc_hex] = true
-    end
-
-    -- BIP125 Rule #5: Don't evict more than MAX_REPLACEMENT_CANDIDATES transactions
-    local eviction_count = 0
-    for _ in pairs(all_conflicts) do
-      eviction_count = eviction_count + 1
-    end
-    if eviction_count > M.MAX_REPLACEMENT_CANDIDATES then
-      return false, string.format("too many potential replacements: %d > %d",
-        eviction_count, M.MAX_REPLACEMENT_CANDIDATES)
-    end
-
-    -- EntriesAndTxidsDisjoint (rbf.cpp:85-98): the replacement tx's in-mempool
-    -- ancestors must not overlap with the direct conflict set.  This prevents
-    -- a replacement from being a descendant of one of the transactions it is
-    -- trying to evict (cyclic replacement).  Ancestors are collected here,
-    -- before conflicts are removed from the mempool, so the check is valid.
-    do
-      local repl_ancestors = {}
-      for _, inp in ipairs(tx.inputs) do
-        local prev_hex = types.hash256_hex(inp.prev_out.hash)
-        local parent = self.entries[prev_hex]
-        if parent then
-          repl_ancestors[prev_hex] = true
-          for anc_hex in pairs(parent.ancestors) do
-            repl_ancestors[anc_hex] = true
-          end
-        end
-      end
-      for anc_hex in pairs(repl_ancestors) do
-        if conflicts[anc_hex] then
-          return false, string.format(
-            "replacement tx %s spends conflicting transaction %s",
-            types.hash256_hex(validation.compute_txid(tx)), anc_hex)
+          all_conflicts[desc_hex] = true
         end
       end
     end
 
-    -- BIP125 Rule #3: Replacement fees must be >= original fees (rbf.cpp:109).
-    -- Equal fees satisfy Rule #3; Rule #4 then enforces the incremental relay
-    -- fee.  Core uses strict less-than here, not less-than-or-equal.
+    -- Rules #3 and #4: PaysForRBF (policy/rbf.cpp:100-125) on modified fees.
+    local modified_fee = fee + (self.map_deltas[txid_hex] or 0)
     local conflicting_fees = 0
     for conflict_hex in pairs(all_conflicts) do
       local entry = self.entries[conflict_hex]
       if entry then
-        conflicting_fees = conflicting_fees + entry.fee
+        conflicting_fees = conflicting_fees + (entry.modified_fee or entry.fee)
       end
     end
-    if fee < conflicting_fees then
-      return false, string.format("replacement fee not higher than conflicting txs: %d < %d",
-        fee, conflicting_fees)
+    if modified_fee < conflicting_fees then
+      return false, string.format(
+        "insufficient fee, rejecting replacement %s, less fees than conflicting txs; %s < %s",
+        txid_hex, M.format_money(modified_fee), M.format_money(conflicting_fees)),
+        "insufficient fee"
     end
-
-    -- BIP125 Rule #4: New tx must pay for its own bandwidth (incremental relay fee)
-    -- Additional fee must be >= incremental_relay_fee * new_tx_vsize
-    local additional_fee = fee - conflicting_fees
+    local additional_fee = modified_fee - conflicting_fees
     local required_additional = math.ceil(M.INCREMENTAL_RELAY_FEE * vsize / 1000)
     if additional_fee < required_additional then
-      return false, string.format("insufficient fee for relay: additional %d < required %d",
-        additional_fee, required_additional)
+      return false, string.format(
+        "insufficient fee, rejecting replacement %s, not enough additional fees to relay; %s < %s",
+        txid_hex, M.format_money(additional_fee), M.format_money(required_additional)),
+        "insufficient fee"
     end
 
-    -- Rule #8 (cluster-mempool): ImprovesFeerateDiagram (Core rbf.cpp:127-140).
-    -- After Rules 3 and 4 pass, verify the replacement strictly improves the
-    -- feerate diagram of every affected cluster.  We build the "old" diagram
-    -- from the current mempool state of all clusters that contain a conflicting
-    -- tx, then the "new" diagram with those conflicts removed and the
-    -- replacement tx added, and require compare_diagrams(old, new) == true.
-    do
-      -- Collect the set of all txids in the same clusters as the conflicts.
-      local affected_txids = {}
-      for conflict_hex in pairs(all_conflicts) do
-        local root = uf_find(conflict_hex)
-        -- Snapshot before walking: uf_find() inserts on the orphan re-root
-        -- path, and mutating uf_parent mid-`pairs` is undefined.  See
-        -- uf_snapshot_keys().
-        local uf_keys, uf_n = uf_snapshot_keys()
-        for i = 1, uf_n do
-          local txid_iter = uf_keys[i]
-          if uf_find(txid_iter) == root and self.entries[txid_iter] then
-            affected_txids[txid_iter] = true
-          end
-        end
-      end
-
-      -- Build the old diagram from the affected cluster entries.
-      local old_cluster_txids = {}
-      for txid_iter in pairs(affected_txids) do
-        old_cluster_txids[#old_cluster_txids + 1] = txid_iter
-      end
-      local old_lin = linearize_cluster(old_cluster_txids, self.entries)
-      local old_diag = build_feerate_diagram(old_lin, self.entries)
-
-      -- Build a synthetic entries table: remove all_conflicts, add replacement.
-      local new_entries = {}
-      for txid_iter, e in pairs(self.entries) do
-        if affected_txids[txid_iter] and not all_conflicts[txid_iter] then
-          new_entries[txid_iter] = e
-        end
-      end
-      -- Synthetic entry for the replacement tx (not yet in the mempool).
-      new_entries[txid_hex] = { fee = fee, size = vsize, vsize = vsize }
-
-      -- Build new cluster txid list: old affected minus conflicts, plus replacement.
-      local new_cluster_txids = {}
-      for txid_iter in pairs(new_entries) do
-        -- Include only affected-cluster txids plus the replacement itself.
-        if affected_txids[txid_iter] or txid_iter == txid_hex then
-          new_cluster_txids[#new_cluster_txids + 1] = txid_iter
-        end
-      end
-      local new_lin = linearize_cluster(new_cluster_txids, new_entries)
-      local new_diag = build_feerate_diagram(new_lin, new_entries)
-
-      if not compare_diagrams(old_diag, new_diag) then
-        return false, "insufficient feerate: does not improve feerate diagram"
-      end
-    end
-
-    -- BIP125 Rule #2: The replacement may only include an unconfirmed input if
-    -- that specific outpoint (txid:vout) was already an input of one of the
-    -- conflicting transactions.  We collect all (txid, vout) outpoints that
-    -- appear in any conflicting tx and use that as the allowed set.
-    -- Reference: BIP 125 rule 2; old Core src/validation.cpp HasNoNewUnconfirmed.
-    local conflict_input_outpoints = {}  -- "txhex:vout" → true
-    for conflict_hex in pairs(conflicts) do   -- only direct conflicts, not descendants
-      local ce = self.entries[conflict_hex]
-      if ce then
-        for _, inp in ipairs(ce.tx.inputs) do
-          local k = types.hash256_hex(inp.prev_out.hash) .. ":" .. inp.prev_out.index
-          conflict_input_outpoints[k] = true
-        end
-      end
-    end
-
-    -- Check each input of the replacement tx
+    -- Stage the removals and the replacement, then the cluster limit and the
+    -- feerate diagram (validation.cpp ReplacementChecks).
+    local parents = {}
     for _, inp in ipairs(tx.inputs) do
       local prev_hex = types.hash256_hex(inp.prev_out.hash)
-      local prev_entry = self.entries[prev_hex]
-      if prev_entry then
-        -- This input spends an unconfirmed mempool UTXO.
-        local outpoint_key = prev_hex .. ":" .. inp.prev_out.index
-        if not conflict_input_outpoints[outpoint_key] then
-          return false, "replacement adds new unconfirmed input"
-        end
-      end
+      if self.entries[prev_hex] then parents[prev_hex] = true end
+    end
+    local staged = self:check_replacement_staging(all_conflicts, {
+      { txid = txid_hex, fee = modified_fee,
+        weight = sigops_adjusted_weight(weight, tx_sigop_cost), parents = parents },
+    })
+    if staged == "too-large-cluster" then
+      return false, "too-large-cluster", "too-large-cluster"
+    elseif staged == "diagram" then
+      return false, "replacement-failed, insufficient feerate: does not improve feerate diagram",
+        "replacement-failed"
     end
 
-    -- All checks passed, remove conflicting transactions and their descendants
-    for conflict_hex in pairs(all_conflicts) do
-      -- Only remove if still in mempool (descendants may have been removed already)
-      if self.entries[conflict_hex] then
-        self:remove_transaction(conflict_hex, "replaced")
+    -- EntriesAndTxidsDisjoint (policy/rbf.cpp:85-98, validation.cpp:1350-1360):
+    -- the replacement's in-mempool ancestors must not include a direct
+    -- conflict (it would spend what it evicts).
+    do
+      local repl_ancestors = {}
+      for prev_hex in pairs(parents) do
+        repl_ancestors[prev_hex] = true
+        for anc_hex in pairs(self.entries[prev_hex].ancestors) do
+          repl_ancestors[anc_hex] = true
+        end
+      end
+      local hits = {}
+      for anc_hex in pairs(repl_ancestors) do
+        if conflicts[anc_hex] then hits[#hits + 1] = anc_hex end
+      end
+      if #hits > 0 then
+        table.sort(hits)
+        return false, string.format(
+          "bad-txns-spends-conflicting-tx, %s spends conflicting transaction %s",
+          txid_hex, hits[1]), "bad-txns-spends-conflicting-tx"
       end
     end
   end
@@ -2148,6 +2070,26 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
     end
   end
 
+  -- 8f. Every check has passed.  Core's m_test_accept returns here with the
+  -- conflicts still in the pool; otherwise the staged removals are applied
+  -- (FinalizeSubpackage) right before the replacement goes in.
+  local replaced = {}
+  if next(all_conflicts) then
+    if opts and opts.test_accept then
+      return true, txid_hex, fee, replaced, vsize
+    end
+    for conflict_hex in pairs(all_conflicts) do
+      if self.entries[conflict_hex] then replaced[#replaced + 1] = conflict_hex end
+    end
+    table.sort(replaced)
+    for _, conflict_hex in ipairs(replaced) do
+      -- A descendant may already have gone with its evicted parent.
+      if self.entries[conflict_hex] then
+        self:remove_transaction(conflict_hex, "replaced")
+      end
+    end
+  end
+
   -- 9. Add to mempool
   -- `weight` and `tx_sigop_cost` were computed above (steps 3d and 6); pass the
   -- sigop-adjusted weight through so the cluster gate below sums exactly what
@@ -2236,9 +2178,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   --
   -- NOTE: this is mempool POLICY, not consensus.  Nothing here may affect block
   -- validation; a block containing a 100-transaction chain stays valid.
+  -- A replacement's cluster was already sized exactly on the staged graph in
+  -- step 7; the union-find never splits, so after the evictions it can still
+  -- hold clusters together that the removed transactions used to link.
   local cluster_root = uf_find(txid_hex)
   local cluster_count, cluster_weight = get_cluster_stats(cluster_root, self.entries)
-  if cluster_count > MAX_CLUSTER_COUNT or cluster_weight > MAX_CLUSTER_WEIGHT then
+  if #replaced == 0 and (cluster_count > MAX_CLUSTER_COUNT or cluster_weight > MAX_CLUSTER_WEIGHT) then
     -- Undo: remove the entry we just added
     self:remove_transaction(txid_hex, "cluster-limit")
     return false, "too-large-cluster"
@@ -2253,7 +2198,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
     self:trim()
   end
 
-  return true, txid_hex, fee
+  return true, txid_hex, fee, replaced
 end
 
 --- AcceptToMemoryPool — main entry point matching Bitcoin Core's AcceptToMemoryPool.
@@ -2283,13 +2228,17 @@ function Mempool:accept_to_memory_pool(tx, test_accept)
     local saved_last_update = self.last_rolling_fee_update
     local saved_since_bump = self.block_since_last_rolling_fee_bump
 
-    local ok, txid_hex_or_err, fee = self:accept_transaction(tx)
+    -- opts.test_accept: a replacement stops before evicting its conflicts
+    -- and is never inserted (4th/5th returns: replaced list, vsize).
+    local ok, txid_hex_or_err, fee_or_reason, _, test_vsize =
+      self:accept_transaction(tx, nil, { test_accept = true })
+    local fee = ok and fee_or_reason or nil
     if ok then
       -- Snapshot vsize before we wipe the entry.
       local entry = self.entries[txid_hex_or_err]
-      local vsize = (entry and entry.vsize) or 0
+      local vsize = (entry and entry.vsize) or test_vsize or 0
       -- Roll back: drop the entry without bumping rolling-fee state.
-      self:remove_transaction(txid_hex_or_err, "test-accept")
+      if entry then self:remove_transaction(txid_hex_or_err, "test-accept") end
       -- Restore rolling-fee state so test_accept is side-effect-free.
       self.rolling_minimum_fee_rate = saved_rolling
       self.last_rolling_fee_update = saved_last_update
@@ -2306,17 +2255,22 @@ function Mempool:accept_to_memory_pool(tx, test_accept)
       self.rolling_minimum_fee_rate = saved_rolling
       self.last_rolling_fee_update = saved_last_update
       self.block_since_last_rolling_fee_bump = saved_since_bump
+      -- A third return is the bare reject reason; the second is then Core's
+      -- state.ToString() ("<reason>, <details>"), testmempoolaccept's
+      -- reject-details.
       return {
         accepted = false,
         txid = nil,
         fee = 0,
         vsize = 0,
-        reject_reason = txid_hex_or_err,
+        reject_reason = fee_or_reason or txid_hex_or_err,
+        reject_details = fee_or_reason and txid_hex_or_err or nil,
       }
     end
   end
 
-  local ok, txid_hex_or_err, fee = self:accept_transaction(tx)
+  local ok, txid_hex_or_err, fee_or_reason = self:accept_transaction(tx)
+  local fee = ok and fee_or_reason or nil
   if ok then
     local entry = self.entries[txid_hex_or_err]
     return {
@@ -2332,7 +2286,8 @@ function Mempool:accept_to_memory_pool(tx, test_accept)
       txid = nil,
       fee = 0,
       vsize = 0,
-      reject_reason = txid_hex_or_err,
+      reject_reason = fee_or_reason or txid_hex_or_err,
+      reject_details = fee_or_reason and txid_hex_or_err or nil,
     }
   end
 end
@@ -3924,6 +3879,519 @@ function M.compute_package_hash(txns)
   return crypto.sha256(table.concat(wtxids))
 end
 
+--------------------------------------------------------------------------------
+-- Cluster-mempool replacement checks (Core 31 policy/rbf.cpp, validation.cpp
+-- ReplacementChecks / PackageRBFChecks, txgraph.cpp GetMainStagingDiagrams)
+--------------------------------------------------------------------------------
+
+-- Core FormatMoney (util/moneystr.cpp): fixed 8 decimals, trailing zeros
+-- trimmed but at least two kept ("0.00006", "1.00").
+local function format_money(n)
+  local neg = n < 0
+  local a = neg and -n or n
+  local s = string.format("%d.%08d", math.floor(a / consensus.COIN), a % consensus.COIN)
+  local int, frac = s:match("^(%d+)%.(%d+)$")
+  frac = frac:gsub("0+$", "")
+  while #frac < 2 do frac = frac .. "0" end
+  return (neg and "-" or "") .. int .. "." .. frac
+end
+M.format_money = format_money
+
+-- Core CFeeRate::ToString() (BTC/kvB), from a fee and a vsize.
+local function format_feerate(fee, vsize)
+  local per_k = vsize > 0 and math.floor(fee * 1000 / vsize) or 0
+  return string.format("%d.%08d BTC/kvB", math.floor(per_k / consensus.COIN), per_k % consensus.COIN)
+end
+
+-- Connected components, inside the array `ids`, of the dependency graph given
+-- by each entry's spends_from (parent links followed only inside the set).
+-- A TxGraph cluster is exactly such a component.
+local function set_components(ids, entries)
+  local in_set, adj = {}, {}
+  for i = 1, #ids do in_set[ids[i]] = true; adj[ids[i]] = {} end
+  for i = 1, #ids do
+    local id = ids[i]
+    for _, p in pairs(entries[id].spends_from or {}) do
+      if in_set[p] and p ~= id then
+        adj[id][#adj[id] + 1] = p
+        adj[p][#adj[p] + 1] = id
+      end
+    end
+  end
+  local sorted = {}
+  for i = 1, #ids do sorted[i] = ids[i] end
+  table.sort(sorted)
+  local seen, comps = {}, {}
+  for _, seed in ipairs(sorted) do
+    if not seen[seed] then
+      seen[seed] = true
+      local members, stack = {}, {seed}
+      while #stack > 0 do
+        local id = table.remove(stack)
+        members[#members + 1] = id
+        for _, other in ipairs(adj[id]) do
+          if not seen[other] then seen[other] = true; stack[#stack + 1] = other end
+        end
+      end
+      comps[#comps + 1] = members
+    end
+  end
+  return comps
+end
+
+-- Append the chunk feerates ({fee, size}, size in sigop-adjusted weight) of
+-- every cluster in `ids` to `out`, as Cluster::AppendChunkFeerates lists them:
+-- chunk_linearize per cluster, then adjacent chunks merged until feerates are
+-- non-increasing.
+local function append_chunk_feerates(ids, entries, out)
+  for _, comp in ipairs(set_components(ids, entries)) do
+    local lin = chunk_linearize(comp, entries)
+    local stack = {}
+    local i = 1
+    while i <= #lin do
+      local c = { fee = lin[i].chunk_fee, size = lin[i].chunk_size }
+      local acc = 0
+      while i <= #lin and acc < c.size do
+        acc = acc + lin[i].tx_size
+        i = i + 1
+      end
+      stack[#stack + 1] = c
+      while #stack >= 2 do
+        local top, prev = stack[#stack], stack[#stack - 1]
+        if cross_cmp(top.fee, prev.size, prev.fee, top.size) <= 0 then break end
+        prev.fee = prev.fee + top.fee
+        prev.size = prev.size + top.size
+        stack[#stack] = nil
+      end
+    end
+    for k = 1, #stack do out[#out + 1] = stack[k] end
+  end
+end
+
+local function sort_chunks(chunks)
+  table.sort(chunks, function(a, b) return chunk_better(a.fee, a.size, b.fee, b.size) end)
+  return chunks
+end
+
+-- Port of CompareChunks (util/feefrac.cpp) over two chunk lists sorted by
+-- descending feerate.  Returns 1 when chunks0 is strictly better somewhere and
+-- nowhere worse, -1 for the reverse, 0 when equal, nil when incomparable.
+local function compare_chunks(chunks0, chunks1)
+  local chunk = { chunks0, chunks1 }
+  local next_index = { 1, 1 }
+  local accum = { { fee = 0, size = 0 }, { fee = 0, size = 0 } }
+  local better = { false, false }
+  local function next_point(d)
+    local c = chunk[d][next_index[d]]
+    return { fee = accum[d].fee + c.fee, size = accum[d].size + c.size }
+  end
+  local function advance(d)
+    local c = chunk[d][next_index[d]]
+    accum[d] = { fee = accum[d].fee + c.fee, size = accum[d].size + c.size }
+    next_index[d] = next_index[d] + 1
+  end
+  while true do
+    local done0 = next_index[1] > #chunk[1]
+    local done1 = next_index[2] > #chunk[2]
+    if done0 and done1 then break end
+    local side
+    if done0 then side = 2
+    elseif done1 then side = 1
+    else side = (next_point(1).size > next_point(2).size) and 2 or 1 end
+    local other = 3 - side
+    local p = next_point(side)
+    local a = accum[other]
+    local ap_fee, ap_size = p.fee - a.fee, p.size - a.size
+    local cmp
+    if done0 or done1 then
+      cmp = cross_cmp(ap_fee, 1, 0, ap_size)
+    else
+      local b = next_point(other)
+      cmp = cross_cmp(ap_fee, b.size - a.size, b.fee - a.fee, ap_size)
+      if b.size == p.size then advance(other) end
+    end
+    if cmp > 0 then better[side] = true end
+    if cmp < 0 then better[other] = true end
+    advance(side)
+    if better[1] and better[2] then return nil end
+  end
+  if better[1] == better[2] then return 0 end
+  return better[1] and 1 or -1
+end
+M.compare_chunks = compare_chunks
+
+--- The live clusters (connected components of the mempool) holding `seeds`
+-- (txid_hex -> true).  Walks the entries' ancestor/descendant sets, so unlike
+-- the union-find it never keeps two clusters merged after the transaction
+-- linking them has left.
+function Mempool:conflict_clusters(seeds)
+  local seen, comps = {}, {}
+  local sorted = {}
+  for id in pairs(seeds) do sorted[#sorted + 1] = id end
+  table.sort(sorted)
+  for _, seed in ipairs(sorted) do
+    if self.entries[seed] and not seen[seed] then
+      seen[seed] = true
+      local members, stack = {}, {seed}
+      while #stack > 0 do
+        local id = table.remove(stack)
+        members[#members + 1] = id
+        local e = self.entries[id]
+        for _, rel in ipairs({ e.ancestors, e.descendants }) do
+          for other in pairs(rel) do
+            if self.entries[other] and not seen[other] then
+              seen[other] = true
+              stack[#stack + 1] = other
+            end
+          end
+        end
+      end
+      comps[#comps + 1] = members
+    end
+  end
+  return comps
+end
+
+--- Stage a replacement the way Core's ChangeSet does and run the two checks
+-- that read the staged graph: CheckMemPoolPolicyLimits and
+-- ImprovesFeerateDiagram.
+-- @param all_conflicts table txid_hex -> true: every tx the replacement evicts
+-- @param additions array of {txid, fee (modified), weight (sigop-adjusted),
+--   parents (txid_hex -> true: in-mempool parents and parents among additions)}
+-- @return nil when both pass, "too-large-cluster" or "diagram" otherwise
+function Mempool:check_replacement_staging(all_conflicts, additions)
+  local seeds = {}
+  for id in pairs(all_conflicts) do seeds[id] = true end
+  for _, a in ipairs(additions) do
+    for p in pairs(a.parents) do
+      if self.entries[p] then seeds[p] = true end
+    end
+  end
+  local comps = self:conflict_clusters(seeds)
+
+  local old_chunks = {}
+  local st_entries, st_ids = {}, {}
+  for _, members in ipairs(comps) do
+    append_chunk_feerates(members, self.entries, old_chunks)
+    for _, id in ipairs(members) do
+      if not all_conflicts[id] then
+        st_entries[id] = self.entries[id]
+        st_ids[#st_ids + 1] = id
+      end
+    end
+  end
+  local is_addition = {}
+  for _, a in ipairs(additions) do is_addition[a.txid] = true end
+  for _, a in ipairs(additions) do
+    local spends_from, nparents = {}, 0
+    for p in pairs(a.parents) do
+      if not all_conflicts[p] and (st_entries[p] or is_addition[p]) then
+        spends_from[#spends_from + 1] = p
+        nparents = nparents + 1
+      end
+    end
+    st_entries[a.txid] = {
+      fee = a.fee, modified_fee = a.fee, adjusted_weight = a.weight,
+      spends_from = spends_from, ancestor_count = nparents,
+    }
+    st_ids[#st_ids + 1] = a.txid
+  end
+
+  -- Clusters the change does not touch keep their (already valid) size.
+  for _, comp in ipairs(set_components(st_ids, st_entries)) do
+    local weight = 0
+    for _, id in ipairs(comp) do weight = weight + entry_cluster_weight(st_entries[id]) end
+    if #comp > MAX_CLUSTER_COUNT or weight > MAX_CLUSTER_WEIGHT then
+      return "too-large-cluster"
+    end
+  end
+
+  local new_chunks = {}
+  append_chunk_feerates(st_ids, st_entries, new_chunks)
+  if compare_chunks(sort_chunks(new_chunks), sort_chunks(old_chunks)) ~= 1 then
+    return "diagram"
+  end
+  return nil
+end
+
+-- Rejects Core files as TX_RECONSIDERABLE (fee-only) or TX_MISSING_INPUTS:
+-- AcceptPackage retries exactly those transactions as a package.
+local PACKAGE_RECONSIDERABLE = {
+  ["insufficient fee"] = true,
+  ["replacement-failed"] = true,
+  ["min relay fee not met"] = true,
+  ["mempool min fee not met"] = true,
+}
+
+local function reject_token(err, reason)
+  if reason then return reason end
+  return (tostring(err):match("^([^:,]+)"))
+end
+
+local function hex_wtxid(tx)
+  return types.hash256_hex(validation.compute_wtxid(tx))
+end
+
+--- Fee, sigop-adjusted size, in-mempool parents and direct mempool conflicts
+-- of a package member, resolving inputs from the chain, the mempool, or an
+-- earlier member of the package (Core PreChecks inputs, CCoinsViewMemPool +
+-- PackageAddTransaction).
+-- @return info table, or nil and the reject string
+function Mempool:package_member_info(tx, package_txs)
+  local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+  local info = {
+    tx = tx, txid = txid_hex, wtxid = hex_wtxid(tx),
+    mempool_parents = {}, conflicts = {}, package_parents = {},
+  }
+  local resolved = {}
+  local input_total = 0
+  for _, inp in ipairs(tx.inputs) do
+    local key = M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)
+    local spender = self.outpoint_to_tx[key]
+    if spender and not package_txs[spender] then info.conflicts[spender] = true end
+    local prev_hex = types.hash256_hex(inp.prev_out.hash)
+    local utxo = self.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+    if not utxo then
+      local src = self.entries[prev_hex] and self.entries[prev_hex].tx or package_txs[prev_hex]
+      local out = src and src.outputs[inp.prev_out.index + 1]
+      if out then
+        utxo = { value = out.value, script_pubkey = out.script_pubkey }
+        if self.entries[prev_hex] then
+          info.mempool_parents[prev_hex] = true
+        else
+          info.package_parents[prev_hex] = true
+        end
+      end
+    end
+    if not utxo then return nil, M.REJECT_MISSING_INPUTS end
+    resolved[inp] = utxo
+    input_total = input_total + utxo.value
+  end
+  local output_total = 0
+  for _, out in ipairs(tx.outputs) do output_total = output_total + out.value end
+  local sigops = validation.get_transaction_sigop_cost(tx,
+    function(inp) return resolved[inp] end, { verify_p2sh = true, verify_witness = true })
+  local weight = validation.get_tx_weight(tx)
+  info.fee = input_total - output_total
+  info.modified_fee = info.fee + (self.map_deltas[txid_hex] or 0)
+  info.vsize = validation.get_virtual_tx_size(weight, sigops, M.DEFAULT_BYTES_PER_SIGOP)
+  info.weight = sigops_adjusted_weight(weight, sigops)
+  return info
+end
+
+--- Evaluate the transactions AcceptPackage could not take one by one as a
+-- package (AcceptMultipleTransactions + PackageRBFChecks, validation.cpp).
+-- Fills `results` (wtxid -> result) and `replaced`; returns Core's
+-- package_state.ToString(), "success" when the package went in.
+function Mempool:package_rbf_eval(eval, results, replaced)
+  local package_txs = {}
+  for _, tx in ipairs(eval) do
+    package_txs[types.hash256_hex(validation.compute_txid(tx))] = tx
+  end
+  local infos = {}
+  local any_conflict = false
+  for i, tx in ipairs(eval) do
+    local info, err = self:package_member_info(tx, package_txs)
+    if not info then
+      results[hex_wtxid(tx)] = { error = err }
+      return "transaction failed"
+    end
+    infos[i] = info
+    if next(info.conflicts) then any_conflict = true end
+  end
+
+  local total_fees, total_vsize = 0, 0
+  local includes = {}
+  for i, info in ipairs(infos) do
+    total_fees = total_fees + info.modified_fee
+    total_vsize = total_vsize + info.vsize
+    includes[i] = info.wtxid
+  end
+  local function admit_all()
+    local feerate_k = math.floor(total_fees * 1000 / total_vsize)
+    for _, info in ipairs(infos) do
+      local e = self.entries[info.txid]
+      results[info.wtxid] = {
+        txid = info.txid, vsize = e.vsize, fee = e.fee,
+        feerate_k = feerate_k, includes = includes,
+      }
+    end
+  end
+
+  if not any_conflict then
+    -- No replacement left in the subpackage: the plain CPFP package path.
+    local ok, res = self:accept_package(eval)
+    if not ok then return tostring(res) end
+    admit_all()
+    return "success"
+  end
+
+  -- CheckFeeRate on the package feerate (validation.cpp, before
+  -- PackageRBFChecks); the failure is reported on the last transaction.
+  local last = infos[#infos]
+  local min_fee_k = math.max(self.min_relay_fee, self:get_min_fee())
+  if total_fees * 1000 < min_fee_k * total_vsize then
+    local token = total_fees * 1000 < self.min_relay_fee * total_vsize
+      and "min relay fee not met" or "mempool min fee not met"
+    results[last.wtxid] = { error = string.format("%s, %d < %d", token, total_fees,
+      math.ceil(min_fee_k * total_vsize / 1000)) }
+    return "transaction failed"
+  end
+
+  -- PackageRBFChecks (validation.cpp).
+  if #infos ~= 2 or not infos[2].package_parents[infos[1].txid] then
+    return "package RBF failed: package must be 1-parent-1-child"
+  end
+  for _, info in ipairs(infos) do
+    if next(info.mempool_parents) then
+      return "package RBF failed: new transaction cannot have mempool ancestors"
+    end
+  end
+  local parent, child = infos[1], infos[2]
+  local direct = {}
+  for _, info in ipairs(infos) do
+    for c in pairs(info.conflicts) do direct[c] = true end
+  end
+  local num_clusters = #self:conflict_clusters(direct)
+  if num_clusters > M.MAX_REPLACEMENT_CANDIDATES then
+    return string.format(
+      "package RBF failed: too many potential replacements, rejecting replacement %s; too many conflicting clusters (%d > %d)",
+      child.txid, num_clusters, M.MAX_REPLACEMENT_CANDIDATES)
+  end
+  local all_conflicts = {}
+  for c in pairs(direct) do
+    all_conflicts[c] = true
+    for d in pairs(self.entries[c].descendants) do all_conflicts[d] = true end
+  end
+  local conflicting_fees = 0
+  for c in pairs(all_conflicts) do
+    local e = self.entries[c]
+    if e then conflicting_fees = conflicting_fees + (e.modified_fee or e.fee) end
+  end
+  if total_fees < conflicting_fees then
+    return string.format(
+      "package RBF failed: insufficient anti-DoS fees, rejecting replacement %s, less fees than conflicting txs; %s < %s",
+      child.txid, format_money(total_fees), format_money(conflicting_fees))
+  end
+  local required = math.ceil(M.INCREMENTAL_RELAY_FEE * total_vsize / 1000)
+  if total_fees - conflicting_fees < required then
+    return string.format(
+      "package RBF failed: insufficient anti-DoS fees, rejecting replacement %s, not enough additional fees to relay; %s < %s",
+      child.txid, format_money(total_fees - conflicting_fees), format_money(required))
+  end
+  -- The package must be a chunk of its own, not a child paying anti-DoS fees.
+  if cross_cmp(total_fees, parent.vsize, parent.modified_fee, total_vsize) <= 0 then
+    return string.format(
+      "package RBF failed: package feerate is less than or equal to parent feerate, package feerate %s <= parent feerate is %s",
+      format_feerate(total_fees, total_vsize), format_feerate(parent.modified_fee, parent.vsize))
+  end
+  local staged = self:check_replacement_staging(all_conflicts, {
+    { txid = parent.txid, fee = parent.modified_fee, weight = parent.weight, parents = {} },
+    { txid = child.txid, fee = child.modified_fee, weight = child.weight,
+      parents = { [parent.txid] = true } },
+  })
+  if staged == "too-large-cluster" then
+    return "too-large-cluster"
+  elseif staged == "diagram" then
+    return "package RBF failed: insufficient feerate: does not improve feerate diagram"
+  end
+
+  -- Apply.  The conflicts leave first; both members then go through the
+  -- single-transaction pipeline (fee floors bypassed as package members) for
+  -- the PreChecks and script checks not run above.  If one of them fails the
+  -- members come back out and the evicted transactions are re-admitted.
+  local evicted = {}
+  for c in pairs(all_conflicts) do
+    if self.entries[c] then evicted[#evicted + 1] = self.entries[c] end
+  end
+  table.sort(evicted, function(a, b)
+    if a.ancestor_count ~= b.ancestor_count then return a.ancestor_count < b.ancestor_count end
+    return types.hash256_hex(a.txid) < types.hash256_hex(b.txid)
+  end)
+  local evicted_ids = {}
+  for i, e in ipairs(evicted) do evicted_ids[i] = types.hash256_hex(e.txid) end
+  for _, id in ipairs(evicted_ids) do
+    if self.entries[id] then self:remove_transaction(id, "replaced") end
+  end
+  local inserted = {}
+  for _, info in ipairs(infos) do
+    local ok, txid_or_err = self:accept_transaction(info.tx, false, { package_member = true })
+    if not ok then
+      for k = #inserted, 1, -1 do self:remove_transaction(inserted[k], "package-rollback") end
+      for _, e in ipairs(evicted) do
+        self:accept_transaction(e.tx, false, { bypass_limits = true })
+      end
+      results[info.wtxid] = { error = txid_or_err }
+      return "transaction failed"
+    end
+    inserted[#inserted + 1] = txid_or_err
+  end
+  for _, id in ipairs(evicted_ids) do replaced[#replaced + 1] = id end
+  admit_all()
+  return "success"
+end
+
+--- submitpackage for a package that conflicts with the mempool: Core's
+-- AcceptPackage (validation.cpp).  Each transaction is first tried alone
+-- (with replacement); the ones refused only for fees or a missing in-package
+-- parent are then evaluated together under PackageRBFChecks.
+-- @return ok, package_msg, info {results = wtxid -> result, replaced = txids}
+function Mempool:accept_package_rbf(txns)
+  local results, replaced, eval = {}, {}, {}
+  local quit_early = false
+  for _, tx in ipairs(txns) do
+    local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+    local wtxid_hex = hex_wtxid(tx)
+    local existing = self.entries[txid_hex]
+    if existing then
+      results[wtxid_hex] = { txid = txid_hex, vsize = existing.vsize, fee = existing.fee }
+    else
+      local ok, a, b, c = self:accept_transaction(tx)
+      if ok then
+        local e = self.entries[a]
+        local modified = e.modified_fee or e.fee
+        results[wtxid_hex] = {
+          txid = txid_hex, vsize = e.vsize, fee = e.fee,
+          feerate_k = math.floor(modified * 1000 / e.vsize), includes = { wtxid_hex },
+        }
+        for _, id in ipairs(c or {}) do replaced[#replaced + 1] = id end
+      else
+        results[wtxid_hex] = { txid = txid_hex, error = a }
+        local token = reject_token(a, b)
+        if #txns == 1 or not (PACKAGE_RECONSIDERABLE[token] or token == M.REJECT_MISSING_INPUTS) then
+          quit_early = true
+        else
+          eval[#eval + 1] = tx
+        end
+      end
+    end
+  end
+  local package_msg = "success"
+  if quit_early then
+    package_msg = "transaction failed"
+  elseif #eval > 0 then
+    package_msg = self:package_rbf_eval(eval, results, replaced)
+  end
+  for wtxid_hex, r in pairs(results) do
+    if not r.txid then
+      for _, tx in ipairs(txns) do
+        if hex_wtxid(tx) == wtxid_hex then
+          r.txid = types.hash256_hex(validation.compute_txid(tx))
+        end
+      end
+    end
+  end
+  -- Core keeps replaced txids in a std::set<Txid>: uint256 byte order, i.e.
+  -- the hex string compared from its last byte.
+  local function blob_key(h)
+    local t = {}
+    for i = #h - 1, 1, -2 do t[#t + 1] = h:sub(i, i + 1) end
+    return table.concat(t)
+  end
+  table.sort(replaced, function(x, y) return blob_key(x) < blob_key(y) end)
+  return package_msg == "success", package_msg, { results = results, replaced = replaced }
+end
+
 --- Accept a package of transactions into the mempool.
 -- Implements CPFP: a child with high fee can pay for low-fee parents.
 -- @param txns table: Array of transactions (topologically sorted, parents first)
@@ -3963,6 +4431,22 @@ function Mempool:accept_package(txns, test_accept)
     local txid_hex = types.hash256_hex(txid)
     package_txid_to_idx[txid_hex] = i
     package_txid_to_tx[txid_hex] = tx
+  end
+
+  -- 3b. A member that spends what a mempool transaction spends: Core's
+  -- AcceptPackage with package RBF (submitpackage only; testmempoolaccept
+  -- runs packages without replacement).
+  if not test_accept then
+    for _, tx in ipairs(txns) do
+      for _, inp in ipairs(tx.inputs) do
+        local spender = self.outpoint_to_tx[M.outpoint_key(inp.prev_out.hash, inp.prev_out.index)]
+        if spender and not package_txid_to_idx[spender] then
+          local rbf_ok, package_msg, info = self:accept_package_rbf(txns)
+          if rbf_ok then return true, { rbf = info } end
+          return false, package_msg, info
+        end
+      end
+    end
   end
 
   -- 4. Calculate fees for each transaction
