@@ -464,6 +464,16 @@ M.DEFAULT_MAX_TX_FEE = 1000000    -- 0.01 BTC max fee (policy, not consensus)
 -- so that sigop-heavy txs cannot pay a too-low fee rate.
 -- Reference: bitcoin-core/src/policy/policy.h:50, policy.cpp:390-398.
 M.DEFAULT_BYTES_PER_SIGOP = 20
+
+-- CFeeRate::GetFee(vsize) (policy/feerate.cpp): FeeFrac::EvaluateFeeUp, so
+-- the fee rounds UP (Core v31.1 allows fee 3001 at 110 vB under a 27281
+-- sat/kvB cap: 3000.91 -> 3001).  `per_kvb` in sat/kvB, non-negative.
+function M.fee_for_rate(per_kvb, vsize)
+  return math.floor((per_kvb * vsize + 999) / 1000)
+end
+
+-- Reject token for the caller-supplied fee cap (opts.max_fee_per_kvb).
+M.MAX_FEE_EXCEEDED = "max-fee-exceeded"
 -- Ancestor/descendant limits (policy/policy.h:76-78, kernel/mempool_limits.h:24-26).
 -- In Bitcoin Core 28+ (cluster mempool) these are deprecated for policy
 -- enforcement and replaced by cluster limits, but are retained here for
@@ -1888,6 +1898,19 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
           fee_rate_per_kb, min_fee_rate_kvb)
       end
     end
+  end
+
+  -- 6c. Caller fee cap (sendrawtransaction's maxfeerate).  Core's
+  -- BroadcastTransaction test-accepts and refuses when the base fee exceeds
+  -- maxfeerate.GetFee(vsize), with vsize the sigop-adjusted size; its test
+  -- accept never commits.  Our test-accept is not a dry run (step 7 removes
+  -- BIP125 conflicts and step 9 expires/trims, and neither is undone), so the
+  -- cap is checked here, once fee and vsize are known and before anything is
+  -- evicted.  opts.max_fee_per_kvb is sat/kvB; nil or 0 = no cap.
+  local max_fee_per_kvb = opts and opts.max_fee_per_kvb
+  if max_fee_per_kvb and max_fee_per_kvb > 0
+     and fee > M.fee_for_rate(max_fee_per_kvb, vsize) then
+    return false, M.MAX_FEE_EXCEEDED
   end
 
   -- 7. Handle RBF conflicts (BIP125)

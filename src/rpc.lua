@@ -110,6 +110,71 @@ local function core_optional_int32(v, default)
   return core_getint32(v)
 end
 
+-- RPCHelpMan::HandleRequest's declared-type check (rpc/util.cpp): a mismatch
+-- is RPC_TYPE_ERROR (-3) "Wrong type passed:\n{\n    \"Position N (name)\":
+-- \"JSON value of type X is not of expected type T\"\n}", raised before the
+-- handler body runs.  null/absent always matches (optional argument).
+local function core_wrong_type(position, name, v, expected)
+  error({code = M.ERROR.TYPE_ERROR,
+         message = string.format(
+           'Wrong type passed:\n{\n    "Position %d (%s)": "JSON value of type %s is not of expected type %s"\n}',
+           position, name, core_json_type_name(v), expected)})
+end
+
+local function core_check_optional_bool(v, position, name)
+  if v ~= nil and v ~= cjson.null and type(v) ~= "boolean" then
+    core_wrong_type(position, name, v, "bool")
+  end
+end
+
+-- AmountFromValue (rpc/util.cpp) -> satoshis.  NUM or STR only (-3 otherwise);
+-- an unparseable value is -3 "Invalid amount"; outside MoneyRange is -3
+-- "Amount out of range".  ParseFixedPoint allows at most 8 decimals.
+local function core_amount_from_value(v)
+  local sats
+  if type(v) == "number" then
+    if v ~= v or v == math.huge or v == -math.huge then
+      error({code = M.ERROR.TYPE_ERROR, message = "Invalid amount"})
+    end
+    local scaled = v * consensus.COIN
+    sats = math.floor(scaled + 0.5)
+    -- A JSON number with more than 8 decimals does not fit ParseFixedPoint;
+    -- tolerate only double rounding noise.
+    if math.abs(scaled - sats) > 1e-3 then
+      error({code = M.ERROR.TYPE_ERROR, message = "Invalid amount"})
+    end
+  elseif type(v) == "string" then
+    local sign, int, frac = v:match("^(%-?)(%d*)%.?(%d*)$")
+    if not sign or (int == "" and frac == "") or #frac > 8 or #int > 12 then
+      error({code = M.ERROR.TYPE_ERROR, message = "Invalid amount"})
+    end
+    sats = (tonumber(int ~= "" and int or "0") * consensus.COIN)
+         + tonumber(((frac .. string.rep("0", 8)):sub(1, 8)))
+    if sign == "-" then sats = -sats end
+  else
+    error({code = M.ERROR.TYPE_ERROR, message = "Amount is not a number or string"})
+  end
+  if sats < 0 or sats > 21000000 * consensus.COIN then
+    error({code = M.ERROR.TYPE_ERROR, message = "Amount out of range"})
+  end
+  return sats
+end
+
+-- ParseFeeRate(self.Arg("maxfeerate")): absent/null takes DEFAULT_MAX_RAW_TX_FEE_RATE
+-- (COIN / 10 per kvB); >= 1 BTC/kvB is -8.  Returns satoshis per kvB; 0 = no cap.
+local DEFAULT_MAX_RAW_TX_FEE_RATE = consensus.COIN / 10
+local function core_parse_max_feerate(v)
+  if v == nil or v == cjson.null then
+    return DEFAULT_MAX_RAW_TX_FEE_RATE
+  end
+  local per_kvb = core_amount_from_value(v)
+  if per_kvb >= consensus.COIN then
+    error({code = M.ERROR.INVALID_PARAMETER,
+           message = "Fee rates larger than or equal to 1BTC/kvB are not accepted"})
+  end
+  return per_kvb
+end
+
 -- Core: rpc/util.cpp ParseConfirmTarget.  getInt<int> first (width/fractional
 -- -> -1), THEN the domain test against the estimator's highest tracked target.
 -- Clamping instead of rejecting fabricates an estimate for a horizon the
@@ -4589,12 +4654,26 @@ function RPCServer:register_methods()
       error({code = M.ERROR.DESERIALIZATION_ERROR,
         message = "TX decode failed. Make sure the tx has at least one input."})
     end
+    -- ParseFeeRate(maxfeerate) runs after the decode and before any mempool
+    -- work (rpc/mempool.cpp sendrawtransaction).
+    local max_feerate = core_parse_max_feerate(params[2])
     if not rpc.mempool then
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
     end
-    local ok, txid_hex = rpc.mempool:accept_transaction(tx)
+    -- BroadcastTransaction (node/transaction.cpp): for a tx not already in the
+    -- mempool and a non-zero cap, refuse with MAX_FEE_EXCEEDED (-25) when the
+    -- base fee exceeds maxfeerate.GetFee(vsize).  The mempool checks the cap
+    -- before it evicts BIP125 conflicts or trims, so a refused tx leaves the
+    -- pool as it was (a tx already in the pool is answered at step 1, before
+    -- the cap, as in Core).
+    local accept_opts = (max_feerate > 0) and {max_fee_per_kvb = max_feerate} or nil
+    local ok, txid_hex = rpc.mempool:accept_transaction(tx, nil, accept_opts)
     local already_in_mempool = false
     if not ok then
+      if txid_hex == "max-fee-exceeded" then
+        error({code = M.ERROR.VERIFY_ERROR,
+               message = "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"})
+      end
       -- Core BroadcastTransaction (node/transaction.cpp): a tx whose txid is
       -- already in the mempool is not an error -- it is re-relayed and the
       -- txid returned.  Both the exact-wtxid and same-txid-different-witness
@@ -12593,6 +12672,7 @@ end
   self.methods["getblockheader"] = function(rpc, params)
     local blockhash = params[1]
     local verbose = params[2]
+    core_check_optional_bool(verbose, 2, "verbose")
     if verbose == nil or verbose == cjson.null then verbose = true end
 
     -- ParseHashV parity: malformed blockhash (wrong length / non-hex) -> -8 at
@@ -13414,25 +13494,36 @@ end
     -- params[1]: rawtxs array.  params[2]: optional maxfeerate (BTC/kvB).
     -- Per-tx response includes effective-feerate and effective-includes in fees.
     local rawtxs = params[1]
-    local maxfeerate_btc_per_kvb = (params[2] ~= nil and params[2] ~= cjson.null)
-                                   and tonumber(params[2]) or nil
-    if type(rawtxs) ~= "table" then
-      error({code = M.ERROR.INVALID_PARAMS, message = "rawtxs must be an array"})
+    -- RPCHelpMan type check (-3), then the 1..MAX_PACKAGE_COUNT bound (-8),
+    -- then ParseFeeRate(maxfeerate), in Core's order (rpc/mempool.cpp).
+    -- cjson decodes arrays and objects alike to tables; a table with a
+    -- non-sequence key is an object.
+    local is_array = type(rawtxs) == "table"
+    if is_array then
+      for k in pairs(rawtxs) do
+        if type(k) ~= "number" then is_array = false break end
+      end
     end
-    if params[2] ~= nil and params[2] ~= cjson.null and not maxfeerate_btc_per_kvb then
-      error({code = M.ERROR.INVALID_PARAMS, message = "maxfeerate must be a number"})
+    if not is_array then
+      core_wrong_type(1, "rawtxs", rawtxs, "array")
+    end
+    local mempool_mod = require("lunarblock.mempool")
+    if #rawtxs < 1 or #rawtxs > mempool_mod.MAX_PACKAGE_COUNT then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = string.format("Array must contain between 1 and %d transactions.",
+          mempool_mod.MAX_PACKAGE_COUNT)})
+    end
+    -- sat/kvB; 0 = no cap.  Both paths below refuse when the base fee is
+    -- over max_raw_tx_fee_rate.GetFee(vsize), as Core's result loop does
+    -- (rpc/mempool.cpp: `if (max_raw_tx_fee && fee > max_raw_tx_fee)`).
+    local maxfeerate_sat_per_kvb = core_parse_max_feerate(params[2])
+    local function over_max_fee(fee, vsize)
+      return maxfeerate_sat_per_kvb > 0
+         and fee > mempool_mod.fee_for_rate(maxfeerate_sat_per_kvb, vsize)
     end
 
     if not rpc.mempool then
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
-    end
-
-    -- MAX_PACKAGE_COUNT guard (Bitcoin Core: RPCTypeCheck then CheckPackageLimits).
-    local mempool_mod = require("lunarblock.mempool")
-    if #rawtxs > mempool_mod.MAX_PACKAGE_COUNT then
-      error({code = M.ERROR.INVALID_PARAMS,
-        message = string.format("Too many transactions: %d > %d",
-          #rawtxs, mempool_mod.MAX_PACKAGE_COUNT)})
     end
 
     -- DecodeHexTx (mempool.cpp:332): a bad hex is RPC_DESERIALIZATION_ERROR
@@ -13471,9 +13562,7 @@ end
       if atmp.accepted then
         local fee_btc = atmp.fee / consensus.COIN
         local vsize = atmp.vsize
-        local feerate_btc_per_kvb = (vsize > 0) and (fee_btc / vsize * 1000) or 0
-        -- maxfeerate check (BTC/kvB)
-        if maxfeerate_btc_per_kvb and feerate_btc_per_kvb > maxfeerate_btc_per_kvb then
+        if over_max_fee(atmp.fee, vsize) then
           res.allowed = false
           res["reject-reason"] = "max-fee-exceeded"
         else
@@ -13510,11 +13599,6 @@ end
     if state and state.kind == "policy" then
       package_error = mempool_mod.validation_state_string(state.reason, state.details)
     end
-    -- maxfeerate (BTC/kvB, Core default DEFAULT_MAX_RAW_TX_FEE_RATE 0.10);
-    -- Core compares the fee with max_raw_tx_fee_rate.GetFee(vsize), and a
-    -- zero cap means no check.
-    local max_rate_sat_kvb = math.floor(
-      (maxfeerate_btc_per_kvb or 0.10) * consensus.COIN + 0.5)
     local exit_early = false
     for i = 1, #txs do
       local res = results[i]
@@ -13523,8 +13607,7 @@ end
       local r = pkg_results[res.wtxid]
       if r and not exit_early then
         if r.kind == "valid" then
-          local max_fee = math.floor((max_rate_sat_kvb * r.vsize + 999) / 1000)
-          if max_fee > 0 and r.fee > max_fee then
+          if over_max_fee(r.fee, r.vsize) then
             res.allowed = false
             res["reject-reason"] = "max-fee-exceeded"
             exit_early = true
