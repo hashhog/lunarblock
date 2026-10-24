@@ -24,32 +24,54 @@ describe("sendrawtransaction result mapping", function()
   local txid_hex = types.hash256_hex(validation.compute_txid(tx))
   local hex = rpc.hex_encode(serialize.serialize_transaction(tx, false))
 
+  -- reject == nil means the mempool accepts the tx.  Returns the decoded
+  -- response, the txids passed to add_unbroadcast, and the relayed messages.
   local function send_with(reject)
+    local unbroadcast, relayed = {}, {}
     local mempool = {
       entries = {},
       has = function() return false end,
-      accept_transaction = function() return false, reject end,
+      accept_transaction = function()
+        if reject == nil then return true, txid_hex end
+        return false, reject
+      end,
       remove_transaction = function() end,
-      -- sendrawtransaction marks every accepted (or already-present) tx
-      -- unbroadcast; the resubmit cases reach that call.
-      add_unbroadcast = function() end,
+      add_unbroadcast = function(_, id) unbroadcast[#unbroadcast + 1] = id end,
     }
-    local server = rpc.new({network = consensus.networks.mainnet, mempool = mempool})
+    local peer_manager = {
+      broadcast = function(_, cmd) relayed[#relayed + 1] = cmd end,
+    }
+    local server = rpc.new({network = consensus.networks.mainnet,
+      mempool = mempool, peer_manager = peer_manager})
     local response = server:handle_request(
       '{"method":"sendrawtransaction","params":["' .. hex .. '"],"id":1}')
-    return cjson.decode(response)
+    return cjson.decode(response), unbroadcast, relayed
   end
 
-  it("resubmitting a tx already in the mempool returns its txid", function()
-    local d = send_with("txn-already-in-mempool")
+  it("a newly accepted tx is marked unbroadcast and relayed", function()
+    local d, unbroadcast, relayed = send_with(nil)
     assert.truthy(d.error == nil or d.error == cjson.null)
     assert.equal(txid_hex, d.result)
+    assert.same({txid_hex}, unbroadcast)
+    assert.same({"inv"}, relayed)
+  end)
+
+  -- Core BroadcastTransaction only calls AddUnbroadcastTx on the branch that
+  -- just inserted the tx; the already-in-mempool branch only reannounces.
+  it("resubmitting a tx already in the mempool returns its txid", function()
+    local d, unbroadcast, relayed = send_with("txn-already-in-mempool")
+    assert.truthy(d.error == nil or d.error == cjson.null)
+    assert.equal(txid_hex, d.result)
+    assert.same({}, unbroadcast)
+    assert.same({"inv"}, relayed)
   end)
 
   it("resubmitting a same-txid tx already in the mempool returns its txid", function()
-    local d = send_with("txn-same-nonwitness-data-in-mempool")
+    local d, unbroadcast, relayed = send_with("txn-same-nonwitness-data-in-mempool")
     assert.truthy(d.error == nil or d.error == cjson.null)
     assert.equal(txid_hex, d.result)
+    assert.same({}, unbroadcast)
+    assert.same({"inv"}, relayed)
   end)
 
   it("a confirmed tx is refused with -27 'Transaction outputs already in utxo set'", function()
