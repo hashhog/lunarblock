@@ -359,6 +359,21 @@ describe("sendrawtransaction maxfeerate on a real mempool", function()
     assert.is_nil(mp.entries[orig_txid])
   end)
 
+  -- BroadcastTransaction answers a tx already in the pool at step 1, before
+  -- the fee cap: the txid comes back even when the tx's fee is over the cap,
+  -- and the resubmit does not put it in the unbroadcast set.
+  it("a tx already in the pool is answered before the cap", function()
+    local mp = real_mempool()
+    local tx, hex, txid = spend(8000000)           -- 2,000,000 sat: over 0.10 BTC/kvB
+    local ok, err = mp:accept_transaction(tx)
+    assert.is_true(ok, tostring(err))
+    local r = call(server(mp), "sendrawtransaction", {hex})
+    assert.is_truthy(r.error == nil or r.error == cjson.null)
+    assert.equal(txid, r.result)
+    assert.is_nil(mp.unbroadcast[txid])
+    assert.equal(1, mp.tx_count)
+  end)
+
   it("the mempool's cap is GetFee(vsize): equal passes, one sat over refuses", function()
     -- Directly on accept_transaction, against the sigop-adjusted vsize.
     local mp = real_mempool()
