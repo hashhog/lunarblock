@@ -4483,16 +4483,27 @@ function RPCServer:register_methods()
     end
     local ok, txid_hex = rpc.mempool:accept_transaction(tx)
     if not ok then
-      -- W96: route mempool reject reasons to canonical Core RPC error codes.
-      -- "txn-already-in-mempool" / "txn-same-nonwitness-data-in-mempool" →
-      -- VERIFY_ALREADY_IN_CHAIN (-27) per Bitcoin Core rpc/rawtransaction.cpp.
-      -- Other rejects remain VERIFY_REJECTED (-26).
+      -- Core BroadcastTransaction (node/transaction.cpp): a tx whose txid is
+      -- already in the mempool is not an error -- it is re-relayed and the
+      -- txid returned.  Both the exact-wtxid and same-txid-different-witness
+      -- reject tokens mean "txid already in the mempool".
       local err_str = tostring(txid_hex or "")
-      if err_str:find("already", 1, true)
-         or err_str:find("same-nonwitness-data", 1, true) then
-        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN, message = err_str})
+      if err_str == "txn-already-in-mempool"
+         or err_str == "txn-same-nonwitness-data-in-mempool" then
+        ok = true
+        txid_hex = types.hash256_hex(validation.compute_txid(tx))
+      elseif err_str == "txn-already-known" then
+        -- An output of this tx is already in the UTXO set (confirmed):
+        -- TransactionError::ALREADY_IN_UTXO_SET -> RPC_VERIFY_ALREADY_IN_UTXO_SET (-27).
+        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN,
+               message = "Transaction outputs already in utxo set"})
+      elseif err_str == "bad-txns-inputs-missingorspent" then
+        -- TransactionError::MISSING_INPUTS -> RPC_TRANSACTION_ERROR (-25),
+        -- message is the validation state string.
+        error({code = M.ERROR.VERIFY_ERROR, message = err_str})
+      else
+        error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
       end
-      error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
     end
     -- Broadcast to peers
     if rpc.peer_manager then
