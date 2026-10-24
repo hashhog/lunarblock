@@ -506,10 +506,13 @@ M.MAX_STANDARD_SCRIPTSIG_SIZE = 1650
 
 -- W96: permit_bare_multisig policy flag (Core policy/policy.cpp:152-154
 -- + kernel/mempool_options.h DEFAULT_PERMIT_BAREMULTISIG).
--- Core flipped this default from true → false in v28 (commit 8ee7773d).
+-- Core's default is TRUE (policy/policy.h DEFAULT_PERMIT_BAREMULTISIG{true},
+-- still so in v31.1; Core 31.1 accepts a 1-of-1 bare multisig output on a
+-- default regtest node).  The earlier "flipped to false in v28" note was
+-- wrong and made lunarblock refuse what Core relays and mines.
 -- When false, IsStandardTx rejects bare-multisig outputs with reason
 -- "bare-multisig" even if 1 <= m <= n <= 3.
-M.PERMIT_BARE_MULTISIG = false
+M.PERMIT_BARE_MULTISIG = true
 
 -- W96: legacy (non-witness) sigops cap per transaction (BIP-54 +
 -- Core policy.h MAX_TX_LEGACY_SIGOPS).  Enforced by ValidateInputsStandardness
@@ -1432,8 +1435,8 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       -- IsStandard() == false path).
       -- Additionally, if permit_bare_multisig is false, reject any bare
       -- multisig with reason "bare-multisig" (Core policy.cpp:152-154).
-      -- We expose the policy flag via M.PERMIT_BARE_MULTISIG (default false
-      -- to match Core's `-permitbaremultisig=0` since v28).
+      -- We expose the policy flag via M.PERMIT_BARE_MULTISIG (default true,
+      -- Core's DEFAULT_PERMIT_BAREMULTISIG).
       local m, n = 0, 0
       if type(type_meta) == "string" then
         local m_s, n_s = type_meta:match("^(%d+)_(%d+)$")
@@ -2154,6 +2157,9 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- Core sums (policy.cpp:390 → txmempool.cpp:1017 → TxGraph).
   local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, M.now(),
     sigops_adjusted_weight(weight, tx_sigop_cost))
+  -- Core CTxMemPoolEntry::GetSigOpCost(): the block assembler and
+  -- getblocktemplate's per-tx `sigops` read this, not a prevout-blind recount.
+  entry.sigop_cost = tx_sigop_cost
   entry.ancestor_count = ancestor_count - 1  -- exclude self
   entry.ancestor_size = ancestor_size - vsize  -- exclude self
   entry.ancestor_fees = ancestor_fees - fee  -- exclude self
