@@ -4504,6 +4504,7 @@ function RPCServer:register_methods()
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
     end
     local ok, txid_hex = rpc.mempool:accept_transaction(tx)
+    local already_in_mempool = false
     if not ok then
       -- Core BroadcastTransaction (node/transaction.cpp): a tx whose txid is
       -- already in the mempool is not an error -- it is re-relayed and the
@@ -4513,6 +4514,7 @@ function RPCServer:register_methods()
       if err_str == "txn-already-in-mempool"
          or err_str == "txn-same-nonwitness-data-in-mempool" then
         ok = true
+        already_in_mempool = true
         txid_hex = types.hash256_hex(validation.compute_txid(tx))
       elseif err_str == "txn-already-known" then
         -- An output of this tx is already in the UTXO set (confirmed):
@@ -4528,8 +4530,11 @@ function RPCServer:register_methods()
       end
     end
     -- Locally submitted: stays in the unbroadcast set until a peer asks for it
-    -- (Core BroadcastTransaction, node/transaction.cpp:102).
-    rpc.mempool:add_unbroadcast(txid_hex)
+    -- (Core BroadcastTransaction, node/transaction.cpp:102).  Only the branch
+    -- that just inserted the tx does this; a resubmit is only reannounced.
+    if not already_in_mempool then
+      rpc.mempool:add_unbroadcast(txid_hex)
+    end
     -- Broadcast to peers
     if rpc.peer_manager then
       local txid = validation.compute_txid(tx)
