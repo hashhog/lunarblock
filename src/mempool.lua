@@ -2532,6 +2532,76 @@ local function chunk_linearize(txids, entries)
   return out
 end
 
+-- Byte-reversed display hex: uint256 operator< is a memcmp of the stored
+-- little-endian bytes, so this string order is Core's txid order.
+local function txid_byte_order_key(hex)
+  local t = {}
+  for i = #hex - 1, 1, -2 do t[#t + 1] = hex:sub(i, i + 1) end
+  return table.concat(t)
+end
+
+local function by_txid_byte_order(a, b)
+  return txid_byte_order_key(a) < txid_byte_order_key(b)
+end
+
+--- In-pool relatives of one entry as Core v31.1's entryToJSON reports them.
+-- Counts, sizes and fees INCLUDE the entry itself and sum MODIFIED fees
+-- (txmempool.cpp CalculateAncestorData / CalculateDescendantData walk
+-- TxGraph::GetAncestors/GetDescendants, which contain the tx, and add
+-- GetModifiedFee).  depends is the in-pool parent set in display-hex order
+-- (rpc/mempool.cpp std::set<std::string>); spentby the in-pool children in
+-- txid byte order (txmempool.cpp GetChildren, CompareIteratorByHash).
+-- The per-entry ancestor_count / descendant_count fields stay self-exclusive:
+-- the TRUC and package checks read them that way.
+-- @param entries table txid_hex -> entry (the pool's entries)
+-- @param txid_hex string
+-- @return table {ancestor_count, ancestor_size, ancestor_fees,
+--   descendant_count, descendant_size, descendant_fees, depends, spentby}
+function M.entry_relatives(entries, txid_hex)
+  local e = entries[txid_hex]
+  local function mod_fee(x) return x.modified_fee or x.fee or 0 end
+  local r = {
+    ancestor_count = 1, ancestor_size = e.vsize or 0, ancestor_fees = mod_fee(e),
+    descendant_count = 1, descendant_size = e.vsize or 0, descendant_fees = mod_fee(e),
+    depends = {}, spentby = {},
+  }
+  for a in pairs(e.ancestors or {}) do
+    local ae = entries[a]
+    if ae and a ~= txid_hex then
+      r.ancestor_count = r.ancestor_count + 1
+      r.ancestor_size = r.ancestor_size + (ae.vsize or 0)
+      r.ancestor_fees = r.ancestor_fees + mod_fee(ae)
+    end
+  end
+  for d in pairs(e.descendants or {}) do
+    local de = entries[d]
+    if de and d ~= txid_hex then
+      r.descendant_count = r.descendant_count + 1
+      r.descendant_size = r.descendant_size + (de.vsize or 0)
+      r.descendant_fees = r.descendant_fees + mod_fee(de)
+      for _, parent_hex in pairs(de.spends_from or {}) do
+        if parent_hex == txid_hex then
+          r.spentby[#r.spentby + 1] = d
+          break
+        end
+      end
+    end
+  end
+  if e.tx and e.tx.inputs then
+    local seen = {}
+    for _, inp in ipairs(e.tx.inputs) do
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      if entries[prev_hex] and not seen[prev_hex] then
+        seen[prev_hex] = true
+        r.depends[#r.depends + 1] = prev_hex
+      end
+    end
+  end
+  table.sort(r.depends)
+  table.sort(r.spentby, by_txid_byte_order)
+  return r
+end
+
 -- TxGraphImpl::Trim for one would-be cluster: walk eligible transactions in
 -- chunk-feerate order (dependencies first) and keep a tx only when adding it
 -- stays within both limits.  A skipped tx takes its descendants with it,

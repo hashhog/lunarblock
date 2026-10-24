@@ -1040,21 +1040,12 @@ function RESTServer:handle_mempool_contents(query_params)
   local verbose = query_params.verbose ~= "false"
 
   if verbose then
-    local result = {}
-    for txid_hex, entry in pairs(self.mempool.entries or {}) do
-      result[txid_hex] = {
-        vsize = entry.vsize,
-        weight = entry.weight,
-        fee = entry.fee / consensus.COIN,
-        time = entry.time,
-        height = entry.height,
-        descendantcount = entry.descendant_count or 1,
-        descendantsize = entry.descendant_size or entry.vsize,
-        ancestorcount = entry.ancestor_count or 1,
-        ancestorsize = entry.ancestor_size or entry.vsize,
-      }
-    end
-    return json_response(result)
+    -- Core rest.cpp rest_mempool -> MempoolToJSON: the same entryToJSON
+    -- objects as getrawmempool verbose.
+    local txids = {}
+    for txid_hex in pairs(self.mempool.entries or {}) do txids[#txids + 1] = txid_hex end
+    local body = rpc_mod._oj_encode(rpc_mod.mempool_entries_to_json(self.mempool, txids))
+    return build_response(200, body .. "\n", "application/json")
   else
     local txids = {}
     for txid_hex, _ in pairs(self.mempool.entries or {}) do

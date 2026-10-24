@@ -1267,6 +1267,84 @@ M._oj_array_of_strings = oj_array_of_strings
 M._oj_encode = oj_encode
 M._oj_value = oj_value
 
+-- Core getrawmempool / getmempoolentry wtxid is display-order hex.
+-- entry.wtxid is a hash256 {bytes=...}; encoding that table puts raw
+-- bytes in the JSON string and the response is not UTF-8.
+local function mempool_wtxid_hex(entry, txid_hex)
+  local w = entry.wtxid
+  if type(w) == "table" and type(w.bytes) == "string" then
+    return types.hash256_hex(w)
+  end
+  if type(w) == "string" then return w end
+  return txid_hex
+end
+
+-- A JSON array of txid strings.  Written verbatim rather than through
+-- cjson.empty_array_mt: the lua-cjson 2.1.0 the node loads from the system
+-- path has no empty_array_mt, so an empty table there encodes as {}.
+local function oj_txid_array(list)
+  if #list == 0 then return oj_array_empty() end
+  return oj_array_of_strings(list)
+end
+
+--- One mempool entry as Core v31.1 rpc/mempool.cpp entryToJSON writes it
+-- (getrawmempool verbose, getmempoolentry, getmempoolancestors/descendants
+-- verbose, REST /mempool/contents), as an ordered object in Core's key
+-- order.  Counts, sizes and fees come from mempool.entry_relatives
+-- (self-inclusive, modified fees).
+-- @param mp Mempool (or any table with .entries)
+function M.mempool_entry_to_json(mp, entry, txid_hex)
+  local mempool_mod = require("lunarblock.mempool")
+  local entries = (mp and mp.entries) or { [txid_hex] = entry }
+  if entries[txid_hex] == nil then entries = { [txid_hex] = entry } end
+  local rel = mempool_mod.entry_relatives(entries, txid_hex)
+  local modified_sats = (mp and mp.get_modified_fee) and mp:get_modified_fee(txid_hex)
+    or entry.modified_fee or entry.fee
+  return oj({
+    "vsize",           entry.vsize,
+    "weight",          entry.weight,
+    "time",            entry.time,
+    "height",          entry.height,
+    "descendantcount", rel.descendant_count,
+    "descendantsize",  rel.descendant_size,
+    "ancestorcount",   rel.ancestor_count,
+    "ancestorsize",    rel.ancestor_size,
+    "wtxid",           mempool_wtxid_hex(entry, txid_hex),
+    -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
+    -- descendantfees/ancestorfees at the top level.
+    "fees", oj({
+      "base",       oj_amount(entry.fee),
+      "modified",   oj_amount(modified_sats),
+      "ancestor",   oj_amount(rel.ancestor_fees),
+      "descendant", oj_amount(rel.descendant_fees),
+    }),
+    "depends",         oj_txid_array(rel.depends),
+    "spentby",         oj_txid_array(rel.spentby),
+    -- FIX-68 (W120 BUG-9): policy/rbf.cpp IsRBFOptIn walks the tx and its
+    -- unconfirmed ancestors (Mempool:is_replaceable).
+    "bip125-replaceable", (mp and mp.is_replaceable) and mp:is_replaceable(txid_hex) or false,
+    "unbroadcast",     false,
+  })
+end
+
+--- An ordered txid -> entryToJSON object (Core MempoolToJSON verbose,
+-- getmempoolancestors/descendants verbose), keys in txid order.
+-- @param txids array of txid_hex
+function M.mempool_entries_to_json(mp, txids)
+  local sorted = {}
+  for i = 1, #txids do sorted[i] = txids[i] end
+  table.sort(sorted)
+  local seq = {}
+  for _, txid_hex in ipairs(sorted) do
+    local entry = mp.entries[txid_hex]
+    if entry then
+      seq[#seq + 1] = txid_hex
+      seq[#seq + 1] = M.mempool_entry_to_json(mp, entry, txid_hex)
+    end
+  end
+  return oj(seq)
+end
+
 --------------------------------------------------------------------------------
 -- Base64 Encoding/Decoding
 --------------------------------------------------------------------------------
@@ -4242,18 +4320,6 @@ function RPCServer:register_methods()
     }))
   end
 
-  -- Core getrawmempool / getmempoolentry wtxid is display-order hex.
-  -- entry.wtxid is a hash256 {bytes=...}; encoding that table puts raw
-  -- bytes in the JSON string and the response is not UTF-8.
-  local function mempool_wtxid_hex(entry, txid_hex)
-    local w = entry.wtxid
-    if type(w) == "table" and type(w.bytes) == "string" then
-      return types.hash256_hex(w)
-    end
-    if type(w) == "string" then return w end
-    return txid_hex
-  end
-
   self.methods["getrawmempool"] = function(rpc, params)
     local verbose = params[1] or false
     if not rpc.mempool then
@@ -4270,47 +4336,9 @@ function RPCServer:register_methods()
       end
       return txids
     end
-    -- Verbose: return details for each tx
-    local result = {}
-    for _, txid_hex in ipairs(rpc.mempool:get_raw_mempool()) do
-      local entry = rpc.mempool:get_entry(txid_hex)
-      if entry then
-        local fee_btc = entry.fee / consensus.COIN
-        -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee).
-        local modified_sats = rpc.mempool:get_modified_fee(txid_hex)
-        local modified_btc = modified_sats / consensus.COIN
-        -- FIX-68 (W120 BUG-9): bip125-replaceable per Bitcoin Core
-        -- policy/rbf.cpp IsRBFOptIn — walks tx + unconfirmed ancestors.
-        -- Was hardcoded `true`, lying to wallets when neither the tx nor
-        -- any ancestor signals RBF.  Walker is rpc.mempool:is_replaceable
-        -- which scans entry.ancestors via signals_rbf (mempool.lua:2218).
-        result[txid_hex] = {
-          vsize = entry.vsize,
-          weight = entry.weight,
-          time = entry.time,
-          height = entry.height,
-          descendantcount = entry.descendant_count or 1,
-          descendantsize = entry.descendant_size or entry.vsize,
-          ancestorcount = entry.ancestor_count or 1,
-          ancestorsize = entry.ancestor_size or entry.vsize,
-          wtxid = mempool_wtxid_hex(entry, txid_hex),
-          -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
-          -- descendantfees/ancestorfees at the top level (removed to match
-          -- Bitcoin Core rpc/mempool.cpp entryToJSON).
-          fees = {
-            base = fee_btc,
-            modified = modified_btc,
-            ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
-            descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
-          },
-          depends = entry.depends or {},
-          spentby = entry.spent_by or {},
-          ["bip125-replaceable"] = rpc.mempool:is_replaceable(txid_hex),
-          unbroadcast = false,
-        }
-      end
-    end
-    return result
+    -- Verbose: return details for each tx.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool,
+      rpc.mempool:get_raw_mempool()))
   end
 
   -- getorphantxs: show transactions in the tx orphanage (Core v28).
@@ -6950,45 +6978,8 @@ end
   -- Mempool entry/ancestor/descendant introspection.
   -- Bitcoin Core: rpc/mempool.cpp::{getmempoolentry,getmempoolancestors,getmempooldescendants}.
   -- Each walks the in-memory CTxMemPool graph; we mirror that with the
-  -- ancestor/descendant sets already maintained on each Mempool entry.
-  --
-  -- FIX-68 (W120 BUG-9): bip125-replaceable computed per Core
-  -- policy/rbf.cpp IsRBFOptIn (walks tx + unconfirmed ancestors); the
-  -- caller must pass `mp` so we can run the ancestor scan via
-  -- Mempool:is_replaceable.  Previously hardcoded `true`, which lied
-  -- to wallets for non-signaling, no-signaling-ancestor mempool entries.
-  local function format_mempool_entry(entry, txid_hex, mp)
-    local fee_btc = entry.fee / consensus.COIN
-    -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee = nFee +
-    -- delta).  Fall back to base fee when no mempool ref is available.
-    local modified_sats = mp and mp.get_modified_fee
-      and mp:get_modified_fee(txid_hex) or entry.fee
-    local modified_btc = modified_sats / consensus.COIN
-    return {
-      vsize = entry.vsize,
-      weight = entry.weight,
-      time = entry.time,
-      height = entry.height,
-      descendantcount = entry.descendant_count or 1,
-      descendantsize = entry.descendant_size or entry.vsize,
-      ancestorcount = entry.ancestor_count or 1,
-      ancestorsize = entry.ancestor_size or entry.vsize,
-      wtxid = mempool_wtxid_hex(entry, txid_hex),
-      -- Core shape: fees is a NESTED object; flat fee/modifiedfee/
-      -- descendantfees/ancestorfees are NOT top-level fields in Core's
-      -- entryToJSON (bitcoin-core/src/rpc/mempool.cpp:508-568).
-      fees = {
-        base = fee_btc,
-        modified = modified_btc,
-        ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
-        descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
-      },
-      depends = entry.depends or {},
-      spentby = entry.spent_by or {},
-      ["bip125-replaceable"] = mp and mp:is_replaceable(txid_hex) or false,
-      unbroadcast = false,
-    }
-  end
+  -- ancestor/descendant sets already maintained on each Mempool entry; the
+  -- entry objects come from M.mempool_entry_to_json (entryToJSON).
 
   self.methods["getmempoolentry"] = function(rpc, params)
     local txid_hex = params and params[1]
@@ -7002,7 +6993,7 @@ end
     if not entry then
       error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
     end
-    return format_mempool_entry(entry, txid_hex, rpc.mempool)
+    return oj_result(M.mempool_entry_to_json(rpc.mempool, entry, txid_hex))
   end
 
   self.methods["getmempoolancestors"] = function(rpc, params)
@@ -7026,13 +7017,8 @@ end
       return out
     end
     local out = {}
-    for anc_hex in pairs(entry.ancestors or {}) do
-      local anc_entry = rpc.mempool:get_entry(anc_hex)
-      if anc_entry then
-        out[anc_hex] = format_mempool_entry(anc_entry, anc_hex, rpc.mempool)
-      end
-    end
-    return out
+    for anc_hex in pairs(entry.ancestors or {}) do out[#out + 1] = anc_hex end
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out))
   end
 
   self.methods["getmempooldescendants"] = function(rpc, params)
@@ -7056,13 +7042,8 @@ end
       return out
     end
     local out = {}
-    for desc_hex in pairs(entry.descendants or {}) do
-      local desc_entry = rpc.mempool:get_entry(desc_hex)
-      if desc_entry then
-        out[desc_hex] = format_mempool_entry(desc_entry, desc_hex, rpc.mempool)
-      end
-    end
-    return out
+    for desc_hex in pairs(entry.descendants or {}) do out[#out + 1] = desc_hex end
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out))
   end
 
   -- prioritisetransaction: bump (or lower) a tx's effective fee for mining.
