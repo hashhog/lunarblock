@@ -7,6 +7,18 @@ local fault = require("lunarblock.fault")
 local mining = require("lunarblock.mining")
 local M = {}
 
+-- Mempool clock.  `setmocktime` (regtest only) pins it so rolling-fee decay and
+-- entry times are reproducible; 0 / nil restores the wall clock.  Core's mock
+-- time moves every clock; here it moves the mempool's, which is what the
+-- mempool-visible behaviour (mempoolminfee decay, expiry) reads.
+local mock_time = nil
+function M.set_mock_time(t)
+  mock_time = (t and t ~= 0) and t or nil
+end
+function M.now()
+  return mock_time or os.time()
+end
+
 --- Compute median-time-past for the current chain tip.
 -- Reads the last 11 block headers via chain_state.storage and returns their
 -- median timestamp.  Used for BIP-113 IsFinalTx and BIP-68 SequenceLocks at
@@ -1088,6 +1100,70 @@ end
 -- @param time number: Unix timestamp when added (optional)
 -- @param adjusted_weight number: max(weight, sigop_cost*20) (optional)
 -- @return table: Mempool entry
+--------------------------------------------------------------------------------
+-- Memory-usage model (Core CTxMemPool::DynamicMemoryUsage)
+--------------------------------------------------------------------------------
+-- getmempoolinfo.usage and the -maxmempool trim threshold are Core's estimate of
+-- the pool's heap footprint, not the serialized byte count.  Core's figure is
+-- memusage::MallocUsage() applied to the sizes of the C++ objects it allocates
+-- (64-bit glibc: bitcoin-core/src/memusage.h), so it is a deterministic function
+-- of the pool contents.  The constants below were measured against Core v31.1
+-- (regtest, wallet-built singleton / chain / independent-tx pools) and agree to
+-- the byte; they are not derivable from this process's own allocator.
+
+--- memusage::MallocUsage for a 64-bit build (memusage.h:52).
+local function malloc_usage(alloc)
+  if alloc == 0 then return 0 end
+  return math.floor((alloc + 31) / 16) * 16
+end
+M.malloc_usage = malloc_usage
+
+-- Fixed per-tx cost of one singleton cluster: the mapTx node
+-- (MallocUsage(sizeof(CTxMemPoolEntry) + 9 pointers)), the txgraph Entry, its
+-- singleton Cluster and its single chunk-index node.
+local USAGE_SINGLETON_FIXED = 440
+-- sizeof(CTxIn) = 112, sizeof(CTxOut) = 48 (prevector<28> is 40 bytes).
+local USAGE_TXIN, USAGE_TXOUT = 112, 48
+-- shared_ptr<const CTransaction>: MallocUsage(sizeof(CTransaction) = 128) plus
+-- MallocUsage(sizeof(stl_shared_counter) = 24).
+local USAGE_TX_OBJECT = malloc_usage(128) + malloc_usage(24)
+-- mapNextTx node (std::map<const COutPoint*, txiter>), one per input.
+local USAGE_NEXTTX_NODE = malloc_usage(48)
+-- txns_randomized element: pair<Wtxid, txiter>.
+local USAGE_RANDOMIZED_ELEM = 40
+-- A prevector<28> scriptSig spills to the heap only past 28 bytes.
+local PREVECTOR_DIRECT = 28
+
+--- RecursiveDynamicUsage(tx) + the tx's mapNextTx nodes: the part of an entry's
+-- usage that depends on the transaction alone.
+function M.tx_dynamic_usage(tx)
+  local usage = USAGE_TX_OBJECT
+    + malloc_usage(#tx.inputs * USAGE_TXIN)
+    + malloc_usage(#tx.outputs * USAGE_TXOUT)
+    + #tx.inputs * USAGE_NEXTTX_NODE
+  for _, inp in ipairs(tx.inputs) do
+    local ss = inp.script_sig
+    if ss and #ss > PREVECTOR_DIRECT then usage = usage + malloc_usage(#ss) end
+    local wit = inp.witness
+    if wit and #wit > 0 then
+      usage = usage + malloc_usage(#wit * 24)
+      for _, item in ipairs(wit) do usage = usage + malloc_usage(#item) end
+    end
+  end
+  -- Output scripts add nothing, even past 28 bytes: Core v31.1 reports the same
+  -- usage for P2WPKH, P2WSH, P2TR, P2SH and P2PKH outputs (measured).
+  return usage
+end
+
+--- txgraph memory for one cluster of n transactions linearizing into k chunks.
+-- n == 1 is a SingletonClusterImpl; n >= 2 a GenericClusterImpl whose mapping
+-- and linearization vectors are rounded by MallocUsage.  Each chunk costs one
+-- 64-byte chunk-index node, so merging chunks saves 64 bytes apiece.
+local function cluster_graph_usage(n, k)
+  if n == 1 then return USAGE_SINGLETON_FIXED end
+  return 400 * n + 152 + 2 * malloc_usage(4 * n) - 64 * (n - k)
+end
+
 function M.mempool_entry(tx, txid, fee, vsize, height, time, adjusted_weight)
   local tx_weight = validation.get_tx_weight(tx)
   return {
@@ -1110,9 +1186,10 @@ function M.mempool_entry(tx, txid, fee, vsize, height, time, adjusted_weight)
     -- production caller (Mempool:accept_transaction) always passes the real one.
     adjusted_weight = adjusted_weight or tx_weight,
     size = #serialize.serialize_transaction(tx, true),
+    usage = M.tx_dynamic_usage(tx),  -- see the memory-usage model above
     fee_rate = fee / vsize,     -- sat/vB
     height = height,            -- block height when added
-    time = time or os.time(),   -- unix timestamp when added
+    time = time or M.now(),   -- unix timestamp when added
     ancestors = {},             -- set of txid_hex -> true
     descendants = {},           -- set of txid_hex -> true
     ancestor_count = 0,
@@ -1182,7 +1259,15 @@ function M.new(chain_state, config)
   -- (mempool_persist.lua).  Reference: bitcoin-core/src/txmempool.{h,cpp}.
   self.map_deltas = {}         -- txid_hex -> int64 fee delta (satoshis, signed)
   self.outpoint_to_tx = {}    -- outpoint_key -> txid_hex (tracks which tx spends each output)
-  self.total_size = 0          -- Current memory usage estimate
+  self.total_size = 0          -- Sum of serialized sizes (bytes)
+  self.total_vsize = 0         -- Sum of virtual sizes: getmempoolinfo.bytes (GetTotalTxSize)
+  self.usage_sum = 0           -- Sum of per-tx entry.usage (cluster-independent part)
+  -- Capacity of Core's txns_randomized vector: grows by doubling and only
+  -- shrinks in remove_transaction below, so it depends on the add/remove history.
+  self.randomized_cap = 0
+  -- Locally submitted txs not yet requested by a peer (CTxMemPool::m_unbroadcast_txids).
+  self.unbroadcast = {}
+  self.unbroadcast_count = 0
   self.tx_count = 0
   -- W96: PolicyScriptChecks/ConsensusScriptChecks gate.
   -- When true, accept_transaction runs script-verify for each input prev script
@@ -1204,7 +1289,7 @@ function M.new(chain_state, config)
   -- Decay is enabled only after a block has been connected
   -- (block_since_last_rolling_fee_bump, txmempool.cpp:427).
   self.rolling_minimum_fee_rate = 0.0   -- sat/kvB, double precision
-  self.last_rolling_fee_update = os.time()
+  self.last_rolling_fee_update = M.now()
   self.block_since_last_rolling_fee_bump = false
   -- Optional notification callbacks (for ZMQ, etc.)
   self.callbacks = {
@@ -2067,7 +2152,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- `weight` and `tx_sigop_cost` were computed above (steps 3d and 6); pass the
   -- sigop-adjusted weight through so the cluster gate below sums exactly what
   -- Core sums (policy.cpp:390 → txmempool.cpp:1017 → TxGraph).
-  local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, os.time(),
+  local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, M.now(),
     sigops_adjusted_weight(weight, tx_sigop_cost))
   entry.ancestor_count = ancestor_count - 1  -- exclude self
   entry.ancestor_size = ancestor_size - vsize  -- exclude self
@@ -2078,8 +2163,13 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
     local wtxid_hex = types.hash256_hex(entry.wtxid)
     if wtxid_hex ~= txid_hex then self.wtxid_index[wtxid_hex] = txid_hex end
   end
+  if self.tx_count == self.randomized_cap then
+    self.randomized_cap = math.max(1, 2 * self.randomized_cap)
+  end
   self.tx_count = self.tx_count + 1
   self.total_size = self.total_size + entry.size
+  self.total_vsize = self.total_vsize + entry.vsize
+  self.usage_sum = self.usage_sum + entry.usage
 
   -- If a priority delta was set for this txid before it entered the mempool
   -- (e.g. prioritisetransaction on a not-yet-arrived tx, or a delta restored
@@ -2287,8 +2377,16 @@ function Mempool:remove_transaction(txid_hex, reason)
   end
 
   self.total_size = self.total_size - entry.size
+  self.total_vsize = self.total_vsize - entry.vsize
+  self.usage_sum = self.usage_sum - (entry.usage or 0)
+  -- txmempool.cpp:289-299: swap-and-pop, shrink_to_fit once under half full;
+  -- removing the last element clear()s and keeps the capacity.
+  if self.tx_count > 1 and (self.tx_count - 1) * 2 < self.randomized_cap then
+    self.randomized_cap = self.tx_count - 1
+  end
   self.tx_count = self.tx_count - 1
   self.entries[txid_hex] = nil
+  self:remove_unbroadcast(txid_hex)
   if entry.wtxid and self.wtxid_index then
     local wtxid_hex = types.hash256_hex(entry.wtxid)
     if self.wtxid_index[wtxid_hex] == txid_hex then self.wtxid_index[wtxid_hex] = nil end
@@ -2350,7 +2448,7 @@ function Mempool:on_block_connected(block)
   -- which is the only state change it could make.
   if next(self.entries) == nil and next(self.outpoint_to_tx) == nil
       and next(self.map_deltas) == nil then
-    self.last_rolling_fee_update = os.time()
+    self.last_rolling_fee_update = M.now()
     self.block_since_last_rolling_fee_bump = true
     return
   end
@@ -2379,7 +2477,7 @@ function Mempool:on_block_connected(block)
   -- Reset rolling fee decay clock (txmempool.cpp:426-427).
   -- block_since_last_rolling_fee_bump=true enables get_min_fee() to
   -- decay the rolling minimum fee toward zero over time.
-  self.last_rolling_fee_update = os.time()
+  self.last_rolling_fee_update = M.now()
   self.block_since_last_rolling_fee_bump = true
 end
 
@@ -2995,13 +3093,14 @@ function Mempool:get_min_fee()
     return self.rolling_minimum_fee_rate
   end
 
-  local now = os.time()
+  local now = M.now()
   if now > self.last_rolling_fee_update + 10 then
     local halflife = M.ROLLING_FEE_HALFLIFE
     -- Adjust halflife based on current pool occupancy (txmempool.cpp:837-841).
-    if self.total_size < self.max_size / 4 then
+    local usage = self:usage_estimate()
+    if usage < self.max_size / 4 then
       halflife = halflife / 4
-    elseif self.total_size < self.max_size / 2 then
+    elseif usage < self.max_size / 2 then
       halflife = halflife / 2
     end
 
@@ -3030,7 +3129,7 @@ end
 -- @param cutoff_time number: optional Unix timestamp; defaults to now - self.expiry
 -- @return number: count of txs removed (including descendants)
 function Mempool:expire(cutoff_time)
-  cutoff_time = cutoff_time or (os.time() - self.expiry)
+  cutoff_time = cutoff_time or (M.now() - self.expiry)
   -- Collect all entries that are directly expired.
   local expired = {}
   for txid_hex, entry in pairs(self.entries) do
@@ -3088,7 +3187,7 @@ end
 --            using (fee+desc_fees)/(vsize+desc_size) as the descendant feerate
 --            proxy (closest analog to Core's GetWorstMainChunk cluster sort).
 function Mempool:trim()
-  while self.total_size > self.max_size do
+  while self.tx_count > 0 and self:usage_estimate() > self.max_size do
     -- Find the entry with the lowest descendant fee rate
     -- (total fee of this tx + descendants) / (total size of this tx + descendants)
     local worst_hex = nil
@@ -3171,6 +3270,107 @@ function Mempool:get_sorted_entries()
   return sorted
 end
 
+--- Count the chunks of the cluster `members` (array of txid_hex) would
+-- linearize into: repeatedly take the best-feerate ancestor-closed set, then
+-- merge a chunk into its predecessor while it pays strictly more (the chunking
+-- of an ancestor-set linearization; Core's optimal linearization has the same
+-- chunk count unless feerates tie).
+local function count_chunks(entries, members)
+  local remaining, left = {}, #members
+  for _, h in ipairs(members) do remaining[h] = true end
+  local chunks = {}
+  while left > 0 do
+    local best_fee, best_size, best_set
+    for h in pairs(remaining) do
+      local e = entries[h]
+      local fee, size, set = e.modified_fee or e.fee, e.vsize, { [h] = true }
+      for a in pairs(e.ancestors) do
+        if remaining[a] then
+          local ae = entries[a]
+          fee = fee + (ae.modified_fee or ae.fee)
+          size = size + ae.vsize
+          set[a] = true
+        end
+      end
+      if not best_set or fee * best_size > best_fee * size then
+        best_fee, best_size, best_set = fee, size, set
+      end
+    end
+    for h in pairs(best_set) do
+      remaining[h] = nil
+      left = left - 1
+    end
+    local fee, size = best_fee, best_size
+    while #chunks > 0 and fee * chunks[#chunks].size > chunks[#chunks].fee * size do
+      local c = table.remove(chunks)
+      fee, size = fee + c.fee, size + c.size
+    end
+    chunks[#chunks + 1] = { fee = fee, size = size }
+  end
+  return #chunks
+end
+
+--- Core's txns_randomized vector cost (capacity, not size).
+function Mempool:randomized_usage()
+  return malloc_usage(self.randomized_cap * USAGE_RANDOMIZED_ELEM)
+end
+
+--- Cheap running estimate of CTxMemPool::DynamicMemoryUsage(): exact while every
+-- tx is its own cluster, and short by the (small) multi-tx cluster overhead
+-- otherwise.  Used where Core would call DynamicMemoryUsage() in a loop (trim,
+-- the rolling-fee half-life) so those stay O(1).
+function Mempool:usage_estimate()
+  return self.usage_sum + USAGE_SINGLETON_FIXED * self.tx_count + self:randomized_usage()
+end
+
+--- Exact CTxMemPool::DynamicMemoryUsage(): walks the clusters so multi-tx
+-- clusters are costed by size and chunk count.  O(pool); for RPC / REST.
+function Mempool:dynamic_usage()
+  local usage = self.usage_sum + self:randomized_usage()
+  local seen = {}
+  for h, e in pairs(self.entries) do
+    if not seen[h] then
+      if next(e.ancestors) == nil and next(e.descendants) == nil then
+        usage = usage + USAGE_SINGLETON_FIXED
+        seen[h] = true
+      else
+        local members, queue = { h }, { h }
+        seen[h] = true
+        while #queue > 0 do
+          local cur = self.entries[table.remove(queue)]
+          for _, set in ipairs({ cur.ancestors, cur.descendants }) do
+            for o in pairs(set) do
+              if not seen[o] and self.entries[o] then
+                seen[o] = true
+                members[#members + 1] = o
+                queue[#queue + 1] = o
+              end
+            end
+          end
+        end
+        usage = usage + cluster_graph_usage(#members, count_chunks(self.entries, members))
+      end
+    end
+  end
+  return usage
+end
+
+--- Unbroadcast set (CTxMemPool::m_unbroadcast_txids): txs submitted locally
+-- (sendrawtransaction) that no peer has asked for yet.
+function Mempool:add_unbroadcast(txid_hex)
+  if self.entries[txid_hex] and not self.unbroadcast[txid_hex] then
+    self.unbroadcast[txid_hex] = true
+    self.unbroadcast_count = self.unbroadcast_count + 1
+  end
+end
+
+function Mempool:remove_unbroadcast(txid_hex)
+  if self.unbroadcast[txid_hex] then
+    self.unbroadcast[txid_hex] = nil
+    self.unbroadcast_count = self.unbroadcast_count - 1
+  end
+end
+
 --- Get mempool statistics.
 -- mempoolminfee returns the effective minimum feerate in sat/kvB:
 -- max(min_relay_fee, get_min_fee()) — the rolling minimum includes the
@@ -3181,8 +3381,9 @@ function Mempool:get_info()
   local effective_min = math.max(self.min_relay_fee, rolling_min)
   return {
     size = self.tx_count,
-    bytes = self.total_size,
-    usage = self.total_size,
+    bytes = self.total_vsize,       -- Core GetTotalTxSize(): sum of vsizes
+    usage = self:dynamic_usage(),   -- Core DynamicMemoryUsage(), not serialized bytes
+    unbroadcastcount = self.unbroadcast_count,
     maxmempool = self.max_size,
     mempoolminfee = effective_min,
     -- FIX-68 (W120 BUG-9): Honest fullrbf reporting — reflects the actual
@@ -4194,7 +4395,7 @@ end
 -- @param now number|nil: current UNIX timestamp (os.time() if omitted)
 -- @return integer: number of orphans evicted
 function OrphanPool:expire_stale(now)
-  now = now or os.time()
+  now = now or M.now()
   local cutoff = now - (self.expire_time or M.ORPHAN_TX_EXPIRE_TIME)
   local evicted = 0
   -- Walk insertion order; collect the stale ones first to avoid

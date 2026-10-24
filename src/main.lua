@@ -81,6 +81,7 @@ local function default_args()
     -- non-signaling replacements are rejected with "conflicting tx does not
     -- signal RBF".  getmempoolinfo.fullrbf reads this value (honest).
     mempool_fullrbf = nil,  -- nil = take mempool.lua default; true/false override
+    maxmempool = nil,       -- Core -maxmempool, megabytes (metric); nil = DEFAULT_MAX_MEMPOOL_SIZE
     -- Full-script-verification parity (mirrors Bitcoin Core's -assumevalid).
     -- Bitcoin Core ships a hard-coded assumevalid block hash and SKIPS script
     -- (signature) verification for every block that is an ancestor of it
@@ -181,6 +182,7 @@ local function parse_args(argv)
       print("      --conf PATH                 Path to bitcoin.conf-style config file")
       print("      --ready-fd N                Write READY token to this FD when listeners are up")
       print("      --mempool-fullrbf BOOL      Mempool full-RBF policy (default: 1 = on, Core v28+ default)")
+      print("      --maxmempool MB             Mempool memory limit in megabytes (default: 300)")
       print("      --noassumevalid             Disable assumevalid: verify every script/signature from genesis (AV=0 parity)")
       print("      --assumevalid HASH          Override assumevalid block hash; 0 disables (full script verification)")
       print("      --externalip IP[:PORT]      Own public address to advertise to peers (repeatable; bare IP = P2P listen port; implies --discover=0)")
@@ -444,6 +446,17 @@ local function parse_args(argv)
         end
       end
       args.mempool_fullrbf = (v == "1" or v == "true" or v == "yes" or v == "on")
+    elseif arg == "--maxmempool" or arg:match("^%-%-maxmempool=") then
+      -- Core -maxmempool=<n>: keep the mempool under n megabytes (metric) of
+      -- DynamicMemoryUsage.  Core refuses a non-numeric or negative value.
+      local v = arg:match("^%-%-maxmempool=(.*)$")
+      if not v then i = i + 1; v = argv[i] end
+      local mb = tonumber(v)
+      if not mb or mb < 0 then
+        io.stderr:write("Error: Invalid -maxmempool: '" .. tostring(v) .. "'\n")
+        os.exit(1)
+      end
+      args.maxmempool = mb
     elseif arg == "--externalip" or arg:match("^%-%-externalip=") then
       -- Core -externalip=<ip>[:port]: our own public address to advertise.
       -- Repeatable and comma-separated.
@@ -1695,7 +1708,8 @@ local function main()
     --     (fee_rate_per_kb < self.min_relay_fee). Passing nil here would also
     --     fall through to the same defaults; we pass them explicitly to make the
     --     coupling obvious.
-    max_mempool_size = mempool_mod.DEFAULT_MAX_MEMPOOL_SIZE,
+    max_mempool_size = args.maxmempool and (args.maxmempool * 1000 * 1000)
+      or mempool_mod.DEFAULT_MAX_MEMPOOL_SIZE,
     min_relay_fee = mempool_mod.DEFAULT_MIN_RELAY_FEE,
     fullrbf = args.mempool_fullrbf,  -- nil => mempool uses DEFAULT_MEMPOOL_FULL_RBF
     -- W96/DoS: run PolicyScriptChecks (STANDARD flags) at relay time so that

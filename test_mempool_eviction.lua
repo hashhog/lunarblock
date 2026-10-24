@@ -284,7 +284,7 @@ do
   -- Before trim: rolling_minimum_fee_rate == 0
   assert_eq(mp.rolling_minimum_fee_rate, 0, "rolling rate is 0 before any eviction")
 
-  -- Accept will add then immediately trim (max_size=1 → total_size > max_size)
+  -- Accept will add then immediately trim (max_size=1 → usage_estimate > max_size)
   local ok, _ = mp:accept_transaction(tx)
   -- tx gets added then trimmed; tx_count should be 0
   assert_eq(mp.tx_count, 0, "tx evicted because max_size=1")
@@ -311,7 +311,9 @@ do
   probe_tx.inputs[1] = make_input(seed1, 0)
   probe_tx.outputs[1] = make_output(1990000)  -- fee = 10000
   mp_probe:accept_transaction(probe_tx)
-  local tx_size = mp_probe.total_size
+  -- trim compares memory usage, not serialized bytes; +32 is the txns_randomized
+  -- capacity Core keeps after the pool grew to 2 entries (96 vs 64 bytes)
+  local tx_size = mp_probe:usage_estimate() + 32
 
   -- Now create a mempool that fits 1 tx but not 2
   local mp = mempool.new(chain_state, {max_mempool_size = tx_size})
@@ -528,7 +530,9 @@ do
   probe.inputs[1] = make_input(seed1, 0)
   probe.outputs[1] = make_output(1990000)
   mp_probe:accept_transaction(probe)
-  local tx_size = mp_probe.total_size
+  -- trim compares memory usage, not serialized bytes; +32 is the txns_randomized
+  -- capacity Core keeps after the pool grew to 2 entries (96 vs 64 bytes)
+  local tx_size = mp_probe:usage_estimate() + 32
 
   -- Pool that fits exactly 1 tx
   local mp = mempool.new(chain_state, {max_mempool_size = tx_size})
