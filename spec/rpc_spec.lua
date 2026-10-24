@@ -2,6 +2,7 @@ local rpc = require("lunarblock.rpc")
 local types = require("lunarblock.types")
 local consensus = require("lunarblock.consensus")
 local cjson = require("cjson")
+local mempool_mod = require("lunarblock.mempool")
 
 describe("rpc", function()
 
@@ -917,10 +918,18 @@ describe("rpc", function()
         has = function(self, txid_hex)
           return self.entries[txid_hex] ~= nil
         end,
-        accept_transaction = function(self, tx)
+        accept_transaction = function(self, tx, allow_rbf, opts)
           if type(accept_result) == "function" then
             return accept_result(tx)
-          elseif accept_result == true then
+          end
+          -- The caller's fee cap is checked before anything is added, as in
+          -- Mempool:accept_transaction; a 100 vB tx, so fee 1000 sat = 10 sat/vB.
+          local cap = opts and opts.max_fee_per_kvb
+          if accept_result == true and cap and cap > 0
+             and (accept_fee or 1000) > mempool_mod.fee_for_rate(cap, 100) then
+            return false, mempool_mod.MAX_FEE_EXCEEDED
+          end
+          if accept_result == true then
             local txid = validation.compute_txid(tx)
             local txid_hex = types.hash256_hex(txid)
             -- Add to entries to track
@@ -929,14 +938,6 @@ describe("rpc", function()
           else
             return false, accept_result or "validation failed"
           end
-        end,
-        -- BroadcastTransaction's max-fee pre-check test-accepts without adding
-        -- the tx; a 100 vB tx, so fee 1000 sat = 10 sat/vB.
-        accept_to_memory_pool = function(self, tx, test_accept)
-          if accept_result == true then
-            return {accepted = true, fee = accept_fee or 1000, vsize = 100}
-          end
-          return {accepted = false, reject_reason = tostring(accept_result)}
         end,
         remove_transaction = function(self, txid_hex, reason)
           self.entries[txid_hex] = nil

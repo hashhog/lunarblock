@@ -26,12 +26,20 @@ local function tx_hex()
 end
 
 -- A mempool stub: every tx validates, paying `fee` sat at `vsize` vbytes.
+-- It refuses over the caller's cap the way Mempool:accept_transaction does
+-- (before adding anything); the real mempool is exercised further down.
 local function stub_mempool(fee, vsize)
+  local mempool = require("lunarblock.mempool")
   local m = {entries = {}, accepted = 0}
+  -- testmempoolaccept's single-tx path.
   function m:accept_to_memory_pool(tx, test_accept)
     return {accepted = true, fee = fee, vsize = vsize}
   end
-  function m:accept_transaction(tx)
+  function m:accept_transaction(tx, allow_rbf, opts)
+    local cap = opts and opts.max_fee_per_kvb
+    if cap and cap > 0 and fee > mempool.fee_for_rate(cap, vsize) then
+      return false, mempool.MAX_FEE_EXCEEDED
+    end
     self.accepted = self.accepted + 1
     return true, types.hash256_hex(validation.compute_txid(tx)), fee
   end
@@ -177,5 +185,101 @@ describe("testmempoolaccept rawtxs and maxfeerate", function()
     local hex = tx_hex()
     is_err(call(server(stub_mempool(1000, 100)), "testmempoolaccept", {{hex}, "x"}),
            -3, "Invalid amount")
+  end)
+end)
+
+-- The cap on a REAL mempool.  Core's BroadcastTransaction test-accept never
+-- commits, so a tx refused for its fee leaves the pool exactly as it was.
+-- lunarblock's test-accept removes BIP125 conflicts (and trims) before the
+-- new tx is dropped again, so the cap must be checked before any eviction.
+describe("sendrawtransaction maxfeerate on a real mempool", function()
+  local mempool = require("lunarblock.mempool")
+  local P2PKH = "\x76\xa9\x14" .. string.rep("\x00", 20) .. "\x88\xac"
+  local prev = types.hash256(string.rep("\x07", 32))
+
+  local function real_mempool()
+    local utxos = {
+      [types.hash256_hex(prev) .. ":0"] = {
+        value = 10000000, script_pubkey = P2PKH, height = 500000, is_coinbase = false,
+      },
+    }
+    local chain_state = {
+      coin_view = {
+        get = function(_, txid, vout) return utxos[types.hash256_hex(txid) .. ":" .. vout] end,
+      },
+      tip_height = 700000,
+    }
+    return mempool.new(chain_state)
+  end
+
+  -- Spends prev:0, RBF-signaling, paying 10,000,000 - out_value sat.
+  local function spend(out_value)
+    local tx = types.transaction(1,
+      {types.txin(types.outpoint(prev, 0), "", 0xfffffffd)},
+      {types.txout(out_value, P2PKH)}, 0)
+    return tx, rpc.hex_encode(serialize.serialize_transaction(tx, false)),
+           types.hash256_hex(validation.compute_txid(tx))
+  end
+
+  it("a refused high-fee replacement leaves the original in the pool", function()
+    local mp = real_mempool()
+    local orig = spend(9995000)                    -- 5,000 sat fee
+    local ok, orig_txid = mp:accept_transaction(orig)
+    assert.is_true(ok, tostring(orig_txid))
+
+    -- 2,000,000 sat at well under 1,000 vB: far over 0.10 BTC/kvB.
+    local _, repl_hex, repl_txid = spend(8000000)
+    is_err(call(server(mp), "sendrawtransaction", {repl_hex}), -25,
+           "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)")
+    assert.is_not_nil(mp.entries[orig_txid])
+    assert.is_nil(mp.entries[repl_txid])
+    assert.equal(1, mp.tx_count)
+  end)
+
+  it("a replacement under the cap still replaces the original", function()
+    local mp = real_mempool()
+    local orig = spend(9995000)
+    local ok, orig_txid = mp:accept_transaction(orig)
+    assert.is_true(ok, tostring(orig_txid))
+
+    local _, repl_hex, repl_txid = spend(9990000)  -- 10,000 sat fee
+    local r = call(server(mp), "sendrawtransaction", {repl_hex})
+    assert.equal(repl_txid, r.result)
+    assert.is_nil(mp.entries[orig_txid])
+    assert.is_not_nil(mp.entries[repl_txid])
+  end)
+
+  it("maxfeerate 0 lets the high-fee replacement through", function()
+    local mp = real_mempool()
+    local orig = spend(9995000)
+    local ok, orig_txid = mp:accept_transaction(orig)
+    assert.is_true(ok, tostring(orig_txid))
+
+    local _, repl_hex, repl_txid = spend(8000000)
+    local r = call(server(mp), "sendrawtransaction", {repl_hex, 0})
+    assert.equal(repl_txid, r.result)
+    assert.is_nil(mp.entries[orig_txid])
+  end)
+
+  it("the mempool's cap is GetFee(vsize): equal passes, one sat over refuses", function()
+    -- Directly on accept_transaction, against the sigop-adjusted vsize.
+    local mp = real_mempool()
+    local probe = spend(9995000)
+    local vsize = validation.get_virtual_tx_size(validation.get_tx_weight(probe), 0,
+                                                 mempool.DEFAULT_BYTES_PER_SIGOP)
+    -- 5,000 sat fee; a cap whose GetFee(vsize) is exactly 5,000 passes...
+    local per_kvb = math.ceil(5000 * 1000 / vsize)
+    while mempool.fee_for_rate(per_kvb, vsize) > 5000 do per_kvb = per_kvb - 1 end
+    assert.equal(5000, mempool.fee_for_rate(per_kvb, vsize))
+    local ok, err = mp:accept_transaction(probe, nil, {max_fee_per_kvb = per_kvb})
+    assert.is_true(ok, tostring(err))
+    -- ...and a cap one sat/kvB lower (GetFee < 5,000) refuses a fresh pool.
+    local mp2 = real_mempool()
+    local lower = per_kvb
+    while mempool.fee_for_rate(lower, vsize) >= 5000 do lower = lower - 1 end
+    local ok2, err2 = mp2:accept_transaction(probe, nil, {max_fee_per_kvb = lower})
+    assert.is_false(ok2)
+    assert.equal(mempool.MAX_FEE_EXCEEDED, err2)
+    assert.equal(0, mp2.tx_count)
   end)
 end)

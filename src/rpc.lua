@@ -175,13 +175,6 @@ local function core_parse_max_feerate(v)
   return per_kvb
 end
 
--- CFeeRate::GetFee(vsize): truncating, but a non-zero rate never rounds to 0.
-local function core_feerate_fee(per_kvb, vsize)
-  local fee = math.floor(per_kvb * vsize / 1000)
-  if fee == 0 and per_kvb > 0 and vsize ~= 0 then fee = 1 end
-  return fee
-end
-
 -- Core: rpc/util.cpp ParseConfirmTarget.  getInt<int> first (width/fractional
 -- -> -1), THEN the domain test against the estimator's highest tracked target.
 -- Clamping instead of rejecting fabricates an estimate for a horizon the
@@ -4668,21 +4661,18 @@ function RPCServer:register_methods()
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
     end
     -- BroadcastTransaction (node/transaction.cpp): for a tx not already in the
-    -- mempool and a non-zero cap, test-accept first and refuse with
-    -- MAX_FEE_EXCEEDED (-25) before the tx is added.  A reject from the test
-    -- accept falls through to the real accept below for the same error mapping.
-    if max_feerate > 0
-       and not (rpc.mempool.entries
-                and rpc.mempool.entries[types.hash256_hex(validation.compute_txid(tx))]) then
-      local atmp = rpc.mempool:accept_to_memory_pool(tx, true)
-      if atmp.accepted
-         and atmp.fee > core_feerate_fee(max_feerate, atmp.vsize) then
+    -- mempool and a non-zero cap, refuse with MAX_FEE_EXCEEDED (-25) when the
+    -- base fee exceeds maxfeerate.GetFee(vsize).  The mempool checks the cap
+    -- before it evicts BIP125 conflicts or trims, so a refused tx leaves the
+    -- pool as it was (a tx already in the pool is answered at step 1, before
+    -- the cap, as in Core).
+    local accept_opts = (max_feerate > 0) and {max_fee_per_kvb = max_feerate} or nil
+    local ok, txid_hex = rpc.mempool:accept_transaction(tx, nil, accept_opts)
+    if not ok then
+      if txid_hex == "max-fee-exceeded" then
         error({code = M.ERROR.VERIFY_ERROR,
                message = "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"})
       end
-    end
-    local ok, txid_hex = rpc.mempool:accept_transaction(tx)
-    if not ok then
       -- W96: route mempool reject reasons to canonical Core RPC error codes.
       -- "txn-already-in-mempool" / "txn-same-nonwitness-data-in-mempool" →
       -- VERIFY_ALREADY_IN_CHAIN (-27) per Bitcoin Core rpc/rawtransaction.cpp.
