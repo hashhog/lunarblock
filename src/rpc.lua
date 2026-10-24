@@ -1335,7 +1335,7 @@ function M.mempool_entry_to_json(mp, entry, txid_hex, chunk)
     -- FIX-68 (W120 BUG-9): policy/rbf.cpp IsRBFOptIn walks the tx and its
     -- unconfirmed ancestors (Mempool:is_replaceable).
     "bip125-replaceable", (mp and mp.is_replaceable) and mp:is_replaceable(txid_hex) or false,
-    "unbroadcast",     false,
+    "unbroadcast",     (mp and mp.is_unbroadcast) and mp:is_unbroadcast(txid_hex) or false,
   })
 end
 
@@ -4318,7 +4318,8 @@ function RPCServer:register_methods()
       "mempoolminfee",       oj_amount(mempool_min_fee),
       "minrelaytxfee",       oj_amount(min_relay_fee),
       "incrementalrelayfee", oj_amount(incremental_fee),
-      "unbroadcastcount",    0,
+      "unbroadcastcount",    (rpc.mempool and rpc.mempool.get_unbroadcast_count)
+                               and rpc.mempool:get_unbroadcast_count() or 0,
       "fullrbf",             fullrbf,
       -- v31.99 fields (cluster mempool). permitbaremultisig mirrors
       -- mp.PERMIT_BARE_MULTISIG inverted? No — Core reports m_opts.permit_bare_multisig
@@ -4536,6 +4537,9 @@ function RPCServer:register_methods()
       end
       error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
     end
+    -- Core BroadcastTransaction (node/transaction.cpp): a tx this call added
+    -- to the pool is unbroadcast until a peer fetches it.
+    if rpc.mempool.add_unbroadcast then rpc.mempool:add_unbroadcast(txid_hex) end
     -- Broadcast to peers
     if rpc.peer_manager then
       local txid = validation.compute_txid(tx)

@@ -4,7 +4,9 @@
 -- CalculateDescendantData); chunkweight / fees.chunk are the entry's chunk in
 -- the cluster linearization (txgraph.cpp GetMainChunkFeerate); depends is the
 -- sorted set of in-pool parents; spentby the in-pool children, sorted by txid
--- byte order (txmempool.cpp GetChildren, CompareIteratorByHash).
+-- byte order (txmempool.cpp GetChildren, CompareIteratorByHash); unbroadcast
+-- is true for a tx sendrawtransaction put in the pool until a peer fetches it
+-- or it leaves the pool (node/transaction.cpp BroadcastTransaction).
 
 local types = require("lunarblock.types")
 local consensus = require("lunarblock.consensus")
@@ -240,6 +242,51 @@ describe("mempool entry accounting (Core v31.1 entryToJSON)", function()
         end
         assert.same(call(server, "getmempoolentry", { h }), r)
       end
+    end)
+  end)
+
+  describe("unbroadcast", function()
+    it("is true after sendrawtransaction and false for a tx not sent over RPC", function()
+      local mp, prev = fund(100000)
+      local server = rpc.new({ network = consensus.networks.mainnet, mempool = mp })
+      local parent = spend(prev, 0, { 99000 })
+      assert(mp:accept_transaction(parent))
+      local child = spend(txid_of(parent), 0, { 98000 })
+      local raw = require("lunarblock.serialize").serialize_transaction(child, true)
+      local hex = (raw:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+      local txid = call(server, "sendrawtransaction", { hex })
+      assert.equal(hex_of(child), txid)
+      assert.is_true(call(server, "getmempoolentry", { txid }).unbroadcast)
+      assert.is_false(call(server, "getmempoolentry", { hex_of(parent) }).unbroadcast)
+      assert.equal(1, call(server, "getmempoolinfo", {}).unbroadcastcount)
+    end)
+
+    it("is cleared when the tx leaves the pool and does not come back with it", function()
+      local mp, prev = fund(100000)
+      local tx = spend(prev, 0, { 99000 })
+      assert(mp:accept_transaction(tx))
+      local h = hex_of(tx)
+      mp:add_unbroadcast(h)
+      assert.is_true(mp:is_unbroadcast(h))
+      mp:remove_transaction(h, "test")
+      assert.is_false(mp:is_unbroadcast(h))
+      assert(mp:accept_transaction(tx))
+      assert.is_false(mp:is_unbroadcast(h))
+    end)
+
+    it("is cleared once a peer has been sent the tx", function()
+      local mp, prev = fund(100000)
+      local tx = spend(prev, 0, { 99000 })
+      assert(mp:accept_transaction(tx))
+      local h = hex_of(tx)
+      mp:add_unbroadcast(h)
+      local peerman = require("lunarblock.peerman")
+      local p2p = require("lunarblock.p2p")
+      local cmd, _, status = peerman.getdata_response(
+        { type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid_of(tx) }, { mempool = mp })
+      assert.equal("tx", cmd)
+      assert.equal("served", status)
+      assert.is_false(mp:is_unbroadcast(h))
     end)
   end)
 end)

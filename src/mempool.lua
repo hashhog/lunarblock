@@ -1182,6 +1182,11 @@ function M.new(chain_state, config)
   -- (mempool_persist.lua).  Reference: bitcoin-core/src/txmempool.{h,cpp}.
   self.map_deltas = {}         -- txid_hex -> int64 fee delta (satoshis, signed)
   self.outpoint_to_tx = {}    -- outpoint_key -> txid_hex (tracks which tx spends each output)
+  -- Core CTxMemPool::m_unbroadcast_txids: txids put in the pool by a local
+  -- broadcast (sendrawtransaction) that no peer has fetched yet.  Cleared when
+  -- a peer is sent the tx (net_processing.cpp ProcessGetData) or the tx leaves
+  -- the pool (txmempool.cpp removeUnchecked).
+  self.unbroadcast = {}        -- txid_hex -> true
   self.total_size = 0          -- Current memory usage estimate
   self.tx_count = 0
   -- W96: PolicyScriptChecks/ConsensusScriptChecks gate.
@@ -2289,6 +2294,7 @@ function Mempool:remove_transaction(txid_hex, reason)
   self.total_size = self.total_size - entry.size
   self.tx_count = self.tx_count - 1
   self.entries[txid_hex] = nil
+  self.unbroadcast[txid_hex] = nil
   if entry.wtxid and self.wtxid_index then
     local wtxid_hex = types.hash256_hex(entry.wtxid)
     if self.wtxid_index[wtxid_hex] == txid_hex then self.wtxid_index[wtxid_hex] = nil end
@@ -3408,6 +3414,28 @@ end
 -- @return boolean: True if transaction is in mempool
 function Mempool:has(txid_hex)
   return self.entries[txid_hex] ~= nil
+end
+
+--- Mark an in-pool tx as locally broadcast and not yet fetched by a peer
+-- (Core CTxMemPool::AddUnbroadcastTx, called from BroadcastTransaction when it
+-- adds the tx to the pool).
+function Mempool:add_unbroadcast(txid_hex)
+  if self.entries[txid_hex] then self.unbroadcast[txid_hex] = true end
+end
+
+--- Core CTxMemPool::RemoveUnbroadcastTx.
+function Mempool:remove_unbroadcast(txid_hex)
+  self.unbroadcast[txid_hex] = nil
+end
+
+function Mempool:is_unbroadcast(txid_hex)
+  return self.unbroadcast[txid_hex] == true
+end
+
+function Mempool:get_unbroadcast_count()
+  local n = 0
+  for _ in pairs(self.unbroadcast) do n = n + 1 end
+  return n
 end
 
 --------------------------------------------------------------------------------
