@@ -1,7 +1,8 @@
 -- Mempool entry accounting as Core v31.1 reports it (rpc/mempool.cpp
 -- entryToJSON): ancestor/descendant count, size and fees INCLUDE the entry
 -- itself and sum MODIFIED fees (txmempool.cpp CalculateAncestorData /
--- CalculateDescendantData); depends is the
+-- CalculateDescendantData); chunkweight / fees.chunk are the entry's chunk in
+-- the cluster linearization (txgraph.cpp GetMainChunkFeerate); depends is the
 -- sorted set of in-pool parents; spentby the in-pool children, sorted by txid
 -- byte order (txmempool.cpp GetChildren, CompareIteratorByHash).
 
@@ -120,10 +121,20 @@ describe("mempool entry accounting (Core v31.1 entryToJSON)", function()
       assert.falsy(body_all:find('"spentby":{}', 1, true))
     end)
 
-    it("ancestor/descendant fees use the modified fee", function()
+    it("both share one chunk: the child pays for the parent", function()
+      local w = pe.adjusted_weight + ce.adjusted_weight
+      for _, h in ipairs({ p_hex, c_hex }) do
+        local r = call(server, "getmempoolentry", { h })
+        assert.equal(w, r.chunkweight)
+        assert.is_true(close(20200 / COIN, r.fees.chunk))
+      end
+    end)
+
+    it("ancestor/descendant/chunk fees use the modified fee", function()
       mp:prioritise_transaction(p_hex, 1000)
       local r = call(server, "getmempoolentry", { c_hex })
       assert.is_true(close(21200 / COIN, r.fees.ancestor))
+      assert.is_true(close(21200 / COIN, r.fees.chunk))
       local rp = call(server, "getmempoolentry", { p_hex })
       assert.is_true(close(1200 / COIN, rp.fees.ancestor))
       assert.is_true(close(21200 / COIN, rp.fees.descendant))
@@ -144,6 +155,8 @@ describe("mempool entry accounting (Core v31.1 entryToJSON)", function()
       assert.equal(1, r.ancestorcount)
       assert.equal(ce.vsize, r.ancestorsize)
       assert.same({}, r.depends)
+      assert.equal(ce.adjusted_weight, r.chunkweight)
+      assert.is_true(close(20000 / COIN, r.fees.chunk))
     end)
   end)
 
@@ -186,6 +199,47 @@ describe("mempool entry accounting (Core v31.1 entryToJSON)", function()
       assert.equal(size, r.descendantsize)
       assert.is_true(close(fees / COIN, r.fees.descendant))
       assert.same(expect, r.spentby)
+    end)
+
+    it("chunk = parent + the children whose feerate beats the running chunk", function()
+      -- Independent oracle: the best chunk containing the parent is the
+      -- parent plus the k highest-feerate children maximising the feerate;
+      -- every other child is a chunk of its own.
+      local pe = mp.entries[p_hex]
+      local sorted = {}
+      for i = 1, CHILDREN do
+        local e = mp.entries[kids[i].hex]
+        sorted[i] = { hex = kids[i].hex, fee = kids[i].fee, w = e.adjusted_weight }
+      end
+      table.sort(sorted, function(a, b) return a.fee * b.w > b.fee * a.w end)
+      local best_fee, best_w, best_k = PARENT_FEE, pe.adjusted_weight, 0
+      local fee, w = PARENT_FEE, pe.adjusted_weight
+      for k = 1, CHILDREN do
+        fee, w = fee + sorted[k].fee, w + sorted[k].w
+        if fee * best_w > best_fee * w then best_fee, best_w, best_k = fee, w, k end
+      end
+      assert.is_true(best_k > 0 and best_k < CHILDREN)
+      local in_chunk = {}
+      for k = 1, best_k do in_chunk[sorted[k].hex] = true end
+
+      local all = call(server, "getrawmempool", { true })
+      assert.equal(best_w, all[p_hex].chunkweight)
+      assert.is_true(close(best_fee / COIN, all[p_hex].fees.chunk))
+      for i = 1, CHILDREN do
+        local h = kids[i].hex
+        local r = all[h]
+        assert.equal(2, r.ancestorcount)
+        assert.same({ p_hex }, r.depends)
+        assert.same({}, r.spentby)
+        if in_chunk[h] then
+          assert.equal(best_w, r.chunkweight)
+          assert.is_true(close(best_fee / COIN, r.fees.chunk))
+        else
+          assert.equal(mp.entries[h].adjusted_weight, r.chunkweight)
+          assert.is_true(close(kids[i].fee / COIN, r.fees.chunk))
+        end
+        assert.same(call(server, "getmempoolentry", { h }), r)
+      end
     end)
   end)
 end)

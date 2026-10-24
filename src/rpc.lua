@@ -1291,15 +1291,25 @@ end
 -- (getrawmempool verbose, getmempoolentry, getmempoolancestors/descendants
 -- verbose, REST /mempool/contents), as an ordered object in Core's key
 -- order.  Counts, sizes and fees come from mempool.entry_relatives
--- (self-inclusive, modified fees).
+-- (self-inclusive, modified fees); chunkweight and fees.chunk from the tx's
+-- chunk in its cluster linearization (TxGraph::GetMainChunkFeerate).
 -- @param mp Mempool (or any table with .entries)
-function M.mempool_entry_to_json(mp, entry, txid_hex)
+-- @param chunk table|nil {fee=, weight=} from mp:chunk_feerates(); computed
+--   for this tx's cluster when nil
+function M.mempool_entry_to_json(mp, entry, txid_hex, chunk)
   local mempool_mod = require("lunarblock.mempool")
   local entries = (mp and mp.entries) or { [txid_hex] = entry }
   if entries[txid_hex] == nil then entries = { [txid_hex] = entry } end
   local rel = mempool_mod.entry_relatives(entries, txid_hex)
   local modified_sats = (mp and mp.get_modified_fee) and mp:get_modified_fee(txid_hex)
     or entry.modified_fee or entry.fee
+  if not chunk and mp and mp.chunk_feerates then
+    chunk = mp:chunk_feerates(txid_hex)[txid_hex]
+  end
+  chunk = chunk or {
+    fee = modified_sats,
+    weight = entry.adjusted_weight or entry.weight or (entry.vsize or 0) * 4,
+  }
   return oj({
     "vsize",           entry.vsize,
     "weight",          entry.weight,
@@ -1310,6 +1320,7 @@ function M.mempool_entry_to_json(mp, entry, txid_hex)
     "ancestorcount",   rel.ancestor_count,
     "ancestorsize",    rel.ancestor_size,
     "wtxid",           mempool_wtxid_hex(entry, txid_hex),
+    "chunkweight",     chunk.weight,
     -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
     -- descendantfees/ancestorfees at the top level.
     "fees", oj({
@@ -1317,6 +1328,7 @@ function M.mempool_entry_to_json(mp, entry, txid_hex)
       "modified",   oj_amount(modified_sats),
       "ancestor",   oj_amount(rel.ancestor_fees),
       "descendant", oj_amount(rel.descendant_fees),
+      "chunk",      oj_amount(chunk.fee),
     }),
     "depends",         oj_txid_array(rel.depends),
     "spentby",         oj_txid_array(rel.spentby),
@@ -1330,7 +1342,8 @@ end
 --- An ordered txid -> entryToJSON object (Core MempoolToJSON verbose,
 -- getmempoolancestors/descendants verbose), keys in txid order.
 -- @param txids array of txid_hex
-function M.mempool_entries_to_json(mp, txids)
+-- @param chunks table|nil txid_hex -> {fee=, weight=}
+function M.mempool_entries_to_json(mp, txids, chunks)
   local sorted = {}
   for i = 1, #txids do sorted[i] = txids[i] end
   table.sort(sorted)
@@ -1339,7 +1352,7 @@ function M.mempool_entries_to_json(mp, txids)
     local entry = mp.entries[txid_hex]
     if entry then
       seq[#seq + 1] = txid_hex
-      seq[#seq + 1] = M.mempool_entry_to_json(mp, entry, txid_hex)
+      seq[#seq + 1] = M.mempool_entry_to_json(mp, entry, txid_hex, chunks and chunks[txid_hex])
     end
   end
   return oj(seq)
@@ -4336,9 +4349,10 @@ function RPCServer:register_methods()
       end
       return txids
     end
-    -- Verbose: return details for each tx.
+    -- Verbose: return details for each tx.  One chunk map for the whole
+    -- pool so each cluster is linearized once, not once per member.
     return oj_result(M.mempool_entries_to_json(rpc.mempool,
-      rpc.mempool:get_raw_mempool()))
+      rpc.mempool:get_raw_mempool(), rpc.mempool:chunk_feerates()))
   end
 
   -- getorphantxs: show transactions in the tx orphanage (Core v28).
@@ -7018,7 +7032,9 @@ end
     end
     local out = {}
     for anc_hex in pairs(entry.ancestors or {}) do out[#out + 1] = anc_hex end
-    return oj_result(M.mempool_entries_to_json(rpc.mempool, out))
+    -- Every ancestor shares txid's cluster: linearize it once.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out,
+      rpc.mempool:chunk_feerates(txid_hex)))
   end
 
   self.methods["getmempooldescendants"] = function(rpc, params)
@@ -7043,7 +7059,9 @@ end
     end
     local out = {}
     for desc_hex in pairs(entry.descendants or {}) do out[#out + 1] = desc_hex end
-    return oj_result(M.mempool_entries_to_json(rpc.mempool, out))
+    -- Every descendant shares txid's cluster: linearize it once.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out,
+      rpc.mempool:chunk_feerates(txid_hex)))
   end
 
   -- prioritisetransaction: bump (or lower) a tx's effective fee for mining.

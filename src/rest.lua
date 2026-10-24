@@ -1044,7 +1044,8 @@ function RESTServer:handle_mempool_contents(query_params)
     -- objects as getrawmempool verbose.
     local txids = {}
     for txid_hex in pairs(self.mempool.entries or {}) do txids[#txids + 1] = txid_hex end
-    local body = rpc_mod._oj_encode(rpc_mod.mempool_entries_to_json(self.mempool, txids))
+    local chunks = self.mempool.chunk_feerates and self.mempool:chunk_feerates() or nil
+    local body = rpc_mod._oj_encode(rpc_mod.mempool_entries_to_json(self.mempool, txids, chunks))
     return build_response(200, body .. "\n", "application/json")
   else
     local txids = {}

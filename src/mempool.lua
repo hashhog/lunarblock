@@ -2602,6 +2602,78 @@ function M.entry_relatives(entries, txid_hex)
   return r
 end
 
+-- The connected component of the in-pool graph holding `txid_hex`: the
+-- closure under ancestor and descendant sets (siblings meet through a shared
+-- ancestor's descendant set).  Core's TxGraph cluster.
+local function cluster_members(entries, txid_hex)
+  local seen, list, stack = { [txid_hex] = true }, { txid_hex }, { txid_hex }
+  while #stack > 0 do
+    local e = entries[table.remove(stack)]
+    if e then
+      for _, set in ipairs({ e.ancestors or {}, e.descendants or {} }) do
+        for o in pairs(set) do
+          if not seen[o] and entries[o] then
+            seen[o] = true
+            list[#list + 1] = o
+            stack[#stack + 1] = o
+          end
+        end
+      end
+    end
+  end
+  table.sort(list)
+  return list
+end
+
+-- Chunk feerate of every tx in one cluster: linearize (highest-feerate
+-- ancestor set first), then chunk the linearization the way Core's
+-- ChunkLinearizationInfo does (cluster_linearize.h): each tx starts a chunk
+-- and absorbs the chunk before it while its feerate is STRICTLY higher
+-- (FeeFrac operator>>), so equal-feerate chunks stay apart.  Sizes are the
+-- sigop-adjusted weights TxGraph holds, fees the modified fees.
+local function cluster_chunk_feerates(entries, txids, out)
+  local lin = chunk_linearize(txids, entries)
+  local chunks = {}
+  for i = 1, #lin do
+    local e = entries[lin[i].txid]
+    local c = { fee = e.modified_fee or e.fee or 0, size = lin[i].tx_size, first = i, last = i }
+    while #chunks > 0 do
+      local top = chunks[#chunks]
+      if cross_cmp(c.fee, top.size, top.fee, c.size) <= 0 then break end
+      chunks[#chunks] = nil
+      c = { fee = c.fee + top.fee, size = c.size + top.size, first = top.first, last = c.last }
+    end
+    chunks[#chunks + 1] = c
+  end
+  for _, c in ipairs(chunks) do
+    for i = c.first, c.last do
+      out[lin[i].txid] = { fee = c.fee, weight = c.size }
+    end
+  end
+end
+
+--- Chunk fee (modified, sats) and weight of the chunk each tx sits in: Core
+-- v31.1 TxGraph::GetMainChunkFeerate, reported by entryToJSON as
+-- fees.chunk / chunkweight.
+-- @param txid_hex string|nil  one tx (only its cluster is linearized), or nil
+--   for the whole pool
+-- @return table txid_hex -> {fee=, weight=}
+function Mempool:chunk_feerates(txid_hex)
+  local out = {}
+  if txid_hex then
+    if self.entries[txid_hex] then
+      cluster_chunk_feerates(self.entries, cluster_members(self.entries, txid_hex), out)
+    end
+    return out
+  end
+  for h in pairs(self.entries) do
+    if not out[h] then
+      cluster_chunk_feerates(self.entries, cluster_members(self.entries, h), out)
+    end
+  end
+  return out
+end
+
 -- TxGraphImpl::Trim for one would-be cluster: walk eligible transactions in
 -- chunk-feerate order (dependencies first) and keep a tx only when adding it
 -- stays within both limits.  A skipped tx takes its descendants with it,
