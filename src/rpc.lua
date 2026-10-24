@@ -1257,6 +1257,54 @@ local function oj_result(obj)
   return { _raw_json = oj_encode(obj) }
 end
 
+-- getblocktemplate result in Core's pushKV order (rpc/mining.cpp).  Encoded
+-- by hand because plain cjson cannot tell an empty array from an empty
+-- object: per-tx `depends` = [] went out as {}.  `coinbaseaux` is Core's
+-- empty object; `default_witness_commitment` is omitted when absent.
+local function block_template_json(t)
+  local txs = {}
+  for i, e in ipairs(t.transactions) do
+    local deps = {}
+    for j, d in ipairs(e.depends or {}) do deps[j] = tostring(d) end
+    txs[i] = oj({
+      "data",    e.data,
+      "txid",    e.txid,
+      "hash",    e.hash,
+      "depends", oj_raw("[" .. table.concat(deps, ",") .. "]"),
+      "fee",     e.fee,
+      "sigops",  e.sigops,
+      "weight",  e.weight,
+    })
+  end
+  local seq = {
+    "capabilities",      oj_array_of_strings(t.capabilities),
+    "version",           t.version,
+    "rules",             oj_array_of_strings(t.rules),
+    "vbavailable",       oj_raw(next(t.vbavailable or {}) and cjson.encode(t.vbavailable) or "{}"),
+    "vbrequired",        t.vbrequired,
+    "previousblockhash", t.previousblockhash,
+    "transactions",      oj_array(txs),
+    "coinbaseaux",       oj_raw("{}"),
+    "coinbasevalue",     t.coinbasevalue,
+    "target",            t.target,
+    "mintime",           t.mintime,
+    "mutable",           oj_array_of_strings(t.mutable),
+    "noncerange",        t.noncerange,
+    "sigoplimit",        t.sigoplimit,
+    "sizelimit",         t.sizelimit,
+    "weightlimit",       t.weightlimit,
+    "curtime",           t.curtime,
+    "bits",              t.bits,
+    "height",            t.height,
+  }
+  if t.default_witness_commitment then
+    seq[#seq + 1] = "default_witness_commitment"
+    seq[#seq + 1] = t.default_witness_commitment
+  end
+  return oj_encode(oj(seq))
+end
+M.block_template_json = block_template_json
+
 M._oj = oj
 M._oj_raw = oj_raw
 M._oj_amount = oj_amount
@@ -1306,9 +1354,8 @@ function M.mempool_info_json(mempool)
     "incrementalrelayfee", oj_amount(mp.INCREMENTAL_RELAY_FEE),
     "unbroadcastcount",    info.unbroadcastcount or 0,
     "fullrbf",             fullrbf,
-    -- Core reports the option value (true on a default node) even though the
-    -- relay STANDARDNESS default for bare multisig flipped to false.
-    "permitbaremultisig",  true,
+    -- Core reports the -permitbaremultisig option value (default true).
+    "permitbaremultisig",  mp.PERMIT_BARE_MULTISIG,
     "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
     "limitclustercount",   64,                        -- DEFAULT cluster_count
     "limitclustersize",    101000,                    -- cluster_size_vbytes
@@ -8202,7 +8249,7 @@ end
         rpc.mempool, rpc.chain_state, rpc.network,
         payout_script
       )
-      return template
+      return { _raw_json = M.block_template_json(template) }
     end
     error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
   end

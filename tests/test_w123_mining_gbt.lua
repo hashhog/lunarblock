@@ -350,10 +350,10 @@ end)
 -- ---------------------------------------------------------------------------
 -- G14: coinbasetxn (BIP-23) — PRESENT (over-emitted)
 -- ---------------------------------------------------------------------------
-print("\n--- G14: GBT coinbasetxn (BIP-23 optional, PARTIAL — Core only emits coinbasevalue) ---")
-test("G14: mining.lua emits coinbasetxn (BIP-23 optional, allowed)", function()
-  expect_match(MINING_SRC, 'coinbasetxn',
-    "coinbasetxn missing from template (BIP-23 optional)")
+print("\n--- G14: GBT coinbasetxn absent (Core only emits coinbasevalue) ---")
+test("G14: mining.lua does not emit coinbasetxn (Core rpc/mining.cpp never does)", function()
+  expect_no_match(MINING_SRC, 'coinbasetxn%s*=',
+    "template emits coinbasetxn; Core 31 emits only coinbasevalue")
 end)
 
 -- ---------------------------------------------------------------------------
