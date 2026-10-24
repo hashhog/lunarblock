@@ -940,7 +940,8 @@ describe("rpc", function()
         end,
         remove_transaction = function(self, txid_hex, reason)
           self.entries[txid_hex] = nil
-        end
+        end,
+        add_unbroadcast = function() end,
       }
     end
 

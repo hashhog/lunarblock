@@ -389,6 +389,11 @@ function M.getdata_response(item, deps)
       end
     end
     if not entry then return nil, nil, "notfound" end
+    -- A peer asked for it: no longer awaiting initial broadcast
+    -- (net_processing.cpp:2548 RemoveUnbroadcastTx).
+    if deps.mempool.remove_unbroadcast and entry.txid then
+      deps.mempool:remove_unbroadcast(types.hash256_hex(entry.txid))
+    end
     -- WTX and WITNESS_TX imply witness serialization; plain MSG_TX is stripped.
     local with_witness = (t ~= T.MSG_TX)
     return "tx", serialize.serialize_transaction(entry.tx, with_witness), "served"

@@ -664,11 +664,27 @@ local function parse_hex_v(v, name)
 end
 M.parse_hex_v = parse_hex_v
 
---- DecodeHexTx: nil when the hex is not a complete transaction.
-local function decode_hex_tx(hex)
+--- DecodeHexTx (core_io.cpp DecodeTx): nil unless the hex is a transaction
+--- that consumes the WHOLE input.  try_witness (extended serialization) is
+--- tried first, then try_no_witness (legacy); Core's defaults for
+--- sendrawtransaction/testmempoolaccept are try_no_witness=false,
+--- try_witness=true.  decoderawtransaction derives both from `iswitness`.
+--- Deviation: Core's CheckTxScriptsSanity (HasValidOps) tie-break between two
+--- full decodes is not ported; the extended decode wins, which is Core's
+--- answer whenever the tie-break does not separate them.
+local function decode_hex_tx(hex, try_no_witness, try_witness)
   if not is_hex_str(hex) then return nil end
-  local ok, tx = pcall(serialize.deserialize_transaction, M.hex_decode(hex))
-  if not ok or not tx then return nil end
+  if try_witness == nil then try_witness = true end
+  local raw = M.hex_decode(hex)
+  local function attempt(allow_witness)
+    local reader = serialize.buffer_reader(raw)
+    local ok, tx = pcall(serialize.deserialize_transaction, reader, allow_witness)
+    if ok and tx and reader.is_eof() then return tx end
+    return nil
+  end
+  local tx
+  if try_witness then tx = attempt(true) end
+  if not tx and try_no_witness then tx = attempt(false) end
   return tx
 end
 
@@ -1316,6 +1332,61 @@ end
 M._oj = oj
 M._oj_raw = oj_raw
 M._oj_amount = oj_amount
+
+--- getmempoolinfo / GET /rest/mempool/info.json body: Core's MempoolInfoToJSON
+-- (bitcoin-core/src/rpc/mempool.cpp:1043).  Field order and set are Core v31's.
+-- `mempool` may be nil (RPC up, no mempool object): the empty-pool shape then
+-- reads the POLICY CONSTANTS so the display cannot diverge from enforcement.
+function M.mempool_info_json(mempool)
+  local mp = require("lunarblock.mempool")
+  local info
+  if mempool then
+    info = mempool:get_info()
+  else
+    info = {
+      size = 0,
+      bytes = 0,
+      usage = 0,
+      unbroadcastcount = 0,
+      maxmempool = mp.DEFAULT_MAX_MEMPOOL_SIZE,   -- metric MB (300*1000*1000)
+      mempoolminfee = mp.DEFAULT_MIN_RELAY_FEE,    -- sat/kvB
+      fullrbf = mp.DEFAULT_MEMPOOL_FULL_RBF,
+    }
+  end
+
+  local total_fee = 0
+  if mempool then
+    for _, entry in pairs(mempool.entries) do total_fee = total_fee + entry.fee end
+  end
+
+  -- Every displayed feerate READS the live relay floor / incremental constant
+  -- (sat/kvB), so display and admission policy cannot diverge.
+  local mempool_min_fee = info.mempoolminfee or mp.DEFAULT_MIN_RELAY_FEE
+  local min_relay_fee = (mempool and mempool.min_relay_fee) or mp.DEFAULT_MIN_RELAY_FEE
+  local fullrbf = info.fullrbf
+  if fullrbf == nil then fullrbf = mp.DEFAULT_MEMPOOL_FULL_RBF end
+
+  return oj_encode(oj({
+    "loaded",              true,
+    "size",                info.size,
+    "bytes",               info.bytes,
+    "usage",               info.usage,
+    "total_fee",           oj_amount(total_fee),
+    "maxmempool",          info.maxmempool,
+    "mempoolminfee",       oj_amount(mempool_min_fee),
+    "minrelaytxfee",       oj_amount(min_relay_fee),
+    "incrementalrelayfee", oj_amount(mp.INCREMENTAL_RELAY_FEE),
+    "unbroadcastcount",    info.unbroadcastcount or 0,
+    "fullrbf",             fullrbf,
+    -- Core reports the option value (true on a default node) even though the
+    -- relay STANDARDNESS default for bare multisig flipped to false.
+    "permitbaremultisig",  true,
+    "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
+    "limitclustercount",   64,                        -- DEFAULT cluster_count
+    "limitclustersize",    101000,                    -- cluster_size_vbytes
+    "optimal",             true,
+  }))
+end
 M._oj_g16 = oj_g16
 M._oj_array = oj_array
 M._oj_array_empty = oj_array_empty
@@ -2475,40 +2546,44 @@ function RPCServer:register_methods()
     local hash = types.hash256_from_hex(blockhash)
     local block = rpc.storage.get_block(hash)
     if not block then
-      -- Check whether this is a known-but-pruned block. We never delete
-      -- CF.HEADERS, so the header is still around even after the body
-      -- is pruned. If header exists AND its height has been pruned,
-      -- mirror Bitcoin Core's RPC_MISC_ERROR + "Block not available
-      -- (pruned data)" string (rpc/blockchain.cpp:677).
+      -- Core: LookupBlockIndex fails -> -5 "Block not found"; a block that IS
+      -- in the index but has no data -> CheckBlockDataAvailability
+      -- (rpc/blockchain.cpp:670): -1 "Block not available (pruned data)" when
+      -- it was really pruned, else -1 "Block not available (not fully
+      -- downloaded)".  The header store is our block index (CF.HEADERS is
+      -- never pruned), so a stored header without a body is the second case —
+      -- e.g. every block at or below a snapshot base (bodies never fetched).
+      local header = rpc.storage.get_header and rpc.storage.get_header(hash)
+      if not header then
+        error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+      end
       if rpc.pruner and rpc.pruner.enabled then
-        local header = rpc.storage.get_header(hash)
-        if header then
-          -- Reverse-lookup height for this hash via the height index.
-          -- This is O(prune_height) worst case but only runs on the
-          -- error path; fast path (block present) never reaches here.
-          local found_height = nil
-          local iter = rpc.storage.iterator("height")
-          if iter then
-            iter.seek_to_first()
-            while iter.valid() do
-              local v = iter.value()
-              if v and #v == 32 and v == hash.bytes then
-                local k = iter.key()
-                found_height = k:byte(1) * 16777216 + k:byte(2) * 65536
-                  + k:byte(3) * 256 + k:byte(4)
-                break
-              end
-              iter.next()
+        -- Reverse-lookup height for this hash via the height index.
+        -- This is O(prune_height) worst case but only runs on the
+        -- error path; fast path (block present) never reaches here.
+        local found_height = nil
+        local iter = rpc.storage.iterator("height")
+        if iter then
+          iter.seek_to_first()
+          while iter.valid() do
+            local v = iter.value()
+            if v and #v == 32 and v == hash.bytes then
+              local k = iter.key()
+              found_height = k:byte(1) * 16777216 + k:byte(2) * 65536
+                + k:byte(3) * 256 + k:byte(4)
+              break
             end
-            iter.destroy()
+            iter.next()
           end
-          if found_height and rpc.pruner:is_pruned(found_height) then
-            error({code = M.ERROR.MISC_ERROR,
-                   message = "Block not available (pruned data)"})
-          end
+          iter.destroy()
+        end
+        if found_height and rpc.pruner:is_pruned(found_height) then
+          error({code = M.ERROR.MISC_ERROR,
+                 message = "Block not available (pruned data)"})
         end
       end
-      error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
+      error({code = M.ERROR.MISC_ERROR,
+             message = "Block not available (not fully downloaded)"})
     end
 
     -- Verbosity 0: return raw hex
@@ -2649,6 +2724,22 @@ function RPCServer:register_methods()
               }),
             }
             if txinwit then vseq[#vseq + 1] = "txinwitness"; vseq[#vseq + 1] = txinwit end
+            -- Core maps every verbosity above 2 to SHOW_DETAILS_AND_PREVOUT
+            -- (core_io.cpp TxToUniv): prevout {generated,height,value,scriptPubKey}
+            -- sits between txinwitness and sequence.
+            if verbosity >= 3 and block_undo then
+              local txu = block_undo.tx_undo[i - 1]
+              local po = txu and txu.prev_outputs and txu.prev_outputs[j]
+              if po then
+                vseq[#vseq + 1] = "prevout"
+                vseq[#vseq + 1] = M._oj({
+                  "generated",    po.is_coinbase and true or false,
+                  "height",       po.height,
+                  "value",        M._oj_amount(po.value),
+                  "scriptPubKey", M.scriptpubkey_oj(po.script_pubkey, rpc.network),
+                })
+              end
+            end
             vseq[#vseq + 1] = "sequence"; vseq[#vseq + 1] = inp.sequence
           end
           vin[j] = M._oj(vseq)
@@ -3327,9 +3418,8 @@ function RPCServer:register_methods()
   --   headers      — best-header height seen so far (-1 if none; Core
   --                  chainman.m_best_header ? nHeight : -1)
   --   chainstates  — ARRAY ordered by work with the most-work (ACTIVE)
-  --                  chainstate LAST.  lunarblock has a single fully-validated
-  --                  chainstate (no AssumeUTXO snapshot active), so this is a
-  --                  1-element array.  Each entry:
+  --                  chainstate LAST.  lunarblock keeps a single live
+  --                  chainstate, so this is a 1-element array.  Each entry:
   --     blocks                — active chainstate tip height
   --     bestblockhash         — tip block hash hex
   --     bits                  — tip nBits, "%08x" (Core strprintf("%08x", nBits))
@@ -3337,15 +3427,18 @@ function RPCServer:register_methods()
   --     difficulty            — tip difficulty (Core GetDifficulty), %.16g
   --     verificationprogress  — progress towards the network tip [0..1]
   --     snapshot_blockhash    — OPTIONAL; emitted only for a from-snapshot
-  --                             chainstate.  OMITTED here (no snapshot active).
+  --                             chainstate (loadtxoutset this process, or a
+  --                             datadir bootstrapped with --import-utxo).
   --     coins_db_cache_bytes  — configured chainstate coins-DB cache (the
   --                             RocksDB LRU block cache, db._block_cache_bytes;
   --                             Core cs.m_coinsdb_cache_size_bytes)
   --     coins_tip_cache_bytes — configured coins-tip (UTXO) cache in bytes
   --                             (coin_view.max_cache_bytes; Core
   --                             cs.m_coinstip_cache_size_bytes)
-  --     validated             — true (single fully-validated chainstate; Core
-  --                             cs.m_assumeutxo == Assumeutxo::VALIDATED)
+  --     validated             — Core cs.m_assumeutxo == Assumeutxo::VALIDATED:
+  --                             true for a genesis-synced chainstate, false for
+  --                             a from-snapshot one until the background pass
+  --                             re-derived the base UTXO set.
   self.methods["getchainstates"] = function(rpc, _params)
     -- headers: best-header height seen so far.  Prefer the header chain's tip
     -- (Core chainman.m_best_header); fall back to chain_state's header tip,
@@ -3430,6 +3523,19 @@ function RPCServer:register_methods()
       elseif snap.chain_state and snap.chain_state.from_snapshot_blockhash then
         snapshot_blockhash_hex =
           types.hash256_hex(snap.chain_state.from_snapshot_blockhash)
+      end
+    else
+      -- A datadir bootstrapped with --import-utxo (or restarted after a
+      -- loadtxoutset) has no in-process SnapshotChainstate, but it persists
+      -- its snapshot record (utxo.read_snapshot_record).
+      -- No background chainstate ever re-derives the base UTXO set from
+      -- genesis on such a node, so the snapshot stays unvalidated: Core shows
+      -- m_from_snapshot_blockhash + validated:false until its background
+      -- download completes (measured on v31.1, also after a restart).
+      local base_hash = require("lunarblock.utxo").read_snapshot_record(rpc.storage)
+      if base_hash then
+        snapshot_blockhash_hex = types.hash256_hex(base_hash)
+        active_validated = false
       end
     end
 
@@ -4208,78 +4314,26 @@ function RPCServer:register_methods()
 
   -- Mempool methods
   self.methods["getmempoolinfo"] = function(rpc, _params)
-    -- MempoolInfoToJSON (bitcoin-core/src/rpc/mempool.cpp:1043). Emit order +
-    -- field set are byte-exact to Core v31.99 via the ordered-JSON helper.
-    local mp = require("lunarblock.mempool")
-    local info
-    if rpc.mempool then
-      info = rpc.mempool:get_info()
-    else
-      -- No live mempool object (RPC up, mempool unavailable): mirror Core's
-      -- empty-pool shape. All fee/size values are read from the POLICY
-      -- CONSTANTS so the displayed floor can never diverge from what the node
-      -- enforces (DEFAULT_MIN_RELAY_FEE/DEFAULT_MAX_MEMPOOL_SIZE).
-      info = {
-        size = 0,
-        bytes = 0,
-        usage = 0,
-        maxmempool = mp.DEFAULT_MAX_MEMPOOL_SIZE,   -- metric MB (300*1000*1000)
-        mempoolminfee = mp.DEFAULT_MIN_RELAY_FEE,    -- 100 sat/kvB
-        fullrbf = mp.DEFAULT_MEMPOOL_FULL_RBF,
-      }
+    return { _raw_json = M.mempool_info_json(rpc.mempool) }
+  end
+
+  -- setmocktime (Core: hidden, regtest only).  Pins the mempool clock so the
+  -- rolling-fee decay behind getmempoolinfo.mempoolminfee is reproducible.
+  self.methods["setmocktime"] = function(rpc, params)
+    if not (rpc.network and rpc.network.name == "regtest") then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "setmocktime is for regression testing (-regtest mode) only"})
     end
-
-    -- Calculate total fees
-    local total_fee = 0
-    if rpc.mempool then
-      for _, entry in pairs(rpc.mempool.entries) do
-        total_fee = total_fee + entry.fee
-      end
+    local t = params[1]
+    if type(t) ~= "number" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "timestamp required"})
     end
-
-    -- ── Fee fields (HONEST FEE POLICY) ──────────────────────────────────────
-    -- Every displayed feerate READS the live relay floor / incremental
-    -- constant; NO hardcoded BTC literal. minrelaytxfee == the floor the
-    -- admission gate enforces (mempool.lua:1337 fee_rate_per_kb <
-    -- self.min_relay_fee), so display and policy can never diverge.
-    --   minrelaytxfee       = min_relay_fee (sat/kvB) / 1e8
-    --   mempoolminfee       = max(min_relay_fee, rolling) / 1e8
-    --   incrementalrelayfee = INCREMENTAL_RELAY_FEE / 1e8
-    local mempool_min_fee = info.mempoolminfee or mp.DEFAULT_MIN_RELAY_FEE  -- sat/kvB
-    local min_relay_fee = (rpc.mempool and rpc.mempool.min_relay_fee)
-                          or mp.DEFAULT_MIN_RELAY_FEE                        -- sat/kvB
-    local incremental_fee = mp.INCREMENTAL_RELAY_FEE                         -- sat/kvB
-
-    local fullrbf = (info.fullrbf ~= nil) and info.fullrbf
-                    or mp.DEFAULT_MEMPOOL_FULL_RBF
-
-    -- Core key order (mempool.cpp:1043): loaded, size, bytes, usage, total_fee,
-    -- maxmempool, mempoolminfee, minrelaytxfee, incrementalrelayfee,
-    -- unbroadcastcount, fullrbf, permitbaremultisig, maxdatacarriersize,
-    -- limitclustercount, limitclustersize, optimal.
-    return oj_result(oj({
-      "loaded",              true,
-      "size",                info.size,
-      "bytes",               info.bytes,
-      "usage",               info.usage,
-      "total_fee",           oj_amount(total_fee),
-      "maxmempool",          info.maxmempool,
-      "mempoolminfee",       oj_amount(mempool_min_fee),
-      "minrelaytxfee",       oj_amount(min_relay_fee),
-      "incrementalrelayfee", oj_amount(incremental_fee),
-      "unbroadcastcount",    0,
-      "fullrbf",             fullrbf,
-      -- v31.99 fields (cluster mempool). permitbaremultisig mirrors
-      -- mp.PERMIT_BARE_MULTISIG inverted? No — Core reports m_opts.permit_bare_multisig
-      -- which on a default node is TRUE (the kernel default), while the relay
-      -- STANDARDNESS default flipped to false. getmempoolinfo reports the option
-      -- value, which defaults true on Core v31.99 regtest (see baseline core).
-      "permitbaremultisig",  true,
-      "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
-      "limitclustercount",   64,                        -- DEFAULT cluster_count
-      "limitclustersize",    101000,                    -- cluster_size_vbytes (kvB)
-      "optimal",             true,
-    }))
+    if t < 0 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "Mock time cannot be negative: \"" .. string.format("%d", t) .. "\"."})
+    end
+    require("lunarblock.mempool").set_mock_time(t)
+    return cjson.null
   end
 
   -- Core getrawmempool / getmempoolentry wtxid is display-order hex.
@@ -4551,6 +4605,9 @@ function RPCServer:register_methods()
       end
       error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
     end
+    -- Locally submitted: stays in the unbroadcast set until a peer asks for it
+    -- (Core BroadcastTransaction, node/transaction.cpp:102).
+    rpc.mempool:add_unbroadcast(txid_hex)
     -- Broadcast to peers
     if rpc.peer_manager then
       local txid = validation.compute_txid(tx)
@@ -4700,7 +4757,10 @@ function RPCServer:register_methods()
       local msg
       if blockhash_hex then
         msg = "No such transaction found in the provided block. Use gettransaction for wallet transactions."
-      elseif rpc.storage and rpc.storage.get then
+      elseif txindex_on then
+        -- Core (rpc/rawtransaction.cpp:322-327): the "or blockchain" wording is
+        -- only valid when g_txindex exists and is synced.  lunarblock's txindex
+        -- is inline, so it is always at the tip when enabled.
         msg = "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
       else
         msg = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
@@ -4934,7 +4994,18 @@ function RPCServer:register_methods()
     if type(hex) ~= "string" then
       error({code = M.ERROR.INVALID_PARAMS, message = "Transaction hex required"})
     end
-    local tx = decode_hex_tx(hex)
+    -- rawtransaction.cpp: iswitness=true -> witness only, false -> legacy
+    -- only, absent -> both (heuristic).
+    local iswitness = params[2]
+    if iswitness == cjson.null then iswitness = nil end
+    local try_witness, try_no_witness = true, true
+    if iswitness ~= nil then
+      if type(iswitness) ~= "boolean" then
+        error({code = M.ERROR.INVALID_PARAMS, message = "iswitness must be boolean"})
+      end
+      try_witness, try_no_witness = iswitness, not iswitness
+    end
+    local tx = decode_hex_tx(hex, try_no_witness, try_witness)
     if not tx then
       error({code = M.ERROR.DESERIALIZATION_ERROR, message = "TX decode failed"})
     end
@@ -5580,8 +5651,16 @@ end
     -- localservices: NODE_NETWORK(1) | NODE_WITNESS(8) | NODE_NETWORK_LIMITED(1024)
     -- | NODE_P2P_V2(2048) = 0xc09. Names mirror the set bits in Core's order.
     -- 1 + 8 + 1024 + 2048 = 0xc09.
+    -- NODE_NETWORK is dropped (0xc08) by the same gate the version message
+    -- uses (p2p.advertises_node_network): while block bodies below a snapshot
+    -- base are missing, or when pruning — Core init.cpp:1947 / loadtxoutset.
     local LOCAL_SERVICES = "0000000000000c09"
     local SERVICE_NAMES = {"NETWORK", "WITNESS", "NETWORK_LIMITED", "P2P_V2"}
+    local prune_mode = (rpc.pruner and rpc.pruner.enabled) and true or false
+    if not p2p.advertises_node_network(prune_mode) then
+      LOCAL_SERVICES = "0000000000000c08"
+      SERVICE_NAMES = {"WITNESS", "NETWORK_LIMITED", "P2P_V2"}
+    end
 
     -- networks[] in Core's GetNetworksInfo order: ipv4, ipv6, onion, i2p, cjdns.
     -- ipv4/ipv6 are reachable (limited=false); onion/i2p/cjdns are limited (no
@@ -6036,9 +6115,8 @@ end
   self.methods["getpeerinfo"] = function(rpc, _params)
     local peers = {}
     -- BUG-22 fix (W115 FIX-50): include mapped_as field per peer.
-    -- Core: src/rpc/net.cpp getpeerinfo includes "mapped_as" (uint32) when
-    -- asmap is loaded.  We always include the field; it is 0 when no asmap
-    -- is loaded or the address has no mapping.
+    -- Core: src/rpc/net.cpp getpeerinfo includes "mapped_as" (uint32) only
+    -- when the peer maps to a non-zero AS (needs a loaded asmap).
     local ok_asmap, asmap_mod_rpc = pcall(require, "lunarblock.asmap")
     local ok_pm, pm_mod = pcall(require, "lunarblock.peerman")
     local loaded_asmap = (ok_pm and pm_mod._asmap_data) or nil
@@ -6066,9 +6144,31 @@ end
         if ok_asmap and loaded_asmap then
           peer_mapped_as = asmap_mod_rpc.get_mapped_as(loaded_asmap, p.ip)
         end
+        -- Core net.cpp:229-234: addrbind is our local socket address (when
+        -- valid); addrlocal is the address the peer reported seeing us at in
+        -- its version message (CNode::SetAddrLocal), omitted when empty/unset.
+        local function fmt_addr_port(ip, port)
+          if ip:find(":", 1, true) then return "[" .. ip .. "]:" .. port end
+          return ip .. ":" .. port
+        end
+        local peer_addrbind = nil
+        if p.socket and p.socket.getsockname then
+          local ok_sn, bind_ip, bind_port = pcall(p.socket.getsockname, p.socket)
+          bind_port = tonumber(bind_port)
+          if ok_sn and bind_ip and bind_port and bind_ip ~= "0.0.0.0" and bind_ip ~= "::" then
+            peer_addrbind = fmt_addr_port(bind_ip, bind_port)
+          end
+        end
+        local peer_addrlocal = nil
+        local vi = p.version_info
+        if vi and vi.recv_ip and vi.recv_ip ~= "0.0.0.0" and vi.recv_ip ~= "::" then
+          peer_addrlocal = fmt_addr_port(vi.recv_ip, vi.recv_port or 0)
+        end
         peers[#peers + 1] = {
           id = i - 1,
           addr = p.ip .. ":" .. p.port,
+          addrbind = peer_addrbind,
+          addrlocal = peer_addrlocal,
           network = _peer_network_from_ip(p.ip),
           services = string.format("%016x", svc),
           servicesnames = svc_names,
@@ -6124,7 +6224,8 @@ end
           connection_type = is_inbound and "inbound" or "outbound-full-relay",
           transport_protocol_type = "v1",
           session_id = "",
-          mapped_as = peer_mapped_as,
+          -- Core net.cpp:235: mapped_as only when the mapped AS is non-zero.
+          mapped_as = (peer_mapped_as ~= 0) and peer_mapped_as or nil,
         }
       end
     end
@@ -14105,6 +14206,23 @@ end
       error({code = M.ERROR.MISC_ERROR,
         message = "Bad snapshot content hash (background re-validation): "
           .. tostring(bg_final.error)})
+    end
+
+    -- Service bits (Core rpc/blockchain.cpp loadtxoutset ~3432:
+    -- RemoveLocalServices(NODE_NETWORK) + AddLocalServices(NODE_NETWORK_LIMITED);
+    -- init.cpp:1368 re-adds NODE_NETWORK once the background download
+    -- completes).  Until the background pass has re-derived the base from
+    -- genesis we cannot serve the blocks below the base, so stop promising
+    -- NODE_NETWORK to peers.  When every historical block was already local
+    -- and the best-effort drive above validated the snapshot, history is
+    -- complete and NODE_NETWORK stays.
+    local history_incomplete = not rpc.snapshot_chainstate:is_validated()
+    p2p.set_history_incomplete(history_incomplete)
+    -- Persist the snapshot record so a restart keeps answering the same way
+    -- (Core keeps the snapshot chainstate and NODE_NETWORK off across a
+    -- restart until the background download completes).
+    if history_incomplete and rpc.storage and rpc.storage.CF then
+      utxo_mod.write_snapshot_record(rpc.storage, meta.base_blockhash)
     end
 
     return {

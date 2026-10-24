@@ -61,6 +61,7 @@ local INCLUDED = {
   "tests/test_inbound_eviction.lua",
   "tests/test_listdescriptors.lua",
   "tests/test_long_rpc_yield.lua",
+  "tests/test_operator_rpc_shape.lua",
   "tests/test_p2_1_p2_2_wallet_security.lua",
   "tests/test_p2_3_bip43_purpose_table.lua",
   "tests/test_p2_4_p2tr_signer.lua",
