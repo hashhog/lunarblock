@@ -316,7 +316,7 @@ do
   -- A and B are independent (no descendants), so each is its own cluster.
   local sizeA = mp11:get_entry(A).size
   local sizeB = mp11:get_entry(B).size
-  mp11.max_size = mp11.total_size - 1   -- must evict at least one
+  mp11.max_size = mp11:usage_estimate() - 1   -- must evict at least one
   mp11:trim()
 
   ok_(mp11:get_entry(A) ~= nil, "prioritised low-base-fee A SURVIVES eviction")
@@ -331,7 +331,7 @@ do
   local mp12 = mempool.new(cs, {})
   local A = add_independent_tx(mp12, cs, "\x28", 100000, 1000)  -- low base fee
   local B = add_independent_tx(mp12, cs, "\x39", 100000, 5000)  -- higher base fee
-  mp12.max_size = mp12.total_size - 1
+  mp12.max_size = mp12:usage_estimate() - 1
   mp12:trim()
   ok_(mp12:get_entry(A) == nil, "no-delta: lowest BASE-fee A is evicted")
   ok_(mp12:get_entry(B) ~= nil, "no-delta: higher-base-fee B survives")

@@ -1260,6 +1260,61 @@ end
 M._oj = oj
 M._oj_raw = oj_raw
 M._oj_amount = oj_amount
+
+--- getmempoolinfo / GET /rest/mempool/info.json body: Core's MempoolInfoToJSON
+-- (bitcoin-core/src/rpc/mempool.cpp:1043).  Field order and set are Core v31's.
+-- `mempool` may be nil (RPC up, no mempool object): the empty-pool shape then
+-- reads the POLICY CONSTANTS so the display cannot diverge from enforcement.
+function M.mempool_info_json(mempool)
+  local mp = require("lunarblock.mempool")
+  local info
+  if mempool then
+    info = mempool:get_info()
+  else
+    info = {
+      size = 0,
+      bytes = 0,
+      usage = 0,
+      unbroadcastcount = 0,
+      maxmempool = mp.DEFAULT_MAX_MEMPOOL_SIZE,   -- metric MB (300*1000*1000)
+      mempoolminfee = mp.DEFAULT_MIN_RELAY_FEE,    -- sat/kvB
+      fullrbf = mp.DEFAULT_MEMPOOL_FULL_RBF,
+    }
+  end
+
+  local total_fee = 0
+  if mempool then
+    for _, entry in pairs(mempool.entries) do total_fee = total_fee + entry.fee end
+  end
+
+  -- Every displayed feerate READS the live relay floor / incremental constant
+  -- (sat/kvB), so display and admission policy cannot diverge.
+  local mempool_min_fee = info.mempoolminfee or mp.DEFAULT_MIN_RELAY_FEE
+  local min_relay_fee = (mempool and mempool.min_relay_fee) or mp.DEFAULT_MIN_RELAY_FEE
+  local fullrbf = info.fullrbf
+  if fullrbf == nil then fullrbf = mp.DEFAULT_MEMPOOL_FULL_RBF end
+
+  return oj_encode(oj({
+    "loaded",              true,
+    "size",                info.size,
+    "bytes",               info.bytes,
+    "usage",               info.usage,
+    "total_fee",           oj_amount(total_fee),
+    "maxmempool",          info.maxmempool,
+    "mempoolminfee",       oj_amount(mempool_min_fee),
+    "minrelaytxfee",       oj_amount(min_relay_fee),
+    "incrementalrelayfee", oj_amount(mp.INCREMENTAL_RELAY_FEE),
+    "unbroadcastcount",    info.unbroadcastcount or 0,
+    "fullrbf",             fullrbf,
+    -- Core reports the option value (true on a default node) even though the
+    -- relay STANDARDNESS default for bare multisig flipped to false.
+    "permitbaremultisig",  true,
+    "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
+    "limitclustercount",   64,                        -- DEFAULT cluster_count
+    "limitclustersize",    101000,                    -- cluster_size_vbytes
+    "optimal",             true,
+  }))
+end
 M._oj_g16 = oj_g16
 M._oj_array = oj_array
 M._oj_array_empty = oj_array_empty
@@ -4168,78 +4223,26 @@ function RPCServer:register_methods()
 
   -- Mempool methods
   self.methods["getmempoolinfo"] = function(rpc, _params)
-    -- MempoolInfoToJSON (bitcoin-core/src/rpc/mempool.cpp:1043). Emit order +
-    -- field set are byte-exact to Core v31.99 via the ordered-JSON helper.
-    local mp = require("lunarblock.mempool")
-    local info
-    if rpc.mempool then
-      info = rpc.mempool:get_info()
-    else
-      -- No live mempool object (RPC up, mempool unavailable): mirror Core's
-      -- empty-pool shape. All fee/size values are read from the POLICY
-      -- CONSTANTS so the displayed floor can never diverge from what the node
-      -- enforces (DEFAULT_MIN_RELAY_FEE/DEFAULT_MAX_MEMPOOL_SIZE).
-      info = {
-        size = 0,
-        bytes = 0,
-        usage = 0,
-        maxmempool = mp.DEFAULT_MAX_MEMPOOL_SIZE,   -- metric MB (300*1000*1000)
-        mempoolminfee = mp.DEFAULT_MIN_RELAY_FEE,    -- 100 sat/kvB
-        fullrbf = mp.DEFAULT_MEMPOOL_FULL_RBF,
-      }
+    return { _raw_json = M.mempool_info_json(rpc.mempool) }
+  end
+
+  -- setmocktime (Core: hidden, regtest only).  Pins the mempool clock so the
+  -- rolling-fee decay behind getmempoolinfo.mempoolminfee is reproducible.
+  self.methods["setmocktime"] = function(rpc, params)
+    if not (rpc.network and rpc.network.name == "regtest") then
+      error({code = M.ERROR.MISC_ERROR,
+        message = "setmocktime is for regression testing (-regtest mode) only"})
     end
-
-    -- Calculate total fees
-    local total_fee = 0
-    if rpc.mempool then
-      for _, entry in pairs(rpc.mempool.entries) do
-        total_fee = total_fee + entry.fee
-      end
+    local t = params[1]
+    if type(t) ~= "number" then
+      error({code = M.ERROR.INVALID_PARAMS, message = "timestamp required"})
     end
-
-    -- ── Fee fields (HONEST FEE POLICY) ──────────────────────────────────────
-    -- Every displayed feerate READS the live relay floor / incremental
-    -- constant; NO hardcoded BTC literal. minrelaytxfee == the floor the
-    -- admission gate enforces (mempool.lua:1337 fee_rate_per_kb <
-    -- self.min_relay_fee), so display and policy can never diverge.
-    --   minrelaytxfee       = min_relay_fee (sat/kvB) / 1e8
-    --   mempoolminfee       = max(min_relay_fee, rolling) / 1e8
-    --   incrementalrelayfee = INCREMENTAL_RELAY_FEE / 1e8
-    local mempool_min_fee = info.mempoolminfee or mp.DEFAULT_MIN_RELAY_FEE  -- sat/kvB
-    local min_relay_fee = (rpc.mempool and rpc.mempool.min_relay_fee)
-                          or mp.DEFAULT_MIN_RELAY_FEE                        -- sat/kvB
-    local incremental_fee = mp.INCREMENTAL_RELAY_FEE                         -- sat/kvB
-
-    local fullrbf = (info.fullrbf ~= nil) and info.fullrbf
-                    or mp.DEFAULT_MEMPOOL_FULL_RBF
-
-    -- Core key order (mempool.cpp:1043): loaded, size, bytes, usage, total_fee,
-    -- maxmempool, mempoolminfee, minrelaytxfee, incrementalrelayfee,
-    -- unbroadcastcount, fullrbf, permitbaremultisig, maxdatacarriersize,
-    -- limitclustercount, limitclustersize, optimal.
-    return oj_result(oj({
-      "loaded",              true,
-      "size",                info.size,
-      "bytes",               info.bytes,
-      "usage",               info.usage,
-      "total_fee",           oj_amount(total_fee),
-      "maxmempool",          info.maxmempool,
-      "mempoolminfee",       oj_amount(mempool_min_fee),
-      "minrelaytxfee",       oj_amount(min_relay_fee),
-      "incrementalrelayfee", oj_amount(incremental_fee),
-      "unbroadcastcount",    0,
-      "fullrbf",             fullrbf,
-      -- v31.99 fields (cluster mempool). permitbaremultisig mirrors
-      -- mp.PERMIT_BARE_MULTISIG inverted? No — Core reports m_opts.permit_bare_multisig
-      -- which on a default node is TRUE (the kernel default), while the relay
-      -- STANDARDNESS default flipped to false. getmempoolinfo reports the option
-      -- value, which defaults true on Core v31.99 regtest (see baseline core).
-      "permitbaremultisig",  true,
-      "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
-      "limitclustercount",   64,                        -- DEFAULT cluster_count
-      "limitclustersize",    101000,                    -- cluster_size_vbytes (kvB)
-      "optimal",             true,
-    }))
+    if t < 0 then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = "Mock time cannot be negative: \"" .. string.format("%d", t) .. "\"."})
+    end
+    require("lunarblock.mempool").set_mock_time(t)
+    return cjson.null
   end
 
   -- Core getrawmempool / getmempoolentry wtxid is display-order hex.
@@ -4494,6 +4497,9 @@ function RPCServer:register_methods()
       end
       error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
     end
+    -- Locally submitted: stays in the unbroadcast set until a peer asks for it
+    -- (Core BroadcastTransaction, node/transaction.cpp:102).
+    rpc.mempool:add_unbroadcast(txid_hex)
     -- Broadcast to peers
     if rpc.peer_manager then
       local txid = validation.compute_txid(tx)
