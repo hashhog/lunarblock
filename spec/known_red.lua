@@ -139,8 +139,6 @@ return {
   ["rpc sendrawtransaction broadcasts inv to peers on success"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc sendrawtransaction returns DESERIALIZATION_ERROR for empty hex"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc sendrawtransaction returns DESERIALIZATION_ERROR for invalid hex"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
-  ["rpc sendrawtransaction returns VERIFY_ALREADY_IN_CHAIN when tx already in mempool"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- ERROR spec/rpc_spec.lua
-  ["rpc sendrawtransaction returns VERIFY_ERROR for missing inputs"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["rpc submitpackage accepts a single-tx package and returns a tx-results map"] = "GAP: RPC T1 fidelity — remaining shape/error-token mismatches vs Core",  -- FAILED spec/rpc_spec.lua
   ["script P2SH push-only scriptSig enforcement fails P2SH with scriptSig containing OP_CHECKSIG"] = "GAP: P2SH SIG_PUSHONLY is checked after scriptSig execution, so OP_CHECKSIG underflows",  -- ERROR spec/script_spec.lua
   ["sync BlockDownloader fork-body routing (reorg-drop part 2) schedule_downloads lowers BOTH cursors to the fork point so the competing fork's bridging bodies are walked in order"] = "GAP: sync work calculation still uses a string/number mix the tests do not accept",  -- FAILED spec/sync_spec.lua

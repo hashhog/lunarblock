@@ -4668,25 +4668,41 @@ function RPCServer:register_methods()
     -- the cap, as in Core).
     local accept_opts = (max_feerate > 0) and {max_fee_per_kvb = max_feerate} or nil
     local ok, txid_hex = rpc.mempool:accept_transaction(tx, nil, accept_opts)
+    local already_in_mempool = false
     if not ok then
       if txid_hex == "max-fee-exceeded" then
         error({code = M.ERROR.VERIFY_ERROR,
                message = "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"})
       end
-      -- W96: route mempool reject reasons to canonical Core RPC error codes.
-      -- "txn-already-in-mempool" / "txn-same-nonwitness-data-in-mempool" →
-      -- VERIFY_ALREADY_IN_CHAIN (-27) per Bitcoin Core rpc/rawtransaction.cpp.
-      -- Other rejects remain VERIFY_REJECTED (-26).
+      -- Core BroadcastTransaction (node/transaction.cpp): a tx whose txid is
+      -- already in the mempool is not an error -- it is re-relayed and the
+      -- txid returned.  Both the exact-wtxid and same-txid-different-witness
+      -- reject tokens mean "txid already in the mempool".
       local err_str = tostring(txid_hex or "")
-      if err_str:find("already", 1, true)
-         or err_str:find("same-nonwitness-data", 1, true) then
-        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN, message = err_str})
+      if err_str == "txn-already-in-mempool"
+         or err_str == "txn-same-nonwitness-data-in-mempool" then
+        ok = true
+        already_in_mempool = true
+        txid_hex = types.hash256_hex(validation.compute_txid(tx))
+      elseif err_str == "txn-already-known" then
+        -- An output of this tx is already in the UTXO set (confirmed):
+        -- TransactionError::ALREADY_IN_UTXO_SET -> RPC_VERIFY_ALREADY_IN_UTXO_SET (-27).
+        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN,
+               message = "Transaction outputs already in utxo set"})
+      elseif err_str == "bad-txns-inputs-missingorspent" then
+        -- TransactionError::MISSING_INPUTS -> RPC_TRANSACTION_ERROR (-25),
+        -- message is the validation state string.
+        error({code = M.ERROR.VERIFY_ERROR, message = err_str})
+      else
+        error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
       end
-      error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
     end
     -- Locally submitted: stays in the unbroadcast set until a peer asks for it
-    -- (Core BroadcastTransaction, node/transaction.cpp:102).
-    rpc.mempool:add_unbroadcast(txid_hex)
+    -- (Core BroadcastTransaction, node/transaction.cpp:102).  Only the branch
+    -- that just inserted the tx does this; a resubmit is only reannounced.
+    if not already_in_mempool then
+      rpc.mempool:add_unbroadcast(txid_hex)
+    end
     -- Broadcast to peers
     if rpc.peer_manager then
       local txid = validation.compute_txid(tx)
