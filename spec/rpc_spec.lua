@@ -1028,15 +1028,14 @@ describe("rpc", function()
       assert.equal(rpc.ERROR.DESERIALIZATION_ERROR, decoded.error.code)
     end)
 
-    it("returns VERIFY_ALREADY_IN_CHAIN when tx already in mempool", function()
+    it("returns the txid when tx is already in the mempool", function()
       local tx = make_test_tx()
-      local txid = validation.compute_txid(tx)
-      local txid_hex = types.hash256_hex(txid)
+      local txid_hex = types.hash256_hex(validation.compute_txid(tx))
       local raw = serialize.serialize_transaction(tx, false)
       local hex = rpc.hex_encode(raw)
 
-      -- Mempool already has this transaction
-      local mock_mempool = make_mock_mempool(true, 1000, {[txid_hex] = {tx = tx}})
+      -- Core BroadcastTransaction: txid already in the mempool is success.
+      local mock_mempool = make_mock_mempool("txn-already-in-mempool")
       local server = rpc.new({
         network = consensus.networks.mainnet,
         mempool = mock_mempool
@@ -1046,9 +1045,8 @@ describe("rpc", function()
       local response = server:handle_request(request)
       local decoded = cjson.decode(response)
 
-      assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.VERIFY_ALREADY_IN_CHAIN, decoded.error.code)
-      assert.truthy(decoded.error.message:match("already"))
+      assert.truthy(decoded.error == nil or decoded.error == cjson.null)
+      assert.equal(txid_hex, decoded.result)
     end)
 
     it("returns VERIFY_ERROR for missing inputs", function()
@@ -1056,7 +1054,7 @@ describe("rpc", function()
       local raw = serialize.serialize_transaction(tx, false)
       local hex = rpc.hex_encode(raw)
 
-      local mock_mempool = make_mock_mempool("missing inputs")
+      local mock_mempool = make_mock_mempool("bad-txns-inputs-missingorspent")
       local server = rpc.new({
         network = consensus.networks.mainnet,
         mempool = mock_mempool
@@ -1068,7 +1066,7 @@ describe("rpc", function()
 
       assert.is_not_nil(decoded.error)
       assert.equal(rpc.ERROR.VERIFY_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("missing inputs"))
+      assert.truthy(decoded.error.message:match("missingorspent"))
     end)
 
     it("returns VERIFY_REJECTED for insufficient fee", function()
