@@ -30,6 +30,9 @@ describe("sendrawtransaction result mapping", function()
       has = function() return false end,
       accept_transaction = function() return false, reject end,
       remove_transaction = function() end,
+      -- sendrawtransaction marks every accepted (or already-present) tx
+      -- unbroadcast; the resubmit cases reach that call.
+      add_unbroadcast = function() end,
     }
     local server = rpc.new({network = consensus.networks.mainnet, mempool = mempool})
     local response = server:handle_request(
