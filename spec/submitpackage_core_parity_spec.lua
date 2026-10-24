@@ -262,3 +262,122 @@ describe("submitpackage / package testmempoolaccept follow Core", function()
     end)
   end)
 end)
+
+-- Negative-space controls for widening relay-time script checks to witness
+-- inputs: the risk of the change is refusing a VALID spend (a false reject
+-- strands a wallet's tx and its children), so every standard output type the
+-- verifier now runs on is pinned as accepted when correctly signed, and as
+-- refused when the signature is broken.
+describe("relay-time script checks: valid spends of every witness type are admitted", function()
+  local function fund_spk(utxos, tag, spk, value)
+    local txid = types.hash256(crypto.hash256("submitpackage-parity-ctl-" .. tag))
+    utxos[hex(txid) .. ":0"] = {
+      value = value, script_pubkey = spk, height = 1, is_coinbase = false,
+    }
+    return txid
+  end
+  local function unsigned(prev_txid, value)
+    return types.transaction(2,
+      { types.txin(types.outpoint(prev_txid, 0), "", 0xFFFFFFFD) },
+      { types.txout(value - 10000, SPK) }, 0)
+  end
+  local function admit(env, tx)
+    tx.segwit = true
+    return env.mp:accept_transaction(tx)
+  end
+
+  it("P2WSH <pub> OP_CHECKSIG: valid admitted, broken signature refused", function()
+    local env = new_env()
+    local ws = string.char(#PUB) .. PUB .. "\xac"
+    local spk = script.make_p2wsh_script(crypto.sha256(ws))
+    local prev = fund_spk(env.utxos, "p2wsh", spk, 100000)
+    local tx = unsigned(prev, 100000)
+    local sighash = validation.signature_hash_segwit_v0(tx, 0, ws, 100000, 1)
+    local sig = assert(crypto.ecdsa_sign(PRIV, sighash)) .. "\x01"
+    tx.inputs[1].witness = { sig, ws }
+    local ok, err = admit(env, tx)
+    assert.is_true(ok, tostring(err))
+
+    local env2 = new_env()
+    fund_spk(env2.utxos, "p2wsh", spk, 100000)
+    local bad = unsigned(prev, 100000)
+    local last = 4 + sig:byte(4)
+    bad.inputs[1].witness = {
+      sig:sub(1, last - 1) .. string.char(bit.bxor(sig:byte(last), 1)) .. sig:sub(last + 1), ws }
+    local ok2, reason = admit(env2, bad)
+    assert.is_false(ok2)
+    assert.equals(NULLFAIL_REASON, reason)
+  end)
+
+  it("P2SH-P2WPKH: valid admitted", function()
+    local env = new_env()
+    local redeem = script.make_p2wpkh_script(PKH)
+    local spk = script.make_p2sh_script(crypto.hash160(redeem))
+    local prev = fund_spk(env.utxos, "p2sh-p2wpkh", spk, 100000)
+    local tx = unsigned(prev, 100000)
+    tx.inputs[1].script_sig = string.char(#redeem) .. redeem
+    local sighash = validation.signature_hash_segwit_v0(
+      tx, 0, script.make_p2pkh_script(PKH), 100000, 1)
+    tx.inputs[1].witness = { assert(crypto.ecdsa_sign(PRIV, sighash)) .. "\x01", PUB }
+    local ok, err = admit(env, tx)
+    assert.is_true(ok, tostring(err))
+  end)
+
+  it("P2TR key path: valid admitted, wrong-key signature refused", function()
+    local env = new_env()
+    local xonly = PUB:sub(2, 33)
+    local tweak = crypto.tagged_hash("TapTweak", xonly)
+    local out_key = assert(crypto.tweak_pubkey(xonly, tweak))
+    local spk = script.make_p2tr_script(out_key)
+    local prev = fund_spk(env.utxos, "p2tr", spk, 100000)
+    local tx = unsigned(prev, 100000)
+    local prevouts = { { value = 100000, script_pubkey = spk } }
+    local sighash = assert(validation.signature_hash_taproot(tx, 0, 0x00, prevouts, 0))
+    local seckey = assert(crypto.taproot_tweak_seckey(PRIV, tweak))
+    tx.inputs[1].witness = { assert(crypto.schnorr_sign(seckey, sighash, string.rep("\0", 32))) }
+    local ok, err = admit(env, tx)
+    assert.is_true(ok, tostring(err))
+
+    local env2 = new_env()
+    fund_spk(env2.utxos, "p2tr", spk, 100000)
+    local bad = unsigned(prev, 100000)
+    -- Signed with the UNTWEAKED key: a well-formed Schnorr signature that
+    -- does not verify against the output key.
+    bad.inputs[1].witness = { assert(crypto.schnorr_sign(PRIV, sighash, string.rep("\0", 32))) }
+    local ok2, reason = admit(env2, bad)
+    assert.is_false(ok2)
+    assert.truthy(reason:match("^mempool%-script%-verify%-flag%-failed %("), reason)
+  end)
+
+  it("P2A anchor spend with an empty witness: admitted (anyone-can-spend v1 program)", function()
+    local env = new_env()
+    local prev = fund_spk(env.utxos, "p2a", "\x51\x02\x4e\x73", 100000)
+    local tx = unsigned(prev, 100000)
+    tx.inputs[1].witness = {}
+    local ok, err = env.mp:accept_transaction(tx)
+    assert.is_true(ok, tostring(err))
+  end)
+
+  it("legacy P2PKH: valid admitted, broken signature refused with Core's reason", function()
+    local env = new_env()
+    local spk = script.make_p2pkh_script(PKH)
+    local prev = fund_spk(env.utxos, "p2pkh", spk, 100000)
+    local tx = unsigned(prev, 100000)
+    local sighash = validation.signature_hash_legacy(tx, 0, spk, 1)
+    local sig = assert(crypto.ecdsa_sign(PRIV, sighash)) .. "\x01"
+    tx.inputs[1].script_sig = string.char(#sig) .. sig .. string.char(#PUB) .. PUB
+    local ok, err = env.mp:accept_transaction(tx)
+    assert.is_true(ok, tostring(err))
+
+    local env2 = new_env()
+    fund_spk(env2.utxos, "p2pkh", spk, 100000)
+    local bad = unsigned(prev, 100000)
+    local last = 4 + sig:byte(4)
+    local bsig = sig:sub(1, last - 1) .. string.char(bit.bxor(sig:byte(last), 1)) .. sig:sub(last + 1)
+    bad.inputs[1].script_sig = string.char(#bsig) .. bsig .. string.char(#PUB) .. PUB
+    local ok2, reason, details = env2.mp:accept_transaction(bad)
+    assert.is_false(ok2)
+    assert.equals(NULLFAIL_REASON, reason)
+    assert.equals(details_for(bad), details)
+  end)
+end)
