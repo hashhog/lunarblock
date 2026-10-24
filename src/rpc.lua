@@ -13497,10 +13497,14 @@ end
         message = string.format("Array must contain between 1 and %d transactions.",
           mempool_mod.MAX_PACKAGE_COUNT)})
     end
-    -- sats per kvB; 0 = no cap.  Compared in BTC/kvB below.
+    -- sat/kvB; 0 = no cap.  Both paths below refuse when the base fee is
+    -- over max_raw_tx_fee_rate.GetFee(vsize), as Core's result loop does
+    -- (rpc/mempool.cpp: `if (max_raw_tx_fee && fee > max_raw_tx_fee)`).
     local maxfeerate_sat_per_kvb = core_parse_max_feerate(params[2])
-    local maxfeerate_btc_per_kvb = (maxfeerate_sat_per_kvb > 0)
-                                   and (maxfeerate_sat_per_kvb / consensus.COIN) or nil
+    local function over_max_fee(fee, vsize)
+      return maxfeerate_sat_per_kvb > 0
+         and fee > mempool_mod.fee_for_rate(maxfeerate_sat_per_kvb, vsize)
+    end
 
     if not rpc.mempool then
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
@@ -13542,9 +13546,7 @@ end
       if atmp.accepted then
         local fee_btc = atmp.fee / consensus.COIN
         local vsize = atmp.vsize
-        local feerate_btc_per_kvb = (vsize > 0) and (fee_btc / vsize * 1000) or 0
-        -- maxfeerate check (BTC/kvB)
-        if maxfeerate_btc_per_kvb and feerate_btc_per_kvb > maxfeerate_btc_per_kvb then
+        if over_max_fee(atmp.fee, vsize) then
           res.allowed = false
           res["reject-reason"] = "max-fee-exceeded"
         else
@@ -13581,11 +13583,6 @@ end
     if state and state.kind == "policy" then
       package_error = mempool_mod.validation_state_string(state.reason, state.details)
     end
-    -- maxfeerate (BTC/kvB, Core default DEFAULT_MAX_RAW_TX_FEE_RATE 0.10);
-    -- Core compares the fee with max_raw_tx_fee_rate.GetFee(vsize), and a
-    -- zero cap means no check.
-    local max_rate_sat_kvb = math.floor(
-      (maxfeerate_btc_per_kvb or 0.10) * consensus.COIN + 0.5)
     local exit_early = false
     for i = 1, #txs do
       local res = results[i]
@@ -13594,8 +13591,7 @@ end
       local r = pkg_results[res.wtxid]
       if r and not exit_early then
         if r.kind == "valid" then
-          local max_fee = math.floor((max_rate_sat_kvb * r.vsize + 999) / 1000)
-          if max_fee > 0 and r.fee > max_fee then
+          if over_max_fee(r.fee, r.vsize) then
             res.allowed = false
             res["reject-reason"] = "max-fee-exceeded"
             exit_early = true

@@ -188,6 +188,104 @@ describe("testmempoolaccept rawtxs and maxfeerate", function()
   end)
 end)
 
+-- testmempoolaccept on two or more txs goes through process_new_package.
+-- Stub: every member validates at its own fee and vsize.
+local function stub_package_mempool(members)
+  local m = {entries = {}}
+  function m:process_new_package(txs, test_accept)
+    local results = {}
+    for i, tx in ipairs(txs) do
+      local wtxid = types.hash256_hex(validation.compute_wtxid(tx))
+      local f = members[i]
+      results[wtxid] = {
+        kind = "valid", fee = f.fee, vsize = f.vsize,
+        effective_feerate = math.floor(f.fee * 1000 / f.vsize),
+        effective_includes = {wtxid},
+      }
+    end
+    return nil, results
+  end
+  return m
+end
+
+-- Two distinct txs; the stub does not look at what they spend.
+local function pair_hex()
+  local a = tx_hex()
+  local prev = types.outpoint(types.hash256(string.rep("\3", 32)), 0)
+  local tx = types.transaction(2,
+    {types.txin(prev, "", 0xfffffffd)},
+    {types.txout(40000, "\0\20" .. string.rep("\4", 20))}, 0)
+  return a, rpc.hex_encode(serialize.serialize_transaction(tx, true))
+end
+
+describe("testmempoolaccept maxfeerate on a package", function()
+  -- Parent pays 0.9 BTC at 200 vB (450 BTC/kvB); the child pays 1,000 sat.
+  local members = {{fee = 90000000, vsize = 200}, {fee = 1000, vsize = 100}}
+
+  it("maxfeerate 0 means no cap: both members allowed", function()
+    local parent, child = pair_hex()
+    local r = call(server(stub_package_mempool(members)), "testmempoolaccept",
+                   {{parent, child}, 0})
+    assert.is_true(r.result[1].allowed)
+    assert.is_nil(r.result[1]["reject-reason"])
+    assert.equal(200, r.result[1].vsize)
+    assert.is_true(r.result[2].allowed)
+  end)
+
+  it("control: omitting maxfeerate applies 0.10 BTC/kvB to the parent", function()
+    local parent, child = pair_hex()
+    local r = call(server(stub_package_mempool(members)), "testmempoolaccept",
+                   {{parent, child}})
+    assert.is_false(r.result[1].allowed)
+    assert.equal("max-fee-exceeded", r.result[1]["reject-reason"])
+    -- Core stops at the first max-fee-exceeded: the child gets no verdict.
+    assert.is_nil(r.result[2].allowed)
+  end)
+
+  -- Core v31.1 measured on regtest (staged-patches/core-getfee/probe.sh):
+  -- fee 3001 at vsize 110 is allowed at 0.00027281 BTC/kvB (27281 * 110 /
+  -- 1000 = 3000.91, GetFee rounds UP to 3001) and refused at 0.00027272
+  -- (2999.92 -> 3000).
+  it("the cap is GetFee(vsize) rounded up, as Core v31.1 answers", function()
+    local parent, child = pair_hex()
+    local m = {{fee = 3001, vsize = 110}, {fee = 1000, vsize = 100}}
+    local r = call(server(stub_package_mempool(m)), "testmempoolaccept",
+                   {{parent, child}, 0.00027281})
+    assert.is_true(r.result[1].allowed)
+    assert.is_true(r.result[2].allowed)
+    r = call(server(stub_package_mempool(m)), "testmempoolaccept",
+             {{parent, child}, 0.00027272})
+    assert.is_false(r.result[1].allowed)
+    assert.equal("max-fee-exceeded", r.result[1]["reject-reason"])
+  end)
+end)
+
+describe("testmempoolaccept maxfeerate on one tx", function()
+  it("the cap is GetFee(vsize) rounded up, as Core v31.1 answers", function()
+    local hex = tx_hex()
+    local r = call(server(stub_mempool(3001, 110)), "testmempoolaccept", {{hex}, 0.00027281})
+    assert.is_true(r.result[1].allowed)
+    assert.equal(110, r.result[1].vsize)
+    r = call(server(stub_mempool(3001, 110)), "testmempoolaccept", {{hex}, 0.00027272})
+    assert.is_false(r.result[1].allowed)
+    assert.equal("max-fee-exceeded", r.result[1]["reject-reason"])
+    assert.is_nil(r.result[1].vsize)
+  end)
+end)
+
+describe("CFeeRate::GetFee", function()
+  local mempool = require("lunarblock.mempool")
+  it("rounds up, matching Core v31.1 (EvaluateFeeUp)", function()
+    assert.equal(3001, mempool.fee_for_rate(27281, 110))
+    assert.equal(3001, mempool.fee_for_rate(27280, 110))
+    assert.equal(3000, mempool.fee_for_rate(27272, 110))
+    assert.equal(3001, mempool.fee_for_rate(27273, 110))  -- 3000.03
+    assert.equal(1, mempool.fee_for_rate(1, 1))
+    assert.equal(0, mempool.fee_for_rate(0, 110))
+    assert.equal(0, mempool.fee_for_rate(27281, 0))
+  end)
+end)
+
 -- The cap on a REAL mempool.  Core's BroadcastTransaction test-accept never
 -- commits, so a tx refused for its fee leaves the pool exactly as it was.
 -- lunarblock's test-accept removes BIP125 conflicts (and trims) before the

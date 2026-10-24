@@ -465,12 +465,11 @@ M.DEFAULT_MAX_TX_FEE = 1000000    -- 0.01 BTC max fee (policy, not consensus)
 -- Reference: bitcoin-core/src/policy/policy.h:50, policy.cpp:390-398.
 M.DEFAULT_BYTES_PER_SIGOP = 20
 
--- CFeeRate::GetFee(vsize) (policy/feerate.cpp): truncating, but a non-zero
--- rate never rounds a non-zero size down to 0.  `per_kvb` in sat/kvB.
+-- CFeeRate::GetFee(vsize) (policy/feerate.cpp): FeeFrac::EvaluateFeeUp, so
+-- the fee rounds UP (Core v31.1 allows fee 3001 at 110 vB under a 27281
+-- sat/kvB cap: 3000.91 -> 3001).  `per_kvb` in sat/kvB, non-negative.
 function M.fee_for_rate(per_kvb, vsize)
-  local fee = math.floor(per_kvb * vsize / 1000)
-  if fee == 0 and per_kvb > 0 and vsize ~= 0 then fee = 1 end
-  return fee
+  return math.floor((per_kvb * vsize + 999) / 1000)
 end
 
 -- Reject token for the caller-supplied fee cap (opts.max_fee_per_kvb).
