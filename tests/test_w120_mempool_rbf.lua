@@ -750,11 +750,13 @@ end)
 test("G28-j: FIX-68 — rpc.lua format_mempool_entry computes replaceable per-entry", function()
   -- Replaces hardcoded `["bip125-replaceable"] = true` with a dynamic call
   -- to mp:is_replaceable(txid_hex).  Verify via source inspection.
+  -- getrawmempool verbose, getmempoolentry and getmempoolancestors/
+  -- descendants all format through the one M.mempool_entry_to_json.
   local src = io.open("src/rpc.lua", "r"):read("*a")
-  expect_true(src:find('%[\"bip125%-replaceable\"%] = mp and mp:is_replaceable') ~= nil,
-    "format_mempool_entry uses dynamic mp:is_replaceable walker")
-  expect_true(src:find('%[\"bip125%-replaceable\"%] = rpc%.mempool:is_replaceable') ~= nil,
-    "getrawmempool verbose uses dynamic rpc.mempool:is_replaceable walker")
+  expect_true(src:find('\"bip125%-replaceable\", %(mp and mp%.is_replaceable%) and mp:is_replaceable%(txid_hex%)') ~= nil,
+    "mempool_entry_to_json uses dynamic mp:is_replaceable walker")
+  expect_true(src:find('oj_result%(M%.mempool_entries_to_json%(rpc%.mempool,%s+rpc%.mempool:get_raw_mempool%(%)') ~= nil,
+    "getrawmempool verbose formats through mempool_entry_to_json")
   -- And the literal hardcode is gone.
   -- We allow exactly the two dynamic occurrences above; the hardcoded
   -- `["bip125-replaceable"] = true,` literal must be absent.
