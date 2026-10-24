@@ -35,6 +35,9 @@ local function stub_mempool(fee, vsize)
     self.accepted = self.accepted + 1
     return true, types.hash256_hex(validation.compute_txid(tx)), fee
   end
+  -- sendrawtransaction records every accepted txid in the unbroadcast set
+  -- before relaying it; these tests only check the RPC result.
+  function m:add_unbroadcast(txid_hex) end
   return m
 end
 
