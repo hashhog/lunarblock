@@ -907,6 +907,10 @@ local function run_import_utxo(args)
   if au_height then
     cs.tip_height = au_height
     db.set_chain_tip(cs.tip_hash, au_height, true)
+    -- Record that this datadir starts at a snapshot: the bodies below the
+    -- base are never downloaded, so the node must answer getblock /
+    -- getchainstates / its service bits accordingly on every later boot.
+    utxo_mod.write_snapshot_record(db, cs.tip_hash)
     if au_data and au_data.hash_serialized then
       print("import-utxo: blockhash matches assumeutxo height " .. au_height)
     end
@@ -1463,6 +1467,22 @@ local function main()
   -- header chain below the base does not reach genesis, open the pre-base
   -- backfill; block connection is held until it links (sync.lua).
   header_chain:refresh_prebase_gap()
+
+  -- A snapshot-bootstrapped datadir never fetches the block bodies below its
+  -- snapshot base, so it cannot honour NODE_NETWORK ("I can serve any block").
+  -- Core advertises NODE_NETWORK_LIMITED only while it has a historical
+  -- (unfinished) chainstate, including after a restart (init.cpp:1947).  The
+  -- persisted snapshot record is our record of that state; set the
+  -- process-wide gate before any peer (or getnetworkinfo) reads it.
+  do
+    local snap_hash = utxo_mod.read_snapshot_record(db)
+    p2p.set_history_incomplete(snap_hash ~= nil)
+    if snap_hash ~= nil then
+      print(string.format(
+        "[assumeutxo] no block bodies below snapshot base %s: advertising "
+        .. "NODE_NETWORK_LIMITED without NODE_NETWORK", types.hash256_hex(snap_hash)))
+    end
+  end
 
   -- --reindex (full): Bitcoin Core re-reads every blk*.dat file from disk
   -- and rebuilds BOTH the block index AND the chainstate (init.cpp
