@@ -119,20 +119,58 @@ function M.should_advertise_compact_filters(opts)
   return true
 end
 
+--------------------------------------------------------------------------------
+-- Historical block availability (NODE_NETWORK gate)
+--------------------------------------------------------------------------------
+--
+-- NODE_NETWORK promises a peer that we can serve ANY block of the chain.  A
+-- node that bootstrapped from a UTXO snapshot (--import-utxo, or the
+-- loadtxoutset RPC) holds no block bodies below the snapshot base, so it must
+-- not make that promise: it advertises NODE_NETWORK_LIMITED only, exactly as
+-- Bitcoin Core does:
+--   * rpc/blockchain.cpp loadtxoutset (~3432): RemoveLocalServices(NODE_NETWORK)
+--     + AddLocalServices(NODE_NETWORK_LIMITED);
+--   * init.cpp:1947: NODE_NETWORK is set at startup only when the node is not
+--     pruning AND has no historical (background, unfinished) chainstate, so a
+--     snapshot node still lacks it after a restart;
+--   * init.cpp:1368: NODE_NETWORK is re-enabled once the background download
+--     completes (and the node is not pruning).
+-- Measured on Core v31.1 regtest: localservices 0xc09 before loadtxoutset,
+-- 0xc08 after, still 0xc08 after a restart; peers see 0xc08 in `version`.
+--
+-- The flag is process-wide, like Core's connman local-services: main.lua sets
+-- it at boot from the persisted snapshot record, loadtxoutset sets it when it
+-- activates a snapshot whose history is not yet validated.  Peers created
+-- afterwards (and getnetworkinfo) see the new value.
+M._history_incomplete = false
+
+--- Record whether block bodies below the snapshot base are missing.
+-- @param incomplete boolean: true while history below the base is not held
+function M.set_history_incomplete(incomplete)
+  M._history_incomplete = incomplete and true or false
+end
+
+--- @return boolean: true while history below a snapshot base is missing
+function M.history_incomplete()
+  return M._history_incomplete == true
+end
+
+--- Whether NODE_NETWORK may be advertised.  Core init.cpp:1947-1950:
+-- `if (!IsPruneMode() && !HistoricalChainstate()) g_local_services |= NODE_NETWORK`.
+-- @param prune_mode boolean: running with --prune
+-- @return boolean
+function M.advertises_node_network(prune_mode)
+  return not prune_mode and not M.history_incomplete()
+end
+
 --- Compute the service-flags bitfield we advertise to peers.
 -- @param peerbloomfilters boolean: include NODE_BLOOM (BIP-35 mempool support)
--- @param prune_mode boolean: (retained for signature compatibility) — does NOT
---   gate NODE_NETWORK_LIMITED.  CORRECTION: NODE_NETWORK_LIMITED (BIP-159,
---   1<<10) is advertised by EVERY Bitcoin Core full node UNCONDITIONALLY.
---   The base local-services value in Core is
+-- @param prune_mode boolean: running with --prune.  Does NOT gate
+--   NODE_NETWORK_LIMITED: that bit (BIP-159, 1<<10) is advertised by EVERY
+--   Bitcoin Core full node UNCONDITIONALLY — the base local-services value is
 --     `ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);`
---   (init.cpp:863) — NODE_NETWORK_LIMITED is in the base set regardless of
---   prune mode.  What prune controls in Core is whether NODE_NETWORK is
---   *added* (init.cpp ~1950 adds NODE_NETWORK when not pruning), NOT whether
---   NODE_NETWORK_LIMITED is set.  lunarblock is a full non-pruned node, so we
---   set BOTH NODE_NETWORK and NODE_NETWORK_LIMITED unconditionally.  The old
---   comment here wrongly claimed Core only sets NODE_NETWORK_LIMITED when
---   pruned; that was backwards.
+--   (init.cpp:863).  What prune controls is whether NODE_NETWORK is *added*:
+--   see M.advertises_node_network below.
 -- @param use_v2 boolean: include NODE_P2P_V2 (BIP-324, 1<<11).  Defaults to
 --   true (omitted/nil ⇒ advertise) because lunarblock runs the v2 encrypted
 --   transport default-on (peer.lua:229 `use_v2 ~= false`).  Mirrors Core
@@ -153,13 +191,14 @@ end
 --   [|NODE_BLOOM] [|NODE_NETWORK_LIMITED] [|NODE_COMPACT_FILTERS])
 function M.our_services(peerbloomfilters, prune_mode, compactfilters, use_v2)
   local bit = require("bit")
-  -- Base full-node set: NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED.
-  -- NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY (matches Core's base
-  -- g_local_services = NODE_NETWORK_LIMITED | NODE_WITNESS, init.cpp:863).
-  -- prune_mode is intentionally NOT consulted here — see the doc-comment for
-  -- the correction of the old (backwards) prune-gating comment.
-  local s = bit.bor(M.SERVICES.NODE_NETWORK, M.SERVICES.NODE_WITNESS,
-                    M.SERVICES.NODE_NETWORK_LIMITED)
+  -- Base set: NODE_WITNESS | NODE_NETWORK_LIMITED, advertised UNCONDITIONALLY
+  -- (Core's base g_local_services = NODE_NETWORK_LIMITED | NODE_WITNESS,
+  -- init.cpp:863).  NODE_NETWORK is added only when we can serve every
+  -- historical block (M.advertises_node_network).
+  local s = bit.bor(M.SERVICES.NODE_WITNESS, M.SERVICES.NODE_NETWORK_LIMITED)
+  if M.advertises_node_network(prune_mode) then
+    s = bit.bor(s, M.SERVICES.NODE_NETWORK)
+  end
   if peerbloomfilters then
     s = bit.bor(s, M.SERVICES.NODE_BLOOM)
   end

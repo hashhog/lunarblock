@@ -1071,27 +1071,9 @@ function RESTServer:handle_mempool_info()
     return error_response(404, "Mempool disabled or instance not found")
   end
 
-  local info = self.mempool:get_info()
-
-  -- Calculate total fees
-  local total_fee = 0
-  for _, entry in pairs(self.mempool.entries or {}) do
-    total_fee = total_fee + (entry.fee or 0)
-  end
-
-  local mempool_min_fee = info.mempoolminfee or 1000
-  local min_relay_fee = self.mempool.min_relay_fee or 1000
-
-  return json_response({
-    loaded = true,
-    size = info.size,
-    bytes = info.bytes,
-    usage = info.usage,
-    total_fee = total_fee / consensus.COIN,
-    maxmempool = info.maxmempool,
-    mempoolminfee = mempool_min_fee / 100000000,
-    minrelaytxfee = min_relay_fee / 100000000,
-  })
+  -- Same body as the getmempoolinfo RPC (Core's rest_mempool_info delegates to
+  -- MempoolInfoToJSON as well).
+  return build_response(200, rpc_mod.mempool_info_json(self.mempool) .. "\n", "application/json")
 end
 
 --- GET /rest/chaininfo.json
