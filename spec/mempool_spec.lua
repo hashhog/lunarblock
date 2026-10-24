@@ -3028,7 +3028,10 @@ describe("mempool", function()
         tx.inputs[1] = make_input(prev_txid, 0)
         tx.outputs[1] = types.txout(89000, ms)
 
+        local saved = mempool.PERMIT_BARE_MULTISIG
+        mempool.PERMIT_BARE_MULTISIG = false  -- -permitbaremultisig=0
         local ok, err = mp:accept_transaction(tx)
+        mempool.PERMIT_BARE_MULTISIG = saved
         assert.is_false(ok)
         assert.equal("bare-multisig", err)
       end)
@@ -3110,7 +3113,10 @@ describe("mempool", function()
 
         local ok, err = mp:accept_transaction(tx)
         assert.is_false(ok)
-        assert.truthy(err:match("mandatory%-script%-verify%-flag%-failed"))
+        -- Core v31 CheckInputScripts under STANDARD flags: the mempool reject
+        -- is "mempool-script-verify-flag-failed (<ScriptErrorString>)"
+        -- (validation.cpp:2120); "mandatory-..." no longer exists in Core.
+        assert.truthy(err:match("^mempool%-script%-verify%-flag%-failed %("), err)
       end)
 
       it("does not run verify_script when gate is off (default)", function()
@@ -3184,8 +3190,8 @@ describe("mempool", function()
       it("MAX_P2SH_SIGOPS = 15", function()
         assert.equal(15, mempool.MAX_P2SH_SIGOPS)
       end)
-      it("PERMIT_BARE_MULTISIG defaults to false (Core v28+)", function()
-        assert.is_false(mempool.PERMIT_BARE_MULTISIG)
+      it("PERMIT_BARE_MULTISIG defaults to true (Core DEFAULT_PERMIT_BAREMULTISIG)", function()
+        assert.is_true(mempool.PERMIT_BARE_MULTISIG)
       end)
     end)
   end)

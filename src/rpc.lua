@@ -1257,6 +1257,54 @@ local function oj_result(obj)
   return { _raw_json = oj_encode(obj) }
 end
 
+-- getblocktemplate result in Core's pushKV order (rpc/mining.cpp).  Encoded
+-- by hand because plain cjson cannot tell an empty array from an empty
+-- object: per-tx `depends` = [] went out as {}.  `coinbaseaux` is Core's
+-- empty object; `default_witness_commitment` is omitted when absent.
+local function block_template_json(t)
+  local txs = {}
+  for i, e in ipairs(t.transactions) do
+    local deps = {}
+    for j, d in ipairs(e.depends or {}) do deps[j] = tostring(d) end
+    txs[i] = oj({
+      "data",    e.data,
+      "txid",    e.txid,
+      "hash",    e.hash,
+      "depends", oj_raw("[" .. table.concat(deps, ",") .. "]"),
+      "fee",     e.fee,
+      "sigops",  e.sigops,
+      "weight",  e.weight,
+    })
+  end
+  local seq = {
+    "capabilities",      oj_array_of_strings(t.capabilities),
+    "version",           t.version,
+    "rules",             oj_array_of_strings(t.rules),
+    "vbavailable",       oj_raw(next(t.vbavailable or {}) and cjson.encode(t.vbavailable) or "{}"),
+    "vbrequired",        t.vbrequired,
+    "previousblockhash", t.previousblockhash,
+    "transactions",      oj_array(txs),
+    "coinbaseaux",       oj_raw("{}"),
+    "coinbasevalue",     t.coinbasevalue,
+    "target",            t.target,
+    "mintime",           t.mintime,
+    "mutable",           oj_array_of_strings(t.mutable),
+    "noncerange",        t.noncerange,
+    "sigoplimit",        t.sigoplimit,
+    "sizelimit",         t.sizelimit,
+    "weightlimit",       t.weightlimit,
+    "curtime",           t.curtime,
+    "bits",              t.bits,
+    "height",            t.height,
+  }
+  if t.default_witness_commitment then
+    seq[#seq + 1] = "default_witness_commitment"
+    seq[#seq + 1] = t.default_witness_commitment
+  end
+  return oj_encode(oj(seq))
+end
+M.block_template_json = block_template_json
+
 M._oj = oj
 M._oj_raw = oj_raw
 M._oj_amount = oj_amount
@@ -1306,9 +1354,8 @@ function M.mempool_info_json(mempool)
     "incrementalrelayfee", oj_amount(mp.INCREMENTAL_RELAY_FEE),
     "unbroadcastcount",    info.unbroadcastcount or 0,
     "fullrbf",             fullrbf,
-    -- Core reports the option value (true on a default node) even though the
-    -- relay STANDARDNESS default for bare multisig flipped to false.
-    "permitbaremultisig",  true,
+    -- Core reports the -permitbaremultisig option value (default true).
+    "permitbaremultisig",  mp.PERMIT_BARE_MULTISIG,
     "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
     "limitclustercount",   64,                        -- DEFAULT cluster_count
     "limitclustersize",    101000,                    -- cluster_size_vbytes
@@ -1321,6 +1368,97 @@ M._oj_array_empty = oj_array_empty
 M._oj_array_of_strings = oj_array_of_strings
 M._oj_encode = oj_encode
 M._oj_value = oj_value
+
+-- Core getrawmempool / getmempoolentry wtxid is display-order hex.
+-- entry.wtxid is a hash256 {bytes=...}; encoding that table puts raw
+-- bytes in the JSON string and the response is not UTF-8.
+local function mempool_wtxid_hex(entry, txid_hex)
+  local w = entry.wtxid
+  if type(w) == "table" and type(w.bytes) == "string" then
+    return types.hash256_hex(w)
+  end
+  if type(w) == "string" then return w end
+  return txid_hex
+end
+
+-- A JSON array of txid strings.  Written verbatim rather than through
+-- cjson.empty_array_mt: the lua-cjson 2.1.0 the node loads from the system
+-- path has no empty_array_mt, so an empty table there encodes as {}.
+local function oj_txid_array(list)
+  if #list == 0 then return oj_array_empty() end
+  return oj_array_of_strings(list)
+end
+
+--- One mempool entry as Core v31.1 rpc/mempool.cpp entryToJSON writes it
+-- (getrawmempool verbose, getmempoolentry, getmempoolancestors/descendants
+-- verbose, REST /mempool/contents), as an ordered object in Core's key
+-- order.  Counts, sizes and fees come from mempool.entry_relatives
+-- (self-inclusive, modified fees); chunkweight and fees.chunk from the tx's
+-- chunk in its cluster linearization (TxGraph::GetMainChunkFeerate).
+-- @param mp Mempool (or any table with .entries)
+-- @param chunk table|nil {fee=, weight=} from mp:chunk_feerates(); computed
+--   for this tx's cluster when nil
+function M.mempool_entry_to_json(mp, entry, txid_hex, chunk)
+  local mempool_mod = require("lunarblock.mempool")
+  local entries = (mp and mp.entries) or { [txid_hex] = entry }
+  if entries[txid_hex] == nil then entries = { [txid_hex] = entry } end
+  local rel = mempool_mod.entry_relatives(entries, txid_hex)
+  local modified_sats = (mp and mp.get_modified_fee) and mp:get_modified_fee(txid_hex)
+    or entry.modified_fee or entry.fee
+  if not chunk and mp and mp.chunk_feerates then
+    chunk = mp:chunk_feerates(txid_hex)[txid_hex]
+  end
+  chunk = chunk or {
+    fee = modified_sats,
+    weight = entry.adjusted_weight or entry.weight or (entry.vsize or 0) * 4,
+  }
+  return oj({
+    "vsize",           entry.vsize,
+    "weight",          entry.weight,
+    "time",            entry.time,
+    "height",          entry.height,
+    "descendantcount", rel.descendant_count,
+    "descendantsize",  rel.descendant_size,
+    "ancestorcount",   rel.ancestor_count,
+    "ancestorsize",    rel.ancestor_size,
+    "wtxid",           mempool_wtxid_hex(entry, txid_hex),
+    "chunkweight",     chunk.weight,
+    -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
+    -- descendantfees/ancestorfees at the top level.
+    "fees", oj({
+      "base",       oj_amount(entry.fee),
+      "modified",   oj_amount(modified_sats),
+      "ancestor",   oj_amount(rel.ancestor_fees),
+      "descendant", oj_amount(rel.descendant_fees),
+      "chunk",      oj_amount(chunk.fee),
+    }),
+    "depends",         oj_txid_array(rel.depends),
+    "spentby",         oj_txid_array(rel.spentby),
+    -- FIX-68 (W120 BUG-9): policy/rbf.cpp IsRBFOptIn walks the tx and its
+    -- unconfirmed ancestors (Mempool:is_replaceable).
+    "bip125-replaceable", (mp and mp.is_replaceable) and mp:is_replaceable(txid_hex) or false,
+    "unbroadcast",     (mp and mp.is_unbroadcast) and mp:is_unbroadcast(txid_hex) or false,
+  })
+end
+
+--- An ordered txid -> entryToJSON object (Core MempoolToJSON verbose,
+-- getmempoolancestors/descendants verbose), keys in txid order.
+-- @param txids array of txid_hex
+-- @param chunks table|nil txid_hex -> {fee=, weight=}
+function M.mempool_entries_to_json(mp, txids, chunks)
+  local sorted = {}
+  for i = 1, #txids do sorted[i] = txids[i] end
+  table.sort(sorted)
+  local seq = {}
+  for _, txid_hex in ipairs(sorted) do
+    local entry = mp.entries[txid_hex]
+    if entry then
+      seq[#seq + 1] = txid_hex
+      seq[#seq + 1] = M.mempool_entry_to_json(mp, entry, txid_hex, chunks and chunks[txid_hex])
+    end
+  end
+  return oj(seq)
+end
 
 --------------------------------------------------------------------------------
 -- Base64 Encoding/Decoding
@@ -4264,18 +4402,6 @@ function RPCServer:register_methods()
     return cjson.null
   end
 
-  -- Core getrawmempool / getmempoolentry wtxid is display-order hex.
-  -- entry.wtxid is a hash256 {bytes=...}; encoding that table puts raw
-  -- bytes in the JSON string and the response is not UTF-8.
-  local function mempool_wtxid_hex(entry, txid_hex)
-    local w = entry.wtxid
-    if type(w) == "table" and type(w.bytes) == "string" then
-      return types.hash256_hex(w)
-    end
-    if type(w) == "string" then return w end
-    return txid_hex
-  end
-
   self.methods["getrawmempool"] = function(rpc, params)
     local verbose = params[1] or false
     if not rpc.mempool then
@@ -4292,47 +4418,10 @@ function RPCServer:register_methods()
       end
       return txids
     end
-    -- Verbose: return details for each tx
-    local result = {}
-    for _, txid_hex in ipairs(rpc.mempool:get_raw_mempool()) do
-      local entry = rpc.mempool:get_entry(txid_hex)
-      if entry then
-        local fee_btc = entry.fee / consensus.COIN
-        -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee).
-        local modified_sats = rpc.mempool:get_modified_fee(txid_hex)
-        local modified_btc = modified_sats / consensus.COIN
-        -- FIX-68 (W120 BUG-9): bip125-replaceable per Bitcoin Core
-        -- policy/rbf.cpp IsRBFOptIn — walks tx + unconfirmed ancestors.
-        -- Was hardcoded `true`, lying to wallets when neither the tx nor
-        -- any ancestor signals RBF.  Walker is rpc.mempool:is_replaceable
-        -- which scans entry.ancestors via signals_rbf (mempool.lua:2218).
-        result[txid_hex] = {
-          vsize = entry.vsize,
-          weight = entry.weight,
-          time = entry.time,
-          height = entry.height,
-          descendantcount = entry.descendant_count or 1,
-          descendantsize = entry.descendant_size or entry.vsize,
-          ancestorcount = entry.ancestor_count or 1,
-          ancestorsize = entry.ancestor_size or entry.vsize,
-          wtxid = mempool_wtxid_hex(entry, txid_hex),
-          -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
-          -- descendantfees/ancestorfees at the top level (removed to match
-          -- Bitcoin Core rpc/mempool.cpp entryToJSON).
-          fees = {
-            base = fee_btc,
-            modified = modified_btc,
-            ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
-            descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
-          },
-          depends = entry.depends or {},
-          spentby = entry.spent_by or {},
-          ["bip125-replaceable"] = rpc.mempool:is_replaceable(txid_hex),
-          unbroadcast = false,
-        }
-      end
-    end
-    return result
+    -- Verbose: return details for each tx.  One chunk map for the whole
+    -- pool so each cluster is linearized once, not once per member.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool,
+      rpc.mempool:get_raw_mempool(), rpc.mempool:chunk_feerates()))
   end
 
   -- getorphantxs: show transactions in the tx orphanage (Core v28).
@@ -6999,45 +7088,8 @@ end
   -- Mempool entry/ancestor/descendant introspection.
   -- Bitcoin Core: rpc/mempool.cpp::{getmempoolentry,getmempoolancestors,getmempooldescendants}.
   -- Each walks the in-memory CTxMemPool graph; we mirror that with the
-  -- ancestor/descendant sets already maintained on each Mempool entry.
-  --
-  -- FIX-68 (W120 BUG-9): bip125-replaceable computed per Core
-  -- policy/rbf.cpp IsRBFOptIn (walks tx + unconfirmed ancestors); the
-  -- caller must pass `mp` so we can run the ancestor scan via
-  -- Mempool:is_replaceable.  Previously hardcoded `true`, which lied
-  -- to wallets for non-signaling, no-signaling-ancestor mempool entries.
-  local function format_mempool_entry(entry, txid_hex, mp)
-    local fee_btc = entry.fee / consensus.COIN
-    -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee = nFee +
-    -- delta).  Fall back to base fee when no mempool ref is available.
-    local modified_sats = mp and mp.get_modified_fee
-      and mp:get_modified_fee(txid_hex) or entry.fee
-    local modified_btc = modified_sats / consensus.COIN
-    return {
-      vsize = entry.vsize,
-      weight = entry.weight,
-      time = entry.time,
-      height = entry.height,
-      descendantcount = entry.descendant_count or 1,
-      descendantsize = entry.descendant_size or entry.vsize,
-      ancestorcount = entry.ancestor_count or 1,
-      ancestorsize = entry.ancestor_size or entry.vsize,
-      wtxid = mempool_wtxid_hex(entry, txid_hex),
-      -- Core shape: fees is a NESTED object; flat fee/modifiedfee/
-      -- descendantfees/ancestorfees are NOT top-level fields in Core's
-      -- entryToJSON (bitcoin-core/src/rpc/mempool.cpp:508-568).
-      fees = {
-        base = fee_btc,
-        modified = modified_btc,
-        ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
-        descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
-      },
-      depends = entry.depends or {},
-      spentby = entry.spent_by or {},
-      ["bip125-replaceable"] = mp and mp:is_replaceable(txid_hex) or false,
-      unbroadcast = false,
-    }
-  end
+  -- ancestor/descendant sets already maintained on each Mempool entry; the
+  -- entry objects come from M.mempool_entry_to_json (entryToJSON).
 
   self.methods["getmempoolentry"] = function(rpc, params)
     local txid_hex = params and params[1]
@@ -7051,7 +7103,7 @@ end
     if not entry then
       error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
     end
-    return format_mempool_entry(entry, txid_hex, rpc.mempool)
+    return oj_result(M.mempool_entry_to_json(rpc.mempool, entry, txid_hex))
   end
 
   self.methods["getmempoolancestors"] = function(rpc, params)
@@ -7075,13 +7127,10 @@ end
       return out
     end
     local out = {}
-    for anc_hex in pairs(entry.ancestors or {}) do
-      local anc_entry = rpc.mempool:get_entry(anc_hex)
-      if anc_entry then
-        out[anc_hex] = format_mempool_entry(anc_entry, anc_hex, rpc.mempool)
-      end
-    end
-    return out
+    for anc_hex in pairs(entry.ancestors or {}) do out[#out + 1] = anc_hex end
+    -- Every ancestor shares txid's cluster: linearize it once.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out,
+      rpc.mempool:chunk_feerates(txid_hex)))
   end
 
   self.methods["getmempooldescendants"] = function(rpc, params)
@@ -7105,13 +7154,10 @@ end
       return out
     end
     local out = {}
-    for desc_hex in pairs(entry.descendants or {}) do
-      local desc_entry = rpc.mempool:get_entry(desc_hex)
-      if desc_entry then
-        out[desc_hex] = format_mempool_entry(desc_entry, desc_hex, rpc.mempool)
-      end
-    end
-    return out
+    for desc_hex in pairs(entry.descendants or {}) do out[#out + 1] = desc_hex end
+    -- Every descendant shares txid's cluster: linearize it once.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out,
+      rpc.mempool:chunk_feerates(txid_hex)))
   end
 
   -- prioritisetransaction: bump (or lower) a tx's effective fee for mining.
@@ -7886,47 +7932,65 @@ end
       error({code = M.ERROR.INVALID_PARAMS,
         message = "package-not-child-with-parents-tree: parents must not spend other parents in the package"})
     end
-    local accept_ok, err_or_results = rpc.mempool:accept_package(txs)
-    local tx_results = {}
-    -- accept_package returns (true, {...}) on success or (false, err_msg).
-    if accept_ok then
+    local state, results = rpc.mempool:process_new_package(txs, false)
+    local package_msg = "success"
+    if state then
+      package_msg = mempool_mod.validation_state_string(state.reason, state.details)
+    end
+
+    -- Broadcast what is in the mempool now (Core: every member that exists,
+    -- including ones that were already there).
+    if rpc.peer_manager then
+      local invs = {}
       for _, tx in ipairs(txs) do
         local txid = validation.compute_txid(tx)
-        local wtxid = validation.compute_wtxid(tx)
-        local txid_hex = types.hash256_hex(txid)
-        local wtxid_hex = types.hash256_hex(wtxid)
-        local entry = rpc.mempool:get_entry(txid_hex)
-        local fee_btc = entry and (entry.fee / consensus.COIN) or 0
-        local vsize = entry and entry.vsize or 0
-        tx_results[wtxid_hex] = {
-          txid = txid_hex,
-          vsize = vsize,
-          fees = {
-            base = fee_btc,
-          },
-        }
-      end
-      -- Broadcast via inv (matches sendrawtransaction).
-      if rpc.peer_manager then
-        local invs = {}
-        for _, tx in ipairs(txs) do
-          local txid = validation.compute_txid(tx)
+        if rpc.mempool.entries[types.hash256_hex(txid)] then
           invs[#invs + 1] = {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
         end
-        local inv_payload = p2p.serialize_inv(invs)
-        rpc.peer_manager:broadcast("inv", inv_payload)
       end
-      return {
-        package_msg = "success",
-        ["tx-results"] = tx_results,
-        ["replaced-transactions"] = {},
-      }
+      if #invs > 0 then
+        rpc.peer_manager:broadcast("inv", p2p.serialize_inv(invs))
+      end
     end
-    return {
-      package_msg = tostring(err_or_results),
-      ["tx-results"] = tx_results,
-      ["replaced-transactions"] = {},
-    }
+
+    -- Per-tx results keyed by wtxid, in Core's shape and pushKV order
+    -- (rpc/mempool.cpp:1457-1511).  Emitted as ordered JSON: the deployed
+    -- lua-cjson (2.1.0) has no empty_array_mt, so a plain {} would encode
+    -- replaced-transactions as an object.
+    local tx_results = {}
+    for _, tx in ipairs(txs) do
+      local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+      local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
+      local res = results[wtxid_hex]
+      local inner = { "txid", txid_hex }
+      if not res then
+        inner[#inner + 1] = "error"; inner[#inner + 1] = "package-not-validated"
+      elseif res.kind == "different_witness" then
+        inner[#inner + 1] = "other-wtxid"; inner[#inner + 1] = res.other_wtxid
+      elseif res.kind == "invalid" then
+        inner[#inner + 1] = "error"
+        inner[#inner + 1] = mempool_mod.validation_state_string(res.reason, res.details)
+      else
+        local fees = { "base", oj_amount(res.fee) }
+        if res.kind == "valid" then
+          -- Not reported for MEMPOOL_ENTRY: whether the package feerate was
+          -- used when it was first submitted is unknown.
+          fees[#fees + 1] = "effective-feerate"; fees[#fees + 1] = oj_amount(res.effective_feerate)
+          fees[#fees + 1] = "effective-includes"
+          fees[#fees + 1] = oj_array_of_strings(res.effective_includes)
+        end
+        inner[#inner + 1] = "vsize"; inner[#inner + 1] = res.vsize
+        inner[#inner + 1] = "fees"; inner[#inner + 1] = oj(fees)
+      end
+      tx_results[#tx_results + 1] = wtxid_hex
+      tx_results[#tx_results + 1] = oj(inner)
+    end
+    return oj_result(oj({
+      "package_msg", package_msg,
+      "tx-results", oj(tx_results),
+      -- No member replaces anything here (package RBF is not implemented).
+      "replaced-transactions", oj_array_empty(),
+    }))
   end
 
   -- generateblock <output> <transactions> [<submit>] -- regtest only.
@@ -8200,7 +8264,7 @@ end
         rpc.mempool, rpc.chain_state, rpc.network,
         payout_script
       )
-      return template
+      return { _raw_json = M.block_template_json(template) }
     end
     error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
   end
@@ -13415,10 +13479,13 @@ end
         else
           res.allowed = true
           res.vsize = vsize
+          -- Core: effective-feerate is CFeeRate(fee, vsize).GetFeePerK()
+          -- (sat/kvB, rounded down) and effective-includes lists WTXIDs.
           res.fees = {
             base = fee_btc,
-            ["effective-feerate"] = feerate_btc_per_kvb,
-            ["effective-includes"] = {res.txid},
+            ["effective-feerate"] = (vsize > 0 and math.floor(atmp.fee * 1000 / vsize) or 0)
+                                    / consensus.COIN,
+            ["effective-includes"] = {res.wtxid},
           }
         end
       else
@@ -13434,57 +13501,51 @@ end
       return results
     end
 
-    -- Multi-tx (package) path: route through accept_package(txns, test_accept=true).
-    -- Collect decoded txs; decode failures already handled above.
-    local tx_list = {}
+    -- Multi-tx (package) path: Core ProcessNewPackage(test_accept=true), each
+    -- member at its own feerate (rpc/mempool.cpp:343-407).  A member with no
+    -- result was not validated (an earlier member failed) and gets only its
+    -- txid and wtxid; a package-level policy failure adds package-error.
+    local state, pkg_results = rpc.mempool:process_new_package(txs, true)
+    local package_error
+    if state and state.kind == "policy" then
+      package_error = mempool_mod.validation_state_string(state.reason, state.details)
+    end
+    -- maxfeerate (BTC/kvB, Core default DEFAULT_MAX_RAW_TX_FEE_RATE 0.10);
+    -- Core compares the fee with max_raw_tx_fee_rate.GetFee(vsize), and a
+    -- zero cap means no check.
+    local max_rate_sat_kvb = math.floor(
+      (maxfeerate_btc_per_kvb or 0.10) * consensus.COIN + 0.5)
+    local exit_early = false
     for i = 1, #txs do
-      tx_list[i] = txs[i]
-    end
-
-    -- Empty package: return empty results without calling accept_package.
-    if #tx_list == 0 then
-      return results
-    end
-
-    local pkg_ok, pkg_result = rpc.mempool:accept_package(tx_list, true)
-    if not pkg_ok then
-      -- Package-level failure: mark all txs with package-error.
-      for i = 1, #results do
-        results[i]["package-error"] = tostring(pkg_result)
-        results[i].allowed = false
-      end
-      return results
-    end
-
-    -- Package accepted (dry-run): populate per-tx results.
-    local pkg_total_fees = pkg_result.total_fees or 0
-    local pkg_total_vsize = pkg_result.total_vsize or 0
-    local pkg_feerate = (pkg_total_vsize > 0) and
-                        ((pkg_total_fees / consensus.COIN) / pkg_total_vsize * 1000) or 0
-
-    -- Build a txid→index map for effective-includes.
-    local txid_list = {}
-    for i, tx in ipairs(tx_list) do
-      txid_list[i] = results[i].txid
-    end
-
-    for i, tx in ipairs(tx_list) do
       local res = results[i]
-      local fee_btc = (pkg_result.fees and pkg_result.fees[i] or 0) / consensus.COIN
-      local weight = validation.get_tx_weight(tx)
-      local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
-      -- maxfeerate check uses package fee rate.
-      if maxfeerate_btc_per_kvb and pkg_feerate > maxfeerate_btc_per_kvb then
-        res.allowed = false
-        res["reject-reason"] = "max-fee-exceeded"
-      else
-        res.allowed = true
-        res.vsize = vsize
-        res.fees = {
-          base = fee_btc,
-          ["effective-feerate"] = pkg_feerate,
-          ["effective-includes"] = txid_list,
-        }
+      if package_error then res["package-error"] = package_error end
+      res.allowed = nil
+      local r = pkg_results[res.wtxid]
+      if r and not exit_early then
+        if r.kind == "valid" then
+          local max_fee = math.floor((max_rate_sat_kvb * r.vsize + 999) / 1000)
+          if max_fee > 0 and r.fee > max_fee then
+            res.allowed = false
+            res["reject-reason"] = "max-fee-exceeded"
+            exit_early = true
+          else
+            res.allowed = true
+            res.vsize = r.vsize
+            res.fees = {
+              base = r.fee / consensus.COIN,
+              ["effective-feerate"] = r.effective_feerate / consensus.COIN,
+              ["effective-includes"] = r.effective_includes,
+            }
+          end
+        else
+          res.allowed = false
+          if mempool_mod.is_missing_inputs(r.reason) then
+            res["reject-reason"] = "missing-inputs"
+          else
+            res["reject-reason"] = r.reason
+            res["reject-details"] = mempool_mod.validation_state_string(r.reason, r.details)
+          end
+        end
       end
     end
 

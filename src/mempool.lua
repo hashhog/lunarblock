@@ -506,10 +506,13 @@ M.MAX_STANDARD_SCRIPTSIG_SIZE = 1650
 
 -- W96: permit_bare_multisig policy flag (Core policy/policy.cpp:152-154
 -- + kernel/mempool_options.h DEFAULT_PERMIT_BAREMULTISIG).
--- Core flipped this default from true → false in v28 (commit 8ee7773d).
+-- Core's default is TRUE (policy/policy.h DEFAULT_PERMIT_BAREMULTISIG{true},
+-- still so in v31.1; Core 31.1 accepts a 1-of-1 bare multisig output on a
+-- default regtest node).  The earlier "flipped to false in v28" note was
+-- wrong and made lunarblock refuse what Core relays and mines.
 -- When false, IsStandardTx rejects bare-multisig outputs with reason
 -- "bare-multisig" even if 1 <= m <= n <= 3.
-M.PERMIT_BARE_MULTISIG = false
+M.PERMIT_BARE_MULTISIG = true
 
 -- W96: legacy (non-witness) sigops cap per transaction (BIP-54 +
 -- Core policy.h MAX_TX_LEGACY_SIGOPS).  Enforced by ValidateInputsStandardness
@@ -1225,6 +1228,133 @@ function M.is_missing_inputs(reason)
   return reason == M.REJECT_MISSING_INPUTS
 end
 
+--- Core ScriptErrorString (script/script_error.cpp), keyed by the error token
+-- the interpreter returns.  Tokens are Core's SCRIPT_ERR_* names; the few the
+-- lunarblock interpreter spells differently (NULLFAIL, SIG_SCHNORR) are
+-- aliased.  An unknown token is passed through unchanged.
+local SCRIPT_ERROR_STRINGS = {
+  EVAL_FALSE = "Script evaluated without error but finished with a false/empty top stack element",
+  VERIFY = "Script failed an OP_VERIFY operation",
+  EQUALVERIFY = "Script failed an OP_EQUALVERIFY operation",
+  CHECKMULTISIGVERIFY = "Script failed an OP_CHECKMULTISIGVERIFY operation",
+  CHECKSIGVERIFY = "Script failed an OP_CHECKSIGVERIFY operation",
+  NUMEQUALVERIFY = "Script failed an OP_NUMEQUALVERIFY operation",
+  SCRIPT_SIZE = "Script is too big",
+  PUSH_SIZE = "Push value size limit exceeded",
+  OP_COUNT = "Operation limit exceeded",
+  STACK_SIZE = "Stack size limit exceeded",
+  SIG_COUNT = "Signature count negative or greater than pubkey count",
+  PUBKEY_COUNT = "Pubkey count negative or limit exceeded",
+  BAD_OPCODE = "Opcode missing or not understood",
+  DISABLED_OPCODE = "Attempted to use a disabled opcode",
+  INVALID_STACK_OPERATION = "Operation not valid with the current stack size",
+  INVALID_ALTSTACK_OPERATION = "Operation not valid with the current altstack size",
+  OP_RETURN = "OP_RETURN was encountered",
+  UNBALANCED_CONDITIONAL = "Invalid OP_IF construction",
+  NEGATIVE_LOCKTIME = "Negative locktime",
+  UNSATISFIED_LOCKTIME = "Locktime requirement not satisfied",
+  SIG_HASHTYPE = "Signature hash type missing or not understood",
+  SIG_DER = "Non-canonical DER signature",
+  MINIMALDATA = "Data push larger than necessary",
+  SIG_PUSHONLY = "Only push operators allowed in signatures",
+  SIG_HIGH_S = "Non-canonical signature: S value is unnecessarily high",
+  SIG_NULLDUMMY = "Dummy CHECKMULTISIG argument must be zero",
+  MINIMALIF = "OP_IF/NOTIF argument must be minimal",
+  SIG_NULLFAIL = "Signature must be zero for failed CHECK(MULTI)SIG operation",
+  NULLFAIL = "Signature must be zero for failed CHECK(MULTI)SIG operation",
+  DISCOURAGE_UPGRADABLE_NOPS = "NOPx reserved for soft-fork upgrades",
+  DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM = "Witness version reserved for soft-fork upgrades",
+  DISCOURAGE_UPGRADABLE_TAPROOT_VERSION = "Taproot version reserved for soft-fork upgrades",
+  DISCOURAGE_OP_SUCCESS = "OP_SUCCESSx reserved for soft-fork upgrades",
+  DISCOURAGE_UPGRADABLE_PUBKEYTYPE = "Public key version reserved for soft-fork upgrades",
+  PUBKEYTYPE = "Public key is neither compressed or uncompressed",
+  CLEANSTACK = "Stack size must be exactly one after execution",
+  WITNESS_PROGRAM_WRONG_LENGTH = "Witness program has incorrect length",
+  WITNESS_PROGRAM_WITNESS_EMPTY = "Witness program was passed an empty witness",
+  WITNESS_PROGRAM_MISMATCH = "Witness program hash mismatch",
+  WITNESS_MALLEATED = "Witness requires empty scriptSig",
+  WITNESS_MALLEATED_P2SH = "Witness requires only-redeemscript scriptSig",
+  WITNESS_UNEXPECTED = "Witness provided for non-witness script",
+  WITNESS_PUBKEYTYPE = "Using non-compressed keys in segwit",
+  SCHNORR_SIG_SIZE = "Invalid Schnorr signature size",
+  SCHNORR_SIG_HASHTYPE = "Invalid Schnorr signature hash type",
+  SCHNORR_SIG = "Invalid Schnorr signature",
+  SIG_SCHNORR = "Invalid Schnorr signature",
+  TAPROOT_WRONG_CONTROL_SIZE = "Invalid Taproot control block size",
+  TAPSCRIPT_VALIDATION_WEIGHT = "Too much signature validation relative to witness weight",
+  TAPSCRIPT_CHECKMULTISIG = "OP_CHECKMULTISIG(VERIFY) is not available in tapscript",
+  TAPSCRIPT_MINIMALIF = "OP_IF/NOTIF argument must be minimal in tapscript",
+  TAPSCRIPT_EMPTY_PUBKEY = "Empty public key in tapscript",
+  OP_CODESEPARATOR = "Using OP_CODESEPARATOR in non-witness script",
+  SIG_FINDANDDELETE = "Signature is found in scriptCode",
+  SCRIPTNUM = "Script number overflowed or is non-minimally encoded",
+}
+
+function M.script_error_string(token)
+  local s = tostring(token or "unknown error")
+  return SCRIPT_ERROR_STRINGS[s] or s
+end
+
+-- STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h) as far as the interpreter
+-- implements them.
+local POLICY_SCRIPT_FLAGS = {
+  verify_p2sh = true,
+  verify_dersig = true,
+  verify_strictenc = true,
+  verify_low_s = true,
+  verify_nulldummy = true,
+  verify_sigpushonly = true,
+  verify_minimaldata = true,
+  verify_discourage_upgradable_nops = true,
+  verify_cleanstack = true,
+  verify_checklocktimeverify = true,
+  verify_checksequenceverify = true,
+  verify_witness = true,
+  verify_taproot = true,
+  verify_nullfail = true,
+  verify_witness_pubkeytype = true,
+  verify_const_scriptcode = true,
+}
+
+--- PolicyScriptChecks (Core validation.cpp MemPoolAccept::PolicyScriptChecks
+-- -> CheckInputScripts with STANDARD_SCRIPT_VERIFY_FLAGS): every input,
+-- legacy, P2SH and witness alike, through the verifier connect_block uses.
+-- @param coins table: resolved prevouts, indexed like tx.inputs
+-- @return true | false, reason, details  (Core's reject reason and debug
+--   message: "mempool-script-verify-flag-failed (<ScriptErrorString>)" and
+--   "input N of <txid> (wtxid <wtxid>), spending <prev>:<n>")
+function M.policy_script_checks(tx, coins)
+  local prev_outputs = {}
+  for i = 1, #tx.inputs do
+    local c = coins[i]
+    if not c then
+      fault.raise(string.format("mempool script check: input %d has no resolved coin", i - 1))
+    end
+    prev_outputs[i] = { value = c.value, script_pubkey = c.script_pubkey }
+  end
+  local cache = validation.precomputed_tx_data(tx, prev_outputs)
+  for i, inp in ipairs(tx.inputs) do
+    local ok, err, internal = validation.verify_input_script(
+      tx, i - 1, coins[i].value, coins[i].script_pubkey, POLICY_SCRIPT_FLAGS,
+      { taproot_active = true, prev_outputs = prev_outputs, cache = cache })
+    if internal then
+      -- The check did not complete: a node fault, not a verdict on the tx.
+      fault.raise(string.format(
+        "mempool script check of input %d did not complete: %s", i - 1, tostring(err)))
+    end
+    if not ok then
+      local reason = string.format("mempool-script-verify-flag-failed (%s)",
+        M.script_error_string(err or "EVAL_FALSE"))
+      local details = string.format("input %d of %s (wtxid %s), spending %s:%d",
+        i - 1, types.hash256_hex(validation.compute_txid(tx)),
+        types.hash256_hex(validation.compute_wtxid(tx)),
+        types.hash256_hex(inp.prev_out.hash), inp.prev_out.index)
+      return false, reason, details
+    end
+  end
+  return true
+end
+
 function M.new(chain_state, config)
   local self = setmetatable({}, Mempool)
   self.chain_state = chain_state
@@ -1432,8 +1562,8 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       -- IsStandard() == false path).
       -- Additionally, if permit_bare_multisig is false, reject any bare
       -- multisig with reason "bare-multisig" (Core policy.cpp:152-154).
-      -- We expose the policy flag via M.PERMIT_BARE_MULTISIG (default false
-      -- to match Core's `-permitbaremultisig=0` since v28).
+      -- We expose the policy flag via M.PERMIT_BARE_MULTISIG (default true,
+      -- Core's DEFAULT_PERMIT_BAREMULTISIG).
       local m, n = 0, 0
       if type(type_meta) == "string" then
         local m_s, n_s = type_meta:match("^(%d+)_(%d+)$")
@@ -1735,9 +1865,10 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   local bypass_limits = opts and opts.bypass_limits == true
   if (not package_member) and (not bypass_limits) and fee_rate_per_kb < self.min_relay_fee then
     -- Core reject-reason for the static min-relay floor is "min relay fee not
-    -- met" (validation.cpp:709); the numeric detail is Core's reject-details,
-    -- which this RPC path does not surface.
-    return false, "min relay fee not met"
+    -- met" (validation.cpp:709); the third return is Core's debug message,
+    -- "<fee> < <min_relay_feerate.GetFee(vsize)>" (GetFee rounds up).
+    return false, "min relay fee not met",
+      string.format("%d < %d", fee, math.floor((self.min_relay_fee * vsize + 999) / 1000))
   end
 
   -- 6b. Rolling minimum fee gate (Bitcoin Core validation.cpp:703-705).
@@ -2052,99 +2183,19 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       fee_rate_per_kb, self.client_max_feerate_kvb)
   end
 
-  -- 8e. W96: PolicyScriptChecks (Core validation.cpp:1135-1157).
-  -- Run input-script verification against STANDARD_SCRIPT_VERIFY_FLAGS so that
-  -- bad signatures, malformed scripts, and policy violations are caught at
-  -- relay time and not just at block-connect time.  This is the equivalent of
-  -- Core's CheckInputScripts call with cacheSigStore=true, cacheFullScriptStore=
-  -- false — the policy pass.  Gated by self.verify_input_scripts so existing
-  -- test fixtures (which use mock scripts) keep passing.
-  --
-  -- Coverage:
-  --   • Legacy + P2SH: full verify_script with verify_p2sh + verify_dersig +
-  --     verify_nulldummy + verify_checklocktimeverify + verify_checksequenceverify
-  --     + verify_low_s + verify_strictenc + verify_minimaldata.
-  --   • Witness paths (P2WPKH/P2WSH/P2TR): require the full segwit/taproot
-  --     verifier stack used by ConnectBlock.  Building that here is non-trivial
-  --     and would duplicate ~400 lines from utxo.lua; we leave witness
-  --     verification to block-connect for now and only verify the non-witness
-  --     side at relay.  This is policy-only (consensus rules are still
-  --     enforced at block-connect), but does mean signature-bad witness txs
-  --     can sit in the mempool until they get mined and rejected.  TODO:
-  --     factor utxo.lua's per-input verifier into a reusable helper and call
-  --     it here.
-  if self.verify_input_scripts then
-    local script_flags = {
-      verify_p2sh = true,
-      verify_dersig = true,
-      verify_strictenc = true,
-      verify_low_s = true,
-      verify_nulldummy = true,
-      verify_sigpushonly = true,
-      verify_minimaldata = true,
-      verify_discourage_upgradable_nops = true,
-      verify_cleanstack = true,
-      verify_checklocktimeverify = true,
-      verify_checksequenceverify = true,
-      verify_witness = true,
-      verify_nullfail = true,
-      verify_witness_pubkeytype = true,
-      verify_const_scriptcode = true,
-    }
-    for i, inp in ipairs(tx.inputs) do
-      local utxo = resolved_utxos[i]
-      if utxo and validation.make_sig_checker then
-        local script_type = script_mod.classify_script(utxo.script_pubkey)
-        -- Only verify non-witness paths here.  Witness paths require the
-        -- per-witness execution machinery in utxo.lua (~400 lines); they are
-        -- still validated at block-connect.  This is policy-only — consensus
-        -- rules continue to be enforced at block validation.
-        local is_witness_path = (script_type == "p2wpkh"
-                                  or script_type == "p2wsh"
-                                  or script_type == "p2tr"
-                                  or script_type == "p2a")
-        if not is_witness_path then
-          local ok_c, checker = pcall(validation.make_sig_checker,
-            tx, i - 1, utxo.value, utxo.script_pubkey, script_flags, nil)
-          if not ok_c then
-            -- The checker constructor failing is this node's fault, not a
-            -- property of the tx.  It used to SKIP the input's script check
-            -- (fail-open policy); now it is a system fault: no verdict, no
-            -- punishment, the tx is simply not admitted.
-            fault.raise("mempool: cannot build signature checker: " .. tostring(checker))
-          end
-          do
-            -- verify_script returns:
-            --   (true)            on success
-            --   (false)           on script eval returning empty/false stack
-            --   (nil, err_string) on hard script error
-            -- We need to handle all three.  pcall adds a leading bool for the
-            -- pcall outcome itself, so successful pcall + true = pass.
-            -- xpcall + fault.script_raise_handler: an explicit consensus
-            -- raise in script.lua/validation.lua is a script failure; a
-            -- runtime fault / allocation failure is NOT a verdict on the tx
-            -- (Core: only a ScriptError rejects).
-            local ok_p, r1, r2 = xpcall(script_mod.verify_script,
-              fault.script_raise_handler,
-              inp.script_sig or "", utxo.script_pubkey, script_flags, checker)
-            if not ok_p then
-              local internal, msg = fault.classify_script_raise(r1)
-              if internal then
-                fault.raise(string.format(
-                  "mempool script check of input %d did not complete: %s", i - 1, msg))
-              end
-              return false, string.format(
-                "mandatory-script-verify-flag-failed (input %d: %s)",
-                i - 1, msg)
-            end
-            if r1 == nil or r1 == false then
-              return false, string.format(
-                "mandatory-script-verify-flag-failed (input %d: %s)",
-                i - 1, tostring(r2 or "script eval"))
-            end
-          end
-        end
-      end
+  -- 8e. PolicyScriptChecks (Core validation.cpp:1135-1157): every input,
+  -- witness included, against STANDARD_SCRIPT_VERIFY_FLAGS.  Witness inputs
+  -- used to be skipped here ("left to block-connect"), so a P2WPKH spend with
+  -- a wrong signature sat in the mempool and was relayed -- and submitpackage
+  -- reported it as accepted (core-regtest seed_submitpackage).  Gated by
+  -- self.verify_input_scripts so fixtures with mock scripts keep passing.
+  -- opts.skip_scripts: the package test-accept path runs every member's
+  -- PreChecks first and the script checks afterwards, as Core's
+  -- AcceptMultipleTransactions does.
+  if self.verify_input_scripts and not (opts and opts.skip_scripts) then
+    local s_ok, s_reason, s_details = M.policy_script_checks(tx, resolved_utxos)
+    if not s_ok then
+      return false, s_reason, s_details
     end
   end
 
@@ -2154,6 +2205,9 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- Core sums (policy.cpp:390 → txmempool.cpp:1017 → TxGraph).
   local entry = M.mempool_entry(tx, txid, fee, vsize, self.chain_state.tip_height, M.now(),
     sigops_adjusted_weight(weight, tx_sigop_cost))
+  -- Core CTxMemPoolEntry::GetSigOpCost(): the block assembler and
+  -- getblocktemplate's per-tx `sigops` read this, not a prevout-blind recount.
+  entry.sigop_cost = tx_sigop_cost
   entry.ancestor_count = ancestor_count - 1  -- exclude self
   entry.ancestor_size = ancestor_size - vsize  -- exclude self
   entry.ancestor_fees = ancestor_fees - fee  -- exclude self
@@ -2625,6 +2679,148 @@ local function chunk_linearize(txids, entries)
       }
       remaining[id] = nil
       nrem = nrem - 1
+    end
+  end
+  return out
+end
+
+-- Byte-reversed display hex: uint256 operator< is a memcmp of the stored
+-- little-endian bytes, so this string order is Core's txid order.
+local function txid_byte_order_key(hex)
+  local t = {}
+  for i = #hex - 1, 1, -2 do t[#t + 1] = hex:sub(i, i + 1) end
+  return table.concat(t)
+end
+
+local function by_txid_byte_order(a, b)
+  return txid_byte_order_key(a) < txid_byte_order_key(b)
+end
+
+--- In-pool relatives of one entry as Core v31.1's entryToJSON reports them.
+-- Counts, sizes and fees INCLUDE the entry itself and sum MODIFIED fees
+-- (txmempool.cpp CalculateAncestorData / CalculateDescendantData walk
+-- TxGraph::GetAncestors/GetDescendants, which contain the tx, and add
+-- GetModifiedFee).  depends is the in-pool parent set in display-hex order
+-- (rpc/mempool.cpp std::set<std::string>); spentby the in-pool children in
+-- txid byte order (txmempool.cpp GetChildren, CompareIteratorByHash).
+-- The per-entry ancestor_count / descendant_count fields stay self-exclusive:
+-- the TRUC and package checks read them that way.
+-- @param entries table txid_hex -> entry (the pool's entries)
+-- @param txid_hex string
+-- @return table {ancestor_count, ancestor_size, ancestor_fees,
+--   descendant_count, descendant_size, descendant_fees, depends, spentby}
+function M.entry_relatives(entries, txid_hex)
+  local e = entries[txid_hex]
+  local function mod_fee(x) return x.modified_fee or x.fee or 0 end
+  local r = {
+    ancestor_count = 1, ancestor_size = e.vsize or 0, ancestor_fees = mod_fee(e),
+    descendant_count = 1, descendant_size = e.vsize or 0, descendant_fees = mod_fee(e),
+    depends = {}, spentby = {},
+  }
+  for a in pairs(e.ancestors or {}) do
+    local ae = entries[a]
+    if ae and a ~= txid_hex then
+      r.ancestor_count = r.ancestor_count + 1
+      r.ancestor_size = r.ancestor_size + (ae.vsize or 0)
+      r.ancestor_fees = r.ancestor_fees + mod_fee(ae)
+    end
+  end
+  for d in pairs(e.descendants or {}) do
+    local de = entries[d]
+    if de and d ~= txid_hex then
+      r.descendant_count = r.descendant_count + 1
+      r.descendant_size = r.descendant_size + (de.vsize or 0)
+      r.descendant_fees = r.descendant_fees + mod_fee(de)
+      for _, parent_hex in pairs(de.spends_from or {}) do
+        if parent_hex == txid_hex then
+          r.spentby[#r.spentby + 1] = d
+          break
+        end
+      end
+    end
+  end
+  if e.tx and e.tx.inputs then
+    local seen = {}
+    for _, inp in ipairs(e.tx.inputs) do
+      local prev_hex = types.hash256_hex(inp.prev_out.hash)
+      if entries[prev_hex] and not seen[prev_hex] then
+        seen[prev_hex] = true
+        r.depends[#r.depends + 1] = prev_hex
+      end
+    end
+  end
+  table.sort(r.depends)
+  table.sort(r.spentby, by_txid_byte_order)
+  return r
+end
+
+-- The connected component of the in-pool graph holding `txid_hex`: the
+-- closure under ancestor and descendant sets (siblings meet through a shared
+-- ancestor's descendant set).  Core's TxGraph cluster.
+local function cluster_members(entries, txid_hex)
+  local seen, list, stack = { [txid_hex] = true }, { txid_hex }, { txid_hex }
+  while #stack > 0 do
+    local e = entries[table.remove(stack)]
+    if e then
+      for _, set in ipairs({ e.ancestors or {}, e.descendants or {} }) do
+        for o in pairs(set) do
+          if not seen[o] and entries[o] then
+            seen[o] = true
+            list[#list + 1] = o
+            stack[#stack + 1] = o
+          end
+        end
+      end
+    end
+  end
+  table.sort(list)
+  return list
+end
+
+-- Chunk feerate of every tx in one cluster: linearize (highest-feerate
+-- ancestor set first), then chunk the linearization the way Core's
+-- ChunkLinearizationInfo does (cluster_linearize.h): each tx starts a chunk
+-- and absorbs the chunk before it while its feerate is STRICTLY higher
+-- (FeeFrac operator>>), so equal-feerate chunks stay apart.  Sizes are the
+-- sigop-adjusted weights TxGraph holds, fees the modified fees.
+local function cluster_chunk_feerates(entries, txids, out)
+  local lin = chunk_linearize(txids, entries)
+  local chunks = {}
+  for i = 1, #lin do
+    local e = entries[lin[i].txid]
+    local c = { fee = e.modified_fee or e.fee or 0, size = lin[i].tx_size, first = i, last = i }
+    while #chunks > 0 do
+      local top = chunks[#chunks]
+      if cross_cmp(c.fee, top.size, top.fee, c.size) <= 0 then break end
+      chunks[#chunks] = nil
+      c = { fee = c.fee + top.fee, size = c.size + top.size, first = top.first, last = c.last }
+    end
+    chunks[#chunks + 1] = c
+  end
+  for _, c in ipairs(chunks) do
+    for i = c.first, c.last do
+      out[lin[i].txid] = { fee = c.fee, weight = c.size }
+    end
+  end
+end
+
+--- Chunk fee (modified, sats) and weight of the chunk each tx sits in: Core
+-- v31.1 TxGraph::GetMainChunkFeerate, reported by entryToJSON as
+-- fees.chunk / chunkweight.
+-- @param txid_hex string|nil  one tx (only its cluster is linearized), or nil
+--   for the whole pool
+-- @return table txid_hex -> {fee=, weight=}
+function Mempool:chunk_feerates(txid_hex)
+  local out = {}
+  if txid_hex then
+    if self.entries[txid_hex] then
+      cluster_chunk_feerates(self.entries, cluster_members(self.entries, txid_hex), out)
+    end
+    return out
+  end
+  for h in pairs(self.entries) do
+    if not out[h] then
+      cluster_chunk_feerates(self.entries, cluster_members(self.entries, h), out)
     end
   end
   return out
@@ -3469,6 +3665,12 @@ function Mempool:has(txid_hex)
   return self.entries[txid_hex] ~= nil
 end
 
+--- Core CTxMemPool::IsUnbroadcastTx (the set is maintained by add_unbroadcast /
+-- remove_unbroadcast above).
+function Mempool:is_unbroadcast(txid_hex)
+  return self.unbroadcast[txid_hex] == true
+end
+
 --------------------------------------------------------------------------------
 -- Prioritisation (mapDeltas) — prioritisetransaction / getprioritisedtransactions
 --
@@ -4141,6 +4343,261 @@ function Mempool:accept_package(txns, test_accept)
     total_fees = total_fees,
     total_vsize = total_vsize,
   }
+end
+
+--- Core TxValidationState/PackageValidationState::ToString: the reject reason,
+-- then ", <debug message>" when there is one.
+function M.validation_state_string(reason, details)
+  if details ~= nil and details ~= "" then
+    return tostring(reason) .. ", " .. tostring(details)
+  end
+  return tostring(reason)
+end
+
+-- TX_RECONSIDERABLE: a member that failed only on feerate may still enter
+-- with its child (Core CheckFeeRate, validation.cpp:703-711).
+local function is_reconsiderable(reason)
+  return reason == "min relay fee not met"
+    or (type(reason) == "string" and reason:sub(1, 23) == "mempool min fee not met")
+end
+
+-- Core CFeeRate(fee, vsize).GetFeePerK(): sat/kvB rounded down.
+local function fee_per_k(fee, vsize)
+  if not vsize or vsize <= 0 then return 0 end
+  return math.floor(fee * 1000 / vsize)
+end
+
+-- Core CFeeRate::GetFee(vsize): rounded up.
+local function fee_for_vsize(rate_per_k, vsize)
+  return math.floor((rate_per_k * vsize + 999) / 1000)
+end
+
+--- Prevouts of an admissible tx, from the UTXO set or a mempool parent (the
+-- same lookup accept_transaction's step 3 does).
+function Mempool:_resolve_coins(tx)
+  local coins = {}
+  for i, inp in ipairs(tx.inputs) do
+    local utxo = self.chain_state.coin_view:get(inp.prev_out.hash, inp.prev_out.index)
+    if not utxo then
+      local parent = self.entries[types.hash256_hex(inp.prev_out.hash)]
+      local out = parent and parent.tx.outputs[inp.prev_out.index + 1]
+      if out then
+        utxo = { value = out.value, script_pubkey = out.script_pubkey }
+      end
+    end
+    coins[i] = utxo
+  end
+  return coins
+end
+
+--- ProcessNewPackage (Core validation.cpp): the package path behind
+-- submitpackage (test_accept=false, MemPoolAccept::AcceptPackage) and a
+-- multi-tx testmempoolaccept (test_accept=true, AcceptMultipleTransactions
+-- with m_package_feerates=false).
+--
+-- Unlike accept_package (all-or-nothing), this follows Core's per-member
+-- semantics:
+--   * submitpackage first tries every member on its own.  A member that is
+--     valid alone stays in the mempool even when a later member fails, and
+--     its fees count only for itself.  Members that failed only on feerate
+--     (TX_RECONSIDERABLE) or missing inputs are then evaluated together at
+--     the package feerate.  Any other failure (a bad signature, say) ends the
+--     package with "transaction failed" and no package evaluation.
+--   * test accept checks every member at its own feerate: PreChecks for all
+--     members first, then script checks, stopping at the first failure; the
+--     members after it get no result.  Nothing is left in the mempool.
+--
+-- @return state, results
+--   state:   nil on success, else {kind = "policy"|"tx", reason, details}
+--   results: wtxid_hex -> {kind = "valid"|"invalid"|"mempool_entry"|
+--            "different_witness", txid, wtxid, vsize, fee, effective_feerate
+--            (sat/kvB), effective_includes (wtxids), reason, details,
+--            other_wtxid}.  A member with no entry was not validated.
+function Mempool:process_new_package(txns, test_accept)
+  local ok_wf, wf_err = M.is_well_formed_package(txns)
+  if not ok_wf then
+    return { kind = "policy", reason = wf_err }, {}
+  end
+
+  local ids = {}
+  for i, tx in ipairs(txns) do
+    ids[i] = {
+      txid = types.hash256_hex(validation.compute_txid(tx)),
+      wtxid = types.hash256_hex(validation.compute_wtxid(tx)),
+    }
+  end
+
+  local saved_rolling = self.rolling_minimum_fee_rate
+  local saved_last_update = self.last_rolling_fee_update
+  local saved_since_bump = self.block_since_last_rolling_fee_bump
+  local function restore_rolling()
+    self.rolling_minimum_fee_rate = saved_rolling
+    self.last_rolling_fee_update = saved_last_update
+    self.block_since_last_rolling_fee_bump = saved_since_bump
+  end
+
+  local function invalid(id, reason, details)
+    return { kind = "invalid", txid = id.txid, wtxid = id.wtxid,
+             reason = reason, details = details }
+  end
+  local function valid(id, entry, eff_rate, includes)
+    return { kind = "valid", txid = id.txid, wtxid = id.wtxid,
+             vsize = entry.vsize, fee = entry.fee,
+             effective_feerate = eff_rate, effective_includes = includes }
+  end
+  local function modified_fee(entry)
+    return entry.modified_fee or entry.fee
+  end
+  local TX_FAILED = { kind = "tx", reason = "transaction failed" }
+
+  -- Members admitted provisionally (PreChecks passed, scripts pending or a
+  -- package verdict pending) and the rollback that takes them out again.
+  local function rollback(inserted)
+    for k = #inserted, 1, -1 do
+      if self.entries[inserted[k]] then
+        self:remove_transaction(inserted[k], "package-rollback")
+      end
+    end
+    restore_rolling()
+  end
+
+  -- Script checks for members already provisionally in the mempool.
+  local function scripts_ok(tx)
+    if not self.verify_input_scripts then return true end
+    return M.policy_script_checks(tx, self:_resolve_coins(tx))
+  end
+
+  -- AcceptMultipleTransactions.  package_feerates: CPFP (fee floor on the
+  -- aggregate) vs each member at its own feerate (test accept).
+  local function accept_multiple(members, package_feerates, keep)
+    local results, inserted = {}, {}
+    for _, m in ipairs(members) do
+      local ok, r, d = self:accept_transaction(m.tx, false,
+        { package_member = package_feerates, skip_scripts = true })
+      if not ok then
+        rollback(inserted)
+        results[m.id.wtxid] = invalid(m.id, r, d)
+        return TX_FAILED, results
+      end
+      inserted[#inserted + 1] = m.id.txid
+    end
+
+    local total_fee, total_vsize, all_wtxids = 0, 0, {}
+    for i, m in ipairs(members) do
+      local e = self.entries[m.id.txid]
+      total_fee = total_fee + modified_fee(e)
+      total_vsize = total_vsize + e.vsize
+      all_wtxids[i] = m.id.wtxid
+    end
+    if package_feerates then
+      local reason, details
+      local pool_min = self:get_min_fee()
+      local pool_reject = pool_min > 0 and fee_for_vsize(pool_min, total_vsize) or 0
+      local relay_min = fee_for_vsize(self.min_relay_fee, total_vsize)
+      if pool_reject > 0 and total_fee < pool_reject then
+        reason, details = "mempool min fee not met", string.format("%d < %d", total_fee, pool_reject)
+      elseif total_fee < relay_min then
+        reason, details = "min relay fee not met", string.format("%d < %d", total_fee, relay_min)
+      end
+      if reason then
+        rollback(inserted)
+        local last = members[#members].id
+        results[last.wtxid] = invalid(last, reason, details)
+        return TX_FAILED, results
+      end
+    end
+
+    for _, m in ipairs(members) do
+      local ok, r, d = scripts_ok(m.tx)
+      if not ok then
+        rollback(inserted)
+        results[m.id.wtxid] = invalid(m.id, r, d)
+        return TX_FAILED, results
+      end
+      local e = self.entries[m.id.txid]
+      if package_feerates then
+        results[m.id.wtxid] = valid(m.id, e, fee_per_k(total_fee, total_vsize), all_wtxids)
+      else
+        results[m.id.wtxid] = valid(m.id, e, fee_per_k(modified_fee(e), e.vsize), { m.id.wtxid })
+      end
+    end
+    if not keep then rollback(inserted) end
+    return nil, results
+  end
+
+  local members = {}
+  for i, tx in ipairs(txns) do members[i] = { tx = tx, id = ids[i] } end
+
+  if test_accept then
+    local state, results = accept_multiple(members, false, false)
+    restore_rolling()
+    return state, results
+  end
+
+  if #txns > 1 and not M.is_child_with_parents(txns) then
+    return { kind = "policy", reason = "package-not-child-with-parents" }, {}
+  end
+
+  local results_final, nonfinal, eval = {}, {}, {}
+  local quit_early = false
+  for _, m in ipairs(members) do
+    local entry = self.entries[m.id.txid]
+    if entry then
+      local entry_wtxid = entry.wtxid and types.hash256_hex(entry.wtxid) or m.id.txid
+      if entry_wtxid == m.id.wtxid then
+        results_final[m.id.wtxid] = { kind = "mempool_entry", txid = m.id.txid,
+          wtxid = m.id.wtxid, vsize = entry.vsize, fee = entry.fee }
+      else
+        results_final[m.id.wtxid] = { kind = "different_witness", txid = m.id.txid,
+          wtxid = m.id.wtxid, other_wtxid = entry_wtxid }
+      end
+    else
+      local ok, r, d = self:accept_transaction(m.tx, false)
+      if ok then
+        local e = self.entries[m.id.txid]
+        results_final[m.id.wtxid] = valid(m.id, e, fee_per_k(modified_fee(e), e.vsize), { m.id.wtxid })
+      elseif #txns == 1 or not (is_reconsiderable(r) or M.is_missing_inputs(r)) then
+        quit_early = true
+        nonfinal[m.id.wtxid] = invalid(m.id, r, d)
+      else
+        nonfinal[m.id.wtxid] = invalid(m.id, r, d)
+        eval[#eval + 1] = m
+      end
+    end
+  end
+
+  local state, multi = nil, {}
+  if quit_early then
+    state = TX_FAILED
+  elseif #eval == 1 then
+    -- AcceptSubPackage of one member is a plain single-tx acceptance.
+    local m = eval[1]
+    local ok, r, d = self:accept_transaction(m.tx, false)
+    if ok then
+      local e = self.entries[m.id.txid]
+      multi[m.id.wtxid] = valid(m.id, e, fee_per_k(modified_fee(e), e.vsize), { m.id.wtxid })
+    else
+      multi[m.id.wtxid] = invalid(m.id, r, d)
+      state = TX_FAILED
+    end
+  elseif #eval > 1 then
+    state, multi = accept_multiple(eval, true, true)
+  end
+
+  local results = {}
+  for _, m in ipairs(members) do
+    local w = m.id.wtxid
+    local res = multi[w] or results_final[w] or nonfinal[w]
+    -- LimitMempoolSize may have evicted an accepted member.
+    if res and (res.kind == "valid" or res.kind == "mempool_entry"
+                or res.kind == "different_witness")
+       and not self.entries[m.id.txid] then
+      res = invalid(m.id, "mempool full")
+      state = TX_FAILED
+    end
+    results[w] = res
+  end
+  return state, results
 end
 
 --- Compute the set of missing-parent txids for `tx` against the current

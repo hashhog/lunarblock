@@ -494,10 +494,12 @@ describe("mining", function()
 
       local mempool = make_mock_mempool({})
 
-      local template, _ = mining.create_block_template(mempool, chain_state, network, payout_script)
+      local template, block = mining.create_block_template(mempool, chain_state, network, payout_script)
 
-      -- Coinbase data should be hex-encoded
-      local coinbase_hex = template.coinbasetxn.data
+      -- Core's template carries no coinbasetxn; the coinbase is the block's
+      -- first transaction.
+      assert.is_nil(template.coinbasetxn)
+      local coinbase_hex = mining.hex_encode(serialize.serialize_transaction(block.transactions[1], true))
       assert.truthy(coinbase_hex)
       assert.truthy(#coinbase_hex > 0)
       assert.equal(0, #coinbase_hex % 2)  -- Even number of hex chars
