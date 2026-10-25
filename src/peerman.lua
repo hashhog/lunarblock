@@ -40,6 +40,19 @@ M.TRICKLE = {
   INBOUND_INTERVAL = 5.0,
   -- Maximum inv entries per message (keeps messages small)
   MAX_INV_PER_MSG = 35,
+  -- Per-peer "already announced" set. Core keeps this in a rolling bloom
+  -- filter (net_processing.cpp TxRelay::m_tx_inventory_known_filter
+  -- {50000, 0.000001}): it always remembers at least the last 50000 hashes
+  -- and never grows. Here it is two plain sets that rotate every
+  -- INV_KNOWN_CAPACITY inserts, so it holds between 50000 and 100000 hashes.
+  INV_KNOWN_CAPACITY = 50000,
+  -- Entries relayed per trickle tick (Core net_processing.cpp:
+  -- INVENTORY_BROADCAST_TARGET = INVENTORY_BROADCAST_PER_SECOND (14) *
+  -- INBOUND_INVENTORY_BROADCAST_INTERVAL (5 s), plus 5 per 1000 queued,
+  -- capped at INVENTORY_BROADCAST_MAX). A fixed 35 per tick was ~7/s to an
+  -- inbound peer, below mainnet's ~8.5 tx/s, so the queue never drained.
+  BROADCAST_TARGET = 70,
+  BROADCAST_MAX = 1000,
 }
 
 --------------------------------------------------------------------------------
@@ -3810,9 +3823,44 @@ function PeerManager:_init_peer_trickle(p)
   self._peer_trickle = self._peer_trickle or {}
   self._peer_trickle[key] = {
     inv_queue = {},                              -- {hash, is_wtxid} entries to announce
-    inv_known = {},                              -- hashes we've already sent (bloom filter substitute)
+    inv_known = {},                              -- hashes we've already sent (rolling set, see M.inv_known_add)
+    inv_known_prev = {},                         -- previous generation of inv_known
+    inv_known_count = 0,                         -- inserts into the current generation
     next_send_time = socket.gettime() + M.poisson_delay(interval),
   }
+end
+
+-- Hashes reach the trickle code as hash256 wrapper tables ({bytes = ...},
+-- the cached tx._cached_txid / _cached_wtxid objects) from the relay path
+-- and as raw 32-byte strings elsewhere. The known-set is keyed by the raw
+-- bytes: a table key only matches that one object, so the "already known"
+-- check never hit, and each key pinned its hash object in memory.
+local function inv_known_key(hash)
+  if type(hash) == "table" then return hash.bytes end
+  return hash
+end
+
+--- True if `hash` was already announced to the peer owning `trickle`.
+function M.inv_known_has(trickle, hash)
+  local k = inv_known_key(hash)
+  return (trickle.inv_known[k] or trickle.inv_known_prev[k]) == true
+end
+
+--- Record `hash` as announced to the peer owning `trickle`.
+-- Live 2026-10-18..25: inv_known was a plain set that was only emptied on
+-- disconnect, so every long-lived peer kept one entry per tx ever relayed
+-- to it. That was the bulk of lunarblock's at-tip Lua heap growth
+-- (~1.07 GB -> ~2.9 GB live in 40 h) behind the 12G cgroup oom-kills.
+function M.inv_known_add(trickle, hash)
+  local k = inv_known_key(hash)
+  if trickle.inv_known[k] then return end
+  trickle.inv_known[k] = true
+  trickle.inv_known_count = trickle.inv_known_count + 1
+  if trickle.inv_known_count >= M.TRICKLE.INV_KNOWN_CAPACITY then
+    trickle.inv_known_prev = trickle.inv_known
+    trickle.inv_known = {}
+    trickle.inv_known_count = 0
+  end
 end
 
 --- Clean up trickling state for a peer.
@@ -4002,7 +4050,7 @@ function PeerManager:queue_tx_announcement(txid, wtxid, tx)
         local hash = p.wtxid_relay and wtxid or txid
         local is_wtxid = p.wtxid_relay
         -- Don't re-announce transactions the peer already knows about
-        if not trickle.inv_known[hash] then
+        if not M.inv_known_has(trickle, hash) then
           trickle.inv_queue[#trickle.inv_queue + 1] = {hash = hash, is_wtxid = is_wtxid}
         end
         ::continue_peer::
@@ -4046,30 +4094,44 @@ function PeerManager:_process_trickle()
         trickle.next_send_time = now + M.poisson_delay(interval)
 
         -- Shuffle queue for privacy (Fisher-Yates)
-        M.shuffle(trickle.inv_queue)
+        local queue = trickle.inv_queue
+        M.shuffle(queue)
 
-        -- Send batches of up to MAX_INV_PER_MSG
-        while #trickle.inv_queue > 0 do
-          local batch = {}
-          local batch_size = math.min(#trickle.inv_queue, M.TRICKLE.MAX_INV_PER_MSG)
-
-          for _ = 1, batch_size do
-            local entry = table.remove(trickle.inv_queue, 1)
+        -- Relay up to broadcast_max entries this tick, in inv messages of at
+        -- most MAX_INV_PER_MSG. Like Core, an entry already announced to this
+        -- peer is dropped rather than sent again, and the per-tick budget
+        -- grows with the backlog so the queue cannot grow without bound.
+        local n = #queue
+        local broadcast_max = math.min(M.TRICKLE.BROADCAST_MAX,
+          M.TRICKLE.BROADCAST_TARGET + math.floor(n / 1000) * 5)
+        local relayed = 0
+        local batch = {}
+        local i = 1
+        while i <= n and relayed < broadcast_max do
+          local entry = queue[i]
+          i = i + 1
+          if not M.inv_known_has(trickle, entry.hash) then
             -- Use MSG_WTX for wtxid, MSG_TX for txid
             local inv_type = entry.is_wtxid and p2p.INV_TYPE.MSG_WTX or p2p.INV_TYPE.MSG_TX
             batch[#batch + 1] = {type = inv_type, hash = entry.hash}
             -- Mark as known so we don't re-announce
-            trickle.inv_known[entry.hash] = true
+            M.inv_known_add(trickle, entry.hash)
+            relayed = relayed + 1
+            if #batch == M.TRICKLE.MAX_INV_PER_MSG then
+              p:send_message("inv", p2p.serialize_inv(batch))
+              batch = {}
+            end
           end
-
-          if #batch > 0 then
-            local payload = p2p.serialize_inv(batch)
-            p:send_message("inv", payload)
-          end
-
-          -- Only send one batch per tick per peer (rate limiting)
-          break
         end
+        if #batch > 0 then
+          p:send_message("inv", p2p.serialize_inv(batch))
+        end
+
+        -- Move the unsent tail to the front in one pass (table.remove(queue, 1)
+        -- per entry was O(queue) each).
+        local consumed = i - 1
+        for j = 1, n - consumed do queue[j] = queue[j + consumed] end
+        for j = n - consumed + 1, n do queue[j] = nil end
       end
     end
   end
@@ -4082,6 +4144,8 @@ function PeerManager:clear_peer_inv_known(p)
   local trickle = self._peer_trickle and self._peer_trickle[key]
   if trickle then
     trickle.inv_known = {}
+    trickle.inv_known_prev = {}
+    trickle.inv_known_count = 0
   end
 end
 
