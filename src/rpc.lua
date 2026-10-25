@@ -4359,10 +4359,17 @@ function RPCServer:register_methods()
       error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
     end
 
-    -- Reconsider the block
+    -- Reconsider the block.  Snapshot the failed set first: the hashes it
+    -- clears are the new chain-selection candidates.
+    local was_invalid = {}
+    for hb in pairs(rpc.chain_state.invalid_blocks or {}) do was_invalid[hb] = true end
     local ok, err = rpc.chain_state:reconsider_block(hash)
     if not ok then
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to reconsider block"})
+    end
+    local cleared = {}
+    for hb in pairs(was_invalid) do
+      if not rpc.chain_state.invalid_blocks[hb] then cleared[hb] = true end
     end
 
     -- The P2P download path keeps its own failed set (seeded from
@@ -4376,6 +4383,26 @@ function RPCServer:register_methods()
       end
       rpc.header_chain.failed = failed
       rpc.header_chain:recalculate_best_header(true)
+    end
+
+    -- Core ReconsiderBlock: ActivateBestChain after the flags are reset.
+    local result, new_tip = rpc.chain_state:activate_best_chain_after_reconsider(
+      hash, cleared, { mempool = rpc.mempool })
+    if result == "connected" then
+      -- Same post-reorg sync as preciousblock / the submitblock reorg arm.
+      if rpc.block_downloader and rpc.block_downloader.next_connect_height then
+        local new_h = rpc.chain_state.tip_height or 0
+        if new_h >= rpc.block_downloader.next_connect_height then
+          rpc.block_downloader.next_connect_height = new_h + 1
+          rpc.block_downloader.next_download_height = new_h + 1
+        end
+      end
+      if rpc.mempool then
+        local new_block = rpc.storage.get_block(new_tip)
+        if new_block then
+          rpc.mempool:on_block_connected(new_block)
+        end
+      end
     end
 
     return cjson.null
@@ -13021,6 +13048,12 @@ end
           -- bad-version — the gates Core runs in AcceptBlockHeader) and the
           -- connect failures indicate an invalid candidate and must surface the
           -- canonical BIP22 reject reason instead of "inconclusive".
+          -- A block building on a failed (invalidated) block: Core
+          -- AcceptBlockHeader BLOCK_INVALID_PREV "bad-prevblk".
+          if sb_err == "invalid-ancestor"
+              and not rpc.chain_state:is_block_invalid(block_hash) then
+            return "bad-prevblk"
+          end
           if sb_err and sb_err:find("^check%-block: ") then
             -- CheckBlock / ContextualCheckBlock at the real height failed.
             return bip22_result(sb_err:sub(#"check-block: " + 1))
