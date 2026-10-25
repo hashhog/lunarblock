@@ -110,6 +110,71 @@ local function core_optional_int32(v, default)
   return core_getint32(v)
 end
 
+-- RPCHelpMan::HandleRequest's declared-type check (rpc/util.cpp): a mismatch
+-- is RPC_TYPE_ERROR (-3) "Wrong type passed:\n{\n    \"Position N (name)\":
+-- \"JSON value of type X is not of expected type T\"\n}", raised before the
+-- handler body runs.  null/absent always matches (optional argument).
+local function core_wrong_type(position, name, v, expected)
+  error({code = M.ERROR.TYPE_ERROR,
+         message = string.format(
+           'Wrong type passed:\n{\n    "Position %d (%s)": "JSON value of type %s is not of expected type %s"\n}',
+           position, name, core_json_type_name(v), expected)})
+end
+
+local function core_check_optional_bool(v, position, name)
+  if v ~= nil and v ~= cjson.null and type(v) ~= "boolean" then
+    core_wrong_type(position, name, v, "bool")
+  end
+end
+
+-- AmountFromValue (rpc/util.cpp) -> satoshis.  NUM or STR only (-3 otherwise);
+-- an unparseable value is -3 "Invalid amount"; outside MoneyRange is -3
+-- "Amount out of range".  ParseFixedPoint allows at most 8 decimals.
+local function core_amount_from_value(v)
+  local sats
+  if type(v) == "number" then
+    if v ~= v or v == math.huge or v == -math.huge then
+      error({code = M.ERROR.TYPE_ERROR, message = "Invalid amount"})
+    end
+    local scaled = v * consensus.COIN
+    sats = math.floor(scaled + 0.5)
+    -- A JSON number with more than 8 decimals does not fit ParseFixedPoint;
+    -- tolerate only double rounding noise.
+    if math.abs(scaled - sats) > 1e-3 then
+      error({code = M.ERROR.TYPE_ERROR, message = "Invalid amount"})
+    end
+  elseif type(v) == "string" then
+    local sign, int, frac = v:match("^(%-?)(%d*)%.?(%d*)$")
+    if not sign or (int == "" and frac == "") or #frac > 8 or #int > 12 then
+      error({code = M.ERROR.TYPE_ERROR, message = "Invalid amount"})
+    end
+    sats = (tonumber(int ~= "" and int or "0") * consensus.COIN)
+         + tonumber(((frac .. string.rep("0", 8)):sub(1, 8)))
+    if sign == "-" then sats = -sats end
+  else
+    error({code = M.ERROR.TYPE_ERROR, message = "Amount is not a number or string"})
+  end
+  if sats < 0 or sats > 21000000 * consensus.COIN then
+    error({code = M.ERROR.TYPE_ERROR, message = "Amount out of range"})
+  end
+  return sats
+end
+
+-- ParseFeeRate(self.Arg("maxfeerate")): absent/null takes DEFAULT_MAX_RAW_TX_FEE_RATE
+-- (COIN / 10 per kvB); >= 1 BTC/kvB is -8.  Returns satoshis per kvB; 0 = no cap.
+local DEFAULT_MAX_RAW_TX_FEE_RATE = consensus.COIN / 10
+local function core_parse_max_feerate(v)
+  if v == nil or v == cjson.null then
+    return DEFAULT_MAX_RAW_TX_FEE_RATE
+  end
+  local per_kvb = core_amount_from_value(v)
+  if per_kvb >= consensus.COIN then
+    error({code = M.ERROR.INVALID_PARAMETER,
+           message = "Fee rates larger than or equal to 1BTC/kvB are not accepted"})
+  end
+  return per_kvb
+end
+
 -- Core: rpc/util.cpp ParseConfirmTarget.  getInt<int> first (width/fractional
 -- -> -1), THEN the domain test against the estimator's highest tracked target.
 -- Clamping instead of rejecting fabricates an estimate for a horizon the
@@ -1257,6 +1322,54 @@ local function oj_result(obj)
   return { _raw_json = oj_encode(obj) }
 end
 
+-- getblocktemplate result in Core's pushKV order (rpc/mining.cpp).  Encoded
+-- by hand because plain cjson cannot tell an empty array from an empty
+-- object: per-tx `depends` = [] went out as {}.  `coinbaseaux` is Core's
+-- empty object; `default_witness_commitment` is omitted when absent.
+local function block_template_json(t)
+  local txs = {}
+  for i, e in ipairs(t.transactions) do
+    local deps = {}
+    for j, d in ipairs(e.depends or {}) do deps[j] = tostring(d) end
+    txs[i] = oj({
+      "data",    e.data,
+      "txid",    e.txid,
+      "hash",    e.hash,
+      "depends", oj_raw("[" .. table.concat(deps, ",") .. "]"),
+      "fee",     e.fee,
+      "sigops",  e.sigops,
+      "weight",  e.weight,
+    })
+  end
+  local seq = {
+    "capabilities",      oj_array_of_strings(t.capabilities),
+    "version",           t.version,
+    "rules",             oj_array_of_strings(t.rules),
+    "vbavailable",       oj_raw(next(t.vbavailable or {}) and cjson.encode(t.vbavailable) or "{}"),
+    "vbrequired",        t.vbrequired,
+    "previousblockhash", t.previousblockhash,
+    "transactions",      oj_array(txs),
+    "coinbaseaux",       oj_raw("{}"),
+    "coinbasevalue",     t.coinbasevalue,
+    "target",            t.target,
+    "mintime",           t.mintime,
+    "mutable",           oj_array_of_strings(t.mutable),
+    "noncerange",        t.noncerange,
+    "sigoplimit",        t.sigoplimit,
+    "sizelimit",         t.sizelimit,
+    "weightlimit",       t.weightlimit,
+    "curtime",           t.curtime,
+    "bits",              t.bits,
+    "height",            t.height,
+  }
+  if t.default_witness_commitment then
+    seq[#seq + 1] = "default_witness_commitment"
+    seq[#seq + 1] = t.default_witness_commitment
+  end
+  return oj_encode(oj(seq))
+end
+M.block_template_json = block_template_json
+
 M._oj = oj
 M._oj_raw = oj_raw
 M._oj_amount = oj_amount
@@ -1306,9 +1419,8 @@ function M.mempool_info_json(mempool)
     "incrementalrelayfee", oj_amount(mp.INCREMENTAL_RELAY_FEE),
     "unbroadcastcount",    info.unbroadcastcount or 0,
     "fullrbf",             fullrbf,
-    -- Core reports the option value (true on a default node) even though the
-    -- relay STANDARDNESS default for bare multisig flipped to false.
-    "permitbaremultisig",  true,
+    -- Core reports the -permitbaremultisig option value (default true).
+    "permitbaremultisig",  mp.PERMIT_BARE_MULTISIG,
     "maxdatacarriersize",  mp.MAX_OP_RETURN_RELAY,   -- 100000
     "limitclustercount",   64,                        -- DEFAULT cluster_count
     "limitclustersize",    101000,                    -- cluster_size_vbytes
@@ -1321,6 +1433,97 @@ M._oj_array_empty = oj_array_empty
 M._oj_array_of_strings = oj_array_of_strings
 M._oj_encode = oj_encode
 M._oj_value = oj_value
+
+-- Core getrawmempool / getmempoolentry wtxid is display-order hex.
+-- entry.wtxid is a hash256 {bytes=...}; encoding that table puts raw
+-- bytes in the JSON string and the response is not UTF-8.
+local function mempool_wtxid_hex(entry, txid_hex)
+  local w = entry.wtxid
+  if type(w) == "table" and type(w.bytes) == "string" then
+    return types.hash256_hex(w)
+  end
+  if type(w) == "string" then return w end
+  return txid_hex
+end
+
+-- A JSON array of txid strings.  Written verbatim rather than through
+-- cjson.empty_array_mt: the lua-cjson 2.1.0 the node loads from the system
+-- path has no empty_array_mt, so an empty table there encodes as {}.
+local function oj_txid_array(list)
+  if #list == 0 then return oj_array_empty() end
+  return oj_array_of_strings(list)
+end
+
+--- One mempool entry as Core v31.1 rpc/mempool.cpp entryToJSON writes it
+-- (getrawmempool verbose, getmempoolentry, getmempoolancestors/descendants
+-- verbose, REST /mempool/contents), as an ordered object in Core's key
+-- order.  Counts, sizes and fees come from mempool.entry_relatives
+-- (self-inclusive, modified fees); chunkweight and fees.chunk from the tx's
+-- chunk in its cluster linearization (TxGraph::GetMainChunkFeerate).
+-- @param mp Mempool (or any table with .entries)
+-- @param chunk table|nil {fee=, weight=} from mp:chunk_feerates(); computed
+--   for this tx's cluster when nil
+function M.mempool_entry_to_json(mp, entry, txid_hex, chunk)
+  local mempool_mod = require("lunarblock.mempool")
+  local entries = (mp and mp.entries) or { [txid_hex] = entry }
+  if entries[txid_hex] == nil then entries = { [txid_hex] = entry } end
+  local rel = mempool_mod.entry_relatives(entries, txid_hex)
+  local modified_sats = (mp and mp.get_modified_fee) and mp:get_modified_fee(txid_hex)
+    or entry.modified_fee or entry.fee
+  if not chunk and mp and mp.chunk_feerates then
+    chunk = mp:chunk_feerates(txid_hex)[txid_hex]
+  end
+  chunk = chunk or {
+    fee = modified_sats,
+    weight = entry.adjusted_weight or entry.weight or (entry.vsize or 0) * 4,
+  }
+  return oj({
+    "vsize",           entry.vsize,
+    "weight",          entry.weight,
+    "time",            entry.time,
+    "height",          entry.height,
+    "descendantcount", rel.descendant_count,
+    "descendantsize",  rel.descendant_size,
+    "ancestorcount",   rel.ancestor_count,
+    "ancestorsize",    rel.ancestor_size,
+    "wtxid",           mempool_wtxid_hex(entry, txid_hex),
+    "chunkweight",     chunk.weight,
+    -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
+    -- descendantfees/ancestorfees at the top level.
+    "fees", oj({
+      "base",       oj_amount(entry.fee),
+      "modified",   oj_amount(modified_sats),
+      "ancestor",   oj_amount(rel.ancestor_fees),
+      "descendant", oj_amount(rel.descendant_fees),
+      "chunk",      oj_amount(chunk.fee),
+    }),
+    "depends",         oj_txid_array(rel.depends),
+    "spentby",         oj_txid_array(rel.spentby),
+    -- FIX-68 (W120 BUG-9): policy/rbf.cpp IsRBFOptIn walks the tx and its
+    -- unconfirmed ancestors (Mempool:is_replaceable).
+    "bip125-replaceable", (mp and mp.is_replaceable) and mp:is_replaceable(txid_hex) or false,
+    "unbroadcast",     (mp and mp.is_unbroadcast) and mp:is_unbroadcast(txid_hex) or false,
+  })
+end
+
+--- An ordered txid -> entryToJSON object (Core MempoolToJSON verbose,
+-- getmempoolancestors/descendants verbose), keys in txid order.
+-- @param txids array of txid_hex
+-- @param chunks table|nil txid_hex -> {fee=, weight=}
+function M.mempool_entries_to_json(mp, txids, chunks)
+  local sorted = {}
+  for i = 1, #txids do sorted[i] = txids[i] end
+  table.sort(sorted)
+  local seq = {}
+  for _, txid_hex in ipairs(sorted) do
+    local entry = mp.entries[txid_hex]
+    if entry then
+      seq[#seq + 1] = txid_hex
+      seq[#seq + 1] = M.mempool_entry_to_json(mp, entry, txid_hex, chunks and chunks[txid_hex])
+    end
+  end
+  return oj(seq)
+end
 
 --------------------------------------------------------------------------------
 -- Base64 Encoding/Decoding
@@ -4156,10 +4359,17 @@ function RPCServer:register_methods()
       error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
     end
 
-    -- Reconsider the block
+    -- Reconsider the block.  Snapshot the failed set first: the hashes it
+    -- clears are the new chain-selection candidates.
+    local was_invalid = {}
+    for hb in pairs(rpc.chain_state.invalid_blocks or {}) do was_invalid[hb] = true end
     local ok, err = rpc.chain_state:reconsider_block(hash)
     if not ok then
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to reconsider block"})
+    end
+    local cleared = {}
+    for hb in pairs(was_invalid) do
+      if not rpc.chain_state.invalid_blocks[hb] then cleared[hb] = true end
     end
 
     -- The P2P download path keeps its own failed set (seeded from
@@ -4173,6 +4383,26 @@ function RPCServer:register_methods()
       end
       rpc.header_chain.failed = failed
       rpc.header_chain:recalculate_best_header(true)
+    end
+
+    -- Core ReconsiderBlock: ActivateBestChain after the flags are reset.
+    local result, new_tip = rpc.chain_state:activate_best_chain_after_reconsider(
+      hash, cleared, { mempool = rpc.mempool })
+    if result == "connected" then
+      -- Same post-reorg sync as preciousblock / the submitblock reorg arm.
+      if rpc.block_downloader and rpc.block_downloader.next_connect_height then
+        local new_h = rpc.chain_state.tip_height or 0
+        if new_h >= rpc.block_downloader.next_connect_height then
+          rpc.block_downloader.next_connect_height = new_h + 1
+          rpc.block_downloader.next_download_height = new_h + 1
+        end
+      end
+      if rpc.mempool then
+        local new_block = rpc.storage.get_block(new_tip)
+        if new_block then
+          rpc.mempool:on_block_connected(new_block)
+        end
+      end
     end
 
     return cjson.null
@@ -4264,18 +4494,6 @@ function RPCServer:register_methods()
     return cjson.null
   end
 
-  -- Core getrawmempool / getmempoolentry wtxid is display-order hex.
-  -- entry.wtxid is a hash256 {bytes=...}; encoding that table puts raw
-  -- bytes in the JSON string and the response is not UTF-8.
-  local function mempool_wtxid_hex(entry, txid_hex)
-    local w = entry.wtxid
-    if type(w) == "table" and type(w.bytes) == "string" then
-      return types.hash256_hex(w)
-    end
-    if type(w) == "string" then return w end
-    return txid_hex
-  end
-
   self.methods["getrawmempool"] = function(rpc, params)
     local verbose = params[1] or false
     if not rpc.mempool then
@@ -4292,47 +4510,10 @@ function RPCServer:register_methods()
       end
       return txids
     end
-    -- Verbose: return details for each tx
-    local result = {}
-    for _, txid_hex in ipairs(rpc.mempool:get_raw_mempool()) do
-      local entry = rpc.mempool:get_entry(txid_hex)
-      if entry then
-        local fee_btc = entry.fee / consensus.COIN
-        -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee).
-        local modified_sats = rpc.mempool:get_modified_fee(txid_hex)
-        local modified_btc = modified_sats / consensus.COIN
-        -- FIX-68 (W120 BUG-9): bip125-replaceable per Bitcoin Core
-        -- policy/rbf.cpp IsRBFOptIn — walks tx + unconfirmed ancestors.
-        -- Was hardcoded `true`, lying to wallets when neither the tx nor
-        -- any ancestor signals RBF.  Walker is rpc.mempool:is_replaceable
-        -- which scans entry.ancestors via signals_rbf (mempool.lua:2218).
-        result[txid_hex] = {
-          vsize = entry.vsize,
-          weight = entry.weight,
-          time = entry.time,
-          height = entry.height,
-          descendantcount = entry.descendant_count or 1,
-          descendantsize = entry.descendant_size or entry.vsize,
-          ancestorcount = entry.ancestor_count or 1,
-          ancestorsize = entry.ancestor_size or entry.vsize,
-          wtxid = mempool_wtxid_hex(entry, txid_hex),
-          -- Core shape: fees is a NESTED object; no flat fee/modifiedfee/
-          -- descendantfees/ancestorfees at the top level (removed to match
-          -- Bitcoin Core rpc/mempool.cpp entryToJSON).
-          fees = {
-            base = fee_btc,
-            modified = modified_btc,
-            ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
-            descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
-          },
-          depends = entry.depends or {},
-          spentby = entry.spent_by or {},
-          ["bip125-replaceable"] = rpc.mempool:is_replaceable(txid_hex),
-          unbroadcast = false,
-        }
-      end
-    end
-    return result
+    -- Verbose: return details for each tx.  One chunk map for the whole
+    -- pool so each cluster is linearized once, not once per member.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool,
+      rpc.mempool:get_raw_mempool(), rpc.mempool:chunk_feerates()))
   end
 
   -- getorphantxs: show transactions in the tx orphanage (Core v28).
@@ -4500,25 +4681,58 @@ function RPCServer:register_methods()
       error({code = M.ERROR.DESERIALIZATION_ERROR,
         message = "TX decode failed. Make sure the tx has at least one input."})
     end
+    -- ParseFeeRate(maxfeerate) runs after the decode and before any mempool
+    -- work (rpc/mempool.cpp sendrawtransaction).
+    local max_feerate = core_parse_max_feerate(params[2])
     if not rpc.mempool then
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
     end
-    local ok, txid_hex = rpc.mempool:accept_transaction(tx)
+    -- BroadcastTransaction (node/transaction.cpp): for a tx not already in the
+    -- mempool and a non-zero cap, refuse with MAX_FEE_EXCEEDED (-25) when the
+    -- base fee exceeds maxfeerate.GetFee(vsize).  The mempool checks the cap
+    -- before it evicts BIP125 conflicts or trims, so a refused tx leaves the
+    -- pool as it was (a tx already in the pool is answered at step 1, before
+    -- the cap, as in Core).
+    local accept_opts = (max_feerate > 0) and {max_fee_per_kvb = max_feerate} or nil
+    local ok, txid_hex, reject_debug = rpc.mempool:accept_transaction(tx, nil, accept_opts)
+    local already_in_mempool = false
     if not ok then
-      -- W96: route mempool reject reasons to canonical Core RPC error codes.
-      -- "txn-already-in-mempool" / "txn-same-nonwitness-data-in-mempool" →
-      -- VERIFY_ALREADY_IN_CHAIN (-27) per Bitcoin Core rpc/rawtransaction.cpp.
-      -- Other rejects remain VERIFY_REJECTED (-26).
-      local err_str = tostring(txid_hex or "")
-      if err_str:find("already", 1, true)
-         or err_str:find("same-nonwitness-data", 1, true) then
-        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN, message = err_str})
+      if txid_hex == "max-fee-exceeded" then
+        error({code = M.ERROR.VERIFY_ERROR,
+               message = "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"})
       end
-      error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
+      -- Core BroadcastTransaction (node/transaction.cpp): a tx whose txid is
+      -- already in the mempool is not an error -- it is re-relayed and the
+      -- txid returned.  Both the exact-wtxid and same-txid-different-witness
+      -- reject tokens mean "txid already in the mempool".
+      local err_str = tostring(txid_hex or "")
+      if err_str == "txn-already-in-mempool"
+         or err_str == "txn-same-nonwitness-data-in-mempool" then
+        ok = true
+        already_in_mempool = true
+        txid_hex = types.hash256_hex(validation.compute_txid(tx))
+      elseif err_str == "txn-already-known" then
+        -- An output of this tx is already in the UTXO set (confirmed):
+        -- TransactionError::ALREADY_IN_UTXO_SET -> RPC_VERIFY_ALREADY_IN_UTXO_SET (-27).
+        error({code = M.ERROR.VERIFY_ALREADY_IN_CHAIN,
+               message = "Transaction outputs already in utxo set"})
+      elseif err_str == "bad-txns-inputs-missingorspent" then
+        -- TransactionError::MISSING_INPUTS -> RPC_TRANSACTION_ERROR (-25),
+        -- message is the validation state string.
+        error({code = M.ERROR.VERIFY_ERROR, message = err_str})
+      else
+        -- Core's message is state.ToString(): "<reason>, <details>".
+        local mempool_mod = require("lunarblock.mempool")
+        error({code = M.ERROR.VERIFY_REJECTED,
+               message = mempool_mod.validation_state_string(err_str, reject_debug)})
+      end
     end
     -- Locally submitted: stays in the unbroadcast set until a peer asks for it
-    -- (Core BroadcastTransaction, node/transaction.cpp:102).
-    rpc.mempool:add_unbroadcast(txid_hex)
+    -- (Core BroadcastTransaction, node/transaction.cpp:102).  Only the branch
+    -- that just inserted the tx does this; a resubmit is only reannounced.
+    if not already_in_mempool then
+      rpc.mempool:add_unbroadcast(txid_hex)
+    end
     -- Broadcast to peers
     if rpc.peer_manager then
       local txid = validation.compute_txid(tx)
@@ -6983,45 +7197,8 @@ end
   -- Mempool entry/ancestor/descendant introspection.
   -- Bitcoin Core: rpc/mempool.cpp::{getmempoolentry,getmempoolancestors,getmempooldescendants}.
   -- Each walks the in-memory CTxMemPool graph; we mirror that with the
-  -- ancestor/descendant sets already maintained on each Mempool entry.
-  --
-  -- FIX-68 (W120 BUG-9): bip125-replaceable computed per Core
-  -- policy/rbf.cpp IsRBFOptIn (walks tx + unconfirmed ancestors); the
-  -- caller must pass `mp` so we can run the ancestor scan via
-  -- Mempool:is_replaceable.  Previously hardcoded `true`, which lied
-  -- to wallets for non-signaling, no-signaling-ancestor mempool entries.
-  local function format_mempool_entry(entry, txid_hex, mp)
-    local fee_btc = entry.fee / consensus.COIN
-    -- modifiedfee reflects prioritisetransaction (Core GetModifiedFee = nFee +
-    -- delta).  Fall back to base fee when no mempool ref is available.
-    local modified_sats = mp and mp.get_modified_fee
-      and mp:get_modified_fee(txid_hex) or entry.fee
-    local modified_btc = modified_sats / consensus.COIN
-    return {
-      vsize = entry.vsize,
-      weight = entry.weight,
-      time = entry.time,
-      height = entry.height,
-      descendantcount = entry.descendant_count or 1,
-      descendantsize = entry.descendant_size or entry.vsize,
-      ancestorcount = entry.ancestor_count or 1,
-      ancestorsize = entry.ancestor_size or entry.vsize,
-      wtxid = mempool_wtxid_hex(entry, txid_hex),
-      -- Core shape: fees is a NESTED object; flat fee/modifiedfee/
-      -- descendantfees/ancestorfees are NOT top-level fields in Core's
-      -- entryToJSON (bitcoin-core/src/rpc/mempool.cpp:508-568).
-      fees = {
-        base = fee_btc,
-        modified = modified_btc,
-        ancestor = (entry.ancestor_fees or entry.fee) / consensus.COIN,
-        descendant = (entry.descendant_fees or entry.fee) / consensus.COIN,
-      },
-      depends = entry.depends or {},
-      spentby = entry.spent_by or {},
-      ["bip125-replaceable"] = mp and mp:is_replaceable(txid_hex) or false,
-      unbroadcast = false,
-    }
-  end
+  -- ancestor/descendant sets already maintained on each Mempool entry; the
+  -- entry objects come from M.mempool_entry_to_json (entryToJSON).
 
   self.methods["getmempoolentry"] = function(rpc, params)
     local txid_hex = params and params[1]
@@ -7035,7 +7212,7 @@ end
     if not entry then
       error({code = M.ERROR.INVALID_ADDRESS, message = "Transaction not in mempool"})
     end
-    return format_mempool_entry(entry, txid_hex, rpc.mempool)
+    return oj_result(M.mempool_entry_to_json(rpc.mempool, entry, txid_hex))
   end
 
   self.methods["getmempoolancestors"] = function(rpc, params)
@@ -7059,13 +7236,10 @@ end
       return out
     end
     local out = {}
-    for anc_hex in pairs(entry.ancestors or {}) do
-      local anc_entry = rpc.mempool:get_entry(anc_hex)
-      if anc_entry then
-        out[anc_hex] = format_mempool_entry(anc_entry, anc_hex, rpc.mempool)
-      end
-    end
-    return out
+    for anc_hex in pairs(entry.ancestors or {}) do out[#out + 1] = anc_hex end
+    -- Every ancestor shares txid's cluster: linearize it once.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out,
+      rpc.mempool:chunk_feerates(txid_hex)))
   end
 
   self.methods["getmempooldescendants"] = function(rpc, params)
@@ -7089,13 +7263,10 @@ end
       return out
     end
     local out = {}
-    for desc_hex in pairs(entry.descendants or {}) do
-      local desc_entry = rpc.mempool:get_entry(desc_hex)
-      if desc_entry then
-        out[desc_hex] = format_mempool_entry(desc_entry, desc_hex, rpc.mempool)
-      end
-    end
-    return out
+    for desc_hex in pairs(entry.descendants or {}) do out[#out + 1] = desc_hex end
+    -- Every descendant shares txid's cluster: linearize it once.
+    return oj_result(M.mempool_entries_to_json(rpc.mempool, out,
+      rpc.mempool:chunk_feerates(txid_hex)))
   end
 
   -- prioritisetransaction: bump (or lower) a tx's effective fee for mining.
@@ -7870,86 +8041,64 @@ end
       error({code = M.ERROR.INVALID_PARAMS,
         message = "package-not-child-with-parents-tree: parents must not spend other parents in the package"})
     end
-    local accept_ok, err_or_results, rbf_info = rpc.mempool:accept_package(txs)
-    if accept_ok and err_or_results.rbf then rbf_info = err_or_results.rbf end
-    local function broadcast_package()
-      if rpc.peer_manager then
-        local invs = {}
-        for _, tx in ipairs(txs) do
-          local txid = validation.compute_txid(tx)
-          invs[#invs + 1] = {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
-        end
-        local inv_payload = p2p.serialize_inv(invs)
-        rpc.peer_manager:broadcast("inv", inv_payload)
-      end
+    local state, results, replaced = rpc.mempool:process_new_package(txs, false)
+    local package_msg = "success"
+    if state then
+      package_msg = mempool_mod.validation_state_string(state.reason, state.details)
     end
-    -- replaced-transactions is a JSON array even when empty; cjson 2.1.0
-    -- would write an empty Lua table as {}.
-    local function replaced_json(list)
-      if list and #list > 0 then return oj_array_of_strings(list) end
-      return oj_array_empty()
-    end
-    if rbf_info then
-      -- Package RBF (Core AcceptPackage): per-tx results in Core's shape,
-      -- txid + error for a refused tx, vsize + fees otherwise.
-      local seq = {}
-      for _, tx in ipairs(txs) do
-        local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
-        local r = rbf_info.results[wtxid_hex]
-        if r then
-          local obj
-          if r.error then
-            obj = oj({"txid", r.txid, "error", r.error})
-          else
-            local fees = {base = r.fee / consensus.COIN}
-            if r.feerate_k then
-              fees["effective-feerate"] = r.feerate_k / consensus.COIN
-              fees["effective-includes"] = r.includes
-            end
-            obj = oj({"txid", r.txid, "vsize", r.vsize, "fees", fees})
-          end
-          seq[#seq + 1] = wtxid_hex
-          seq[#seq + 1] = obj
-        end
-      end
-      if accept_ok then broadcast_package() end
-      return oj_result(oj({
-        "package_msg", accept_ok and "success" or tostring(err_or_results),
-        "tx-results", oj(seq),
-        "replaced-transactions", replaced_json(rbf_info.replaced),
-      }))
-    end
-    local tx_results = {}
-    -- accept_package returns (true, {...}) on success or (false, err_msg).
-    if accept_ok then
+
+    -- Broadcast what is in the mempool now (Core: every member that exists,
+    -- including ones that were already there).
+    if rpc.peer_manager then
+      local invs = {}
       for _, tx in ipairs(txs) do
         local txid = validation.compute_txid(tx)
-        local wtxid = validation.compute_wtxid(tx)
-        local txid_hex = types.hash256_hex(txid)
-        local wtxid_hex = types.hash256_hex(wtxid)
-        local entry = rpc.mempool:get_entry(txid_hex)
-        local fee_btc = entry and (entry.fee / consensus.COIN) or 0
-        local vsize = entry and entry.vsize or 0
-        tx_results[wtxid_hex] = {
-          txid = txid_hex,
-          vsize = vsize,
-          fees = {
-            base = fee_btc,
-          },
-        }
+        if rpc.mempool.entries[types.hash256_hex(txid)] then
+          invs[#invs + 1] = {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
+        end
       end
-      -- Broadcast via inv (matches sendrawtransaction).
-      broadcast_package()
-      return oj_result(oj({
-        "package_msg", "success",
-        "tx-results", tx_results,
-        "replaced-transactions", replaced_json(nil),
-      }))
+      if #invs > 0 then
+        rpc.peer_manager:broadcast("inv", p2p.serialize_inv(invs))
+      end
+    end
+
+    -- Per-tx results keyed by wtxid, in Core's shape and pushKV order
+    -- (rpc/mempool.cpp:1457-1511).  Emitted as ordered JSON: the deployed
+    -- lua-cjson (2.1.0) has no empty_array_mt, so a plain {} would encode
+    -- replaced-transactions as an object.
+    local tx_results = {}
+    for _, tx in ipairs(txs) do
+      local txid_hex = types.hash256_hex(validation.compute_txid(tx))
+      local wtxid_hex = types.hash256_hex(validation.compute_wtxid(tx))
+      local res = results[wtxid_hex]
+      local inner = { "txid", txid_hex }
+      if not res then
+        inner[#inner + 1] = "error"; inner[#inner + 1] = "package-not-validated"
+      elseif res.kind == "different_witness" then
+        inner[#inner + 1] = "other-wtxid"; inner[#inner + 1] = res.other_wtxid
+      elseif res.kind == "invalid" then
+        inner[#inner + 1] = "error"
+        inner[#inner + 1] = mempool_mod.validation_state_string(res.reason, res.details)
+      else
+        local fees = { "base", oj_amount(res.fee) }
+        if res.kind == "valid" then
+          -- Not reported for MEMPOOL_ENTRY: whether the package feerate was
+          -- used when it was first submitted is unknown.
+          fees[#fees + 1] = "effective-feerate"; fees[#fees + 1] = oj_amount(res.effective_feerate)
+          fees[#fees + 1] = "effective-includes"
+          fees[#fees + 1] = oj_array_of_strings(res.effective_includes)
+        end
+        inner[#inner + 1] = "vsize"; inner[#inner + 1] = res.vsize
+        inner[#inner + 1] = "fees"; inner[#inner + 1] = oj(fees)
+      end
+      tx_results[#tx_results + 1] = wtxid_hex
+      tx_results[#tx_results + 1] = oj(inner)
     end
     return oj_result(oj({
-      "package_msg", tostring(err_or_results),
-      "tx-results", tx_results,
-      "replaced-transactions", replaced_json(nil),
+      "package_msg", package_msg,
+      "tx-results", oj(tx_results),
+      "replaced-transactions", (#replaced > 0) and oj_array_of_strings(replaced)
+                               or oj_array_empty(),
     }))
   end
 
@@ -8224,7 +8373,7 @@ end
         rpc.mempool, rpc.chain_state, rpc.network,
         payout_script
       )
-      return template
+      return { _raw_json = M.block_template_json(template) }
     end
     error({code = M.ERROR.MISC_ERROR, message = "Mining not available"})
   end
@@ -12553,6 +12702,7 @@ end
   self.methods["getblockheader"] = function(rpc, params)
     local blockhash = params[1]
     local verbose = params[2]
+    core_check_optional_bool(verbose, 2, "verbose")
     if verbose == nil or verbose == cjson.null then verbose = true end
 
     -- ParseHashV parity: malformed blockhash (wrong length / non-hex) -> -8 at
@@ -12901,6 +13051,12 @@ end
           -- bad-version — the gates Core runs in AcceptBlockHeader) and the
           -- connect failures indicate an invalid candidate and must surface the
           -- canonical BIP22 reject reason instead of "inconclusive".
+          -- A block building on a failed (invalidated) block: Core
+          -- AcceptBlockHeader BLOCK_INVALID_PREV "bad-prevblk".
+          if sb_err == "invalid-ancestor"
+              and not rpc.chain_state:is_block_invalid(block_hash) then
+            return "bad-prevblk"
+          end
           if sb_err and sb_err:find("^check%-block: ") then
             -- CheckBlock / ContextualCheckBlock at the real height failed.
             return bip22_result(sb_err:sub(#"check-block: " + 1))
@@ -13374,25 +13530,36 @@ end
     -- params[1]: rawtxs array.  params[2]: optional maxfeerate (BTC/kvB).
     -- Per-tx response includes effective-feerate and effective-includes in fees.
     local rawtxs = params[1]
-    local maxfeerate_btc_per_kvb = (params[2] ~= nil and params[2] ~= cjson.null)
-                                   and tonumber(params[2]) or nil
-    if type(rawtxs) ~= "table" then
-      error({code = M.ERROR.INVALID_PARAMS, message = "rawtxs must be an array"})
+    -- RPCHelpMan type check (-3), then the 1..MAX_PACKAGE_COUNT bound (-8),
+    -- then ParseFeeRate(maxfeerate), in Core's order (rpc/mempool.cpp).
+    -- cjson decodes arrays and objects alike to tables; a table with a
+    -- non-sequence key is an object.
+    local is_array = type(rawtxs) == "table"
+    if is_array then
+      for k in pairs(rawtxs) do
+        if type(k) ~= "number" then is_array = false break end
+      end
     end
-    if params[2] ~= nil and params[2] ~= cjson.null and not maxfeerate_btc_per_kvb then
-      error({code = M.ERROR.INVALID_PARAMS, message = "maxfeerate must be a number"})
+    if not is_array then
+      core_wrong_type(1, "rawtxs", rawtxs, "array")
+    end
+    local mempool_mod = require("lunarblock.mempool")
+    if #rawtxs < 1 or #rawtxs > mempool_mod.MAX_PACKAGE_COUNT then
+      error({code = M.ERROR.INVALID_PARAMETER,
+        message = string.format("Array must contain between 1 and %d transactions.",
+          mempool_mod.MAX_PACKAGE_COUNT)})
+    end
+    -- sat/kvB; 0 = no cap.  Both paths below refuse when the base fee is
+    -- over max_raw_tx_fee_rate.GetFee(vsize), as Core's result loop does
+    -- (rpc/mempool.cpp: `if (max_raw_tx_fee && fee > max_raw_tx_fee)`).
+    local maxfeerate_sat_per_kvb = core_parse_max_feerate(params[2])
+    local function over_max_fee(fee, vsize)
+      return maxfeerate_sat_per_kvb > 0
+         and fee > mempool_mod.fee_for_rate(maxfeerate_sat_per_kvb, vsize)
     end
 
     if not rpc.mempool then
       error({code = M.ERROR.MISC_ERROR, message = "Mempool not available"})
-    end
-
-    -- MAX_PACKAGE_COUNT guard (Bitcoin Core: RPCTypeCheck then CheckPackageLimits).
-    local mempool_mod = require("lunarblock.mempool")
-    if #rawtxs > mempool_mod.MAX_PACKAGE_COUNT then
-      error({code = M.ERROR.INVALID_PARAMS,
-        message = string.format("Too many transactions: %d > %d",
-          #rawtxs, mempool_mod.MAX_PACKAGE_COUNT)})
     end
 
     -- DecodeHexTx (mempool.cpp:332): a bad hex is RPC_DESERIALIZATION_ERROR
@@ -13431,20 +13598,18 @@ end
       if atmp.accepted then
         local fee_btc = atmp.fee / consensus.COIN
         local vsize = atmp.vsize
-        local feerate_btc_per_kvb = (vsize > 0) and (fee_btc / vsize * 1000) or 0
-        -- maxfeerate check (BTC/kvB)
-        if maxfeerate_btc_per_kvb and feerate_btc_per_kvb > maxfeerate_btc_per_kvb then
+        if over_max_fee(atmp.fee, vsize) then
           res.allowed = false
           res["reject-reason"] = "max-fee-exceeded"
         else
           res.allowed = true
           res.vsize = vsize
+          -- Core: effective-feerate is CFeeRate(fee, vsize).GetFeePerK()
+          -- (sat/kvB, rounded down) and effective-includes lists WTXIDs.
           res.fees = {
             base = fee_btc,
-            -- ValueFromAmount(CFeeRate(fee, vsize).GetFeePerK()): integer
-            -- sat/kvB, rendered with 8 decimals; includes are wtxids.
-            ["effective-feerate"] = (vsize > 0)
-              and (math.floor(atmp.fee * 1000 / vsize) / consensus.COIN) or 0,
+            ["effective-feerate"] = (vsize > 0 and math.floor(atmp.fee * 1000 / vsize) or 0)
+                                    / consensus.COIN,
             ["effective-includes"] = {res.wtxid},
           }
         end
@@ -13466,57 +13631,45 @@ end
       return results
     end
 
-    -- Multi-tx (package) path: route through accept_package(txns, test_accept=true).
-    -- Collect decoded txs; decode failures already handled above.
-    local tx_list = {}
+    -- Multi-tx (package) path: Core ProcessNewPackage(test_accept=true), each
+    -- member at its own feerate (rpc/mempool.cpp:343-407).  A member with no
+    -- result was not validated (an earlier member failed) and gets only its
+    -- txid and wtxid; a package-level policy failure adds package-error.
+    local state, pkg_results = rpc.mempool:process_new_package(txs, true)
+    local package_error
+    if state and state.kind == "policy" then
+      package_error = mempool_mod.validation_state_string(state.reason, state.details)
+    end
+    local exit_early = false
     for i = 1, #txs do
-      tx_list[i] = txs[i]
-    end
-
-    -- Empty package: return empty results without calling accept_package.
-    if #tx_list == 0 then
-      return results
-    end
-
-    local pkg_ok, pkg_result = rpc.mempool:accept_package(tx_list, true)
-    if not pkg_ok then
-      -- Package-level failure: mark all txs with package-error.
-      for i = 1, #results do
-        results[i]["package-error"] = tostring(pkg_result)
-        results[i].allowed = false
-      end
-      return results
-    end
-
-    -- Package accepted (dry-run): populate per-tx results.
-    local pkg_total_fees = pkg_result.total_fees or 0
-    local pkg_total_vsize = pkg_result.total_vsize or 0
-    local pkg_feerate = (pkg_total_vsize > 0) and
-                        ((pkg_total_fees / consensus.COIN) / pkg_total_vsize * 1000) or 0
-
-    -- Build a txid→index map for effective-includes.
-    local txid_list = {}
-    for i, tx in ipairs(tx_list) do
-      txid_list[i] = results[i].txid
-    end
-
-    for i, tx in ipairs(tx_list) do
       local res = results[i]
-      local fee_btc = (pkg_result.fees and pkg_result.fees[i] or 0) / consensus.COIN
-      local weight = validation.get_tx_weight(tx)
-      local vsize = math.ceil(weight / consensus.WITNESS_SCALE_FACTOR)
-      -- maxfeerate check uses package fee rate.
-      if maxfeerate_btc_per_kvb and pkg_feerate > maxfeerate_btc_per_kvb then
-        res.allowed = false
-        res["reject-reason"] = "max-fee-exceeded"
-      else
-        res.allowed = true
-        res.vsize = vsize
-        res.fees = {
-          base = fee_btc,
-          ["effective-feerate"] = pkg_feerate,
-          ["effective-includes"] = txid_list,
-        }
+      if package_error then res["package-error"] = package_error end
+      res.allowed = nil
+      local r = pkg_results[res.wtxid]
+      if r and not exit_early then
+        if r.kind == "valid" then
+          if over_max_fee(r.fee, r.vsize) then
+            res.allowed = false
+            res["reject-reason"] = "max-fee-exceeded"
+            exit_early = true
+          else
+            res.allowed = true
+            res.vsize = r.vsize
+            res.fees = {
+              base = r.fee / consensus.COIN,
+              ["effective-feerate"] = r.effective_feerate / consensus.COIN,
+              ["effective-includes"] = r.effective_includes,
+            }
+          end
+        else
+          res.allowed = false
+          if mempool_mod.is_missing_inputs(r.reason) then
+            res["reject-reason"] = "missing-inputs"
+          else
+            res["reject-reason"] = r.reason
+            res["reject-details"] = mempool_mod.validation_state_string(r.reason, r.details)
+          end
+        end
       end
     end
 

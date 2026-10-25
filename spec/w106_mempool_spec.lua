@@ -711,15 +711,17 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
       local repl_output = total_in - repl_fee
 
       local repl = types.transaction(2, repl_inputs, { make_output(repl_output) }, 0)
-      local ok2, err2 = accept(mp, repl)
+      local ok2, err2, details2 = accept(mp, repl)
 
       -- The diagram check must fire and reject the replacement.
       assert.is_false(ok2,
         "FIXED G19: low-feerate replacement must be rejected by ImprovesFeerateDiagram " ..
         "(was silently accepted before this fix; Core rbf.cpp:127-140)")
-      assert.is_string(err2)
-      assert.is_truthy(err2:find("feerate diagram"),
-        "rejection reason must mention 'feerate diagram', got: " .. tostring(err2))
+      -- Core: TX_RECONSIDERABLE "replacement-failed", debug message
+      -- "insufficient feerate: does not improve feerate diagram".
+      assert.equal("replacement-failed", err2)
+      assert.is_truthy(tostring(details2):find("feerate diagram"),
+        "rejection details must mention 'feerate diagram', got: " .. tostring(details2))
     end)
   end)
 

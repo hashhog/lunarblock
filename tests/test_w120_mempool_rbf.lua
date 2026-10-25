@@ -522,7 +522,9 @@ print("\n--- G17: Rule 3 error message ---")
 
 test("G17-a: emits Core's 'insufficient fee, ... less fees than conflicting txs'", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find('"insufficient fee, rejecting replacement %%s, less fees than conflicting txs; %%s < %%s"') ~= nil,
+  -- Reason and debug message are returned separately (state.ToString()
+  -- joins them with ", ").
+  expect_true(src:find('return false, "insufficient fee", string.format%(\n%s*"rejecting replacement %%s, less fees than conflicting txs; %%s < %%s"') ~= nil,
     "Rule 3 error string")
 end)
 
@@ -604,7 +606,7 @@ print("\n--- G24: Rule 5 error message ---")
 
 test("G24-a: emits 'too many potential replacements'", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find('"too many potential replacements, rejecting replacement %%s; too many conflicting clusters %(%%d > %%d%)"') ~= nil,
+  expect_true(src:find('return false, "too many potential replacements", string.format%(\n%s*"rejecting replacement %%s; too many conflicting clusters %(%%d > %%d%)"') ~= nil,
     "Rule 5 error string")
 end)
 
@@ -615,7 +617,7 @@ print("\n--- G25: EntriesAndTxidsDisjoint ---")
 
 test("G25-a: check exists at mempool.lua:1331-1349", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("bad%-txns%-spends%-conflicting%-tx, %%s spends conflicting transaction %%s") ~= nil,
+  expect_true(src:find('return false, "bad%-txns%-spends%-conflicting%-tx", string.format%(\n%s*"%%s spends conflicting transaction %%s"') ~= nil,
     "EntriesAndTxidsDisjoint error string matches Core rbf.cpp:92-93")
 end)
 
@@ -748,11 +750,13 @@ end)
 test("G28-j: FIX-68 — rpc.lua format_mempool_entry computes replaceable per-entry", function()
   -- Replaces hardcoded `["bip125-replaceable"] = true` with a dynamic call
   -- to mp:is_replaceable(txid_hex).  Verify via source inspection.
+  -- getrawmempool verbose, getmempoolentry and getmempoolancestors/
+  -- descendants all format through the one M.mempool_entry_to_json.
   local src = io.open("src/rpc.lua", "r"):read("*a")
-  expect_true(src:find('%[\"bip125%-replaceable\"%] = mp and mp:is_replaceable') ~= nil,
-    "format_mempool_entry uses dynamic mp:is_replaceable walker")
-  expect_true(src:find('%[\"bip125%-replaceable\"%] = rpc%.mempool:is_replaceable') ~= nil,
-    "getrawmempool verbose uses dynamic rpc.mempool:is_replaceable walker")
+  expect_true(src:find('\"bip125%-replaceable\", %(mp and mp%.is_replaceable%) and mp:is_replaceable%(txid_hex%)') ~= nil,
+    "mempool_entry_to_json uses dynamic mp:is_replaceable walker")
+  expect_true(src:find('oj_result%(M%.mempool_entries_to_json%(rpc%.mempool,%s+rpc%.mempool:get_raw_mempool%(%)') ~= nil,
+    "getrawmempool verbose formats through mempool_entry_to_json")
   -- And the literal hardcode is gone.
   -- We allow exactly the two dynamic occurrences above; the hardcoded
   -- `["bip125-replaceable"] = true,` literal must be absent.
@@ -781,8 +785,8 @@ test("G30-a: conflicts evicted only after every check (incl. scripts) passes", f
   local src = io.open("src/mempool.lua", "r"):read("*a")
   -- The eviction loop sits after the diagram check AND after the script
   -- checks, so a refused replacement never costs the pool its originals.
-  local diagram_pos = src:find('"replacement%-failed, insufficient feerate')
-  local scripts_pos = src:find("8e%. W96: PolicyScriptChecks")
+  local diagram_pos = src:find('return false, "replacement%-failed", "insufficient feerate')
+  local scripts_pos = src:find("8e%. PolicyScriptChecks")
   local evict_pos = src:find('self:remove_transaction%(conflict_hex, "replaced"%)')
   expect_true(diagram_pos ~= nil and scripts_pos ~= nil and evict_pos ~= nil,
     "markers present")

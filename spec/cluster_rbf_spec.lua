@@ -96,11 +96,11 @@ describe("cluster-mempool RBF", function()
         inputs[i] = { base }
       end
       local sweep = tx_of(inputs, { 101 * 100000 - 1000000 })
-      local ok, err, reason = mp:accept_transaction(sweep)
+      local ok, reason, details = mp:accept_transaction(sweep)
       assert.is_false(ok)
-      assert.equal("too many potential replacements, rejecting replacement " .. txid_hex(sweep) ..
-        "; too many conflicting clusters (101 > 100)", err)
       assert.equal("too many potential replacements", reason)
+      assert.equal("rejecting replacement " .. txid_hex(sweep) ..
+        "; too many conflicting clusters (101 > 100)", details)
     end)
   end)
 
@@ -121,10 +121,10 @@ describe("cluster-mempool RBF", function()
 
     it("refuses a replacement that worsens the diagram with replacement-failed", function()
       local mp, orig, wide = diagram_case()
-      local ok, err, reason = mp:accept_transaction(wide)
+      local ok, reason, details = mp:accept_transaction(wide)
       assert.is_false(ok)
-      assert.equal("replacement-failed, insufficient feerate: does not improve feerate diagram", err)
       assert.equal("replacement-failed", reason)
+      assert.equal("insufficient feerate: does not improve feerate diagram", details)
       assert.is_not_nil(mp:get_entry(txid_hex(orig)))
     end)
 
@@ -181,11 +181,11 @@ describe("cluster-mempool RBF", function()
       local base = coin(cs, 100000)
       assert.is_true((mp:accept_transaction(tx_of({ { base } }, { 79000 }))))
       local low = tx_of({ { base } }, { 94000 })
-      local ok, err, reason = mp:accept_transaction(low)
+      local ok, reason, details = mp:accept_transaction(low)
       assert.is_false(ok)
-      assert.equal("insufficient fee, rejecting replacement " .. txid_hex(low) ..
-        ", less fees than conflicting txs; 0.00006 < 0.00021", err)
       assert.equal("insufficient fee", reason)
+      assert.equal("rejecting replacement " .. txid_hex(low) ..
+        ", less fees than conflicting txs; 0.00006 < 0.00021", details)
     end)
   end)
 
@@ -216,18 +216,18 @@ describe("cluster-mempool RBF", function()
 
     it("replaces the conflict and its descendant with a 1-parent-1-child package", function()
       local mp, o, d, p, c = package_case(100, 100)
-      local ok, res = mp:accept_package({ p, c })
-      assert.is_true(ok, tostring(res))
-      local info = res.rbf
+      local state, results, replaced = mp:process_new_package({ p, c }, false)
+      assert.is_nil(state, state and mempool.validation_state_string(state.reason, state.details))
       assert.is_nil(mp:get_entry(txid_hex(o)))
       assert.is_nil(mp:get_entry(txid_hex(d)))
       assert.is_not_nil(mp:get_entry(txid_hex(p)))
       assert.is_not_nil(mp:get_entry(txid_hex(c)))
-      assert.equal(2, #info.replaced)
-      local rp, rc = info.results[wtxid_hex(p)], info.results[wtxid_hex(c)]
-      assert.same({ wtxid_hex(p), wtxid_hex(c) }, rp.includes)
-      assert.equal(rp.feerate_k, rc.feerate_k)
-      assert.equal(math.floor(206000 * 1000 / (rp.vsize + rc.vsize)), rp.feerate_k)
+      assert.equal(2, #replaced)
+      local rp, rc = results[wtxid_hex(p)], results[wtxid_hex(c)]
+      assert.equal("valid", rp.kind)
+      assert.same({ wtxid_hex(p), wtxid_hex(c) }, rp.effective_includes)
+      assert.equal(rp.effective_feerate, rc.effective_feerate)
+      assert.equal(math.floor(206000 * 1000 / (rp.vsize + rc.vsize)), rp.effective_feerate)
     end)
 
     it("refuses a package whose cluster is too large and keeps the conflicts", function()
@@ -236,28 +236,31 @@ describe("cluster-mempool RBF", function()
       local saved = mempool.PERMIT_BARE_MULTISIG
       mempool.PERMIT_BARE_MULTISIG = true
       local mp, o, d, p, c = package_case(127, 126, MULTISIG)
-      local ok, msg, info = mp:accept_package({ p, c })
+      local state, results, replaced = mp:process_new_package({ p, c }, false)
       mempool.PERMIT_BARE_MULTISIG = saved
-      assert.is_false(ok)
-      assert.equal("too-large-cluster", msg)
+      assert.is_not_nil(state)
+      assert.equal("too-large-cluster", mempool.validation_state_string(state.reason, state.details))
       assert.is_not_nil(mp:get_entry(txid_hex(o)))
       assert.is_not_nil(mp:get_entry(txid_hex(d)))
       assert.is_nil(mp:get_entry(txid_hex(p)))
-      assert.equal(0, #info.replaced)
+      assert.equal(0, #replaced)
       -- Each transaction carries its individual (first-pass) result.
-      assert.truthy(info.results[wtxid_hex(p)].error:match(
-        "^insufficient fee, rejecting replacement %x+, less fees than conflicting txs; 0%.00006 < 0%.00021$"))
-      assert.equal(mempool.REJECT_MISSING_INPUTS, info.results[wtxid_hex(c)].error)
+      local rp = results[wtxid_hex(p)]
+      assert.equal("insufficient fee", rp.reason)
+      assert.truthy(rp.details:match(
+        "^rejecting replacement %x+, less fees than conflicting txs; 0%.00006 < 0%.00021$"))
+      assert.equal(mempool.REJECT_MISSING_INPUTS, results[wtxid_hex(c)].reason)
     end)
 
     it("refuses a package that cannot pay for what it replaces", function()
       local mp, o, _, p = package_case(100, 100)
       -- A child paying nothing: 6000 in package fees against 21000 replaced.
       local c0 = tx_of({ { validation.compute_txid(p), 0 } }, { p.outputs[1].value })
-      local ok, msg = mp:accept_package({ p, c0 })
-      assert.is_false(ok)
+      local state = mp:process_new_package({ p, c0 }, false)
+      assert.is_not_nil(state)
       assert.equal("package RBF failed: insufficient anti-DoS fees, rejecting replacement " ..
-        txid_hex(c0) .. ", less fees than conflicting txs; 0.00006 < 0.00021", msg)
+        txid_hex(c0) .. ", less fees than conflicting txs; 0.00006 < 0.00021",
+        mempool.validation_state_string(state.reason, state.details))
       assert.is_not_nil(mp:get_entry(txid_hex(o)))
     end)
   end)

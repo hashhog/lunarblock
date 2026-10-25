@@ -2,6 +2,7 @@ local rpc = require("lunarblock.rpc")
 local types = require("lunarblock.types")
 local consensus = require("lunarblock.consensus")
 local cjson = require("cjson")
+local mempool_mod = require("lunarblock.mempool")
 
 describe("rpc", function()
 
@@ -917,10 +918,18 @@ describe("rpc", function()
         has = function(self, txid_hex)
           return self.entries[txid_hex] ~= nil
         end,
-        accept_transaction = function(self, tx)
+        accept_transaction = function(self, tx, allow_rbf, opts)
           if type(accept_result) == "function" then
             return accept_result(tx)
-          elseif accept_result == true then
+          end
+          -- The caller's fee cap is checked before anything is added, as in
+          -- Mempool:accept_transaction; a 100 vB tx, so fee 1000 sat = 10 sat/vB.
+          local cap = opts and opts.max_fee_per_kvb
+          if accept_result == true and cap and cap > 0
+             and (accept_fee or 1000) > mempool_mod.fee_for_rate(cap, 100) then
+            return false, mempool_mod.MAX_FEE_EXCEEDED
+          end
+          if accept_result == true then
             local txid = validation.compute_txid(tx)
             local txid_hex = types.hash256_hex(txid)
             -- Add to entries to track
@@ -1028,15 +1037,14 @@ describe("rpc", function()
       assert.equal(rpc.ERROR.DESERIALIZATION_ERROR, decoded.error.code)
     end)
 
-    it("returns VERIFY_ALREADY_IN_CHAIN when tx already in mempool", function()
+    it("returns the txid when tx is already in the mempool", function()
       local tx = make_test_tx()
-      local txid = validation.compute_txid(tx)
-      local txid_hex = types.hash256_hex(txid)
+      local txid_hex = types.hash256_hex(validation.compute_txid(tx))
       local raw = serialize.serialize_transaction(tx, false)
       local hex = rpc.hex_encode(raw)
 
-      -- Mempool already has this transaction
-      local mock_mempool = make_mock_mempool(true, 1000, {[txid_hex] = {tx = tx}})
+      -- Core BroadcastTransaction: txid already in the mempool is success.
+      local mock_mempool = make_mock_mempool("txn-already-in-mempool")
       local server = rpc.new({
         network = consensus.networks.mainnet,
         mempool = mock_mempool
@@ -1046,9 +1054,8 @@ describe("rpc", function()
       local response = server:handle_request(request)
       local decoded = cjson.decode(response)
 
-      assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.VERIFY_ALREADY_IN_CHAIN, decoded.error.code)
-      assert.truthy(decoded.error.message:match("already"))
+      assert.truthy(decoded.error == nil or decoded.error == cjson.null)
+      assert.equal(txid_hex, decoded.result)
     end)
 
     it("returns VERIFY_ERROR for missing inputs", function()
@@ -1056,7 +1063,7 @@ describe("rpc", function()
       local raw = serialize.serialize_transaction(tx, false)
       local hex = rpc.hex_encode(raw)
 
-      local mock_mempool = make_mock_mempool("missing inputs")
+      local mock_mempool = make_mock_mempool("bad-txns-inputs-missingorspent")
       local server = rpc.new({
         network = consensus.networks.mainnet,
         mempool = mock_mempool
@@ -1068,7 +1075,7 @@ describe("rpc", function()
 
       assert.is_not_nil(decoded.error)
       assert.equal(rpc.ERROR.VERIFY_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("missing inputs"))
+      assert.truthy(decoded.error.message:match("missingorspent"))
     end)
 
     it("returns VERIFY_REJECTED for insufficient fee", function()
@@ -1109,8 +1116,8 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("exceeds maxfeerate"))
+      assert.equal(rpc.ERROR.VERIFY_ERROR, decoded.error.code)
+      assert.truthy(decoded.error.message:match("Fee exceeds maximum configured"))
     end)
 
     it("accepts any fee when maxfeerate is 0", function()
@@ -1153,8 +1160,8 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_not_nil(decoded.error)
-      assert.equal(rpc.ERROR.MISC_ERROR, decoded.error.code)
-      assert.truthy(decoded.error.message:match("cannot exceed"))
+      assert.equal(rpc.ERROR.INVALID_PARAMETER, decoded.error.code)
+      assert.equal("Fee rates larger than or equal to 1BTC/kvB are not accepted", decoded.error.message)
     end)
 
     it("uses default maxfeerate of 0.10 BTC/kvB", function()

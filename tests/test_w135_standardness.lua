@@ -208,9 +208,9 @@ if mempool_mod_ok then
   test("CONST: MAX_TX_LEGACY_SIGOPS = 2500", function()
     expect_eq(mempool.MAX_TX_LEGACY_SIGOPS, 2500)
   end)
-  test("CONST: PERMIT_BARE_MULTISIG = false (matches Core v28+ -permitbaremultisig=0)",
+  test("CONST: PERMIT_BARE_MULTISIG = true (Core DEFAULT_PERMIT_BAREMULTISIG)",
     function()
-      expect_eq(mempool.PERMIT_BARE_MULTISIG, false)
+      expect_eq(mempool.PERMIT_BARE_MULTISIG, true)
     end)
   test("CONST: TRUC_VERSION = 3", function()
     expect_eq(mempool.TRUC_VERSION, 3)

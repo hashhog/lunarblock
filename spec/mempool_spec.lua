@@ -322,9 +322,10 @@ describe("mempool", function()
       tx2.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFD)
       tx2.outputs[1] = make_output(95000)  -- 5000 sat fee (lower)
 
-      local ok, err = mp:accept_transaction(tx2)
+      local ok, err, details = mp:accept_transaction(tx2)
       assert.is_false(ok)
-      assert.truthy(err:match("^insufficient fee, rejecting replacement %x+, less fees than conflicting txs; "))
+      assert.equal("insufficient fee", err)
+      assert.truthy(details:match("^rejecting replacement %x+, less fees than conflicting txs; "))
     end)
 
     it("rejects replacement when original does not signal RBF", function()
@@ -1366,13 +1367,14 @@ describe("mempool", function()
         tx2.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFD)
         tx2.outputs[1] = make_output(95000)  -- 5000 sat fee (lower than 10000)
 
-        local ok, err = mp:accept_transaction(tx2)
+        local ok, err, details = mp:accept_transaction(tx2)
         assert.is_false(ok)
         -- Core PaysForRBF (policy/rbf.cpp): "insufficient fee, rejecting
         -- replacement <txid>, less fees than conflicting txs; <new> < <old>".
         assert.equal("insufficient fee, rejecting replacement " ..
           types.hash256_hex(validation.compute_txid(tx2)) ..
-          ", less fees than conflicting txs; 0.00005 < 0.0001", err)
+          ", less fees than conflicting txs; 0.00005 < 0.0001",
+          mempool.validation_state_string(err, details))
       end)
 
       it("Rule #3: equal fee passes Rule #3, rejected by Rule #4 (incremental relay)", function()
@@ -1402,9 +1404,10 @@ describe("mempool", function()
         tx2.outputs[1] = make_output(45000)  -- two outputs, same total (10000 sat fee)
         tx2.outputs[2] = make_output(45000)
 
-        local ok, err = mp:accept_transaction(tx2)
+        local ok, err, details = mp:accept_transaction(tx2)
         assert.is_false(ok)
         -- Rule #4 fires (additional fee 0 < incremental relay fee on vsize).
+        err = mempool.validation_state_string(err, details)
         assert.truthy(err:match("^insufficient fee, rejecting replacement %x+, not enough additional fees to relay; 0%.00 < "),
           "expected Core's Rule 4 reject, got: " .. tostring(err))
       end)
@@ -1429,9 +1432,10 @@ describe("mempool", function()
         tx2.inputs[1] = make_input(prev_txid, 0, 0xFFFFFFFD)
         tx2.outputs[1] = make_output(89999)  -- 10001 sat fee
 
-        local ok, err = mp:accept_transaction(tx2)
+        local ok, err, details = mp:accept_transaction(tx2)
         assert.is_false(ok)
-        assert.truthy(err:match("not enough additional fees to relay; 0%.00000001 < "))
+        assert.equal("insufficient fee", err)
+        assert.truthy(details:match("not enough additional fees to relay; 0%.00000001 < "))
       end)
 
       it("accepts replacement with sufficient incremental fee", function()
@@ -1539,8 +1543,10 @@ describe("mempool", function()
         tx_b.inputs[2] = make_input(txid_a, 0, 0xFFFFFFFD)      -- Tx A is ancestor of Tx B
         tx_b.outputs[1] = make_output(199970000)
 
-        local ok_b, err_b = mp:accept_transaction(tx_b)
+        local ok_b, err_b, details_b = mp:accept_transaction(tx_b)
         assert.is_false(ok_b, "Tx B should be rejected: ancestor overlaps with conflict")
+        assert.equal("bad-txns-spends-conflicting-tx", err_b)
+        err_b = mempool.validation_state_string(err_b, details_b)
         assert.truthy(tostring(err_b):match("conflicting transaction"),
           "expected 'conflicting transaction' in error, got: " .. tostring(err_b))
       end)
@@ -3037,7 +3043,10 @@ describe("mempool", function()
         tx.inputs[1] = make_input(prev_txid, 0)
         tx.outputs[1] = types.txout(89000, ms)
 
+        local saved = mempool.PERMIT_BARE_MULTISIG
+        mempool.PERMIT_BARE_MULTISIG = false  -- -permitbaremultisig=0
         local ok, err = mp:accept_transaction(tx)
+        mempool.PERMIT_BARE_MULTISIG = saved
         assert.is_false(ok)
         assert.equal("bare-multisig", err)
       end)
@@ -3119,7 +3128,10 @@ describe("mempool", function()
 
         local ok, err = mp:accept_transaction(tx)
         assert.is_false(ok)
-        assert.truthy(err:match("mandatory%-script%-verify%-flag%-failed"))
+        -- Core v31 CheckInputScripts under STANDARD flags: the mempool reject
+        -- is "mempool-script-verify-flag-failed (<ScriptErrorString>)"
+        -- (validation.cpp:2120); "mandatory-..." no longer exists in Core.
+        assert.truthy(err:match("^mempool%-script%-verify%-flag%-failed %("), err)
       end)
 
       it("does not run verify_script when gate is off (default)", function()
@@ -3193,8 +3205,8 @@ describe("mempool", function()
       it("MAX_P2SH_SIGOPS = 15", function()
         assert.equal(15, mempool.MAX_P2SH_SIGOPS)
       end)
-      it("PERMIT_BARE_MULTISIG defaults to false (Core v28+)", function()
-        assert.is_false(mempool.PERMIT_BARE_MULTISIG)
+      it("PERMIT_BARE_MULTISIG defaults to true (Core DEFAULT_PERMIT_BAREMULTISIG)", function()
+        assert.is_true(mempool.PERMIT_BARE_MULTISIG)
       end)
     end)
   end)

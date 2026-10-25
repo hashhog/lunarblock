@@ -26,6 +26,9 @@ local MAX_CONSECUTIVE_FAILURES       = 1000
 -- BLOCK_FULL_ENOUGH_WEIGHT_DELTA: "close to full" threshold.
 -- Core miner.cpp:285.
 local BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000
+-- Sigop cost reserved for the coinbase outputs (Core node/types.h
+-- DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS).
+local COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS = 400
 
 -- Median-time-past of the 11 blocks ending at tip_hash (Core GetMedianTimePast).
 -- Mirrors the same helper in utxo.lua (kept local to avoid a module cycle); used
@@ -307,7 +310,10 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   local selected = {}
   local selected_set = {}     -- txid_hex -> true
   local total_fees = 0
-  local total_sigops = 0
+  -- Core resetBlock (node/miner.cpp): nBlockSigOpsCost starts at
+  -- coinbase_output_max_additional_sigops (DEFAULT 400), reserving room for
+  -- the coinbase's own outputs.
+  local total_sigops = COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS
 
   -- BUG FIX: start weight at block_reserved_weight (8000), which reserves
   -- space for the block header, tx count varint, and coinbase tx.
@@ -319,15 +325,18 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   -- within BLOCK_FULL_ENOUGH_WEIGHT_DELTA (4000) of the weight cap, stop.
   local consecutive_failed = 0
 
-  local function sigops_of(tx)
-    local n = 0
-    for _, inp in ipairs(tx.inputs) do
-      n = n + validation.count_script_sigops(inp.script_sig, true) * consensus.WITNESS_SCALE_FACTOR
-    end
-    for _, out in ipairs(tx.outputs) do
-      n = n + validation.count_script_sigops(out.script_pubkey, true) * consensus.WITNESS_SCALE_FACTOR
-    end
-    return n
+  -- Sigop cost of a candidate: the mempool entry's GetSigOpCost(), i.e. what
+  -- MemPoolAccept computed with GetTransactionSigOpCost(tx, view,
+  -- STANDARD_SCRIPT_VERIFY_FLAGS) -- legacy x4 plus P2SH x4 plus witness, with
+  -- the prevouts in hand.  Core's BlockAssembler sums exactly this
+  -- (node/miner.cpp addChunks / AddToBlock) and getblocktemplate reports it
+  -- per transaction (rpc/mining.cpp vTxSigOpsCost).  Recounting the tx alone
+  -- here missed every P2SH and witness sigop (a P2WPKH spend read 0, Core 1).
+  -- An entry without a recorded cost (built outside accept_transaction) falls
+  -- back to the legacy count, the only part computable without prevouts.
+  local function sigops_of(entry)
+    if entry.sigop_cost then return entry.sigop_cost end
+    return validation.get_legacy_sigop_count(entry.tx) * consensus.WITNESS_SCALE_FACTOR
   end
 
   for _, entry in ipairs(sorted_entries) do
@@ -378,7 +387,7 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
         if not pkg_ok then break end
         in_pkg[types.hash256_hex(pe.txid)] = true
         pkg_weight = pkg_weight + pe.weight
-        pkg_sigops = pkg_sigops + sigops_of(pe.tx)
+        pkg_sigops = pkg_sigops + sigops_of(pe)
         pkg_fees = pkg_fees + pe.fee
       end
 
@@ -523,11 +532,10 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
     vbrequired = vbrequired,
     previousblockhash = types.hash256_hex(prev_hash),
     transactions = {},
-    coinbaseaux = {flags = ""},
+    -- Core pushes coinbaseaux as an EMPTY object and never emits coinbasetxn
+    -- (rpc/mining.cpp: only coinbasevalue); the caller builds the coinbase.
+    coinbaseaux = {},
     coinbasevalue = coinbase_value,
-    coinbasetxn = {
-      data = M.hex_encode(serialize.serialize_transaction(coinbase_tx, true)),
-    },
     target = M.hex_encode(consensus.bits_to_target(bits)),
     -- BUG FIX: mintime must be MTP+1 (GetMinimumTime), not os.time().
     -- Core miner.cpp:36-47: GetMinimumTime returns MTP+1 (adjusted for
@@ -577,7 +585,7 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
       hash = types.hash256_hex(entry.wtxid),
       depends = depends,
       fee = entry.fee,
-      sigops = 0,  -- simplified
+      sigops = sigops_of(entry),
       weight = entry.weight,
     }
   end

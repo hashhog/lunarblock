@@ -4674,6 +4674,24 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     entry.height = common_height + (side_len - i + 1)
   end
 
+  -- ── Stage 2a: guard — reject side branches that descend from an
+  -- invalidated block (Core AcceptBlockHeader: a parent with
+  -- BLOCK_FAILED_VALID is BLOCK_INVALID_PREV "bad-prevblk", checked before
+  -- ContextualCheckBlockHeader; FindMostWorkChain never picks a chain
+  -- through a failed block).  side_chain holds this block and every
+  -- ancestor above the common ancestor; everything at or below it is on the
+  -- active chain and so not failed.  This used to be
+  -- has_invalid_ancestor(block_hash) after Stage 2b, which starts at the NEW
+  -- block's hash: a block that only arrived through submitblock is in
+  -- neither the header index nor CF.HEADERS, so the walk stopped at once and
+  -- a child of an invalidateblock'ed block was connected (and its failed
+  -- parent reconnected with it).  Checked before storing (B2/B9).
+  for i = 1, side_len do
+    if self:is_block_invalid(side_chain[i].hash) then
+      return nil, "invalid-ancestor"
+    end
+  end
+
   -- ── Stage 2b: FULL contextual header check for the just-submitted block, run
   -- at its REAL height — the exact set of gates Core runs in
   -- ContextualCheckBlockHeader (bitcoin-core/src/validation.cpp:4088-4118) inside
@@ -4778,14 +4796,7 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     end
   end
 
-  -- ── Stage 3: guard — reject side branches that descend from an
-  -- invalidated block.  Core's FindMostWorkChain (validation.cpp:3139-3164)
-  -- skips any candidate whose ancestor chain contains BLOCK_FAILED_VALID.
-  -- B2 fix: check BEFORE storing so we never write an invalid-ancestor block
-  -- to RocksDB (B9 fix: store only after this check and work comparison pass).
-  if self:has_invalid_ancestor(block_hash) then
-    return nil, "invalid-ancestor"
-  end
+  -- (Stage 3, the invalid-ancestor guard, now runs as Stage 2a above.)
 
   -- ── Stage 4: compute side-branch work and active-chain work above the
   -- common ancestor.  256-bit work add/compare via consensus helpers.
@@ -6002,6 +6013,80 @@ function ChainState:clear_descendant_invalid_flags(block_hash)
   for hash_bytes, _ in pairs(descendants) do
     self.invalid_blocks[hash_bytes] = nil
   end
+end
+
+--- ActivateBestChain after reconsiderblock (Core ReconsiderBlock,
+--- rpc/blockchain.cpp: ResetBlockFailureFlags, then ActivateBestChain).
+-- reconsider_block only clears flags.  Without this the node stayed on the
+-- chain it fell back to at invalidateblock: the reconsidered block was never
+-- reconnected, so the tip stayed below Core's and the block's txs stayed in
+-- the mempool.  The chains that can now beat the tip are the ones through a
+-- block whose flag was just cleared: the reconsidered block and its cleared
+-- descendants (Core re-adds exactly those to setBlockIndexCandidates).  Each
+-- one with a body is tried, most work first, through the same reorg
+-- orchestrator submitblock uses (accept_side_branch_block), which compares
+-- work with the active chain and reorgs only to a strictly heavier branch.
+-- A candidate that fails to connect is skipped and the next one is tried
+-- (Core ActivateBestChainStep: InvalidBlockFound, then the next candidate).
+-- @param block_hash hash256: the reconsidered block
+-- @param cleared table: set of hash bytes whose invalid flag was cleared
+-- @param opts table|nil: { mempool = <mempool> }
+-- @return "connected" | "noop", hash256|nil (the new tip when connected)
+function ChainState:activate_best_chain_after_reconsider(block_hash, cleared, opts)
+  opts = opts or {}
+  local root = block_hash.bytes
+  local root_header = self.storage.get_header(block_hash)
+  if not root_header then return "noop" end
+
+  -- Work from the reconsidered block (inclusive) up to each candidate; false
+  -- for a cleared hash that does not descend from it (a cleared ancestor).
+  local work_of = { [root] = consensus.get_block_work(root_header.bits) }
+  local function work_to_root(hb)
+    local path, cur = {}, hb
+    while work_of[cur] == nil do
+      local hdr = cleared[cur] and self.storage.get_header(types.hash256(cur))
+      if not hdr then work_of[cur] = false break end
+      path[#path + 1] = { cur, hdr.bits }
+      cur = hdr.prev_hash.bytes
+    end
+    local w = work_of[cur]
+    for i = #path, 1, -1 do
+      if w then w = consensus.work_add(w, consensus.get_block_work(path[i][2])) end
+      work_of[path[i][1]] = w
+    end
+    return work_of[hb]
+  end
+
+  local candidates = {}
+  local seen = { [root] = true }
+  candidates[1] = { bytes = root, work = work_of[root] }
+  for hb in pairs(cleared) do
+    if not seen[hb] then
+      seen[hb] = true
+      local w = work_to_root(hb)
+      if w then candidates[#candidates + 1] = { bytes = hb, work = w } end
+    end
+  end
+  table.sort(candidates, function(a, b)
+    local c = consensus.work_compare(a.work, b.work)
+    if c ~= 0 then return c > 0 end
+    return a.bytes < b.bytes
+  end)
+
+  for _, c in ipairs(candidates) do
+    local h = types.hash256(c.bytes)
+    if self.tip_hash and self.tip_hash.bytes == c.bytes then return "noop" end
+    local block = self.storage.get_block(h)
+    if block then
+      local result = self:accept_side_branch_block(block, h,
+        { skip_scripts = false, nosync = false, mempool = opts.mempool })
+      if result == "connected" then return "connected", h end
+      -- "stored": the most-work remaining candidate is not heavier than
+      -- the active chain, so none of the lighter ones is either.
+      if result == "stored" then return "noop" end
+    end
+  end
+  return "noop"
 end
 
 --- Get the list of currently invalidated block hashes.
