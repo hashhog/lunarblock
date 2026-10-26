@@ -948,7 +948,7 @@ M.DESCRIPTOR_TYPES = {
 }
 
 -- Parse a descriptor string
-function M.parse_descriptor(desc_str)
+function M.parse_descriptor(desc_str, network)
   local desc = desc_str
   local checksum = nil
 
@@ -980,31 +980,31 @@ function M.parse_descriptor(desc_str)
   -- Handle different descriptor types
   if desc_type == "pk" then
     -- pk(KEY)
-    local key, err = M.parse_key_expression(inner)
+    local key, err = M.parse_key_expression(inner, network)
     if not key then return nil, err end
     result.key = key
     result.is_range = key.is_range
 
   elseif desc_type == "pkh" then
     -- pkh(KEY)
-    local key, err = M.parse_key_expression(inner)
+    local key, err = M.parse_key_expression(inner, network)
     if not key then return nil, err end
     result.key = key
     result.is_range = key.is_range
 
   elseif desc_type == "wpkh" then
     -- wpkh(KEY)
-    local key, err = M.parse_key_expression(inner)
+    local key, err = M.parse_key_expression(inner, network)
     if not key then return nil, err end
     result.key = key
     result.is_range = key.is_range
 
   elseif desc_type == "sh" then
     -- sh(SCRIPT)
-    local inner_desc, err = M.parse_descriptor(inner .. ")") -- Re-add closing paren
+    local inner_desc, err = M.parse_descriptor(inner .. ")", network) -- Re-add closing paren
     if not inner_desc then
       -- Try parsing as raw script descriptor
-      inner_desc, err = M.parse_descriptor(inner)
+      inner_desc, err = M.parse_descriptor(inner, network)
     end
     if not inner_desc then return nil, "invalid sh inner: " .. (err or "unknown") end
     result.inner = inner_desc
@@ -1012,7 +1012,7 @@ function M.parse_descriptor(desc_str)
 
   elseif desc_type == "wsh" then
     -- wsh(SCRIPT)
-    local inner_desc, err = M.parse_descriptor(inner)
+    local inner_desc, err = M.parse_descriptor(inner, network)
     if not inner_desc then return nil, "invalid wsh inner: " .. (err or "unknown") end
     result.inner = inner_desc
     result.is_range = inner_desc.is_range
@@ -1040,7 +1040,7 @@ function M.parse_descriptor(desc_str)
         depth = depth - 1
         current = current .. ch
       elseif ch == "," and depth == 0 then
-        local key, err = M.parse_key_expression(current)
+        local key, err = M.parse_key_expression(current, network)
         if not key then return nil, "invalid key in multi: " .. (err or current) end
         result.keys[#result.keys + 1] = key
         if key.is_range then result.is_range = true end
@@ -1051,7 +1051,7 @@ function M.parse_descriptor(desc_str)
     end
     -- Don't forget the last key
     if #current > 0 then
-      local key, err = M.parse_key_expression(current)
+      local key, err = M.parse_key_expression(current, network)
       if not key then return nil, "invalid key in multi: " .. (err or current) end
       result.keys[#result.keys + 1] = key
       if key.is_range then result.is_range = true end
@@ -1081,7 +1081,7 @@ function M.parse_descriptor(desc_str)
       key_str = inner
     end
 
-    local key, err = M.parse_key_expression(key_str)
+    local key, err = M.parse_key_expression(key_str, network)
     if not key then return nil, "invalid tr key: " .. (err or key_str) end
     result.key = key
     result.is_range = key.is_range
@@ -1111,7 +1111,7 @@ function M.parse_descriptor(desc_str)
 
   elseif desc_type == "combo" then
     -- combo(KEY)
-    local key, err = M.parse_key_expression(inner)
+    local key, err = M.parse_key_expression(inner, network)
     if not key then return nil, err end
     result.key = key
     result.is_range = key.is_range

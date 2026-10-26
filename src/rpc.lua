@@ -5254,7 +5254,9 @@ function RPCServer:register_methods()
     local function coin_exists(prev_hash, prev_index)
       local cv = rpc.chain_state and rpc.chain_state.coin_view
       if cv and cv.get then
-        local coin = cv.get(prev_hash, prev_index)
+        -- CoinView:get is a method; calling cv.get(...) leaves self nil and
+        -- raised a Lua error (-32603) instead of Core's -25 below.
+        local coin = cv:get(prev_hash, prev_index)
         if coin then return true end
       end
       if rpc.mempool then
@@ -9755,13 +9757,22 @@ end
     return psbt_mod.to_base64(result)
   end
 
-  -- descriptorprocesspsbt (rawtransaction.cpp:1990). Update/sign a PSBT
-  -- from output descriptors. A bad descriptor is RPC_INVALID_ADDRESS_OR_KEY
-  -- (-5). Unknown inputs stay unsigned (complete=false).
+  -- descriptorprocesspsbt (rawtransaction.cpp descriptorprocesspsbt). Update
+  -- a PSBT from output descriptors: fill missing prevouts from the chainstate,
+  -- add BIP32 derivations for inputs/outputs whose scriptPubKey a descriptor
+  -- produces, sign with any private keys the descriptors carry, and finalize.
+  -- A bad descriptor is RPC_INVALID_ADDRESS_OR_KEY (-5). Keys are decoded for
+  -- THIS node's network (Core parses descriptors against Params()), so a
+  -- regtest/testnet WIF is accepted on regtest and a mainnet WIF is not.
+  --
+  -- SCOPE: single-key descriptors (pk/pkh/wpkh and sh() wrapping one of them),
+  -- ranged ones over [0,1000] or the given range. multi/wsh/tr descriptors are
+  -- validated but do not contribute scripts, so inputs they would cover stay
+  -- unsigned (complete=false) rather than being signed wrongly.
   self.methods["descriptorprocesspsbt"] = function(rpc, params)
-    local _ = rpc
     local psbt_b64 = params and params[1]
     local descriptors = params and params[2]
+    local options = params and params[3]
     if type(psbt_b64) ~= "string" then
       error({code = M.ERROR.TYPE_ERROR,
         message = "JSON value of type " .. core_json_type_name(psbt_b64) ..
@@ -9772,18 +9783,35 @@ end
         message = "JSON value of type " .. core_json_type_name(descriptors) ..
                   " is not of expected type array"})
     end
+    local do_derivs, do_finalize = true, true
+    if type(options) == "table" then
+      if options.bip32derivs ~= nil then do_derivs = options.bip32derivs and true or false end
+      if options.finalize ~= nil then do_finalize = options.finalize and true or false end
+    end
     local psbt_mod = require("lunarblock.psbt")
+    local crypto_mod = require("lunarblock.crypto")
+    local network_name = rpc.network and rpc.network.name or "mainnet"
     local ok, psbt = pcall(psbt_mod.from_base64, psbt_b64)
     if not ok then
       error({code = M.ERROR.DESERIALIZATION_ERROR,
         message = "TX decode failed " .. strip_internal_location(psbt)})
     end
+
+    -- scripts[scriptPubKey] = {pubkey, privkey, key, redeem}
+    local scripts = {}
     for _, item in ipairs(descriptors) do
-      local desc_str
+      local desc_str, range_end = nil, 1000
+      local range_start = 0
       if type(item) == "table" then
         desc_str = item.desc
         if type(desc_str) ~= "string" then
           error({code = M.ERROR.INVALID_ADDRESS, message = "Missing desc field"})
+        end
+        local r = item.range
+        if type(r) == "number" then
+          range_end = r
+        elseif type(r) == "table" and type(r[1]) == "number" and type(r[2]) == "number" then
+          range_start, range_end = r[1], r[2]
         end
       elseif type(item) == "string" then
         desc_str = item
@@ -9791,27 +9819,110 @@ end
         error({code = M.ERROR.INVALID_ADDRESS,
           message = "Descriptor must be a string or object"})
       end
-      local parsed, err = address_mod.parse_descriptor(desc_str)
+      local parsed, err = address_mod.parse_descriptor(desc_str, network_name)
       if not parsed then
         error({code = M.ERROR.INVALID_ADDRESS, message = err or "Invalid descriptor"})
       end
-    end
-    local complete = true
-    if not psbt.inputs or #psbt.inputs == 0 then
-      complete = false
-    else
-      for i, inp in ipairs(psbt.inputs) do
-        if not psbt_mod.input_is_signed(inp) then
-          complete = false
-          break
+      local top = parsed
+      local wrapped = false
+      if parsed.type == "sh" and parsed.inner then
+        top = parsed.inner
+        wrapped = true
+      end
+      local key = (top.type == "pk" or top.type == "pkh" or top.type == "wpkh"
+                   or top.type == "combo") and top.key or nil
+      if key then
+        local first, last = 0, 0
+        if parsed.is_range then first, last = range_start, range_end end
+        for idx = first, last do
+          local script = address_mod.descriptor_to_script(parsed, idx, network_name)
+          local pubkey = key.pubkey
+          if key.is_range then
+            pubkey = address_mod.derive_path(key, key.path, idx)
+          end
+          if script and pubkey then
+            scripts[script] = {
+              pubkey = pubkey,
+              privkey = (not key.is_range) and key.privkey or nil,
+              key = key,
+              redeem = wrapped and address_mod.descriptor_to_script(top, idx, network_name) or nil,
+            }
+          end
         end
-        local _ = i
       end
     end
-    return {
+
+    local function add_deriv(map, info)
+      local key = info.key
+      local fp, path
+      if key.origin then
+        fp, path = key.origin.fingerprint, key.origin.path
+      elseif key.type == "wif" or key.type == "pubkey" then
+        fp, path = crypto_mod.hash160(info.pubkey):sub(1, 4), {}
+      else
+        return
+      end
+      map[psbt_mod.hex_encode(info.pubkey)] = {fingerprint = fp, path = path}
+    end
+
+    -- Inputs: fill the prevout from the chainstate, then attach derivations
+    -- and sign when a descriptor owns the script.
+    local cv = rpc.chain_state and rpc.chain_state.coin_view
+    for i, tx_input in ipairs(psbt.tx.inputs) do
+      local inp = psbt.inputs[i]
+      if not psbt_mod.input_is_signed(inp) then
+        if not inp.witness_utxo and not inp.non_witness_utxo and cv then
+          local entry = cv:get(tx_input.prev_out.hash, tx_input.prev_out.index)
+          if entry then
+            inp.witness_utxo = {value = entry.value, script_pubkey = entry.script_pubkey}
+          end
+        end
+        local spk
+        if inp.witness_utxo then
+          spk = inp.witness_utxo.script_pubkey
+        elseif inp.non_witness_utxo then
+          local po = inp.non_witness_utxo.outputs[tx_input.prev_out.index + 1]
+          spk = po and po.script_pubkey
+        end
+        local info = spk and scripts[spk]
+        if info then
+          if info.redeem and not inp.redeem_script then inp.redeem_script = info.redeem end
+          if do_derivs then add_deriv(inp.bip32_derivations, info) end
+          if info.privkey then
+            pcall(psbt_mod.sign_input, psbt, i - 1, info.privkey, info.pubkey)
+          end
+        end
+      end
+    end
+
+    -- Outputs: derivations (and redeem script) for outputs we can derive.
+    for i, out in ipairs(psbt.tx.outputs) do
+      local info = scripts[out.script_pubkey]
+      if info then
+        local pout = psbt.outputs[i]
+        if info.redeem and not pout.redeem_script then pout.redeem_script = info.redeem end
+        if do_derivs then add_deriv(pout.bip32_derivations, info) end
+      end
+    end
+
+    local complete
+    if do_finalize then
+      complete = psbt_mod.finalize(psbt)
+    else
+      complete = psbt_mod.is_complete(psbt)
+    end
+    if not psbt.inputs or #psbt.inputs == 0 then complete = false end
+    local result = {
       psbt = psbt_mod.to_base64(psbt),
-      complete = complete,
+      complete = complete and true or false,
     }
+    if result.complete then
+      local ok_ex, tx = pcall(psbt_mod.extract, psbt)
+      if ok_ex and tx then
+        result.hex = M.hex_encode(serialize.serialize_transaction(tx, true))
+      end
+    end
+    return result
   end
 
   ----------------------------------------------------------------------------
@@ -9911,9 +10022,6 @@ end
   end
 
   self.methods["createmultisig"] = function(rpc, params)
-    -- Suppress unused warning
-    local _ = rpc
-
     local nrequired = params[1]
     local pubkeys_param = params[2]
     local address_type = params[3] or "legacy"
@@ -10010,7 +10118,9 @@ end
     local multi_inner = string.format("multi(%d,%s)", nrequired, table.concat(pk_hex_list, ","))
 
     local crypto = require("lunarblock.crypto")
-    local network_name = "mainnet"
+    -- Addresses must use the node's own network (Core: Params() in
+    -- AddAndGetMultisigDestination/EncodeDestination), not hardcoded mainnet.
+    local network_name = rpc.network and rpc.network.name or "mainnet"
 
     local address
     local descriptor_body
