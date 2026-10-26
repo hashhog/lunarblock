@@ -15095,8 +15095,10 @@ function RPCServer:setup_w47b_methods()
                 local ok, entry = pcall(utxo_mod.deserialize_utxo_entry, v)
                 if ok and entry then
                   n_txouts = n_txouts + 1
-                  local desc = needles[entry.script_pubkey]
-                  if desc ~= nil then
+                  if needles[entry.script_pubkey] ~= nil then
+                    -- Core reports InferDescriptor(coin script), not the scan
+                    -- object that matched (rpc/blockchain.cpp scantxoutset).
+                    local desc = M.decode_script_pubkey(entry.script_pubkey, rpc.network).desc
                     total_sats = total_sats + (entry.value or 0)
                     -- Key layout: txid[32] (internal byte order) + vout[4] LE.
                     -- JSON-RPC reports txid in display order (reversed hex), matching
