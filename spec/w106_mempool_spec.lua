@@ -403,8 +403,9 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
   ---------------------------------------------------------------------------
   -- G12: RBF Rule #2 — no new unconfirmed inputs
   ---------------------------------------------------------------------------
-  describe("G12: RBF Rule #2 - replacement may not add new unconfirmed inputs", function()
-    it("rejects replacement adding a new in-mempool input not in original", function()
+  -- Core 31 dropped Rule #2 (no HasNoNewUnconfirmed in policy/rbf.cpp).
+  describe("G12: RBF Rule #2 is gone in Core 31", function()
+    it("accepts a replacement adding a new in-mempool input not in the original", function()
       local cs = make_chain()
       local coin_a = random_txid()
       add_utxo(cs, coin_a, 0, 300000)
@@ -428,15 +429,14 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
       local ok1 = accept(mp, orig)
       assert.is_true(ok1)
 
-      -- Replacement adds parent_tx:0 (a NEW unconfirmed input — Rule #2 violation)
+      -- Replacement adds parent_tx:0 (a NEW unconfirmed input; BIP-125 Rule #2
+      -- refused this, Core 31 takes it because the diagram improves).
       local repl = types.transaction(2,
         { make_input(coin_a, 0, 0xFFFFFFFD),
           make_input(parent_txid, 0) },
         { make_output(300000) }, 0)
       local ok2, err2 = accept(mp, repl)
-      assert.is_false(ok2,
-        "replacement adding new unconfirmed input must be rejected (BIP-125 Rule #2)")
-      assert.is_string(err2)
+      assert.is_true(ok2, tostring(err2))
     end)
   end)
 
@@ -711,15 +711,17 @@ describe("W106 CTxMemPool descendant/ancestor + RBF + TRUC + package audit", fun
       local repl_output = total_in - repl_fee
 
       local repl = types.transaction(2, repl_inputs, { make_output(repl_output) }, 0)
-      local ok2, err2 = accept(mp, repl)
+      local ok2, err2, details2 = accept(mp, repl)
 
       -- The diagram check must fire and reject the replacement.
       assert.is_false(ok2,
         "FIXED G19: low-feerate replacement must be rejected by ImprovesFeerateDiagram " ..
         "(was silently accepted before this fix; Core rbf.cpp:127-140)")
-      assert.is_string(err2)
-      assert.is_truthy(err2:find("feerate diagram"),
-        "rejection reason must mention 'feerate diagram', got: " .. tostring(err2))
+      -- Core: TX_RECONSIDERABLE "replacement-failed", debug message
+      -- "insufficient feerate: does not improve feerate diagram".
+      assert.equal("replacement-failed", err2)
+      assert.is_truthy(tostring(details2):find("feerate diagram"),
+        "rejection details must mention 'feerate diagram', got: " .. tostring(details2))
     end)
   end)
 

@@ -265,7 +265,7 @@ function()
   -- Mempool-side IS present:
   expect_true(
     MEMPOOL_SRC:find(
-      "additional_fee%s*=%s*fee%s*%-%s*conflicting_fees", 1, false)
+      "additional_fee%s*=%s*modified_fee%s*%-%s*conflicting_fees", 1, false)
       ~= nil,
     "mempool.lua:1404 'additional_fee = fee - conflicting_fees' "
     .. "present")
@@ -659,7 +659,7 @@ end)
 test("Mempool-side Rule 3 (fee < conflicting_fees) PRESENT", function()
   expect_true(
     MEMPOOL_SRC:find(
-      "if fee < conflicting_fees then", 1, true) ~= nil,
+      "if modified_fee < conflicting_fees then", 1, true) ~= nil,
     "mempool.lua:1397 mempool-side Rule 3 enforced (W120 G16)")
 end)
 

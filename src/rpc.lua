@@ -4694,7 +4694,7 @@ function RPCServer:register_methods()
     -- pool as it was (a tx already in the pool is answered at step 1, before
     -- the cap, as in Core).
     local accept_opts = (max_feerate > 0) and {max_fee_per_kvb = max_feerate} or nil
-    local ok, txid_hex = rpc.mempool:accept_transaction(tx, nil, accept_opts)
+    local ok, txid_hex, reject_debug = rpc.mempool:accept_transaction(tx, nil, accept_opts)
     local already_in_mempool = false
     if not ok then
       if txid_hex == "max-fee-exceeded" then
@@ -4721,7 +4721,10 @@ function RPCServer:register_methods()
         -- message is the validation state string.
         error({code = M.ERROR.VERIFY_ERROR, message = err_str})
       else
-        error({code = M.ERROR.VERIFY_REJECTED, message = err_str})
+        -- Core's message is state.ToString(): "<reason>, <details>".
+        local mempool_mod = require("lunarblock.mempool")
+        error({code = M.ERROR.VERIFY_REJECTED,
+               message = mempool_mod.validation_state_string(err_str, reject_debug)})
       end
     end
     -- Locally submitted: stays in the unbroadcast set until a peer asks for it
@@ -8038,7 +8041,7 @@ end
       error({code = M.ERROR.INVALID_PARAMS,
         message = "package-not-child-with-parents-tree: parents must not spend other parents in the package"})
     end
-    local state, results = rpc.mempool:process_new_package(txs, false)
+    local state, results, replaced = rpc.mempool:process_new_package(txs, false)
     local package_msg = "success"
     if state then
       package_msg = mempool_mod.validation_state_string(state.reason, state.details)
@@ -8094,8 +8097,8 @@ end
     return oj_result(oj({
       "package_msg", package_msg,
       "tx-results", oj(tx_results),
-      -- No member replaces anything here (package RBF is not implemented).
-      "replaced-transactions", oj_array_empty(),
+      "replaced-transactions", (#replaced > 0) and oj_array_of_strings(replaced)
+                               or oj_array_empty(),
     }))
   end
 
@@ -13619,6 +13622,11 @@ end
           reason = "missing-inputs"
         end
         res["reject-reason"] = reason
+        -- reject-details is state.ToString() (rpc/mempool.cpp:403); only the
+        -- rejects that carry their reason separately supply it.
+        if atmp.reject_details then
+          res["reject-details"] = atmp.reject_details
+        end
       end
       return results
     end

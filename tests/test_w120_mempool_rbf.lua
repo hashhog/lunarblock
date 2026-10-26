@@ -455,16 +455,17 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G13: Rule 2 — no new unconfirmed inputs ---")
 
-test("G13-a: Rule 2 check exists at mempool.lua:1428-1455", function()
+-- Core 31 removed Rule 2 with cluster mempool; lunarblock follows.
+test("G13-a: no Rule 2 check (Core 31 has no HasNoNewUnconfirmed)", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("conflict_input_outpoints") ~= nil,
-    "Rule 2 uses conflict_input_outpoints set")
+  expect_false(src:find("conflict_input_outpoints") ~= nil,
+    "Rule 2 conflict_input_outpoints set is gone")
 end)
 
-test("G13-b: Rule 2 emits 'replacement adds new unconfirmed input'", function()
+test("G13-b: no 'replacement adds new unconfirmed input' reject", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find('"replacement adds new unconfirmed input"') ~= nil,
-    "Rule 2 error string")
+  expect_false(src:find('"replacement adds new unconfirmed input"') ~= nil,
+    "Rule 2 error string is gone")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -472,12 +473,10 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G14: Rule 2 only checks direct conflicts ---")
 
-test("G14-a: BUG-11 — conflict_input_outpoints built from 'conflicts' not 'all_conflicts'", function()
+test("G14-a: BUG-11 moot — the Rule 2 direct-conflict outpoint loop is gone", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  -- Lunarblock loops `for conflict_hex in pairs(conflicts) do` not all_conflicts.
-  expect_true(src:find("for conflict_hex in pairs%(conflicts%) do   %-%- only direct conflicts") ~= nil,
-    "Rule 2 only considers direct conflicts — phantom-spend risk when replacement spends a descendant's output")
-  bug("BUG-11", "MED")
+  expect_false(src:find("for conflict_hex in pairs%(conflicts%) do   %-%- only direct conflicts") ~= nil,
+    "Rule 2 loop removed with Rule 2")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -496,7 +495,7 @@ test("G15-a: BUG-3 — modern Core has no HasNoNewUnconfirmed", function()
     expect_false(s:find("HasNoNewUnconfirmed") ~= nil,
       "Core rbf.cpp does not contain HasNoNewUnconfirmed")
   end
-  bug("BUG-3", "P1")
+  -- Lunarblock no longer enforces it either (G13).
 end)
 
 -- ---------------------------------------------------------------------------
@@ -504,9 +503,9 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G16: Rule 3 — fee comparison ---")
 
-test("G16-a: Rule 3 check exists at mempool.lua:1362", function()
+test("G16-a: Rule 3 check exists (PaysForRBF on modified fees)", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("if fee < conflicting_fees then") ~= nil,
+  expect_true(src:find("if modified_fee < conflicting_fees then") ~= nil,
     "Rule 3 strict less-than per Core rbf.cpp:109")
 end)
 
@@ -521,9 +520,11 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G17: Rule 3 error message ---")
 
-test("G17-a: emits 'replacement fee not higher than conflicting txs'", function()
+test("G17-a: emits Core's 'insufficient fee, ... less fees than conflicting txs'", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find('"replacement fee not higher than conflicting txs') ~= nil,
+  -- Reason and debug message are returned separately (state.ToString()
+  -- joins them with ", ").
+  expect_true(src:find('return false, "insufficient fee", string.format%(\n%s*"rejecting replacement %%s, less fees than conflicting txs; %%s < %%s"') ~= nil,
     "Rule 3 error string")
 end)
 
@@ -560,7 +561,7 @@ print("\n--- G20: Rule 4 additional fee derivation ---")
 
 test("G20-a: additional_fee = fee - conflicting_fees", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("additional_fee = fee %- conflicting_fees") ~= nil,
+  expect_true(src:find("additional_fee = modified_fee %- conflicting_fees") ~= nil,
     "additional_fee derivation correct")
 end)
 
@@ -569,9 +570,9 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G21: Rule 4 error message ---")
 
-test("G21-a: emits 'insufficient fee for relay'", function()
+test("G21-a: emits Core's 'not enough additional fees to relay'", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find('"insufficient fee for relay: additional ') ~= nil,
+  expect_true(src:find('not enough additional fees to relay; %%s < %%s"') ~= nil,
     "Rule 4 error string")
 end)
 
@@ -590,13 +591,12 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G23: Rule 5 counting semantics ---")
 
-test("G23-a: BUG-1 — counts evicted transactions, not unique clusters", function()
+test("G23-a: BUG-1 fixed — counts distinct conflicting clusters, not evictions", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("for _ in pairs%(all_conflicts%) do") ~= nil,
-    "iterates per-tx in all_conflicts")
-  expect_false(src:find("GetUniqueClusterCount") ~= nil,
-    "no cluster-count call — divergence from modern Core")
-  bug("BUG-1", "MED CDIV")
+  expect_false(src:find("for _ in pairs%(all_conflicts%) do") ~= nil,
+    "no per-tx eviction count")
+  expect_true(src:find("local num_clusters = #self:conflict_clusters%(conflicts%)") ~= nil,
+    "Rule 5 counts clusters (Core GetUniqueClusterCount)")
 end)
 
 -- ---------------------------------------------------------------------------
@@ -606,7 +606,7 @@ print("\n--- G24: Rule 5 error message ---")
 
 test("G24-a: emits 'too many potential replacements'", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find('"too many potential replacements: ') ~= nil,
+  expect_true(src:find('return false, "too many potential replacements", string.format%(\n%s*"rejecting replacement %%s; too many conflicting clusters %(%%d > %%d%)"') ~= nil,
     "Rule 5 error string")
 end)
 
@@ -617,7 +617,7 @@ print("\n--- G25: EntriesAndTxidsDisjoint ---")
 
 test("G25-a: check exists at mempool.lua:1331-1349", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("replacement tx %%s spends conflicting transaction %%s") ~= nil,
+  expect_true(src:find('return false, "bad%-txns%-spends%-conflicting%-tx", string.format%(\n%s*"%%s spends conflicting transaction %%s"') ~= nil,
     "EntriesAndTxidsDisjoint error string matches Core rbf.cpp:92-93")
 end)
 
@@ -628,13 +628,13 @@ print("\n--- G26: descendant eviction ---")
 
 test("G26-a: conflict_descendants collected", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("conflict_descendants") ~= nil,
+  expect_true(src:find("for desc_hex in pairs%(conflict_entry%.descendants%) do") ~= nil,
     "descendants of conflicts collected for eviction")
 end)
 
 test("G26-b: descendants added to all_conflicts", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find("for desc_hex in pairs%(conflict_descendants%) do") ~= nil,
+  expect_true(src:find("all_conflicts%[desc_hex%] = true") ~= nil,
     "descendants merged into all_conflicts for Rules 3-5")
 end)
 
@@ -781,13 +781,17 @@ end)
 -- ---------------------------------------------------------------------------
 print("\n--- G30: conflict eviction order ---")
 
-test("G30-a: remove_transaction called after all Rules 1-5 pass", function()
+test("G30-a: conflicts evicted only after every check (incl. scripts) passes", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  -- Verify the eviction loop is positioned AFTER Rule 2 check.
-  local r2_pos = src:find('"replacement adds new unconfirmed input"')
-  local evict_pos = src:find("self:remove_transaction%(conflict_hex,")
-  expect_true(r2_pos < evict_pos,
-    "eviction must follow Rule 2 check — atomic accept-or-reject")
+  -- The eviction loop sits after the diagram check AND after the script
+  -- checks, so a refused replacement never costs the pool its originals.
+  local diagram_pos = src:find('return false, "replacement%-failed", "insufficient feerate')
+  local scripts_pos = src:find("8e%. PolicyScriptChecks")
+  local evict_pos = src:find('self:remove_transaction%(conflict_hex, "replaced"%)')
+  expect_true(diagram_pos ~= nil and scripts_pos ~= nil and evict_pos ~= nil,
+    "markers present")
+  expect_true(diagram_pos < evict_pos and scripts_pos < evict_pos,
+    "eviction follows all checks — atomic accept-or-reject")
 end)
 
 -- ===========================================================================
