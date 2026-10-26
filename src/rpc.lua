@@ -13,6 +13,7 @@ local script_mod = require("lunarblock.script")
 local address_mod = require("lunarblock.address")
 local bit = require("bit")
 local storage_mod = require("lunarblock.storage")
+local chaintips = require("lunarblock.chaintips")
 local M = {}
 
 --- Map a decoded JSON value to Bitcoin Core's uvTypeName spelling.
@@ -12999,23 +13000,27 @@ end
   end
 
   --- getchaintips: Return information about all known chain tips.
+  -- Every block-index leaf plus the active tip, with Core's status and
+  -- branchlen (rpc/blockchain.cpp getchaintips) -- see src/chaintips.lua.
   self.methods["getchaintips"] = function(rpc, _params)
-    local tip_height = 0
-    local tip_hash = types.hash256_zero()
-    if rpc.chain_state then
-      tip_height = rpc.chain_state.tip_height or 0
-      tip_hash = rpc.chain_state.tip_hash or types.hash256_zero()
-    end
+    local tips = chaintips.tips({
+      storage = rpc.storage,
+      chain_state = rpc.chain_state,
+      header_chain = rpc.header_chain
+        or (rpc.chain_state and rpc.chain_state.header_index),
+    })
     -- Core key order (rpc/blockchain.cpp getchaintips): height, hash,
     -- branchlen, status. Emit as an ordered array of ordered objects.
-    return { _raw_json = M._oj_value(M._oj_array({
-      M._oj({
-        "height",    tip_height,
-        "hash",      types.hash256_hex(tip_hash),
-        "branchlen", 0,
-        "status",    "active",
-      }),
-    })) }
+    local objs = {}
+    for i, t in ipairs(tips) do
+      objs[i] = M._oj({
+        "height",    t.height,
+        "hash",      t.hash,
+        "branchlen", t.branchlen,
+        "status",    t.status,
+      })
+    end
+    return { _raw_json = M._oj_value(M._oj_array(objs)) }
   end
 
   --- getdifficulty: Return the proof-of-work difficulty as a multiple of minimum.
