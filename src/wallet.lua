@@ -2545,7 +2545,7 @@ function M.fee_for_vsize(fee_rate, vsize)
 end
 
 --- Estimate fee rate for a transaction (Core wallet/fees.cpp
--- GetMinimumFeeRate): a RELIABLE estimator answer, else -fallbackfee, else
+-- minimum-fee-rate computation): a RELIABLE estimator answer, else -fallbackfee, else
 -- failure (an estimator with no data does not count as an answer). The rate
 -- is then raised to the mempool minimum fee, and then to the required fee
 -- max(-mintxfee, relay minimum). An explicit fee_rate never comes here.
