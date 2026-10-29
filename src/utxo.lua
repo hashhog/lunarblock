@@ -13,6 +13,7 @@ local mining = require("lunarblock.mining")
 local blockfilter = require("lunarblock.blockfilter")
 local prune_mod = require("lunarblock.prune")
 local bit = require("bit")
+local chaintips_mod = require("lunarblock.chaintips")
 local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 -- MIN_BLOCKS_TO_KEEP: reused from prune_mod (= 288).  Blocks this far ahead
 -- of the active tip are not stored when the block was not explicitly requested
@@ -5543,6 +5544,12 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     if had_undo then
       batch.delete(storage_mod.CF.UNDO, disconnect_hash.bytes)
     end
+    -- Remember that this block was connected once (Core: BLOCK_VALID_SCRIPTS
+    -- stays set on a disconnected block index entry).  Read only by
+    -- getchaintips to tell "valid-fork" from "valid-headers"; no validation
+    -- or chain-selection decision reads it.
+    batch.put(storage_mod.CF.META,
+              chaintips_mod.WAS_CONNECTED_PREFIX .. disconnect_hash.bytes, "\1")
     -- Pattern C0 (revised): txindex entries are NOT deleted on disconnect —
     -- Core's TxIndex has no CustomRemove, so entries survive reorgs.  The
     -- former delete loop has been removed; getrawtransaction on an orphaned
