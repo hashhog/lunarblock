@@ -139,4 +139,36 @@ describe("submitblock advances the header chain (getheaders serving)", function(
     -- The activation batch still recorded the block at its height.
     assert.truthy(types.hash256_eq(db.get_hash_by_height(4), bh))
   end)
+
+  -- hashhog/lunarblock#26 review: after a restart the in-memory map can hold
+  -- only genesis (core-regtest failed_reorg a-restart-child).  The header tip
+  -- then jumped to the submitted block with heights 1..3 missing from
+  -- height_to_hash, and getchaintips reported the active block below the new
+  -- tip as an extra valid-headers tip of branchlen 4.
+  it("leaves no height_to_hash hole when the map is partial after a restart", function()
+    local fresh = sync.new_header_chain(REGTEST, db)
+    fresh:init()
+    -- This spec's chain starts from its own height-0 block, not the regtest
+    -- genesis; make it resident the way init makes the real genesis resident.
+    local g = db.get_header(hashes[0])
+    fresh.headers[types.hash256_hex(hashes[0])] =
+      {header = g, height = 0, total_work = fresh:work_for_bits(g.bits)}
+    fresh.height_to_hash[0] = types.hash256_hex(hashes[0])
+    assert.is_nil(fresh.headers[types.hash256_hex(hashes[3])])
+    local r = rpc_mod.new({rpcport = 0, network = REGTEST, chain_state = cs,
+                           storage = db, header_chain = fresh})
+    local blk, bh = valid_block(4, hashes[3])
+    local res = r.methods["submitblock"](r, {
+      mining.hex_encode(serialize.serialize_block(blk))})
+    assert.is_nil(res ~= require("cjson").null and res or nil)
+    assert.equal(4, fresh.header_tip_height)
+    for h = 1, 3 do
+      assert.equal(types.hash256_hex(hashes[h]), fresh.height_to_hash[h])
+    end
+    local tips = require("lunarblock.chaintips").tips(
+      {storage = db, chain_state = cs, header_chain = fresh})
+    assert.equal(1, #tips)
+    assert.equal(types.hash256_hex(bh), tips[1].hash)
+    assert.equal("active", tips[1].status)
+  end)
 end)

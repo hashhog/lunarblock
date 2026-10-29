@@ -2295,6 +2295,45 @@ function HeaderChain:_point_heights_at(tip_hex, tip_entry, memory_only)
   end
 end
 
+--- Load a stored header's ancestry into the in-memory map, down to the first
+--- ancestor already resident, so a tip built on it has a gapless map.
+---
+--- After a restart the map can be partial (a submitblock-fed regtest node comes
+--- back with only genesis resident).  add_mined_tip then advanced the header tip
+--- with nothing below it, and _point_heights_at stopped at the first missing
+--- ancestor, leaving height_to_hash with a hole under the new tip.
+--- chaintips.build_index answers "on the active chain?" from height_to_hash at
+--- and below the highest height where it agrees with the active chain, so every
+--- active block in the hole was reported as an extra valid-headers tip, and the
+--- branchlen of real side tips was measured to genesis (core-regtest
+--- failed_reorg, hashhog/lunarblock#26 review).  getheaders could not serve the
+--- hole either.  Every header here was connected by accept_block, so this is
+--- bookkeeping only: no header is re-validated or newly accepted.
+-- @param hash hash256: the header to start from (the new block's parent)
+-- @param height number: its height
+-- @return table|nil: its headers[] entry, or nil when the stored ancestry does
+--   not reach a resident header (the caller then recomputes work from storage)
+function HeaderChain:_backfill_ancestry(hash, height)
+  local pending = {}
+  local cur_hash, h = hash, height
+  while h >= 0 and not self.headers[types.hash256_hex(cur_hash)] do
+    local hdr = self.storage.get_header(cur_hash)
+    if not hdr then return nil end
+    pending[#pending + 1] = {hash_hex = types.hash256_hex(cur_hash), header = hdr, height = h}
+    cur_hash, h = hdr.prev_hash, h - 1
+  end
+  if h < 0 then return nil end
+  local anchor = self.headers[types.hash256_hex(cur_hash)]
+  if anchor.height ~= h then return nil end
+  local work = anchor.total_work
+  for i = #pending, 1, -1 do
+    local p = pending[i]
+    work = consensus.work_add(work, self:work_for_bits(p.header.bits))
+    self.headers[p.hash_hex] = {header = p.header, height = p.height, total_work = work}
+  end
+  return self.headers[types.hash256_hex(hash)]
+end
+
 --- Advance the in-memory header chain to a block WE just produced + connected
 --- locally (generatetoaddress / submitblock tip-extension), WITHOUT re-running
 --- the contextual header gates.
@@ -2343,6 +2382,9 @@ function HeaderChain:add_mined_tip(header, height, opts)
   -- the node booted from a snapshot and only now starts mining).
   local prev_hex = types.hash256_hex(header.prev_hash)
   local parent = self.headers[prev_hex]
+  if not parent and height and height > 0 then
+    parent = self:_backfill_ancestry(header.prev_hash, height - 1)
+  end
   local parent_work
   if parent then
     parent_work = parent.total_work
