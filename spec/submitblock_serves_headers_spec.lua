@@ -55,11 +55,18 @@ local function valid_block(height, prev_hash)
   return block, validation.compute_block_hash(block.header)
 end
 
+local function make_temp_dir()
+  local tmpname = os.tmpname()
+  os.remove(tmpname)
+  os.execute("mkdir -p " .. tmpname)
+  return tmpname
+end
+
 describe("submitblock advances the header chain (getheaders serving)", function()
   local db, cs, hc, rpc, path, hashes
 
   before_each(function()
-    path = "/home/work/hashhog/staged-patches/lunarblock_serve_" .. os.time() .. "_" .. math.random(1e9)
+    path = make_temp_dir()
     db = storage_mod.open(path)
     cs = utxo.new_chain_state(db, REGTEST)
     cs:init()
@@ -107,5 +114,29 @@ describe("submitblock advances the header chain (getheaders serving)", function(
     local headers = p2p.deserialize_headers(payload)
     assert.equal(1, #headers)
     assert.truthy(types.hash256_eq(validation.compute_block_hash(headers[1]), bh))
+  end)
+
+  -- hashhog/lunarblock#26 review: the persisted height index belongs to the
+  -- chainstate activation path (submitblock's accept_block batch).  The
+  -- header-chain bump must stay in memory, so a header that merely wins the
+  -- header-work compare cannot repoint heights the active chain still owns
+  -- (it moved getchaintips in the core-regtest failed_reorg scenarios).
+  it("does not write the persisted height index from the header chain", function()
+    local blk, bh = valid_block(4, hashes[3])
+    local writes = {}
+    local real_put = db.put_height_index
+    db.put_height_index = function(h, hash)
+      writes[#writes + 1] = h
+      return real_put(h, hash)
+    end
+    local res = rpc.methods["submitblock"](rpc, {
+      mining.hex_encode(serialize.serialize_block(blk))})
+    db.put_height_index = real_put
+    assert.is_nil(res ~= require("cjson").null and res or nil)
+    assert.equal(4, hc.header_tip_height)
+    assert.equal(types.hash256_hex(bh), hc.height_to_hash[4])
+    assert.same({}, writes)
+    -- The activation batch still recorded the block at its height.
+    assert.truthy(types.hash256_eq(db.get_hash_by_height(4), bh))
   end)
 end)
