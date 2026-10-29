@@ -2280,11 +2280,13 @@ end
 --- partial after a restart).
 -- @param tip_hex string: hex hash of the new best header
 -- @param tip_entry table: its headers[] entry
-function HeaderChain:_point_heights_at(tip_hex, tip_entry)
+-- @param memory_only boolean|nil: re-point the in-memory map only and leave
+--   the persisted height index alone (see add_mined_tip)
+function HeaderChain:_point_heights_at(tip_hex, tip_entry, memory_only)
   local cur_hex, cur = tip_hex, tip_entry
   while cur and self.height_to_hash[cur.height] ~= cur_hex do
     self.height_to_hash[cur.height] = cur_hex
-    if self.storage.put_height_index then
+    if not memory_only and self.storage.put_height_index then
       self.storage.put_height_index(cur.height, validation.compute_block_hash(cur.header))
     end
     if cur.height == 0 then break end
@@ -2321,8 +2323,15 @@ end
 --- is harmless.
 -- @param header block_header: the header of the just-connected block
 -- @param height number: the absolute height it was connected at
+-- @param opts table|nil: {memory_only = true} advances the in-memory header
+--   chain (map, height_to_hash, header tip) but never writes the persisted
+--   height index.  submitblock uses it: the persisted index belongs to the
+--   chainstate activation path (its own atomic batch), and a header that only
+--   wins the header-work compare must not repoint heights the active chain
+--   still owns (hashhog/lunarblock#26 review: getchaintips moved in the
+--   failed_reorg scenarios).
 -- @return boolean: true on success
-function HeaderChain:add_mined_tip(header, height)
+function HeaderChain:add_mined_tip(header, height, opts)
   local hash = validation.compute_block_hash(header)
   local hash_hex = types.hash256_hex(hash)
   if self.headers[hash_hex] then
@@ -2367,7 +2376,7 @@ function HeaderChain:add_mined_tip(header, height)
   if consensus.work_compare(work, current_tip_work) > 0 then
     self.header_tip_hash = hash
     self.header_tip_height = height
-    self:_point_heights_at(hash_hex, entry)
+    self:_point_heights_at(hash_hex, entry, opts and opts.memory_only)
   end
   return true
 end

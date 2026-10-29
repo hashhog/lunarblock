@@ -13367,7 +13367,10 @@ end
     -- empty `headers` and never syncs; it also left peer_manager.our_height
     -- (advertised in VERSION) at the stale header tip.
     if rpc.chain_state and rpc.header_chain and rpc.header_chain.add_mined_tip then
-      rpc.header_chain:add_mined_tip(block.header, new_height)
+      -- memory_only: the persisted height index is written by the
+      -- accept_block batch above (chainstate activation), not by the header
+      -- chain, so a header-work win here cannot repoint heights on disk.
+      rpc.header_chain:add_mined_tip(block.header, new_height, {memory_only = true})
       if rpc.peer_manager and rpc.header_chain.header_tip_height then
         rpc.peer_manager.our_height = rpc.header_chain.header_tip_height
       end
