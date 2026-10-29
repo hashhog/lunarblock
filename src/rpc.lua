@@ -9405,8 +9405,8 @@ end
   -- send_to / fund errors that are "not enough money" are -6, not -4.
   local function spend_failure(err)
     local msg = err or "Failed to create transaction"
-    -- Core spend.cpp send paths map every CreateTransaction failure, including
-    -- "Fee estimation failed. Fallbackfee is disabled...", to -6.
+    -- Core SendMoney (sendtoaddress/sendmany) maps every CreateTransaction
+    -- failure, including "Fee estimation failed...", to -6; send() is -4.
     if type(msg) == "string" and (msg:find("nsufficient") or msg:find("^Fee estimation failed") or msg:find("No available UTXO")) then
       return {code = M.ERROR.INSUFFICIENT_FUNDS, message = msg}
     end
@@ -10763,7 +10763,15 @@ end
     local send_opts = {}
     if fee_rate ~= nil then send_opts.fee_rate = fee_rate end
     local tx, err = wallet:send_to(recipients, send_opts)
-    if not tx then error(spend_failure(err)) end
+    if not tx then
+      -- Core send() funds through FundTransaction, which throws
+      -- RPC_WALLET_ERROR (-4) for a fee failure; -6 is SendMoney's
+      -- (sendtoaddress/sendmany).
+      if type(err) == "string" and err:find("^Fee estimation failed") then
+        error({code = M.ERROR.WALLET_ERROR, message = err})
+      end
+      error(spend_failure(err))
+    end
 
     if wallet.save_if_dirty then
       wallet:mark_dirty()
@@ -12499,7 +12507,7 @@ end
     local est_output_vsize = 31
     local est_vsize = est_overhead + (#inputs + 1) * est_input_vsize
                       + (#outputs + 1) * est_output_vsize
-    local fee = math.ceil(est_vsize * fee_rate)
+    local fee = wallet_mod.fee_for_vsize(fee_rate, est_vsize)
 
     local needed = total_out + fee - user_total_in
     local change_pos = -1
@@ -12551,7 +12559,7 @@ end
       -- Recompute fee + change with the final input count.
       est_vsize = est_overhead + #inputs * est_input_vsize
                   + (#outputs + 1) * est_output_vsize
-      fee = math.ceil(est_vsize * fee_rate)
+      fee = wallet_mod.fee_for_vsize(fee_rate, est_vsize)
       local total_in = user_total_in + extra_in
       change = total_in - total_out - fee
       if change > wallet_mod.DUST_THRESHOLD then
