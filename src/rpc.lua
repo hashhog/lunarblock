@@ -13,6 +13,7 @@ local script_mod = require("lunarblock.script")
 local address_mod = require("lunarblock.address")
 local bit = require("bit")
 local storage_mod = require("lunarblock.storage")
+local chaintips = require("lunarblock.chaintips")
 local M = {}
 
 --- Map a decoded JSON value to Bitcoin Core's uvTypeName spelling.
@@ -4277,6 +4278,49 @@ function RPCServer:register_methods()
   end
 
   -- Block invalidation methods
+  -- Tell the header/download layer a block failed (LB-3, see invalidateblock).
+  local function mark_header_layer_invalid(rpc, hash, why)
+    local hx = types.hash256_hex(hash)
+    if rpc.block_downloader and rpc.block_downloader.mark_block_invalid
+        and rpc.header_chain and rpc.header_chain.headers
+        and rpc.header_chain.headers[hx] then
+      local ok_m, err_m = pcall(rpc.block_downloader.mark_block_invalid,
+        rpc.block_downloader, hx, why)
+      if not ok_m then
+        print("[" .. why .. "] header-layer mark failed (non-fatal): " .. tostring(err_m))
+      end
+    elseif rpc.header_chain and rpc.header_chain.mark_failed then
+      pcall(rpc.header_chain.mark_failed, rpc.header_chain, hx)
+    end
+  end
+
+  -- ActivateBestChain after invalidateblock / reconsiderblock
+  -- (ChainState:activate_best_chain), then the same post-reorg sync as
+  -- preciousblock / the submitblock reorg arm.
+  local function activate_best_chain(rpc)
+    local result, new_tip = rpc.chain_state:activate_best_chain({
+      mempool = rpc.mempool,
+      header_chain = rpc.header_chain,
+      on_block_failed = function(h)
+        mark_header_layer_invalid(rpc, h, "activatebestchain")
+      end,
+    })
+    if result ~= "connected" then return end
+    if rpc.block_downloader and rpc.block_downloader.next_connect_height then
+      local new_h = rpc.chain_state.tip_height or 0
+      if new_h >= rpc.block_downloader.next_connect_height then
+        rpc.block_downloader.next_connect_height = new_h + 1
+        rpc.block_downloader.next_download_height = new_h + 1
+      end
+    end
+    if rpc.mempool then
+      local new_block = rpc.storage.get_block(new_tip)
+      if new_block then
+        rpc.mempool:on_block_connected(new_block)
+      end
+    end
+  end
+
   self.methods["invalidateblock"] = function(rpc, params)
     local blockhash = params[1]
     -- ParseHashV parity (bitcoin-core/src/rpc/util.cpp:117): a malformed
@@ -4312,18 +4356,7 @@ function RPCServer:register_methods()
     -- resident descendants failed, moves the header tip to the best valid
     -- header, drops their in-flight / pending entries and re-anchors the
     -- cursors on the (now lower) active tip.
-    local hx = types.hash256_hex(hash)
-    if rpc.block_downloader and rpc.block_downloader.mark_block_invalid
-        and rpc.header_chain and rpc.header_chain.headers
-        and rpc.header_chain.headers[hx] then
-      local ok_m, err_m = pcall(rpc.block_downloader.mark_block_invalid,
-        rpc.block_downloader, hx, "invalidateblock")
-      if not ok_m then
-        print("[invalidateblock] header-layer mark failed (non-fatal): " .. tostring(err_m))
-      end
-    elseif rpc.header_chain and rpc.header_chain.mark_failed then
-      pcall(rpc.header_chain.mark_failed, rpc.header_chain, hx)
-    end
+    mark_header_layer_invalid(rpc, hash, "invalidateblock")
     -- The tip may have dropped: evict entries that are no longer final /
     -- BIP-68-final / mature at the new tip+1 (Core InvalidateBlock ->
     -- MaybeUpdateMempoolForReorg -> removeForReorg).
@@ -4333,6 +4366,10 @@ function RPCServer:register_methods()
         print("[invalidateblock] mempool remove_for_reorg failed (non-fatal): " .. tostring(err_rr))
       end
     end
+
+    -- Core invalidateblock: ActivateBestChain after InvalidateBlock.  A
+    -- stored side branch with more work than the new tip is connected.
+    activate_best_chain(rpc)
 
     return cjson.null
   end
@@ -4359,17 +4396,9 @@ function RPCServer:register_methods()
       error({code = M.ERROR.INVALID_ADDRESS, message = "Block not found"})
     end
 
-    -- Reconsider the block.  Snapshot the failed set first: the hashes it
-    -- clears are the new chain-selection candidates.
-    local was_invalid = {}
-    for hb in pairs(rpc.chain_state.invalid_blocks or {}) do was_invalid[hb] = true end
     local ok, err = rpc.chain_state:reconsider_block(hash)
     if not ok then
       error({code = M.ERROR.MISC_ERROR, message = err or "Failed to reconsider block"})
-    end
-    local cleared = {}
-    for hb in pairs(was_invalid) do
-      if not rpc.chain_state.invalid_blocks[hb] then cleared[hb] = true end
     end
 
     -- The P2P download path keeps its own failed set (seeded from
@@ -4386,24 +4415,7 @@ function RPCServer:register_methods()
     end
 
     -- Core ReconsiderBlock: ActivateBestChain after the flags are reset.
-    local result, new_tip = rpc.chain_state:activate_best_chain_after_reconsider(
-      hash, cleared, { mempool = rpc.mempool })
-    if result == "connected" then
-      -- Same post-reorg sync as preciousblock / the submitblock reorg arm.
-      if rpc.block_downloader and rpc.block_downloader.next_connect_height then
-        local new_h = rpc.chain_state.tip_height or 0
-        if new_h >= rpc.block_downloader.next_connect_height then
-          rpc.block_downloader.next_connect_height = new_h + 1
-          rpc.block_downloader.next_download_height = new_h + 1
-        end
-      end
-      if rpc.mempool then
-        local new_block = rpc.storage.get_block(new_tip)
-        if new_block then
-          rpc.mempool:on_block_connected(new_block)
-        end
-      end
-    end
+    activate_best_chain(rpc)
 
     return cjson.null
   end
@@ -12873,6 +12885,31 @@ end
       if cw then chainwork_hex = cw end
     end
 
+    -- A block off the active chain still has a height and a chainwork in Core
+    -- (pindex->nHeight, pindex->nChainWork): walk its parents down to the
+    -- active chain and add their proof to the chainwork at the fork.  Only
+    -- the confirmations (-1) and nextblockhash (absent) say it is off-chain.
+    local off_height
+    if not block_height and rpc.chain_state and rpc.chain_state.active_height_of then
+      local side, cur, cur_hdr = consensus.work_zero(), hash, header
+      for depth = 1, 10000000 do
+        side = consensus.work_add(side, consensus.get_block_work(cur_hdr.bits))
+        cur = cur_hdr.prev_hash
+        local fork_h = rpc.chain_state:active_height_of(cur, 0)
+        if fork_h then
+          off_height = fork_h + depth
+          local cw = compute_chainwork(rpc.storage, fork_h, rpc.network)
+          if cw then
+            chainwork_hex = consensus.work_to_hex(
+              consensus.work_add(consensus.work_from_hex(cw), side))
+          end
+          break
+        end
+        cur_hdr = rpc.storage.get_header(cur)
+        if not cur_hdr then break end
+      end
+    end
+
     -- nTx: number of transactions in the block. Prefer the stored block body;
     -- fall back to 1 (every connected block has at least the coinbase) when the
     -- body is absent (header-only / pruned). No external node is consulted.
@@ -12901,7 +12938,7 @@ end
     local seq = {
       "hash",          blockhash,
       "confirmations", confirmations,
-      "height",        block_height or 0,
+      "height",        block_height or off_height or 0,
       "version",       header.version,
       "versionHex",    string.format("%08x", header.version),
       "merkleroot",    types.hash256_hex(header.merkle_root),
@@ -12999,23 +13036,27 @@ end
   end
 
   --- getchaintips: Return information about all known chain tips.
+  -- Every block-index leaf plus the active tip, with Core's status and
+  -- branchlen (rpc/blockchain.cpp getchaintips) -- see src/chaintips.lua.
   self.methods["getchaintips"] = function(rpc, _params)
-    local tip_height = 0
-    local tip_hash = types.hash256_zero()
-    if rpc.chain_state then
-      tip_height = rpc.chain_state.tip_height or 0
-      tip_hash = rpc.chain_state.tip_hash or types.hash256_zero()
-    end
+    local tips = chaintips.tips({
+      storage = rpc.storage,
+      chain_state = rpc.chain_state,
+      header_chain = rpc.header_chain
+        or (rpc.chain_state and rpc.chain_state.header_index),
+    })
     -- Core key order (rpc/blockchain.cpp getchaintips): height, hash,
     -- branchlen, status. Emit as an ordered array of ordered objects.
-    return { _raw_json = M._oj_value(M._oj_array({
-      M._oj({
-        "height",    tip_height,
-        "hash",      types.hash256_hex(tip_hash),
-        "branchlen", 0,
-        "status",    "active",
-      }),
-    })) }
+    local objs = {}
+    for i, t in ipairs(tips) do
+      objs[i] = M._oj({
+        "height",    t.height,
+        "hash",      t.hash,
+        "branchlen", t.branchlen,
+        "status",    t.status,
+      })
+    end
+    return { _raw_json = M._oj_value(M._oj_array(objs)) }
   end
 
   --- getdifficulty: Return the proof-of-work difficulty as a multiple of minimum.

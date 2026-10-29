@@ -13,6 +13,7 @@ local mining = require("lunarblock.mining")
 local blockfilter = require("lunarblock.blockfilter")
 local prune_mod = require("lunarblock.prune")
 local bit = require("bit")
+local chaintips_mod = require("lunarblock.chaintips")
 local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 -- MIN_BLOCKS_TO_KEEP: reused from prune_mod (= 288).  Blocks this far ahead
 -- of the active tip are not stored when the block was not explicitly requested
@@ -2078,6 +2079,14 @@ function M.new_chain_state(storage, network)
   self.pruner = nil
   -- Set of invalidated block hashes (keyed by hash bytes for fast lookup)
   self.invalid_blocks = {}
+  -- Core CBlockIndex::nSequenceId, the equal-work tie-break of chain
+  -- selection (see ChainState:block_sequence_id).  In memory only, as in
+  -- Core: ids start at SEQ_ID_INIT_FROM_DISK + 1 on every start.
+  self.block_seq = {}
+  self.next_block_seq = 2
+  -- Active tip loaded at init (Core marks that chain SEQ_ID_BEST_CHAIN_FROM_DISK).
+  self.boot_tip_hash = nil
+  self.boot_tip_height = -1
   -- Signature verification cache (avoids re-verifying scripts during IBD/reorg)
   self.sig_cache = sig_cache.new(50000)
   -- Optional notification callbacks (for ZMQ, etc.)
@@ -2485,6 +2494,8 @@ function ChainState:init()
     -- No chain tip stored yet: build and connect the genesis block
     self:connect_genesis()
   end
+  self.boot_tip_hash = self.tip_hash
+  self.boot_tip_height = self.tip_height
   -- Load invalid blocks set from storage
   self:load_invalid_blocks()
   -- Seed the coinstatsindex in-memory accumulator from the tip snapshot
@@ -2995,6 +3006,46 @@ end
 -- @return boolean: true if the block is invalid
 function ChainState:is_block_invalid(block_hash)
   return self.invalid_blocks[block_hash.bytes] == true
+end
+
+--- Record that a block body arrived (Core ReceivedBlockTransactions:
+--- pindexNew->nSequenceId = nBlockSequenceId++).  The first arrival counts.
+-- Recorded where a block enters off the active tip (accept_side_branch_block);
+-- a block connected straight onto the tip is not recorded and reads as 1
+-- below, i.e. ahead of every side-branch block received since the start.
+-- A block whose body is already stored (a reorg or preciousblock re-running
+-- the orchestrator on it) keeps the id it reads as now: Core never renumbers.
+-- @param hash_bytes string: raw block hash
+-- @param height number: the block's height
+function ChainState:note_block_received(hash_bytes, height)
+  if self.block_seq[hash_bytes] ~= nil then return end
+  if self.storage.get(storage_mod.CF.BLOCKS, hash_bytes) ~= nil then
+    self.block_seq[hash_bytes] = self:block_sequence_id(hash_bytes, height)
+    return
+  end
+  self.block_seq[hash_bytes] = self.next_block_seq
+  self.next_block_seq = self.next_block_seq + 1
+end
+
+--- Core nSequenceId of a block, for the equal-work tie-break
+--- (CBlockIndexWorkComparator: lower id wins).  Blocks not received since
+--- the start read as Core's values after LoadBlockIndex: 0 on the chain that
+--- was active at load (SEQ_ID_BEST_CHAIN_FROM_DISK), 1 elsewhere
+--- (SEQ_ID_INIT_FROM_DISK).
+-- @param hash_bytes string: raw block hash
+-- @param height number: the block's height
+-- @return number
+function ChainState:block_sequence_id(hash_bytes, height)
+  local s = self.block_seq[hash_bytes]
+  if s then return s end
+  local cur, h = self.boot_tip_hash, self.boot_tip_height
+  if not cur or height > h then return 1 end
+  while h > height do
+    local hdr = self.storage.get_header(cur)
+    if not hdr then return 1 end
+    cur, h = hdr.prev_hash, h - 1
+  end
+  return cur.bytes == hash_bytes and 0 or 1
 end
 
 --------------------------------------------------------------------------------
@@ -4839,6 +4890,8 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- CBlockIndexWorkComparator sorts it ahead of equal-work peers that were
   -- received earlier (validation.cpp Chainstate::PreciousBlock).
   local work_cmp = consensus.work_compare(side_work, active_work)
+  -- Every path below stores the body: it has now been received.
+  self:note_block_received(block_hash.bytes, side_chain[1].height)
   local store_without_reorg
   if opts.precious then
     store_without_reorg = (work_cmp < 0)
@@ -5543,6 +5596,12 @@ function ChainState:disconnect_block(block, height, block_hash, prev_hash, reorg
     if had_undo then
       batch.delete(storage_mod.CF.UNDO, disconnect_hash.bytes)
     end
+    -- Remember that this block was connected once (Core: BLOCK_VALID_SCRIPTS
+    -- stays set on a disconnected block index entry).  Read only by
+    -- getchaintips to tell "valid-fork" from "valid-headers"; no validation
+    -- or chain-selection decision reads it.
+    batch.put(storage_mod.CF.META,
+              chaintips_mod.WAS_CONNECTED_PREFIX .. disconnect_hash.bytes, "\1")
     -- Pattern C0 (revised): txindex entries are NOT deleted on disconnect —
     -- Core's TxIndex has no CustomRemove, so entries survive reorgs.  The
     -- former delete loop has been removed; getrawtransaction on an orphaned
@@ -6015,78 +6074,90 @@ function ChainState:clear_descendant_invalid_flags(block_hash)
   end
 end
 
---- ActivateBestChain after reconsiderblock (Core ReconsiderBlock,
---- rpc/blockchain.cpp: ResetBlockFailureFlags, then ActivateBestChain).
--- reconsider_block only clears flags.  Without this the node stayed on the
--- chain it fell back to at invalidateblock: the reconsidered block was never
--- reconnected, so the tip stayed below Core's and the block's txs stayed in
--- the mempool.  The chains that can now beat the tip are the ones through a
--- block whose flag was just cleared: the reconsidered block and its cleared
--- descendants (Core re-adds exactly those to setBlockIndexCandidates).  Each
--- one with a body is tried, most work first, through the same reorg
--- orchestrator submitblock uses (accept_side_branch_block), which compares
--- work with the active chain and reorgs only to a strictly heavier branch.
--- A candidate that fails to connect is skipped and the next one is tried
--- (Core ActivateBestChainStep: InvalidBlockFound, then the next candidate).
--- @param block_hash hash256: the reconsidered block
--- @param cleared table: set of hash bytes whose invalid flag was cleared
--- @param opts table|nil: { mempool = <mempool> }
+--- ActivateBestChain for invalidateblock and reconsiderblock (Core
+--- rpc/blockchain.cpp: InvalidateBlock / ResetBlockFailureFlags, then
+--- ActivateBestChain).
+-- invalidate_block only disconnects and reconsider_block only clears flags;
+-- the chain they leave the node on is not necessarily the best one.  Core
+-- then connects the most-work candidate (setBlockIndexCandidates: every block
+-- with all its data, not failed, with at least the tip's work), equal work
+-- going to the lower sequence id (block_sequence_id).  Without this the node
+-- stayed on the invalidated block's parent when a stored side branch had
+-- more work, and a later reconsiderblock reconnected the reconsidered block
+-- over a side branch Core had moved to and kept.
+--
+-- Candidates come from the block index (chaintips.candidates).  Each one is
+-- connected through the reorg orchestrator submitblock uses
+-- (accept_side_branch_block; an equal-work winner goes through its
+-- preciousblock arm, which also reorgs on a tie).  A candidate that fails
+-- ConnectBlock with a consensus verdict is marked invalid with its
+-- descendants and the next one is tried (Core ActivateBestChainStep ->
+-- InvalidChainFound); the failed attempt itself was rolled back whole by
+-- abort_reorg, so a valid prefix is then picked up as a candidate of its own.
+-- Anything else (no verdict, a missing body) stops here, leaving the tip as it
+-- was.
+-- @param opts table|nil: { mempool = <mempool>, header_chain = <HeaderChain>,
+--   on_block_failed = function(hash256) for each block marked invalid }
 -- @return "connected" | "noop", hash256|nil (the new tip when connected)
-function ChainState:activate_best_chain_after_reconsider(block_hash, cleared, opts)
+function ChainState:activate_best_chain(opts)
   opts = opts or {}
-  local root = block_hash.bytes
-  local root_header = self.storage.get_header(block_hash)
-  if not root_header then return "noop" end
-
-  -- Work from the reconsidered block (inclusive) up to each candidate; false
-  -- for a cleared hash that does not descend from it (a cleared ancestor).
-  local work_of = { [root] = consensus.get_block_work(root_header.bits) }
-  local function work_to_root(hb)
-    local path, cur = {}, hb
-    while work_of[cur] == nil do
-      local hdr = cleared[cur] and self.storage.get_header(types.hash256(cur))
-      if not hdr then work_of[cur] = false break end
-      path[#path + 1] = { cur, hdr.bits }
-      cur = hdr.prev_hash.bytes
+  local connected = false
+  local ctx = { storage = self.storage, chain_state = self,
+                header_chain = opts.header_chain or self.header_index }
+  for _ = 1, 1000 do
+    local cands = chaintips_mod.candidates(ctx)
+    if #cands == 0 then break end
+    -- Most work first (each side compared above its own fork: a beats b when
+    -- a.side + b.active > b.side + a.active), then the lower sequence id.
+    for _, c in ipairs(cands) do
+      c.seq = self:block_sequence_id(c.bytes, c.height)
     end
-    local w = work_of[cur]
-    for i = #path, 1, -1 do
-      if w then w = consensus.work_add(w, consensus.get_block_work(path[i][2])) end
-      work_of[path[i][1]] = w
+    table.sort(cands, function(a, b)
+      local c = consensus.work_compare(
+        consensus.work_add(a.side_work, b.active_work),
+        consensus.work_add(b.side_work, a.active_work))
+      if c ~= 0 then return c > 0 end
+      if a.seq ~= b.seq then return a.seq < b.seq end
+      return a.bytes < b.bytes
+    end)
+    local best = cands[1]
+    local tie = consensus.work_compare(best.side_work, best.active_work) == 0
+    if tie and best.seq >= self:block_sequence_id(self.tip_hash.bytes, self.tip_height) then
+      break
     end
-    return work_of[hb]
-  end
-
-  local candidates = {}
-  local seen = { [root] = true }
-  candidates[1] = { bytes = root, work = work_of[root] }
-  for hb in pairs(cleared) do
-    if not seen[hb] then
-      seen[hb] = true
-      local w = work_to_root(hb)
-      if w then candidates[#candidates + 1] = { bytes = hb, work = w } end
-    end
-  end
-  table.sort(candidates, function(a, b)
-    local c = consensus.work_compare(a.work, b.work)
-    if c ~= 0 then return c > 0 end
-    return a.bytes < b.bytes
-  end)
-
-  for _, c in ipairs(candidates) do
-    local h = types.hash256(c.bytes)
-    if self.tip_hash and self.tip_hash.bytes == c.bytes then return "noop" end
+    local h = types.hash256(best.bytes)
     local block = self.storage.get_block(h)
-    if block then
-      local result = self:accept_side_branch_block(block, h,
-        { skip_scripts = false, nosync = false, mempool = opts.mempool })
-      if result == "connected" then return "connected", h end
-      -- "stored": the most-work remaining candidate is not heavier than
-      -- the active chain, so none of the lighter ones is either.
-      if result == "stored" then return "noop" end
+    if not block then break end
+    local result, err = self:accept_side_branch_block(block, h,
+      { precious = tie, skip_scripts = false, nosync = false, mempool = opts.mempool })
+    if result == "connected" then
+      connected = true
+    elseif result ~= nil then
+      break
+    else
+      local failed = self:_failed_candidate_block(best, err)
+      if not failed then break end
+      self.invalid_blocks[failed.bytes] = true
+      self:mark_descendant_invalid(failed)
+      self:save_invalid_blocks()
+      if opts.on_block_failed then opts.on_block_failed(failed) end
     end
   end
+  if connected then return "connected", self.tip_hash end
   return "noop"
+end
+
+--- The block a failed candidate connect condemns, or nil when the error is
+--- not a consensus verdict on one block of the candidate's branch.
+-- accept_side_branch_block reports a ConnectBlock failure as
+-- "reorg-connect-failed at height H: <reason>".
+function ChainState:_failed_candidate_block(cand, err)
+  if type(err) ~= "string" then return nil end
+  local h, reason = err:match("^reorg%-connect%-failed at height (%d+): (.*)$")
+  if not h then return nil end
+  if not require("lunarblock.sync").is_invalid_block_verdict(reason) then return nil end
+  local b = cand.chain[tonumber(h) - cand.fork_height]
+  return b and types.hash256(b) or nil
 end
 
 --- Get the list of currently invalidated block hashes.
