@@ -12885,6 +12885,31 @@ end
       if cw then chainwork_hex = cw end
     end
 
+    -- A block off the active chain still has a height and a chainwork in Core
+    -- (pindex->nHeight, pindex->nChainWork): walk its parents down to the
+    -- active chain and add their proof to the chainwork at the fork.  Only
+    -- the confirmations (-1) and nextblockhash (absent) say it is off-chain.
+    local off_height
+    if not block_height and rpc.chain_state and rpc.chain_state.active_height_of then
+      local side, cur, cur_hdr = consensus.work_zero(), hash, header
+      for depth = 1, 10000000 do
+        side = consensus.work_add(side, consensus.get_block_work(cur_hdr.bits))
+        cur = cur_hdr.prev_hash
+        local fork_h = rpc.chain_state:active_height_of(cur, 0)
+        if fork_h then
+          off_height = fork_h + depth
+          local cw = compute_chainwork(rpc.storage, fork_h, rpc.network)
+          if cw then
+            chainwork_hex = consensus.work_to_hex(
+              consensus.work_add(consensus.work_from_hex(cw), side))
+          end
+          break
+        end
+        cur_hdr = rpc.storage.get_header(cur)
+        if not cur_hdr then break end
+      end
+    end
+
     -- nTx: number of transactions in the block. Prefer the stored block body;
     -- fall back to 1 (every connected block has at least the coinbase) when the
     -- body is absent (header-only / pruned). No external node is consulted.
@@ -12913,7 +12938,7 @@ end
     local seq = {
       "hash",          blockhash,
       "confirmations", confirmations,
-      "height",        block_height or 0,
+      "height",        block_height or off_height or 0,
       "version",       header.version,
       "versionHex",    string.format("%08x", header.version),
       "merkleroot",    types.hash256_hex(header.merkle_root),

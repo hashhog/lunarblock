@@ -218,6 +218,30 @@ describe("invalidateblock / reconsiderblock activate the best chain (Core Activa
     assert.same(want, tips())
   end)
 
+  -- failed_reorg */displaced-header: Core's getblockheader of a block off the
+  -- active chain keeps its height and chainwork (pindex->nHeight /
+  -- nChainWork); only confirmations (-1) and the missing nextblockhash tell.
+  it("getblockheader of a block off the active chain keeps its height and chainwork", function()
+    local function header(h)
+      return cjson.decode(call("getblockheader", hx(h))._raw_json)
+    end
+    local on_chain = header(hashes[10])
+    assert.equal(10, on_chain.height)
+    assert.equal(1, on_chain.confirmations)
+    local _, s10h = equal_work_side()
+    local side = header(s10h)  -- stored, never connected
+    assert.equal(10, side.height)
+    assert.equal(-1, side.confirmations)
+    assert.equal(on_chain.chainwork, side.chainwork)
+    call("invalidateblock", hx(hashes[10]))
+    local displaced = header(hashes[10])
+    assert.equal(10, displaced.height)
+    assert.equal(-1, displaced.confirmations)
+    assert.equal(on_chain.chainwork, displaced.chainwork)
+    assert.is_nil(displaced.nextblockhash)
+    assert.equal(1, header(s10h).confirmations)  -- now the active tip
+  end)
+
   -- Controls: nothing heavier than the parent, or only a lighter side branch,
   -- leaves invalidateblock where it was before this change.
   it("control: invalidateblock with no side branch stays on the parent", function()
