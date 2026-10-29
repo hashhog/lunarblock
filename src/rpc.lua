@@ -9394,7 +9394,9 @@ end
   -- send_to / fund errors that are "not enough money" are -6, not -4.
   local function spend_failure(err)
     local msg = err or "Failed to create transaction"
-    if type(msg) == "string" and (msg:find("nsufficient") or msg:find("No available UTXO")) then
+    -- Core spend.cpp send paths map every CreateTransaction failure, including
+    -- "Fee estimation failed. Fallbackfee is disabled...", to -6.
+    if type(msg) == "string" and (msg:find("nsufficient") or msg:find("^Fee estimation failed") or msg:find("No available UTXO")) then
       return {code = M.ERROR.INSUFFICIENT_FUNDS, message = msg}
     end
     return {code = M.ERROR.WALLET_ERROR, message = msg}
@@ -12472,7 +12474,15 @@ end
     -- built at the 1 sat/vB fallback (effective-feerate ~1 instead of the
     -- requested rate). Honour `fee_rate` first, then the legacy `feeRate`.
     local fee_rate = options.fee_rate or options.feeRate
-                     or wallet:estimate_fee_rate(options.conf_target) or 1
+    if not fee_rate then
+      -- Core FundTransaction -> RPC_WALLET_ERROR when there is no estimate
+      -- and no -fallbackfee.
+      local ferr
+      fee_rate, ferr = wallet:estimate_fee_rate(options.conf_target)
+      if not fee_rate then
+        error({code = M.ERROR.WALLET_ERROR, message = ferr})
+      end
+    end
     local est_overhead = 11
     local est_input_vsize = 68
     local est_output_vsize = 31

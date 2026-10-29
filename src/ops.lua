@@ -138,6 +138,7 @@ function M.apply_conf_to_args(args, defaults, conf)
     connect       = {"connect",       "string"},
     printtoconsole = {"printtoconsole", "bool"},
     nowalletcreate = {"nowalletcreate", "bool"},
+    fallbackfee   = {"fallbackfee",   "number"},
     daemon        = {"daemon",        "bool"},
     reindex       = {"reindex",       "bool"},
     prune         = {"prune",         "number"},

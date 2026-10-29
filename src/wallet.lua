@@ -2513,21 +2513,41 @@ function M.sign_input_p2tr_keypath(tx, input_index, prev_outputs, privkey32, has
   end
 end
 
---- Estimate fee rate for a transaction.
+-- Core -fallbackfee (wallet/wallet.h DEFAULT_FALLBACK_FEE = 0, i.e. disabled).
+-- Held in sat/vB; nil/0 = disabled. Set once at startup by main.lua from
+-- --fallbackfee (BTC/kvB, Core's unit).
+M.fallback_fee_rate = nil
+-- Node-wide fee estimator, wired by main.lua; a wallet's own estimator wins.
+M.fee_estimator = nil
+-- Core wallet/fees.cpp floors the result at the relay fee.
+M.MIN_RELAY_FEE_RATE = 1
+M.FEE_ESTIMATION_FAILED = "Fee estimation failed. Fallbackfee is disabled. " ..
+  "Wait a few blocks or enable -fallbackfee."
+
+--- Estimate fee rate for a transaction (Core wallet/fees.cpp
+-- minimum-fee-rate computation): a RELIABLE estimator answer, else -fallbackfee, else
+-- failure. An estimator with no data does not count as an answer.
 -- @param conf_target number: Desired confirmation target in blocks (default 6)
--- @return number: Fee rate in sat/vB
+-- @return number|nil: Fee rate in sat/vB, or nil when no estimate and no fallback
+-- @return string|nil: Error message when nil
 function Wallet:estimate_fee_rate(conf_target)
   conf_target = conf_target or 6
 
-  if self.fee_estimator then
-    local fee_rate = self.fee_estimator:estimate_smart_fee(conf_target)
-    if fee_rate then
-      return fee_rate
+  local est = self.fee_estimator or M.fee_estimator
+  if est then
+    local fee_rate, reliable = est:estimate_fee(conf_target, 0.85)
+    if not reliable then
+      fee_rate, reliable = est:estimate_fee(conf_target * 2, 0.60)
+    end
+    if reliable and fee_rate and fee_rate > 0 then
+      return math.max(fee_rate, M.MIN_RELAY_FEE_RATE)
     end
   end
 
-  -- Fallback: use default minimum relay fee
-  return 1  -- 1 sat/vB
+  if M.fallback_fee_rate and M.fallback_fee_rate > 0 then
+    return math.max(M.fallback_fee_rate, M.MIN_RELAY_FEE_RATE)
+  end
+  return nil, M.FEE_ESTIMATION_FAILED
 end
 
 --- Create and sign a transaction.
@@ -2558,7 +2578,12 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
   end
 
   -- 2. Get fee rate
-  local fee_rate = options.fee_rate or self:estimate_fee_rate(options.conf_target)
+  local fee_rate = options.fee_rate
+  if not fee_rate then
+    local ferr
+    fee_rate, ferr = self:estimate_fee_rate(options.conf_target)
+    if not fee_rate then return nil, ferr end
+  end
 
   -- 3. Get available UTXOs
   local include_unconfirmed = options.include_unconfirmed ~= false

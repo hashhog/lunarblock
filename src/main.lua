@@ -42,6 +42,7 @@ local function default_args()
     regtest = false,
     printtoconsole = false,
     nowalletcreate = false,
+    fallbackfee = nil,        -- Core -fallbackfee, BTC/kvB; nil = disabled (Core default 0)
     reindex = false,
     reindex_chainstate = false,
     daemon = false,
@@ -151,6 +152,7 @@ local function parse_args(argv)
       print("      --regtest           Use regtest")
       print("      --printtoconsole    Print log to console")
       print("      --nowalletcreate    Do not create wallet on first run")
+      print("      --fallbackfee AMT   Wallet fee rate (BTC/kvB) used when fee estimation has no data (default: 0 = disabled)")
       print("      --reindex           Rebuild UTXO set from blocks")
       print("      --reindex-chainstate Rebuild chainstate (UTXO set) from on-disk blocks")
       print("      --daemon            Run as daemon")
@@ -264,6 +266,18 @@ local function parse_args(argv)
       args.printtoconsole = true
     elseif arg == "--nowalletcreate" then
       args.nowalletcreate = true
+    elseif arg == "--fallbackfee" or arg:match("^%-%-fallbackfee=") then
+      -- Core -fallbackfee=<amt>: BTC/kvB used by the wallet when fee
+      -- estimation has no data. 0 (default) disables it: sends then fail
+      -- with "Fee estimation failed. Fallbackfee is disabled...".
+      local v = arg:match("^%-%-fallbackfee=(.*)$")
+      if v == nil then i = i + 1; v = argv[i] end
+      args.fallbackfee = tonumber(v)
+      if args.fallbackfee == nil or args.fallbackfee < 0 then
+        io.stderr:write("Error: Invalid amount for -fallbackfee=<amount>: '" ..
+          tostring(v) .. "'\n")
+        os.exit(1)
+      end
     elseif arg == "--reindex" then
       args.reindex = true
     elseif arg == "--reindex-chainstate" then
@@ -3094,11 +3108,20 @@ local function main()
   -- loaded wallet, not only the default; this startup reconcile covers the gap
   -- a wallet spent offline.
   wallet_manager:set_chain_context(chain_state, mempool)
+  -- Wallet fee policy (Core wallet/fees.cpp): estimator, else -fallbackfee
+  -- (BTC/kvB -> sat/vB), else the send fails.
+  wallet_mod.fee_estimator = fee_estimator
+  wallet_mod.fallback_fee_rate = args.fallbackfee and args.fallbackfee > 0
+    and (args.fallbackfee * 1e8 / 1000) or nil
 
   -- Load or create default wallet (backward compatible)
   local wallet = nil
   local default_wallet_path = datadir .. "/wallet.json"
-  if not args.nowalletcreate then
+  -- Core creates and loads no wallet at startup on regtest (and, since 0.21,
+  -- anywhere): a wallet exists only when createwallet/loadwallet asks for it.
+  -- Mainnet/testnet keep the legacy auto-created default for existing datadirs.
+  local skip_default_wallet = args.nowalletcreate or network.name == "regtest"
+  if not skip_default_wallet then
     -- Try to load existing default wallet. A missing / corrupt / partially
     -- written wallet file MUST NOT crash node startup: M.load is internally
     -- fault-tolerant (quarantines a bad file to .bak, recovers from a
