@@ -43,24 +43,14 @@ local function hex_of(bytes)
   return (bytes:reverse():gsub(".", HEXB))
 end
 
---- Compute the tip list.
--- @param ctx table { storage, chain_state, header_chain (optional) }
--- @return array of { height, hash (hex), branchlen, status }, highest first
-function M.tips(ctx)
+-- The off-chain part of the block index: one pass over CF.HEADERS.
+-- Requires ctx.chain_state.tip_hash and ctx.storage.iterator.
+local function build_index(ctx)
   local cs = ctx.chain_state
   local storage = ctx.storage
   local hc = ctx.header_chain
-  local tip_hash = cs and cs.tip_hash
-  local tip_height = cs and cs.tip_height or 0
-  if not tip_hash then
-    return { { height = tip_height, hash = hex_of(ZERO32), branchlen = 0,
-               status = "active" } }
-  end
-  local active = { { height = tip_height, hash = hex_of(tip_hash.bytes),
-                     branchlen = 0, status = "active" } }
-  if not storage or not storage.iterator then
-    return active
-  end
+  local tip_hash = cs.tip_hash
+  local tip_height = cs.tip_height or 0
 
   local resident = hc and hc.headers
   local h2h = hc and hc.height_to_hash
@@ -177,6 +167,22 @@ function M.tips(ctx)
 
   -- Work of the branch from `k` down to (not including) the fork at
   -- fork_h, against the active chain above fork_h.
+  -- Work of the active chain above fork_h (nil when a header is missing).
+  local act_memo = {}
+  local function active_work_above(fork_h)
+    local act = act_memo[fork_h]
+    if act ~= nil then return act or nil end
+    act = consensus.work_zero()
+    for h = fork_h + 1, tip_height do
+      local a = cs:active_hash_at(h)
+      local hdr = a and storage.get_header(a)
+      if not hdr then act = false break end
+      act = consensus.work_add(act, consensus.get_block_work(hdr.bits))
+    end
+    act_memo[fork_h] = act
+    return act or nil
+  end
+
   local function more_work_than_active(k, fork_h)
     local side = consensus.work_zero()
     local cur = k
@@ -184,63 +190,101 @@ function M.tips(ctx)
       side = consensus.work_add(side, consensus.get_block_work(bits_of[cur]))
       cur = prev_of[cur]
     end
-    local act = consensus.work_zero()
-    for h = fork_h + 1, tip_height do
-      local a = cs:active_hash_at(h)
-      local hdr = a and storage.get_header(a)
-      if not hdr then return false end
-      act = consensus.work_add(act, consensus.get_block_work(hdr.bits))
-    end
+    local act = active_work_above(fork_h)
+    if not act then return false end
     return consensus.work_compare(side, act) > 0
   end
 
-  local out = { active[1] }
-  for k, prev in pairs(prev_of) do
+  -- Walk an off-chain leaf down to the active chain.  Returns the fork
+  -- height (nil when the ancestry is not in the index), whether any block on
+  -- the way is invalid, whether every one has data, and the blocks newest
+  -- first.
+  local function walk(k)
+    local invalid, data = false, true
+    local cur, fork_h = k, nil
+    local path = {}
+    for _ = 1, 10000000 do
+      path[#path + 1] = cur
+      if is_invalid(cur) then invalid = true end
+      if data and not has_data(cur) then data = false end
+      local p = prev_of[cur]
+      if not p then break end  -- unreachable: cur is in prev_of
+      if prev_of[p] then
+        cur = p
+      else
+        -- p is on the active chain (or not in the index at all).
+        local ph = height_of[cur] - 1
+        local ok = on_active(hex_of(p), p, ph)
+        if ok then fork_h = ph end
+        break
+      end
+    end
+    return fork_h, invalid, data, path
+  end
+
+  -- Leaves: off-chain entries that are no off-chain entry's parent.
+  local leaves = {}
+  for k in pairs(prev_of) do
     if not is_parent[k] and k ~= tip_hash.bytes then
-      -- Walk down to the active chain.
-      local invalid, data = false, true
-      local cur, fork_h = k, nil
-      for _ = 1, 10000000 do
-        if is_invalid(cur) then invalid = true end
-        if data and not has_data(cur) then data = false end
-        local p = prev_of[cur]
-        if not p then break end  -- unreachable: cur is in prev_of
-        if prev_of[p] then
-          cur = p
-        else
-          -- p is on the active chain (or not in the index at all).
-          local ph = height_of[cur] - 1
-          local ok = on_active(hex_of(p), p, ph)
-          if ok then fork_h = ph end
-          break
-        end
+      leaves[#leaves + 1] = k
+    end
+  end
+
+  return {
+    height_of = height_of, bits_of = bits_of, leaves = leaves, walk = walk,
+    is_invalid = is_invalid, has_data = has_data, was_connected = was_connected,
+    more_work_than_active = more_work_than_active, active_work_above = active_work_above,
+  }
+end
+
+--- Compute the tip list.
+-- @param ctx table { storage, chain_state, header_chain (optional) }
+-- @return array of { height, hash (hex), branchlen, status }, highest first
+function M.tips(ctx)
+  local cs = ctx.chain_state
+  local storage = ctx.storage
+  local tip_hash = cs and cs.tip_hash
+  local tip_height = cs and cs.tip_height or 0
+  if not tip_hash then
+    return { { height = tip_height, hash = hex_of(ZERO32), branchlen = 0,
+               status = "active" } }
+  end
+  local active = { { height = tip_height, hash = hex_of(tip_hash.bytes),
+                     branchlen = 0, status = "active" } }
+  if not storage or not storage.iterator then
+    return active
+  end
+  local ix = build_index(ctx)
+  local height_of, was_connected = ix.height_of, ix.was_connected
+
+  local out = { active[1] }
+  for _, k in ipairs(ix.leaves) do
+    local fork_h, invalid, data = ix.walk(k)
+    -- No fork on the active chain: the ancestry is not in the index, so
+    -- the branch length is unknowable; leave the leaf out rather than guess.
+    -- Also left out: a "valid" branch with all its data and MORE work than
+    -- the active chain.  Core cannot hold one (ActivateBestChain connects
+    -- it or marks it failed); lunarblock does when a side-branch connect
+    -- failed without a recorded verdict (accept_side_branch_block's
+    -- abort_reorg) or the branch was never activated.  Its real status is
+    -- unknown to this node, so no status is invented for it.
+    if fork_h and not invalid and data
+        and ix.more_work_than_active(k, fork_h) then
+      fork_h = nil
+    end
+    if fork_h then
+      local status
+      if invalid then
+        status = "invalid"
+      elseif not data then
+        status = "headers-only"
+      elseif was_connected(k) then
+        status = "valid-fork"
+      else
+        status = "valid-headers"
       end
-      -- No fork on the active chain: the ancestry is not in the index, so
-      -- the branch length is unknowable; leave the leaf out rather than guess.
-      -- Also left out: a "valid" branch with all its data and MORE work than
-      -- the active chain.  Core cannot hold one (ActivateBestChain connects
-      -- it or marks it failed); lunarblock does when a side-branch connect
-      -- failed without a recorded verdict (accept_side_branch_block's
-      -- abort_reorg) or the branch was never activated.  Its real status is
-      -- unknown to this node, so no status is invented for it.
-      if fork_h and not invalid and data
-          and more_work_than_active(k, fork_h) then
-        fork_h = nil
-      end
-      if fork_h then
-        local status
-        if invalid then
-          status = "invalid"
-        elseif not data then
-          status = "headers-only"
-        elseif was_connected(k) then
-          status = "valid-fork"
-        else
-          status = "valid-headers"
-        end
-        out[#out + 1] = { height = height_of[k], hash = hex_of(k),
-                          branchlen = height_of[k] - fork_h, status = status }
-      end
+      out[#out + 1] = { height = height_of[k], hash = hex_of(k),
+                        branchlen = height_of[k] - fork_h, status = status }
     end
   end
 
@@ -248,6 +292,45 @@ function M.tips(ctx)
     if a.height ~= b.height then return a.height > b.height end
     return a.hash < b.hash
   end)
+  return out
+end
+
+--- Chain-selection candidates off the active chain (Core
+--- setBlockIndexCandidates minus the active tip): on every branch, the
+--- highest block that it and every block down to the fork have data and are
+--- not invalid, when that block has at least the active tip's work.
+-- @param ctx table { storage, chain_state, header_chain (optional) }
+-- @return array of { bytes, height, fork_height, side_work, active_work,
+--   chain (raw hashes from fork + 1 up to the candidate) }; side_work and
+--   active_work are the work above the fork on each side.
+function M.candidates(ctx)
+  local cs = ctx.chain_state
+  if not (cs and cs.tip_hash and ctx.storage and ctx.storage.iterator) then
+    return {}
+  end
+  local ix = build_index(ctx)
+  local out, seen = {}, {}
+  for _, k in ipairs(ix.leaves) do
+    local fork_h, _, _, path = ix.walk(k)
+    local act = fork_h and ix.active_work_above(fork_h)
+    if act then
+      -- path is newest first; take the valid prefix from the fork up.
+      local chain, side = {}, consensus.work_zero()
+      for i = #path, 1, -1 do
+        local b = path[i]
+        if ix.is_invalid(b) or not ix.has_data(b) then break end
+        chain[#chain + 1] = b
+        side = consensus.work_add(side, consensus.get_block_work(ix.bits_of[b]))
+      end
+      local top = chain[#chain]
+      if top and not seen[top] and consensus.work_compare(side, act) >= 0 then
+        seen[top] = true
+        out[#out + 1] = { bytes = top, height = ix.height_of[top],
+                          fork_height = fork_h, side_work = side,
+                          active_work = act, chain = chain }
+      end
+    end
+  end
   return out
 end
 
