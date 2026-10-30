@@ -79,9 +79,18 @@ local SPK = script.make_p2pkh_script(PKH)
 -- Build a matured chain of `n` coinbase-only blocks (heights 0..n-1) with the
 -- txospenderindex toggled per `enabled`.  Returns db, chain_state, hashes,
 -- coinbase-txid-by-height map, path.
+-- Every scratch DB path build_base hands out; removed in the file-level
+-- teardown below so a failing test cannot leak it either.
+local scratch_paths = {}
+teardown(function()
+  for _, p in ipairs(scratch_paths) do os.execute("rm -rf -- '" .. p .. "'") end
+  scratch_paths = {}
+end)
+
 local function build_base(n, enabled)
   local tmp_path = "/tmp/lunarblock_txospender_"
     .. os.time() .. "_" .. math.random(100000000)
+  scratch_paths[#scratch_paths + 1] = tmp_path
   local db = storage_mod.open(tmp_path)
   local chain_state = utxo.new_chain_state(db, consensus.networks.regtest)
   chain_state:set_txospenderindex_enabled(enabled)
