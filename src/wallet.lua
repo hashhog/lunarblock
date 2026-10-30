@@ -2513,21 +2513,75 @@ function M.sign_input_p2tr_keypath(tx, input_index, prev_outputs, privkey32, has
   end
 end
 
---- Estimate fee rate for a transaction.
+-- Core -fallbackfee (wallet/wallet.h DEFAULT_FALLBACK_FEE = 0, i.e. disabled).
+-- Held in sat/vB; nil/0 = disabled. Set once at startup by main.lua from
+-- --fallbackfee (BTC/kvB, Core's unit).
+M.fallback_fee_rate = nil
+-- Node-wide fee estimator, wired by main.lua; a wallet's own estimator wins.
+M.fee_estimator = nil
+-- Node mempool, wired by main.lua; a wallet's own (set_mempool) wins. Source
+-- of Core's chain().mempoolMinFee() and chain().relayMinFee().
+M.mempool = nil
+-- Core wallet/wallet.h DEFAULT_TRANSACTION_MINFEE (-mintxfee; lunarblock has
+-- no such option, so the default applies), sat/kvB.
+M.DEFAULT_TRANSACTION_MINFEE = 1000
+-- Core policy DEFAULT_MIN_RELAY_TX_FEE, used when no mempool is wired.
+M.DEFAULT_MIN_RELAY_TX_FEE = 100
+M.FEE_ESTIMATION_FAILED = "Fee estimation failed. Fallbackfee is disabled. " ..
+  "Wait a few blocks or enable -fallbackfee."
+
+local function to_kvb(sat_per_vb)
+  return math.floor(sat_per_vb * 1000 + 0.5)
+end
+
+--- Fee for `vsize` vbytes at `fee_rate` sat/vB, rounded up in integer
+-- sat/kvB arithmetic like Core CFeeRate::GetFee (EvaluateFeeUp). The float
+-- product vsize * fee_rate can overshoot by one (2.075 * 240 -> 499 vs 498).
+function M.fee_for_vsize(fee_rate, vsize)
+  local n = to_kvb(fee_rate) * vsize
+  local fee = math.floor(n / 1000)
+  if fee * 1000 < n then fee = fee + 1 end
+  return fee
+end
+
+--- Estimate fee rate for a transaction (Core wallet/fees.cpp
+-- minimum-fee-rate computation): a RELIABLE estimator answer, else -fallbackfee, else
+-- failure (an estimator with no data does not count as an answer). The rate
+-- is then raised to the mempool minimum fee, and then to the required fee
+-- max(-mintxfee, relay minimum). An explicit fee_rate never comes here.
 -- @param conf_target number: Desired confirmation target in blocks (default 6)
--- @return number: Fee rate in sat/vB
+-- @return number|nil: Fee rate in sat/vB, or nil when no estimate and no fallback
+-- @return string|nil: Error message when nil
 function Wallet:estimate_fee_rate(conf_target)
   conf_target = conf_target or 6
 
-  if self.fee_estimator then
-    local fee_rate = self.fee_estimator:estimate_smart_fee(conf_target)
-    if fee_rate then
-      return fee_rate
+  local needed  -- sat/kvB
+  local est = self.fee_estimator or M.fee_estimator
+  if est then
+    local fee_rate, reliable = est:estimate_fee(conf_target, 0.85)
+    if not reliable then
+      fee_rate, reliable = est:estimate_fee(conf_target * 2, 0.60)
+    end
+    if reliable and fee_rate and fee_rate > 0 then
+      needed = to_kvb(fee_rate)
     end
   end
 
-  -- Fallback: use default minimum relay fee
-  return 1  -- 1 sat/vB
+  if not needed then
+    -- Core: a disabled (0) fallback returns at once, before any floor.
+    if not (M.fallback_fee_rate and M.fallback_fee_rate > 0) then
+      return nil, M.FEE_ESTIMATION_FAILED
+    end
+    needed = to_kvb(M.fallback_fee_rate)
+  end
+
+  local mp = self.mempool or M.mempool
+  if mp and mp.get_min_fee then
+    needed = math.max(needed, math.floor(mp:get_min_fee() + 0.5))
+  end
+  local relay = (mp and mp.min_relay_fee) or M.DEFAULT_MIN_RELAY_TX_FEE
+  needed = math.max(needed, M.DEFAULT_TRANSACTION_MINFEE, relay)
+  return needed / 1000
 end
 
 --- Create and sign a transaction.
@@ -2558,7 +2612,12 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
   end
 
   -- 2. Get fee rate
-  local fee_rate = options.fee_rate or self:estimate_fee_rate(options.conf_target)
+  local fee_rate = options.fee_rate
+  if not fee_rate then
+    local ferr
+    fee_rate, ferr = self:estimate_fee_rate(options.conf_target)
+    if not fee_rate then return nil, ferr end
+  end
 
   -- 3. Get available UTXOs
   local include_unconfirmed = options.include_unconfirmed ~= false
@@ -2577,7 +2636,7 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
   -- Initial target (output + estimated fees for minimum inputs)
   local min_inputs = 1
   local est_vsize = est_overhead + min_inputs * est_input_vsize + (#recipients + 1) * est_output_vsize
-  local initial_target = total_out + math.ceil(est_vsize * fee_rate)
+  local initial_target = total_out + M.fee_for_vsize(fee_rate, est_vsize)
 
   -- 5. Run coin selection
   local selected, algo = M.select_coins(available_utxos, initial_target, fee_rate)
@@ -2592,7 +2651,7 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
   end
 
   est_vsize = est_overhead + #selected * est_input_vsize + (#recipients + 1) * est_output_vsize
-  local fee = math.ceil(est_vsize * fee_rate)
+  local fee = M.fee_for_vsize(fee_rate, est_vsize)
 
   -- Verify we have enough
   if total_in < total_out + fee then
@@ -2607,7 +2666,7 @@ function Wallet:create_transaction(recipients, options, change_address_legacy)
       total_in = total_in + item.utxo.value
     end
     est_vsize = est_overhead + #selected * est_input_vsize + (#recipients + 1) * est_output_vsize
-    fee = math.ceil(est_vsize * fee_rate)
+    fee = M.fee_for_vsize(fee_rate, est_vsize)
   end
 
   -- 7. Build transaction

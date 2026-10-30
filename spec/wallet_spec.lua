@@ -777,24 +777,24 @@ describe("wallet", function()
   end)
 
   describe("Fee estimation integration", function()
-    it("uses fee estimator when available", function()
+    it("has no rate without estimator data or -fallbackfee (Core: fails)", function()
       local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
       local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
 
-      local estimator = fee.new(144)
-      w:set_fee_estimator(estimator)
+      w:set_fee_estimator(fee.new(144))  -- fresh estimator: no samples
 
-      local rate = w:estimate_fee_rate(6)
-      assert.is_true(rate >= 1)  -- At least 1 sat/vB
+      local rate, err = w:estimate_fee_rate(6)
+      assert.is_nil(rate)
+      assert.equals(wallet.FEE_ESTIMATION_FAILED, err)
     end)
 
-    it("falls back to default fee rate", function()
+    it("uses -fallbackfee when the estimator has no data", function()
       local seed = hex_to_bin("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
       local w = wallet.from_seed(seed, consensus.networks.mainnet, nil)
-
-      -- No fee estimator set
+      wallet.fallback_fee_rate = 20
       local rate = w:estimate_fee_rate(6)
-      assert.equals(1, rate)  -- Default 1 sat/vB
+      wallet.fallback_fee_rate = nil
+      assert.equals(20, rate)
     end)
   end)
 

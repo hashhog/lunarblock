@@ -105,6 +105,47 @@ function M.parse_conf_file(path, network)
   return result, nil
 end
 
+M.COIN = 100000000
+M.MAX_MONEY = 21000000 * M.COIN
+-- Core wallet/wallet.h HIGH_TX_FEE_PER_KB (COIN / 100), sat/kvB.
+M.HIGH_TX_FEE_PER_KB = M.COIN / 100
+
+--- Parse a BTC amount string into satoshis (Core util/moneystr.cpp
+-- ParseMoney): no NUL, surrounding whitespace trimmed, digits with at most
+-- one '.', at most 8 decimals and 10 whole digits, result in MoneyRange.
+-- No sign, exponent or hex.
+-- @return number|nil: satoshis, or nil when Core would reject the string
+function M.parse_money(s)
+  if type(s) ~= "string" or s:find("\0", 1, true) then return nil end
+  s = s:match("^[ \f\n\r\t\v]*(.-)[ \f\n\r\t\v]*$")
+  if s == "" then return nil end
+  local whole, frac = s:match("^(%d*)%.?(%d*)$")
+  if not whole then return nil end
+  if #frac > 8 or #whole > 10 then return nil end
+  local value = (tonumber(whole) or 0) * M.COIN +
+    (tonumber((frac .. "00000000"):sub(1, 8)) or 0)
+  if value < 0 or value > M.MAX_MONEY then return nil end
+  return value
+end
+
+--- Validate -fallbackfee the way Core's wallet init does (wallet.cpp).
+-- @param v string: raw value from the command line or config file
+-- @return number|nil: sat/kvB
+-- @return string|nil: startup error (Core refuses to start)
+-- @return string|nil: startup warning (value above HIGH_TX_FEE_PER_KB)
+function M.check_fallbackfee(v)
+  local kvb = M.parse_money(v)
+  if not kvb then
+    return nil, string.format("Invalid amount for %s=<amount>: '%s'",
+      "-fallbackfee", tostring(v))
+  end
+  if kvb > M.HIGH_TX_FEE_PER_KB then
+    return kvb, nil, "-fallbackfee is set very high! This is the transaction " ..
+      "fee you may pay when fee estimates are not available."
+  end
+  return kvb
+end
+
 --- Apply parsed conf-file kv pairs onto an args table.
 -- Bitcoin Core semantics: command-line flags win over conf-file.  We honor
 -- that by only setting a key if its current value matches the parser default.
@@ -138,6 +179,8 @@ function M.apply_conf_to_args(args, defaults, conf)
     connect       = {"connect",       "string"},
     printtoconsole = {"printtoconsole", "bool"},
     nowalletcreate = {"nowalletcreate", "bool"},
+    -- Raw string: parse_args validates it with parse_money (Core ParseMoney).
+    fallbackfee   = {"fallbackfee",   "string"},
     daemon        = {"daemon",        "bool"},
     reindex       = {"reindex",       "bool"},
     prune         = {"prune",         "number"},

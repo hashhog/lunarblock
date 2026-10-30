@@ -371,9 +371,13 @@ function()
       "if options%.fee_rate and options%.fee_rate > 0 then", 1, false)
       ~= nil,
     "wallet.lua:1870 takes options.fee_rate without mempool-min check")
+  -- Scoped to bump_fee: estimate_fee_rate (the -fallbackfee / estimator
+  -- path) reads the relay floor legitimately and is not the user path.
+  local BUMP_SRC = WALLET_SRC:match("\nfunction Wallet:bump_fee%(.-\nfunction ")
+  expect_true(BUMP_SRC ~= nil, "Wallet:bump_fee source located")
   expect_false(
-    WALLET_SRC:find("min_relay_fee", 1, true) ~= nil
-      or WALLET_SRC:find("mempool_min_fee", 1, true) ~= nil,
+    (BUMP_SRC or ""):find("min_relay_fee", 1, true) ~= nil
+      or (BUMP_SRC or ""):find("mempool_min_fee", 1, true) ~= nil,
     "no min_relay_fee / mempool_min_fee guards on the user path")
 end)
 

@@ -42,6 +42,7 @@ local function default_args()
     regtest = false,
     printtoconsole = false,
     nowalletcreate = false,
+    fallbackfee = nil,        -- Core -fallbackfee, BTC/kvB; nil = disabled (Core default 0)
     reindex = false,
     reindex_chainstate = false,
     daemon = false,
@@ -151,6 +152,7 @@ local function parse_args(argv)
       print("      --regtest           Use regtest")
       print("      --printtoconsole    Print log to console")
       print("      --nowalletcreate    Do not create wallet on first run")
+      print("      --fallbackfee AMT   Wallet fee rate (BTC/kvB) used when fee estimation has no data (default: 0 = disabled)")
       print("      --reindex           Rebuild UTXO set from blocks")
       print("      --reindex-chainstate Rebuild chainstate (UTXO set) from on-disk blocks")
       print("      --daemon            Run as daemon")
@@ -264,6 +266,14 @@ local function parse_args(argv)
       args.printtoconsole = true
     elseif arg == "--nowalletcreate" then
       args.nowalletcreate = true
+    elseif arg == "--fallbackfee" or arg:match("^%-%-fallbackfee=") then
+      -- Core -fallbackfee=<amt>: BTC/kvB used by the wallet when fee
+      -- estimation has no data. 0 (default) disables it: sends then fail
+      -- with "Fee estimation failed. Fallbackfee is disabled...".
+      -- Validated after the conf-file merge, so both sources are checked.
+      local v = arg:match("^%-%-fallbackfee=(.*)$")
+      if v == nil then i = i + 1; v = argv[i] end
+      args.fallbackfee = v or ""
     elseif arg == "--reindex" then
       args.reindex = true
     elseif arg == "--reindex-chainstate" then
@@ -519,6 +529,19 @@ local function parse_args(argv)
       end
       ops.apply_conf_to_args(args, defaults, conf)
     end
+  end
+
+  -- -fallbackfee (Core wallet.cpp): a value ParseMoney rejects refuses
+  -- startup; one above HIGH_TX_FEE_PER_KB starts with a warning.
+  if args.fallbackfee ~= nil then
+    local ops = require("lunarblock.ops")
+    local kvb, err, warn = ops.check_fallbackfee(args.fallbackfee)
+    if not kvb then
+      io.stderr:write("Error: " .. err .. "\n")
+      os.exit(1)
+    end
+    if warn then io.stderr:write("Warning: " .. warn .. "\n") end
+    args.fallbackfee_kvb = kvb
   end
 
   -- Self-advertisement: flatten --externalip and resolve the -discover
@@ -3094,6 +3117,12 @@ local function main()
   -- loaded wallet, not only the default; this startup reconcile covers the gap
   -- a wallet spent offline.
   wallet_manager:set_chain_context(chain_state, mempool)
+  -- Wallet fee policy (Core wallet/fees.cpp): estimator, else -fallbackfee
+  -- (BTC/kvB -> sat/vB), else the send fails.
+  wallet_mod.fee_estimator = fee_estimator
+  wallet_mod.mempool = mempool
+  wallet_mod.fallback_fee_rate = args.fallbackfee_kvb and args.fallbackfee_kvb > 0
+    and (args.fallbackfee_kvb / 1000) or nil
 
   -- Load or create default wallet (backward compatible)
   local wallet = nil
