@@ -3127,11 +3127,7 @@ local function main()
   -- Load or create default wallet (backward compatible)
   local wallet = nil
   local default_wallet_path = datadir .. "/wallet.json"
-  -- Core creates and loads no wallet at startup on regtest (and, since 0.21,
-  -- anywhere): a wallet exists only when createwallet/loadwallet asks for it.
-  -- Mainnet/testnet keep the legacy auto-created default for existing datadirs.
-  local skip_default_wallet = args.nowalletcreate or network.name == "regtest"
-  if not skip_default_wallet then
+  if not args.nowalletcreate then
     -- Try to load existing default wallet. A missing / corrupt / partially
     -- written wallet file MUST NOT crash node startup: M.load is internally
     -- fault-tolerant (quarantines a bad file to .bak, recovers from a
