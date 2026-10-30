@@ -13379,6 +13379,21 @@ end
       rpc.storage.put_height_index(new_height, block_hash)
     end
 
+    -- Advance the in-memory header chain exactly as generatetoaddress does.
+    -- getheaders is answered from header_chain (peerman.getheaders_response),
+    -- so without this a Core peer dialing in to a submitblock-fed node gets an
+    -- empty `headers` and never syncs; it also left peer_manager.our_height
+    -- (advertised in VERSION) at the stale header tip.
+    if rpc.chain_state and rpc.header_chain and rpc.header_chain.add_mined_tip then
+      -- memory_only: the persisted height index is written by the
+      -- accept_block batch above (chainstate activation), not by the header
+      -- chain, so a header-work win here cannot repoint heights on disk.
+      rpc.header_chain:add_mined_tip(block.header, new_height, {memory_only = true})
+      if rpc.peer_manager and rpc.header_chain.header_tip_height then
+        rpc.peer_manager.our_height = rpc.header_chain.header_tip_height
+      end
+    end
+
     -- Sync block_downloader so P2P sync doesn't try to re-connect this block
     if rpc.block_downloader and rpc.block_downloader.next_connect_height then
       if new_height >= rpc.block_downloader.next_connect_height then
