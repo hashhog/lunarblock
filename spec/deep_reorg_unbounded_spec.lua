@@ -130,6 +130,7 @@ describe("unbounded archive reorg (Core parity, >288 deep)", function()
 
   after_each(function()
     if db then db.close() end
+    if path then os.execute("rm -rf -- '" .. path .. "'") end
   end)
 
   it("archive node (pruning OFF) reorgs onto the deeper higher-work chain", function()
