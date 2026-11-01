@@ -13095,6 +13095,35 @@ end
     return { _raw_json = string.format("%.16g", calculate_difficulty(current_bits)) }
   end
 
+  --- A block extending the active tip failed accept_block with `err`: when
+  --- that is a verdict Core reaches after indexing the block, index it as
+  --- failed so getchaintips lists it "invalid" (rpc/blockchain.cpp
+  --- getchaintips: BLOCK_FAILED_VALID -> "invalid").
+  -- Core ProcessNewBlock runs the context-free CheckBlock first and indexes
+  -- nothing when it fails; AcceptBlockHeader (PoW, bad-diffbits,
+  -- time-too-old/new, bad-version) also returns before AddToBlockIndex.
+  -- After that, AcceptBlock's ContextualCheckBlock and ConnectTip's
+  -- ConnectBlock call InvalidBlockFound, which sets BLOCK_FAILED_VALID unless
+  -- the result is BLOCK_MUTATED (validation.cpp InvalidBlockFound).
+  -- is_invalid_block_verdict already refuses header-layer reasons, mutated
+  -- bodies, "missing utxo" and system faults; re-running the context-free
+  -- check_block (no height, so no BIP34) drops the CheckBlock failures.
+  local function record_failed_tip_block(rpc, block, block_hash, header_data, block_data, err)
+    local cs = rpc.chain_state
+    if not (cs and cs.record_failed_block and rpc.storage) then return end
+    if cs.invalid_blocks and cs.invalid_blocks[block_hash.bytes] then return end
+    if not require("lunarblock.sync").is_invalid_block_verdict(err) then return end
+    local ok_cb, cb_res = pcall(validation.check_block, block, rpc.network, nil)
+    if not ok_cb or not cb_res then return end
+    local ok_rec, rec_err = pcall(cs.record_failed_block, cs, block_hash,
+      header_data, block_data)
+    if not ok_rec then
+      if fault.is_system_fault(rec_err) then raise_system_fault_rpc(rec_err) end
+      io.stderr:write("submitblock: indexing the failed block failed: "
+        .. tostring(rec_err) .. "\n")
+    end
+  end
+
   --- submitblock: Submit a new block to the network.
   -- @param hexdata string: Block data in hex
   local submitblock_inner
@@ -13347,6 +13376,7 @@ end
         if rpc.chain_state and rpc.chain_state.coin_view then
           rpc.chain_state.coin_view:discard_dirty()
         end
+        record_failed_tip_block(rpc, block, block_hash, header_data, block_data, conn_ret1)
         return bip22_result(conn_ret1)
       end
       if not conn_ret1 then
@@ -13354,6 +13384,7 @@ end
         if rpc.chain_state and rpc.chain_state.coin_view then
           rpc.chain_state.coin_view:discard_dirty()
         end
+        record_failed_tip_block(rpc, block, block_hash, header_data, block_data, conn_ret2)
         return bip22_result(conn_ret2 or "rejected")
       end
 

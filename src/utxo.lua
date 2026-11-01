@@ -3008,6 +3008,35 @@ function ChainState:is_block_invalid(block_hash)
   return self.invalid_blocks[block_hash.bytes] == true
 end
 
+--- Index a block that failed validation on top of the active tip and mark it
+--- failed (Core AcceptBlock + ConnectTip -> InvalidBlockFound).
+-- Core's AcceptBlock adds the header to the block index and writes the block
+-- to disk BEFORE ContextualCheckBlock / ConnectBlock; a verdict there sets
+-- BLOCK_FAILED_VALID on that entry, so getchaintips keeps listing it as an
+-- "invalid" tip.  The submitblock tip path wrote the header and body only
+-- inside the connect batch, so a rejected block left no trace at all.
+-- Header, body and the invalid set go in one batch: the body is never
+-- indexed without the mark (activate_best_chain would otherwise pick it up
+-- as a candidate).  The caller decides that `block_hash` has a verdict.
+-- @param block_hash hash256
+-- @param header_data string: the 80-byte serialized header
+-- @param block_data string: the serialized block
+function ChainState:record_failed_block(block_hash, header_data, block_data)
+  self.invalid_blocks[block_hash.bytes] = true
+  local parts = {}
+  for hash_bytes, _ in pairs(self.invalid_blocks) do
+    parts[#parts + 1] = hash_bytes
+  end
+  table.sort(parts)
+  local batch = self.storage.batch()
+  batch.put(storage_mod.CF.HEADERS, block_hash.bytes, header_data)
+  batch.put(storage_mod.CF.BLOCKS, block_hash.bytes, block_data)
+  batch.put(storage_mod.CF.META, "invalid_blocks", table.concat(parts))
+  local ok, err = pcall(batch.write, true)
+  batch.destroy()
+  if not ok then error(err, 0) end
+end
+
 --- Record that a block body arrived (Core ReceivedBlockTransactions:
 --- pindexNew->nSequenceId = nBlockSequenceId++).  The first arrival counts.
 -- Recorded where a block enters off the active tip (accept_side_branch_block);
