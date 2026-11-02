@@ -1912,6 +1912,59 @@ describe("rpc", function()
       assert.is_true(decoded.result.initialblockdownload)
     end)
 
+    it("regtest: stays in IBD while the tip is older than 24h even when blocks == headers (Core IsInitialBlockDownload)", function()
+      local ts = os.time() - (25 * 60 * 60)
+      local mock_storage = {
+        get_header = function(hash)
+          return {
+            version = 0x20000000,
+            prev_hash = types.hash256(string.rep("\x00", 32)),
+            merkle_root = types.hash256(string.rep("\xab", 32)),
+            timestamp = ts, bits = 0x207fffff, nonce = 0,
+          }
+        end,
+      }
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 100,
+          tip_hash = types.hash256(string.rep("\xab", 32)),
+          header_tip_height = 100,
+        },
+        storage = mock_storage,
+        network = consensus.networks.regtest
+      })
+      local decoded = cjson.decode((server:handle_request(
+        '{"method":"getblockchaininfo","params":[],"id":1}')))
+      assert.is_true(decoded.result.initialblockdownload)
+    end)
+
+    it("regtest: IBD latches to false once the tip is recent and never re-enters", function()
+      local ts = os.time() - 60
+      local mock_storage = {
+        get_header = function(hash)
+          return {
+            version = 0x20000000,
+            prev_hash = types.hash256(string.rep("\x00", 32)),
+            merkle_root = types.hash256(string.rep("\xab", 32)),
+            timestamp = ts, bits = 0x207fffff, nonce = 0,
+          }
+        end,
+      }
+      local server = rpc.new({
+        chain_state = {
+          tip_height = 100,
+          tip_hash = types.hash256(string.rep("\xab", 32)),
+          header_tip_height = 100,
+        },
+        storage = mock_storage,
+        network = consensus.networks.regtest
+      })
+      local req = '{"method":"getblockchaininfo","params":[],"id":1}'
+      assert.is_false(cjson.decode((server:handle_request(req))).result.initialblockdownload)
+      ts = os.time() - (25 * 60 * 60)  -- tip now "old" (e.g. after invalidateblock)
+      assert.is_false(cjson.decode((server:handle_request(req))).result.initialblockdownload)
+    end)
+
     it("tracks separate header and block heights", function()
       local server = rpc.new({
         chain_state = {

@@ -2537,23 +2537,24 @@ function RPCServer:register_methods()
     local verification_progress = tip_height / estimated_total_blocks
     if verification_progress > 1.0 then verification_progress = 1.0 end
 
-    -- initialblockdownload: Core's IsInitialBlockDownload latches to false once
-    -- the chain reaches the best header (and never re-enters IBD). On regtest a
-    -- node at/near its header tip is NOT in IBD (chainman.IsInitialBlockDownload
-    -- returns false), so report false when the block tip has caught the header
-    -- tip. For real networks fall back to the tip-age heuristic.
-    local initial_block_download
-    if rpc.network.name == "regtest" then
-      initial_block_download = (header_height > tip_height)
-    else
+    -- initialblockdownload: Core's IsInitialBlockDownload (validation.cpp) is
+    -- true while there is no tip or the tip timestamp is older than
+    -- max_tip_age (24h), and LATCHES to false the first time it evaluates
+    -- false (it never re-enters IBD). Regtest has no minimum chainwork, so the
+    -- tip-age rule is the whole test there too: a regtest chain whose tip is
+    -- old reports true even when blocks == headers (the Core regtest harness
+    -- builds such a chain), so do not shortcut on header_height.
+    local initial_block_download = true
+    if rpc.ibd_latched_false then
       initial_block_download = false
+    else
       if rpc.storage and rpc.chain_state and rpc.chain_state.tip_hash then
         local header = rpc.storage.get_header(rpc.chain_state.tip_hash)
         if header then
-          local age = os.time() - header.timestamp
-          initial_block_download = age > 24 * 60 * 60
+          initial_block_download = (os.time() - header.timestamp) > 24 * 60 * 60
         end
       end
+      if not initial_block_download then rpc.ibd_latched_false = true end
     end
 
     -- Cumulative chainwork: compute natively from genesis to tip (same exact
