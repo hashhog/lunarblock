@@ -13209,11 +13209,17 @@ end
           return bip22_result("rejected")
         end
 
-        local result, sb_err = rpc.chain_state:accept_side_branch_block(
+        local result, sb_err, sb_failed = rpc.chain_state:accept_side_branch_block(
           block, block_hash,
           { skip_scripts = false, nosync = false, mempool = rpc.mempool,
             check_diffbits = true, check_block = true }
         )
+        if result == nil and sb_failed then
+          -- A side-branch block failed ConnectBlock during the reorg: Core
+          -- marks it BLOCK_FAILED_VALID (InvalidBlockFound), so getchaintips
+          -- lists it "invalid".  The reorg itself was rolled back whole.
+          rpc.chain_state:record_side_branch_verdict(sb_failed, sb_err)
+        end
         if result == "connected" then
           -- Reorg succeeded; B3 is now the active tip.  The reorg connect
           -- itself syncs (nosync=false).  Also arm the shared periodic
