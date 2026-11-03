@@ -5192,9 +5192,13 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
       ok_conn, err_conn = nil, ok_conn
     end
     if not ok_conn then
-      return abort_reorg(string.format(
+      -- The third value names the block whose ConnectBlock failed, so a
+      -- caller that has no candidate chain to map the height onto (the
+      -- submitblock arm) can record the verdict on it.
+      local r1, r2 = abort_reorg(string.format(
         "reorg-connect-failed at height %d: %s",
         entry.height, tostring(err_conn)))
+      return r1, r2, entry.hash
     end
   end
 
@@ -6187,6 +6191,29 @@ function ChainState:_failed_candidate_block(cand, err)
   if not require("lunarblock.sync").is_invalid_block_verdict(reason) then return nil end
   local b = cand.chain[tonumber(h) - cand.fork_height]
   return b and types.hash256(b) or nil
+end
+
+--- Mark the side-branch block whose ConnectBlock failed during a reorg
+--- (Core ActivateBestChainStep -> ConnectTip fails -> InvalidBlockFound sets
+--- BLOCK_FAILED_VALID, then InvalidChainFound).
+-- `failed_hash` is the third value accept_side_branch_block returns with a
+-- "reorg-connect-failed at height H: <reason>" error.  Only a consensus
+-- verdict marks anything; a missing body, an unresolvable MTP or a system
+-- fault leaves the block as it was.  activate_best_chain and the P2P path
+-- record the same verdict on their own; the submitblock arm did not, so the
+-- failed block stayed unmarked: getchaintips then left it out while its
+-- branch had more work than the tip, and listed it "valid-headers" once the
+-- active chain caught up, where Core lists it "invalid".
+-- @return hash256|nil the block marked invalid
+function ChainState:record_side_branch_verdict(failed_hash, err)
+  if not failed_hash or type(err) ~= "string" then return nil end
+  local reason = err:match("^reorg%-connect%-failed at height %d+: (.*)$")
+  if not reason then return nil end
+  if not require("lunarblock.sync").is_invalid_block_verdict(reason) then return nil end
+  self.invalid_blocks[failed_hash.bytes] = true
+  self:mark_descendant_invalid(failed_hash)
+  self:save_invalid_blocks()
+  return failed_hash
 end
 
 --- Get the list of currently invalidated block hashes.

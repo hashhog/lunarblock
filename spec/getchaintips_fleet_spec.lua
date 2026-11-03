@@ -176,11 +176,10 @@ describe("getchaintips lists every block-index leaf (Core statuses)", function()
   end)
 
   -- A heavier side branch whose connect failed (s11 overpays its coinbase):
-  -- Core marks s11 failed and lists it "invalid".  lunarblock aborts the
-  -- reorg without recording a verdict, so s11 is a "valid" leaf with data and
-  -- more work than the active chain -- a state Core cannot be in.  Its status
-  -- is unknown here, so it is left out instead of reported valid-headers.
-  it("a heavier branch whose connect failed is left out, not called valid", function()
+  -- Core marks s11 failed (InvalidBlockFound) and lists it "invalid".  This
+  -- used to pin lunarblock leaving s11 out, because the submitblock arm
+  -- recorded no verdict; it now records one (record_side_branch_verdict).
+  it("a heavier branch whose connect failed is listed invalid, as Core does", function()
     local s10, s10h = valid_block(10, hashes[9], "s10")
     local s11, s11h = valid_block(11, s10h, "s11", 1)
     assert.equal("inconclusive", submit(s10))
@@ -188,8 +187,12 @@ describe("getchaintips lists every block-index leaf (Core statuses)", function()
     assert.is_true(type(res) == "string", tostring(res))  -- rejected, not null
     assert.equal(hx(hashes[10]), hx(cs.tip_hash))
     assert.is_not_nil(db.get(storage_mod.CF.BLOCKS, s11h.bytes))  -- s11 is indexed with data
-    assert.is_false(cs:is_block_invalid(s11h))                    -- and no verdict recorded
-    assert.same({ [hx(hashes[10])] = "10/0/active" }, tips())
+    assert.is_true(cs:is_block_invalid(s11h))                     -- with its verdict recorded
+    assert.is_false(cs:is_block_invalid(s10h))                    -- its valid parent is not
+    assert.same({
+      [hx(hashes[10])] = "10/0/active",
+      [hx(s11h)]       = "11/2/invalid",
+    }, tips())
   end)
 
   -- Index bookkeeping this item adds: disconnect_block records that the block
