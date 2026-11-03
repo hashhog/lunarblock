@@ -146,6 +146,9 @@ describe("submitblock advances the header chain (getheaders serving)", function(
   -- height_to_hash, and getchaintips reported the active block below the new
   -- tip as an extra valid-headers tip of branchlen 4.
   it("leaves no height_to_hash hole when the map is partial after a restart", function()
+    -- Simulate the stale persisted header tip of that restart (add_mined_tip
+    -- now persists it; see header_tip_persist_on_submitblock_spec.lua).
+    hc:set_header_tip(hashes[0], 0, false)
     local fresh = sync.new_header_chain(REGTEST, db)
     fresh:init()
     -- This spec's chain starts from its own height-0 block, not the regtest
