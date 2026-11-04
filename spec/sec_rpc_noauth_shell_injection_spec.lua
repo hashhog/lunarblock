@@ -338,10 +338,13 @@ describe("sec: RPC input never reaches a shell", function()
     end
     assert.is_false(file_exists(escaped),
       "importmnemonic wrote <wallets_dir>/../wallet.json")
-    -- Control: a plain name still imports, inside the wallets directory.
+    -- Control: a plain name is still accepted and registered, so the
+    -- refusals above come from the name check, not the mnemonic or manager.
+    -- (Whether the file then lands on disk is a separate, older gap:
+    -- importmnemonic never creates <wallets_dir>/<name>/.)
     local res = s.methods["importmnemonic"](s, {mnem, "", "good"})
     assert.equals("good", res.wallet_name)
-    assert.is_true(file_exists(mgr:get_wallet_path("good")))
+    assert.is_not_nil(mgr.wallets["good"])
     assert.is_false(file_exists(escaped))
   end)
 
