@@ -98,8 +98,6 @@ each with the reason it is expected to fail.
 
 - No signet.
 - Initial sync is much slower than Bitcoin Core's.
-- No cookie authentication for RPC; with the default empty `--rpcpassword` the RPC port
-  has no authentication at all.
 - `--reindex` only rebuilds the chain state from blocks already stored; it does not
   re-import block files.
 - At startup, when `--connect` is not given, the node tries one outbound connection to

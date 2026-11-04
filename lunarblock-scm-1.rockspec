@@ -45,6 +45,7 @@ build = {
     ["lunarblock.mempool"] = "src/mempool.lua",
     ["lunarblock.mining"] = "src/mining.lua",
     ["lunarblock.rpc"] = "src/rpc.lua",
+    ["lunarblock.fsutil"] = "src/fsutil.lua",
     ["lunarblock.wallet"] = "src/wallet.lua",
     ["lunarblock.bip39"] = "src/bip39.lua",
     ["lunarblock.utxo"] = "src/utxo.lua",

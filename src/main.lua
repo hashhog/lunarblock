@@ -18,6 +18,10 @@ local function default_args()
     rpcport = nil,  -- will default from network config
     rpcuser = "lunarblock",
     rpcpassword = "",
+    -- --rpcauth USER:SALT$HASH (repeatable), Core's hashed-credential form.
+    -- With no --rpcpassword the RPC server always writes <datadir>/.cookie
+    -- and requires it: there is no unauthenticated mode.
+    rpcauth = {},
     -- FIX-64 (W119): optional HTTPS/TLS termination for the RPC server.
     -- When BOTH paths are set, the JSON-RPC HTTP server wraps each accepted
     -- socket with luasec so traffic is TLS-encrypted (Core's httpserver.cpp
@@ -138,7 +142,8 @@ local function parse_args(argv)
       print("  -n, --network NET       Network: mainnet, testnet, regtest (default: mainnet)")
       print("      --rpcport PORT      RPC server port")
       print("      --rpcuser USER      RPC username (default: lunarblock)")
-      print("      --rpcpassword PW    RPC password")
+      print("      --rpcpassword PW    RPC password (if unset, a random cookie is written to <datadir>/.cookie)")
+      print("      --rpcauth U:SALT$H  Hashed RPC credential, as Core's share/rpcauth (repeatable)")
       print("      --rpc-tls-cert PATH PEM cert path (enables HTTPS; requires --rpc-tls-key)")
       print("      --rpc-tls-key PATH  PEM private-key path (requires --rpc-tls-cert)")
       print("      --port PORT         P2P listen port")
@@ -211,6 +216,10 @@ local function parse_args(argv)
     elseif arg == "--rpcpassword" then
       i = i + 1
       args.rpcpassword = argv[i]
+    elseif arg == "--rpcauth" or arg:match("^%-%-rpcauth=") then
+      local v = arg:match("^%-%-rpcauth=(.*)$")
+      if not v then i = i + 1; v = argv[i] end
+      args.rpcauth[#args.rpcauth + 1] = v
     elseif arg == "--rpc-tls-cert" or arg:match("^%-%-rpc%-tls%-cert=") then
       -- FIX-64 (W119): PEM cert path for HTTPS RPC.  Must be paired with
       -- --rpc-tls-key.  Mirrors Bitcoin Core's optional libevent+OpenSSL
@@ -579,7 +588,7 @@ local function run_import_blocks(args)
   if args.network ~= "mainnet" then
     datadir = datadir .. "/" .. args.network
   end
-  os.execute("mkdir -p " .. datadir)
+  require("lunarblock.fsutil").mkdir_p(datadir)  -- no shell
 
   print(string.format("import-blocks: network=%s datadir=%s source=%s",
     args.network, datadir, args.import_blocks))
@@ -765,7 +774,7 @@ local function run_import_utxo(args)
   if args.network ~= "mainnet" then
     datadir = datadir .. "/" .. args.network
   end
-  os.execute("mkdir -p " .. datadir)
+  require("lunarblock.fsutil").mkdir_p(datadir)  -- no shell
 
   print(string.format("import-utxo: network=%s datadir=%s source=%s",
     args.network, datadir, args.import_utxo))
@@ -1117,8 +1126,8 @@ local function main()
   if args.network ~= "mainnet" then
     datadir = datadir .. "/" .. args.network
   end
-  os.execute("mkdir -p " .. args.datadir)
-  os.execute("mkdir -p " .. datadir)
+  require("lunarblock.fsutil").mkdir_p(args.datadir)  -- no shell
+  require("lunarblock.fsutil").mkdir_p(datadir)  -- no shell
 
   print("LunarBlock v" .. VERSION .. " starting...")
   print("Network: " .. args.network)
@@ -3306,6 +3315,9 @@ local function main()
     rpcport = args.rpcport,
     rpcuser = args.rpcuser,
     rpcpassword = args.rpcpassword,
+    rpcauth = args.rpcauth,
+    -- Core writes .cookie in the network-specific datadir (regtest/.cookie).
+    cookie_dir = datadir,
     -- FIX-64 (W119): optional HTTPS termination.  When both paths are set
     -- RPCServer:start() wraps the listening socket via luasec.  When neither
     -- is set, plaintext path (backward-compat).  Mismatch is a fatal error
@@ -3848,7 +3860,8 @@ if not pcall(debug.getlocal, 4, 1) then
       print("  -n, --network NET       Network: mainnet, testnet, regtest (default: mainnet)")
       print("      --rpcport PORT      RPC server port")
       print("      --rpcuser USER      RPC username (default: lunarblock)")
-      print("      --rpcpassword PW    RPC password")
+      print("      --rpcpassword PW    RPC password (if unset, a random cookie is written to <datadir>/.cookie)")
+      print("      --rpcauth U:SALT$H  Hashed RPC credential, as Core's share/rpcauth (repeatable)")
       print("      --rpc-tls-cert PATH PEM cert path (enables HTTPS; requires --rpc-tls-key)")
       print("      --rpc-tls-key PATH  PEM private-key path (requires --rpc-tls-cert)")
       print("      --port PORT         P2P listen port")

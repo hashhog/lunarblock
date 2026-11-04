@@ -40,8 +40,6 @@ fix and disclosure timeline with you and credit you if you wish.
 
 - Sync speed.
 - Problems that need an already compromised host.
-- RPC without a password: with the default empty `--rpcpassword` the RPC port accepts
-  unauthenticated requests. This is documented; RPC binds to `127.0.0.1`. Set a password.
 
 ## Fixing
 

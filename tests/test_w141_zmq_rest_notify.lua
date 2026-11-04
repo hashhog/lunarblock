@@ -656,12 +656,15 @@ end)
 
 -- G30: shell-injection hardening (BUG-17 latent)
 print("\n--- G30: shell-injection hardening (BUG-17 P1, latent) ---")
-test("G30-a: os.execute(mkdir -p ..) pattern still present (documents BUG-17)", function()
-  -- This is the antipattern that will recur in notify-script substitution.
-  -- We assert it EXISTS today (documenting BUG-17); the fix is to switch to
-  -- lfs.mkdir or an FFI mkdir(2) call AND add a shell_escape helper.
-  expect_truthy(file_contains("src/main.lua", 'os.execute("mkdir -p " .. datadir)'),
-                "BUG-17 antipattern unexpectedly missing (datadir mkdir was hardened?)")
+test("G30-a: datadir mkdir no longer goes through os.execute (BUG-17 datadir half fixed)", function()
+  -- Flipped by fix-lunarblock-sec-rpc-noauth-shell-injection: the datadir is
+  -- now created with an FFI mkdir(2) (lunarblock.fsutil.mkdir_p). This test
+  -- used to assert the os.execute("mkdir -p " .. datadir) antipattern was
+  -- still present. G30-b (shell_escape for notify scripts) is still open.
+  expect_falsy(file_contains("src/main.lua", 'os.execute("mkdir -p " .. datadir)'),
+               "datadir mkdir still shells out")
+  expect_truthy(file_contains("src/main.lua", 'require("lunarblock.fsutil").mkdir_p(datadir)'),
+                "fsutil.mkdir_p(datadir) not used")
 end)
 test_xfail_pre_fix("G30-b: shell_escape helper exists for notify-script substitution (BUG-17)", function()
   -- Core: src/util/string.cpp ShellEscape — single-quote-wrap with internal

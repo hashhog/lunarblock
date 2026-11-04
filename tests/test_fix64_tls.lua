@@ -329,7 +329,7 @@ if HAVE_LUASEC and cert_ready and have_curl then
     host = "127.0.0.1",
     rpcport = port,
     rpcuser = "lunarblock",
-    rpcpassword = "",  -- empty password skips Basic-auth check (gates /health)
+    rpcpassword = "tlstest",  -- /health is behind auth like every other path
     rpc_tls_cert = CERT_PATH,
     rpc_tls_key  = KEY_PATH,
   })
@@ -343,7 +343,7 @@ if HAVE_LUASEC and cert_ready and have_curl then
     -- -i: include response headers in output (status line + Content-Type).
     -- --tls-max 1.3 / --tlsv1.2: belt-and-suspenders for the TLS range.
     local cmd = string.format(
-      "curl -s -i --insecure --max-time 3 https://127.0.0.1:%d/health " ..
+      "curl -s -i --insecure --max-time 3 -u lunarblock:tlstest https://127.0.0.1:%d/health " ..
       "2>/dev/null", port)
     local body, rc, perr = pump_with_curl(server, cmd, 4)
     server:stop()
@@ -382,7 +382,7 @@ if have_curl then
     host = "127.0.0.1",
     rpcport = port,
     rpcuser = "lunarblock",
-    rpcpassword = "",
+    rpcpassword = "tlstest",
     -- INTENTIONALLY no rpc_tls_cert / rpc_tls_key
   })
 
@@ -392,7 +392,7 @@ if have_curl then
   else
     assert_eq(server.tls_ctx, nil, "plaintext: tls_ctx nil after start")
     local cmd = string.format(
-      "curl -s -i --max-time 3 http://127.0.0.1:%d/health 2>/dev/null", port)
+      "curl -s -i --max-time 3 -u lunarblock:tlstest http://127.0.0.1:%d/health 2>/dev/null", port)
     local body, rc, perr = pump_with_curl(server, cmd, 4)
     server:stop()
     if not body then

@@ -4106,12 +4106,26 @@ function WalletManager:set_chain_context(chain_state, mempool)
   self.mempool = mempool
 end
 
+--- Is `name` safe to turn into <wallets_dir>/<name>?
+-- "" is the default wallet (it lives in the datadir root). Anything else
+-- must be a single path component: no separators or the characters the old
+-- check already refused, no NUL/control bytes, and not "." or "..", so a
+-- wallet name (which arrives from RPC params and the /wallet/<name> URL) can
+-- never point outside the wallets directory.
+function M.is_valid_wallet_name(name)
+  if type(name) ~= "string" then return false end
+  if name == "" then return true end
+  if name == "." or name == ".." then return false end
+  if name:find("[/\\:*?\"<>|]") then return false end
+  if name:find("[%z\1-\31\127]") then return false end
+  return true
+end
+
 --- Ensure wallets directory exists.
 -- @return boolean: true on success
 function WalletManager:ensure_wallets_dir()
-  -- Try to create directory
-  local ok = os.execute("mkdir -p '" .. self.wallets_dir .. "'")
-  return ok == true or ok == 0
+  -- No shell (the path used to be spliced into "mkdir -p '<dir>'").
+  return (require("lunarblock.fsutil").mkdir_p(self.wallets_dir))
 end
 
 --- Get wallet directory path for a wallet name.
@@ -4220,7 +4234,7 @@ function WalletManager:create_wallet(name, options)
   options = options or {}
 
   -- Validate name
-  if name:find("[/\\:*?\"<>|]") then
+  if not M.is_valid_wallet_name(name) then
     return nil, "Invalid wallet name: contains illegal characters"
   end
 
@@ -4239,7 +4253,10 @@ function WalletManager:create_wallet(name, options)
   if name ~= "" then
     self:ensure_wallets_dir()
     local wallet_dir = self:get_wallet_dir(name)
-    os.execute("mkdir -p '" .. wallet_dir .. "'")
+    local mk_ok, mk_err = require("lunarblock.fsutil").mkdir_p(wallet_dir)
+    if not mk_ok then
+      return nil, "Cannot create wallet directory: " .. tostring(mk_err)
+    end
   end
 
   -- Acquire lock
@@ -4289,6 +4306,10 @@ end
 -- @return Wallet|nil: Loaded wallet, or nil on error
 -- @return string|nil: Error message
 function WalletManager:load_wallet(name, passphrase)
+  if not M.is_valid_wallet_name(name) then
+    return nil, "Invalid wallet name: contains illegal characters"
+  end
+
   -- Check if already loaded
   if self.wallets[name] then
     return nil, "Wallet \"" .. name .. "\" is already loaded"
@@ -4387,18 +4408,17 @@ function WalletManager:list_wallet_dir()
   end
 
   -- Scan wallets directory
-  local handle = io.popen("ls -1 '" .. self.wallets_dir .. "' 2>/dev/null")
-  if handle then
-    for dir in handle:lines() do
-      local wallet_path = self.wallets_dir .. "/" .. dir .. "/wallet.json"
-      if M.exists(wallet_path) then
-        wallets[#wallets + 1] = {
-          name = dir,
-          loaded = self.wallets[dir] ~= nil,
-        }
-      end
+  -- No shell (this used to be io.popen("ls -1 '<dir>'")).
+  local entries = require("lunarblock.fsutil").list_dir(self.wallets_dir)
+  for _, e in ipairs(entries or {}) do
+    local dir = e.name
+    local wallet_path = self.wallets_dir .. "/" .. dir .. "/wallet.json"
+    if M.exists(wallet_path) then
+      wallets[#wallets + 1] = {
+        name = dir,
+        loaded = self.wallets[dir] ~= nil,
+      }
     end
-    handle:close()
   end
 
   return wallets
