@@ -1641,8 +1641,10 @@ end
 -- HTTP Response Building
 --------------------------------------------------------------------------------
 
-function M.build_http_response(status, body, content_type)
+function M.build_http_response(status, body, content_type, extra_headers)
   content_type = content_type or "application/json"
+  local extra = ""
+  for _, h in ipairs(extra_headers or {}) do extra = extra .. h .. "\r\n" end
   local status_text = {
     [200] = "OK",
     [204] = "No Content",
@@ -1662,8 +1664,8 @@ function M.build_http_response(status, body, content_type)
   end
 
   local response = string.format(
-    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s",
-    status, status_text[status] or "Unknown", content_type, #body, body
+    "HTTP/1.1 %d %s\r\n%sContent-Type: %s\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s",
+    status, status_text[status] or "Unknown", extra, content_type, #body, body
   )
   return response
 end
@@ -1672,15 +1674,158 @@ end
 -- HTTP Basic Authentication
 --------------------------------------------------------------------------------
 
+-- Mirrors Bitcoin Core httprpc.cpp / rpc/request.cpp. There is no
+-- unauthenticated mode: with no --rpcpassword the server writes a random
+-- cookie (<datadir>/.cookie, "__cookie__:<64 hex>", mode 0600) and only that
+-- credential (plus any --rpcauth entries) is accepted. Plaintext passwords are
+-- salted and HMAC-SHA256'd at startup (InitRPCAuthentication) and the
+-- plaintext is not kept on the server object.
+
+M.COOKIEAUTH_USER = "__cookie__"
+M.COOKIEAUTH_FILE = ".cookie"
+M.WWW_AUTH_HEADER_DATA = 'Basic realm="jsonrpc"'
+
+local function hex_of(s)
+  return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+--- Constant-time string compare (Core util/strencodings.h TimingResistantEqual):
+-- the running time depends only on the lengths, never on where the first
+-- differing byte is.
+function M.timing_resistant_equal(a, b)
+  if type(a) ~= "string" or type(b) ~= "string" then return false end
+  if #b == 0 then return #a == 0 end
+  local acc = bit.bxor(#a, #b)
+  for i = 1, #a do
+    local j = ((i - 1) % #b) + 1
+    acc = bit.bor(acc, bit.bxor(a:byte(i), b:byte(j)))
+  end
+  return acc == 0
+end
+
+--- Split an "Authorization: Basic <b64>" header into user, pass.
+-- Returns nil for any malformed header (Core RPCAuthorized).
+function M.parse_basic_auth(auth)
+  if type(auth) ~= "string" or auth:sub(1, 6) ~= "Basic " then return nil end
+  local b64 = auth:sub(7):match("^%s*(.-)%s*$")
+  if b64 == "" or not b64:match("^[%w%+/]+=?=?$") or #b64 % 4 ~= 0 then
+    return nil
+  end
+  local decoded = M.base64_decode(b64)
+  local colon = decoded:find(":", 1, true)
+  if not colon then return nil end
+  return decoded:sub(1, colon - 1), decoded:sub(colon + 1)
+end
+
+--- HMAC-SHA256(salt, pass) as lowercase hex, the -rpcauth hash format.
+function M.rpcauth_hash(salt, pass)
+  local crypto = require("lunarblock.crypto")
+  return hex_of(crypto.hmac_sha256(salt, pass))
+end
+
+--- Build a {user, salt, hash} entry from a plaintext credential with a fresh
+-- random 16-byte salt (Core InitRPCAuthentication).
+function M.hash_credential(user, pass)
+  local crypto = require("lunarblock.crypto")
+  local salt = hex_of(crypto.random_bytes(16))
+  return {user = user, salt = salt, hash = M.rpcauth_hash(salt, pass)}
+end
+
+--- Parse one "-rpcauth=<user>:<salt>$<hash>" value. Returns the entry or nil.
+function M.parse_rpcauth(value)
+  if type(value) ~= "string" then return nil end
+  local user, rest = value:match("^([^:]*):([^:]*)$")
+  if not user then return nil end
+  local salt, hash = rest:match("^([^%$]*)%$([^%$]*)$")
+  if not salt then return nil end
+  return {user = user, salt = salt, hash = hash:lower()}
+end
+
+--- Core CheckUserAuthorized: does (user, pass) match any entry?
+function M.check_user_authorized(entries, user, pass)
+  local ok = false
+  for _, e in ipairs(entries or {}) do
+    if M.timing_resistant_equal(e.user, user) then
+      if M.timing_resistant_equal(M.rpcauth_hash(e.salt, pass), e.hash) then
+        ok = true
+      end
+    end
+  end
+  return ok
+end
+
+--- Write a fresh random cookie to <dir>/.cookie (via .cookie.tmp + rename, as
+-- Core GenerateAuthCookie does) with mode 0600. Returns user, pass, path or
+-- nil plus an error message.
+function M.generate_auth_cookie(dir)
+  local fsutil = require("lunarblock.fsutil")
+  local crypto = require("lunarblock.crypto")
+  if type(dir) ~= "string" or dir == "" then
+    return nil, "no data directory for the RPC cookie"
+  end
+  local pass = hex_of(crypto.random_bytes(32))
+  local path = dir .. "/" .. M.COOKIEAUTH_FILE
+  local tmp = path .. ".tmp"
+  local ok, err = fsutil.write_file_mode(tmp, M.COOKIEAUTH_USER .. ":" .. pass, 384)  -- 0600
+  if not ok then
+    os.remove(tmp)
+    return nil, "Unable to open cookie authentication file " .. tmp .. ": " .. tostring(err)
+  end
+  local rok, rerr = os.rename(tmp, path)
+  if not rok then
+    os.remove(tmp)
+    return nil, "Unable to rename cookie authentication file " .. tmp .. " to " ..
+                path .. ": " .. tostring(rerr)
+  end
+  return M.COOKIEAUTH_USER, pass, path
+end
+
+--- Backward-compatible single-credential check (constant time).
 function M.check_auth(headers, username, password)
-  local auth = headers["authorization"]
-  if not auth then return false end
-  local scheme, creds = auth:match("^(%w+)%s+(.+)")
-  if scheme ~= "Basic" then return false end
-  -- Decode base64
-  local decoded = M.base64_decode(creds)
-  local expected = username .. ":" .. password
-  return decoded == expected
+  local user, pass = M.parse_basic_auth(headers and headers["authorization"])
+  if not user then return false end
+  local u_ok = M.timing_resistant_equal(user, username)
+  local p_ok = M.timing_resistant_equal(pass, password)
+  return u_ok and p_ok
+end
+
+--- Set up the server's credential list. Never leaves the server open: with
+-- no usable credential every request is refused.
+local function init_auth(self, config)
+  self.rpcauth = {}
+  self.cookie_path = nil
+  local password = config.rpcpassword
+  if password == nil or password == "" then
+    -- config.cookie_dir is the network datadir (main.lua). An embedder that
+    -- passes neither a password nor a cookie dir gets a server that refuses
+    -- every request (fail closed), never an open one. A cookie that cannot
+    -- be written is fatal, as in Core (InitRPCAuthentication returns false).
+    if config.cookie_dir ~= nil then
+      local user, pass, path = M.generate_auth_cookie(config.cookie_dir)
+      if not user then error("RPC auth: " .. tostring(pass)) end
+      self.cookie_path = path
+      self.rpcauth[#self.rpcauth + 1] = M.hash_credential(user, pass)
+    end
+  else
+    self.rpcauth[#self.rpcauth + 1] =
+      M.hash_credential(config.rpcuser or "lunarblock", password)
+  end
+  for _, v in ipairs(config.rpcauth or {}) do
+    local e = M.parse_rpcauth(v)
+    if not e then error("RPC auth: Invalid -rpcauth argument.") end
+    self.rpcauth[#self.rpcauth + 1] = e
+  end
+end
+
+--- Browser defence. Core is never reachable from a web page because it
+-- always demands credentials. We additionally refuse any request carrying an
+-- Origin header: every browser sends Origin on a POST (same-site or
+-- cross-site, fetch or form), and no RPC client does (bitcoin-cli, curl,
+-- python). The Content-Type is NOT used: Core ignores it, and Core's own
+-- documented curl example sends "content-type: text/plain;", as do the
+-- hashhog harnesses, so filtering on it would only break real clients.
+function M.is_browser_request(headers)
+  return headers ~= nil and headers["origin"] ~= nil
 end
 
 --------------------------------------------------------------------------------
@@ -1974,8 +2119,8 @@ end
 -- Bitcoin Core's getblockchaininfo `size_on_disk` reports CalculateCurrentUsage()
 -- (the persistent block/undo data). lunarblock keeps blocks + the UTXO set in a
 -- single RocksDB store under <datadir>/chainstate, so the honest analog is that
--- directory's byte total. Uses `du -sb` (apparent size), mirroring the io.popen
--- pattern already used in wallet.lua. Returns 0 on any failure so the field is
+-- directory's byte total (apparent size of its files, summed without a shell).
+-- Returns 0 on any failure so the field is
 -- always a valid integer (never crashes getblockchaininfo). Reporting-only.
 local function chainstate_size_on_disk(datadir, network_name)
   if type(datadir) ~= "string" or datadir == "" then return 0 end
@@ -1988,13 +2133,9 @@ local function chainstate_size_on_disk(datadir, network_name)
     base = base .. "/" .. network_name
   end
   local dir = base .. "/chainstate"
-  local h = io.popen("du -sb '" .. dir .. "' 2>/dev/null")
-  if not h then return 0 end
-  local out = h:read("*a")
-  h:close()
-  if type(out) ~= "string" then return 0 end
-  local n = out:match("^(%d+)")
-  return n and math.floor(tonumber(n)) or 0
+  -- No shell: sum the files directly (lunarblock.fsutil).
+  local ok, n = pcall(require("lunarblock.fsutil").dir_size, dir)
+  return (ok and type(n) == "number") and math.floor(n) or 0
 end
 
 -- R3(a) oracle independence: the former `query_local_core_header` helper (and
@@ -2049,8 +2190,8 @@ function M.new(config)
   local self = setmetatable({}, RPCServer)
   self.host = config.host or "127.0.0.1"
   self.port = config.rpcport or 8332
-  self.username = config.rpcuser or "lunarblock"
-  self.password = config.rpcpassword or ""
+  -- Credentials (see init_auth): hashed entries only, never plaintext.
+  init_auth(self, config)
   -- FIX-64 (W119): optional HTTPS/TLS termination.  When both paths are set
   -- the listening socket is wrapped with luasec at accept() time.  When
   -- neither is set the server stays plaintext (backward-compat).  Mismatch
@@ -9437,8 +9578,9 @@ end
 
   local function path_is_dir(path)
     if type(path) ~= "string" or path == "" then return false end
-    local r1, _, r3 = os.execute("test -d " .. string.format("%q", path))
-    return r1 == true or r1 == 0 or r3 == 0
+    -- No shell: %q is Lua quoting, not shell quoting, so the old
+    -- os.execute("test -d " .. %q) ran $(...) inside an RPC-supplied path.
+    return require("lunarblock.fsutil").is_dir(path)
   end
 
   -- Parse send/walletcreatefundedpsbt outputs. Empty -> -8. A bad address
@@ -10847,16 +10989,22 @@ end
     bf:close()
 
     local wallet_mod = require("lunarblock.wallet")
+    -- Validate before the name is turned into a path at all: no separators,
+    -- no "." / "..", no NUL/control bytes, so it cannot leave the wallets dir.
+    if not wallet_mod.is_valid_wallet_name(wallet_name) then
+      error({code = M.ERROR.WALLET_ERROR, message = "Invalid wallet name"})
+    end
     local dest = rpc.wallet_manager:get_wallet_path(wallet_name)
     if rpc.wallet_manager:get_wallet(wallet_name) or wallet_mod.exists(dest) then
       error({code = -36,
              message = "Failed to restore wallet. Database file exists."})
     end
-    if wallet_name:find("[/\\:*?\"<>|]") then
-      error({code = M.ERROR.WALLET_ERROR, message = "Invalid wallet name"})
-    end
     local dir = rpc.wallet_manager:get_wallet_dir(wallet_name)
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    local mk_ok, mk_err = require("lunarblock.fsutil").mkdir_p(dir)
+    if not mk_ok then
+      error({code = M.ERROR.WALLET_ERROR,
+             message = "Failed to restore wallet: " .. tostring(mk_err)})
+    end
     local ok, copy_err = copy_file(backup, dest)
     if not ok then
       error({code = M.ERROR.WALLET_ERROR,
@@ -16050,9 +16198,10 @@ function RPCServer:tick()
     return
   end
 
-  -- Check authentication
-  if self.password ~= "" and not M.check_auth(headers, self.username, self.password) then
-    client:send(M.build_http_response(401, '{"error":"Unauthorized"}'))
+  -- Check authentication. Every request, every path, every method.
+  local status, extra = self:authorize_request(headers)
+  if status ~= 200 then
+    client:send(M.build_http_response(status, "", nil, extra))
     client:close()
     return
   end
@@ -16086,8 +16235,9 @@ function RPCServer:tick()
     end
   end
 
-  -- /health: GET endpoint for process supervisors.  No auth required so
-  -- supervisors don't need RPC creds.  Returns 200 with a small JSON body
+  -- /health: GET endpoint for process supervisors.  Like every other path it
+  -- sits behind the auth check above (supervisors read the cookie or pass
+  -- --rpcpassword credentials).  Returns 200 with a small JSON body
   -- whenever the RPC server's tick is running — supervisors can use this
   -- as a "the daemon is responsive" probe.  We deliberately do NOT report
   -- IBD-completion status here; this is a *liveness* check, not readiness.
@@ -16229,11 +16379,37 @@ function RPCServer:drain_deferred_waits()
   end
 end
 
+--- Decide whether a parsed request may proceed. Returns 200, or the HTTP
+-- status to refuse with (403 browser-origin, 401 missing/bad credentials)
+-- plus any extra response headers.
+function RPCServer:authorize_request(headers)
+  if M.is_browser_request(headers) then
+    return 403, nil
+  end
+  local auth = headers and headers["authorization"]
+  if not auth then
+    return 401, {"WWW-Authenticate: " .. M.WWW_AUTH_HEADER_DATA}
+  end
+  local user, pass = M.parse_basic_auth(auth)
+  if not user or not M.check_user_authorized(self.rpcauth, user, pass) then
+    -- Core also sleeps 250ms here to slow brute force. This server runs on
+    -- the node's single main loop, so a sleep would let any local client
+    -- stall block processing; a 256-bit cookie needs no throttle.
+    return 401, {"WWW-Authenticate: " .. M.WWW_AUTH_HEADER_DATA}
+  end
+  return 200, nil
+end
+
 function RPCServer:stop()
   self.running = false
   if self.server_socket then
     self.server_socket:close()
     self.server_socket = nil
+  end
+  -- Core DeleteAuthCookie: the cookie is only valid while the server runs.
+  if self.cookie_path then
+    os.remove(self.cookie_path)
+    self.cookie_path = nil
   end
 end
 
