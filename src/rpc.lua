@@ -11558,6 +11558,11 @@ end
         error({code = M.ERROR.INVALID_PARAMS,
                message = "wallet_name is required when a wallet manager is loaded"})
       end
+      -- Same check as createwallet/loadwallet/restorewallet, before the name
+      -- becomes a path: ".." would otherwise save to <wallets_dir>/../wallet.json.
+      if not wallet_obj.is_valid_wallet_name(wname) then
+        error({code = M.ERROR.WALLET_ERROR, message = "Invalid wallet name"})
+      end
       rpc.wallet_manager.wallets[wname] = new_wallet
       local path = rpc.wallet_manager:get_wallet_path(wname)
       new_wallet:save(path)
