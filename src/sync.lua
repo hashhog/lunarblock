@@ -2419,6 +2419,11 @@ function HeaderChain:add_mined_tip(header, height, opts)
     self.header_tip_hash = hash
     self.header_tip_height = height
     self:_point_heights_at(hash_hex, entry, opts and opts.memory_only)
+    -- Persist the header-tip record too.  Without it a restart loaded the
+    -- header chain only up to the last header accepted over P2P/submitheader,
+    -- so a header whose parent was a block added here was dropped as
+    -- "unknown parent" (core-regtest warden_invalidated_submit/p2p-header).
+    self:set_header_tip(hash, height, false)
   end
   return true
 end

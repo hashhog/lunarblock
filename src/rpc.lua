@@ -12869,6 +12869,12 @@ end
     local block_height = nil
     if rpc.chain_state and rpc.chain_state.tip_height then
       block_height = active_height_of(rpc, hash)
+      -- The persisted height index follows the best HEADER chain, so a header
+      -- accepted over P2P/submitheader above the active tip sits in it.  It is
+      -- active-chain only up to the chainstate tip (Core: chain.Contains).
+      if block_height and block_height > rpc.chain_state.tip_height then
+        block_height = nil
+      end
     end
 
     -- confirmations: ComputeNextBlockAndDepth (blockchain.cpp:116) ->
@@ -12936,6 +12942,10 @@ end
     local blk = rpc.storage.get_block(hash)
     if blk and blk.transactions then
       ntx = #blk.transactions
+    elseif not block_height then
+      -- Header-only block off the active chain: Core's pindex->nTx is 0 until
+      -- the body arrives.
+      ntx = 0
     end
 
     local nextblockhash = nil
