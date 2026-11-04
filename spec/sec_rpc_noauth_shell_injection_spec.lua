@@ -1,5 +1,5 @@
 -- Security: RPC must never run unauthenticated, and no RPC input may reach a
--- shell (audit hashhog#220, item fix-lunarblock-sec-rpc-noauth-shell-injection).
+-- shell.
 --
 -- Before the fix:
 --   * with no --rpcpassword the server skipped the auth check entirely, so any
@@ -321,6 +321,28 @@ describe("sec: RPC input never reaches a shell", function()
     assert.is_nil((mgr:create_wallet(".", {blank = true})))
     assert.is_nil((mgr:create_wallet("a\0b", {blank = true})))
     for n in pairs(mgr.wallets) do mgr:release_lock(n) end
+  end)
+
+  it("importmnemonic refuses a wallet name that leaves the wallets directory", function()
+    local s, mgr = rpc_with_manager()
+    local mnem = "abandon abandon abandon abandon abandon abandon"
+      .. " abandon abandon abandon abandon abandon about"
+    -- <wallets_dir>/../wallet.json is <datadir>/wallet.json.
+    local escaped = dir .. "/wallet.json"
+    os.remove(escaped)
+    for _, bad in ipairs({"..", ".", "../x", "a/b", "a\0b"}) do
+      local ok, err = pcall(s.methods["importmnemonic"], s, {mnem, "", bad})
+      assert.is_false(ok, "importmnemonic accepted wallet name " .. bad)
+      assert.equals(rpc.ERROR.WALLET_ERROR, err.code)
+      assert.is_nil(mgr.wallets[bad])
+    end
+    assert.is_false(file_exists(escaped),
+      "importmnemonic wrote <wallets_dir>/../wallet.json")
+    -- Control: a plain name still imports, inside the wallets directory.
+    local res = s.methods["importmnemonic"](s, {mnem, "", "good"})
+    assert.equals("good", res.wallet_name)
+    assert.is_true(file_exists(mgr:get_wallet_path("good")))
+    assert.is_false(file_exists(escaped))
   end)
 
   it("no os.execute or io.popen call remains in src/", function()
