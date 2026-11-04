@@ -7,9 +7,20 @@ batched (up to 1,000 per batch).
 
 ## Authentication
 
-HTTP Basic auth, user `--rpcuser` (default `lunarblock`) and password `--rpcpassword`.
-There is no `.cookie` file and no `rpcauth`. With an empty password, the default, every
-request is accepted without credentials, so set a password.
+Every request (every path, `/health` included) needs HTTP Basic auth, as in Core
+(`httprpc.cpp`). Accepted credentials:
+
+- with `--rpcpassword`: user `--rpcuser` (default `lunarblock`) and that password;
+- without it: the cookie the node writes at startup to `.cookie` in the network data
+  directory (`<datadir>/.cookie` on mainnet, `<datadir>/<network>/.cookie` otherwise),
+  content `__cookie__:<64 hex>`, mode 0600, rewritten on every start and removed on
+  shutdown;
+- any `--rpcauth USER:SALT$HASH` entry (Core's `share/rpcauth` format).
+
+A missing or wrong credential gets 401 with `WWW-Authenticate: Basic realm="jsonrpc"`. A
+request carrying an `Origin` header gets 403, so a web page cannot reach the RPC port.
+Wallet names must be a single path component: none of `/ \ : * ? " < > |`, no control
+characters, and not `.` or `..`.
 
 ```bash
 curl -s --user lunarblock:changeme \
@@ -67,7 +78,6 @@ Without `setmocktime`, tests that move the clock cannot be run against lunarbloc
 
 ## Known differences from Core
 
-- No cookie authentication; see above.
 - `dumptxoutset` accepts Core's `rollback` option and returns `txoutset_hash`, which is
   the same `hash_serialized_3` value Core reports.
 

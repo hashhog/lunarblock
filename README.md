@@ -82,10 +82,14 @@ All flags, the config file, the data directory layout and logging are in
 ## RPC
 
 lunarblock aims to match Bitcoin Core's JSON-RPC interface: same method names,
-parameters, result shapes and error codes. It accepts HTTP Basic auth with user
-`lunarblock` (change with `--rpcuser`) and the password from `--rpcpassword`. There is no
-cookie file, and if `--rpcpassword` is empty (the default) the RPC port accepts requests
-without any authentication, so always set one.
+parameters, result shapes and error codes. Every request needs HTTP Basic auth, as in Core.
+With `--rpcpassword` the credential is user `lunarblock` (change with `--rpcuser`) and that
+password; `--rpcauth USER:SALT$HASH` (Core's `share/rpcauth` format) adds hashed
+credentials. Without `--rpcpassword` the node writes a random cookie to `.cookie` in the
+network data directory (`<datadir>/.cookie` on mainnet, `<datadir>/regtest/.cookie` on
+regtest), mode 0600, and accepts it as the credential:
+`curl --user "$(cat <datadir>/regtest/.cookie)" ...`. Requests that carry an `Origin`
+header (browsers) are refused.
 
 ```bash
 curl -s --user lunarblock:changeme \

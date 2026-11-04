@@ -72,7 +72,8 @@ the node with `Unknown option: ...`. Boolean values may be `1/0`, `true/false`,
 |---|---|---|
 | `--rpcport PORT` | per network | JSON-RPC port, bound to `127.0.0.1`. |
 | `--rpcuser USER` | `lunarblock` | RPC user name. |
-| `--rpcpassword PW` | empty | RPC password. Empty means no authentication. |
+| `--rpcpassword PW` | empty | RPC password. Empty means cookie auth: a random `__cookie__:<hex>` credential is written to `<network datadir>/.cookie` (mode 0600) at startup and removed at shutdown. |
+| `--rpcauth USER:SALT$HASH` (`=`) | none | Hashed RPC credential in Core's `share/rpcauth` format; repeatable. |
 | `--rpc-tls-cert PATH`, `--rpc-tls-key PATH` (`=`) | none | Serve RPC over TLS; give both. Needs LuaSec. |
 | `--rest` | off | Read-only REST API, no authentication, on `127.0.0.1`. |
 | `--restport PORT` | `8080` | REST port. |
