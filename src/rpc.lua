@@ -13345,6 +13345,15 @@ end
         if rpc.storage then
           local existing_block = rpc.storage.get(rpc.storage.CF.BLOCKS, block_hash.bytes)
           if existing_block then
+            -- Core AcceptBlockHeader (validation.cpp): a known block whose
+            -- index entry is BLOCK_FAILED_VALID is BLOCK_CACHED_INVALID
+            -- "duplicate-invalid".  invalidateblock / InvalidChainFound mark
+            -- every descendant failed too, so a stored descendant of an
+            -- invalidated block answers duplicate-invalid, not duplicate.
+            if rpc.chain_state.has_invalid_ancestor
+                and rpc.chain_state:has_invalid_ancestor(block_hash) then
+              return "duplicate-invalid"
+            end
             return "duplicate"
           end
         end
@@ -13424,6 +13433,30 @@ end
           if sb_err == "invalid-ancestor"
               and not rpc.chain_state:is_block_invalid(block_hash) then
             return "bad-prevblk"
+          end
+          -- Core AcceptBlockHeader: an unknown parent is BLOCK_MISSING_PREV
+          -- "prev-blk-not-found"; ProcessNewBlock reports it through
+          -- BlockChecked, so submitblock returns that token
+          -- (rpc/mining.cpp BIP22ValidationResult), not "inconclusive".
+          if sb_err == "unknown-parent" then
+            return "prev-blk-not-found"
+          end
+          -- ConnectBlock failed during the reorg.  Core's submitblock only
+          -- sees a verdict through BlockChecked for the submitted block
+          -- itself (submitblock_StateCatcher): when the submitted block is
+          -- the one that failed, the answer is its reason token
+          -- (bad-cb-amount, ...); when an ancestor on its branch failed, the
+          -- catcher never fires and the answer is "inconclusive".  The
+          -- "reorg-connect-failed at height H: " wrapper must come off
+          -- before the token map, or every reason falls through to the
+          -- generic "rejected".
+          local connect_reason = sb_err
+            and sb_err:match("^reorg%-connect%-failed at height %d+: (.*)$")
+          if connect_reason and sb_failed then
+            if sb_failed.bytes == block_hash.bytes then
+              return bip22_result(connect_reason)
+            end
+            return "inconclusive"
           end
           if sb_err and sb_err:find("^check%-block: ") then
             -- CheckBlock / ContextualCheckBlock at the real height failed.
