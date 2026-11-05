@@ -13977,6 +13977,8 @@ end
       -- Check already-in-mempool (Core returns specific error here).
       if rpc.mempool.entries[res.txid] then
         res["reject-reason"] = "txn-already-in-mempool"
+        -- state.ToString() of a state with no debug message is the bare token.
+        res["reject-details"] = "txn-already-in-mempool"
         return results
       end
       local atmp = rpc.mempool:accept_to_memory_pool(tx, true)
@@ -14007,10 +14009,12 @@ end
           reason = "missing-inputs"
         end
         res["reject-reason"] = reason
-        -- reject-details is state.ToString() (rpc/mempool.cpp:403); only the
-        -- rejects that carry their reason separately supply it.
-        if atmp.reject_details then
-          res["reject-details"] = atmp.reject_details
+        -- reject-details is state.ToString() (rpc/mempool.cpp:403).
+        -- A reject with no debug message (txn-already-known, ...) prints as
+        -- the bare token, so reject-details is always present on a reject.
+        -- Core (rpc/mempool.cpp:399-403) reports missing-inputs WITHOUT it.
+        if reason ~= "missing-inputs" then
+          res["reject-details"] = atmp.reject_details or atmp.reject_reason or reason
         end
       end
       return results

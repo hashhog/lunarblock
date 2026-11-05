@@ -111,8 +111,11 @@ describe("mempool coinbase maturity at tip+1", function()
     assert.is_true(ok, tostring(err))
     local c2 = add_coin(cs, "cb3", 102)    -- 201 - 102 = 99
     cs.coin_view.utxos[types.hash256_hex(c2) .. ":0"].is_coinbase = true
-    local ok2, err2 = mp:accept_transaction(spend(c2, 0, 0xFFFFFFFE, 2, 0, 90000))
+    local ok2, err2, details2 = mp:accept_transaction(spend(c2, 0, 0xFFFFFFFE, 2, 0, 90000))
     assert.is_false(ok2)
     assert.equal("bad-txns-premature-spend-of-coinbase", err2)
+    -- Core tx_verify.cpp:180 debug message; testmempoolaccept reject-details
+    -- is "<token>, <message>".
+    assert.equal("tried to spend coinbase at depth 99", details2)
   end)
 end)
