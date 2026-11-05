@@ -4578,9 +4578,9 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   local prev_hash = block.header.prev_hash
   local prev_header = self.storage.get_header(prev_hash)
   if not prev_header then
-    -- True orphan: parent header not in storage.  Caller surfaces this
-    -- as BIP-22 "inconclusive" (matches the pre-fix behavior for any
-    -- non-tip-extending block).
+    -- True orphan: parent header not in storage.  The submitblock caller
+    -- surfaces this as Core's BIP-22 "prev-blk-not-found" (AcceptBlockHeader
+    -- BLOCK_MISSING_PREV).
     return nil, "unknown-parent"
   end
 
