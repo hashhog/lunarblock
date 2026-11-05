@@ -1708,7 +1708,10 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       if utxo.is_coinbase then
         if next_height - utxo.height < consensus.COINBASE_MATURITY then
           -- Core token: consensus/tx_verify.cpp:180.
-          return false, "bad-txns-premature-spend-of-coinbase"
+          -- Debug message: consensus/tx_verify.cpp:180 "tried to spend
+          -- coinbase at depth %d" (the input's depth at the spend height).
+          return false, "bad-txns-premature-spend-of-coinbase",
+            "tried to spend coinbase at depth " .. tostring(next_height - utxo.height)
         end
       end
       -- Save per-input UTXO height for BIP-68 sequence lock check.
