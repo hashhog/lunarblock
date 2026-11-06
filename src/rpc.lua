@@ -2678,7 +2678,17 @@ function RPCServer:register_methods()
     if rpc.chain_state then
       tip_height = rpc.chain_state.tip_height or 0
       tip_hash = rpc.chain_state.tip_hash or types.hash256_zero()
-      header_height = rpc.chain_state.header_tip_height or tip_height
+      -- headers: Core reports chainman.m_best_header->nHeight
+      -- (rpc/blockchain.cpp:1423).  The header chain's tip IS that best
+      -- header; chain_state.header_tip_height is only copied from it on the
+      -- P2P headers path, so a header accepted by submitheader (or any header
+      -- after a restart) never reached it.  Same source getchainstates uses.
+      if rpc.header_chain and rpc.header_chain.header_tip_height
+          and rpc.header_chain.header_tip_height >= 0 then
+        header_height = rpc.header_chain.header_tip_height
+      else
+        header_height = rpc.chain_state.header_tip_height or tip_height
+      end
 
       -- Get current block's bits for difficulty calculation
       if rpc.storage then
@@ -13809,6 +13819,17 @@ end
     -- single tip-extending header on a node not yet past min_chain_work.
     local accepted, accept_err = chain:accept_header(header, { min_pow_checked = true })
     if accepted then
+      -- Persist the header tip, as process_headers does for P2P headers.
+      -- Core keeps the header in the block index across a restart, so
+      -- m_best_header (getblockchaininfo.headers) is still this header after
+      -- a reboot; without the META record lunarblock reloaded its header
+      -- chain only up to the last mined/P2P tip.
+      if chain.header_tip_hash and chain.header_tip_height then
+        chain:set_header_tip(chain.header_tip_hash, chain.header_tip_height, false)
+      end
+      if rpc.chain_state then
+        rpc.chain_state.header_tip_height = chain.header_tip_height
+      end
       -- Validated + stored, or already-known (accept_header returns true for
       -- both) -> Core returns UniValue::VNULL.
       return cjson.null
