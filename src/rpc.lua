@@ -2456,6 +2456,27 @@ function RPCServer:handle_single_request(request)
     }
   end
 
+  -- getpeerinfo: Core emits `inflight`, `permissions` and an empty peer list
+  -- as JSON arrays (rpc/net.cpp VARR).  The lua-cjson on the production
+  -- LUA_CPATH has no array_mt, so an empty Lua table there encodes as `{}`.
+  -- The handler keeps returning a plain table (callers index it); fix the
+  -- known-empty fields on the wire here.
+  if method == "getpeerinfo" and type(result) == "table" then
+    local enc
+    if #result == 0 then
+      enc = "[]"
+    else
+      enc = cjson.encode(result)
+      enc = enc:gsub('"inflight":{}', '"inflight":[]')
+      enc = enc:gsub('"permissions":{}', '"permissions":[]')
+    end
+    return {
+      _raw_json_result = enc,
+      error = cjson.null,
+      id = id,
+    }
+  end
+
   return {
     result = result,
     error = cjson.null,
