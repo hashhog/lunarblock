@@ -2456,6 +2456,27 @@ function RPCServer:handle_single_request(request)
     }
   end
 
+  -- getpeerinfo: Core emits `inflight`, `permissions` and an empty peer list
+  -- as JSON arrays (rpc/net.cpp VARR).  The lua-cjson on the production
+  -- LUA_CPATH has no array_mt, so an empty Lua table there encodes as `{}`.
+  -- The handler keeps returning a plain table (callers index it); fix the
+  -- known-empty fields on the wire here.
+  if method == "getpeerinfo" and type(result) == "table" then
+    local enc
+    if #result == 0 then
+      enc = "[]"
+    else
+      enc = cjson.encode(result)
+      enc = enc:gsub('"inflight":{}', '"inflight":[]')
+      enc = enc:gsub('"permissions":{}', '"permissions":[]')
+    end
+    return {
+      _raw_json_result = enc,
+      error = cjson.null,
+      id = id,
+    }
+  end
+
   return {
     result = result,
     error = cjson.null,
@@ -2535,7 +2556,9 @@ function RPCServer:handle_request(request_body)
       for _, r in ipairs(responses) do
         if r._raw_json_result then
           local outer = cjson.encode({result = cjson.null, error = r.error, id = r.id})
-          outer = outer:gsub('"result":null', '"result":' .. r._raw_json_result, 1)
+          local frag = '"result":' .. r._raw_json_result
+          -- function replacement: a '%' in the fragment must not be read as a capture
+          outer = outer:gsub('"result":null', function() return frag end, 1)
           parts[#parts + 1] = outer
         else
           parts[#parts + 1] = cjson.encode(r)
@@ -2567,7 +2590,9 @@ function RPCServer:handle_request(request_body)
   if response._raw_json_result then
     local outer = cjson.encode({result = cjson.null, error = response.error, id = response.id})
     -- Replace the null result placeholder with the raw fragment.
-    outer = outer:gsub('"result":null', '"result":' .. response._raw_json_result, 1)
+    local frag = '"result":' .. response._raw_json_result
+    -- function replacement: a '%' in the fragment must not be read as a capture
+    outer = outer:gsub('"result":null', function() return frag end, 1)
     return outer, nil
   end
 
