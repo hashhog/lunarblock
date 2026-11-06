@@ -2556,7 +2556,9 @@ function RPCServer:handle_request(request_body)
       for _, r in ipairs(responses) do
         if r._raw_json_result then
           local outer = cjson.encode({result = cjson.null, error = r.error, id = r.id})
-          outer = outer:gsub('"result":null', '"result":' .. r._raw_json_result, 1)
+          local frag = '"result":' .. r._raw_json_result
+          -- function replacement: a '%' in the fragment must not be read as a capture
+          outer = outer:gsub('"result":null', function() return frag end, 1)
           parts[#parts + 1] = outer
         else
           parts[#parts + 1] = cjson.encode(r)
@@ -2588,7 +2590,9 @@ function RPCServer:handle_request(request_body)
   if response._raw_json_result then
     local outer = cjson.encode({result = cjson.null, error = response.error, id = response.id})
     -- Replace the null result placeholder with the raw fragment.
-    outer = outer:gsub('"result":null', '"result":' .. response._raw_json_result, 1)
+    local frag = '"result":' .. response._raw_json_result
+    -- function replacement: a '%' in the fragment must not be read as a capture
+    outer = outer:gsub('"result":null', function() return frag end, 1)
     return outer, nil
   end
 

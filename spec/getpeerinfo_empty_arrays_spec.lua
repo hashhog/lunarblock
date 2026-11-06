@@ -45,6 +45,14 @@ describe("getpeerinfo empty arrays", function()
     assert.is_truthy(resp:find('"bytesrecv_per_msg":{}', 1, true), resp)
   end)
 
+  it("passes a '%' in a peer string through unchanged", function()
+    local resp = call({ { ip = "10.1.2.3", port = 18444, services = 9,
+                          inbound = false, latency_ms = 5,
+                          user_agent = "/x%d%1/" } })
+    assert.is_truthy(resp:find("x%d%1", 1, true), resp)
+    assert.is_truthy(resp:find('"inflight":%[%]'), resp)
+  end)
+
   it("returns [] with no peers", function()
     local resp = call({})
     assert.is_truthy(resp:find('"result":%[%]'), resp)
