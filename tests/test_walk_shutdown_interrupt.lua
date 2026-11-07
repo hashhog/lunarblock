@@ -116,8 +116,8 @@ do
   local ok, res = pcall(call_info, server)
   local code = (not ok and type(res) == "table") and res.code or nil
   local msg = (not ok and type(res) == "table") and res.message or (ok and "ok" or tostring(res))
-  check("stop during the walk returns LunarBlock stopping",
-    stop_reply == "LunarBlock stopping", tostring(stop_reply))
+  check("stop during the walk returns Bitcoin Core stopping",
+    stop_reply == "Bitcoin Core stopping", tostring(stop_reply))
   check("stop during the walk aborts with Shutting down",
     code == -9 and msg == "Shutting down",
     "code=" .. tostring(code) .. " msg=" .. tostring(msg))

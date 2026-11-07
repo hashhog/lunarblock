@@ -8865,7 +8865,7 @@ end
     -- is written first: the RPC server is serviced synchronously inside the
     -- main loop tick, before the next poll.
     require("lunarblock.ops").raise_signal(15)  -- SIGTERM
-    return "LunarBlock stopping"
+    return "Bitcoin Core stopping"
   end
 
   self.methods["jitprofileflush"] = function(_rpc, _params)
