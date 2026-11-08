@@ -3325,12 +3325,11 @@ function Wallet:list_unspent(include_unconfirmed, include_immature_coinbase)
     --       continue;
     -- (wallet/spend.cpp AvailableCoins; wallet/rpc/coins.cpp listunspent).
     -- Listing it with spendable=false made a fresh regtest wallet show 101
-    -- coins where Core shows the one mature coinbase.
+    -- coins where Core shows the one mature coinbase. When it is asked for,
+    -- Core still reports it spendable: "Any coins we list are always
+    -- spendable" (wallet/rpc/coins.cpp listunspent).
     local immature = utxo.is_coinbase
       and (utxo.confirmations or 0) < consensus.COINBASE_MATURITY + 1
-    if immature then
-      spendable = false
-    end
 
     if include_immature_coinbase or not immature then
       result[#result + 1] = {

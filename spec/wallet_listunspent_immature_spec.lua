@@ -71,14 +71,11 @@ describe("listunspent and immature coinbase", function()
     for _, r in ipairs(rows) do assert.is_true(r.spendable) end
   end)
 
-  it("include_immature_coinbase lists them again, still not spendable", function()
+  it("include_immature_coinbase lists them again, spendable as Core reports", function()
+    -- Core listunspent: "Any coins we list are always spendable".
     local rows = w:list_unspent(false, true)
     assert.equals(4, #rows)
-    local unspendable = 0
-    for _, r in ipairs(rows) do
-      if r.spendable == false then unspendable = unspendable + 1 end
-    end
-    assert.equals(2, unspendable)
+    for _, r in ipairs(rows) do assert.is_true(r.spendable) end
   end)
 
   it("listunspent RPC returns only the mature coinbase and the 1-conf coin", function()
