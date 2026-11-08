@@ -1202,6 +1202,21 @@ local function strip_btc_sentinels(json)
   return (json:gsub('"~~(-?%d+%.%d+)~~"', '%1'))
 end
 
+--- btc_sentinel() for an amount the wallet layer already divided into BTC.
+-- Rounds back to whole satoshis (|x| <= MAX_MONEY keeps x*1e8 well inside
+-- 2^53), symmetric around zero so a negative fee rounds like its magnitude.
+-- Non-numbers pass through untouched.
+local function btc_sentinel_from_btc(btc)
+  if type(btc) ~= "number" then return btc end
+  local sats
+  if btc < 0 then
+    sats = -math.floor(-btc * 100000000 + 0.5)
+  else
+    sats = math.floor(btc * 100000000 + 0.5)
+  end
+  return btc_sentinel(sats)
+end
+
 --------------------------------------------------------------------------------
 -- Ordered JSON emit (Core pushKV byte-order parity)
 --------------------------------------------------------------------------------
@@ -10707,8 +10722,11 @@ end
       wallet:scan_utxos(rpc.chain_state)
     end
 
+    -- Core: ValueFromAmount(bal.m_mine_trusted) (wallet/rpc/coins.cpp), a
+    -- fixed-8 number such as 50.00000000. Returning balance / 1e8 let cjson
+    -- write an integral balance as 50, a JSON integer where Core has a real.
     local balance = wallet:get_balance()
-    return balance / 100000000  -- Convert satoshis to BTC
+    return { _raw_json = oj_amount(balance).__oj_raw }
   end
 
   --- getbalances: Get detailed balance info.
@@ -10722,22 +10740,25 @@ end
     sync_wallet_ledger(rpc, wallet)
 
     local details = wallet:get_balance_details()
-    return {
+    -- Every amount is ValueFromAmount (wallet/rpc/coins.cpp getbalances), so
+    -- each goes out fixed-8 (50.00000000, 0.00000000), never a JSON integer.
+    local result = {
       mine = {
         -- trusted = confirmed spendable balance, EXCLUDING immature coinbase
         -- (Bitcoin Core getbalances: immature coinbases are reported under
         -- `immature`, never under `trusted`).
-        trusted = details.spendable / 100000000,
-        untrusted_pending = details.unconfirmed / 100000000,
-        immature = (details.immature or 0) / 100000000,
+        trusted = btc_sentinel(details.spendable or 0),
+        untrusted_pending = btc_sentinel(details.unconfirmed or 0),
+        immature = btc_sentinel(details.immature or 0),
       },
       watchonly = {
-        trusted = 0,
-        untrusted_pending = 0,
-        immature = 0,
+        trusted = btc_sentinel(0),
+        untrusted_pending = btc_sentinel(0),
+        immature = btc_sentinel(0),
       },
       lastprocessedblock = last_processed_block(rpc, wallet),
     }
+    return { _raw_json = strip_btc_sentinels(cjson.encode(result)) }
   end
 
   --- listunspent: List unspent transaction outputs.
@@ -10807,7 +10828,9 @@ end
           address = u.address,
           label = "",
           scriptPubKey = script_hex_for_address(u.address, network_name),
-          amount = (u.satoshis or 0) / 100000000,
+          -- ValueFromAmount(out.txout.nValue) (wallet/rpc/coins.cpp):
+          -- fixed-8, so a 50 BTC coin is 50.00000000 and not the integer 50.
+          amount = btc_sentinel(u.satoshis or 0),
           confirmations = conf,
           spendable = u.spendable ~= false,
           solvable = true,
@@ -10818,7 +10841,7 @@ end
       end
     end
 
-    return result
+    return { _raw_json = strip_btc_sentinels(cjson.encode(result)) }
   end
 
   --- sendtoaddress: Send to a Bitcoin address.
@@ -13968,7 +13991,21 @@ end
       error({code = M.ERROR.INVALID_ADDRESS,
              message = "Invalid or non-wallet transaction id"})
     end
-    return detail
+    -- Core writes amount, fee and each details[].amount/fee with
+    -- ValueFromAmount (wallet/rpc/transactions.cpp), fixed-8. The wallet
+    -- layer hands back BTC numbers, which cjson would print as 1 for a
+    -- whole coin; re-render them as Core's fixed-8 literals.
+    detail.amount = btc_sentinel_from_btc(detail.amount)
+    if detail.fee ~= nil then detail.fee = btc_sentinel_from_btc(detail.fee) end
+    if type(detail.details) == "table" then
+      for _, d in ipairs(detail.details) do
+        if type(d) == "table" then
+          d.amount = btc_sentinel_from_btc(d.amount)
+          if d.fee ~= nil then d.fee = btc_sentinel_from_btc(d.fee) end
+        end
+      end
+    end
+    return { _raw_json = strip_btc_sentinels(cjson.encode(detail)) }
   end
 
   --- testmempoolaccept: Dry-run mempool validation for raw transactions.
