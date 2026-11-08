@@ -594,7 +594,7 @@ describe("rpc", function()
       local decoded = cjson.decode(response)
 
       assert.is_string(decoded.result)
-      assert.truthy(decoded.result:match("stopping"))
+      assert.truthy(decoded.result == "Bitcoin Core stopping")
     end)
 
     -- Gate 5: stop must actually request shutdown through the SIGTERM path
