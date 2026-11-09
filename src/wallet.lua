@@ -3304,8 +3304,10 @@ end
 
 --- List unspent outputs.
 -- @param include_unconfirmed boolean: Include pending UTXOs (default true)
+-- @param include_immature_coinbase boolean: Also list coinbase outputs that
+--   are not yet mature (default false, as in Core)
 -- @return table: Array of UTXO info
-function Wallet:list_unspent(include_unconfirmed)
+function Wallet:list_unspent(include_unconfirmed, include_immature_coinbase)
   include_unconfirmed = include_unconfirmed ~= false
 
   local result = {}
@@ -3316,23 +3318,31 @@ function Wallet:list_unspent(include_unconfirmed)
     if self.spent_pending[key] then
       spendable = false
     end
-    -- Immature coinbase (< COINBASE_MATURITY+1 = 101 confirmations) is not
-    -- spendable: the node would reject the spend as "spending immature
-    -- coinbase". Matches Bitcoin Core, which marks such outputs not spendable.
-    if utxo.is_coinbase and (utxo.confirmations or 0) < consensus.COINBASE_MATURITY + 1 then
-      spendable = false
-    end
+    -- Immature coinbase (< COINBASE_MATURITY+1 = 101 confirmations). Core's
+    -- listunspent leaves it out unless the caller sets the
+    -- include_immature_coinbase query option (default false):
+    --   if (wallet.IsTxImmatureCoinBase(wtx) && !params.include_immature_coinbase)
+    --       continue;
+    -- (wallet/spend.cpp AvailableCoins; wallet/rpc/coins.cpp listunspent).
+    -- Listing it with spendable=false made a fresh regtest wallet show 101
+    -- coins where Core shows the one mature coinbase. When it is asked for,
+    -- Core still reports it spendable: "Any coins we list are always
+    -- spendable" (wallet/rpc/coins.cpp listunspent).
+    local immature = utxo.is_coinbase
+      and (utxo.confirmations or 0) < consensus.COINBASE_MATURITY + 1
 
-    result[#result + 1] = {
-      txid = types.hash256_hex(utxo.txid),
-      vout = utxo.vout,
-      address = utxo.address,
-      amount = utxo.value / consensus.COIN,
-      satoshis = utxo.value,
-      confirmations = utxo.confirmations or 0,
-      spendable = spendable,
-      safe = not self.spent_pending[key],
-    }
+    if include_immature_coinbase or not immature then
+      result[#result + 1] = {
+        txid = types.hash256_hex(utxo.txid),
+        vout = utxo.vout,
+        address = utxo.address,
+        amount = utxo.value / consensus.COIN,
+        satoshis = utxo.value,
+        confirmations = utxo.confirmations or 0,
+        spendable = spendable,
+        safe = not self.spent_pending[key],
+      }
+    end
   end
 
   -- Add pending UTXOs
