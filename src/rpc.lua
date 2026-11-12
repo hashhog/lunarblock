@@ -10751,11 +10751,8 @@ end
         untrusted_pending = btc_sentinel(details.unconfirmed or 0),
         immature = btc_sentinel(details.immature or 0),
       },
-      watchonly = {
-        trusted = btc_sentinel(0),
-        untrusted_pending = btc_sentinel(0),
-        immature = btc_sentinel(0),
-      },
+      -- No "watchonly" object: Core's getbalances (wallet/rpc/coins.cpp)
+      -- reports only mine + lastprocessedblock.
       lastprocessedblock = last_processed_block(rpc, wallet),
     }
     return { _raw_json = strip_btc_sentinels(cjson.encode(result)) }
