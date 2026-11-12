@@ -757,7 +757,11 @@ function Peer:handle_version(payload)
     return
   end
   -- Deserialize version message
-  local ver = p2p.deserialize_version(payload)
+  local ver, verr = p2p.deserialize_version(payload)
+  if not ver then
+    self:disconnect(verr or "malformed version payload")
+    return
+  end
   self.version_info = ver
   self.version_recv_time = socket.gettime()
   self.services = ver.services
@@ -1065,104 +1069,118 @@ function Peer:process_messages()
 
     processed[#processed + 1] = msg
 
-    if msg.command == "version" then
-      self:handle_version(msg.payload)
-    elseif msg.command == "verack" then
-      self:handle_verack()
-    elseif msg.command == "ping" then
-      self:handle_ping(msg.payload)
-    elseif msg.command == "pong" then
-      self:handle_pong(msg.payload)
-    elseif msg.command == "sendheaders" then
-      self.send_headers = true
-    elseif msg.command == "sendcmpct" then
-      local sc = p2p.deserialize_sendcmpct(msg.payload)
-      -- Only accept compact blocks version 2 (wtxid-based, BIP152).
-      -- W112 BUG-8 fix: send_compact was set unconditionally outside this block,
-      -- allowing version 1 to enable compact mode even though we only support v2.
-      if sc.version == 2 then
-        self.provides_compact = true
-        self.high_bandwidth = sc.announce
-        self.compact_version = sc.version
-        self.send_compact = sc.announce
-      end
-    elseif msg.command == "feefilter" then
-      self.fee_filter = p2p.deserialize_feefilter(msg.payload)
-    elseif msg.command == "wtxidrelay" then
-      -- BIP 339: wtxidrelay must be sent before verack.  Core only honours it
-      -- when the common version >= WTXID_RELAY_VERSION (net_processing.cpp:3923),
-      -- otherwise it is ignored (not a disconnect).
-      if (self.common_version or p2p.PROTOCOL_VERSION) >= M.WTXID_RELAY_VERSION then
-        self.wtxid_relay = true
-      end
-    elseif msg.command == "sendaddrv2" then
-      -- BIP 155: sendaddrv2 must be sent before verack
-      self.send_addrv2 = true
-    elseif msg.command == "sendtxrcncl" then
-      -- BIP 330: Erlay transaction reconciliation
-      -- Must be received before verack, only from outbound peers for us
-      if not self.handshake_complete then
-        local rcncl = p2p.deserialize_sendtxrcncl(msg.payload)
-        self.erlay_their_salt = rcncl.salt
-        -- If we also sent sendtxrcncl, Erlay is now negotiated
-        if self.erlay_salt > 0 then
-          self.erlay_enabled = true
-          self.erlay_version = math.min(rcncl.version, erlay.VERSION)
-          -- Combined salt: tagged-hash combination matching Core's ComputeSalt.
-          -- Previous bit.bxor of lower-32-bits only silently discarded upper bits.
-          self.erlay_combined_salt = erlay.compute_combined_salt(
-            self.erlay_salt, self.erlay_their_salt
-          )
-        end
-      end
-    elseif msg.command == "getcfilters" or
-           msg.command == "getcfheaders" or
-           msg.command == "getcfcheckpt" then
-      -- FIX-81 / W121 BUG-1: BIP-157 compact-filter request dispatch.
-      -- Three incoming wire messages (getcfilters / getcfheaders /
-      -- getcfcheckpt) require Core-parity validation and a server-side
-      -- response.  The dispatch is delegated to a registered handler
-      -- (main.lua peer_manager:register_handler) which has closure
-      -- access to chain_state / header_chain / storage / index_manager
-      -- needed to walk stop_index ancestors per Core's
-      -- PrepareBlockFilterRequest (net_processing.cpp:3262).
-      --
-      -- If no handler is registered (e.g. --blockfilterindex disabled),
-      -- silently drop — Core also does not respond when the index
-      -- isn't available (PrepareBlockFilterRequest falls through after
-      -- the supported_filter_type check fires).  Setting the
-      -- BIP157_P2P_DISPATCH_PRESENT flag without a handler would still
-      -- not advertise NODE_COMPACT_FILTERS because the gate's (b)
-      -- condition (blockfilterindex_enabled) AND'd in.
-      local handler = self.message_handlers[msg.command]
-      if handler then
-        handler(self, msg.payload)
-      end
-    elseif msg.command == "cfilter" or
-           msg.command == "cfheaders" or
-           msg.command == "cfcheckpt" then
-      -- FIX-81: response-side messages.  lunarblock is server-side only
-      -- for BIP-157 — we never issue getcfilters / getcfheaders /
-      -- getcfcheckpt to peers, so receiving these is unexpected.  Core
-      -- in client mode would route to CChainStateManager updates; here
-      -- we log via the registered handler (if any) and otherwise drop
-      -- silently.  Future BIP-157 client-mode work can register a
-      -- handler without changing the dispatch.
-      local handler = self.message_handlers[msg.command]
-      if handler then
-        Peer._safe_dispatch(self, msg.command, handler, msg.payload)
-      end
-    else
-      -- Dispatch to registered handler.
-      local handler = self.message_handlers[msg.command]
-      if handler then
-        Peer._safe_dispatch(self, msg.command, handler, msg.payload)
-      end
-    end
+    -- Built-in handlers run under the same per-message guard as registered
+    -- ones: a deserializer that raises (short version/ping/pong, ...) used to
+    -- unwind out of PeerManager:tick and starve every other peer (C5).
+    Peer._safe_dispatch(self, msg.command, Peer._dispatch_message, msg)
+    -- Core stops processing a peer once fDisconnect is set
+    -- (net_processing.cpp ProcessMessages: `if (node.fDisconnect) return false`).
+    if self.state == M.STATE.DISCONNECTED then break end
 
     ::continue::
   end
   return processed
+end
+
+--- Dispatch one received message to its built-in or registered handler.
+-- Called through Peer._safe_dispatch, so a handler that raises disconnects
+-- this peer instead of aborting the caller.
+-- @param msg table: {command, payload}
+function Peer:_dispatch_message(msg)
+  if msg.command == "version" then
+    self:handle_version(msg.payload)
+  elseif msg.command == "verack" then
+    self:handle_verack()
+  elseif msg.command == "ping" then
+    self:handle_ping(msg.payload)
+  elseif msg.command == "pong" then
+    self:handle_pong(msg.payload)
+  elseif msg.command == "sendheaders" then
+    self.send_headers = true
+  elseif msg.command == "sendcmpct" then
+    local sc = p2p.deserialize_sendcmpct(msg.payload)
+    -- Only accept compact blocks version 2 (wtxid-based, BIP152).
+    -- W112 BUG-8 fix: send_compact was set unconditionally outside this block,
+    -- allowing version 1 to enable compact mode even though we only support v2.
+    if sc.version == 2 then
+      self.provides_compact = true
+      self.high_bandwidth = sc.announce
+      self.compact_version = sc.version
+      self.send_compact = sc.announce
+    end
+  elseif msg.command == "feefilter" then
+    self.fee_filter = p2p.deserialize_feefilter(msg.payload)
+  elseif msg.command == "wtxidrelay" then
+    -- BIP 339: wtxidrelay must be sent before verack.  Core only honours it
+    -- when the common version >= WTXID_RELAY_VERSION (net_processing.cpp:3923),
+    -- otherwise it is ignored (not a disconnect).
+    if (self.common_version or p2p.PROTOCOL_VERSION) >= M.WTXID_RELAY_VERSION then
+      self.wtxid_relay = true
+    end
+  elseif msg.command == "sendaddrv2" then
+    -- BIP 155: sendaddrv2 must be sent before verack
+    self.send_addrv2 = true
+  elseif msg.command == "sendtxrcncl" then
+    -- BIP 330: Erlay transaction reconciliation
+    -- Must be received before verack, only from outbound peers for us
+    if not self.handshake_complete then
+      local rcncl = p2p.deserialize_sendtxrcncl(msg.payload)
+      self.erlay_their_salt = rcncl.salt
+      -- If we also sent sendtxrcncl, Erlay is now negotiated
+      if self.erlay_salt > 0 then
+        self.erlay_enabled = true
+        self.erlay_version = math.min(rcncl.version, erlay.VERSION)
+        -- Combined salt: tagged-hash combination matching Core's ComputeSalt.
+        -- Previous bit.bxor of lower-32-bits only silently discarded upper bits.
+        self.erlay_combined_salt = erlay.compute_combined_salt(
+          self.erlay_salt, self.erlay_their_salt
+        )
+      end
+    end
+  elseif msg.command == "getcfilters" or
+         msg.command == "getcfheaders" or
+         msg.command == "getcfcheckpt" then
+    -- FIX-81 / W121 BUG-1: BIP-157 compact-filter request dispatch.
+    -- Three incoming wire messages (getcfilters / getcfheaders /
+    -- getcfcheckpt) require Core-parity validation and a server-side
+    -- response.  The dispatch is delegated to a registered handler
+    -- (main.lua peer_manager:register_handler) which has closure
+    -- access to chain_state / header_chain / storage / index_manager
+    -- needed to walk stop_index ancestors per Core's
+    -- PrepareBlockFilterRequest (net_processing.cpp:3262).
+    --
+    -- If no handler is registered (e.g. --blockfilterindex disabled),
+    -- silently drop — Core also does not respond when the index
+    -- isn't available (PrepareBlockFilterRequest falls through after
+    -- the supported_filter_type check fires).  Setting the
+    -- BIP157_P2P_DISPATCH_PRESENT flag without a handler would still
+    -- not advertise NODE_COMPACT_FILTERS because the gate's (b)
+    -- condition (blockfilterindex_enabled) AND'd in.
+    local handler = self.message_handlers[msg.command]
+    if handler then
+      handler(self, msg.payload)
+    end
+  elseif msg.command == "cfilter" or
+         msg.command == "cfheaders" or
+         msg.command == "cfcheckpt" then
+    -- FIX-81: response-side messages.  lunarblock is server-side only
+    -- for BIP-157 — we never issue getcfilters / getcfheaders /
+    -- getcfcheckpt to peers, so receiving these is unexpected.  Core
+    -- in client mode would route to CChainStateManager updates; here
+    -- we log via the registered handler (if any) and otherwise drop
+    -- silently.  Future BIP-157 client-mode work can register a
+    -- handler without changing the dispatch.
+    local handler = self.message_handlers[msg.command]
+    if handler then
+      Peer._safe_dispatch(self, msg.command, handler, msg.payload)
+    end
+  else
+    -- Dispatch to registered handler.
+    local handler = self.message_handlers[msg.command]
+    if handler then
+      Peer._safe_dispatch(self, msg.command, handler, msg.payload)
+    end
+  end
 end
 
 --- Defense-in-depth: every handler dispatch is pcall-wrapped here so a

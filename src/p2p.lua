@@ -491,9 +491,23 @@ function M.serialize_version(opts)
 end
 
 --- Deserialize a version message.
+-- A truncated payload is reported as (nil, err) rather than raised: the raise
+-- used to unwind out of Peer:process_messages and PeerManager:tick, so one peer
+-- streaming empty `version` messages starved every other peer (security
+-- finding C5).  Core confines the failure to the message (net_processing.cpp
+-- ProcessMessages try/catch).
 -- @param data string: version payload
--- @return table: version message fields
+-- @return table|nil: version message fields, or nil on a malformed payload
+-- @return string|nil: error message when the payload is malformed
 function M.deserialize_version(data)
+  local ok, res = pcall(M._deserialize_version, data)
+  if not ok then
+    return nil, "malformed version payload: " .. tostring(res)
+  end
+  return res
+end
+
+function M._deserialize_version(data)
   local r = serialize.buffer_reader(data)
 
   local version = r.read_i32le()

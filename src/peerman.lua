@@ -3434,6 +3434,45 @@ function PeerManager:_reconnect_manual_peers()
   end
 end
 
+--- One peer's share of a tick: drain its messages, run its timeouts, and
+-- finish a newly completed handshake.  Called under pcall from tick().
+function PeerManager:_tick_peer(p)
+  if p.state ~= peer_mod.STATE.DISCONNECTED then
+    p:process_messages()
+    p:check_timeouts()
+    -- Check if state became ESTABLISHED (newly completed handshake)
+    if p.state == peer_mod.STATE.ESTABLISHED and not p._established_notified then
+      p._established_notified = true
+      -- Learn our own address from the peer's VERSION addr_recv (Core
+      -- SeenLocal / discovery).  Feelers are outbound peers too.
+      local okd, errd = pcall(self.note_version_addr_recv, self, p)
+      if not okd then
+        io.stderr:write("self-advert discovery error (non-fatal): " .. tostring(errd) .. "\n")
+      end
+      -- Feeler: the handshake SUCCEEDED -> mark for disconnect.  The promotion
+      -- NEW->TRIED happens in disconnect_peer (_move_to_tried for ESTABLISHED
+      -- outbound peers), so a feeler that reaches ESTABLISHED is promoted and
+      -- one that never does (dial/handshake fail) is not -- Core's
+      -- promote-on-success-only semantics.  Feelers carry no relay, so we do
+      -- NOT init trickling for them.
+      if p.is_feeler then
+        p._feeler_done = true
+      else
+        -- Initialize trickling state for newly established peer
+        self:_init_peer_trickle(p)
+        if self.callbacks.on_peer_established then
+          self.callbacks.on_peer_established(p)
+        end
+        -- Initial self-announcement (Core MaybeSendAddr, first SendMessages).
+        local oks, errs = pcall(self.maybe_send_local_addr, self, p)
+        if not oks then
+          io.stderr:write("self-advert send error (non-fatal): " .. tostring(errs) .. "\n")
+        end
+      end
+    end
+  end
+end
+
 function PeerManager:tick()
   -- Accept inbound connections
   self:accept_inbound()
@@ -3441,39 +3480,18 @@ function PeerManager:tick()
   -- Process messages from all peers
   local disconnected = {}
   for _, p in ipairs(self.peer_list) do
-    if p.state ~= peer_mod.STATE.DISCONNECTED then
-      p:process_messages()
-      p:check_timeouts()
-      -- Check if state became ESTABLISHED (newly completed handshake)
-      if p.state == peer_mod.STATE.ESTABLISHED and not p._established_notified then
-        p._established_notified = true
-        -- Learn our own address from the peer's VERSION addr_recv (Core
-        -- SeenLocal / discovery).  Feelers are outbound peers too.
-        local okd, errd = pcall(self.note_version_addr_recv, self, p)
-        if not okd then
-          io.stderr:write("self-advert discovery error (non-fatal): " .. tostring(errd) .. "\n")
-        end
-        -- Feeler: the handshake SUCCEEDED -> mark for disconnect.  The promotion
-        -- NEW->TRIED happens in disconnect_peer (_move_to_tried for ESTABLISHED
-        -- outbound peers), so a feeler that reaches ESTABLISHED is promoted and
-        -- one that never does (dial/handshake fail) is not -- Core's
-        -- promote-on-success-only semantics.  Feelers carry no relay, so we do
-        -- NOT init trickling for them.
-        if p.is_feeler then
-          p._feeler_done = true
-        else
-          -- Initialize trickling state for newly established peer
-          self:_init_peer_trickle(p)
-          if self.callbacks.on_peer_established then
-            self.callbacks.on_peer_established(p)
-          end
-          -- Initial self-announcement (Core MaybeSendAddr, first SendMessages).
-          local oks, errs = pcall(self.maybe_send_local_addr, self, p)
-          if not oks then
-            io.stderr:write("self-advert send error (non-fatal): " .. tostring(errs) .. "\n")
-          end
-        end
-      end
+    -- Per-peer guard (security finding C5): an error raised while handling
+    -- one peer's messages used to unwind out of tick(), skipping every later
+    -- peer, the handshake timeouts and all maintenance below -- on every tick
+    -- the peer kept sending.  Core confines a failure to the peer that caused
+    -- it (net_processing.cpp ProcessMessages try/catch); here the peer is
+    -- disconnected and the loop moves on.
+    local okp, errp = pcall(self._tick_peer, self, p)
+    if not okp then
+      io.stderr:write(string.format("[peerman] peer %s:%s processing raised: %s -- disconnecting\n",
+        tostring(p.ip), tostring(p.port), tostring(errp)))
+      pcall(p.disconnect, p, "error while processing peer: " .. tostring(errp))
+      p.state = peer_mod.STATE.DISCONNECTED
     end
     if p.state == peer_mod.STATE.DISCONNECTED then
       disconnected[#disconnected + 1] = p
