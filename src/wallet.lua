@@ -1679,6 +1679,20 @@ function Wallet:_owned_addr_for_spk(script_pubkey)
   return nil
 end
 
+--- Is this owned address a change (internal-chain) address? Core's
+--- OutputIsChange / ScriptIsChange: an output we own that is not a receive
+--- address the user was handed. Here that is the BIP44 internal chain
+--- (change == 1) or a watch-only descriptor imported as internal.
+-- @param addr string|nil
+-- @return boolean
+function Wallet:_is_change_addr(addr)
+  if not addr then return false end
+  local k = self.keys[addr]
+  if k then return k.change == 1 end
+  local w = self.watch_addrs[addr]
+  return w ~= nil and w.internal and true or false
+end
+
 --- Register a watch-only descriptor's classified address into the owned-script
 --- view. The wallet credits funds paid to this address (scan_utxos /
 --- _owned_addr_for_spk) but holds no private key, so it cannot spend them.
@@ -1718,8 +1732,9 @@ end
 -- credit/debit/received/sent mirror Core's CachedTxGetAmounts exactly:
 --   * fee is computed only when we are the sender (debit>0) as debit-value_out.
 --   * "sent" entries enumerate EVERY non-change output of a from-me tx
---     (include_change=false → outputs paying our own keys are skipped).
---   * "received" entries enumerate every output paying one of our keys.
+--     (an output paying a non-change address of ours is included).
+--   * "received" entries enumerate every output paying one of our keys,
+--     except change outputs of a from-me tx (listed in neither).
 -- @param chain_state ChainState
 -- @param mempool table|nil (unused for confirmed history; reserved)
 -- @param yield function|nil: called once per block height by a cooperative caller
@@ -1797,9 +1812,16 @@ function Wallet:scan_history(chain_state, mempool, yield)
             if addr then
               local vout = vout_idx - 1
               credit = credit + out.value
-              received[#received + 1] = {
-                address = addr, vout = vout, amount = out.value,
-              }
+              -- Change outputs of a from-me tx are not listed at all (Core
+              -- CachedTxGetAmounts: `if (nDebit > 0 && OutputIsChange) continue`
+              -- skips both the sent and the received row). `debit` is final
+              -- here: it is summed over the inputs above. credit/balances
+              -- still count the output; only the history rows differ.
+              if not (debit > 0 and self:_is_change_addr(addr)) then
+                received[#received + 1] = {
+                  address = addr, vout = vout, amount = out.value,
+                }
+              end
               owned_out[outpoint_key(txid.bytes, vout)] = {
                 value = out.value, address = addr,
               }
@@ -1816,10 +1838,11 @@ function Wallet:scan_history(chain_state, mempool, yield)
               if fee < 0 then fee = 0 end
               for vout_idx = 1, #tx.outputs do
                 local out = tx.outputs[vout_idx]
-                -- include_change=false: skip outputs that pay back to us
-                -- (change). Core's OutputIsChange excludes our own outputs from
-                -- the "send" list for a from-me tx.
-                if not self:_owned_addr_for_spk(out.script_pubkey) then
+                -- Skip only CHANGE (Core OutputIsChange). An output paying
+                -- another, non-change address of ours is still a "send" row
+                -- (and also a "receive" row): send-to-self.
+                local own = self:_owned_addr_for_spk(out.script_pubkey)
+                if not (own and self:_is_change_addr(own)) then
                   local dest_addr = self:_address_label_for_spk(out.script_pubkey)
                   sent[#sent + 1] = {
                     address = dest_addr, vout = vout_idx - 1,
