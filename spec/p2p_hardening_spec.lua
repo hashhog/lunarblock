@@ -23,16 +23,18 @@ end
 describe("LB-8 partial non-blocking send", function()
   -- Socket that accepts at most `cap` bytes per send() call, like a full
   -- kernel send buffer: nil, "timeout", <index of last byte accepted>.
+  -- Follows luasocket's send(data, i): bytes from index i, indices absolute.
   local function throttled_socket(cap)
     local s = { wire = {}, cap = cap, closed = false }
-    function s:send(data)
-      if self.cap == 0 then return nil, "timeout", 0 end
-      if #data <= self.cap then
-        self.wire[#self.wire + 1] = data
+    function s:send(data, i)
+      i = i or 1
+      if self.cap == 0 then return nil, "timeout", i - 1 end
+      if #data - i + 1 <= self.cap then
+        self.wire[#self.wire + 1] = data:sub(i)
         return #data
       end
-      self.wire[#self.wire + 1] = data:sub(1, self.cap)
-      return nil, "timeout", self.cap
+      self.wire[#self.wire + 1] = data:sub(i, i + self.cap - 1)
+      return nil, "timeout", i + self.cap - 1
     end
     function s:receive() return nil, "timeout", "" end
     function s:close() self.closed = true end
@@ -58,7 +60,7 @@ describe("LB-8 partial non-blocking send", function()
     local expect = p2p.make_message(regtest.magic_bytes, "ping", p2p.serialize_ping(1))
                 .. p2p.make_message(regtest.magic_bytes, "ping", p2p.serialize_ping(2))
     assert.equal(expect, table.concat(sock.wire))
-    assert.equal("", p.send_buffer)
+    assert.equal(0, p:send_queue_size())
   end)
 
   it("still disconnects on a real socket error", function()

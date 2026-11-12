@@ -122,6 +122,18 @@ M.WTXID_RELAY_VERSION = 70016
 -- far behind is not keeping up and is dropped.
 M.MAX_SEND_BUFFER = 32 * 1024 * 1024
 
+-- getdata serving limits (Core net_processing.cpp ProcessGetData).  Core keeps
+-- a peer's outstanding getdata items in m_getdata_requests and serves them a
+-- few at a time, stopping as soon as the send buffer is over its limit
+-- (pfrom.fPauseSend, set in net.cpp once nSendSize > nSendBufferMaxSize, which
+-- is DEFAULT_MAXSENDBUFFER = 5000 KB); the rest wait for a later pass.  Here a
+-- pass is one tick of the event loop, so each pass is also bounded in items and
+-- wall-clock time: the RPC server runs on the same thread and must not wait for
+-- a 50,000-item request to be served in one go.
+M.SEND_PAUSE_BYTES = 5000 * 1000
+M.MAX_GETDATA_ITEMS_PER_TICK = 1000
+M.GETDATA_TICK_BUDGET = 0.05  -- seconds of serving per peer per tick
+
 -- Handshake timeout in seconds (60 seconds per spec)
 M.HANDSHAKE_TIMEOUT = 60
 
@@ -198,7 +210,22 @@ function M.new(ip, port, network, our_height, use_v2, proxy_config, peerbloomfil
   self.handshake_complete = false -- True after version/verack exchange
   self.version_received = false   -- True after receiving their version
   self.handshake_start_time = 0   -- When connection started (for timeout)
-  self.send_buffer = ""           -- Unsent tail of a partial non-blocking send (LB-8)
+  -- Outbound queue (LB-8): a list of whole wire messages, the first of which
+  -- may be partly sent (send_queue_offset bytes of it are already on the
+  -- wire).  A list, not one string: appending to or draining a string copies
+  -- every queued byte each time, which turned a non-reading peer into a
+  -- quadratic copy loop on the only thread (Core net.cpp keeps vSendMsg as a
+  -- deque of per-message buffers for the same reason).
+  self.send_queue = {}
+  self.send_queue_head = 1        -- index of the first unsent message
+  self.send_queue_tail = 0        -- index of the last queued message
+  self.send_queue_offset = 0
+  self.send_queue_bytes = 0       -- unsent bytes across the whole queue
+  -- Outstanding getdata items (Core Peer::m_getdata_requests).
+  self.getdata_queue = nil
+  self.getdata_head = 1
+  self.getdata_serve = nil
+  self.deferred_messages = nil    -- messages read behind a pending getdata
   self.wtxid_relay = false        -- BIP 339: peer wants wtxid for tx relay
   self.send_addrv2 = false        -- BIP 155: peer supports addrv2
   -- Services we advertised to this peer in our `version` message. Set in
@@ -518,6 +545,13 @@ function Peer:disconnect(reason)
   end
   self.state = M.STATE.DISCONNECTED
   self.recv_buffer = ""
+  -- Nothing queued for a closed socket can be delivered: free it now, and
+  -- stop serving the rest of its getdata (Core FinalizeNode).
+  self:_clear_send_queue()
+  self.getdata_queue = nil
+  self.getdata_head = 1
+  self.getdata_serve = nil
+  self.deferred_messages = nil
   self.handshake_complete = false
   self.version_received = false
   -- reason is available for logging if needed
@@ -578,46 +612,145 @@ function Peer:send_message(command, payload)
   -- not a failure: queue the unsent tail and drain it on later ticks (Core
   -- CNode::vSendMsg + SocketSendData).  Only a real socket error, or a peer
   -- that lets the queue grow past MAX_SEND_BUFFER, drops the connection.
-  self.send_buffer = self.send_buffer or ""
-  if self.send_buffer ~= "" then
-    -- Earlier bytes are still queued: preserve message order.
-    self.send_buffer = self.send_buffer .. msg
-    if #self.send_buffer > M.MAX_SEND_BUFFER then
-      self:disconnect("send buffer overflow")
-      return false
-    end
-    return self:flush_send_buffer()
+  if not self.send_queue then self:_clear_send_queue() end
+  local had_queued = self.send_queue_bytes > 0
+  -- Explicit head/tail indices: sent entries are set to nil to free them, and
+  -- `#` is not reliable on a table with a nil prefix.
+  self.send_queue_tail = self.send_queue_tail + 1
+  self.send_queue[self.send_queue_tail] = msg
+  self.send_queue_bytes = self.send_queue_bytes + #msg
+  if had_queued and self.send_queue_bytes > M.MAX_SEND_BUFFER then
+    self:disconnect("send buffer overflow")
+    return false
   end
-  self.send_buffer = msg
   return self:flush_send_buffer()
 end
 
+--- Bytes queued for this peer and not yet accepted by the socket.
+function Peer:send_queue_size()
+  return self.send_queue_bytes or 0
+end
+
+--- Drop everything queued for sending.
+function Peer:_clear_send_queue()
+  self.send_queue = {}
+  self.send_queue_head = 1
+  self.send_queue_tail = 0
+  self.send_queue_offset = 0
+  self.send_queue_bytes = 0
+end
+
 --- Write as much of the queued outbound data as the socket will take.
+-- Each queued message is handed to the socket with luasocket's
+-- send(data, i) start index, so a partly sent message is never re-copied.
 -- @return boolean: false only if the peer was disconnected by a send error
 function Peer:flush_send_buffer()
-  local buf = self.send_buffer or ""
-  if buf == "" or not self.socket then return true end
-  local sent, err, last = self.socket:send(buf)
-  local n
-  if sent then
-    n = sent
-  elseif err == "timeout" or err == "wantwrite" then
-    n = last or 0
-  else
-    self.send_buffer = ""
-    self:disconnect("send failed: " .. (err or "unknown"))
-    return false
+  if (self.send_queue_bytes or 0) == 0 or not self.socket then return true end
+  local q = self.send_queue
+  local total = 0
+  while self.send_queue_head <= self.send_queue_tail do
+    local chunk = q[self.send_queue_head]
+    local off = self.send_queue_offset
+    local sent, err, last = self.socket:send(chunk, off + 1)
+    if sent then
+      -- luasocket returns the index of the last byte sent (== #chunk).
+      local n = sent - off
+      total = total + n
+      self.send_queue_bytes = self.send_queue_bytes - n
+      q[self.send_queue_head] = nil
+      self.send_queue_head = self.send_queue_head + 1
+      self.send_queue_offset = 0
+    elseif err == "timeout" or err == "wantwrite" then
+      local upto = last or off
+      if upto > off then
+        local n = upto - off
+        total = total + n
+        self.send_queue_bytes = self.send_queue_bytes - n
+        self.send_queue_offset = upto
+      end
+      break
+    else
+      self:_clear_send_queue()
+      self:disconnect("send failed: " .. (err or "unknown"))
+      return false
+    end
   end
-  if n > 0 then
+  if self.send_queue_head > self.send_queue_tail then
+    self:_clear_send_queue()
+  end
+  if total > 0 then
     self.last_send = socket.gettime()
-    self.bytes_sent = self.bytes_sent + n
+    self.bytes_sent = self.bytes_sent + total
   end
-  self.send_buffer = buf:sub(n + 1)
-  if #self.send_buffer > M.MAX_SEND_BUFFER then
+  if self.send_queue_bytes > M.MAX_SEND_BUFFER then
     self:disconnect("send buffer overflow")
     return false
   end
   return true
+end
+
+--------------------------------------------------------------------------------
+-- getdata serving (Core ProcessGetData)
+--------------------------------------------------------------------------------
+
+--- True while some getdata items from this peer are still waiting to be served.
+function Peer:getdata_pending()
+  return self.getdata_queue ~= nil and self.getdata_head <= #self.getdata_queue
+end
+
+--- Queue the items of a getdata message and serve what fits in this pass.
+-- Core appends to m_getdata_requests and calls ProcessGetData once; whatever
+-- is left is served on later passes (process_messages calls back in here
+-- before it reads anything else from the peer).
+-- @param items table: inventory items from p2p.deserialize_inv
+-- @param serve function(peer, item, not_found): serves one item, appending
+--   to not_found the items to answer with `notfound`
+function Peer:queue_getdata(items, serve)
+  if self.state == M.STATE.DISCONNECTED then return end
+  local q = self.getdata_queue
+  if not q then
+    q = {}
+    self.getdata_queue = q
+    self.getdata_head = 1
+  end
+  for i = 1, #items do q[#q + 1] = items[i] end
+  self.getdata_serve = serve
+  self:process_getdata()
+end
+
+--- Serve queued getdata items until the queue is empty, the peer is gone, the
+-- send queue is over SEND_PAUSE_BYTES (Core fPauseSend), or this pass has used
+-- its item or time budget.  Items are served strictly in request order.
+function Peer:process_getdata()
+  local q = self.getdata_queue
+  if not q then return end
+  local serve = self.getdata_serve
+  local not_found = {}
+  local done = 0
+  local t0 = socket.gettime()
+  while self.getdata_head <= #q do
+    if self.state == M.STATE.DISCONNECTED then break end
+    if (self.send_queue_bytes or 0) > M.SEND_PAUSE_BYTES then break end
+    if done >= M.MAX_GETDATA_ITEMS_PER_TICK then break end
+    if done > 0 and socket.gettime() - t0 >= M.GETDATA_TICK_BUDGET then break end
+    -- Entries are left in place (no nil prefix, so `#q` stays exact); the
+    -- whole table is dropped once the request is done.
+    local item = q[self.getdata_head]
+    self.getdata_head = self.getdata_head + 1
+    done = done + 1
+    serve(self, item, not_found)
+  end
+  if #not_found > 0 and self.state ~= M.STATE.DISCONNECTED then
+    self:send_message("notfound", p2p.serialize_notfound(not_found))
+  end
+  if self.state == M.STATE.DISCONNECTED or self.getdata_head > #q then
+    self.getdata_queue = nil
+    self.getdata_head = 1
+    if self.state == M.STATE.DISCONNECTED then
+      self.getdata_serve = nil
+      self.deferred_messages = nil
+    end
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -1040,9 +1173,39 @@ function Peer:process_messages()
     return {}  -- No application messages yet
   end
 
-  local messages = self:recv_messages()
+  -- Core ProcessMessages: outstanding getdata is served before anything else
+  -- from this peer, and while some of it is still waiting no further message
+  -- is processed (or read), so replies stay in request order and a peer that
+  -- does not drain its socket cannot queue more work behind it.
+  if self:getdata_pending() then
+    local ok, err = pcall(self.process_getdata, self)
+    if not ok then
+      print(string.format("peer %s: getdata serving raised: %s — disconnecting",
+        tostring(self.addr or "?"), tostring(err)))
+      self:disconnect("getdata serving error")
+    end
+    if self.state == M.STATE.DISCONNECTED or self:getdata_pending() then
+      return {}
+    end
+  end
+
+  local messages
+  if self.deferred_messages then
+    messages = self.deferred_messages
+    self.deferred_messages = nil
+  else
+    messages = self:recv_messages()
+  end
   local processed = {}
-  for _, msg in ipairs(messages) do
+  for idx, msg in ipairs(messages) do
+    -- A getdata earlier in this batch left items unserved: keep the rest of
+    -- the batch for a later pass, after the getdata is done.
+    if idx > 1 and self:getdata_pending() then
+      local rest = {}
+      for j = idx, #messages do rest[#rest + 1] = messages[j] end
+      self.deferred_messages = rest
+      break
+    end
     -- Pre-handshake filtering (Bitcoin Core: fSuccessfullyConnected check)
     -- Before version: only version allowed
     -- Before verack: only PRE_HANDSHAKE_ALLOWED messages
@@ -1200,7 +1363,7 @@ end
 --- Check for timeouts and send keepalive pings.
 function Peer:check_timeouts()
   local now = socket.gettime()
-  if (self.send_buffer or "") ~= "" and not self:flush_send_buffer() then return end
+  if (self.send_queue_bytes or 0) > 0 and not self:flush_send_buffer() then return end
   -- Handshake timeout from connection start (default 60s; tests may
   -- shorten Peer.handshake_timeout so a half-open inbound is reaped
   -- without waiting a minute).

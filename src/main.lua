@@ -2761,9 +2761,12 @@ local function main()
     end
   end)
 
-  peer_manager:register_handler("getdata", function(peer, payload)
-    local items = p2p.deserialize_inv(payload)
-    local not_found = {}
+  -- getdata is served incrementally: the handler only queues the items on the
+  -- peer, and Peer:process_getdata serves them a bounded batch per tick, in
+  -- order, stopping when the peer's send queue is full or it disconnects
+  -- (Core ProcessGetData / m_getdata_requests / fPauseSend).  This function
+  -- serves ONE item; not_found collects the items answered with `notfound`.
+  local function serve_getdata_item(peer, item, not_found)
     -- BIP-159 peer-served-blocks gate: when prune mode is on and the
     -- pruner has actually deleted blocks below the keep window, the
     -- `db.get_block(item.hash)` call below will return nil for those
@@ -2786,7 +2789,7 @@ local function main()
         return (chain_state.tip_height or 0) - entry.height
       end,
     }
-    for _, item in ipairs(items) do
+    do
       local cmd, data, status = peerman_mod.getdata_response(item, getdata_deps)
       if status == "served" then
         peer:send_message(cmd, data)
@@ -2840,9 +2843,10 @@ local function main()
         -- else: block found but no filter loaded → silently omit (Core behaviour)
       end
     end
-    if #not_found > 0 then
-      peer:send_message("notfound", p2p.serialize_notfound(not_found))
-    end
+  end
+
+  peer_manager:register_handler("getdata", function(peer, payload)
+    peer:queue_getdata(p2p.deserialize_inv(payload), serve_getdata_item)
   end)
 
   --------------------------------------------------------------------------
