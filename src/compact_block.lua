@@ -418,6 +418,58 @@ end
 M.PartiallyDownloadedBlock = PartiallyDownloadedBlock
 
 --------------------------------------------------------------------------------
+-- Per-peer pending partial block (the getblocktxn round trip)
+--------------------------------------------------------------------------------
+--
+-- Core keeps a partial block only in the peer's in-flight slot for that block
+-- (mapBlocksInFlight / QueuedBlock::partialBlock) and drops it when the block
+-- download times out.  peer.pending_compact used to be an open-ended map
+-- keyed by block hash with no expiry, so a peer could park one partial (and
+-- its mempool-filled tx table) per junk cmpctblock it sent, without bound.
+-- It now holds at most ONE entry: a newer partial replaces the older one,
+-- and an entry older than PENDING_COMPACT_TIMEOUT is discarded unused.
+
+-- Seconds a partial waits for its blocktxn (Core: the block download
+-- timeout base, one block interval).
+M.PENDING_COMPACT_TIMEOUT = 600
+
+-- Wall clock; replaceable by tests.
+M.clock = function() return require("socket").gettime() end
+
+--- Park `partial` as the peer's only pending compact block.
+function M.set_pending(peer, hash_hex, partial)
+  partial.pending_since = M.clock()
+  peer.pending_compact = { [hash_hex] = partial }
+end
+
+--- Take the peer's pending partial for `hash_hex` (removing it).
+-- Returns nil, reason when there is none or it has expired.
+function M.take_pending(peer, hash_hex)
+  local now = M.clock()
+  local pend = peer.pending_compact
+  -- Drop anything that has expired, whether or not it is the one asked for.
+  if pend then
+    for k, p in pairs(pend) do
+      if now - (p.pending_since or 0) > M.PENDING_COMPACT_TIMEOUT then
+        pend[k] = nil
+        if k == hash_hex then
+          peer.pending_compact = next(pend) and pend or nil
+          return nil, "pending compact block expired"
+        end
+      end
+    end
+  end
+  local partial = pend and pend[hash_hex]
+  if not partial then
+    if pend and next(pend) == nil then peer.pending_compact = nil end
+    return nil, "no pending compact block"
+  end
+  pend[hash_hex] = nil
+  if next(pend) == nil then peer.pending_compact = nil end
+  return partial
+end
+
+--------------------------------------------------------------------------------
 -- High-Bandwidth Peer Management
 --------------------------------------------------------------------------------
 
