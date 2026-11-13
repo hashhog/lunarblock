@@ -2642,6 +2642,40 @@ local function main()
       -- of the 80-byte header to get the 32-byte block hash (crypto.hash256_type).
       local block_hash = crypto.hash256_type(header_bytes)
 
+      -- C4: accept the header BEFORE any reconstruction work (Core
+      -- net_processing.cpp CMPCTBLOCK).  Building a partial block scans the
+      -- whole mempool and parks state on the peer, so it must only happen
+      -- for a header that connects to a block we know and passes the same
+      -- checks as a "headers" message (PoW, difficulty, timestamps, version,
+      -- not building on a failed block).
+      do
+        local prev_hex = types.hash256_hex(cmpctblock.header.prev_hash)
+        if not header_chain.headers[prev_hex] then
+          -- Core: doesn't connect -> MaybeSendGetHeaders, no punishment.
+          print(string.format("cmpctblock from %s:%d does not connect (prev %s) — ignored",
+            peer.ip, peer.port, prev_hex))
+          return
+        end
+        local accepted, herr = header_chain:process_headers({ cmpctblock.header }, peer)
+        if herr then
+          print(string.format("cmpctblock from %s:%d has an invalid header: %s",
+            peer.ip, peer.port, herr))
+          -- Core: MaybePunishNodeForBlock(..., "invalid header via cmpctblock")
+          -- for an invalid header; low-work / time-too-new are only ignored.
+          if headers_err_is_banworthy(herr) then
+            peer_manager:add_ban_score(peer, 100, "invalid header via cmpctblock: " .. herr)
+          end
+          return
+        end
+        if header_chain:is_failed(types.hash256_hex(block_hash)) then
+          return  -- cached invalid (Core BLOCK_CACHED_INVALID)
+        end
+        if accepted and accepted > 0 then
+          peer_manager.our_height = header_chain.header_tip_height
+          chain_state.header_tip_height = header_chain.header_tip_height
+        end
+      end
+
       -- W112 BUG-7 fix: enforce MAX_CMPCTBLOCK_DEPTH=5 — reject stale compact
       -- blocks more than 5 blocks below our current tip (Core net_processing.cpp).
       do
@@ -2685,9 +2719,9 @@ local function main()
         print(string.format("Compact block missing %d txns, sending getblocktxn", #missing))
         local req_payload = p2p.serialize_getblocktxn(block_hash, missing)
         peer:send_message("getblocktxn", req_payload)
-        -- Store partial block for later completion
-        peer.pending_compact = peer.pending_compact or {}
-        peer.pending_compact[types.hash256_hex(block_hash)] = partial
+        -- Store partial block for later completion: one slot per peer,
+        -- replaced by a newer one, expired after PENDING_COMPACT_TIMEOUT (C4).
+        compact_block.set_pending(peer, types.hash256_hex(block_hash), partial)
       end
     end)
     if not ok then
@@ -2702,23 +2736,22 @@ local function main()
       print(string.format("Received blocktxn from %s:%d (%d txns)",
         peer.ip, peer.port, #blocktxn.transactions))
 
-      -- Look up pending compact block
-      if not peer.pending_compact or not peer.pending_compact[hash_hex] then
-        print("Unexpected blocktxn (no pending compact block)")
+      -- Look up (and take) the pending compact block; an expired one is
+      -- discarded, the block arrives by the normal download path instead.
+      local partial, why = compact_block.take_pending(peer, hash_hex)
+      if not partial then
+        print("Unexpected blocktxn (" .. tostring(why) .. ")")
         return
       end
 
-      local partial = peer.pending_compact[hash_hex]
       local fill_err = partial:fill_from_blocktxn(blocktxn.transactions)
       if fill_err then
         print("blocktxn fill error: " .. fill_err)
-        peer.pending_compact[hash_hex] = nil
         return
       end
 
       local blk, recon_err = partial:reconstruct(
         cmpct_check_mutated(blocktxn.block_hash))
-      peer.pending_compact[hash_hex] = nil
       if blk then
         print("Compact block reconstructed from blocktxn")
           local blk_data = serialize.serialize_block(blk)
