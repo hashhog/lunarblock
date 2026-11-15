@@ -6895,8 +6895,8 @@ end
 -- lunarblock has one chainstate DB, so the equivalent is two passes over the
 -- file:
 --   pass 1 (verify) parses every coin and runs every per-coin gate, the
---          canonical-order check and the HASH_SERIALIZED computation, writing
---          NOTHING.  The caller's gates (content hash, background replay) run
+--          group-order / duplicate check and the HASH_SERIALIZED computation,
+--          writing NOTHING.  The caller's gates (content hash, background replay) run
 --          on that result, still before any write.
 --   pass 2 (commit) runs only for a snapshot that passed all of them.  It
 --          writes the in-progress marker durably, wipes the live coins (the
@@ -6949,13 +6949,22 @@ local function _wipe_cf(storage, cf)
 end
 
 -- One pass over the snapshot body (after the 51-byte metadata).  Runs every
--- per-coin gate, requires canonical order (txid groups strictly ascending in
--- key byte order, vouts strictly ascending inside a group -- the order
--- dumptxoutset writes and compute_utxo_stats walks), and returns the
--- HASH_SERIALIZED of exactly those coins.  `on_coin(txid, vout, entry, n)` is
--- called for each coin when given; pass 1 passes nil and so writes nothing.
--- Raises on any defect.
-local function _scan_snapshot_body(r, coins_total, base_height, on_coin)
+-- per-coin gate and returns the HASH_SERIALIZED of exactly those coins, in
+-- the order compute_utxo_stats (and Core's ComputeUTXOStats) hashes them:
+-- txid groups in key byte order, and inside a group by NUMERIC vout.
+--
+-- Order: txid groups must be strictly ascending (dumptxoutset writes them
+-- in cursor order, and Core's 'C'||txid key prefix sorts like ours), which
+-- also rules out a txid split over two groups.  Inside a group the file order
+-- is NOT numeric for Core's dumps -- its key ends in VARINT(n), and VARINT
+-- byte order is not numeric (255 = 80 7f < 16512 = 80 80 00 < 256 = 81 00) --
+-- so a group is buffered and sorted before hashing, exactly as Core's
+-- std::map<uint32_t, Coin> does (kernel/coinstats.cpp).  A vout seen twice in
+-- a group is refused: a set cannot hold it twice.
+--
+-- `on_coin(txid, vout, entry, n)` is called for each coin when given; pass 1
+-- passes nil and so writes nothing.  Raises on any defect.
+local function _scan_snapshot_body(r, coins_total, effective_base_height, on_coin)
   local hasher = crypto.sha256_init()
   local coins_loaded = 0
   local coins_left = coins_total
@@ -6981,24 +6990,17 @@ local function _scan_snapshot_body(r, coins_total, base_height, on_coin)
     end
     prev_txid_bytes = txid_bytes
 
-    local prev_vout = -1
-    for _ = 1, coins_per_txid do
-      local vout = r.read_varint()  -- CompactSize for vout
+    local group = {}
+    local vouts = {}
+    for i = 1, coins_per_txid do
+      -- CompactSize vout; COutPoint::n is uint32 (Core casts it the same way).
+      local vout = r.read_varint() % 4294967296
       local entry = M.deserialize_snapshot_coin(r)
-
-      -- COutPoint::n is uint32 (Core casts the CompactSize the same way).
-      vout = vout % 4294967296
-      if vout <= prev_vout then
-        error(string.format(
-          "Bad snapshot data after deserializing %d coins - coins out of order",
-          coins_loaded))
-      end
-      prev_vout = vout
 
       -- BUG-6 fix: per-coin height > base_height guard.
       -- Core validation.cpp:5814-5819: "Bad snapshot data after deserializing
       -- N coins" when coin.nHeight > base_height.
-      if entry.height > base_height then
+      if entry.height > effective_base_height then
         error(string.format(
           "Bad snapshot data after deserializing %d coins", coins_loaded))
       end
@@ -7012,11 +7014,24 @@ local function _scan_snapshot_body(r, coins_total, base_height, on_coin)
           coins_loaded))
       end
 
-      -- TxOutSer, byte-identical to what compute_utxo_stats hashes per coin.
-      hasher.update(_serialize_txoutser(M.outpoint_key(txid, vout), entry))
+      if group[vout] ~= nil then
+        error(string.format(
+          "Bad snapshot data after deserializing %d coins - duplicate coin",
+          coins_loaded))
+      end
+      group[vout] = entry
+      vouts[i] = vout
       coins_loaded = coins_loaded + 1
       coins_left = coins_left - 1
       if on_coin then on_coin(txid, vout, entry, coins_loaded) end
+    end
+
+    -- TxOutSer per coin in numeric vout order, byte-identical to what
+    -- compute_utxo_stats hashes.
+    table.sort(vouts)
+    for i = 1, #vouts do
+      local vout = vouts[i]
+      hasher.update(_serialize_txoutser(M.outpoint_key(txid, vout), group[vout]))
     end
   end
 
@@ -7179,7 +7194,11 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
   -- Caller gates that must also run before the live set is touched (the RPC's
   -- Core-worded content gate and the best-effort background replay).
   if opts and opts.pre_commit then
-    local ok_pre, pre_err = opts.pre_commit(verified_hash, verified_coins, metadata)
+    local ok_call, ok_pre, pre_err = pcall(opts.pre_commit,
+      verified_hash, verified_coins, metadata)
+    if not ok_call then
+      ok_pre, pre_err = false, tostring(ok_pre)
+    end
     if not ok_pre then
       file:close()
       return false, pre_err or "snapshot refused before activation"
