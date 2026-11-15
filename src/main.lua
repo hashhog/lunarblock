@@ -839,6 +839,13 @@ local function run_import_utxo(args)
   -- bottom of this function did the same thing, just too late to help the
   -- guard) and feed it in.
   local pre_base_height = nil
+  -- The allowlisted commitment for the snapshot's base block, as 32 raw bytes
+  -- in compute_utxo_hash order.  Handed to load_snapshot so a snapshot whose
+  -- coins do not match it is refused in pass 1, BEFORE the live coins are
+  -- wiped (Core: ActivateSnapshot checks hash_serialized before the snapshot
+  -- chainstate is activated).  Checking it only after the load, as this path
+  -- used to, left the mismatched set live with the marker cleared.
+  local expected_set_hash = nil
   -- Set only when HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypassed the whitelist below;
   -- carried past the `do` block so the post-load chain-tip write can use it.
   local unsafe_base_height = nil
@@ -868,6 +875,9 @@ local function run_import_utxo(args)
       consensus_mod.assumeutxo_for_blockhash(network, base_hex)
     if _au_height then
       pre_base_height = _au_height
+      if _au_data and _au_data.hash_serialized then
+        expected_set_hash = types.hash256_from_hex(_au_data.hash_serialized).bytes
+      end
       print(string.format(
         "import-utxo: base block %s -> assumeutxo height %d",
         base_hex, _au_height))
@@ -922,8 +932,10 @@ local function run_import_utxo(args)
 
   local t0 = os.time()
   -- Pass base_height so the per-coin height guard uses the true snapshot
-  -- height instead of the fresh-datadir genesis tip (0).
-  local ok, err = cs:load_snapshot(args.import_utxo, nil, pre_base_height)
+  -- height instead of the fresh-datadir genesis tip (0), and the allowlisted
+  -- hash so a mismatch refuses before anything is written.  On a refusal
+  -- nothing below runs: no chain tip, no snapshot record.
+  local ok, err = cs:load_snapshot(args.import_utxo, expected_set_hash, pre_base_height)
   local elapsed = os.time() - t0
 
   if not ok then

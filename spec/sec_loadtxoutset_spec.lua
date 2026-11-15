@@ -502,6 +502,72 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
     db.close()
   end)
 
+  -- --import-utxo (main.lua run_import_utxo) against a datadir that already
+  -- holds a chain.  Runs the real CLI in a child process, exactly as an
+  -- operator would, with the snapshot's base allowlisted through
+  -- HASHHOG_CAMPAIGN_ASSUMEUTXO under `hash_serialized_hex`.
+  local function run_import(hash_serialized_hex)
+    local root = new_dir("imp")
+    local cs_dir = root .. "/regtest/chainstate"
+    os.execute("mkdir -p '" .. root .. "/regtest'")
+    local db = build_chain(cs_dir, 3, 0x52)
+    db.close()
+    local before_db, _, before_server = reopen(cs_dir, REGTEST)
+    local before = observe(before_server)
+    before_db.close()
+    assert.are.equal(2, before.blockcount)
+
+    local campaign = root .. ".campaign.json"
+    cleanup[#cleanup + 1] = campaign
+    local cf = assert(io.open(campaign, "wb"))
+    cf:write(cjson.encode({{height = 4, blockhash = base_hex,
+      hash_serialized = hash_serialized_hex, m_chain_tx_count = 5}}))
+    cf:close()
+    local out = root .. ".out"
+    cleanup[#cleanup + 1] = out
+    local cmd = string.format(
+      "HASHHOG_CAMPAIGN_ASSUMEUTXO='%s' luajit src/main.lua --regtest "
+      .. "--datadir '%s' --import-utxo '%s' > '%s' 2>&1",
+      campaign, root, snap, out)
+    local r1, _, r3 = os.execute(cmd)
+    local code = (type(r1) == "number") and r1 or r3
+    local of = assert(io.open(out, "rb")); local text = of:read("*a"); of:close()
+    return cs_dir, before, code, text
+  end
+
+  it("--import-utxo with a mismatched assumeutxo hash leaves the on-disk tip and UTXO set unchanged", function()
+    local cs_dir, before, code, text = run_import(string.rep("ab", 32))
+    assert.are_not.equal(0, code, "import of a mismatched snapshot exited 0: " .. text)
+
+    local db, _, server = reopen(cs_dir, REGTEST)
+    local after = observe(server)
+    local marker = read_marker(db)
+    local record = utxo.read_snapshot_record(db)
+    db.close()
+    assert.are.same(before, after,
+      "--import-utxo replaced the live set with a snapshot that failed its commitment")
+    assert.is_nil(marker, "--import-utxo left the in-progress marker set")
+    assert.is_nil(record, "--import-utxo recorded a snapshot start for a refused snapshot")
+    -- Refused by load_snapshot's pre-write gate, not by the post-load check.
+    assert.matches("import%-utxo FAILED: snapshot hash mismatch %(hash_serialized%)", text)
+  end)
+
+  it("control: --import-utxo with the matching assumeutxo hash loads the snapshot", function()
+    local cs_dir, before, code, text = run_import(hex_display(snap_hash_raw))
+    assert.are.equal(0, code, "good snapshot import failed: " .. text)
+    assert.matches("MATCHES assumeutxo", text)
+
+    local db, _, server = reopen(cs_dir, REGTEST)
+    local after = observe(server)
+    assert.are_not.same(before, after)
+    assert.are.equal(4, after.blockcount)
+    assert.are.equal(base_hex, after.bestblockhash)
+    assert.are.equal(hex_display(snap_hash_raw), after.hash_serialized_3)
+    assert.is_nil(read_marker(db))
+    assert.is_truthy(utxo.read_snapshot_record(db))
+    db.close()
+  end)
+
   it("txid groups out of order: refused before any write, live state untouched", function()
     -- Two one-coin groups, the larger txid first.
     local serialize = require("lunarblock.serialize")
