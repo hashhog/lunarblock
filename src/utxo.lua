@@ -6895,8 +6895,8 @@ end
 -- lunarblock has one chainstate DB, so the equivalent is two passes over the
 -- file:
 --   pass 1 (verify) parses every coin and runs every per-coin gate, the
---          group-order / duplicate check and the HASH_SERIALIZED computation,
---          writing NOTHING.  The caller's gates (content hash, background replay) run
+--          txid-group order check and the HASH_SERIALIZED computation (a
+--          duplicate coin keeps its first copy, as in Core), writing NOTHING.  The caller's gates (content hash, background replay) run
 --          on that result, still before any write.
 --   pass 2 (commit) runs only for a snapshot that passed all of them.  It
 --          writes the in-progress marker durably, wipes the live coins (the
@@ -6960,7 +6960,14 @@ end
 -- byte order is not numeric (255 = 80 7f < 16512 = 80 80 00 < 256 = 81 00) --
 -- so a group is buffered and sorted before hashing, exactly as Core's
 -- std::map<uint32_t, Coin> does (kernel/coinstats.cpp).  A vout seen twice in
--- a group is refused: a set cannot hold it twice.
+-- a group keeps its FIRST copy, as Core's loader does (EmplaceCoinInternalDANGER
+-- is a try_emplace); the later copy still counts toward coins_count and still
+-- passes the per-coin gates, but is neither hashed nor written.
+--
+-- Stricter than Core, by construction of a streaming hash: Core never checks
+-- the txid order (it hashes its CoinsDB afterwards), so it would also accept
+-- a file with txid groups out of order or one txid split over two groups.
+-- No dumptxoutset writes such a file; this refuses it before any write.
 --
 -- `on_coin(txid, vout, entry, n)` is called for each coin when given; pass 1
 -- passes nil and so writes nothing.  Raises on any defect.
@@ -6992,7 +6999,7 @@ local function _scan_snapshot_body(r, coins_total, effective_base_height, on_coi
 
     local group = {}
     local vouts = {}
-    for i = 1, coins_per_txid do
+    for _ = 1, coins_per_txid do
       -- CompactSize vout; COutPoint::n is uint32 (Core casts it the same way).
       local vout = r.read_varint() % 4294967296
       local entry = M.deserialize_snapshot_coin(r)
@@ -7014,16 +7021,13 @@ local function _scan_snapshot_body(r, coins_total, effective_base_height, on_coi
           coins_loaded))
       end
 
-      if group[vout] ~= nil then
-        error(string.format(
-          "Bad snapshot data after deserializing %d coins - duplicate coin",
-          coins_loaded))
-      end
-      group[vout] = entry
-      vouts[i] = vout
       coins_loaded = coins_loaded + 1
       coins_left = coins_left - 1
-      if on_coin then on_coin(txid, vout, entry, coins_loaded) end
+      if group[vout] == nil then
+        group[vout] = entry
+        vouts[#vouts + 1] = vout
+        if on_coin then on_coin(txid, vout, entry, coins_loaded) end
+      end
     end
 
     -- TxOutSer per coin in numeric vout order, byte-identical to what
@@ -7244,12 +7248,17 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
     self.coin_view:flush()
 
     -- Base tip + marker clear in ONE batch, after the coins, then an atomic
-    -- flush: the marker is never gone without the coins and the tip.
-    local w = serialize.buffer_writer()
-    w.write_hash256(metadata.base_blockhash)
-    w.write_u32le(effective_base_height)
+    -- flush: the marker is never gone without the coins and the tip.  The tip
+    -- is written only when the caller supplied the base height (the RPC always
+    -- does; --import-utxo does when it resolved one); without it the height is
+    -- unknown and the caller keeps writing the tip itself, as before.
     local batch = storage.batch()
-    batch.put(CF.META, "chain_tip", w.result())
+    if base_height ~= nil then
+      local w = serialize.buffer_writer()
+      w.write_hash256(metadata.base_blockhash)
+      w.write_u32le(base_height)
+      batch.put(CF.META, "chain_tip", w.result())
+    end
     batch.delete(CF.META, M.SNAPSHOT_LOAD_MARKER_KEY)
     batch.write(true)
     batch.destroy()
@@ -7267,9 +7276,10 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
       .. "set is incomplete and the node must stop: " .. tostring(commit_err)
   end
 
-  -- Snapshot base block becomes the chainstate tip (persisted above).
+  -- Snapshot base block becomes the chainstate tip (persisted above when
+  -- base_height was given; the height is otherwise filled in by the caller).
   self.tip_hash = metadata.base_blockhash
-  self.tip_height = effective_base_height
+  if base_height ~= nil then self.tip_height = base_height end
 
   -- BUG-3 fix: record activation so a second call is refused.
   -- Mirrors Core's m_from_snapshot_blockhash (validation.cpp:1872).

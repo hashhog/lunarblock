@@ -439,20 +439,58 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
     db.close()
   end)
 
-  it("duplicate coin in a txid group: refused, live state untouched, also after reopen", function()
+  it("duplicate coin in a txid group keeps the first copy, as Core's loader does", function()
+    -- Core: EmplaceCoinInternalDANGER is a try_emplace, so the first copy of a
+    -- repeated outpoint wins and the content hash is of the collapsed set.
+    local txid_bytes = string.rep("\x5b", 32)
+    local txid = types.hash256(txid_bytes)
+    local spk = script.make_p2pkh_script(string.rep("\x77", 20))
     local f = snap .. ".dup"
     cleanup[#cleanup + 1] = f
-    write_group_snapshot(f, types.hash256_from_hex(base_hex), string.rep("\x5b", 32), {1, 1}, 1)
-    local net = network_with(4, base_hex, string.rep("cd", 32))
-    local dir, db, _, server = live_node(net)
-    local before = observe(server)
+    write_group_snapshot(f, types.hash256_from_hex(base_hex), txid_bytes, {1, 1}, 1)
+    local first = db_hash_of({
+      {txid = txid, vout = 1, entry = utxo.utxo_entry(1001, spk, 1, false)}})
+    local second = db_hash_of({
+      {txid = txid, vout = 1, entry = utxo.utxo_entry(1002, spk, 1, false)}})
 
-    local res, err = call(server, "loadtxoutset", {f})
-    assert.is_nil(res)
-    assert.is_truthy(err)
-    assert_untouched(dir, db, server, net, before, "duplicate coin")
-    -- Refused by the duplicate check itself, not only by the content gate.
-    assert.matches("duplicate coin", err.message)
+    -- Committed to the SECOND copy: refused, live state untouched.
+    local net_b = network_with(4, base_hex, hex_display(second))
+    local dir_b, db_b, _, server_b = live_node(net_b)
+    local before = observe(server_b)
+    local res_b, err_b = call(server_b, "loadtxoutset", {f})
+    assert.is_nil(res_b)
+    assert.is_truthy(err_b)
+    assert_untouched(dir_b, db_b, server_b, net_b, before, "duplicate coin")
+    assert.matches("Bad snapshot content hash", err_b.message)
+
+    -- Committed to the FIRST copy: loads, and the live coin is the first one.
+    local net_a = network_with(4, base_hex, hex_display(first))
+    local dir_a, db_a, _, server_a = live_node(net_a)
+    local res_a, err_a = call(server_a, "loadtxoutset", {f})
+    assert.is_truthy(res_a, cjson.encode(err_a or {}))
+    local after = observe(server_a)
+    assert.are.equal(1, after.txouts)
+    assert.are.equal(hex_display(first), after.hash_serialized_3)
+    db_a.close()
+    local _ = dir_a
+  end)
+
+  it("load_snapshot without a base height leaves the stored tip to the caller", function()
+    -- --import-utxo with no assumeutxo entry passes base_height = nil; the
+    -- commit must not pair the base hash with a guessed height on disk.
+    local net = network_with(4, base_hex, string.rep("00", 32))
+    local _, db, cs = live_node(net)
+    local old_hash, old_height = db.get_chain_tip()
+    local f = snap .. ".nobase"
+    cleanup[#cleanup + 1] = f
+    write_group_snapshot(f, types.hash256_from_hex(base_hex), string.rep("\x5c", 32), {0}, 1)
+    local ok, err = cs:load_snapshot(f)
+    assert.is_true(ok, tostring(err))
+    local hash, height = db.get_chain_tip()
+    assert.are.equal(old_hash.bytes, hash.bytes)
+    assert.are.equal(old_height, height)
+    assert.is_nil(read_marker(db))
+    db.close()
   end)
 
   it("txid groups out of order: refused before any write, live state untouched", function()
