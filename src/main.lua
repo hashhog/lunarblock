@@ -817,6 +817,10 @@ local function run_import_utxo(args)
   -- next operator-driven snapshot import.
   local db = storage_mod.open(datadir .. "/chainstate")
   local cs = utxo_mod.new_chain_state(db, network)
+  -- This import rewrites the whole UTXO set, so it may finish a snapshot load
+  -- that an earlier run left half-written (ChainState:init refuses that
+  -- datadir everywhere else).
+  cs.resume_interrupted_snapshot_load = true
   cs:init()
 
   -- Peek the 51-byte snapshot metadata header BEFORE loading so we can
