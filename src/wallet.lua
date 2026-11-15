@@ -1358,8 +1358,11 @@ function Wallet:unlock(passphrase)
   for addr, info in pairs(self.imported_keys) do
     if info.crypted then
       local priv = M.aes_decrypt(info.crypted, key, imported_key_iv(info.pubkey))
-      if not priv or #priv ~= 32
-          or crypto.pubkey_from_privkey(priv, info.compressed ~= false) ~= info.pubkey then
+      local pub_ok, pub = false, nil
+      if priv and #priv == 32 then
+        pub_ok, pub = pcall(crypto.pubkey_from_privkey, priv, info.compressed ~= false)
+      end
+      if not pub_ok or pub ~= info.pubkey then
         return false, "Imported key decryption failed"
       end
       imported_plain[addr] = priv
@@ -1373,7 +1376,12 @@ function Wallet:unlock(passphrase)
       -- only ciphertext.
       info.crypted = M.aes_encrypt(info.privkey, key, imported_key_iv(info.pubkey))
     end
-    install_imported_key(self, addr, info)
+    -- Hand the secret to the tracked key entry. During M.load the entries do
+    -- not exist yet; load installs them after the HD addresses, keeping the
+    -- address order unchanged.
+    if self.keys[addr] then
+      self.keys[addr].privkey = info.privkey
+    end
   end
   self._crypt_key = key
 
@@ -3788,11 +3796,16 @@ function Wallet:serialize()
         -- locked wallet writes the ciphertext it loaded back unchanged.
         rec.crypted_privkey = M.hex_encode(info.crypted)
         rec.pubkey = M.hex_encode(info.pubkey)
-      else
+      elseif info.privkey then
         -- Unencrypted wallet, or an old-format plaintext record in an
         -- encrypted wallet that has not been unlocked since load (it cannot
         -- be sealed without the key; write it back as found, not drop it).
         rec.privkey = M.hex_encode(info.privkey)
+      elseif info.crypted then
+        -- Inconsistent file (ciphertext in an unencrypted wallet): keep the
+        -- record as found rather than crash or drop it.
+        rec.crypted_privkey = M.hex_encode(info.crypted)
+        rec.pubkey = M.hex_encode(info.pubkey)
       end
       imp[addr] = rec
     end
