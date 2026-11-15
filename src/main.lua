@@ -2334,6 +2334,13 @@ local function main()
   peer_manager:register_handler("inv", function(peer, payload)
     local items = p2p.deserialize_inv(payload)
     local to_request = {}
+    -- Core net_processing.cpp INV: block items only remember the LAST unknown
+    -- hash (best_block); one getheaders goes out after the loop, through
+    -- MaybeSendGetHeaders' per-peer HEADERS_RESPONSE_TIME limit, and the
+    -- header-sync peer is not changed.  Calling start_sync per item sent one
+    -- getheaders per entry (50,000 for a MAX_INV_SZ inv) and handed the
+    -- global sync latch to whoever announced last (security finding H7).
+    local best_block = nil
     for _, item in ipairs(items) do
       if item.type == p2p.INV_TYPE.MSG_TX or item.type == p2p.INV_TYPE.MSG_WITNESS_TX then
         local txid_hex = types.hash256_hex(item.hash)
@@ -2356,10 +2363,15 @@ local function main()
       elseif item.type == p2p.INV_TYPE.MSG_BLOCK or item.type == p2p.INV_TYPE.MSG_WITNESS_BLOCK then
         -- Core UpdateBlockAvailability: an inv for a block we know raises the
         -- peer's best known block (LB-5).
-        pcall(note_peer_has_block, peer, types.hash256_hex(item.hash), false)
-        -- Request new block headers
-        header_chain:start_sync(peer)
+        local block_hex = types.hash256_hex(item.hash)
+        pcall(note_peer_has_block, peer, block_hex, false)
+        if not header_chain.headers[block_hex] then
+          best_block = block_hex
+        end
       end
+    end
+    if best_block then
+      header_chain:maybe_send_getheaders(peer)
     end
     -- Core net_processing.cpp:128: MAX_GETDATA_SZ=1000 — cap each outgoing
     -- getdata to 1000 items.  An inv from a peer can carry up to 50000 entries

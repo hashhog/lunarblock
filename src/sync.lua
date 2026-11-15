@@ -2669,6 +2669,37 @@ function HeaderChain:start_sync(peer)
   end
 end
 
+--- Core HEADERS_RESPONSE_TIME (net_processing.cpp): a getheaders to a peer is
+-- treated as in flight for this long, and no second one goes out meanwhile.
+HeaderChain.HEADERS_RESPONSE_TIME = 2 * 60
+
+--- Send one getheaders to `peer` unless one is already in flight to it
+-- (Core PeerManagerImpl::MaybeSendGetHeaders).  Used for block inv
+-- announcements: unlike start_sync it does NOT take the header-sync latch
+-- (syncing / sync_peer), so an announcing peer cannot steal header sync.
+-- The in-flight mark is cleared when the peer sends connecting headers
+-- (handle_headers), so the next announced block fetches headers again.
+-- @param peer table
+-- @param now number|nil: clock override for tests (os.time() seconds)
+-- @return boolean: true if a getheaders was sent
+function HeaderChain:maybe_send_getheaders(peer, now)
+  now = now or os.time()
+  local last = peer.last_getheaders_time
+  if last and now - last <= HeaderChain.HEADERS_RESPONSE_TIME then
+    return false
+  end
+  local payload = p2p.serialize_getheaders(
+    p2p.PROTOCOL_VERSION,
+    self:get_block_locator(),
+    types.hash256_zero()
+  )
+  if not peer:send_message("getheaders", payload) then
+    return false
+  end
+  peer.last_getheaders_time = now
+  return true
+end
+
 --- Try to initiate low-work header sync (PRESYNC/REDOWNLOAD).
 -- Called when headers from peer would extend our chain but we haven't
 -- verified they have sufficient work yet.
@@ -2797,6 +2828,13 @@ function HeaderChain:handle_headers(peer, payload)
   if self.sync_peer == peer then self.sync_request_time = os.time() end
   -- Deserialize headers
   local headers = p2p.deserialize_headers(payload)
+
+  -- Core ProcessHeadersMessage: headers that connect (or an empty reply) are
+  -- the answer to any outstanding getheaders, so clear the in-flight mark that
+  -- maybe_send_getheaders set.  Non-connecting headers cannot be a response.
+  if #headers == 0 or self.headers[types.hash256_hex(headers[1].prev_hash)] then
+    peer.last_getheaders_time = nil
+  end
 
   -- Pre-base backfill response: extends the staged chain below the band.
   local gap = self.prebase_gap
