@@ -4700,17 +4700,20 @@ function RPCServer:register_methods()
 
   self.methods["getrawmempool"] = function(rpc, params)
     local verbose = params[1] or false
+    -- Core rpc/mempool.cpp MempoolToJSON: non-verbose is a VARR of txids,
+    -- verbose a VOBJ keyed by txid, so an empty pool is [] and {} respectively.
+    -- The empty array goes out as a pre-encoded "[]": the lua-cjson 2.1.0 the
+    -- node loads from the system LUA_CPATH has no empty_array_mt, so
+    -- setmetatable({}, cjson.empty_array_mt) there is a plain table and
+    -- encodes as {} (an empty getrawmempool read as an object).
     if not rpc.mempool then
-      -- Empty mempool: return empty array (non-verbose) or empty object (verbose).
-      -- Use cjson.empty_array_mt so the empty table serialises as [] not {}.
       if verbose then return {} end
-      return setmetatable({}, cjson.empty_array_mt)
+      return { _raw_json = "[]" }
     end
     if not verbose then
       local txids = rpc.mempool:get_raw_mempool()
-      -- Guard against empty-table-vs-empty-array cjson ambiguity.
       if #txids == 0 then
-        return setmetatable({}, cjson.empty_array_mt)
+        return { _raw_json = "[]" }
       end
       return txids
     end
