@@ -54,6 +54,7 @@ build = {
     ["lunarblock.perf"] = "src/perf.lua",
     ["lunarblock.prune"] = "src/prune.lua",
     ["lunarblock.ops"] = "src/ops.lua",
+    ["lunarblock.metrics_server"] = "src/metrics_server.lua",
     ["lunarblock.sha256_accel"] = {
       sources = {"csrc/sha256_accel.c"},
       libraries = {"crypto"},
