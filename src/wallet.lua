@@ -1224,6 +1224,32 @@ end
 -- Wallet Encryption
 --------------------------------------------------------------------------------
 
+--- Per-key IV for an imported key: the first 16 bytes of hash256(pubkey).
+-- Mirrors Core's EncryptSecret(vMasterKey, secret, pubkey.GetHash()), which
+-- uses the pubkey hash as the IV so every crypted key has its own IV.
+local function imported_key_iv(pubkey)
+  return crypto.hash256(pubkey):sub(1, M.CRYPTO_IV_SIZE)
+end
+
+--- Install an imported key record into the address/key tables.
+-- `info.privkey` is nil while the wallet is locked; the address and pubkey
+-- stay known so the wallet keeps tracking the script (Core keeps crypted
+-- keys loaded, with their pubkeys, while locked).
+local function install_imported_key(self, addr, info)
+  self.keys[addr] = {
+    privkey = info.privkey,
+    pubkey = info.pubkey,
+    path = "imported",
+    type = info.type or "p2pkh",
+    change = 0,
+    index = -1,
+  }
+  for _, a in ipairs(self.addresses) do
+    if a == addr then return end
+  end
+  self.addresses[#self.addresses + 1] = addr
+end
+
 --- Encrypt the wallet with a passphrase.
 -- @param passphrase string: The encryption passphrase
 function Wallet:encrypt(passphrase)
@@ -1253,6 +1279,17 @@ function Wallet:encrypt(passphrase)
     self.encrypted_mnemonic = nil
   end
 
+  -- Encrypt every imported key under the same key (Core's EncryptKeys covers
+  -- all keys, not just the HD seed). Imported keys are not derivable from the
+  -- master key, so without this they would sit on disk as plaintext.
+  for _, info in pairs(self.imported_keys) do
+    if info.privkey then
+      info.crypted = M.aes_encrypt(info.privkey, key, imported_key_iv(info.pubkey))
+    end
+  end
+  -- Held in memory only while unlocked (Core's vMasterKey); lock() wipes it.
+  self._crypt_key = key
+
   self.is_encrypted = true
   self.is_locked = false  -- Still unlocked after encryption
 end
@@ -1272,6 +1309,14 @@ function Wallet:lock()
   for addr, key_info in pairs(self.keys) do
     key_info.privkey = nil
   end
+
+  -- Imported keys: keep only the ciphertext. An old-format record with no
+  -- ciphertext yet keeps its plaintext (it is already plaintext on disk and
+  -- cannot be sealed without the key); unlock() seals it.
+  for _, info in pairs(self.imported_keys) do
+    if info.crypted then info.privkey = nil end
+  end
+  self._crypt_key = nil
 
   -- Clear mnemonic from memory; encrypted_mnemonic stays for re-unlock.
   self.mnemonic_words = nil
@@ -1305,6 +1350,40 @@ function Wallet:unlock(passphrase)
   if #plaintext ~= 64 then
     return false, "Invalid decrypted key length"
   end
+
+  -- Decrypt imported keys before changing any state, and check each one
+  -- against its stored pubkey (Core's DecryptKey + VerifyPubKey); a key that
+  -- fails leaves the wallet locked.
+  local imported_plain = {}
+  for addr, info in pairs(self.imported_keys) do
+    if info.crypted then
+      local priv = M.aes_decrypt(info.crypted, key, imported_key_iv(info.pubkey))
+      local pub_ok, pub = false, nil
+      if priv and #priv == 32 then
+        pub_ok, pub = pcall(crypto.pubkey_from_privkey, priv, info.compressed ~= false)
+      end
+      if not pub_ok or pub ~= info.pubkey then
+        return false, "Imported key decryption failed"
+      end
+      imported_plain[addr] = priv
+    end
+  end
+  for addr, info in pairs(self.imported_keys) do
+    if imported_plain[addr] then
+      info.privkey = imported_plain[addr]
+    elseif info.privkey then
+      -- Old-format plaintext record: seal it now so the next save holds
+      -- only ciphertext.
+      info.crypted = M.aes_encrypt(info.privkey, key, imported_key_iv(info.pubkey))
+    end
+    -- Hand the secret to the tracked key entry. During M.load the entries do
+    -- not exist yet; load installs them after the HD addresses, keeping the
+    -- address order unchanged.
+    if self.keys[addr] then
+      self.keys[addr].privkey = info.privkey
+    end
+  end
+  self._crypt_key = key
 
   -- Restore master key
   local seed_key = plaintext:sub(1, 32)
@@ -3440,6 +3519,11 @@ end
 -- BIP-86 tweak path).  Uncompressed WIFs predate witness, so they always
 -- map to legacy P2PKH regardless of wallet.address_type.
 function Wallet:import_privkey(wif)
+  -- Core's importprivkey requires an unlocked wallet (EnsureWalletIsUnlocked):
+  -- without the wallet key the new key could only be stored as plaintext.
+  if self.is_encrypted and (self.is_locked or not self._crypt_key) then
+    error("Wallet is locked")
+  end
   local version, payload = address.base58check_decode(wif)
   assert(version == self.network.wif_prefix, "Wrong network WIF prefix")
   local compressed = (#payload == 33 and payload:byte(33) == 0x01)
@@ -3486,6 +3570,12 @@ function Wallet:import_privkey(wif)
     compressed = compressed,
     type = addr_type,
   }
+  -- In an encrypted wallet the key is stored only as ciphertext under the
+  -- wallet key (Core's AddCryptedKey).
+  if self.is_encrypted then
+    self.imported_keys[addr].crypted =
+      M.aes_encrypt(privkey, self._crypt_key, imported_key_iv(pubkey))
+  end
   -- Avoid a duplicate entry in the ordered address list if re-imported.
   local already = false
   for _, a in ipairs(self.addresses) do
@@ -3693,11 +3783,31 @@ function Wallet:serialize()
   if self.imported_keys and next(self.imported_keys) ~= nil then
     local imp = {}
     for addr, info in pairs(self.imported_keys) do
-      imp[addr] = {
-        privkey = M.hex_encode(info.privkey),
+      local rec = {
         compressed = info.compressed and true or false,
         type = info.type,
       }
+      if self.is_encrypted and not info.crypted and info.privkey and self._crypt_key then
+        info.crypted = M.aes_encrypt(info.privkey, self._crypt_key,
+                                     imported_key_iv(info.pubkey))
+      end
+      if self.is_encrypted and info.crypted then
+        -- Encrypted wallet: ciphertext + pubkey only, never the secret. A
+        -- locked wallet writes the ciphertext it loaded back unchanged.
+        rec.crypted_privkey = M.hex_encode(info.crypted)
+        rec.pubkey = M.hex_encode(info.pubkey)
+      elseif info.privkey then
+        -- Unencrypted wallet, or an old-format plaintext record in an
+        -- encrypted wallet that has not been unlocked since load (it cannot
+        -- be sealed without the key; write it back as found, not drop it).
+        rec.privkey = M.hex_encode(info.privkey)
+      elseif info.crypted then
+        -- Inconsistent file (ciphertext in an unencrypted wallet): keep the
+        -- record as found rather than crash or drop it.
+        rec.crypted_privkey = M.hex_encode(info.crypted)
+        rec.pubkey = M.hex_encode(info.pubkey)
+      end
+      imp[addr] = rec
     end
     data.imported_keys = imp
   end
@@ -3937,6 +4047,28 @@ function M.load(filepath, network, storage, passphrase)
   wallet.address_type = data.address_type or "p2wpkh"
   wallet.is_encrypted = data.is_encrypted or false
 
+  -- Read imported keys (importprivkey) BEFORE any unlock so unlock() can
+  -- decrypt them. Two on-disk forms: {crypted_privkey, pubkey} (encrypted
+  -- wallets) and the older {privkey} plaintext hex, which stays loadable.
+  -- A locked wallet keeps the ciphertext so the next save writes it back
+  -- unchanged instead of erasing the key.
+  if type(data.imported_keys) == "table" then
+    for addr, info in pairs(data.imported_keys) do
+      local compressed = info.compressed ~= false
+      local rec = { compressed = compressed, type = info.type or "p2pkh" }
+      if info.crypted_privkey and info.pubkey then
+        rec.crypted = M.hex_decode(info.crypted_privkey)
+        rec.pubkey = M.hex_decode(info.pubkey)
+      elseif info.privkey then
+        rec.privkey = M.hex_decode(info.privkey)
+        rec.pubkey = crypto.pubkey_from_privkey(rec.privkey, compressed)
+      end
+      if rec.pubkey then
+        wallet.imported_keys[addr] = rec
+      end
+    end
+  end
+
   if data.is_encrypted then
     -- Load encrypted key
     wallet.encrypted_master_key = M.hex_decode(data.encrypted_master_key)
@@ -4017,31 +4149,14 @@ function M.load(filepath, network, storage, passphrase)
   -- from the master key, so the HD regen above would never recreate them — they
   -- are held apart in self.imported_keys and re-installed into self.keys here so
   -- every scan / sign / own-script path sees them. A reseed never wipes them.
-  if data.imported_keys and not wallet.is_locked then
-    for addr, info in pairs(data.imported_keys) do
-      local privkey = M.hex_decode(info.privkey)
-      local pubkey = crypto.pubkey_from_privkey(privkey, info.compressed ~= false)
-      wallet.keys[addr] = {
-        privkey = privkey,
-        pubkey = pubkey,
-        path = "imported",
-        type = info.type or "p2pkh",
-        change = 0,
-        index = -1,
-      }
-      wallet.imported_keys[addr] = {
-        privkey = privkey,
-        pubkey = pubkey,
-        compressed = info.compressed ~= false,
-        type = info.type or "p2pkh",
-      }
-      local seen = false
-      for _, a in ipairs(wallet.addresses) do
-        if a == addr then seen = true; break end
-      end
-      if not seen then
-        wallet.addresses[#wallet.addresses + 1] = addr
-      end
+  -- Installed even while locked (privkey nil until unlock), so a locked
+  -- wallet keeps tracking the imported address.
+  for addr, info in pairs(wallet.imported_keys) do
+    if wallet.is_encrypted and wallet.is_locked then
+      install_imported_key(wallet, addr,
+        { pubkey = info.pubkey, type = info.type })
+    else
+      install_imported_key(wallet, addr, info)
     end
   end
 
