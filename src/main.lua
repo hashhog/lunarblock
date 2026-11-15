@@ -2770,28 +2770,59 @@ local function main()
     end
   end)
 
+  -- Serves one queued getdata item; defined with the getdata handler below.
+  -- The getblocktxn handler hands a too-deep request to it (Core pushes a
+  -- MSG_WITNESS_BLOCK onto m_getdata_requests).
+  local serve_getdata_item
+
+  -- Core net_processing.cpp GETBLOCKTXN: a blocktxn is only built for a block
+  -- at most MAX_BLOCKTXN_DEPTH below the active tip.  For an older block the
+  -- request is answered as a getdata for the full block instead, so a peer
+  -- that wants us to read a deep block from disk has to download all of it;
+  -- otherwise every ~60-byte request cost one full block decode.
+
   peer_manager:register_handler("getblocktxn", function(peer, payload)
     local ok, err = pcall(function()
       local req = p2p.deserialize_getblocktxn(payload)
       print(string.format("Received getblocktxn from %s:%d (%d indexes)",
         peer.ip, peer.port, #req.indexes))
 
-      -- Look up the full block
-      local blk = db.get_block(req.block_hash)
-      if blk then
-        -- Respond with the requested transactions
-        local transactions = {}
-        for _, index in ipairs(req.indexes) do
-          local tx = blk.transactions[index + 1]  -- Convert to 1-based
-          if tx then
-            transactions[#transactions + 1] = tx
-          end
-        end
-        local resp_payload = p2p.serialize_blocktxn(req.block_hash, transactions)
-        peer:send_message("blocktxn", resp_payload)
-      else
+      -- Core: no block index entry -> "a block we don't have", ignored.
+      local entry = header_chain:get_header(req.block_hash)
+      if not (entry and entry.height) then
         print("getblocktxn: block not found")
+        return
       end
+
+      if entry.height < (chain_state.tip_height or 0) - compact_block.MAX_BLOCKTXN_DEPTH then
+        print(string.format("getblocktxn from %s:%d for a block > %d deep; "
+          .. "serving the full block instead", peer.ip, peer.port,
+          compact_block.MAX_BLOCKTXN_DEPTH))
+        peer:queue_getdata({ { type = p2p.INV_TYPE.MSG_WITNESS_BLOCK,
+                               hash = req.block_hash } }, serve_getdata_item)
+        return
+      end
+
+      local blk = db.get_block(req.block_hash)
+      if not blk then
+        print("getblocktxn: block not found")
+        return
+      end
+
+      -- Core SendBlockTransactions: an index past the end of the block is
+      -- Misbehaving("getblocktxn with out-of-bounds tx indices"), no reply.
+      local transactions = {}
+      local ntx = #blk.transactions
+      for i, index in ipairs(req.indexes) do
+        if index >= ntx then
+          peer_manager:misbehaving(peer, 100,
+            "getblocktxn with out-of-bounds tx indices")
+          return
+        end
+        transactions[i] = blk.transactions[index + 1]  -- Convert to 1-based
+      end
+      local resp_payload = p2p.serialize_blocktxn(req.block_hash, transactions)
+      peer:send_message("blocktxn", resp_payload)
     end)
     if not ok then
       print("Error processing getblocktxn: " .. tostring(err))
@@ -2803,7 +2834,7 @@ local function main()
   -- order, stopping when the peer's send queue is full or it disconnects
   -- (Core ProcessGetData / m_getdata_requests / fPauseSend).  This function
   -- serves ONE item; not_found collects the items answered with `notfound`.
-  local function serve_getdata_item(peer, item, not_found)
+  function serve_getdata_item(peer, item, not_found)
     -- BIP-159 peer-served-blocks gate: when prune mode is on and the
     -- pruner has actually deleted blocks below the keep window, the
     -- `db.get_block(item.hash)` call below will return nil for those
