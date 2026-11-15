@@ -7615,7 +7615,7 @@ function M.activate_snapshot_with_background(active_chain_state, snapshot_path,
   -- original on any activation failure.
   local function pre_commit(verified_hash, _coins, _metadata)
     if opts.check_content_hash then
-        local cerr = opts.check_content_hash(verified_hash)
+      local cerr = opts.check_content_hash(verified_hash)
       if cerr then return false, cerr end
     end
 

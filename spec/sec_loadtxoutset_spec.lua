@@ -451,5 +451,34 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
     assert.is_nil(res)
     assert.is_truthy(err)
     assert_untouched(dir, db, server, net, before, "duplicate coin")
+    -- Refused by the duplicate check itself, not only by the content gate.
+    assert.matches("duplicate coin", err.message)
+  end)
+
+  it("txid groups out of order: refused before any write, live state untouched", function()
+    -- Two one-coin groups, the larger txid first.
+    local serialize = require("lunarblock.serialize")
+    local w = serialize.buffer_writer()
+    w.write_bytes(utxo.serialize_snapshot_metadata(
+      utxo.snapshot_metadata(REGTEST.magic_bytes, types.hash256_from_hex(base_hex), 2)))
+    for _, b in ipairs({"\x6b", "\x6a"}) do
+      w.write_bytes(string.rep(b, 32))
+      w.write_varint(1)
+      w.write_varint(0)
+      w.write_bytes(utxo.serialize_snapshot_coin(utxo.utxo_entry(
+        1000, script.make_p2pkh_script(string.rep("\x77", 20)), 1, false)))
+    end
+    local f = snap .. ".order"
+    cleanup[#cleanup + 1] = f
+    local fh = assert(io.open(f, "wb")); fh:write(w.result()); fh:close()
+
+    local net = network_with(4, base_hex, string.rep("ef", 32))
+    local dir, db, _, server = live_node(net)
+    local before = observe(server)
+    local res, err = call(server, "loadtxoutset", {f})
+    assert.is_nil(res)
+    assert.is_truthy(err)
+    assert_untouched(dir, db, server, net, before, "txid order")
+    assert.matches("coins out of order", err.message)
   end)
 end)
