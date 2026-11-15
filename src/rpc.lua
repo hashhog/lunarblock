@@ -10646,7 +10646,7 @@ end
   end
 
   --- getnewaddress: Get a new receiving address.
-  -- @param label string: (ignored)
+  -- @param label string: address-book label (default "")
   -- @param address_type string: Address type (optional)
   -- @return string: New address
   self.methods["getnewaddress"] = function(rpc, params)
@@ -10672,7 +10672,21 @@ end
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet is locked"})
     end
 
-    -- params[1] is label (ignored), params[2] is address_type.
+    -- params[1] is the label (Core LabelFromValue, wallet/rpc/util.cpp:
+    -- null -> "", a non-string is a type error, "*" is reserved), parsed
+    -- before a key is generated. params[2] is address_type.
+    local label = params[1]
+    if label == nil then label = params.label end
+    if label == nil or label == cjson.null then label = "" end
+    if type(label) ~= "string" then
+      error({code = M.ERROR.TYPE_ERROR,
+             message = "JSON value of type " .. core_json_type_name(label) ..
+                       " is not of expected type string"})
+    end
+    if label == "*" then
+      error({code = -11, message = "Invalid label name"})  -- RPC_WALLET_INVALID_LABEL_NAME
+    end
+
     -- Validate BEFORE touching wallet.address_type: an unknown type used to
     -- stick (the assignment happened before get_new_address threw), and the
     -- next spend then crashed in generate_address.
@@ -10702,11 +10716,15 @@ end
           if type(addr_or_err) == "table" and addr_or_err.code then error(addr_or_err) end
           error({code = M.ERROR.INTERNAL_ERROR, message = tostring(addr_or_err)})
         end
+        -- Core GetNewDestination: SetAddressBook(dest, label, RECEIVE).
+        wallet:set_address_label(addr_or_err, label)
         return addr_or_err
       end
     end
 
-    return wallet:get_new_address()
+    local addr = wallet:get_new_address()
+    wallet:set_address_label(addr, label)
+    return addr
   end
 
   --- getbalance: Get wallet balance.
@@ -12125,8 +12143,18 @@ end
       end
       if key_info.change == 1 then result.ischange = true end
     end
-    if watch_info and watch_info.label and watch_info.label ~= "" then
-      result.labels[1] = watch_info.label
+    -- Core (addresses.cpp:503-508) pushes the address-book entry's label,
+    -- including the default "", whenever the address has an entry. A
+    -- getnewaddress address always has one (GetNewDestination records it in
+    -- address_labels); a keypool lookahead or change key has none. A
+    -- non-ranged watch-only descriptor gets one unless internal
+    -- (CWallet::AddWalletDescriptor).
+    local book_label = wallet.get_address_label and wallet:get_address_label(addr)
+    if book_label == nil and watch_info and not watch_info.internal then
+      book_label = watch_info.label or ""
+    end
+    if book_label ~= nil then
+      result.labels[1] = book_label
     end
     return result
   end

@@ -1044,6 +1044,9 @@ function M.new(network, storage)
   self.spendable_balance = 0       -- Confirmed balance excluding immature coinbase
   self.immature_balance = 0        -- Sum of confirmed-but-immature coinbase values
   self.unconfirmed_balance = 0     -- Balance from unconfirmed transactions
+  -- Address-book labels set by getnewaddress (Core SetAddressBook with the
+  -- caller's label, "" by default). Maps address -> label.
+  self.address_labels = {}
   self.next_external_index = 0     -- BIP44 external chain index
   self.next_internal_index = 0     -- BIP44 internal (change) chain index
   self.gap_limit = 20              -- BIP44 address gap limit
@@ -1516,6 +1519,25 @@ function Wallet:get_new_address()
   self:mark_dirty()
   self:save_if_dirty()
   return addr
+end
+
+--- Record the address-book label for an address (Core CWallet::SetAddressBook).
+-- @param addr string
+-- @param label string
+function Wallet:set_address_label(addr, label)
+  if type(addr) ~= "string" or type(label) ~= "string" then return end
+  self.address_labels = self.address_labels or {}
+  if self.address_labels[addr] == label then return end
+  self.address_labels[addr] = label
+  self:mark_dirty()
+  self:save_if_dirty()
+end
+
+--- The address-book label for an address, or nil when none was recorded.
+-- @param addr string
+-- @return string|nil
+function Wallet:get_address_label(addr)
+  return self.address_labels and self.address_labels[addr]
 end
 
 function Wallet:get_change_address()
@@ -3755,6 +3777,9 @@ function Wallet:serialize()
     -- presence). Default true for legacy wallet files lacking the field.
     private_keys_enabled = self.private_keys_enabled ~= false,
   }
+  if next(self.address_labels or {}) then
+    data.address_labels = self.address_labels
+  end
 
   -- Persist WATCH-ONLY descriptors (importdescriptors on a dpk wallet). The
   -- wallet holds no private key for these scripts, so unlike HD/imported keys
@@ -4046,6 +4071,13 @@ function M.load(filepath, network, storage, passphrase)
   wallet.account = data.account or 0
   wallet.address_type = data.address_type or "p2wpkh"
   wallet.is_encrypted = data.is_encrypted or false
+  if type(data.address_labels) == "table" then
+    for addr, label in pairs(data.address_labels) do
+      if type(addr) == "string" and type(label) == "string" then
+        wallet.address_labels[addr] = label
+      end
+    end
+  end
 
   -- Read imported keys (importprivkey) BEFORE any unlock so unlock() can
   -- decrypt them. Two on-disk forms: {crypted_privkey, pubkey} (encrypted
