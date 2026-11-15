@@ -6896,7 +6896,8 @@ end
 -- file:
 --   pass 1 (verify) parses every coin and runs every per-coin gate, the
 --          txid-group order check and the HASH_SERIALIZED computation (a
---          duplicate coin keeps its first copy, as in Core), writing NOTHING.  The caller's gates (content hash, background replay) run
+--          duplicate coin keeps its first copy, as in Core), writing
+--          NOTHING.  The caller's gates (content hash, background replay) run
 --          on that result, still before any write.
 --   pass 2 (commit) runs only for a snapshot that passed all of them.  It
 --          writes the in-progress marker durably, wipes the live coins (the
@@ -6904,8 +6905,9 @@ end
 --          writes the coins, then persists the base tip and clears the marker
 --          in one batch.  It re-hashes the stream and requires the pass-1
 --          hash, so a file that changed between the passes is not activated.
--- A crash or failure inside pass 2 leaves the marker set; ChainState:init
--- then refuses to run on that partial set (see snapshot_load_marker).
+-- A failure inside pass 2 latches fault (AbortNode) and leaves the marker
+-- set; a crash leaves the marker set.  ChainState:init then refuses to run on
+-- that partial set (see read_snapshot_load_marker).
 --------------------------------------------------------------------------------
 
 M.SNAPSHOT_LOAD_MARKER_KEY = "snapshot_load_in_progress"
@@ -7268,12 +7270,16 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
   file:close()
 
   if not ok_commit then
-    -- The live coins were already wiped: this chainstate is NOT usable.  The
-    -- marker stays set so a restart refuses it too (ChainState:init).
+    -- The live coins were already wiped: this chainstate is NOT usable.  Latch
+    -- the AbortNode analogue (fault.latch) so this process connects no block,
+    -- admits no transaction and stops without flushing the chainstate; the
+    -- marker stays set so a restart refuses the datadir too (ChainState:init).
     self.snapshot_commit_failed = tostring(commit_err)
     self.coin_view:clear_cache()
-    return false, "snapshot activation failed while writing the coins; the UTXO "
+    local msg = "snapshot activation failed while writing the coins; the UTXO "
       .. "set is incomplete and the node must stop: " .. tostring(commit_err)
+    fault.latch(msg)
+    return false, msg
   end
 
   -- Snapshot base block becomes the chainstate tip (persisted above when

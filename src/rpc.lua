@@ -14717,10 +14717,10 @@ end
     -- Security audit H2: the gate used to run AFTER the coins were written into
     -- the live set, so a refused snapshot stayed merged into it.  load_snapshot
     -- now hands it the hash of the verified file (the same TxOutSer stream
-    -- compute_utxo_hash walks) before writing anything.  compute_utxo_hash
-    -- order is 32 raw bytes in natural (little-endian) HashWriter::GetHash
-    -- order; au_data.hash_serialized is uint256 display (big-endian) hex, so
-    -- compare raw bytes and reverse only for the human-facing "got" string.
+    -- compute_utxo_hash walks) before writing anything.  That hash is 32 raw
+    -- bytes in natural (little-endian) HashWriter::GetHash order, while
+    -- au_data.hash_serialized is uint256 display (big-endian) hex, so compare
+    -- raw bytes and reverse only for the human-facing "got" string.
     local function check_content_hash(computed_bytes)
       if not au_data.hash_serialized then return nil end
       local expected_bytes = types.hash256_from_hex(au_data.hash_serialized).bytes
@@ -14753,13 +14753,9 @@ end
         target_snapshot_hash = whitelist_bypassed,
         drive_background = true })
     if not activation then
-      if rpc.chain_state.snapshot_commit_failed then
-        -- The coins were being written when the load failed: the live set is
-        -- incomplete.  Core's answer to a failed chainstate write is
-        -- AbortNode; stop the node (the marker makes a restart refuse it).
-        io.stderr:write("loadtxoutset: " .. tostring(aerr) .. "\n")
-        pcall(function() require("lunarblock.ops").raise_signal(15) end)
-      end
+      -- A failure while the coins were being written has already latched the
+      -- AbortNode analogue inside load_snapshot (fault.latch): nothing more is
+      -- connected or admitted, and the node stops without flushing.
       error({code = M.ERROR.MISC_ERROR,
         message = aerr or "load failed"})
     end

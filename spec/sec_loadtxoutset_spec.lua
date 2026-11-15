@@ -338,7 +338,6 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
 
   it("a write failure while committing leaves the marker, and a restart refuses the partial set", function()
     local fault = require("lunarblock.fault")
-    local ops = require("lunarblock.ops")
     local net = network_with(4, base_hex, hex_display(snap_hash_raw))
     local dir, db, cs, server = live_node(net)
 
@@ -352,12 +351,18 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
     end }
     local res, err = call(server, "loadtxoutset", {snap})
     fault.hooks = nil
-    pcall(ops.reset_signal_handlers)
 
     assert.is_nil(res)
     assert.is_truthy(err)
     assert.matches("incomplete", err.message)
     assert.is_truthy(cs.snapshot_commit_failed)
+    -- The running node must not keep using the partial set: the AbortNode
+    -- latch is set, so connect / submitblock / mempool entry points refuse.
+    local latched = fault.is_latched()
+    local ok_connect = pcall(fault.check_latch, "block connect")
+    fault._reset_for_tests()
+    assert.is_true(latched, "a failed commit left the node running on a partial set")
+    assert.is_false(ok_connect)
     assert.are.equal(types.hash256_from_hex(base_hex).bytes, read_marker(db))
     db.close()
 
@@ -399,8 +404,12 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
           swapped = true
           return true
         end })
+    local fault = require("lunarblock.fault")
+    local latched = fault.is_latched()
+    fault._reset_for_tests()
     assert.is_true(swapped, "the verify pass never handed over to the commit")
     assert.is_false(ok)
+    assert.is_true(latched, "a failed commit left the node running on a partial set")
     assert.matches("changed while it was being loaded", tostring(err))
     assert.are.equal(before_tip, cs.tip_hash)
     assert.is_truthy(read_marker(db))
