@@ -592,7 +592,19 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
     recv_buffer = "",
     recv_len = 0,         -- Decrypted length for current packet
     recv_aad = "",        -- AAD for next packet (garbage during handshake)
-    recv_decode_buffer = "",  -- Decrypted packet ready for retrieval
+    recv_decode_buffer = "",  -- (unused since sec H8; kept for callers that peek)
+    -- sec H8: decoded application packets waiting for get_message(), FIFO.
+    -- recv_bytes decodes EVERY complete packet it is given (Core's
+    -- CNode::ReceiveMsgBytes loops until the read is consumed), so this
+    -- queue, not recv_buffer, is where a burst of small packets lands.
+    recv_queue = {},
+    recv_queue_head = 1,
+    -- sec H8: read offset into recv_buffer while decoding packets, and
+    -- chunks held back while a packet is still incomplete, so a large
+    -- packet arriving in many reads is concatenated once, not per read.
+    recv_pos = 1,
+    recv_pending = {},
+    recv_pending_len = 0,
 
     -- Send state
     send_state = initiator and M.SendState.AWAITING_KEY or M.SendState.MAYBE_V1,
@@ -651,9 +663,59 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
   -- @param data string: received bytes
   -- @return boolean: true if successful, false on error
   -- @return string|nil: error message on failure
-  function self:recv_bytes(data)
-    self.recv_buffer = self.recv_buffer .. data
+  -- Largest encrypted packet we accept; recv_buffer never holds more than
+  -- one partial packet once the handshake is done (sec H8).
+  local MAX_PACKET_SIZE = M.LENGTH_LEN + M.HEADER_LEN + M.MAX_PAYLOAD_LEN + M.TAG_LEN
 
+  -- Drop the bytes already consumed by packet decoding (one copy per call,
+  -- not one per packet).
+  local function compact(t)
+    if t.recv_pos > 1 then
+      t.recv_buffer = t.recv_buffer:sub(t.recv_pos)
+      t.recv_pos = 1
+    end
+  end
+
+  function self:recv_bytes(data)
+    data = data or ""
+    local in_packets = self.recv_state == M.RecvState.VERSION
+      or self.recv_state == M.RecvState.APP
+    if in_packets and self.recv_len > 0 then
+      -- Length already decrypted: if this read still does not complete the
+      -- packet, park it instead of re-concatenating the whole buffer.
+      local need = M.LENGTH_LEN + M.HEADER_LEN + self.recv_len + M.TAG_LEN
+      if #self.recv_buffer + self.recv_pending_len + #data < need then
+        if #data > 0 then
+          self.recv_pending[#self.recv_pending + 1] = data
+          self.recv_pending_len = self.recv_pending_len + #data
+        end
+        return true
+      end
+    end
+    if self.recv_pending_len > 0 then
+      self.recv_pending[#self.recv_pending + 1] = data
+      data = table.concat(self.recv_pending)
+      self.recv_pending = {}
+      self.recv_pending_len = 0
+    end
+    if #data > 0 then
+      self.recv_buffer = self.recv_buffer .. data
+    end
+
+    local ok, err = self:_recv_loop()
+    compact(self)
+    if ok and (self.recv_state == M.RecvState.VERSION or self.recv_state == M.RecvState.APP) then
+      -- Every complete packet has been decoded, so what is left is at most
+      -- one partial packet. Anything larger is a bookkeeping bug; fail the
+      -- connection rather than let the buffer grow.
+      if #self.recv_buffer > MAX_PACKET_SIZE then
+        return false, "v2 receive buffer overflow: " .. #self.recv_buffer
+      end
+    end
+    return ok, err
+  end
+
+  function self:_recv_loop()
     while true do
       if self.recv_state == M.RecvState.KEY_MAYBE_V1 then
         -- Need 16 bytes to distinguish v1 from v2
@@ -747,12 +809,15 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
       elseif self.recv_state == M.RecvState.VERSION or self.recv_state == M.RecvState.APP then
         -- Receive encrypted packet
         -- First, decrypt length (3 bytes)
-        if #self.recv_buffer < M.LENGTH_LEN then
+        -- sec H8: parse at offset recv_pos; recv_bytes compacts once.
+        local pos = self.recv_pos
+        local avail = #self.recv_buffer - pos + 1
+        if avail < M.LENGTH_LEN then
           return true
         end
 
         if self.recv_len == 0 then
-          local enc_len = self.recv_buffer:sub(1, M.LENGTH_LEN)
+          local enc_len = self.recv_buffer:sub(pos, pos + M.LENGTH_LEN - 1)
           self.recv_len = self.cipher:decrypt_length(enc_len)
           -- W67c: reject oversize frames before we allocate/buffer them.
           -- Matches Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH. A corrupt
@@ -770,12 +835,12 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
 
         -- Check if we have the full packet
         local packet_size = M.LENGTH_LEN + M.HEADER_LEN + self.recv_len + M.TAG_LEN
-        if #self.recv_buffer < packet_size then
+        if avail < packet_size then
           return true
         end
 
         -- Decrypt packet
-        local enc_payload = self.recv_buffer:sub(M.LENGTH_LEN + 1, packet_size)
+        local enc_payload = self.recv_buffer:sub(pos + M.LENGTH_LEN, pos + packet_size - 1)
         -- W54: capture cipher state BEFORE decrypt so a failed auth lets us
         -- compare our nonce vs what the peer used. recv_p_cipher.packet_counter
         -- is the counter that was used for this specific decrypt attempt (the
@@ -807,7 +872,7 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
           return false, "decryption failed: " .. (err or "unknown")
         end
 
-        self.recv_buffer = self.recv_buffer:sub(packet_size + 1)
+        self.recv_pos = pos + packet_size
         self.recv_len = 0
         self.recv_aad = ""  -- Clear AAD after first packet in state
 
@@ -831,10 +896,10 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
             io.stderr:flush()
             self.recv_state = M.RecvState.APP
           else
-            -- Application packet, make available
-            self.recv_decode_buffer = contents
-            self.recv_state = M.RecvState.APP_READY
-            return true
+            -- Application packet: queue it and keep decoding (sec H8).
+            -- The old code parked here in APP_READY and decoded nothing
+            -- more until the next read, one packet per 64 KB read.
+            self.recv_queue[#self.recv_queue + 1] = contents
           end
         end
       elseif self.recv_state == M.RecvState.APP_READY then
@@ -852,16 +917,25 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
   --- Check if a message is ready for retrieval.
   -- @return boolean: true if message is ready
   function self:message_ready()
-    return self.recv_state == M.RecvState.APP_READY
+    return self.recv_queue_head <= #self.recv_queue
   end
 
   --- Get the received message.
   -- @return string, string: message type and payload
   function self:get_message()
-    assert(self.recv_state == M.RecvState.APP_READY, "no message ready")
-    local contents = self.recv_decode_buffer
-    self.recv_decode_buffer = ""
-    self.recv_state = M.RecvState.APP
+    assert(self:message_ready(), "no message ready")
+    local head = self.recv_queue_head
+    local queue = self.recv_queue
+    local n = #queue  -- read before clearing a slot: # is unreliable with holes
+    local contents = queue[head]
+    queue[head] = false  -- release the string, keep the sequence hole-free
+    if head >= n then
+      -- Drained: reset so the table does not keep growing its index.
+      self.recv_queue = {}
+      self.recv_queue_head = 1
+    else
+      self.recv_queue_head = head + 1
+    end
     return M.decode_message(contents)
   end
 
