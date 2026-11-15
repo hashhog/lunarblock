@@ -18,6 +18,10 @@ M.CMPCTBLOCKS_VERSION = 2
 -- Maximum depth from tip to serve compact blocks
 M.MAX_CMPCTBLOCK_DEPTH = 5
 
+-- Maximum depth from tip to answer getblocktxn with a blocktxn; deeper
+-- requests get the full block (Core net_processing.cpp MAX_BLOCKTXN_DEPTH).
+M.MAX_BLOCKTXN_DEPTH = 10
+
 -- Maximum concurrent compact block requests per block hash
 M.MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3
 
