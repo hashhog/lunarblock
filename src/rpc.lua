@@ -14705,55 +14705,59 @@ end
         active_tip_work = e2 and e2.total_work or nil
       end
     end
-    local activation, aerr = utxo_mod.activate_snapshot_with_background(
-      rpc.chain_state, path, au_data, au_height, bg_get_block,
-      { active_tip_height = active_tip, mempool = rpc.mempool,
-        snapshot_base_work = snap_base_work, active_tip_work = active_tip_work })
-    if not activation then
-      error({code = M.ERROR.MISC_ERROR,
-        message = aerr or "load failed"})
-    end
-
-    -- Whitelist bypassed (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT): there is no
-    -- hardcoded hash_serialized for this base, so the background validator was
-    -- built with target_hash = nil and would fail its final comparison against
-    -- nil.  Record the LOADED set's own hash as the target instead, so the
-    -- INDEPENDENT genesis->base re-derivation still runs and still has to agree
-    -- with the snapshot -- that check is not bypassed, only the chainparams
-    -- trust anchor is.
-    if whitelist_bypassed then
-      activation.background.target_hash = rpc.chain_state:compute_utxo_hash()
-    end
-
-    -- ── W102-BUG1 fix: SYNCHRONOUS load-time HASH_SERIALIZED gate. ─────────
+    -- ── W102-BUG1: SYNCHRONOUS load-time HASH_SERIALIZED gate. ─────────────
     -- Bitcoin Core's PopulateAndValidateSnapshot (validation.cpp:5899-5915)
-    -- performs a SYNCHRONOUS load-time gate: after loading the snapshot coins
-    -- into the snapshot chainstate's CoinsDB it recomputes their HASH_SERIALIZED
-    -- via ComputeUTXOStats and REJECTS the load (returns false, error
-    -- "Bad snapshot content hash: expected %s, got %s") when
+    -- recomputes the loaded coins' HASH_SERIALIZED via ComputeUTXOStats and
+    -- REJECTS the load ("Bad snapshot content hash: expected %s, got %s") when
     --   AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized.
     -- This is SEPARATE from and BEFORE the async background genesis->base
     -- re-validation (MaybeValidateSnapshot), so it MUST fire even on a fast-sync
-    -- node where the historical bg blocks are not yet local.  We mirror it here:
-    -- activate_snapshot_with_background just loaded the coins into rpc.chain_state,
-    -- so recompute their hash_serialized_3 (compute_utxo_hash — the same primitive
-    -- gettxoutsetinfo hash_serialized_3 uses) and compare it to the expected
-    -- assumeutxo commitment.  On MISMATCH, error() so the load is refused
-    -- synchronously (Core's `return false`), regardless of bg-block availability.
-    if au_data.hash_serialized then
-      -- compute_utxo_hash returns 32 raw bytes in natural (little-endian)
-      -- HashWriter::GetHash order; au_data.hash_serialized is uint256 display
-      -- (big-endian) hex, so compare in the raw-byte domain and reverse only for
-      -- the human-facing "got" string (types.hash256_hex reverses to display).
-      local computed_bytes = rpc.chain_state:compute_utxo_hash()
+    -- node where the historical bg blocks are not yet local.
+    --
+    -- Security audit H2: the gate used to run AFTER the coins were written into
+    -- the live set, so a refused snapshot stayed merged into it.  load_snapshot
+    -- now hands it the hash of the verified file (the same TxOutSer stream
+    -- compute_utxo_hash walks) before writing anything.  That hash is 32 raw
+    -- bytes in natural (little-endian) HashWriter::GetHash order, while
+    -- au_data.hash_serialized is uint256 display (big-endian) hex, so compare
+    -- raw bytes and reverse only for the human-facing "got" string.
+    local function check_content_hash(computed_bytes)
+      if not au_data.hash_serialized then return nil end
       local expected_bytes = types.hash256_from_hex(au_data.hash_serialized).bytes
       if computed_bytes ~= expected_bytes then
-        error({code = M.ERROR.MISC_ERROR,
-          message = string.format(
-            "Bad snapshot content hash: expected %s, got %s",
-            au_data.hash_serialized,
-            types.hash256_hex(types.hash256(computed_bytes)))})
+        return string.format(
+          "Bad snapshot content hash: expected %s, got %s",
+          au_data.hash_serialized,
+          types.hash256_hex(types.hash256(computed_bytes)))
       end
+      return nil
+    end
+
+    -- Core runs MaybeValidateSnapshot ASYNCHRONOUSLY, and a mismatch there is a
+    -- fatal AbortNode.  lunarblock drives the background pass synchronously
+    -- when every block genesis->base is already local (a node that snapshotted
+    -- its own chain, or regtest), and does so BEFORE activation: a proven
+    -- mismatch refuses the load with the original chainstate untouched.
+    -- Otherwise the bg validator stays UNVALIDATED (getchainstates
+    -- validated=false) until the maintenance loop backfills and ticks it.
+    --
+    -- Whitelist bypassed (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT): there is no
+    -- hardcoded hash_serialized, so the snapshot's own hash is the background
+    -- target -- the INDEPENDENT genesis->base re-derivation still has to agree
+    -- with the snapshot; only the chainparams trust anchor is skipped.
+    local activation, aerr = utxo_mod.activate_snapshot_with_background(
+      rpc.chain_state, path, au_data, au_height, bg_get_block,
+      { active_tip_height = active_tip, mempool = rpc.mempool,
+        snapshot_base_work = snap_base_work, active_tip_work = active_tip_work,
+        check_content_hash = check_content_hash,
+        target_snapshot_hash = whitelist_bypassed,
+        drive_background = true })
+    if not activation then
+      -- A failure while the coins were being written has already latched the
+      -- AbortNode analogue inside load_snapshot (fault.latch): nothing more is
+      -- connected or admitted, and the node stops without flushing.
+      error({code = M.ERROR.MISC_ERROR,
+        message = aerr or "load failed"})
     end
 
     -- Stash the dual-chainstate handle so getchainstates can surface the
@@ -14766,49 +14770,6 @@ end
     rpc.chain_state.tip_height = au_height
     if rpc.storage and rpc.storage.set_chain_tip then
       rpc.storage.set_chain_tip(rpc.chain_state.tip_hash, au_height, true)
-    end
-
-    -- Best-effort: drive the background validation now if every block
-    -- genesis->base is already present in the block store (e.g. a node that
-    -- snapshotted from its own chain, or regtest).  If the historical blocks
-    -- are not yet present (normal fast-sync), the bg validator simply stays
-    -- UNVALIDATED — getchainstates reports validated=false — until the node's
-    -- maintenance loop backfills the blocks and ticks background:step().
-    --
-    -- Core runs MaybeValidateSnapshot ASYNCHRONOUSLY (after ActivateSnapshot
-    -- returns), so loadtxoutset itself SUCCEEDS even when the background pass
-    -- will later reject: a HASH MISMATCH triggers a fatal AbortNode in the
-    -- background, not an error from the loadtxoutset call.  We mirror that —
-    -- loadtxoutset returns success, and the verdict is surfaced via
-    -- getchainstates (validated/invalid) + the snapshot chainstate state.  The
-    -- synchronous fatal-on-mismatch contract is exercised by the orchestrator's
-    -- on_invalid callback (see utxo.activate_snapshot_with_background and the
-    -- dual-chainstate spec), not by this RPC return.
-    if bg_get_block(au_height) ~= nil or au_height == 0 then
-      local bg = activation.background
-      -- Step until done, blocked (missing block), or proven invalid.
-      while not bg.validated and not bg.error do
-        local prev = bg.current_height
-        bg:step()
-        if bg.current_height == prev and not bg.validated and not bg.error then
-          break  -- no forward progress: a block was missing, stop best-effort
-        end
-      end
-    end
-
-    -- Belt-and-suspenders (W102-BUG1): if the best-effort background drive above
-    -- already PROVED the snapshot invalid (bg.error set — the INDEPENDENT
-    -- genesis->base re-derivation reached a different UTXO hash than the
-    -- assumeutxo commitment), reject the load too.  Core's async
-    -- MaybeValidateSnapshot fatal-aborts on this mismatch (validation.cpp:6061-6064);
-    -- lacking an in-process AbortNode, we surface it as a synchronous load error.
-    -- The load-time hash gate above already rejects corrupt snapshots on its own;
-    -- this only tightens the case where the bg pass ran and disagreed.
-    local bg_final = activation.background
-    if bg_final and bg_final.error then
-      error({code = M.ERROR.MISC_ERROR,
-        message = "Bad snapshot content hash (background re-validation): "
-          .. tostring(bg_final.error)})
     end
 
     -- Service bits (Core rpc/blockchain.cpp loadtxoutset ~3432:

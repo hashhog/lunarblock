@@ -2486,6 +2486,22 @@ function M.read_snapshot_record(storage)
 end
 
 function ChainState:init()
+  -- A loadtxoutset / --import-utxo that crashed or failed while writing the
+  -- coins (load_snapshot pass 2) left the in-progress marker: the old coins
+  -- are gone and the snapshot's are only partly written.  Never run on that
+  -- set.  --import-utxo sets resume_interrupted_snapshot_load because its
+  -- load rewrites the whole set and clears the marker.
+  if not self.resume_interrupted_snapshot_load then
+    local marker = M.read_snapshot_load_marker(self.storage)
+    if marker then
+      error(string.format(
+        "chainstate: a UTXO snapshot load (base %s) was interrupted while "
+        .. "writing the coins, so the UTXO set is incomplete. Re-run "
+        .. "--import-utxo with the same snapshot to finish it, or start from "
+        .. "an empty datadir.",
+        types.hash256_hex(types.hash256(marker))), 0)
+    end
+  end
   local hash, height = self.storage.get_chain_tip()
   if hash then
     self.tip_hash = hash
@@ -6863,6 +6879,186 @@ local function _file_reader(file)
   return r
 end
 
+--------------------------------------------------------------------------------
+-- Snapshot load: verify first, then a marker-guarded commit (security audit
+-- 2026-11-04 H2).
+--
+-- load_snapshot used to write every coin into the live CF.UTXO while it
+-- parsed, and only then ran the content-hash gate (and the RPC's background
+-- re-validation).  A load that failed any of them left the old coins AND the
+-- snapshot coins live, with the tip at the snapshot base, across a restart.
+-- Core never has that window: ActivateSnapshot (validation.cpp) loads into a
+-- SEPARATE snapshot chainstate and activates it only after
+-- PopulateAndValidateSnapshot matched m_assumeutxo_data; on failure the
+-- snapshot chainstate is discarded and the original chainstate is untouched.
+--
+-- lunarblock has one chainstate DB, so the equivalent is two passes over the
+-- file:
+--   pass 1 (verify) parses every coin and runs every per-coin gate, the
+--          txid-group order check and the HASH_SERIALIZED computation (a
+--          duplicate coin keeps its first copy, as in Core), writing
+--          NOTHING.  The caller's gates (content hash, background replay) run
+--          on that result, still before any write.
+--   pass 2 (commit) runs only for a snapshot that passed all of them.  It
+--          writes the in-progress marker durably, wipes the live coins (the
+--          snapshot chainstate is exactly the snapshot's coins, as in Core),
+--          writes the coins, then persists the base tip and clears the marker
+--          in one batch.  It re-hashes the stream and requires the pass-1
+--          hash, so a file that changed between the passes is not activated.
+-- A failure inside pass 2 latches fault (AbortNode) and leaves the marker
+-- set; a crash leaves the marker set.  ChainState:init then refuses to run on
+-- that partial set (see read_snapshot_load_marker).
+--------------------------------------------------------------------------------
+
+M.SNAPSHOT_LOAD_MARKER_KEY = "snapshot_load_in_progress"
+
+--- Read the interrupted-snapshot-load marker (CF.META), if any.
+-- @return string|nil: 32-byte base blockhash of the load that was writing
+function M.read_snapshot_load_marker(storage)
+  if not storage or not storage.get or not storage.CF or not storage.CF.META then
+    return nil
+  end
+  local v = storage.get(storage.CF.META, M.SNAPSHOT_LOAD_MARKER_KEY)
+  if v and #v > 0 then return v end
+  return nil
+end
+
+-- Delete every key of `cf` in bounded batches (a 100M+ row UTXO set must not
+-- become one giant write batch).  Same shape as reindex_chainstate's wipe.
+-- The iterator and batch are released on every exit, also when a write
+-- raises (an open iterator aborts RocksDB's close).
+local function _wipe_cf(storage, cf)
+  local iter = storage.iterator(cf)
+  local batch = storage.batch()
+  local ok, err = pcall(function()
+    iter.seek_to_first()
+    local count = 0
+    while iter.valid() do
+      batch.delete(cf, iter.key())
+      count = count + 1
+      if count >= 65536 then
+        batch.write(false)
+        batch.clear()
+        count = 0
+      end
+      iter.next()
+    end
+    if count > 0 then batch.write(false) end
+  end)
+  batch.destroy()
+  iter.destroy()
+  if not ok then error(err, 0) end
+end
+
+-- One pass over the snapshot body (after the 51-byte metadata).  Runs every
+-- per-coin gate and returns the HASH_SERIALIZED of exactly those coins, in
+-- the order compute_utxo_stats (and Core's ComputeUTXOStats) hashes them:
+-- txid groups in key byte order, and inside a group by NUMERIC vout.
+--
+-- Order: txid groups must be strictly ascending (dumptxoutset writes them
+-- in cursor order, and Core's 'C'||txid key prefix sorts like ours), which
+-- also rules out a txid split over two groups.  Inside a group the file order
+-- is NOT numeric for Core's dumps -- its key ends in VARINT(n), and VARINT
+-- byte order is not numeric (255 = 80 7f < 16512 = 80 80 00 < 256 = 81 00) --
+-- so a group is buffered and sorted before hashing, exactly as Core's
+-- std::map<uint32_t, Coin> does (kernel/coinstats.cpp).  A vout seen twice in
+-- a group keeps its FIRST copy, as Core's loader does (EmplaceCoinInternalDANGER
+-- is a try_emplace); the later copy still counts toward coins_count and still
+-- passes the per-coin gates, but is neither hashed nor written.
+--
+-- Stricter than Core, by construction of a streaming hash: Core never checks
+-- the txid order (it hashes its CoinsDB afterwards), so it would also accept
+-- a file with txid groups out of order or one txid split over two groups.
+-- No dumptxoutset writes such a file; this refuses it before any write.
+--
+-- `on_coin(txid, vout, entry, n)` is called for each coin when given; pass 1
+-- passes nil and so writes nothing.  Raises on any defect.
+local function _scan_snapshot_body(r, coins_total, effective_base_height, on_coin)
+  local hasher = crypto.sha256_init()
+  local coins_loaded = 0
+  local coins_left = coins_total
+  local prev_txid_bytes = nil
+
+  while coins_left > 0 do
+    -- Per-txid header: raw 32-byte txid + CompactSize(coins_per_txid).
+    local txid_bytes = r.read_bytes(32)
+    local txid = types.hash256(txid_bytes)
+    local coins_per_txid = r.read_varint()  -- CompactSize, see WriteUTXOSnapshot
+
+    -- BUG-8 fix: coins_per_txid > coins_left overflow guard.
+    -- Core validation.cpp:5804-5806: "Mismatch in coins count in snapshot
+    -- metadata and actual snapshot data".
+    if coins_per_txid > coins_left then
+      error("Mismatch in coins count in snapshot metadata and actual snapshot data")
+    end
+
+    if prev_txid_bytes and txid_bytes <= prev_txid_bytes then
+      error(string.format(
+        "Bad snapshot data after deserializing %d coins - coins out of order",
+        coins_loaded))
+    end
+    prev_txid_bytes = txid_bytes
+
+    local group = {}
+    local vouts = {}
+    for _ = 1, coins_per_txid do
+      -- CompactSize vout; COutPoint::n is uint32 (Core casts it the same way).
+      local vout = r.read_varint() % 4294967296
+      local entry = M.deserialize_snapshot_coin(r)
+
+      -- BUG-6 fix: per-coin height > base_height guard.
+      -- Core validation.cpp:5814-5819: "Bad snapshot data after deserializing
+      -- N coins" when coin.nHeight > base_height.
+      if entry.height > effective_base_height then
+        error(string.format(
+          "Bad snapshot data after deserializing %d coins", coins_loaded))
+      end
+
+      -- BUG-7 fix: per-coin MoneyRange validation.
+      -- Core validation.cpp:5820-5823: "Bad snapshot data after deserializing
+      -- N coins - bad tx out value".
+      if entry.value < 0 or entry.value > consensus.MAX_MONEY then
+        error(string.format(
+          "Bad snapshot data after deserializing %d coins - bad tx out value",
+          coins_loaded))
+      end
+
+      coins_loaded = coins_loaded + 1
+      coins_left = coins_left - 1
+      if group[vout] == nil then
+        group[vout] = entry
+        vouts[#vouts + 1] = vout
+        if on_coin then on_coin(txid, vout, entry, coins_loaded) end
+      end
+    end
+
+    -- TxOutSer per coin in numeric vout order, byte-identical to what
+    -- compute_utxo_stats hashes.
+    table.sort(vouts)
+    for i = 1, #vouts do
+      local vout = vouts[i]
+      hasher.update(_serialize_txoutser(M.outpoint_key(txid, vout), group[vout]))
+    end
+  end
+
+  -- BUG-9 fix: trailing-bytes EOF check.
+  -- Core validation.cpp:5872-5883: after reading all expected coins,
+  -- attempt to read one more byte; if it succeeds (no exception) then
+  -- there is leftover data → snapshot is corrupt.  _file_reader.read_bytes
+  -- throws on EOF (mirrors std::ios_base::failure), so a successful read
+  -- means extra data is present.
+  local trailing_ok, _ = pcall(r.read_bytes, 1)
+  if trailing_ok then
+    error(string.format(
+      "Bad snapshot - coins left over after deserializing %d coins",
+      coins_loaded))
+  end
+  -- EOF-throw is the expected success path; swallow it.
+
+  -- HashWriter::GetHash() is SHA256d (hash.h:115-119; coinstats.cpp:182-184).
+  return crypto.sha256(hasher.final()), coins_loaded
+end
+
 --- Load a UTXO snapshot file into this chainstate.
 -- Accepts the Bitcoin Core wire format produced by dumptxoutset
 -- (lunarblock's dump_snapshot is byte-compatible with this).
@@ -6884,8 +7080,16 @@ end
 -- @param mempool table|nil: mempool object with a size() method; when present
 --                           and non-empty the load is refused (BUG-5 /
 --                           Core:5627-5629).
--- @return boolean, string|nil: success flag, error message
-function ChainState:load_snapshot(file_path, expected_hash, base_height, active_tip_height, mempool, snapshot_base_work, active_tip_work)
+-- @param opts table|nil: { pre_commit = fn(hash, coins, metadata) -> ok, err }
+--                        a gate run after the file verified and before the
+--                        live set is touched; a false return refuses the load
+--                        with nothing written.
+-- @return boolean, string|nil, string|nil: success flag, error message, and
+--         on success the HASH_SERIALIZED of the loaded set (32 raw bytes)
+--
+-- Every refusal before the commit leaves this chainstate exactly as it was.
+-- See "Snapshot load: verify first, then a marker-guarded commit" above.
+function ChainState:load_snapshot(file_path, expected_hash, base_height, active_tip_height, mempool, snapshot_base_work, active_tip_work, opts)
   -- BUG-3 fix: duplicate-activation guard.
   -- Core validation.cpp:5600-5601: if m_from_snapshot_blockhash is already
   -- set, refuse with "Can't activate a snapshot-based chainstate more than
@@ -6959,95 +7163,14 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
   -- taken at, as set by the RPC layer before calling us).
   local effective_base_height = base_height or (self.tip_height or 0)
 
-  -- Clear in-memory cache; the underlying CF is left untouched and the
-  -- caller is expected to feed a fresh chainstate (Core does the same).
-  self.coin_view:clear_cache()
-
-  local coins_loaded = 0
-  local coins_total = metadata.coins_count
-
-  -- Wrap the file in a buffered reader so the new Core-format inner
-  -- payload (Core VARINTs + ScriptCompression) can be parsed with the
-  -- same primitives as buffer_reader.
+  -- ── Pass 1: verify.  Nothing below writes until every gate has passed. ──
   local r = _file_reader(file)
-
-  local ok_outer, parse_err = pcall(function()
-    local coins_left = coins_total
-
-    while coins_left > 0 do
-      -- Per-txid header: raw 32-byte txid + CompactSize(coins_per_txid).
-      local txid_bytes = r.read_bytes(32)
-      local txid = types.hash256(txid_bytes)
-      local coins_per_txid = r.read_varint()  -- CompactSize, see WriteUTXOSnapshot
-
-      -- BUG-8 fix: coins_per_txid > coins_left overflow guard.
-      -- Core validation.cpp:5804-5806: "Mismatch in coins count in snapshot
-      -- metadata and actual snapshot data".
-      if coins_per_txid > coins_left then
-        error("Mismatch in coins count in snapshot metadata and actual snapshot data")
-      end
-
-      for _ = 1, coins_per_txid do
-        local vout = r.read_varint()  -- CompactSize for vout
-        local entry = M.deserialize_snapshot_coin(r)
-
-        -- BUG-6 fix: per-coin height > base_height guard.
-        -- Core validation.cpp:5814-5819: "Bad snapshot data after deserializing
-        -- N coins" when coin.nHeight > base_height.
-        if entry.height > effective_base_height then
-          error(string.format(
-            "Bad snapshot data after deserializing %d coins", coins_loaded))
-        end
-
-        -- BUG-7 fix: per-coin MoneyRange validation.
-        -- Core validation.cpp:5820-5823: "Bad snapshot data after deserializing
-        -- N coins - bad tx out value".
-        if entry.value < 0 or entry.value > consensus.MAX_MONEY then
-          error(string.format(
-            "Bad snapshot data after deserializing %d coins - bad tx out value",
-            coins_loaded))
-        end
-
-        self.coin_view:add(txid, vout, entry)
-        coins_loaded = coins_loaded + 1
-        coins_left = coins_left - 1
-
-        -- Periodic flush to keep the cache from running away on a 100M+
-        -- UTXO load.  Use a 1M window with reallocate=true so each flush
-        -- takes the cheap `self.cache = {}` clear path (CoinView:flush
-        -- reallocate branch) instead of the O(cache_size) pairs()-rebuild
-        -- eviction branch — converting ~1650 full-cache rebuilds into ~165
-        -- wholesale clears.  Same coins, same async WriteBatch, same write
-        -- ordering; no consensus surface (mirrors camlcoin flush_every=1M).
-        if coins_loaded % 1000000 == 0 then
-          self.coin_view:flush(true)
-        end
-      end
-    end
-
-    -- BUG-9 fix: trailing-bytes EOF check.
-    -- Core validation.cpp:5872-5883: after reading all expected coins,
-    -- attempt to read one more byte; if it succeeds (no exception) then
-    -- there is leftover data → snapshot is corrupt.  _file_reader.read_bytes
-    -- throws on EOF (mirrors std::ios_base::failure), so a successful read
-    -- means extra data is present.
-    local trailing_ok, _ = pcall(r.read_bytes, 1)
-    if trailing_ok then
-      error(string.format(
-        "Bad snapshot - coins left over after deserializing %d coins",
-        coins_loaded))
-    end
-    -- EOF-throw is the expected success path; swallow it.
-  end)
-
-  file:close()
-
-  if not ok_outer then
-    return false, "snapshot parse error: " .. tostring(parse_err)
+  local ok_scan, verified_hash, verified_coins = pcall(_scan_snapshot_body,
+    r, metadata.coins_count, effective_base_height, nil)
+  if not ok_scan then
+    file:close()
+    return false, "snapshot parse error: " .. tostring(verified_hash)
   end
-
-  -- Final flush of the in-memory deltas.
-  self.coin_view:flush()
 
   if expected_hash then
     -- bitcoin-core/src/validation.cpp:5904-5915 (loadtxoutset strict gate)
@@ -7065,21 +7188,110 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
     -- compute_utxo_hash returns. Callers passing a hex string from
     -- consensus.assumeutxo.hash_serialized must reverse the bytes first
     -- (uint256.ToString is big-endian display).
-    local computed_hash, _ = self:compute_utxo_hash()
-    if computed_hash ~= expected_hash then
+    --
+    -- The hash is of the snapshot's coins alone (pass 1), which is what
+    -- Core's snapshot chainstate holds when it runs this comparison.
+    if verified_hash ~= expected_hash then
+      file:close()
       return false, "snapshot hash mismatch (hash_serialized)"
     end
   end
 
-  -- Snapshot base block becomes the chainstate tip.  Height is filled in
-  -- by the caller via assumeutxo lookup.
+  -- Caller gates that must also run before the live set is touched (the RPC's
+  -- Core-worded content gate and the best-effort background replay).
+  if opts and opts.pre_commit then
+    local ok_call, ok_pre, pre_err = pcall(opts.pre_commit,
+      verified_hash, verified_coins, metadata)
+    if not ok_call then
+      ok_pre, pre_err = false, tostring(ok_pre)
+    end
+    if not ok_pre then
+      file:close()
+      return false, pre_err or "snapshot refused before activation"
+    end
+  end
+
+  -- ── Pass 2: commit, guarded by the in-progress marker. ──
+  local storage = self.storage
+  local CF = storage_mod.CF
+  local function durable()
+    if storage.checkpoint then storage.checkpoint(true) end
+  end
+
+  local ok_commit, commit_err = pcall(function()
+    storage.put(CF.META, M.SNAPSHOT_LOAD_MARKER_KEY,
+      metadata.base_blockhash.bytes, true)
+    durable()
+
+    -- The snapshot chainstate is exactly the snapshot's coins (Core loads
+    -- into an empty CoinsDB).  Drop the cache without flushing and wipe the
+    -- old coins so none of them survives next to the snapshot's.
+    self.coin_view:clear_cache()
+    _wipe_cf(storage, CF.UTXO)
+
+    file:seek("set", 51)
+    local r2 = _file_reader(file)
+    local commit_hash = _scan_snapshot_body(r2, metadata.coins_count,
+      effective_base_height, function(txid, vout, entry, n)
+        self.coin_view:add(txid, vout, entry)
+        -- Periodic flush to keep the cache from running away on a 100M+
+        -- UTXO load.  Use a 1M window with reallocate=true so each flush
+        -- takes the cheap `self.cache = {}` clear path (CoinView:flush
+        -- reallocate branch) instead of the O(cache_size) pairs()-rebuild
+        -- eviction branch.  Same coins, same async WriteBatch, same write
+        -- ordering; no consensus surface (mirrors camlcoin flush_every=1M).
+        if n % 1000000 == 0 then
+          self.coin_view:flush(true)
+        end
+      end)
+    if commit_hash ~= verified_hash then
+      error("snapshot file changed while it was being loaded")
+    end
+    self.coin_view:flush()
+
+    -- Base tip + marker clear in ONE batch, after the coins, then an atomic
+    -- flush: the marker is never gone without the coins and the tip.  The tip
+    -- is written only when the caller supplied the base height (the RPC always
+    -- does; --import-utxo does when it resolved one); without it the height is
+    -- unknown and the caller keeps writing the tip itself, as before.
+    local batch = storage.batch()
+    if base_height ~= nil then
+      local w = serialize.buffer_writer()
+      w.write_hash256(metadata.base_blockhash)
+      w.write_u32le(base_height)
+      batch.put(CF.META, "chain_tip", w.result())
+    end
+    batch.delete(CF.META, M.SNAPSHOT_LOAD_MARKER_KEY)
+    batch.write(true)
+    batch.destroy()
+    durable()
+  end)
+
+  file:close()
+
+  if not ok_commit then
+    -- The live coins were already wiped: this chainstate is NOT usable.  Latch
+    -- the AbortNode analogue (fault.latch) so this process connects no block,
+    -- admits no transaction and stops without flushing the chainstate; the
+    -- marker stays set so a restart refuses the datadir too (ChainState:init).
+    self.snapshot_commit_failed = tostring(commit_err)
+    self.coin_view:clear_cache()
+    local msg = "snapshot activation failed while writing the coins; the UTXO "
+      .. "set is incomplete and the node must stop: " .. tostring(commit_err)
+    fault.latch(msg)
+    return false, msg
+  end
+
+  -- Snapshot base block becomes the chainstate tip (persisted above when
+  -- base_height was given; the height is otherwise filled in by the caller).
   self.tip_hash = metadata.base_blockhash
+  if base_height ~= nil then self.tip_height = base_height end
 
   -- BUG-3 fix: record activation so a second call is refused.
   -- Mirrors Core's m_from_snapshot_blockhash (validation.cpp:1872).
   self.from_snapshot_blockhash = metadata.base_blockhash
 
-  return true
+  return true, nil, verified_hash
 end
 
 --------------------------------------------------------------------------------
@@ -7380,6 +7592,13 @@ end
 -- @param opts table|nil: { active_tip_height, mempool, bg_storage }.
 --                        bg_storage overrides the bg coins store (must NOT be
 --                        the active chainstate's storage); default in-memory.
+--                        check_content_hash = fn(hash) -> errmsg|nil, the
+--                        caller's content gate; target_snapshot_hash = true
+--                        makes the snapshot's own hash the background target
+--                        when au_data has none; drive_background = true runs
+--                        the background pass synchronously when the blocks
+--                        are local.  All three act BEFORE the live set is
+--                        written, so any refusal leaves it untouched.
 -- @return table|nil, string|nil: { snapshot, background } or nil, error.
 function M.activate_snapshot_with_background(active_chain_state, snapshot_path,
                                              au_data, base_height, get_block, opts)
@@ -7394,51 +7613,108 @@ function M.activate_snapshot_with_background(active_chain_state, snapshot_path,
     expected_hash = types.hash256_from_hex(au_data.hash_serialized).bytes
   end
 
-  -- Step 1: load the snapshot into the ACTIVE chainstate (Core ActivateSnapshot).
-  --
-  -- Deliberately do NOT pass expected_hash here: the load-time HASH_SERIALIZED
-  -- gate in loadtxoutset is a separate concern (lunarblock W102 BUG-1, tracked
-  -- independently) and the existing live path loads without it.  The trustless
-  -- guarantee for this pilot is the BACKGROUND re-verification below, which
-  -- never trusts the loaded coins and rebuilds the set from genesis.  A caller
-  -- that wants the load-time gate too can pass opts.enforce_load_hash=true.
-  local load_expected = opts.enforce_load_hash and expected_hash or nil
-  local ok, lerr = active_chain_state:load_snapshot(
-    snapshot_path, load_expected, base_height, opts.active_tip_height, opts.mempool,
-    opts.snapshot_base_work, opts.active_tip_work)
-  if not ok then
-    return nil, lerr or "snapshot load failed"
-  end
-  active_chain_state.tip_height = base_height
-
-  local snapshot = M.new_snapshot_chainstate(
-    active_chain_state, base_height, active_chain_state.tip_hash)
-
   -- Guard: the bg coins store MUST be a different object from the active store.
   if opts.bg_storage and opts.bg_storage == active_chain_state.storage then
     return nil, "background storage must be separate from the active chainstate store"
   end
 
-  -- Step 2: BACKGROUND chainstate (Core AddChainstate demotion).  Separate coins
-  -- store, genesis-seeded, targeting the snapshot base.
-  local background = M.new_background_validator(
-    opts.bg_storage,            -- nil => fresh in-memory store (separate object)
-    active_chain_state.network,
-    base_height,
-    expected_hash,
-    get_block)
+  -- The snapshot chainstate descriptor is built once the load committed; the
+  -- background pass may already have reached a verdict by then (driven
+  -- before the commit below), so the callbacks record it and it is applied
+  -- when the descriptor exists.
+  local snapshot, background, verdict, invalid_reason
 
-  -- Wire the verdict back to the snapshot chainstate's assumeutxo state.
-  background.on_validated = function()
-    snapshot:set_validated()
-    background:retire()
+  -- Step 2 runs INSIDE load_snapshot, after the file verified and before any
+  -- live write (security audit H2): a background pass that can already prove
+  -- the snapshot wrong must refuse the load while the original chainstate is
+  -- still untouched -- Core discards the snapshot chainstate and keeps the
+  -- original on any activation failure.
+  local function pre_commit(verified_hash, _coins, _metadata)
+    if opts.check_content_hash then
+      local cerr = opts.check_content_hash(verified_hash)
+      if cerr then return false, cerr end
+    end
+
+    -- Without a hardcoded commitment (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT), the
+    -- caller may ask for the snapshot's own hash as the target, so the
+    -- independent genesis->base replay still has to agree with it.
+    local target = expected_hash
+    if not target and opts.target_snapshot_hash then
+      target = verified_hash
+    end
+
+    -- Step 2: BACKGROUND chainstate (Core AddChainstate demotion).  Separate
+    -- coins store, genesis-seeded, targeting the snapshot base.
+    background = M.new_background_validator(
+      opts.bg_storage,            -- nil => fresh in-memory store (separate object)
+      active_chain_state.network,
+      base_height,
+      target,
+      get_block)
+
+    -- Wire the verdict back to the snapshot chainstate's assumeutxo state.
+    background.on_validated = function()
+      verdict = "validated"
+      if snapshot then snapshot:set_validated() end
+      background:retire()
+    end
+    background.on_invalid = function(reason)
+      -- Core handle_invalid_snapshot: mark INVALID + fatal abort.  lunarblock has
+      -- no AbortNode in-process here; we mark INVALID and let the caller surface a
+      -- fatal condition (the validator's error is set and on_invalid fired).
+      verdict = "invalid"
+      invalid_reason = reason
+      if snapshot then
+        snapshot:set_invalid()
+        snapshot.invalid_reason = reason
+      end
+    end
+
+    -- Best-effort synchronous drive when every block genesis->base is already
+    -- local (a node that snapshotted its own chain, or regtest).  Otherwise
+    -- the validator stays UNVALIDATED until the maintenance loop ticks it.
+    if opts.drive_background
+        and (base_height == 0 or get_block(base_height) ~= nil) then
+      while not background.validated and not background.error do
+        local prev = background.current_height
+        background:step()
+        if background.current_height == prev
+            and not background.validated and not background.error then
+          break  -- no forward progress: a block was missing, stop best-effort
+        end
+      end
+      if background.error then
+        -- Core's async MaybeValidateSnapshot fatal-aborts on this mismatch
+        -- (validation.cpp:6061-6064); here it is proven before activation,
+        -- so the load is simply refused.
+        return false, "Bad snapshot content hash (background re-validation): "
+          .. tostring(background.error)
+      end
+    end
+    return true
   end
-  background.on_invalid = function(reason)
-    -- Core handle_invalid_snapshot: mark INVALID + fatal abort.  lunarblock has
-    -- no AbortNode in-process here; we mark INVALID and let the caller surface a
-    -- fatal condition (the validator's error is set and on_invalid fired).
+
+  -- Step 1: load the snapshot into the ACTIVE chainstate (Core ActivateSnapshot).
+  --
+  -- expected_hash is passed only with opts.enforce_load_hash; the RPC instead
+  -- supplies opts.check_content_hash so the refusal carries Core's wording.
+  -- Either way every gate runs before the commit.
+  local load_expected = opts.enforce_load_hash and expected_hash or nil
+  local ok, lerr = active_chain_state:load_snapshot(
+    snapshot_path, load_expected, base_height, opts.active_tip_height, opts.mempool,
+    opts.snapshot_base_work, opts.active_tip_work, { pre_commit = pre_commit })
+  if not ok then
+    return nil, lerr or "snapshot load failed"
+  end
+  active_chain_state.tip_height = base_height
+
+  snapshot = M.new_snapshot_chainstate(
+    active_chain_state, base_height, active_chain_state.tip_hash)
+  if verdict == "validated" then
+    snapshot:set_validated()
+  elseif verdict == "invalid" then
     snapshot:set_invalid()
-    snapshot.invalid_reason = reason
+    snapshot.invalid_reason = invalid_reason
   end
 
   return { snapshot = snapshot, background = background }, nil
