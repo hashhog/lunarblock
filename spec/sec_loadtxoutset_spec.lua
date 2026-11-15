@@ -170,6 +170,34 @@ local function rewrite_last_coin_bad_height(src_path, dst_path, base_height)
   end)
 end
 
+-- Hand-build a snapshot of ONE txid whose coins are written in the given vout
+-- order (Core writes a txid's coins in its VARINT key order, not numeric).
+local function write_group_snapshot(path, base_hash, txid_bytes, vouts, height)
+  local serialize = require("lunarblock.serialize")
+  local w = serialize.buffer_writer()
+  w.write_bytes(utxo.serialize_snapshot_metadata(
+    utxo.snapshot_metadata(REGTEST.magic_bytes, base_hash, #vouts)))
+  w.write_bytes(txid_bytes)
+  w.write_varint(#vouts)
+  for i, vout in ipairs(vouts) do
+    w.write_varint(vout)
+    w.write_bytes(utxo.serialize_snapshot_coin(utxo.utxo_entry(
+      1000 + i, script.make_p2pkh_script(string.rep("\x77", 20)), height, false)))
+  end
+  local f = assert(io.open(path, "wb"))
+  f:write(w.result())
+  f:close()
+end
+
+-- HASH_SERIALIZED of a coin set as compute_utxo_stats computes it from a
+-- chainstate DB (the walk gettxoutsetinfo and Core's ComputeUTXOStats use).
+local function db_hash_of(coins)
+  local cs = utxo.new_chain_state(storage_mod.new_memory_storage(), REGTEST)
+  cs:init()
+  for _, c in ipairs(coins) do cs.coin_view:add(c.txid, c.vout, c.entry) end
+  return (cs:compute_utxo_hash())
+end
+
 -- Reads the in-progress marker; absent on a tree that has none.
 local function read_marker(db)
   if not utxo.read_snapshot_load_marker then return nil end
@@ -382,5 +410,46 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
     local cs2 = utxo.new_chain_state(db2, net)
     assert.is_false(pcall(function() cs2:init() end))
     db2.close()
+  end)
+
+  it("control: a Core-ordered txid group across the VARINT boundary loads to Core's hash", function()
+    -- Core's cursor order for outputs 255, 16512, 256 (keys ..80 7f, ..80 80
+    -- 00, ..81 00); its ComputeUTXOStats hashes them numerically.
+    local txid_bytes = string.rep("\x5a", 32)
+    local f = snap .. ".varint"
+    cleanup[#cleanup + 1] = f
+    write_group_snapshot(f, types.hash256_from_hex(base_hex), txid_bytes, {255, 16512, 256}, 1)
+    local txid = types.hash256(txid_bytes)
+    local spk = script.make_p2pkh_script(string.rep("\x77", 20))
+    local want = db_hash_of({
+      {txid = txid, vout = 255,   entry = utxo.utxo_entry(1001, spk, 1, false)},
+      {txid = txid, vout = 16512, entry = utxo.utxo_entry(1002, spk, 1, false)},
+      {txid = txid, vout = 256,   entry = utxo.utxo_entry(1003, spk, 1, false)},
+    })
+
+    local dir = new_dir("varint")
+    local db = storage_mod.open(dir)
+    local cs = utxo.new_chain_state(db, REGTEST)
+    cs:init()
+    local ok, err = cs:load_snapshot(f, want, 4)
+    assert.is_true(ok, tostring(err))
+    local got, n = cs:compute_utxo_hash()
+    assert.are.equal(3, n)
+    assert.are.equal(hex_display(want), hex_display(got))
+    db.close()
+  end)
+
+  it("duplicate coin in a txid group: refused, live state untouched, also after reopen", function()
+    local f = snap .. ".dup"
+    cleanup[#cleanup + 1] = f
+    write_group_snapshot(f, types.hash256_from_hex(base_hex), string.rep("\x5b", 32), {1, 1}, 1)
+    local net = network_with(4, base_hex, string.rep("cd", 32))
+    local dir, db, _, server = live_node(net)
+    local before = observe(server)
+
+    local res, err = call(server, "loadtxoutset", {f})
+    assert.is_nil(res)
+    assert.is_truthy(err)
+    assert_untouched(dir, db, server, net, before, "duplicate coin")
   end)
 end)
