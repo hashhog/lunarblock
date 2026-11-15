@@ -185,6 +185,7 @@ function M.apply_conf_to_args(args, defaults, conf)
     reindex       = {"reindex",       "bool"},
     prune         = {"prune",         "number"},
     metricsport   = {"metricsport",   "number"},
+    metricsbind   = {"metricsbind",   "string"},
     rest          = {"rest",          "bool"},
     restport      = {"restport",      "number"},
     pid           = {"pid",           "string"},

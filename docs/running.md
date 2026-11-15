@@ -79,7 +79,8 @@ the node with `Unknown option: ...`. Boolean values may be `1/0`, `true/false`,
 | `--restport PORT` | `8080` | REST port. |
 | `--zmqpubhashblock`, `--zmqpubhashtx`, `--zmqpubrawblock`, `--zmqpubrawtx`, `--zmqpubsequence ENDPOINT` | none | ZeroMQ publishers (Core's topics). Need libzmq. |
 | `--zmqpubhwm N` | `1000` | ZeroMQ high-water mark. |
-| `--metricsport PORT` | `9332` | Prometheus metrics on all interfaces; `0` turns it off. |
+| `--metricsport PORT` | `9332` | Prometheus metrics port; `0` turns it off. |
+| `--metricsbind ADDR` | `127.0.0.1` | Metrics listen address. A scraper on another host needs `0.0.0.0` (or a specific interface address). |
 | `--jitprofile`, `--jitverbose` | off | Write LuaJIT profiler or trace output to `jit_profile.txt` / `jit_verbose.txt` in the data directory. |
 
 ## Config file
@@ -92,7 +93,7 @@ do not quote them. Command-line options win over the file.
 Recognised keys: `datadir`, `network`, `rpcport`, `rpcuser`, `rpcpassword`,
 `rpc-tls-cert`, `rpc-tls-key`, `port`, `bind`, `maxpeers`, `maxconnections`, `dbcache`,
 `connect`, `printtoconsole`, `nowalletcreate`, `daemon`, `reindex`, `prune`,
-`metricsport`, `rest`, `restport`, `pid`, `debug`, `log`, `nov2transport`,
+`metricsport`, `metricsbind`, `rest`, `restport`, `pid`, `debug`, `log`, `nov2transport`,
 `peerbloomfilters`, `ready-fd`, `noassumevalid`, `assumevalid`, `externalip`, `discover`.
 Other keys are ignored without a warning.
 
@@ -158,7 +159,8 @@ shut the node down cleanly, saving the mempool and fee estimates.
 
 - `GET /health` on the RPC port returns `{"status":"ok","height":N,...}` while the node is
   responsive. It needs the RPC credentials like any other request.
-- The metrics port serves Prometheus text format.
+- The metrics port serves Prometheus text format on `127.0.0.1`; scraping from another
+  host needs `--metricsbind 0.0.0.0`. Each request must arrive within 2 s and 8 KiB.
 - The usual RPCs: `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getnetworkinfo`.
 
 ```bash
