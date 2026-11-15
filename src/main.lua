@@ -165,6 +165,7 @@ local function parse_args(argv)
       print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --prune N           Prune mode: 0=disabled, 1=manual, >=550=target MB")
       print("      --metricsport PORT  Prometheus metrics port (default: 9332, 0 = disabled)")
+      print("      --metricsbind ADDR  Metrics listen address (default: 127.0.0.1; 0.0.0.0 = all interfaces)")
       print("      --rest              Enable REST API (no auth, read-only)")
       print("      --restport PORT     REST server port (default: 8080)")
       print("      --zmqpubhashblock ENDPOINT  Publish hashblock notifications")
@@ -405,6 +406,9 @@ local function parse_args(argv)
     elseif arg == "--metricsport" then
       i = i + 1
       args.metricsport = tonumber(argv[i])
+    elseif arg == "--metricsbind" then
+      i = i + 1
+      args.metricsbind = argv[i]
     elseif arg == "--rest" then
       args.rest = true
     elseif arg == "--restport" then
@@ -3405,24 +3409,40 @@ local function main()
     rest_server:start()
   end
 
-  -- Initialize Prometheus metrics server
+  -- Initialize Prometheus metrics server. Loopback by default (Core's RPC
+  -- default, httpserver.cpp HTTPBindAddresses); --metricsbind widens it.
+  -- Requests are served without blocking the event loop: see
+  -- src/metrics_server.lua.
   local metrics_port = args.metricsport or 9332
-  local metrics_socket = nil
+  local metrics_server = nil
   if metrics_port > 0 then
-    local socket = require("socket")
-    -- tcp4() not tcp(): see rpc.lua / rest.lua — reuseaddr otherwise
-    -- silently fails on LuaSocket 3.0 and bind races TIME_WAIT on relaunch.
-    metrics_socket = socket.tcp4()
-    assert(metrics_socket:setoption("reuseaddr", true))
-    local ok, err = metrics_socket:bind("0.0.0.0", metrics_port)
-    if ok then
-      metrics_socket:listen(16)
-      metrics_socket:settimeout(0)
-      print(string.format("Prometheus metrics server on port %d", metrics_port))
+    local metrics_mod = require("lunarblock.metrics_server")
+    local bind = args.metricsbind or metrics_mod.DEFAULT_BIND
+    local srv, err = metrics_mod.new({
+      port = metrics_port,
+      bind = bind,
+      render = function()
+        local height = chain_state.tip_height or 0
+        local peers = #(peer_manager:get_established_peers())
+        local mp_count = mempool and mempool.tx_count or 0
+        return string.format(
+          "# HELP bitcoin_blocks_total Current block height\n" ..
+          "# TYPE bitcoin_blocks_total gauge\n" ..
+          "bitcoin_blocks_total %d\n" ..
+          "# HELP bitcoin_peers_connected Number of connected peers\n" ..
+          "# TYPE bitcoin_peers_connected gauge\n" ..
+          "bitcoin_peers_connected %d\n" ..
+          "# HELP bitcoin_mempool_size Mempool transaction count\n" ..
+          "# TYPE bitcoin_mempool_size gauge\n" ..
+          "bitcoin_mempool_size %d\n",
+          height, peers, mp_count)
+      end,
+    })
+    if srv then
+      metrics_server = srv
+      print(string.format("Prometheus metrics server on %s:%d", bind, metrics_port))
     else
-      print(string.format("WARNING: Metrics server failed on port %d: %s", metrics_port, tostring(err)))
-      metrics_socket:close()
-      metrics_socket = nil
+      print(string.format("WARNING: Metrics server failed on %s:%d: %s", bind, metrics_port, tostring(err)))
     end
   end
 
@@ -3696,39 +3716,9 @@ local function main()
       rest_server:tick()
     end
 
-    -- Process Prometheus metrics requests
-    if metrics_socket then
-      local client = metrics_socket:accept()
-      if client then
-        client:settimeout(2)
-        -- Read and discard HTTP request
-        repeat
-          local line = client:receive("*l")
-        until not line or line == ""
-        -- Build metrics response
-        local height = chain_state.tip_height or 0
-        local peers = #(peer_manager:get_established_peers())
-        local mp_count = mempool and mempool.tx_count or 0
-        local body = string.format(
-          "# HELP bitcoin_blocks_total Current block height\n" ..
-          "# TYPE bitcoin_blocks_total gauge\n" ..
-          "bitcoin_blocks_total %d\n" ..
-          "# HELP bitcoin_peers_connected Number of connected peers\n" ..
-          "# TYPE bitcoin_peers_connected gauge\n" ..
-          "bitcoin_peers_connected %d\n" ..
-          "# HELP bitcoin_mempool_size Mempool transaction count\n" ..
-          "# TYPE bitcoin_mempool_size gauge\n" ..
-          "bitcoin_mempool_size %d\n",
-          height, peers, mp_count)
-        local resp = string.format(
-          "HTTP/1.1 200 OK\r\n" ..
-          "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" ..
-          "Content-Length: %d\r\n" ..
-          "Connection: close\r\n\r\n%s",
-          #body, body)
-        client:send(resp)
-        client:close()
-      end
+    -- Process Prometheus metrics requests (non-blocking)
+    if metrics_server then
+      metrics_server:tick()
     end
 
     -- Periodic status update
@@ -3919,6 +3909,7 @@ if not pcall(debug.getlocal, 4, 1) then
       print("      --jitverbose        Enable verbose JIT compilation logging")
       print("      --prune N           Prune mode: 0=disabled, 1=manual, >=550=target MB")
       print("      --metricsport PORT  Prometheus metrics port (default: 9332, 0 = disabled)")
+      print("      --metricsbind ADDR  Metrics listen address (default: 127.0.0.1; 0.0.0.0 = all interfaces)")
       print("      --rest              Enable REST API (no auth, read-only)")
       print("      --restport PORT     REST server port (default: 8080)")
       print("      --zmqpubhashblock ENDPOINT  Publish hashblock notifications")

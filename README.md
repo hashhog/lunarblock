@@ -67,8 +67,8 @@ is `~/.lunarblock`; every network except mainnet uses a subdirectory named after
 | regtest (`--regtest`) | 18444 | 18443 |
 
 RPC binds to `127.0.0.1`. P2P listens on all interfaces. A Prometheus metrics endpoint
-listens on all interfaces, port 9332 (`--metricsport 0` turns it off; a busy port only
-logs a warning).
+listens on `127.0.0.1`, port 9332 (`--metricsbind 0.0.0.0` exposes it to other hosts;
+`--metricsport 0` turns it off; a busy port only logs a warning).
 
 Blocks are kept in RocksDB inside the data directory. An unpruned mainnet node stores
 every block, so plan for at least as much fast disk as Bitcoin Core needs, or use
