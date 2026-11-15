@@ -48,7 +48,8 @@ end
 -- opts.now     clock override for tests (default socket.gettime)
 -- Returns server, or nil + error string.
 function M.new(opts)
-  local bind = opts.bind or M.DEFAULT_BIND
+  local bind = opts.bind
+  if bind == nil or bind == "" then bind = M.DEFAULT_BIND end
   local sock
   if bind:find(":", 1, true) then
     sock = socket.tcp6()
@@ -83,7 +84,8 @@ function MetricsServer:client_count()
 end
 
 function MetricsServer:_accept_all()
-  while true do
+  -- Bounded so a connect flood cannot keep one tick() busy.
+  for _ = 1, 2 * M.MAX_CLIENTS do
     local c = self.socket:accept()
     if not c then return end
     if #self.clients >= M.MAX_CLIENTS then

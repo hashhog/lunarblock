@@ -3417,7 +3417,8 @@ local function main()
   local metrics_server = nil
   if metrics_port > 0 then
     local metrics_mod = require("lunarblock.metrics_server")
-    local bind = args.metricsbind or metrics_mod.DEFAULT_BIND
+    local bind = args.metricsbind
+    if bind == nil or bind == "" then bind = metrics_mod.DEFAULT_BIND end
     local srv, err = metrics_mod.new({
       port = metrics_port,
       bind = bind,

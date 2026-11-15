@@ -287,8 +287,12 @@ describe("metrics_server module", function()
     srv:tick()
     assert.are.equal(0, srv:client_count())
     c:settimeout(1)
-    local data, err = c:receive("*a")
-    assert.are.equal("", data or "")
+    local data, err, partial = c:receive("*a")
+    -- A closed connection ends receive("*a") with err nil or "closed"
+    -- (unread bytes make the close an RST); an open one ends in "timeout".
+    assert.is_true(err == nil or err == "closed",
+      "server did not close the late client: " .. tostring(err))
+    assert.are.equal("", data or partial or "")
     c:close()
     srv:close()
   end)
