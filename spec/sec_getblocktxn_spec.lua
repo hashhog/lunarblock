@@ -220,4 +220,18 @@ describe("getblocktxn depth limit and index bounds (H6)", function()
     assert.equals(0, #peer.getdata)
     assert.equals(0, #rec.bans)
   end)
+
+  -- The handler hands deep requests to serve_getdata_item, which main.lua
+  -- defines after it; the spec injects a stub, so check the live scoping:
+  -- the local is declared before the handler and the later definition
+  -- assigns that local instead of declaring a new one.
+  it("hands deep requests to the getdata server that main.lua defines later", function()
+    local src = read_main()
+    local h = assert(src:find('  peer_manager:register_handler("getblocktxn"', 1, true))
+    local decl = src:find("\n  local serve_getdata_item\n", 1, true)
+    assert.truthy(decl and decl < h, "serve_getdata_item is not declared before the handler")
+    assert.is_nil(src:find("local function serve_getdata_item", 1, true))
+    local def = src:find("\n  function serve_getdata_item(", 1, true)
+    assert.truthy(def and def > h, "serve_getdata_item is not defined after the handler")
+  end)
 end)
