@@ -3901,10 +3901,21 @@ end
 -- COMPLETED and the next CANDIDATE becomes REQUESTED).  Without the fallback a
 -- silent first announcer would suppress the tx: honest peers announce it once.
 -- The entry is dropped when the tx arrives or no announcer is left.
+--
+-- H5: each peer may hold at most MAX_PEER_TX_ANNOUNCEMENTS entries (as the
+-- requested peer or as a fallback); further announcements from it are ignored
+-- until some of them resolve, as Core's net_processing.cpp AddTxAnnouncement
+-- does.  Before this one peer could fill the whole table.  Expiry is driven by
+-- a min-heap on expiry time and each peer indexes its own entries, so neither
+-- an inv item on a full table nor a disconnect walks the whole table (Core:
+-- TxRequestTracker's ByTime / ByPeer indexes).  The forced full sweep that ran
+-- for every inv item once the table was full stalled the node 18.3 s on two
+-- 50,000-item invs.
 M.GETDATA_TX_INTERVAL = 60
--- Fallback announcers remembered per tx (Core bounds per peer instead, at
--- MAX_PEER_TX_ANNOUNCEMENTS; a per-tx bound keeps this table small).
+-- Fallback announcers remembered per tx.
 M.MAX_TX_ANNOUNCERS = 32
+-- Core net_processing.cpp MAX_PEER_TX_ANNOUNCEMENTS.
+M.MAX_PEER_TX_ANNOUNCEMENTS = 5000
 -- Distinct txs tracked at once.  Past this, announcements are requested
 -- untracked (the pre-dedup behaviour) rather than dropped.
 M.MAX_TX_REQUESTS = 50000
@@ -3920,12 +3931,91 @@ local function tx_requests(self)
     reqs = {}
     self._tx_requested = reqs
     self._tx_requested_n = 0
+    -- peer -> { [key] = true } for every entry the peer requested or backs
+    -- as a fallback, and peer -> number of such entries.  Weak keys: a peer
+    -- object that is gone takes its index with it.
+    self._tx_by_peer = setmetatable({}, { __mode = "k" })
+    self._tx_peer_n = setmetatable({}, { __mode = "k" })
+    -- Min-heap of { expiry, key }.  A node is stale once its entry is gone or
+    -- carries a different expiry; stale nodes are skipped when popped.
+    self._tx_expiry_heap = {}
   end
   return reqs
 end
 
+local function peer_track(self, peer, key)
+  local s = self._tx_by_peer[peer]
+  if not s then
+    s = {}
+    self._tx_by_peer[peer] = s
+  end
+  if not s[key] then
+    s[key] = true
+    self._tx_peer_n[peer] = (self._tx_peer_n[peer] or 0) + 1
+  end
+end
+
+local function peer_untrack(self, peer, key)
+  local s = self._tx_by_peer[peer]
+  if s and s[key] then
+    s[key] = nil
+    local n = self._tx_peer_n[peer] - 1
+    self._tx_peer_n[peer] = n > 0 and n or nil
+  end
+end
+
+local function heap_push(heap, expiry, key)
+  local i = #heap + 1
+  heap[i] = { expiry, key }
+  while i > 1 do
+    local parent = math.floor(i / 2)
+    if heap[parent][1] <= expiry then break end
+    heap[i], heap[parent] = heap[parent], heap[i]
+    i = parent
+  end
+end
+
+local function heap_pop(heap)
+  local n = #heap
+  local top = heap[1]
+  heap[1] = heap[n]
+  heap[n] = nil
+  n = n - 1
+  local i = 1
+  while true do
+    local l, r, m = 2 * i, 2 * i + 1, i
+    if l <= n and heap[l][1] < heap[m][1] then m = l end
+    if r <= n and heap[r][1] < heap[m][1] then m = r end
+    if m == i then break end
+    heap[i], heap[m] = heap[m], heap[i]
+    i = m
+  end
+  return top
+end
+
+local function set_expiry(self, key, e, expiry)
+  e.expiry = expiry
+  local heap = self._tx_expiry_heap
+  heap_push(heap, expiry, key)
+  -- Released txs leave stale nodes until their expiry passes; rebuild when
+  -- they outnumber the live ones so the heap stays O(live entries).
+  if #heap > 2 * self._tx_requested_n + 1024 then
+    local live = {}
+    for i = 1, #heap do
+      local node = heap[i]
+      local le = self._tx_requested[node[2]]
+      if le and le.expiry == node[1] then live[#live + 1] = node end
+    end
+    table.sort(live, function(x, y) return x[1] < y[1] end)  -- sorted = valid heap
+    self._tx_expiry_heap = live
+  end
+end
+
 local function tx_request_forget(self, key)
-  if self._tx_requested[key] then
+  local e = self._tx_requested[key]
+  if e then
+    peer_untrack(self, e.peer, key)
+    for _, p in ipairs(e.announcers) do peer_untrack(self, p, key) end
     self._tx_requested[key] = nil
     self._tx_requested_n = self._tx_requested_n - 1
   end
@@ -3936,18 +4026,25 @@ end
 function PeerManager:_tx_request_next(key, now)
   local e = self._tx_requested[key]
   if not e then return end
+  peer_untrack(self, e.peer, key)
   while #e.announcers > 0 do
     local p = table.remove(e.announcers, 1)
     if p.state == peer_mod.STATE.ESTABLISHED then
-      e.peer = p
-      e.expiry = now + M.GETDATA_TX_INTERVAL
+      e.peer = p  -- stays tracked for p: it moves from fallback to requested
+      set_expiry(self, key, e, now + M.GETDATA_TX_INTERVAL)
       p:send_message("getdata", p2p.serialize_inv({
         { type = tx_request_inv_type(e.kind), hash = { bytes = e.hash } },
       }))
       return
     end
+    peer_untrack(self, p, key)
   end
   tx_request_forget(self, key)
+end
+
+--- Number of tx announcements currently held for `peer`.
+function PeerManager:tx_request_peer_count(peer)
+  return (self._tx_peer_n and self._tx_peer_n[peer]) or 0
 end
 
 --- Record an announcement of a transaction and decide whether to request it.
@@ -3965,12 +4062,16 @@ function PeerManager:claim_tx_request(kind, hash, peer, now)
     self:_tx_request_next(key, now)
     e = reqs[key]
   end
+  local s = self._tx_by_peer[peer]
+  if s and s[key] then return false end  -- this peer already announced it
+  -- Core AddTxAnnouncement: a peer at MAX_PEER_TX_ANNOUNCEMENTS is ignored.
+  if (self._tx_peer_n[peer] or 0) >= M.MAX_PEER_TX_ANNOUNCEMENTS then
+    return false
+  end
   if e then
-    if e.peer ~= peer and #e.announcers < M.MAX_TX_ANNOUNCERS then
-      for _, p in ipairs(e.announcers) do
-        if p == peer then return false end
-      end
+    if #e.announcers < M.MAX_TX_ANNOUNCERS then
       e.announcers[#e.announcers + 1] = peer
+      peer_track(self, peer, key)
     end
     return false
   end
@@ -3978,9 +4079,11 @@ function PeerManager:claim_tx_request(kind, hash, peer, now)
     self:expire_tx_requests(now, true)
     if self._tx_requested_n >= M.MAX_TX_REQUESTS then return true end
   end
-  reqs[key] = { kind = kind, hash = hash, peer = peer,
-                expiry = now + M.GETDATA_TX_INTERVAL, announcers = {} }
+  e = { kind = kind, hash = hash, peer = peer, announcers = {} }
+  reqs[key] = e
   self._tx_requested_n = self._tx_requested_n + 1
+  peer_track(self, peer, key)
+  set_expiry(self, key, e, now + M.GETDATA_TX_INTERVAL)
   return true
 end
 
@@ -3992,32 +4095,49 @@ end
 --- A peer answered notfound for a transaction.  If it was the peer we asked,
 -- move on to the next announcer; otherwise just drop its announcement.
 function PeerManager:tx_request_notfound(kind, hash, peer, now)
-  local e = self._tx_requested and self._tx_requested[kind .. hash]
+  local key = kind .. hash
+  local e = self._tx_requested and self._tx_requested[key]
   if not e then return end
   if e.peer == peer then
-    self:_tx_request_next(kind .. hash, now or socket.gettime())
+    self:_tx_request_next(key, now or socket.gettime())
     return
   end
   for i, p in ipairs(e.announcers) do
-    if p == peer then table.remove(e.announcers, i); break end
+    if p == peer then
+      table.remove(e.announcers, i)
+      peer_untrack(self, peer, key)
+      break
+    end
   end
 end
 
---- Re-route every request outstanding to a peer that has disconnected.
--- Its fallback announcements are skipped lazily by _tx_request_next.
+--- Re-route every request outstanding to a peer that has disconnected and
+-- drop its fallback announcements.  Walks only that peer's own entries.
 function PeerManager:tx_requests_drop_peer(peer, now)
   local reqs = self._tx_requested
   if not reqs then return end
   now = now or socket.gettime()
+  local s = self._tx_by_peer[peer]
+  if not s then return end
   local keys = {}
-  for key, e in pairs(reqs) do
-    if e.peer == peer then keys[#keys + 1] = key end
+  for key in pairs(s) do keys[#keys + 1] = key end
+  for _, key in ipairs(keys) do
+    local e = reqs[key]
+    if e and e.peer == peer then
+      self:_tx_request_next(key, now)
+    elseif e then
+      for i, p in ipairs(e.announcers) do
+        if p == peer then table.remove(e.announcers, i); break end
+      end
+    end
   end
-  for _, key in ipairs(keys) do self:_tx_request_next(key, now) end
+  self._tx_by_peer[peer] = nil
+  self._tx_peer_n[peer] = nil
 end
 
 --- Move requests whose peer has not delivered within GETDATA_TX_INTERVAL on
--- to the next announcer.  Swept at most once a second from tick().
+-- to the next announcer.  Swept at most once a second from tick(); pops only
+-- the expired nodes of the expiry heap.
 -- @param force boolean|nil: sweep even if one ran within the last second
 function PeerManager:expire_tx_requests(now, force)
   local reqs = self._tx_requested
@@ -4027,11 +4147,14 @@ function PeerManager:expire_tx_requests(now, force)
     return
   end
   self._tx_requested_swept = now
-  local keys = {}
-  for key, e in pairs(reqs) do
-    if now >= e.expiry then keys[#keys + 1] = key end
+  while true do
+    local heap = self._tx_expiry_heap
+    local top = heap[1]
+    if not top or top[1] > now then break end
+    heap_pop(heap)
+    local e = reqs[top[2]]
+    if e and e.expiry == top[1] then self:_tx_request_next(top[2], now) end
   end
-  for _, key in ipairs(keys) do self:_tx_request_next(key, now) end
 end
 
 --- Queue a transaction announcement for all established peers.
