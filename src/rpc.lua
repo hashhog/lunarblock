@@ -1338,6 +1338,21 @@ local function oj_result(obj)
   return { _raw_json = oj_encode(obj) }
 end
 
+--- Core rpc/util.cpp PushWarnings: a wallet-load result (createwallet,
+-- loadwallet, unloadwallet, restorewallet) carries "warnings" only when there
+-- is at least one; an empty list leaves the key out (RPCResult marks it
+-- optional). Emitting `warnings = {}` instead put a key Core never sends, and
+-- the system lua-cjson 2.1.0 encoded it as {} (an object) on top.
+-- @param obj table: the result object to extend
+-- @param warnings table: array of warning strings
+-- @return table: obj
+local function push_warnings(obj, warnings)
+  if warnings and #warnings > 0 then
+    obj.warnings = warnings
+  end
+  return obj
+end
+
 -- getblocktemplate result in Core's pushKV order (rpc/mining.cpp).  Encoded
 -- by hand because plain cjson cannot tell an empty array from an empty
 -- object: per-tx `depends` = [] went out as {}.  `coinbaseaux` is Core's
@@ -10382,7 +10397,7 @@ end
   -- @param blank boolean: Create blank wallet (no keys)
   -- @param passphrase string: Encryption passphrase (optional)
   -- @param descriptors boolean: Use descriptors (always true)
-  -- @return table: {name, warnings}
+  -- @return table: {name[, warnings]} (warnings only when non-empty, Core PushWarnings)
   self.methods["createwallet"] = function(rpc, params)
     if not rpc.wallet_manager then
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
@@ -10487,16 +10502,13 @@ end
       warnings[#warnings + 1] = "Empty string given as passphrase, wallet will not be encrypted."
     end
 
-    return {
-      name = wallet_name,
-      warnings = warnings,
-    }
+    return push_warnings({ name = wallet_name }, warnings)
   end
 
   --- loadwallet: Load a wallet from a wallet file.
   -- @param filename string: Wallet name (directory name under wallets/)
   -- @param load_on_startup boolean: (ignored)
-  -- @return table: {name, warnings}
+  -- @return table: {name[, warnings]} (warnings only when non-empty, Core PushWarnings)
   self.methods["loadwallet"] = function(rpc, params)
     if not rpc.wallet_manager then
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
@@ -10519,16 +10531,13 @@ end
       end
     end
 
-    return {
-      name = filename,
-      warnings = {},
-    }
+    return push_warnings({ name = filename }, {})
   end
 
   --- unloadwallet: Unload a wallet.
   -- @param wallet_name string: Wallet name (optional, uses request context)
   -- @param load_on_startup boolean: (ignored)
-  -- @return table: {warnings}
+  -- @return table: {[warnings]} (warnings only when non-empty, Core PushWarnings)
   self.methods["unloadwallet"] = function(rpc, params)
     if not rpc.wallet_manager then
       error({code = M.ERROR.WALLET_ERROR, message = "Wallet manager not available"})
@@ -10567,9 +10576,7 @@ end
       end
     end
 
-    return {
-      warnings = {},
-    }
+    return push_warnings({}, {})
   end
 
   --- listwallets: List currently loaded wallets.
@@ -11073,10 +11080,7 @@ end
       error({code = M.ERROR.WALLET_ERROR,
              message = load_err or "Failed to load restored wallet"})
     end
-    return {
-      name = wallet_name,
-      warnings = setmetatable({}, cjson.empty_array_mt),
-    }
+    return push_warnings({ name = wallet_name }, {})
   end
 
   --- bumpfee: BIP-125 RBF fee bump of an own wallet transaction.
