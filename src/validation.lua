@@ -70,8 +70,9 @@ local pv_available = nil
 -- nil = auto (pv_init(0)); a number is passed straight to pv_init.
 local requested_workers = nil
 
--- SCRIPT_VERIFY bit packing for the C job. TAPROOT_ACTIVE is a deployment
--- gate (height >= taproot_height), not a Core SCRIPT_VERIFY_* flag.
+-- SCRIPT_VERIFY bit packing for the C job. TAPROOT_ACTIVE mirrors the
+-- block's verify_taproot (Core SCRIPT_VERIFY_TAPROOT), set by connect_block
+-- from get_block_script_flags -- not from taproot_height.
 M.SCRIPT_FLAG_BITS = {
   verify_p2sh                = 1,
   verify_dersig              = 2,
@@ -395,10 +396,10 @@ function M.verify_script_checks(jobs)
     cjobs[j].prev_script = ffi.cast("const uint8_t *", spk)
     cjobs[j].prev_script_len = #spk
 
-    -- Prevouts are BIP341-only. Encoding them for every pre-taproot input
-    -- interned a blob the worker then decoded per input, for no consensus
-    -- reason. Skip unless this job is actually taproot.
-    local prevouts = job.taproot_active and job.prev_outputs or nil
+    -- Prevouts are BIP341-only: skip the blob unless the job carries
+    -- Taproot rules.  jtap is the same bit packed into cjobs[j].flags, so
+    -- every job the worker runs with Taproot rules gets the full vector.
+    local prevouts = jtap and job.prev_outputs or nil
     if prevouts then
       local blob = prev_ptr[prevouts]
       if not blob then
