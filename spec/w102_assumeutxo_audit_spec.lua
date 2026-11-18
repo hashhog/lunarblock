@@ -133,7 +133,7 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
   -- without a second argument, so expected_hash is nil and the strict gate is
   -- a no-op.  A snapshot with wrong coins passes silently.
   describe("BUG-1: hash_serialized strict gate not invoked by loadtxoutset", function()
-    it("load_snapshot accepts wrong-hash when expected_hash is nil (documents bug)", function()
+    it("load_snapshot refuses when expected_hash is nil and no unsafe flag is passed", function()
       local tmp = "/tmp/lb_w102_bug1_" .. os.time() .. "_" .. math.random(1000000)
       local db = storage_mod.open(tmp)
       local cs = utxo.new_chain_state(db, consensus.networks.regtest)
@@ -148,16 +148,17 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
       -- Pass a clearly wrong expected_hash — load must fail when the gate fires
       local wrong_hash = string.rep("\xff", 32)
-      -- BUG: without expected_hash, this call succeeds even with garbage
-      local ok_no_hash = cs:load_snapshot(snap)
+      -- Without expected_hash (and without opts.unsafe_unverified) the load
+      -- has nothing to verify against and must refuse, like Core.
+      local ok_no_hash, err_no_hash = cs:load_snapshot(snap)
       -- When expected_hash IS provided, it should reject
       local cs2 = utxo.new_chain_state(db, consensus.networks.regtest)
       cs2:init()
       local ok_wrong, err_wrong = cs2:load_snapshot(snap, wrong_hash)
 
-      -- Document the bug: no-arg call succeeds (should be rejected by rpc.lua)
-      assert.is_true(ok_no_hash,
-        "load_snapshot with no expected_hash should succeed (gate lives in caller)")
+      assert.is_false(ok_no_hash,
+        "load_snapshot with no expected_hash must refuse (Core always has a commitment)")
+      assert.matches("no assumeutxo hash_serialized", err_no_hash)
       -- When expected_hash is provided, it correctly rejects
       assert.is_false(ok_wrong)
       assert.matches("hash mismatch", err_wrong)
@@ -362,7 +363,7 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
       -- Fixed: load_snapshot must reject a coin whose height > base_height
       -- (Core validation.cpp:5814-5819).
-      local ok, err = cs:load_snapshot(snap)
+      local ok, err = cs:load_snapshot(snap, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
       assert.is_false(ok,
         "coin with height > base_height must be rejected (Core:5814-5819)")
       assert.is_not_nil(err)
@@ -401,7 +402,7 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
       -- Fixed: MoneyRange check must reject negative-value coin
       -- (Core validation.cpp:5820-5823).
-      local ok, err = cs:load_snapshot(snap)
+      local ok, err = cs:load_snapshot(snap, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
       assert.is_false(ok,
         "negative coin value must be rejected (Core:5820-5823)")
       assert.is_not_nil(err)
@@ -443,7 +444,7 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
       -- Fixed: coins_per_txid > coins_left must be rejected
       -- (Core validation.cpp:5804-5806).
-      local ok, err = cs:load_snapshot(snap)
+      local ok, err = cs:load_snapshot(snap, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
       assert.is_false(ok,
         "coins_per_txid > coins_left must be rejected (Core:5804-5806)")
       assert.is_not_nil(err)
@@ -485,7 +486,7 @@ describe("W102 AssumeUTXO snapshot loading gate audit", function()
 
       -- Fixed: trailing data after the last coin must be rejected
       -- (Core validation.cpp:5872-5883).
-      local ok, err = cs:load_snapshot(snap)
+      local ok, err = cs:load_snapshot(snap, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
       assert.is_false(ok,
         "trailing data after last coin must be rejected (Core:5872-5883)")
       assert.is_not_nil(err)

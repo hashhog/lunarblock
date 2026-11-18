@@ -485,7 +485,7 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
   end)
 
   it("load_snapshot without a base height leaves the stored tip to the caller", function()
-    -- --import-utxo with no assumeutxo entry passes base_height = nil; the
+    -- An explicitly unsafe load with no base height (base_height = nil); the
     -- commit must not pair the base hash with a guessed height on disk.
     local net = network_with(4, base_hex, string.rep("00", 32))
     local _, db, cs = live_node(net)
@@ -493,7 +493,7 @@ describe("H2: a failed loadtxoutset leaves the live UTXO set and tip untouched",
     local f = snap .. ".nobase"
     cleanup[#cleanup + 1] = f
     write_group_snapshot(f, types.hash256_from_hex(base_hex), string.rep("\x5c", 32), {0}, 1)
-    local ok, err = cs:load_snapshot(f)
+    local ok, err = cs:load_snapshot(f, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
     assert.is_true(ok, tostring(err))
     local hash, height = db.get_chain_tip()
     assert.are.equal(old_hash.bytes, hash.bytes)
