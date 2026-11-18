@@ -303,22 +303,98 @@ local function get_cluster_stats(root, entries)
   return count, weight
 end
 
+-- Count and weight of the live cluster holding `txid_hex`: the connected
+-- component of the in-pool dependency graph, i.e. Core's TxGraph cluster.  The
+-- walk stops once the count passes `max_count` or the weight passes
+-- `max_weight`, so its cost is bounded by the cluster limit and not by the size
+-- of the pool; the returned figures are then lower bounds already over a limit.
+--
+-- Normally the walk follows each entry's ancestor and descendant sets (their
+-- closure is the component).  During a reorg refill `pending` is the set of
+-- parent..child edges that link_mempool_children has written into those sets
+-- but deferred for _finalize_reorg_cluster_links.  Core has not added them to
+-- TxGraph yet either (UpdateTransactionsFromBlock runs after every re-add), so
+-- the walk then follows linked direct edges only: a parent named in the
+-- entry's spends_from, a child whose spends_from names the entry, skipping
+-- the pending ones.
+-- @return count, weight
+function M.live_cluster_stats(entries, txid_hex, max_count, max_weight, pending)
+  local e = entries[txid_hex]
+  if not e then return 0, 0 end
+  max_count = max_count or math.huge
+  max_weight = max_weight or math.huge
+  local seen = { [txid_hex] = true }
+  local stack, top = { txid_hex }, 1
+  local count, weight = 1, entry_cluster_weight(e)
+  local function over() return count > max_count or weight > max_weight end
+  local function visit(o)
+    if seen[o] then return end
+    seen[o] = true
+    local oe = entries[o]
+    if oe then
+      count = count + 1
+      weight = weight + entry_cluster_weight(oe)
+      top = top + 1
+      stack[top] = o
+    end
+  end
+  local function links_to(child, parent_hex)
+    for _, p in pairs(child.spends_from or {}) do
+      if p == parent_hex then return true end
+    end
+    return false
+  end
+  while top > 0 and not over() do
+    local cur_hex = stack[top]
+    local cur = entries[cur_hex]
+    stack[top] = nil
+    top = top - 1
+    if pending then
+      for _, p in pairs(cur.spends_from or {}) do
+        if not pending[p .. cur_hex] then visit(p) end
+        if over() then break end
+      end
+      if not over() then
+        for d in pairs(cur.descendants or {}) do
+          if not seen[d] and not pending[cur_hex .. d] then
+            local de = entries[d]
+            if de and links_to(de, cur_hex) then visit(d) end
+          end
+          if over() then break end
+        end
+      end
+    else
+      for o in pairs(cur.ancestors or {}) do
+        visit(o)
+        if over() then break end
+      end
+      if not over() then
+        for o in pairs(cur.descendants or {}) do
+          visit(o)
+          if over() then break end
+        end
+      end
+    end
+  end
+  return count, weight
+end
+
 -- Legacy union-find node count for `root` (no entries scoping).  Kept for
--- external callers; the acceptance gate uses get_cluster_stats with entries.
+-- external callers; the acceptance gate uses M.live_cluster_stats.
 local function get_cluster_size(root)
   local count = get_cluster_stats(root, nil)
   return count
 end
 
--- Total cluster size in WEIGHT UNITS.  This is the quantity the acceptance gate
--- compares against MAX_CLUSTER_WEIGHT.
+-- Total cluster size in WEIGHT UNITS over the union-find cluster (reporting;
+-- the acceptance gate sizes the live cluster with M.live_cluster_stats).
 local function get_cluster_weight(root, entries)
   local _, weight = get_cluster_stats(root, entries)
   return weight
 end
 
 -- Sum the vsize of all in-mempool transactions in the cluster rooted at `root`.
--- REPORTING ONLY — the acceptance gate uses get_cluster_weight().  Retained
+-- REPORTING ONLY — the acceptance gate sums weight units.  Retained
 -- because Σ⌈vsizeᵢ⌉ is what an operator-facing vbyte figure means; it is
 -- deliberately NOT the value compared against a limit (see MAX_CLUSTER_WEIGHT).
 local function get_cluster_vsize(root, entries)
@@ -2254,10 +2330,17 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- NOTE: this is mempool POLICY, not consensus.  Nothing here may affect block
   -- validation; a block containing a 100-transaction chain stays valid.
   -- A replacement's cluster was already sized exactly on the staged graph in
-  -- step 7; the union-find never splits, so after the evictions it can still
-  -- hold clusters together that the removed transactions used to link.
-  local cluster_root = uf_find(txid_hex)
-  local cluster_count, cluster_weight = get_cluster_stats(cluster_root, self.entries)
+  -- step 7, so the gate below is skipped for it.
+  --
+  -- The cluster is the connected component of the LIVE dependency graph (Core's
+  -- TxGraph splits a cluster when a linking tx leaves), walked from the new tx
+  -- and stopped as soon as it is over a limit, so the cost is bounded by the
+  -- cluster limit rather than by the pool.  The union-find's get_cluster_stats
+  -- scanned every key in the pool on every accept (~1 MB of garbage per tx at
+  -- 70k entries), which is what pushed the mainnet node past its 20G cap.
+  local cluster_count, cluster_weight = M.live_cluster_stats(
+    self.entries, txid_hex, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT,
+    self._pending_link_set)
   if #replaced == 0 and (cluster_count > MAX_CLUSTER_COUNT or cluster_weight > MAX_CLUSTER_WEIGHT) then
     -- Undo: remove the entry we just added
     self:remove_transaction(txid_hex, "cluster-limit")
@@ -2968,6 +3051,10 @@ function Mempool:link_mempool_children(parent_hex)
       if self._pending_cluster_links then
         local n = #self._pending_cluster_links
         self._pending_cluster_links[n + 1] = {parent_hex, child_hex}
+        -- The accept gate must not see this edge until it is finalized.
+        if self._pending_link_set then
+          self._pending_link_set[parent_hex .. child_hex] = true
+        end
       else
         uf_union(child_hex, parent_hex)
       end
@@ -2983,6 +3070,7 @@ end
 function Mempool:_finalize_reorg_cluster_links()
   local links = self._pending_cluster_links
   self._pending_cluster_links = nil
+  self._pending_link_set = nil
   if not links or #links == 0 then return end
 
   local live = {}
@@ -3121,6 +3209,7 @@ end
 function Mempool:update_for_reorg(disconnected, confirmed)
   confirmed = confirmed or {}
   self._pending_cluster_links = {}
+  self._pending_link_set = {}
   local readded = 0
   for b = #(disconnected or {}), 1, -1 do
     local block = disconnected[b]
