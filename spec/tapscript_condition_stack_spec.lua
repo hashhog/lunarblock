@@ -212,13 +212,15 @@ describe("tapscript condition stack (cffix-lunarblock-tapscript-condition-stack)
       { flags = { is_witness_v0 = true }, minimal = false },
       { flags = {}, minimal = false },
     }
-    -- Deterministic LCG so the run is reproducible without touching math.random.
+    -- Deterministic Park-Miller generator (products stay below 2^53, so it
+    -- is exact in doubles) so the run is reproducible without math.random.
     local seed = 0x5eed
     local function rnd(n)
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed % n + 1
+      seed = (seed * 16807) % 2147483647
+      return math.floor(seed / 2147483647 * n) + 1
     end
     local mismatches = {}
+    local outcomes = {}
     for i = 1, 30000 do
       local len = rnd(24)
       local ops = {}
@@ -226,6 +228,8 @@ describe("tapscript condition stack (cffix-lunarblock-tapscript-condition-stack)
       local mode = modes[(i % #modes) + 1]
       local want = reference(ops, mode.minimal)
       local got = run(asm(ops), mode.flags)
+      local kind = want:sub(1, 2)
+      outcomes[kind] = (outcomes[kind] or 0) + 1
       if got ~= want and #mismatches < 5 then
         local h = {}
         for k, o in ipairs(ops) do h[k] = string.format("%02x", o) end
@@ -233,5 +237,8 @@ describe("tapscript condition stack (cffix-lunarblock-tapscript-condition-stack)
       end
     end
     assert.equals(0, #mismatches, table.concat(mismatches, "\n"))
+    -- Coverage guard: the generator must produce balanced scripts that run to
+    -- completion, not only errors, or a broken toggle could hide.
+    assert.is_true((outcomes["OK"] or 0) >= 1000, "too few completed scripts")
   end)
 end)
