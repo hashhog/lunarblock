@@ -149,7 +149,7 @@ describe("tapscript condition stack (cffix-lunarblock-tapscript-condition-stack)
     assert.equals("ERR", run(asm({ OP_ELSE, OP_1 })))
     assert.equals("ERR", run(asm({ OP_ENDIF, OP_1 })))
     assert.equals("ERR", run(asm({ OP_1, OP_IF, OP_1 })))
-    -- Re-balanced after a pop: the stack is usable again.
+    -- An ENDIF after the stack is already empty again is unbalanced.
     assert.equals("ERR", run(asm({ OP_1, OP_IF, OP_ENDIF, OP_ENDIF, OP_1 })))
   end)
 
@@ -212,7 +212,7 @@ describe("tapscript condition stack (cffix-lunarblock-tapscript-condition-stack)
       { flags = { is_witness_v0 = true }, minimal = false },
       { flags = {}, minimal = false },
     }
-    -- Deterministic Park-Miller generator (products stay below 2^53, so it
+    -- Deterministic Park-Miller generator (products stay below 2^46, so it
     -- is exact in doubles) so the run is reproducible without math.random.
     local seed = 0x5eed
     local function rnd(n)
