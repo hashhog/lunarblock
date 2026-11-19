@@ -160,7 +160,10 @@ local function parse_pj_url(url)
   if not port or port < 1 or port > 65535 then
     return nil, "pj URL port invalid: " .. tostring(port_str)
   end
-  local is_onion = host:lower():match("%.onion$") ~= nil
+  -- A .onion host is only DNS-label characters ending in ".onion"; anything
+  -- else ("evil.com#.onion", "a@b.onion") is not a hidden service and must
+  -- not unlock plain http.
+  local is_onion = host:lower():match("^[%w%-%.]+%.onion$") ~= nil
   -- BIP-78 §Protocol: the endpoint MUST be https, or http to a Tor hidden
   -- service.  Plaintext http to any other host lets anyone on the path
   -- rewrite the Proposal the wallet is about to sign.

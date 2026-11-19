@@ -377,6 +377,15 @@ describe("payjoin sender checklist (BIP-78)", function()
     assert.are.equal(0, #r.mp.accepted)
   end)
 
+  it("http:// pj endpoint whose host only ends in '.onion' after a '#' or '@' is refused", function()
+    for _, pj in ipairs({"http%3A%2F%2Fevil.example%23.onion%2Fpj",
+                         "http%3A%2F%2Fu%40evil.example%23x.onion"}) do
+      local r = run("fake-onion", function() end, nil, pj)
+      assert.is_false(r.called)
+      assert.are.equal(sender.ERR.BAD_URI, r.err and r.err.code)
+    end
+  end)
+
   it("http:// pj endpoint on a .onion host is allowed", function()
     local r = run("onion", function() end, nil,
       "http%3A%2F%2Fexampleonionaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion%2Fpj")
