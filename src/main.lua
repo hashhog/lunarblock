@@ -2760,24 +2760,30 @@ local function main()
       -- full mempool scan of SipHash short ids and sent a getblocktxn.
       do
         local hx = types.hash256_hex(block_hash)
+        -- Core checks BLOCK_HAVE_DATA first.  The pending set is a table
+        -- lookup; the stored-body probe is a DB read, so it is only done
+        -- when the cheaper tests have not already decided.
+        if block_downloader.pending_blocks and block_downloader.pending_blocks[hx] then
+          return  -- body received, waiting to connect
+        end
+        local st = header_chain.storage
+        local function have_stored_body()
+          return st and st.get and st.CF and st.CF.BLOCKS
+            and st.get(st.CF.BLOCKS, block_hash.bytes) ~= nil
+        end
         local entry = header_chain.headers[hx]
         local tip_entry = chain_state.tip_hash
           and header_chain.headers[types.hash256_hex(chain_state.tip_hash)]
         if entry and entry.total_work and tip_entry and tip_entry.total_work
             and work_compare(entry.total_work, tip_entry.total_work) <= 0 then
           local inf = block_downloader.inflight and block_downloader.inflight[hx]
-          if inf and inf.peer == peer then
+          if inf and inf.peer == peer and not have_stored_body() then
             peer:send_message("getdata", p2p.serialize_inv({
               { type = p2p.INV_TYPE.MSG_WITNESS_BLOCK, hash = block_hash } }))
           end
           return
         end
-        if block_downloader.pending_blocks and block_downloader.pending_blocks[hx] then
-          return  -- body received, waiting to connect
-        end
-        local st = header_chain.storage
-        if st and st.get and st.CF and st.CF.BLOCKS
-            and st.get(st.CF.BLOCKS, block_hash.bytes) ~= nil then
+        if have_stored_body() then
           return  -- body already stored
         end
       end

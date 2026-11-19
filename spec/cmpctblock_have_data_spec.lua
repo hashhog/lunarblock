@@ -245,6 +245,30 @@ describe("cmpctblock for a block we have / with no more work than the tip", func
 
   it("a cmpctblock with no more work than the tip, requested from this peer, gets a full-block getdata", function()
     local chain, cs, blocks = connected_chain(2)
+    -- s2: a sibling of the tip b2 (same height, same work), header known,
+    -- body never received.
+    local s2 = make_block(chain, block_hex(blocks[1]), { spend(90) }, "sib")
+    local _, herr = chain:process_headers({ s2.header })
+    assert.is_nil(herr)
+    local hx = block_hex(s2)
+    local peer = new_peer()
+    local bd = { inflight = { [hx] = { peer = peer } }, pending_blocks = {} }
+    function bd:handle_block() error("must not be handed a block") end
+    local h = build(chain, cs, bd, stub_mempool(N))
+    h.cmpctblock(peer, payload_for(s2))
+    assert.equals(0, short_id_calls)
+    assert.same({ "getdata" }, peer.sent)
+    -- requested from ANOTHER peer: nothing sent to this one
+    local other = new_peer()
+    h.cmpctblock(other, payload_for(s2))
+    assert.equals(0, short_id_calls)
+    assert.same({}, other.sent)
+  end)
+
+  it("a requested cmpctblock for a block whose body is already stored sends no getdata", function()
+    -- Core returns on BLOCK_HAVE_DATA before the requested-from-this-peer
+    -- getdata: the connected tip, in flight from this peer, gets nothing.
+    local chain, cs, blocks = connected_chain(2)
     local hx = block_hex(blocks[2])
     local peer = new_peer()
     local bd = { inflight = { [hx] = { peer = peer } }, pending_blocks = {} }
@@ -252,12 +276,7 @@ describe("cmpctblock for a block we have / with no more work than the tip", func
     local h = build(chain, cs, bd, stub_mempool(N))
     h.cmpctblock(peer, payload_for(blocks[2]))
     assert.equals(0, short_id_calls)
-    assert.same({ "getdata" }, peer.sent)
-    -- requested from ANOTHER peer: nothing sent to this one
-    local other = new_peer()
-    h.cmpctblock(other, payload_for(blocks[2]))
-    assert.equals(0, short_id_calls)
-    assert.same({}, other.sent)
+    assert.same({}, peer.sent)
   end)
 
   it("a cmpctblock for a block with more work whose body is already stored is not reconstructed", function()
