@@ -1713,9 +1713,8 @@ describe("peerman", function()
 
       -- Should only select from different subnet
       local candidate = pm:select_peer_to_connect()
-      if candidate then
-        assert.equals("11.0.0.1", candidate.ip)
-      end
+      assert.is_not_nil(candidate)
+      assert.equals("11.0.0.1", candidate.ip)
     end)
 
   end)
