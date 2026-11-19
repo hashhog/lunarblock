@@ -26,7 +26,7 @@ end
 -- Build `n+1` headers (heights 0..n) with the given per-height timestamp and
 -- bits functions; returns the header map, the tip hash, and a by-height list.
 local function build_chain(n, ts_of, bits_of, tag)
-  local headers, by_height = {}, {}
+  local headers, by_height, hash_at = {}, {}, {}
   local prev = types.hash256_zero()
   local tip
   for h = 0, n do
@@ -34,10 +34,11 @@ local function build_chain(n, ts_of, bits_of, tag)
     headers[hash.bytes] = { version = 0x20000000, prev_hash = prev,
       merkle_root = types.hash256_zero(), timestamp = ts_of(h), bits = bits_of(h), nonce = 0 }
     by_height[h] = headers[hash.bytes]
+    hash_at[h] = hash
     prev = hash
     tip = hash
   end
-  return headers, tip, by_height
+  return headers, tip, by_height, hash_at
 end
 
 local function mock_cs(headers, tip, tip_height)
@@ -56,7 +57,7 @@ describe("block template nBits = GetNextWorkRequired (Core miner.cpp:220)", func
   local T0 = 1700000000
   local START_BITS = 0x1d00ffff
   local SPACING = 300
-  local headers, tip, by_height = build_chain(INTERVAL - 1,
+  local headers, tip, by_height, hash_at = build_chain(INTERVAL - 1,
     function(h) return T0 + SPACING * h end, function() return START_BITS end)
 
   it("tip at 2015, non-two-week timespan: template.bits == get_next_work_required", function()
@@ -83,6 +84,22 @@ describe("block template nBits = GetNextWorkRequired (Core miner.cpp:220)", func
     assert.equal(string.format("%08x", want), tmpl.bits)
     -- and the node's own connect-time gate accepts the template header
     assert.is_true(cs:check_diffbits(block.header, INTERVAL))
+    -- check_diffbits now goes through next_work_required: it must still
+    -- reject the stale parent bits the old template carried, and a
+    -- non-retarget height must still require the parent's bits.
+    local stale = {}
+    for k, v in pairs(block.header) do stale[k] = v end
+    stale.bits = START_BITS
+    local ok, why = cs:check_diffbits(stale, INTERVAL)
+    assert.is_false(ok)
+    assert.matches("^bad%-diffbits", why)
+    local mid = { prev_hash = hash_at[99] }
+    assert.is_not_nil(mid.prev_hash)
+    mid.timestamp = by_height[99].timestamp + 600
+    mid.bits = START_BITS
+    assert.is_true(cs:check_diffbits(mid, 100))
+    mid.bits = want
+    assert.is_false((cs:check_diffbits(mid, 100)))
   end)
 
   it("testnet min-difficulty: a template >20 min after the tip uses pow_limit bits", function()
@@ -153,9 +170,9 @@ describe("block template dry-run validity check (Core TestBlockValidity, miner.c
     -- A chain-state hook that reports a WRONG next-work value: the template
     -- would carry it, and the independent dry-run must catch it.
     cs.next_work_required = function() return 0x1d00ffff end
-    assert.has_error(function()
-      mining.create_block_template(empty_mempool(), cs, MAINNET, PAYOUT)
-    end)
+    local ok, err = pcall(mining.create_block_template, empty_mempool(), cs, MAINNET, PAYOUT)
+    assert.is_false(ok)
+    assert.matches("TestBlockValidity failed: bad%-diffbits", tostring(err))
   end)
 
   it("refuses to build a template when the next work cannot be resolved", function()
@@ -166,9 +183,9 @@ describe("block template dry-run validity check (Core TestBlockValidity, miner.c
     for hash, hd in pairs(headers) do
       if hd == by_height[0] then headers[hash] = nil end
     end
-    assert.has_error(function()
-      mining.create_block_template(empty_mempool(), mock_cs(headers, tip, INTERVAL - 1),
-        MAINNET, PAYOUT)
-    end)
+    local ok, err = pcall(mining.create_block_template, empty_mempool(),
+      mock_cs(headers, tip, INTERVAL - 1), MAINNET, PAYOUT)
+    assert.is_false(ok)
+    assert.matches("next work required is not computable", tostring(err))
   end)
 end)
