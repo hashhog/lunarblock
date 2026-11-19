@@ -7117,8 +7117,7 @@ end
     -- (AddrMan::Add rejects non-routable).  We accept dotted-decimal
     -- IPv4 / bracketless IPv6 literals; non-routable → success=false.
     local pm = require("lunarblock.peerman")
-    local is_ipv4 = addr:match("^%d+%.%d+%.%d+%.%d+$") ~= nil
-    if is_ipv4 and not pm.is_routable(addr) then
+    if not pm.is_routable(addr) then
       return { success = false }
     end
 

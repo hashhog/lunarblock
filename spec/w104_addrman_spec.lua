@@ -209,7 +209,7 @@ describe("G4 add to new table", function()
 
   it("accepts a new address", function()
     local pm, d = make_pm()
-    local added = pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+    local added = pm:_add_to_new("93.184.1.1", 8333, 1, os.time(), "10.0.0.1")
     assert.is_true(added)
     assert.equals(1, pm._new_count)
     rm_dir(d)
@@ -1102,8 +1102,11 @@ describe("G31 IsRoutable filter at AddrMan Add (FIXED)", function()
     assert.is_false(peerman.is_routable("203.0.113.1"))     -- TEST-NET-3
   end)
 
-  it("is_routable rejects reserved/broadcast 240.0.0.0/4", function()
-    assert.is_false(peerman.is_routable("240.0.0.1"))
+  -- Core CNetAddr::IsRoutable has no 240.0.0.0/4 rule; only IsValid's
+  -- INADDR_NONE (255.255.255.255) is refused there.  The earlier assertion
+  -- that 240.0.0.1 is unroutable diverged from Core.
+  it("is_routable rejects 255.255.255.255 but not the rest of 240.0.0.0/4 (Core)", function()
+    assert.is_true(peerman.is_routable("240.0.0.1"))
     assert.is_false(peerman.is_routable("255.255.255.255"))
   end)
 
