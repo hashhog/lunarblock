@@ -129,9 +129,9 @@ local function load_ltn12()
 end
 
 -- Parse a pj= URL into {scheme, host, port, path, query}.
--- We accept "https://", "http://" (for tests / loopback only — caller
--- enforces clearnet HTTPS), and "http://*.onion" for Tor (the SOCKS5
--- adapter handles routing).  Returns nil + err on malformed input.
+-- We accept "https://" and "http://*.onion" for Tor (the SOCKS5 adapter
+-- handles routing); "http://" to any other host is refused (BIP-78
+-- §Protocol).  Returns nil + err on malformed or refused input.
 local function parse_pj_url(url)
   if type(url) ~= "string" or #url == 0 then
     return nil, "pj URL is empty"
@@ -160,12 +160,20 @@ local function parse_pj_url(url)
   if not port or port < 1 or port > 65535 then
     return nil, "pj URL port invalid: " .. tostring(port_str)
   end
+  local is_onion = host:lower():match("%.onion$") ~= nil
+  -- BIP-78 §Protocol: the endpoint MUST be https, or http to a Tor hidden
+  -- service.  Plaintext http to any other host lets anyone on the path
+  -- rewrite the Proposal the wallet is about to sign.
+  if scheme == "http" and not is_onion then
+    return nil, "pj URL must be https (plain http is only allowed for " ..
+                ".onion hosts)"
+  end
   return {
     scheme  = scheme,
     host    = host,
     port    = port,
     path    = path,
-    is_onion = host:lower():match("%.onion$") ~= nil,
+    is_onion = is_onion,
   }
 end
 
@@ -280,8 +288,8 @@ local function http_post(parsed, body, query_str, opts)
     return table.concat(response_chunks), nil
   end
 
-  -- Plaintext path (loopback / .onion proxied).  http.request returns
-  -- (body, status, headers, status_line) on success when sink/source
+  -- Plaintext path (.onion only; parse_pj_url refuses clearnet http).
+  -- http.request returns (body, status, headers, status_line) on success when sink/source
   -- aren't supplied, but with source/sink it returns (ok, code, ...).
   local http, herr = load_http()
   if not http then return nil, M.ERR.TRANSPORT, herr end
@@ -314,6 +322,17 @@ local function outpoint_set(tx)
     set[key] = true
   end
   return set
+end
+
+-- Helper: outpoint key (txid_bytes .. vout_le4) of a txin, the same
+-- shape as wallet.utxos keys.
+local function outpoint_key(inp)
+  return inp.prev_out.hash.bytes ..
+         string.char(
+           inp.prev_out.index % 256,
+           math.floor(inp.prev_out.index / 256) % 256,
+           math.floor(inp.prev_out.index / 65536) % 256,
+           math.floor(inp.prev_out.index / 16777216) % 256)
 end
 
 -- Helper: build a set of script_pubkey strings for fast membership.
@@ -374,17 +393,24 @@ end
 --------------------------------------------------------------------------------
 -- G10 [P0-SECURITY]: payjoin_check_outputs
 --
--- Sender output-set anti-snoop.  The Proposal's outputs may differ from
--- the Original's ONLY in:
---   * The payment-output amount may have been bumped (BIP-78 §Receiver).
---   * The change-output amount may have been reduced by the
---     receiver-declared maxadditionalfeecontribution.
--- New outputs MUST NOT be added.  Outputs MUST NOT be removed.
--- (The receiver may change the order, but the SET — by script_pubkey —
--- must match: every sender output script must still be present, and
--- every proposal output script must be a sender output OR the payment
--- script.)
-function M.payjoin_check_outputs(original_psbt, proposal_psbt)
+-- BIP-78 "Sender's payjoin proposal checklist", outputs part.  Outputs are
+-- matched by script_pubkey (the receiver may reorder them):
+--   * No output may be added and none removed (the script multiset must
+--     match; stricter than BIP-78, which lets the receiver add outputs).
+--   * The payment output (ctx.payment_script) is left to G14: its amount may
+--     change unless disableoutputsubstitution is set.
+--   * The fee output (ctx.fee_output_index, BIP-78 additionalfeeoutputindex,
+--     0-based in the ORIGINAL) may decrease by at most ctx.max_contribution
+--     and may not increase.
+--   * Every other sender output keeps its exact amount.
+--
+-- Returns ok, err, contribution — contribution is the number of sats taken
+-- from the fee output, which the caller must check only pays fee.
+--
+-- With no ctx every output must keep its amount (no payment output, no fee
+-- output): the safe default.
+function M.payjoin_check_outputs(original_psbt, proposal_psbt, ctx)
+  ctx = ctx or {}
   local orig_scripts = script_set(original_psbt.tx)
   local prop_scripts = script_set(proposal_psbt.tx)
 
@@ -399,13 +425,121 @@ function M.payjoin_check_outputs(original_psbt, proposal_psbt)
   end
   -- Every proposal output script must have been in the original.
   -- This rejects any NEW output the receiver tried to inject.
-  for spk in pairs(prop_scripts) do
-    if not orig_scripts[spk] then
+  for spk, count in pairs(prop_scripts) do
+    if not orig_scripts[spk] or count > orig_scripts[spk] then
       return false,
         "Receiver added a new output (output-set anti-snoop violation)"
     end
   end
 
+  -- Amounts.  Group values by script, sorted, so duplicate scripts pair
+  -- up deterministically.
+  local function values_by_script(tx)
+    local m = {}
+    for _, out in ipairs(tx.outputs) do
+      local l = m[out.script_pubkey]
+      if not l then l = {}; m[out.script_pubkey] = l end
+      l[#l + 1] = out.value
+    end
+    for _, l in pairs(m) do table.sort(l) end
+    return m
+  end
+  local orig_vals = values_by_script(original_psbt.tx)
+  local prop_vals = values_by_script(proposal_psbt.tx)
+
+  local fee_spk
+  if ctx.fee_output_index ~= nil then
+    local o = original_psbt.tx.outputs[ctx.fee_output_index + 1]
+    if not o then
+      return false, "additionalfeeoutputindex " ..
+        tostring(ctx.fee_output_index) .. " is not an output of the original"
+    end
+    fee_spk = o.script_pubkey
+    if fee_spk == ctx.payment_script then
+      return false, "additionalfeeoutputindex points at the payment output"
+    end
+    if orig_scripts[fee_spk] ~= 1 then
+      return false, "fee output script is not unique in the original"
+    end
+  end
+
+  local contribution = 0
+  for spk, ovals in pairs(orig_vals) do
+    if spk ~= ctx.payment_script then
+      local pvals = prop_vals[spk]
+      if spk == fee_spk then
+        local drop = ovals[1] - pvals[1]
+        if drop < 0 then
+          return false, string.format(
+            "Receiver increased the fee output (orig=%d, proposal=%d)",
+            ovals[1], pvals[1])
+        end
+        if drop > (ctx.max_contribution or 0) then
+          return false, string.format(
+            "Receiver took %d sats from the fee output, more than " ..
+            "maxadditionalfeecontribution=%d", drop, ctx.max_contribution or 0)
+        end
+        contribution = drop
+      else
+        for i = 1, #ovals do
+          if ovals[i] ~= pvals[i] then
+            return false, string.format(
+              "Receiver changed the amount of a sender output " ..
+              "(orig=%d, proposal=%d)", ovals[i], pvals[i])
+          end
+        end
+      end
+    end
+  end
+
+  return true, nil, contribution
+end
+
+--------------------------------------------------------------------------------
+-- payjoin_check_tx_fields
+--
+-- BIP-78 sender checklist: the Proposal keeps the Original's tx version and
+-- nLockTime; every sender input keeps its nSequence; and receiver-added
+-- inputs may not introduce a different nSequence (a mixed-sequence tx is a
+-- PayJoin fingerprint, and a changed sequence changes what the sender's
+-- signature commits to: RBF signalling, relative locktime).
+function M.payjoin_check_tx_fields(original_psbt, proposal_psbt)
+  local otx, ptx = original_psbt.tx, proposal_psbt.tx
+  if otx.version ~= ptx.version then
+    return false, string.format(
+      "Receiver changed the tx version (orig=%s, proposal=%s)",
+      tostring(otx.version), tostring(ptx.version))
+  end
+  if otx.locktime ~= ptx.locktime then
+    return false, string.format(
+      "Receiver changed nLockTime (orig=%s, proposal=%s)",
+      tostring(otx.locktime), tostring(ptx.locktime))
+  end
+  local orig_seq = {}
+  local seq_values, first_seq = {}, nil
+  for _, inp in ipairs(otx.inputs) do
+    orig_seq[outpoint_key(inp)] = inp.sequence
+    if first_seq == nil then first_seq = inp.sequence end
+    seq_values[inp.sequence] = true
+  end
+  local homogeneous = true
+  for v in pairs(seq_values) do
+    if v ~= first_seq then homogeneous = false end
+  end
+  for _, inp in ipairs(ptx.inputs) do
+    local want = orig_seq[outpoint_key(inp)]
+    if want ~= nil then
+      if inp.sequence ~= want then
+        return false, string.format(
+          "Receiver changed a sender input's nSequence (orig=%s, proposal=%s)",
+          tostring(want), tostring(inp.sequence))
+      end
+    elseif homogeneous and inp.sequence ~= first_seq then
+      return false, string.format(
+        "Receiver input nSequence %s differs from the sender's %s " ..
+        "(mixed sequences)", tostring(inp.sequence), tostring(first_seq))
+    end
+  end
   return true, nil
 end
 
@@ -762,8 +896,25 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
                                               sender_outpoints)
   checks[#checks + 1] = {gate = "G12", ok = ok12, msg = msg12}
 
-  -- G10 [P0-SECURITY]: no new outputs.
-  local ok10, msg10 = M.payjoin_check_outputs(orig_psbt, proposal_psbt)
+  -- Tx version, nLockTime and nSequence unchanged (BIP-78 checklist).
+  local okf, msgf = M.payjoin_check_tx_fields(orig_psbt, proposal_psbt)
+  checks[#checks + 1] = {gate = "G10", ok = okf, msg = msgf}
+
+  -- G10 [P0-SECURITY]: no new outputs, and sender output amounts kept
+  -- except the fee output, which may fund at most
+  -- maxadditionalfeecontribution (only when additionalfeeoutputindex
+  -- names it).
+  local fee_idx = tonumber(options.additionalfeeoutputindex)
+  local max_contrib = 0
+  if fee_idx ~= nil then
+    max_contrib = tonumber(options.maxadditionalfeecontribution) or 0
+  end
+  local ok10, msg10, contribution = M.payjoin_check_outputs(
+    orig_psbt, proposal_psbt, {
+      payment_script   = payment_script,
+      fee_output_index = fee_idx,
+      max_contribution = max_contrib,
+    })
   checks[#checks + 1] = {gate = "G10", ok = ok10, msg = msg10}
 
   -- G11 [P1]: scriptSig homogeneity.
@@ -776,19 +927,45 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
     options.disableoutputsubstitution and true or false)
   checks[#checks + 1] = {gate = "G14", ok = ok14, msg = msg14}
 
-  -- G13 [P1]: max_additional_fee.  Compute proposal fee.  This is
-  -- approximate when witness_utxo isn't populated on every input — for
-  -- the foundation we accept that and treat missing inputs as
-  -- contributing 0 (which conservatively biases the check toward
-  -- "exceeded").
-  local proposal_fee = 0
+  -- G13 [P1]: fees.  The sender's own inputs are valued from the WALLET,
+  -- never from the Proposal's witness_utxo (the receiver writes those, and
+  -- an inflated value would make a theft look like a fee).  Only
+  -- receiver-added inputs use the receiver's witness_utxo; a receiver
+  -- lying about its own input value only misstates its own money, and
+  -- G10 already pinned every sender output.
+  local proposal_fee
+  local fee_err
   do
+    local function wallet_value(inp)
+      local u = wallet.utxos and wallet.utxos[outpoint_key(inp)]
+      return u and u.value
+    end
+    local orig_in, orig_out = 0, 0
+    for _, inp in ipairs(orig_psbt.tx.inputs) do
+      local v = wallet_value(inp)
+      if not v then fee_err = "sender input missing from wallet"; break end
+      orig_in = orig_in + v
+    end
+    for _, out in ipairs(orig_psbt.tx.outputs) do
+      orig_out = orig_out + out.value
+    end
+    orig_fee = orig_in - orig_out
+
+    local orig_keys = outpoint_set(orig_psbt.tx)
     local total_in = 0
-    for i, _ in ipairs(proposal_psbt.tx.inputs) do
-      local p_in = proposal_psbt.inputs[i]
-      if p_in and p_in.witness_utxo and p_in.witness_utxo.value then
-        total_in = total_in + p_in.witness_utxo.value
+    for i, inp in ipairs(proposal_psbt.tx.inputs) do
+      local v
+      if orig_keys[outpoint_key(inp)] then
+        v = wallet_value(inp)
+      else
+        local p_in = proposal_psbt.inputs[i]
+        v = p_in and p_in.witness_utxo and p_in.witness_utxo.value
+        if type(v) ~= "number" then
+          fee_err = fee_err or ("receiver input " .. tostring(i) ..
+                                " has no witness_utxo value")
+        end
       end
+      total_in = total_in + (v or 0)
     end
     local total_out = 0
     for _, out in ipairs(proposal_psbt.tx.outputs) do
@@ -796,12 +973,19 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
     end
     proposal_fee = total_in - total_out
   end
-  local ok13, msg13
-  if options.maxadditionalfeecontribution then
+  local ok13, msg13 = true, nil
+  if fee_err then
+    ok13, msg13 = false, fee_err
+  elseif ok10 and contribution > proposal_fee - orig_fee then
+    -- BIP-78: the amount taken from the fee output may only pay fee.
+    -- (Skipped when G10 failed: there is no trusted contribution then, and
+    -- G10's failure already forces the fallback.)
+    ok13, msg13 = false, string.format(
+      "fee-output contribution %d exceeds the fee increase %d",
+      contribution, proposal_fee - orig_fee)
+  elseif options.maxadditionalfeecontribution then
     ok13, msg13 = M.enforce_max_additional_fee(orig_fee, proposal_fee,
       tonumber(options.maxadditionalfeecontribution) or 0)
-  else
-    ok13 = true
   end
   checks[#checks + 1] = {gate = "G13", ok = ok13, msg = msg13}
 
