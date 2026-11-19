@@ -260,6 +260,102 @@ function M.clamp_options(config)
   return out
 end
 
+--- Core GetMinimumTime (node/miner.cpp:36-47): MTP+1, raised to
+-- prev.time - MAX_TIMEWARP when the block to be mined is the first of a
+-- difficulty period.  Core applies the timewarp floor on all networks
+-- ("makes future activation safer"), not only where BIP94 is enforced.
+function M.get_minimum_time(storage, prev_hash, height, mtp)
+  local min_time = mtp + 1
+  if height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
+    local prev = storage.get_header(prev_hash)
+    if not prev then
+      error("block template: tip header not held", 0)
+    end
+    local floor = prev.timestamp - consensus.MAX_TIMEWARP
+    if floor > min_time then min_time = floor end
+  end
+  return min_time
+end
+
+-- GetNextWorkRequired over the stored headers on prev_hash's own ancestry
+-- (Core pindexPrev->GetAncestor).  Used when the chain state does not provide
+-- ChainState:next_work_required (bare storage); the walk resumes downward so a
+-- testnet min-difficulty walk-back stays linear.
+local function storage_next_work_required(storage, network, prev_hash, height, timestamp)
+  local cur_hash, cur_h = prev_hash, height - 1
+  local get_ancestor = function(target)
+    if target < 0 or target >= height then return nil end
+    if target > cur_h then
+      cur_hash, cur_h = prev_hash, height - 1
+    end
+    while cur_h > target do
+      local hdr = storage.get_header(cur_hash)
+      if not hdr then return nil end
+      cur_hash = hdr.prev_hash
+      cur_h = cur_h - 1
+    end
+    local hdr = storage.get_header(cur_hash)
+    if not hdr then return nil end
+    return { header = hdr, height = cur_h }
+  end
+  return consensus.get_next_work_required(height, timestamp, network, get_ancestor)
+end
+
+-- Required bits for the template: the chain state's own resolver when present
+-- (it also resolves pre-snapshot-base ancestors from the pinned anchor, the
+-- same code the connect-time check_diffbits gate uses), else the storage walk.
+local function next_work_required(chain_state, network, prev_hash, height, timestamp)
+  if type(chain_state.next_work_required) == "function" then
+    return chain_state:next_work_required(prev_hash, height, timestamp)
+  end
+  return storage_next_work_required(chain_state.storage, network, prev_hash, height, timestamp)
+end
+
+--- Dry-run validity check of a freshly assembled template block (Core
+-- TestBlockValidity with check_pow=false, node/miner.cpp:225).  Raises
+-- "TestBlockValidity failed: <reason>" on the first failing rule.
+-- Covers: CheckBlock (context-free body, version floor, BIP34, witness
+-- commitment), ContextualCheckBlockHeader nBits (bad-diffbits, via the
+-- node's own check_diffbits when available), time-too-old, BIP94
+-- time-timewarp-attack, and IsFinalTx for every transaction.  Inputs are not
+-- re-run against the UTXO set here: every selected transaction was accepted
+-- by the mempool against the current tip.
+function M.test_block_validity(chain_state, network, block, height, mtp)
+  local function fail(reason)
+    error("TestBlockValidity failed: " .. tostring(reason), 0)
+  end
+  local header = block.header
+
+  local ok, err = pcall(validation.check_block, block, network, height, false)
+  if not ok then fail(err) end
+
+  if type(chain_state.check_diffbits) == "function" then
+    local ok_db, db_err = chain_state:check_diffbits(header, height)
+    if not ok_db then fail(db_err) end
+  else
+    local want, why = storage_next_work_required(chain_state.storage, network,
+      header.prev_hash, height, header.timestamp)
+    if not want then fail("diffbits-unresolvable: " .. tostring(why)) end
+    if header.bits ~= want then
+      fail(string.format("bad-diffbits: expected 0x%08x got 0x%08x", want, header.bits))
+    end
+  end
+
+  if header.timestamp <= mtp then fail("time-too-old") end
+  if network.enforce_bip94 and height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL == 0 then
+    local prev = chain_state.storage.get_header(header.prev_hash)
+    if not prev then fail("prev-blk-not-found") end
+    if header.timestamp < prev.timestamp - consensus.MAX_TIMEWARP then
+      fail("time-timewarp-attack")
+    end
+  end
+
+  for _, tx in ipairs(block.transactions) do
+    if not M.is_final_tx(tx, height, mtp) then fail("bad-txns-nonfinal") end
+  end
+  return true
+end
+
 --- Create a block template for mining.
 -- @param mempool table: The mempool object
 -- @param chain_state table: Chain state with tip_height, tip_hash, storage
@@ -461,10 +557,6 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   end
   local merkle_root = crypto.compute_merkle_root(tx_hashes)
 
-  -- Get difficulty target
-  local bits = chain_state.storage.get_header(prev_hash).bits
-  -- In a real implementation, compute next required bits at retarget heights
-
   -- Compute block version via BIP9 state machine.
   -- Bitcoin Core miner.cpp uses VersionBitsCache::ComputeBlockVersion to set
   -- the signaling bits for any STARTED or LOCKED_IN deployments (versionbits.cpp:265-279).
@@ -486,9 +578,25 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
   -- its chain to R1), so the heavier-fork header tip never propagated and the
   -- reorg machinery never engaged.  Clamping to MTP+1 makes every mined block
   -- header-MTP-valid, exactly like Core's miner.
+  --
+  -- GetMinimumTime also applies the BIP94 timewarp floor on EVERY network
+  -- (miner.cpp:41-45): at a retarget boundary the block may not be more than
+  -- MAX_TIMEWARP earlier than its parent.
+  local min_time = M.get_minimum_time(chain_state.storage, prev_hash, height, mtp)
   local block_time = os.time()
-  if block_time <= mtp then
-    block_time = mtp + 1
+  if block_time < min_time then
+    block_time = min_time
+  end
+
+  -- nBits = GetNextWorkRequired(pindexPrev, pblock) AFTER the time is chosen
+  -- (Core CreateNewBlock miner.cpp:219-220): at a retarget height the bits
+  -- change, and on min-difficulty testnets they depend on the block time.
+  -- Pre-fix this copied the parent's bits, so every template at a difficulty
+  -- change (and testnet min-difficulty cases) was bad-diffbits.
+  local bits, bits_err = next_work_required(chain_state, network, prev_hash, height, block_time)
+  if not bits then
+    error("block template: next work required is not computable (" ..
+      tostring(bits_err) .. ")", 0)
   end
 
   -- Build block header
@@ -537,10 +645,9 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
     coinbaseaux = {},
     coinbasevalue = coinbase_value,
     target = M.hex_encode(consensus.bits_to_target(bits)),
-    -- BUG FIX: mintime must be MTP+1 (GetMinimumTime), not os.time().
-    -- Core miner.cpp:36-47: GetMinimumTime returns MTP+1 (adjusted for
-    -- BIP94 timewarp on retarget boundaries).  BIP22 mintime field.
-    mintime = mtp + 1,
+    -- mintime = GetMinimumTime (Core rpc/mining.cpp:1004, miner.cpp:36-47):
+    -- MTP+1, raised to prev.time - MAX_TIMEWARP on retarget boundaries.
+    mintime = min_time,
     mutable = {"time", "transactions", "prevblock"},
     noncerange = "00000000ffffffff",
     sigoplimit = consensus.MAX_BLOCK_SIGOPS_COST,
@@ -592,6 +699,10 @@ function M.create_block_template(mempool, chain_state, network, payout_script, c
 
   -- Also return the full block object for direct mining
   local block = types.block(header, transactions)
+
+  -- Dry-run validity check before handing the template out (Core
+  -- CreateNewBlock -> TestBlockValidity, miner.cpp:225, which throws).
+  M.test_block_validity(chain_state, network, block, height, mtp)
 
   return template, block
 end
