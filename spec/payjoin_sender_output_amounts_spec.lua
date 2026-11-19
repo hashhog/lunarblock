@@ -124,10 +124,26 @@ describe("payjoin sender checklist (BIP-78)", function()
 
   -- Run the full sender flow against a transport hook that rewrites the
   -- Original PSBT with `mutate(psbt, ctx)` and returns it as the Proposal.
-  local function run(seed, mutate, opts, pj)
+  local function run(seed, mutate, opts, pj, view)
     local sw, change_spk = make_sender(seed)
     local _, recv_addr, recv_spk = make_receiver(seed)
     local mp = make_mempool()
+    if view then
+      -- A UTXO view like the node's: chain_state.coin_view plus the
+      -- mempool's _resolve_coins lookup over it.  `view` maps
+      -- outpoint txid bytes -> {value, script_pubkey} (vout 0).
+      mp.chain_state = {coin_view = {get = function(_, hash, idx)
+        if idx == 0 then return view[hash.bytes] end
+      end}}
+      function mp:_resolve_coins(tx)
+        local coins = {}
+        for i, inp in ipairs(tx.inputs) do
+          coins[i] = self.chain_state.coin_view:get(inp.prev_out.hash,
+                                                    inp.prev_out.index)
+        end
+        return coins
+      end
+    end
     sw:set_mempool(mp)
     local called = false
     local transport = function(_, body, _)
@@ -247,6 +263,65 @@ describe("payjoin sender checklist (BIP-78)", function()
           additionalfeeoutputindex = CHANGE_IDX})
     assert.is_nil(r.err and r.err.message)
     assert.are.equal("payjoin", r.status)
+  end)
+
+  -- Receiver input: real value 10,000 at RCV_TXID:0, same script type as
+  -- the sender's.  The receiver may report a different witness_utxo value.
+  local RCV_TXID = string.rep("\x5A", 32)
+  local function add_receiver_input(p, c, claimed)
+    p.tx.inputs[#p.tx.inputs + 1] = types.txin(
+      types.outpoint(types.hash256(RCV_TXID), 0), "", p.tx.inputs[1].sequence)
+    local pin = psbt_mod.psbt_input()
+    pin.witness_utxo = {value = claimed, script_pubkey = c.pay_spk}
+    pin.final_script_witness = {string.rep("\x01", 71), string.rep("\x02", 33)}
+    p.inputs[#p.inputs + 1] = pin
+  end
+  local function view_for(spk)
+    return {[RCV_TXID] = {value = 10000, script_pubkey = spk}}
+  end
+
+  -- Receiver over-states its own input (12,000 claimed, 10,000 real), takes
+  -- 2,000 from the fee output and pays the payee 12,000 more: the computed
+  -- fee rises by exactly the contribution, the real fee does not move.
+  local function overstated_receiver_input(p, c)
+    add_receiver_input(p, c, 12000)
+    local ci = find_out(p.tx, c.change_spk)
+    local pi = find_out(p.tx, c.pay_spk)
+    p.tx.outputs[ci].value = p.tx.outputs[ci].value - 2000
+    p.tx.outputs[pi].value = p.tx.outputs[pi].value + 12000
+  end
+
+  it("receiver over-states its own input to justify a fee-output contribution (UTXO view present) -> fallback", function()
+    local _, _, rspk = make_receiver("lie-view")
+    local r = run("lie-view", overstated_receiver_input,
+      {maxadditionalfeecontribution = 5000, additionalfeeoutputindex = CHANGE_IDX},
+      nil, view_for(rspk))
+    assert.are.equal("fallback", r.status)
+    assert.are.equal(sender.ERR.FEE_EXCEEDED, r.err and r.err.code)
+    assert.is_truthy(r.err.message:find("disagrees with the UTXO set", 1, true))
+  end)
+
+  it("receiver over-states its own input to justify a fee-output contribution (no UTXO view) -> fallback", function()
+    local r = run("lie-noview", overstated_receiver_input,
+      {maxadditionalfeecontribution = 5000, additionalfeeoutputindex = CHANGE_IDX})
+    assert.are.equal("fallback", r.status)
+    assert.are.equal(sender.ERR.FEE_EXCEEDED, r.err and r.err.code)
+    assert.is_truthy(r.err.message:find("cannot verify receiver input", 1, true))
+  end)
+
+  it("positive control: honest receiver input confirmed by the UTXO view, fee output pays its fee -> payjoin", function()
+    local _, _, rspk = make_receiver("honest")
+    local r = run("honest", function(p, c)
+      add_receiver_input(p, c, 10000)
+      local ci = find_out(p.tx, c.change_spk)
+      local pi = find_out(p.tx, c.pay_spk)
+      p.tx.outputs[ci].value = p.tx.outputs[ci].value - 300
+      p.tx.outputs[pi].value = p.tx.outputs[pi].value + 10000
+    end, {maxadditionalfeecontribution = 300, additionalfeeoutputindex = CHANGE_IDX},
+    nil, view_for(rspk))
+    assert.is_nil(r.err and r.err.message)
+    assert.are.equal("payjoin", r.status)
+    assert.are.equal(2, #r.mp.accepted[1].inputs)
   end)
 
   it("fee output dropping by more than maxadditionalfeecontribution -> fallback", function()

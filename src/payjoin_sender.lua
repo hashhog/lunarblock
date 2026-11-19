@@ -929,10 +929,21 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
 
   -- G13 [P1]: fees.  The sender's own inputs are valued from the WALLET,
   -- never from the Proposal's witness_utxo (the receiver writes those, and
-  -- an inflated value would make a theft look like a fee).  Only
-  -- receiver-added inputs use the receiver's witness_utxo; a receiver
-  -- lying about its own input value only misstates its own money, and
-  -- G10 already pinned every sender output.
+  -- an inflated value would make a theft look like a fee).
+  --
+  -- Receiver-added inputs are valued from this node's UTXO view
+  -- (mempool:_resolve_coins: chainstate, then mempool parents) when it has
+  -- one; a witness_utxo that disagrees with it is a reject.  Without a UTXO
+  -- view only the receiver's witness_utxo is available.  That is harmless
+  -- while nothing is taken from the fee output (G10 pins every other sender
+  -- output exactly), but an over-stated receiver value would make a
+  -- fee-output contribution look like fee while it actually went to the
+  -- payee.  So a non-zero contribution requires every receiver input to be
+  -- confirmed by the UTXO view.
+  --
+  -- orig_fee is recomputed here the same way (wallet values), replacing the
+  -- figure create_transaction returned, so both sides of the comparison
+  -- use one source.
   local proposal_fee
   local fee_err
   do
@@ -951,6 +962,14 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
     end
     orig_fee = orig_in - orig_out
 
+    local view_coins
+    if mempool and type(mempool._resolve_coins) == "function" and
+       mempool.chain_state and mempool.chain_state.coin_view then
+      local okc, coins = pcall(mempool._resolve_coins, mempool,
+                               proposal_psbt.tx)
+      if okc and type(coins) == "table" then view_coins = coins end
+    end
+
     local orig_keys = outpoint_set(orig_psbt.tx)
     local total_in = 0
     for i, inp in ipairs(proposal_psbt.tx.inputs) do
@@ -959,10 +978,26 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
         v = wallet_value(inp)
       else
         local p_in = proposal_psbt.inputs[i]
-        v = p_in and p_in.witness_utxo and p_in.witness_utxo.value
-        if type(v) ~= "number" then
+        local claimed = p_in and p_in.witness_utxo and p_in.witness_utxo.value
+        local coin = view_coins and view_coins[i]
+        if type(claimed) ~= "number" then
           fee_err = fee_err or ("receiver input " .. tostring(i) ..
                                 " has no witness_utxo value")
+        elseif coin then
+          if coin.value ~= claimed or
+             coin.script_pubkey ~= p_in.witness_utxo.script_pubkey then
+            fee_err = fee_err or string.format(
+              "receiver input %d witness_utxo (value %d) disagrees with " ..
+              "the UTXO set (value %d)", i, claimed, coin.value)
+          end
+          v = coin.value
+        else
+          if ok10 and contribution > 0 then
+            fee_err = fee_err or ("cannot verify receiver input " ..
+              tostring(i) .. " against the UTXO set; refusing to take " ..
+              "a fee-output contribution on its claimed value")
+          end
+          v = claimed
         end
       end
       total_in = total_in + (v or 0)
