@@ -2661,6 +2661,9 @@ local function main()
 
   -- BIP 152: Compact block message handlers
   local compact_block = require("lunarblock.compact_block")
+  -- main()'s consensus module is `consensus_mod`; bind the one helper the
+  -- handler needs here so the section is self-contained.
+  local work_compare = require("lunarblock.consensus").work_compare
 
   -- LB-12: Core PartiallyDownloadedBlock::FillBlock runs IsBlockMutated on
   -- the reconstructed block (blockencodings.cpp) and returns
@@ -2747,6 +2750,37 @@ local function main()
       print(string.format("Received compact block from %s:%d (short_ids=%d, prefilled=%d)",
         peer.ip, peer.port, #cmpctblock.short_ids, #cmpctblock.prefilled_txns))
       pcall(note_peer_has_block, peer, types.hash256_hex(block_hash), true)
+
+      -- Core net_processing.cpp CMPCTBLOCK, before InitData: a block we
+      -- already have (BLOCK_HAVE_DATA) or one with no more work than the
+      -- active tip is never reconstructed; if we asked THIS peer for it,
+      -- fetch the full block with getdata instead.  accept_header returns
+      -- true for a known header, so without this every resent cmpctblock
+      -- for the tip (or a block up to MAX_CMPCTBLOCK_DEPTH below it) ran a
+      -- full mempool scan of SipHash short ids and sent a getblocktxn.
+      do
+        local hx = types.hash256_hex(block_hash)
+        local entry = header_chain.headers[hx]
+        local tip_entry = chain_state.tip_hash
+          and header_chain.headers[types.hash256_hex(chain_state.tip_hash)]
+        if entry and entry.total_work and tip_entry and tip_entry.total_work
+            and work_compare(entry.total_work, tip_entry.total_work) <= 0 then
+          local inf = block_downloader.inflight and block_downloader.inflight[hx]
+          if inf and inf.peer == peer then
+            peer:send_message("getdata", p2p.serialize_inv({
+              { type = p2p.INV_TYPE.MSG_WITNESS_BLOCK, hash = block_hash } }))
+          end
+          return
+        end
+        if block_downloader.pending_blocks and block_downloader.pending_blocks[hx] then
+          return  -- body received, waiting to connect
+        end
+        local st = header_chain.storage
+        if st and st.get and st.CF and st.CF.BLOCKS
+            and st.get(st.CF.BLOCKS, block_hash.bytes) ~= nil then
+          return  -- body already stored
+        end
+      end
 
       -- Create a partial block and try to reconstruct
       local partial = compact_block.new_partial_block()
