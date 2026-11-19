@@ -1209,7 +1209,14 @@ function M.execute_script(script_bytes, stack, flags, checker)
   end
 
   local altstack = {}
-  local if_stack = {}  -- tracks execution state: true = executing, false = not executing
+  -- Condition stack, Core's ConditionStack (interpreter.cpp): the IF/NOTIF
+  -- state is a stack of booleans, but only two numbers are kept -- its size
+  -- and the 1-based position of the first false entry (0 = all true). That
+  -- makes "are we executing?" and OP_ELSE O(1). The previous boolean table
+  -- was walked in full on every opcode; tapscript is exempt from SCRIPT_SIZE
+  -- and OP_COUNT (BIP342), so D nested true IFs cost O(D^2) table reads.
+  local cond_size = 0
+  local cond_first_false = 0
   local op_count = 0
   local codesep_pos = 0xFFFFFFFF  -- BIP143/342: initialize to 0xFFFFFFFF
 
@@ -1241,14 +1248,17 @@ function M.execute_script(script_bytes, stack, flags, checker)
     return execute_p2pkh_template(script_bytes, stack, flags, checker)
   end
 
-  -- Helper: check if we're in an executing branch
+  -- Helper: check if we're in an executing branch (ConditionStack::all_true)
   local function is_executing()
-    for _, v in ipairs(if_stack) do
-      if not v then
-        return false
-      end
+    return cond_first_false == 0
+  end
+
+  -- ConditionStack::push_back
+  local function cond_push(f)
+    cond_size = cond_size + 1
+    if cond_first_false == 0 and not f then
+      cond_first_false = cond_size
     end
-    return true
   end
 
   -- Helper: pop from stack
@@ -1363,9 +1373,9 @@ function M.execute_script(script_bytes, stack, flags, checker)
             return nil, "MINIMALIF"
           end
         end
-        if_stack[#if_stack + 1] = M.cast_to_bool(val)
+        cond_push(M.cast_to_bool(val))
       else
-        if_stack[#if_stack + 1] = false
+        cond_push(false)
       end
       i = i + 1
       goto continue
@@ -1384,36 +1394,36 @@ function M.execute_script(script_bytes, stack, flags, checker)
             return nil, "MINIMALIF"
           end
         end
-        if_stack[#if_stack + 1] = not M.cast_to_bool(val)
+        cond_push(not M.cast_to_bool(val))
       else
-        if_stack[#if_stack + 1] = false
+        cond_push(false)
       end
       i = i + 1
       goto continue
     elseif opcode == M.OP.OP_ELSE then
       -- interpreter.cpp:639-640: SCRIPT_ERR_UNBALANCED_CONDITIONAL
-      if #if_stack == 0 then
+      if cond_size == 0 then
         error("UNBALANCED_CONDITIONAL")
       end
-      -- Only flip if we're the inner-most if and parent is executing
-      local parent_executing = true
-      for j = 1, #if_stack - 1 do
-        if not if_stack[j] then
-          parent_executing = false
-          break
-        end
-      end
-      if parent_executing then
-        if_stack[#if_stack] = not if_stack[#if_stack]
+      -- ConditionStack::toggle_top: flip the top only when every entry below
+      -- it is true. A false entry further down keeps the branch skipped.
+      if cond_first_false == 0 then
+        cond_first_false = cond_size        -- top was true, becomes false
+      elseif cond_first_false == cond_size then
+        cond_first_false = 0                -- top was the only false
       end
       i = i + 1
       goto continue
     elseif opcode == M.OP.OP_ENDIF then
       -- interpreter.cpp:647-648: SCRIPT_ERR_UNBALANCED_CONDITIONAL
-      if #if_stack == 0 then
+      if cond_size == 0 then
         error("UNBALANCED_CONDITIONAL")
       end
-      if_stack[#if_stack] = nil
+      -- ConditionStack::pop_back
+      if cond_first_false == cond_size then
+        cond_first_false = 0
+      end
+      cond_size = cond_size - 1
       i = i + 1
       goto continue
     end
@@ -2160,7 +2170,7 @@ function M.execute_script(script_bytes, stack, flags, checker)
   end
 
   -- interpreter.cpp:1235-1236: leftover vfExec → SCRIPT_ERR_UNBALANCED_CONDITIONAL
-  if #if_stack ~= 0 then
+  if cond_size ~= 0 then
     error("UNBALANCED_CONDITIONAL")
   end
 
