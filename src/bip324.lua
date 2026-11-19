@@ -401,17 +401,19 @@ function M.BIP324Cipher(privkey, our_ellswift)
       self.recv_garbage_terminator = garbage_terms:sub(1, 16)
     end
 
-    -- Zero the OKM Lua string references (already copied into cipher state).
+    -- Drop the OKM Lua string references (already copied into cipher state).
     initiator_l = nil
     initiator_p = nil
     responder_l = nil
     responder_p = nil
     garbage_terms = nil
 
-    -- Encourage GC to collect the sensitive Lua string objects.  This does not
-    -- guarantee the memory is overwritten (Lua's GC is not a secure allocator)
-    -- but it reduces the window during which they remain reachable.
-    collectgarbage("collect")
+    -- No collectgarbage("collect") here.  A full collection is a
+    -- stop-the-world pass over the whole Lua heap on the single event loop
+    -- that serves P2P, RPC and REST, and any inbound peer could trigger it by
+    -- sending 64 non-v1 bytes, once per connection.  It also never zeroed the
+    -- key strings (Lua strings are immutable and the GC does not wipe freed
+    -- memory).  Core's BIP324Cipher::Initialize does constant work.
 
     self.initialized = true
     return true
