@@ -3683,7 +3683,15 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             goto skip_verification
           end
 
-          local taproot_active = height >= self.network.taproot_height
+          -- Taproot rules follow the block's script flags, not the
+          -- deployment height: Core's GetBlockScriptFlags sets
+          -- SCRIPT_VERIFY_TAPROOT for every block except the listed
+          -- exceptions, and PrecomputedTransactionData::Init always hashes
+          -- every input's spent output.  Gating on taproot_height left a
+          -- witness v1 spend below 709632 checked with a one-element
+          -- prevout vector: a wrong BIP341 sighash (valid blocks rejected)
+          -- and a nil index under ANYONECANPAY at input > 0.
+          local taproot_active = block_script_flags.verify_taproot and true or false
           local job = {
             tx = tx,
             input_index = inp_idx - 1,
@@ -3692,7 +3700,7 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
             flags = block_script_flags,
             taproot_active = taproot_active,
             -- Prevouts are BIP341-only; skip the encode/decode round-trip
-            -- on the worker for every pre-taproot input.
+            -- on the worker when the block's flags carry no Taproot.
             prev_outputs = taproot_active and get_tx_prev_outputs() or nil,
             cache = get_tx_cache(),
           }
