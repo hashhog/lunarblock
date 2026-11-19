@@ -238,4 +238,58 @@ describe("addr routability (Core CNetAddr::IsRoutable at AddrMan::AddSingle)", f
     assert.is_not_nil(c)
     assert.equals("2a01:4f8::1", c.ip)
   end)
+
+  it("peers.dat load drops non-routable entries stored before the gate", function()
+    local pm = make_pm()
+    pm:_deserialize_addrman({
+      new = {
+        { ip = "fe80::1", port = 8333, bucket = 1, pos = 1, services = 1, timestamp = os.time() },
+        { ip = "10.0.0.1", port = 8333, bucket = 2, pos = 2, services = 1, timestamp = os.time() },
+        { ip = "2a01:4f8::1", port = 8333, bucket = 3, pos = 3, services = 1, timestamp = os.time() },
+      },
+      tried = {
+        { ip = "127.0.0.1", port = 8333, bucket = 1, pos = 1, services = 1, timestamp = os.time() },
+        { ip = "1.2.3.4", port = 8333, bucket = 2, pos = 2, services = 1, timestamp = os.time() },
+      },
+    })
+    local ips = addrman_ips(pm)
+    table.sort(ips)
+    assert.same({ "1.2.3.4", "2a01:4f8::1" }, ips)
+    assert.equals(1, pm._new_count)
+    assert.equals(1, pm._tried_count)
+  end)
+
+  it("feeler selection skips a non-routable NEW entry", function()
+    local pm = make_pm()
+    -- Plant a non-routable entry straight into a NEW bucket (pre-gate pool).
+    pm._new_buckets[0][0] = { ip = "fc00::1", port = 8333, services = 1,
+                              timestamp = os.time(), src_ip = "5.6.7.8" }
+    pm._addr_info["fc00::1:8333"] = { in_tried = false, new_ref_count = 1,
+                                       new_refs = { [0] = 0 } }
+    pm._new_count = 1
+    assert.is_nil(pm:_select_for_feeler())
+  end)
+
+  it("anchors: a non-routable anchor is neither loaded nor saved", function()
+    local pm = make_pm()
+    local dir = pm.data_dir
+    local f = assert(io.open(dir .. "/anchors.dat", "w"))
+    f:write("127.0.0.1:8333\n10.0.0.1:8333\n1.2.3.4:8333\n")
+    f:close()
+    pm:_load_anchors()
+    assert.equals(1, #pm._anchors)
+    assert.equals("1.2.3.4", pm._anchors[1].ip)
+
+    local function peer(ip)
+      return { ip = ip, port = 8333, inbound = false,
+               state = require("lunarblock.peer").STATE.ESTABLISHED }
+    end
+    pm.peer_list = { peer("127.0.0.1"), peer("1.2.3.4") }
+    pm:_save_anchors()
+    local g = assert(io.open(dir .. "/anchors.dat", "r"))
+    local content = g:read("*a")
+    g:close()
+    assert.is_nil(content:find("127.0.0.1", 1, true))
+    assert.truthy(content:find("1.2.3.4:8333", 1, true))
+  end)
 end)

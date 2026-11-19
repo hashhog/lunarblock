@@ -2176,7 +2176,13 @@ function PeerManager:_load_anchors()
     local ip, port_str = line:match("^([^:]+):(%d+)$")
     if ip and port_str then
       local port = tonumber(port_str)
-      if port then
+      -- Anchors are redialled automatically at startup.  Core's anchors are
+      -- block-relay-only automatic connections drawn from addrman, so they
+      -- are routable by construction (and ThreadOpenConnections still skips
+      -- !IsValid() / IsLocal() ones); refuse non-routable entries here so a
+      -- manual 127.0.0.1 peer or an address that entered before the addrman
+      -- gate is not auto-dialled.
+      if port and _is_routable(ip) then
         self._anchors[#self._anchors + 1] = {ip = ip, port = port}
       end
     end
@@ -2195,7 +2201,8 @@ function PeerManager:_save_anchors()
 
   -- Collect block-relay-only outbound peers
   for _, p in ipairs(self.peer_list) do
-    if not p.inbound and p.state == peer_mod.STATE.ESTABLISHED then
+    if not p.inbound and p.state == peer_mod.STATE.ESTABLISHED
+        and _is_routable(p.ip) then
       -- In a full implementation, we'd check if this is a block-relay-only connection
       -- For now, just save outbound peers
       if #anchors_to_save < M.ADDRMAN.MAX_ANCHORS then
