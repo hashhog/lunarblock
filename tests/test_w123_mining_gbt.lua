@@ -261,30 +261,31 @@ test_xfail_pre_fix("G6: getblocktemplate handler checks IBD before returning tem
 -- G7: bits from GetNextWorkRequired (retarget) — BUG-5 (P1-RPC)
 -- ---------------------------------------------------------------------------
 print("\n--- G7: GBT bits via GetNextWorkRequired — expect PARTIAL ---")
-test_xfail_pre_fix("G7: mining.lua create_block_template calls get_next_work_required",
+-- BUG-5 FIXED (cffix-lunarblock-gbt-next-work-required): the template takes
+-- nBits from get_next_work_required after the time is chosen; behaviour is
+-- pinned in spec/gbt_next_work_required_spec.lua.
+test("G7: mining.lua create_block_template calls get_next_work_required",
   function()
     expect_match(MINING_SRC, 'get_next_work_required',
       "consensus.get_next_work_required helper exists (consensus.lua:401) but " ..
       "mining.lua:382 reads prev_header.bits directly — dead-helper-at-call-site")
-  end, "BUG-5")
+  end)
 
-test("G7-confession: mining.lua:382 reads prev_header.bits directly", function()
-  -- This is the comment that confesses BUG-5 — keep the test asserting the
-  -- regression marker stays visible until the fix lands.
-  expect_match(MINING_SRC, 'In a real implementation, compute next required bits',
-    "BUG-5 confession comment removed without fix? mining.lua:383")
+test("G7-confession: the BUG-5 confession comment is gone with the fix", function()
+  expect_no_match(MINING_SRC, 'In a real implementation, compute next required bits',
+    "BUG-5 confession comment still present")
 end)
 
 -- ---------------------------------------------------------------------------
 -- G8: mintime honors BIP-94 timewarp — BUG-6 (P1-RPC)
 -- ---------------------------------------------------------------------------
 print("\n--- G8: GBT mintime BIP-94 timewarp clause — expect PARTIAL ---")
-test_xfail_pre_fix("G8: mining.lua references MAX_TIMEWARP in mintime computation",
+-- BUG-6 FIXED: mintime = GetMinimumTime incl. the MAX_TIMEWARP floor.
+test("G8: mining.lua references MAX_TIMEWARP in mintime computation",
   function()
-    -- MAX_TIMEWARP = 600 declared in consensus.lua:41 but unused by mining.lua.
     expect_match(MINING_SRC, 'MAX_TIMEWARP',
       "MAX_TIMEWARP not referenced in mining path; mintime missing BIP-94 clause")
-  end, "BUG-6")
+  end)
 
 test("G8: MAX_TIMEWARP constant exists in consensus.lua (dead-helper)", function()
   expect_match(CONSENSUS_SRC, 'M%.MAX_TIMEWARP%s*=%s*600',
