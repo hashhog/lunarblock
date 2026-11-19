@@ -324,6 +324,50 @@ describe("payjoin sender checklist (BIP-78)", function()
     assert.are.equal(2, #r.mp.accepted[1].inputs)
   end)
 
+  -- Receiver input described only by non_witness_utxo (BIP-78 allows it):
+  -- a real previous tx paying 10,000 to the receiver, spent at vout 0.
+  local function add_receiver_input_nwu(p, c)
+    local prev = types.transaction(2,
+      {types.txin(types.outpoint(types.hash256(string.rep("\x77", 32)), 0),
+                  "", 0xFFFFFFFF)},
+      {types.txout(10000, c.pay_spk)}, 0)
+    local prev_txid = validation.compute_txid(prev)
+    p.tx.inputs[#p.tx.inputs + 1] = types.txin(
+      types.outpoint(prev_txid, 0), "", p.tx.inputs[1].sequence)
+    local pin = psbt_mod.psbt_input()
+    pin.non_witness_utxo = prev
+    pin.final_script_witness = {string.rep("\x01", 71), string.rep("\x02", 33)}
+    p.inputs[#p.inputs + 1] = pin
+    return prev_txid
+  end
+
+  it("positive control: receiver input with only non_witness_utxo, nothing taken from the fee output -> payjoin", function()
+    local r = run("nwu", function(p, c)
+      add_receiver_input_nwu(p, c)
+      local pi = find_out(p.tx, c.pay_spk)
+      p.tx.outputs[pi].value = p.tx.outputs[pi].value + 10000
+    end)
+    assert.is_nil(r.err and r.err.message)
+    assert.are.equal("payjoin", r.status)
+    assert.are.equal(2, #r.mp.accepted[1].inputs)
+  end)
+
+  it("positive control: non_witness_utxo-only receiver input confirmed by the UTXO view funds the fee output's contribution -> payjoin", function()
+    local _, _, rspk = make_receiver("nwu-view")
+    local view = {}
+    local r = run("nwu-view", function(p, c)
+      local txid = add_receiver_input_nwu(p, c)
+      view[txid.bytes] = {value = 10000, script_pubkey = rspk}
+      local ci = find_out(p.tx, c.change_spk)
+      local pi = find_out(p.tx, c.pay_spk)
+      p.tx.outputs[ci].value = p.tx.outputs[ci].value - 300
+      p.tx.outputs[pi].value = p.tx.outputs[pi].value + 10000
+    end, {maxadditionalfeecontribution = 300, additionalfeeoutputindex = CHANGE_IDX},
+    nil, view)
+    assert.is_nil(r.err and r.err.message)
+    assert.are.equal("payjoin", r.status)
+  end)
+
   it("fee output dropping by more than maxadditionalfeecontribution -> fallback", function()
     local r = run("overfee", function(p, c)
       local ci = find_out(p.tx, c.change_spk)

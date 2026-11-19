@@ -980,17 +980,26 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
       if orig_keys[outpoint_key(inp)] then
         v = wallet_value(inp)
       else
+        -- BIP-78 lets the receiver describe its input with witness_utxo
+        -- or non_witness_utxo (psbt.lua checks the latter's txid).
         local p_in = proposal_psbt.inputs[i]
-        local claimed = p_in and p_in.witness_utxo and p_in.witness_utxo.value
+        local claimed, claimed_spk
+        local wu = p_in and p_in.witness_utxo
+        if wu and type(wu.value) == "number" then
+          claimed, claimed_spk = wu.value, wu.script_pubkey
+        elseif p_in and p_in.non_witness_utxo and
+               p_in.non_witness_utxo.outputs then
+          local o = p_in.non_witness_utxo.outputs[inp.prev_out.index + 1]
+          if o then claimed, claimed_spk = o.value, o.script_pubkey end
+        end
         local coin = view_coins and view_coins[i]
         if type(claimed) ~= "number" then
           fee_err = fee_err or ("receiver input " .. tostring(i) ..
-                                " has no witness_utxo value")
+            " has no witness_utxo or non_witness_utxo value")
         elseif coin then
-          if coin.value ~= claimed or
-             coin.script_pubkey ~= p_in.witness_utxo.script_pubkey then
+          if coin.value ~= claimed or coin.script_pubkey ~= claimed_spk then
             fee_err = fee_err or string.format(
-              "receiver input %d witness_utxo (value %d) disagrees with " ..
+              "receiver input %d prevout (value %d) disagrees with " ..
               "the UTXO set (value %d)", i, claimed, coin.value)
           end
           v = coin.value
