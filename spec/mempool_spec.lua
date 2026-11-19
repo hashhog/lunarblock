@@ -2775,9 +2775,13 @@ describe("mempool", function()
 
       -- Second TRUC child spending the OTHER output of the same parent.
       -- This triggers sibling eviction: child1 is evicted, child2 takes its place.
+      -- The sibling is a staged RBF conflict (Core validation.cpp:958-969), so
+      -- child2 must pay for it under PaysForRBF: 20000 > child1's 10000 plus
+      -- the incremental relay fee.  (It used to pay the same 10000 and evict
+      -- child1 for free.)
       local child2 = make_tx(3, {}, {}, 0)
       child2.inputs[1] = make_input(parent_txid, 1)
-      child2.outputs[1] = make_output(1480000)
+      child2.outputs[1] = make_output(1470000)
       local ok_c2, c2_hex = mp:accept_transaction(child2)
       assert.is_true(ok_c2, "sibling eviction should allow second TRUC child, got: " .. tostring(c2_hex))
 
