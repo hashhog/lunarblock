@@ -1016,10 +1016,10 @@ test("G28-f: Gate 6 descendant count + sibling-eviction signal", function()
     "sibling-eviction eligibility")
 end)
 
-test("G28-g: single_truc_checks wired into accept_transaction at step 8c",
+test("G28-g: single_truc_checks wired into accept_transaction at step 7b (before the RBF checks)",
 function()
   expect_true(file_contains("src/mempool.lua",
-    "M.single_truc_checks(self.entries, tx, direct_parents, vsize, truc_conflicts)"),
+    "M.single_truc_checks(self.entries, tx, direct_parents, vsize, conflicts)"),
     "TRUC checks call site")
 end)
 

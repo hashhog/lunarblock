@@ -2015,10 +2015,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- Judged on the DIRECT conflicts only, before a TRUC sibling joins the set
   -- below: Core checks signaling in PreChecks' conflict scan and does not
   -- re-check the sibling (validation.cpp:958-972 comment).
-  if next(conflicts) and not self.fullrbf then
-    for conflict_txid_hex in pairs(conflicts) do
-      if not self:is_replaceable(conflict_txid_hex) then
-        return false, "conflicting tx does not signal RBF"
+  if next(conflicts) then
+    if not self.fullrbf then
+      for conflict_txid_hex in pairs(conflicts) do
+        if not self:is_replaceable(conflict_txid_hex) then
+          return false, "conflicting tx does not signal RBF"
+        end
       end
     end
   end

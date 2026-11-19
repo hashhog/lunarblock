@@ -523,8 +523,9 @@ print("\n--- G17: Rule 3 error message ---")
 test("G17-a: emits Core's 'insufficient fee, ... less fees than conflicting txs'", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
   -- Reason and debug message are returned separately (state.ToString()
-  -- joins them with ", ").
-  expect_true(src:find('return false, "insufficient fee", string.format%(\n%s*"rejecting replacement %%s, less fees than conflicting txs; %%s < %%s"') ~= nil,
+  -- joins them with ", ").  The reason carries Core's " (including sibling
+  -- eviction)" suffix when a TRUC sibling is staged (validation.cpp:1014).
+  expect_true(src:find('return false, "insufficient fee" %.%. including_sibling, string.format%(\n%s*"rejecting replacement %%s, less fees than conflicting txs; %%s < %%s"') ~= nil,
     "Rule 3 error string")
 end)
 
@@ -606,7 +607,7 @@ print("\n--- G24: Rule 5 error message ---")
 
 test("G24-a: emits 'too many potential replacements'", function()
   local src = io.open("src/mempool.lua", "r"):read("*a")
-  expect_true(src:find('return false, "too many potential replacements", string.format%(\n%s*"rejecting replacement %%s; too many conflicting clusters %(%%d > %%d%)"') ~= nil,
+  expect_true(src:find('return false, "too many potential replacements" %.%. including_sibling, string.format%(\n%s*"rejecting replacement %%s; too many conflicting clusters %(%%d > %%d%)"') ~= nil,
     "Rule 5 error string")
 end)
 
