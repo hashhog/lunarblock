@@ -324,7 +324,7 @@ describe("assumeutxo", function()
       local chain_state2 = utxo.new_chain_state(db2, consensus.networks.regtest)
       chain_state2:init()
 
-      local ok, load_err = chain_state2:load_snapshot(snapshot_file)
+      local ok, load_err = chain_state2:load_snapshot(snapshot_file, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
       db2.close()
 
       assert.is_true(ok)

@@ -919,13 +919,33 @@ local function run_import_utxo(args)
           .. "production.\n",
           unsafe_base_height, base_hex, unsafe_base_height))
       else
-        -- No assumeutxo entry for this base block.  We still attempt the load,
-        -- but warn loudly: the per-coin height guard will reject the snapshot
-        -- because effective_base_height falls back to the genesis tip (0).
+        -- No assumeutxo entry for this base block and no explicit override:
+        -- refuse before anything is written, exactly as loadtxoutset does
+        -- (rpc.lua) and as Core's ActivateSnapshot does for a base blockhash
+        -- with no m_assumeutxo_data entry (validation.cpp).  This path used
+        -- to only warn and then load with no hash gate and the CURRENT TIP as
+        -- the per-coin height bound, so on a datadir already past the base
+        -- height any well-formed file replaced the live UTXO set and the run
+        -- exited 0 ("NOT VERIFIED").  Same height derivation and wording as
+        -- the RPC so operators and consensus-diff probes see one message.
+        local base_height
+        if base_hex == network.genesis_hash then
+          base_height = 0
+        elseif db.get_hash_by_height and cs.tip_height then
+          for h = 0, cs.tip_height do
+            local hh = db.get_hash_by_height(h)
+            if hh and types.hash256_hex(hh) == base_hex then
+              base_height = h
+              break
+            end
+          end
+        end
+        db.close()
         io.stderr:write(string.format(
-          "import-utxo WARNING: no assumeutxo entry for base block %s; "
-          .. "per-coin height guard will reject coins from blocks > 0\n",
-          base_hex))
+          "import-utxo FAILED: Assumeutxo height in snapshot metadata not "
+          .. "recognized (%s) - refusing to load snapshot\n",
+          base_height ~= nil and tostring(base_height) or "?"))
+        os.exit(1)
       end
     end
   end
@@ -935,7 +955,11 @@ local function run_import_utxo(args)
   -- height instead of the fresh-datadir genesis tip (0), and the allowlisted
   -- hash so a mismatch refuses before anything is written.  On a refusal
   -- nothing below runs: no chain tip, no snapshot record.
-  local ok, err = cs:load_snapshot(args.import_utxo, expected_set_hash, pre_base_height)
+  -- Only the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT branch above reaches here without
+  -- an expected hash; it is the one caller allowed to say so.
+  local ok, err = cs:load_snapshot(args.import_utxo, expected_set_hash,
+    pre_base_height, nil, nil, nil, nil,
+    { unsafe_unverified = (unsafe_base_height ~= nil) or nil })
   local elapsed = os.time() - t0
 
   if not ok then

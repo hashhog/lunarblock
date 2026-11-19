@@ -14786,6 +14786,7 @@ end
         snapshot_base_work = snap_base_work, active_tip_work = active_tip_work,
         check_content_hash = check_content_hash,
         target_snapshot_hash = whitelist_bypassed,
+        unsafe_unverified = whitelist_bypassed,
         drive_background = true })
     if not activation then
       -- A failure while the coins were being written has already latched the

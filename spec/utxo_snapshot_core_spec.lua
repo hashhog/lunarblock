@@ -328,7 +328,7 @@ describe("Core-format UTXO snapshot", function()
       local cs2 = utxo.new_chain_state(db2, consensus.networks.regtest)
       cs2:init()
 
-      local ok, load_err = cs2:load_snapshot(snapshot_file)
+      local ok, load_err = cs2:load_snapshot(snapshot_file, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
       assert.is_true(ok)
       assert.is_nil(load_err)
 
@@ -407,7 +407,7 @@ describe("Core-format UTXO snapshot", function()
       local cs = utxo.new_chain_state(db, network)
       cs:init()
 
-      local ok, err = cs:load_snapshot(snapshot_file)
+      local ok, err = cs:load_snapshot(snapshot_file, nil, nil, nil, nil, nil, nil, {unsafe_unverified = true})
       assert.is_true(ok, err)
 
       -- The loaded UTXO should match what we wrote.

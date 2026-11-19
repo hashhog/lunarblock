@@ -7076,6 +7076,7 @@ end
 --                                  in HashWriter natural-LE order. When
 --                                  supplied, mirrors Core's loadtxoutset
 --                                  strict gate (validation.cpp:5904-5915).
+--                                  nil is refused unless opts says why.
 -- @param base_height number|nil: height of the snapshot base block; used for
 --                                the per-coin height guard (BUG-6 / Core:5814).
 --                                When nil, self.tip_height is used as a proxy.
@@ -7092,6 +7093,9 @@ end
 --                        a gate run after the file verified and before the
 --                        live set is touched; a false return refuses the load
 --                        with nothing written.
+--                        hash_gated_by_caller / unsafe_unverified: the only
+--                        ways to load with expected_hash nil (see the gate
+--                        after the network-magic check); otherwise refused.
 -- @return boolean, string|nil, string|nil: success flag, error message, and
 --         on success the HASH_SERIALIZED of the loaded set (32 raw bytes)
 --
@@ -7163,6 +7167,25 @@ function ChainState:load_snapshot(file_path, expected_hash, base_height, active_
   if metadata.network_magic ~= self.network.magic_bytes then
     file:close()
     return false, "snapshot network magic mismatch"
+  end
+
+  -- No commitment, no load.  Core's ActivateSnapshot refuses a base blockhash
+  -- with no assumeutxo entry before any coin is read (validation.cpp,
+  -- "assumeutxo block hash in snapshot metadata not recognized"), and
+  -- PopulateAndValidateSnapshot always compares against that entry's
+  -- hash_serialized.  A nil expected_hash used to skip the gate silently, so
+  -- --import-utxo on a non-allowlisted base replaced the live set unverified.
+  -- A caller may load without expected_hash only by saying why:
+  --   opts.hash_gated_by_caller -- it holds an assumeutxo commitment and checks
+  --     it itself (activate_snapshot_with_background: pre_commit content gate
+  --     and/or the background genesis->base re-derivation);
+  --   opts.unsafe_unverified -- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT, no commitment
+  --     exists (development only).
+  if not expected_hash
+      and not (opts and (opts.hash_gated_by_caller or opts.unsafe_unverified)) then
+    file:close()
+    return false, "no assumeutxo hash_serialized to verify the snapshot "
+      .. "against - refusing to load snapshot"
   end
 
   -- Resolve the effective base_height for per-coin validation.
@@ -7707,10 +7730,17 @@ function M.activate_snapshot_with_background(active_chain_state, snapshot_path,
   -- expected_hash is passed only with opts.enforce_load_hash; the RPC instead
   -- supplies opts.check_content_hash so the refusal carries Core's wording.
   -- Either way every gate runs before the commit.
+  -- With no commitment at all (au_data has no hash_serialized) the load is
+  -- unverified; only an explicit opts.unsafe_unverified
+  -- (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT) may ask for that.
   local load_expected = opts.enforce_load_hash and expected_hash or nil
   local ok, lerr = active_chain_state:load_snapshot(
     snapshot_path, load_expected, base_height, opts.active_tip_height, opts.mempool,
-    opts.snapshot_base_work, opts.active_tip_work, { pre_commit = pre_commit })
+    opts.snapshot_base_work, opts.active_tip_work, {
+      pre_commit = pre_commit,
+      hash_gated_by_caller = (expected_hash ~= nil) or nil,
+      unsafe_unverified = (expected_hash == nil and opts.unsafe_unverified) or nil,
+    })
   if not ok then
     return nil, lerr or "snapshot load failed"
   end
