@@ -181,23 +181,29 @@ describe("addr routability (Core CNetAddr::IsRoutable at AddrMan::AddSingle)", f
   end)
 
   it("control: routable IPv4, IPv6 and overlay entries are still stored", function()
-    local pm = make_pm()
-    pm:handle_addr(src_peer(), addr_v1({ "2a01:4f8::1", "::ffff:8.8.8.8" }))
-    assert.equals(2, count(pm.known_addresses))
-    assert.equals(2, pm._new_count)
-
-    local pm2 = make_pm()
-    pm2:handle_addrv2(src_peer(), addr_v2({
-      { p2p.NET_ID.IPV4, v4("1.2.3.4") },
-      { p2p.NET_ID.IPV6, v6("2a01:4f8::2") },
-      { p2p.NET_ID.TORV3, string.rep("\1", 32) },
-      { p2p.NET_ID.I2P, string.rep("\2", 32) },
-      { p2p.NET_ID.CJDNS, "\xfc" .. string.rep("\3", 15) },
-    }))
-    -- All five are remembered; only the two IP entries reach the bucketed
-    -- addrman (overlay networks were never bucketed here).
-    assert.equals(5, count(pm2.known_addresses))
-    assert.equals(2, pm2._new_count)
+    -- One addrman per address: two entries from one source share that
+    -- source's 64 NEW buckets and can collide on a slot (~1/4096), which
+    -- would make a combined count flaky.
+    for _, s in ipairs({ "2a01:4f8::1", "::ffff:8.8.8.8" }) do
+      local pm = make_pm()
+      pm:handle_addr(src_peer(), addr_v1({ s }))
+      assert.equals(1, count(pm.known_addresses), s)
+      assert.equals(1, pm._new_count, s)
+    end
+    -- All five addrv2 kinds are remembered; only the two IP entries reach the
+    -- bucketed addrman (overlay networks were never bucketed here).
+    for _, e in ipairs({
+      { p2p.NET_ID.IPV4, v4("1.2.3.4"), 1 },
+      { p2p.NET_ID.IPV6, v6("2a01:4f8::2"), 1 },
+      { p2p.NET_ID.TORV3, string.rep("\1", 32), 0 },
+      { p2p.NET_ID.I2P, string.rep("\2", 32), 0 },
+      { p2p.NET_ID.CJDNS, "\xfc" .. string.rep("\3", 15), 0 },
+    }) do
+      local pm = make_pm()
+      pm:handle_addrv2(src_peer(), addr_v2({ { e[1], e[2] } }))
+      assert.equals(1, count(pm.known_addresses), "net " .. e[1])
+      assert.equals(e[3], pm._new_count, "net " .. e[1])
+    end
   end)
 
   it("add_known_address and _add_to_new refuse non-routable addresses", function()
