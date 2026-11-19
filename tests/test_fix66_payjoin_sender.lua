@@ -554,7 +554,7 @@ test("end-to-end PayJoin round-trip via in-proc transport", function()
 
   local transport = make_inproc_transport(recv_server)
   local uri = "bitcoin:" .. recv_addr ..
-              "?amount=0.0005&pj=http%3A%2F%2Flocalhost%2Fpayjoin"
+              "?amount=0.0005&pj=https%3A%2F%2Flocalhost%2Fpayjoin"
 
   local txid_hex, status, err = sender.send_payjoin_request(
     sender_wallet, mp, nil, uri, nil, {
@@ -582,7 +582,7 @@ test("garbage response from receiver → fallback to Original (G22)", function()
   sw:set_mempool(mp)
   local transport = function(_, _, _) return "garbage not a psbt", nil end
   local uri = "bitcoin:" .. recv_addr ..
-              "?amount=0.0005&pj=http%3A%2F%2Flocalhost%2Fpayjoin"
+              "?amount=0.0005&pj=https%3A%2F%2Flocalhost%2Fpayjoin"
   local txid_hex, status, err = sender.send_payjoin_request(
     sw, mp, nil, uri, nil, {
       network = "regtest", transport = transport, fee_rate = 1,
@@ -607,7 +607,7 @@ test("HTTP 500 from receiver → fallback to Original (G22)", function()
       "receiver returned HTTP 500"
   end
   local uri = "bitcoin:" .. recv_addr ..
-              "?amount=0.0005&pj=http%3A%2F%2Flocalhost%2Fpayjoin"
+              "?amount=0.0005&pj=https%3A%2F%2Flocalhost%2Fpayjoin"
   local txid_hex, status, err = sender.send_payjoin_request(
     sw, mp, nil, uri, nil, {
       network = "regtest", transport = transport, fee_rate = 1,
@@ -642,7 +642,7 @@ test("snoop attack (G10): receiver adds new output → sender falls back", funct
     return psbt_mod.to_base64(p), nil
   end
   local uri = "bitcoin:" .. recv_addr ..
-              "?amount=0.0005&pj=http%3A%2F%2Flocalhost%2Fpayjoin"
+              "?amount=0.0005&pj=https%3A%2F%2Flocalhost%2Fpayjoin"
   local txid_hex, status, err = sender.send_payjoin_request(
     sw, mp, nil, uri, nil, {
       network = "regtest", transport = transport, fee_rate = 1,
@@ -700,13 +700,13 @@ test("G2: transport sends Content-Type text/plain (BIP-78 wire spec)", function(
   local mp = make_mempool_stub()
   sw:set_mempool(mp)
   local uri = "bitcoin:" .. recv_addr ..
-              "?amount=0.0005&pj=http%3A%2F%2Flocalhost%2Fpayjoin"
+              "?amount=0.0005&pj=https%3A%2F%2Flocalhost%2Fpayjoin"
   local _ = sender.send_payjoin_request(sw, mp, nil, uri, nil, {
     network = "regtest", transport = transport, fee_rate = 1,
   })
   expect_eq(captured.headers["Content-Type"], "text/plain")
   expect_true(captured.body and #captured.body > 0)
-  expect_match(captured.url, "http://localhost")
+  expect_match(captured.url, "https://localhost")
   expect_match(captured.url, "v=1")
 end)
 
