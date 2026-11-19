@@ -836,17 +836,66 @@ local function _is_routable_addr(network_id, bytes)
   return false
 end
 
+--- Core DecodeBase32 without padding (util/strencodings.cpp): RFC 4648
+-- alphabet, either case, and ConvertBits<5, 8, false> semantics -- fewer than
+-- 5 leftover bits, all zero.
+-- @return string|nil: decoded bytes, or nil if invalid
+local function _b32decode(str)
+  local out, acc, bits = {}, 0, 0
+  for i = 1, #str do
+    local c = str:byte(i)
+    local v
+    if c >= 97 and c <= 122 then v = c - 97          -- a-z
+    elseif c >= 65 and c <= 90 then v = c - 65       -- A-Z
+    elseif c >= 50 and c <= 55 then v = c - 50 + 26  -- 2-7
+    else return nil end
+    acc = acc * 32 + v
+    bits = bits + 5
+    if bits >= 8 then
+      bits = bits - 8
+      local byte = math.floor(acc / 2 ^ bits)
+      out[#out + 1] = string.char(byte)
+      acc = acc - byte * 2 ^ bits
+    end
+  end
+  if bits >= 5 or acc ~= 0 then return nil end
+  return table.concat(out)
+end
+
+--- Core CNetAddr::SetTor / SetI2P structure check for an overlay name.
+-- Tor: "<56 base32>.onion" decoding to pubkey(32) || checksum(2) || version
+-- 0x03.  The 2-byte checksum is SHA3-256 based and is NOT verified here
+-- (lunarblock has no SHA3); every other condition is Core's.  I2P: exactly 52
+-- base32 characters + ".b32.i2p" (suffix any case) decoding to 32 bytes.
+-- @return boolean|nil: true/false for an overlay name, nil if not one
+local function _overlay_name_valid(name)
+  if name:sub(-6) == ".onion" then
+    local body = name:sub(1, -7)
+    if #body ~= 56 then return false end
+    local b = _b32decode(body)
+    return b ~= nil and #b == 35 and b:byte(35) == 3
+  end
+  if #name > 8 and name:sub(-8):lower() == ".b32.i2p" then
+    if #name ~= 60 then return false end
+    local b = _b32decode(name:sub(1, 52))
+    return b ~= nil and #b == 32
+  end
+  if name:lower():match("%.i2p$") then return false end
+  return nil
+end
+
 --- Core CNetAddr::IsRoutable for an address literal as stored here.
 -- IPv4 and IPv6 literals (any spelling, including the uncompressed form the
 -- addr decoder produces) are parsed to bytes first; an IPv4-mapped IPv6
--- literal is that IPv4 address, as in Core's addr (v1) decoding.  Tor and
--- I2P names pass (they are routable whenever valid).  Anything else, nil or
--- unparsable, is not routable.
+-- literal is that IPv4 address, as in Core's addr (v1) decoding.  Tor v3 and
+-- I2P names are routable when they pass Core's SetTor / SetI2P structure
+-- checks (_overlay_name_valid).  Anything else, nil or unparsable, is not.
 -- @param ip string: address literal (no port)
 -- @return boolean: true if the address is routable
 local function _is_routable(ip)
   if type(ip) ~= "string" or ip == "" then return false end
-  if ip:match("%.onion$") or ip:match("%.i2p$") then return true end
+  local overlay = _overlay_name_valid(ip)
+  if overlay ~= nil then return overlay end
   local info = M.parse_ip(ip)
   if not info then return false end
   if info.family == "ipv4" then return _ipv4_bytes_routable(info.bytes) end
@@ -2178,10 +2227,10 @@ function PeerManager:_load_anchors()
       local port = tonumber(port_str)
       -- Anchors are redialled automatically at startup.  Core's anchors are
       -- block-relay-only automatic connections drawn from addrman, so they
-      -- are routable by construction (and ThreadOpenConnections still skips
-      -- !IsValid() / IsLocal() ones); refuse non-routable entries here so a
-      -- manual 127.0.0.1 peer or an address that entered before the addrman
-      -- gate is not auto-dialled.
+      -- are routable by construction (ThreadOpenConnections itself only skips
+      -- !IsValid() ones and our own addresses).  Refuse non-routable entries
+      -- here so a manual 127.0.0.1 peer or an address that entered before the
+      -- addrman gate is not auto-dialled.
       if port and _is_routable(ip) then
         self._anchors[#self._anchors + 1] = {ip = ip, port = port}
       end

@@ -133,12 +133,26 @@ describe("addr routability (Core CNetAddr::IsRoutable at AddrMan::AddSingle)", f
       "224.0.0.1",          -- IPv4 multicast: Core does not filter it
       "240.0.0.1",          -- Core has no 240/4 rule
       "::ffff:8.8.8.8",     -- mapped public IPv4 is that IPv4
-      "abcdef.onion", "abcdef.b32.i2p",
+      -- Core netbase_tests / net_tests vectors (valid Tor v3 and I2P names)
+      "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+      "udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p",
+      "UDHDRTRCETJM5SXZSKJYR5ZTPESZYDBH4DPL3PL4UTGQQW2V4JNA.B32.I2P",
     }) do
       assert.is_true(peerman.is_routable(s), s .. " must be routable")
     end
     assert.is_false(peerman.is_routable("255.255.255.255"))  -- INADDR_NONE
     assert.is_false(peerman.is_routable("0.0.0.0"))          -- INADDR_ANY
+    -- Overlay names Core's SetTor / SetI2P refuse (bad length, alphabet,
+    -- Tor version byte, I2P padding bits or suffix).
+    for _, s in ipairs({
+      "abcdef.onion", "evil.onion",
+      "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscrya.onion", -- version 0
+      "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscry1.onion", -- bad char
+      "abcdef.b32.i2p", "foo.i2p",
+      "udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jnb.b32.i2p",   -- pad bits
+    }) do
+      assert.is_false(peerman.is_routable(s), s .. " must not be routable")
+    end
     assert.is_false(peerman.is_routable("not-an-ip"))
     assert.is_false(peerman.is_routable(""))
     assert.is_false(peerman.is_routable(nil))
