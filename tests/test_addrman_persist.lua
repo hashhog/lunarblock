@@ -95,7 +95,7 @@ for a = 10, 13 do
 end
 
 -- Promote a few to tried (exercise both classifications).
-local tried_addrs = { "10.0.0.1", "11.0.0.2", "12.0.0.3" }
+local tried_addrs = { "13.0.0.1", "11.0.0.2", "12.0.0.3" }
 for _, ip in ipairs(tried_addrs) do
   pm1:_move_to_tried(ip, PORT)
 end
