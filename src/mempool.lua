@@ -2006,25 +2006,79 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- returns Core's reject reason and, as a third value, its debug message
   -- (state.ToString() is "<reason>, <details>").
   --
-  -- Nothing is evicted here.  The conflicts leave the pool only once every
-  -- later check (TRUC, scripts) has passed, just before the replacement goes
-  -- in (step 9), and never for opts.test_accept.
-  local all_conflicts = {}  -- All txs to be evicted (conflicts + descendants)
-  if next(conflicts) then
-    -- BIP125 Rule #1 (opt-in signaling) only under -mempoolfullrbf=0; Core
-    -- v28+ defaults full RBF on (policy/rbf.h DEFAULT_MEMPOOL_FULL_RBF).
-    if not self.fullrbf then
-      for conflict_txid_hex in pairs(conflicts) do
-        if not self:is_replaceable(conflict_txid_hex) then
-          return false, "conflicting tx does not signal RBF"
-        end
+  -- Nothing is evicted here.  The conflicts (a staged TRUC sibling included)
+  -- leave the pool only once every later check (max feerate, scripts) has
+  -- passed, just before the replacement goes in (step 8f), and never for
+  -- opts.test_accept.
+  -- BIP125 Rule #1 (opt-in signaling) only under -mempoolfullrbf=0; Core
+  -- v28+ defaults full RBF on (policy/rbf.h DEFAULT_MEMPOOL_FULL_RBF).
+  -- Judged on the DIRECT conflicts only, before a TRUC sibling joins the set
+  -- below: Core checks signaling in PreChecks' conflict scan and does not
+  -- re-check the sibling (validation.cpp:958-972 comment).
+  if next(conflicts) and not self.fullrbf then
+    for conflict_txid_hex in pairs(conflicts) do
+      if not self:is_replaceable(conflict_txid_hex) then
+        return false, "conflicting tx does not signal RBF"
       end
     end
+  end
 
+  -- 7a. In-mempool ancestors (read-only; the TRUC gate needs the direct
+  -- parents, and the entry built in step 9 needs the full set).
+  local ancestors = {}  -- txid_hex -> true (set of all ancestors)
+  local direct_parents = {}  -- txid_hex -> entry (direct parents only)
+
+  for _, inp in ipairs(tx.inputs) do
+    local prev_hex = types.hash256_hex(inp.prev_out.hash)
+    local parent = self.entries[prev_hex]
+    if parent then
+      direct_parents[prev_hex] = parent
+      ancestors[prev_hex] = true
+      -- Include all of parent's ancestors (properly deduped via set)
+      for anc_hex in pairs(parent.ancestors) do
+        ancestors[anc_hex] = true
+      end
+    end
+  end
+
+  -- 7b. BIP-431 TRUC (v3) policy checks, in PreChecks before
+  -- ReplacementChecks as in Core (validation.cpp:952-976,
+  -- policy/truc_policy.cpp:171-261 SingleTRUCChecks).  Must be called for
+  -- every tx (TRUC and non-TRUC) to enforce the inheritance gates.
+  --
+  -- Sibling eviction: when the parent's one other child may be evicted, Core
+  -- adds that sibling to the CONFLICT SET (m_conflicts) and lets
+  -- ReplacementChecks judge it like any other replaced tx -- Rule 5, PaysForRBF
+  -- on its fee, the staged cluster limit and the feerate diagram -- and only
+  -- FinalizeSubpackage removes it, after every later check (max feerate,
+  -- scripts) has passed and never under test-accept.  Package contexts
+  -- (allow_rbf=false here, Core m_allow_sibling_eviction=false for
+  -- PackageTestAccept / PackageChildWithParents) never evict a sibling: the
+  -- TRUC violation is a hard reject there.  This used to call
+  -- remove_transaction on the sibling right here, so an invalid-signature,
+  -- min-fee C' evicted an honest high-fee child for free, and a
+  -- testmempoolaccept or package dry run evicted it for good.
+  local sibling_eviction = false
+  do
+    local truc_ok, truc_err, sibling_hex =
+      M.single_truc_checks(self.entries, tx, direct_parents, vsize, conflicts)
+    if not truc_ok then
+      if sibling_hex and allow_rbf then
+        conflicts[sibling_hex] = true
+        sibling_eviction = true
+      else
+        return false, truc_err
+      end
+    end
+  end
+  local including_sibling = sibling_eviction and " (including sibling eviction)" or ""
+
+  local all_conflicts = {}  -- All txs to be evicted (conflicts + descendants)
+  if next(conflicts) then
     -- Rule #5: distinct conflicting clusters (policy/rbf.cpp:69).
     local num_clusters = #self:conflict_clusters(conflicts)
     if num_clusters > M.MAX_REPLACEMENT_CANDIDATES then
-      return false, "too many potential replacements", string.format(
+      return false, "too many potential replacements" .. including_sibling, string.format(
         "rejecting replacement %s; too many conflicting clusters (%d > %d)",
         txid_hex, num_clusters, M.MAX_REPLACEMENT_CANDIDATES)
     end
@@ -2049,14 +2103,14 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
       end
     end
     if modified_fee < conflicting_fees then
-      return false, "insufficient fee", string.format(
+      return false, "insufficient fee" .. including_sibling, string.format(
         "rejecting replacement %s, less fees than conflicting txs; %s < %s",
         txid_hex, M.format_money(modified_fee), M.format_money(conflicting_fees))
     end
     local additional_fee = modified_fee - conflicting_fees
     local required_additional = math.ceil(M.INCREMENTAL_RELAY_FEE * vsize / 1000)
     if additional_fee < required_additional then
-      return false, "insufficient fee", string.format(
+      return false, "insufficient fee" .. including_sibling, string.format(
         "rejecting replacement %s, not enough additional fees to relay; %s < %s",
         txid_hex, M.format_money(additional_fee), M.format_money(required_additional))
     end
@@ -2101,24 +2155,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
     end
   end
 
-  -- 8. Compute ancestors (with proper deduplication) and check limits
-  -- Build the full set of unique in-mempool ancestors
-  local ancestors = {}  -- txid_hex -> true (set of all ancestors)
-  local direct_parents = {}  -- txid_hex -> entry (direct parents only)
-
-  for _, inp in ipairs(tx.inputs) do
-    local prev_hex = types.hash256_hex(inp.prev_out.hash)
-    local parent = self.entries[prev_hex]
-    if parent then
-      direct_parents[prev_hex] = parent
-      ancestors[prev_hex] = true
-      -- Include all of parent's ancestors (properly deduped via set)
-      for anc_hex in pairs(parent.ancestors) do
-        ancestors[anc_hex] = true
-      end
-    end
-  end
-
+  -- 8. Sum the ancestors collected in step 7a.
   -- Count unique ancestors and sum their sizes/fees
   local ancestor_count = 1  -- include self
   local ancestor_size = vsize  -- include self
@@ -2156,39 +2193,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- wallet-facing package-limit query, matching Core's remaining use of them.
   --
   -- TRUC's 2-ancestor / 2-descendant limits are the ONLY surviving
-  -- ancestor/descendant enforcement, and they are applied in step 8c below.
-
-  -- 8c. BIP-431 TRUC (v3) policy checks.
-  -- Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261 (SingleTRUCChecks).
-  -- Must be called for every tx (TRUC and non-TRUC) to enforce inheritance gates.
-  -- The `conflicts` set (direct RBF conflicts) is forwarded so Gate 6 can detect
-  -- sibling-eviction eligibility (the existing child is about to be replaced).
-  do
-    local truc_conflicts = {}
-    for conflict_hex in pairs(conflicts) do
-      truc_conflicts[conflict_hex] = true
-    end
-    local truc_ok, truc_err, sibling_hex =
-      M.single_truc_checks(self.entries, tx, direct_parents, vsize, truc_conflicts)
-    if not truc_ok then
-      if sibling_hex then
-        -- Sibling eviction: attempt to evict the existing TRUC child and retry.
-        -- This mirrors Core's behaviour: the caller removes the sibling under RBF
-        -- rules and re-attempts acceptance.  Here we evict the sibling and
-        -- re-run the gate, then continue if it now passes.
-        -- Reference: Core validation.cpp AcceptSingleTransaction sibling-eviction path.
-        self:remove_transaction(sibling_hex, "truc-sibling-eviction")
-        local retry_ok, retry_err, _ =
-          M.single_truc_checks(self.entries, tx, direct_parents, vsize, truc_conflicts)
-        if not retry_ok then
-          return false, retry_err or truc_err
-        end
-        -- Sibling evicted and gate now passes; fall through.
-      else
-        return false, truc_err
-      end
-    end
-  end
+  -- ancestor/descendant enforcement, and they are applied in step 7b above.
 
   -- 8d. W96: client_max_feerate gate (Core validation.cpp:1368-1371).
   -- When the caller (e.g. RPC sendrawtransaction with `maxfeerate`) supplied
@@ -4860,6 +4865,7 @@ end
 local function is_reconsiderable(reason)
   return reason == "min relay fee not met"
     or reason == "insufficient fee"
+    or reason == "insufficient fee (including sibling eviction)"
     or reason == "replacement-failed"
     or (type(reason) == "string" and reason:sub(1, 23) == "mempool min fee not met")
 end
