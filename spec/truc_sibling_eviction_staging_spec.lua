@@ -211,6 +211,9 @@ describe("TRUC sibling eviction is staged as an RBF conflict (Core PreChecks/Fin
       local r = env.call("testmempoolaccept", { { raw(other), raw(good) } }).result
       assert.is_not_nil(r[2])
       assert.is_true(r[2].allowed ~= true, "a package never evicts a sibling: " .. cjson.encode(r[2]))
+      -- Refused on the TRUC descendant limit itself, not on some other gate.
+      assert.truthy(tostring(r[2]["reject-reason"]):find("would exceed descendant count limit", 1, true),
+        cjson.encode(r[2]))
       assert.is_nil(env.mp.entries[txid_hex(good)])
       assert.is_nil(env.mp.entries[txid_hex(other)], "test accept leaves the mempool alone")
       assert_child_kept(env, "package testmempoolaccept")

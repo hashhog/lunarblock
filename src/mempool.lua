@@ -1982,10 +1982,10 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- 6c. Caller fee cap (sendrawtransaction's maxfeerate).  Core's
   -- BroadcastTransaction test-accepts and refuses when the base fee exceeds
   -- maxfeerate.GetFee(vsize), with vsize the sigop-adjusted size; its test
-  -- accept never commits.  Our test-accept is not a dry run (step 9 evicts
-  -- the replaced conflicts and expires/trims, and none of it is undone), so
-  -- the cap is checked here, once fee and vsize are known and before anything
-  -- is evicted.  opts.max_fee_per_kvb is sat/kvB; nil or 0 = no cap.
+  -- accept never commits.  sendrawtransaction runs no separate test-accept
+  -- here, so the cap is checked inside the real acceptance, once fee and
+  -- vsize are known and before any conflict (a staged TRUC sibling included)
+  -- is evicted in step 8f.  opts.max_fee_per_kvb is sat/kvB; nil or 0 = no cap.
   local max_fee_per_kvb = opts and opts.max_fee_per_kvb
   if max_fee_per_kvb and max_fee_per_kvb > 0
      and fee > M.fee_for_rate(max_fee_per_kvb, vsize) then
