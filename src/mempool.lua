@@ -2335,7 +2335,14 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   -- GetSequence().  Reorg re-admissions get 0 so a tx that was just in a
   -- block stays servable to every peer; anything else is servable to a peer
   -- only after a later inv round to it (PeerManager last_inv_sequence).
-  entry.sequence = bypass_limits and 0 or self.sequence
+  -- opts.entry_sequence: a tx put back by the package-RBF rollback keeps the
+  -- sequence it had, so the rollback does not open it to peers it was never
+  -- announced to.
+  if opts and type(opts.entry_sequence) == "number" then
+    entry.sequence = opts.entry_sequence
+  else
+    entry.sequence = bypass_limits and 0 or self.sequence
+  end
   self.sequence = self.sequence + 1
   self.entries[txid_hex] = entry
   if entry.wtxid then
@@ -4708,7 +4715,8 @@ function Mempool:package_rbf_eval(eval, replaced)
     if not ok then
       for k = #inserted, 1, -1 do self:remove_transaction(inserted[k], "package-rollback") end
       for _, e in ipairs(evicted) do
-        self:accept_transaction(e.tx, false, { bypass_limits = true })
+        self:accept_transaction(e.tx, false,
+          { bypass_limits = true, entry_sequence = e.sequence })
       end
       return TX_FAILED, { [info.wtxid] = invalid(info, r, d) }
     end

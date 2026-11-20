@@ -172,6 +172,19 @@ describe("getdata serves only announced txs (Core FindTxForGetData)", function()
       select(3, ask(P, T.MSG_WTX, validation.compute_wtxid(tx3))))
   end)
 
+  it("a tx restored with its old sequence (package-RBF rollback) stays gated", function()
+    -- The rollback in accept_package passes the evicted entry's sequence
+    -- back in (opts.entry_sequence) instead of bypass_limits' 0.
+    local tx4 = new_tx(utxos, 0x04)
+    local seq = mp.get_sequence and mp:get_sequence() or 1
+    assert.is_true((mp:accept_transaction(tx4, false,
+      { bypass_limits = true, entry_sequence = seq })))
+    local w4 = validation.compute_wtxid(tx4)
+    assert.equal("notfound", select(3, ask(P, T.MSG_WTX, w4)))
+    trickle_round(P)
+    assert.equal("served", select(3, ask(P, T.MSG_WTX, w4)))
+  end)
+
   it("a getdata does not clear unbroadcast for a tx it refused", function()
     local h = types.hash256_hex(txid)
     mp:add_unbroadcast(h)
