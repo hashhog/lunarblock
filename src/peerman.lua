@@ -3606,6 +3606,26 @@ function PeerManager:broadcast(command, payload, filter_fn)
   end
 end
 
+--- Record that a tx inv was just sent directly to every established peer
+-- (the broadcast("inv", ...) calls in sendrawtransaction, submitpackage and
+-- the payjoin sender, which bypass the trickle).  Core sets
+-- m_last_inv_sequence = GetSequence() after every tx inv round, so the txs
+-- just announced are served on the peer's getdata (FindTxForGetData).
+-- Without this the peers would draw `notfound` for a tx we had just
+-- announced to them, unless a trickle round happened to run in between.
+function PeerManager:note_tx_inv_broadcast()
+  if not (self._peer_trickle and self.mempool and self.mempool.get_sequence) then
+    return
+  end
+  local seq = self.mempool:get_sequence()
+  for _, p in ipairs(self.peer_list) do
+    if p.state == peer_mod.STATE.ESTABLISHED then
+      local trickle = self._peer_trickle[p.ip .. ":" .. p.port]
+      if trickle then trickle.last_inv_sequence = seq end
+    end
+  end
+end
+
 --- Announce a newly connected block to all established peers.
 -- Per BIP-130, peers that previously sent a `sendheaders` message expect
 -- header announces (`headers` with one entry); other peers get the legacy

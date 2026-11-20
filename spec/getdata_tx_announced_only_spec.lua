@@ -185,6 +185,27 @@ describe("getdata serves only announced txs (Core FindTxForGetData)", function()
     assert.equal("served", select(3, ask(P, T.MSG_WTX, w4)))
   end)
 
+  it("a tx sent by sendrawtransaction is served after its direct inv", function()
+    -- sendrawtransaction announces with an immediate inv to every peer
+    -- (PeerManager:broadcast), not through the trickle.  Those peers must
+    -- still be served the getdata that follows.
+    local rpc = require("lunarblock.rpc")
+    local consensus = require("lunarblock.consensus")
+    local cjson = require("cjson")
+    local tx5 = new_tx(utxos, 0x05)
+    local server = rpc.new({ network = consensus.networks.regtest,
+      mempool = mp, peer_manager = pm })
+    local hex = rpc.hex_encode(serialize.serialize_transaction(tx5, true))
+    local d = cjson.decode((server:handle_request(
+      '{"method":"sendrawtransaction","params":["' .. hex .. '"],"id":1}')))
+    assert.truthy(d.error == nil or d.error == cjson.null)
+    local t5 = validation.compute_txid(tx5)
+    assert.equal(types.hash256_hex(t5), d.result)
+    assert.is_not_nil(P.invs[types.hash256_hex(t5)])  -- the direct inv
+    assert.equal("served", select(3, ask(P, T.MSG_WITNESS_TX, t5)))
+    assert.equal("served", select(3, ask(Q, T.MSG_WTX, validation.compute_wtxid(tx5))))
+  end)
+
   it("a getdata does not clear unbroadcast for a tx it refused", function()
     local h = types.hash256_hex(txid)
     mp:add_unbroadcast(h)

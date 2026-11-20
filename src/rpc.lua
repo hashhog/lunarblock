@@ -4962,6 +4962,10 @@ function RPCServer:register_methods()
         {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
       })
       rpc.peer_manager:broadcast("inv", inv_payload)
+      -- Serve the getdata that follows (announced-only gate).
+      if rpc.peer_manager.note_tx_inv_broadcast then
+        rpc.peer_manager:note_tx_inv_broadcast()
+      end
     end
     return txid_hex
   end
@@ -8283,6 +8287,10 @@ end
       end
       if #invs > 0 then
         rpc.peer_manager:broadcast("inv", p2p.serialize_inv(invs))
+        -- Serve the getdata that follows (announced-only gate).
+        if rpc.peer_manager.note_tx_inv_broadcast then
+          rpc.peer_manager:note_tx_inv_broadcast()
+        end
       end
     end
 
