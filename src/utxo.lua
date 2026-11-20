@@ -4382,7 +4382,30 @@ function ChainState:check_diffbits(header, height)
   if not height or height <= 0 then return true end
   if not self.storage then return true end
 
+  local expected_bits, unresolvable, base =
+    self:next_work_required(header.prev_hash, height, header.timestamp)
+  if not expected_bits then
+    -- FAIL-CLOSED.  Never fall back to "whatever the block declares".
+    return false, string.format("diffbits-unresolvable: %s (snapshot base %s)",
+      tostring(unresolvable), tostring(base))
+  end
+  if header.bits ~= expected_bits then
+    return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
+      expected_bits, header.bits)
+  end
+  return true
+end
+
+--- Required nBits for a block at `height` built on `prev_hash` with time
+-- `timestamp` (Core GetNextWorkRequired(pindexPrev, pblock)).  The ancestor
+-- walk follows prev_hash through stored headers and resolves pre-snapshot-base
+-- ancestors from the pinned anchor; see check_diffbits above.  Shared by
+-- check_diffbits (the connect-time gate) and the block-template builder
+-- (mining.lua, Core BlockAssembler::CreateNewBlock miner.cpp:220).
+-- @return bits | nil, reason, snapshot_base_height
+function ChainState:next_work_required(prev_hash, height, timestamp)
   local base = self:get_snapshot_base_height()
+  local header = { prev_hash = prev_hash }
 
   local get_ancestor = function(target_height)
     if target_height < 0 or target_height >= height then return nil end
@@ -4426,17 +4449,8 @@ function ChainState:check_diffbits(header, height)
   end
 
   local expected_bits, unresolvable = consensus.get_next_work_required(
-    height, header.timestamp, self.network, get_ancestor)
-  if not expected_bits then
-    -- FAIL-CLOSED.  Never fall back to "whatever the block declares".
-    return false, string.format("diffbits-unresolvable: %s (snapshot base %s)",
-      tostring(unresolvable), tostring(base))
-  end
-  if header.bits ~= expected_bits then
-    return false, string.format("bad-diffbits: expected 0x%08x got 0x%08x",
-      expected_bits, header.bits)
-  end
-  return true
+    height, timestamp, self.network, get_ancestor)
+  return expected_bits, unresolvable, base
 end
 
 function ChainState:accept_block(block, height, block_hash, opts)
