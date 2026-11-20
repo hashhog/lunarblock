@@ -3868,8 +3868,16 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
   local chaintx_value = nil
   do
     local prev_cumulative
+    -- Inside a multi-block reorg the earlier side blocks' counts live only
+    -- in the uncommitted shared batch; disk still holds the REPLACED
+    -- blocks' counts at those heights.  accept_side_branch_block carries
+    -- the running counts here (Core: m_chain_tx_count comes from pprev, not
+    -- from what has been flushed).
+    local reorg_chaintx = reorg_batch and self._reorg_chaintx
     if height <= 0 then
       prev_cumulative = 0
+    elseif reorg_chaintx and reorg_chaintx[height - 1] then
+      prev_cumulative = reorg_chaintx[height - 1]
     else
       prev_cumulative = self.storage.get_chaintx_at_height(height - 1)
       -- Genesis was seeded with chaintx:0 = 1; if the prev entry is somehow
@@ -3883,6 +3891,9 @@ function ChainState:connect_block(block, height, block_hash, prev_block_mtp, get
     local block_tx_count = block.transactions and #block.transactions or 0
     chaintx_key = self.storage.chaintx_meta_key(height)
     chaintx_value = self.storage.encode_chaintx_count(prev_cumulative + block_tx_count)
+    if reorg_chaintx then
+      reorg_chaintx[height] = prev_cumulative + block_tx_count
+    end
   end
 
   -- BIP-157 Phase 2: build the basic block filter and chain its header
@@ -5097,6 +5108,7 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     -- disk.  Drop them: mempool, wallet, ZMQ, peers and the tip notifier
     -- never saw the aborted branch, so they already match the restored chain.
     self._reorg_deferred = nil
+    self._reorg_chaintx = nil
     -- Drop the WHOLE coin cache, not only the dirty entries.  In Pattern D
     -- deferred mode CoinView:flush(.., reorg_batch) clears the dirty flag
     -- on every entry it queues and KEEPS it in cache (spent markers for the
@@ -5121,6 +5133,9 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
   -- bodies): restore memory from disk before re-raising, exactly as for a
   -- returned failure, so a half-disconnected in-memory tip never survives.
   self._reorg_deferred = {}
+  -- height -> cumulative tx count of the side blocks connected so far in this
+  -- reorg (read by connect_block in place of the not-yet-committed disk key).
+  self._reorg_chaintx = {}
   local rb_ok, disconnected, dc_err = pcall(self.rollback_chain_to, self,
     common_height, reorg_batch)
   if not rb_ok then
@@ -5265,6 +5280,7 @@ function ChainState:accept_side_branch_block(block, block_hash, opts)
     end
   end
   reorg_batch.destroy()
+  self._reorg_chaintx = nil
   self.coin_view:reorg_batch_committed()
 
   -- The reorg is durable: now publish it.  Replay the queued observer
