@@ -1552,6 +1552,12 @@ function M.new(chain_state, config)
   self.unbroadcast = {}
   self.unbroadcast_count = 0
   self.tx_count = 0
+  -- CTxMemPool::m_sequence_number (starts at 1).  Each entry records the
+  -- value at insert (entry.sequence) and the counter then advances, so
+  -- "entry.sequence < s" means "was in the pool when the sequence was s".
+  -- The getdata gate compares it with a peer's last-inv sequence
+  -- (net_processing.cpp FindTxForGetData / info_for_relay).
+  self.sequence = 1
   -- W96: PolicyScriptChecks/ConsensusScriptChecks gate.
   -- When true, accept_transaction runs script-verify for each input prev script
   -- before adding the tx to the mempool (Core validation.cpp:1135-1157 +
@@ -2325,6 +2331,12 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   entry.ancestor_size = ancestor_size - vsize  -- exclude self
   entry.ancestor_fees = ancestor_fees - fee  -- exclude self
   entry.ancestors = ancestors
+  -- Core validation.cpp PreChecks: entry_sequence = bypass_limits ? 0 :
+  -- GetSequence().  Reorg re-admissions get 0 so a tx that was just in a
+  -- block stays servable to every peer; anything else is servable to a peer
+  -- only after a later inv round to it (PeerManager last_inv_sequence).
+  entry.sequence = bypass_limits and 0 or self.sequence
+  self.sequence = self.sequence + 1
   self.entries[txid_hex] = entry
   if entry.wtxid then
     local wtxid_hex = types.hash256_hex(entry.wtxid)
@@ -3805,6 +3817,12 @@ end
 -- @return table: Mempool entry or nil
 function Mempool:get_entry(txid_hex)
   return self.entries[txid_hex]
+end
+
+--- Current mempool sequence (CTxMemPool::GetSequence).  Every entry now in
+-- the pool has entry.sequence < get_sequence().
+function Mempool:get_sequence()
+  return self.sequence
 end
 
 --- Check if a transaction is in the mempool.

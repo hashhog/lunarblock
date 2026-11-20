@@ -2212,6 +2212,9 @@ local function main()
     return chain_state.tip_height, hx, e and e.total_work or nil
   end
   peer_manager.block_inflight_source = block_downloader
+  -- The trickle reads the mempool sequence at each inv round so getdata
+  -- serves a peer only the txs announced to it (Core m_last_inv_sequence).
+  peer_manager.mempool = mempool
   -- A peer has shown us block `hx` (header known): raise its best known
   -- block (Core UpdateBlockAvailability).  `announce` = it was NEW to us and
   -- has more work than our tip (Core m_last_block_announcement).
@@ -2941,6 +2944,9 @@ local function main()
     -- plain MSG_TX / MSG_BLOCK types are served without witness data.
     local getdata_deps = {
       mempool = mempool, get_block = db.get_block,
+      -- Tx items: only what we have announced to this peer (Core
+      -- FindTxForGetData); 0 for a peer without trickle state = serve none.
+      last_inv_sequence = peer_manager:get_last_inv_sequence(peer) or 0,
       -- MSG_CMPCT_BLOCK depth gate (Core: pindex->nHeight >= tip->nHeight -
       -- MAX_CMPCTBLOCK_DEPTH); nil when the block is not on our header chain.
       block_depth = function(hash)
