@@ -594,6 +594,7 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
     recv_buffer = "",
     recv_len = 0,         -- Decrypted length for current packet
     recv_aad = "",        -- AAD for next packet (garbage during handshake)
+    garb_scan_pos = 0,    -- GARB_GARBTERM: first terminator offset not yet checked
     recv_decode_buffer = "",  -- (unused since sec H8; kept for callers that peek)
     -- sec H8: decoded application packets waiting for get_message(), FIFO.
     -- recv_bytes decodes EVERY complete packet it is given (Core's
@@ -771,6 +772,7 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
 
         -- Transition to garbage phase
         self.recv_state = M.RecvState.GARB_GARBTERM
+        self.garb_scan_pos = 0
         self.send_state = M.SendState.READY
         -- Continue processing
       elseif self.recv_state == M.RecvState.GARB_GARBTERM then
@@ -778,16 +780,22 @@ function M.V2Transport(magic_bytes, initiator, peer_ip, peer_port)
         local term = self.cipher.recv_garbage_terminator
         local max_search = M.MAX_GARBAGE_LEN + M.GARBAGE_TERMINATOR_LEN
 
-        -- Search for terminator (last 16 bytes of any position)
-        if #self.recv_buffer < M.GARBAGE_TERMINATOR_LEN then
-          return true
-        end
-
+        -- Search for the terminator incrementally, like Core's
+        -- V2Transport::ProcessReceivedGarbageBytes, which checks only the
+        -- newest 16-byte window per received byte.  garb_scan_pos is the
+        -- first garbage length (0-based offset) not yet ruled out; every
+        -- earlier offset was checked on a previous call, so a call with no
+        -- new bytes does no work at all.  The plain find runs in C without
+        -- allocating a substring per offset.
+        local last = #self.recv_buffer - M.GARBAGE_TERMINATOR_LEN
+        local scan = self.garb_scan_pos
         local found_at = nil
-        for i = 0, math.min(#self.recv_buffer - M.GARBAGE_TERMINATOR_LEN, M.MAX_GARBAGE_LEN) do
-          if self.recv_buffer:sub(i + 1, i + M.GARBAGE_TERMINATOR_LEN) == term then
-            found_at = i
-            break
+        if last >= scan and scan <= M.MAX_GARBAGE_LEN then
+          local s = string.find(self.recv_buffer, term, scan + 1, true)
+          if s and s - 1 <= M.MAX_GARBAGE_LEN then
+            found_at = s - 1
+          else
+            self.garb_scan_pos = last + 1
           end
         end
 
