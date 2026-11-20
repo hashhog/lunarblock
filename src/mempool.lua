@@ -1552,6 +1552,12 @@ function M.new(chain_state, config)
   self.unbroadcast = {}
   self.unbroadcast_count = 0
   self.tx_count = 0
+  -- CTxMemPool::m_sequence_number (starts at 1).  Each entry records the
+  -- value at insert (entry.sequence) and the counter then advances, so
+  -- "entry.sequence < s" means "was in the pool when the sequence was s".
+  -- The getdata gate compares it with a peer's last-inv sequence
+  -- (net_processing.cpp FindTxForGetData / info_for_relay).
+  self.sequence = 1
   -- W96: PolicyScriptChecks/ConsensusScriptChecks gate.
   -- When true, accept_transaction runs script-verify for each input prev script
   -- before adding the tx to the mempool (Core validation.cpp:1135-1157 +
@@ -2325,6 +2331,19 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   entry.ancestor_size = ancestor_size - vsize  -- exclude self
   entry.ancestor_fees = ancestor_fees - fee  -- exclude self
   entry.ancestors = ancestors
+  -- Core validation.cpp PreChecks: entry_sequence = bypass_limits ? 0 :
+  -- GetSequence().  Reorg re-admissions get 0 so a tx that was just in a
+  -- block stays servable to every peer; anything else is servable to a peer
+  -- only after a later inv round to it (PeerManager last_inv_sequence).
+  -- opts.entry_sequence: a tx put back by the package-RBF rollback keeps the
+  -- sequence it had, so the rollback does not open it to peers it was never
+  -- announced to.
+  if opts and type(opts.entry_sequence) == "number" then
+    entry.sequence = opts.entry_sequence
+  else
+    entry.sequence = bypass_limits and 0 or self.sequence
+  end
+  self.sequence = self.sequence + 1
   self.entries[txid_hex] = entry
   if entry.wtxid then
     local wtxid_hex = types.hash256_hex(entry.wtxid)
@@ -3807,6 +3826,12 @@ function Mempool:get_entry(txid_hex)
   return self.entries[txid_hex]
 end
 
+--- Current mempool sequence (CTxMemPool::GetSequence).  Every entry now in
+-- the pool has entry.sequence < get_sequence().
+function Mempool:get_sequence()
+  return self.sequence
+end
+
 --- Check if a transaction is in the mempool.
 -- @param txid_hex string: Transaction id as hex string
 -- @return boolean: True if transaction is in mempool
@@ -4690,7 +4715,8 @@ function Mempool:package_rbf_eval(eval, replaced)
     if not ok then
       for k = #inserted, 1, -1 do self:remove_transaction(inserted[k], "package-rollback") end
       for _, e in ipairs(evicted) do
-        self:accept_transaction(e.tx, false, { bypass_limits = true })
+        self:accept_transaction(e.tx, false,
+          { bypass_limits = true, entry_sequence = e.sequence })
       end
       return TX_FAILED, { [info.wtxid] = invalid(info, r, d) }
     end

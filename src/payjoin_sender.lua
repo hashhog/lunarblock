@@ -715,7 +715,11 @@ function M.payjoin_fallback(mempool, peer_mgr, tx)
     local inv_payload = p2p.serialize_inv({
       {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
     })
-    pcall(function() peer_mgr:broadcast("inv", inv_payload) end)
+    pcall(function()
+      peer_mgr:broadcast("inv", inv_payload)
+      -- Serve the getdata that follows (announced-only gate).
+      if peer_mgr.note_tx_inv_broadcast then peer_mgr:note_tx_inv_broadcast() end
+    end)
   end
   return true, txid_hex, nil
 end
@@ -1147,7 +1151,11 @@ function M.send_payjoin_request(wallet, mempool, peer_mgr, uri, recipients, opti
     local inv_payload = p2p.serialize_inv({
       {type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid}
     })
-    pcall(function() peer_mgr:broadcast("inv", inv_payload) end)
+    pcall(function()
+      peer_mgr:broadcast("inv", inv_payload)
+      -- Serve the getdata that follows (announced-only gate).
+      if peer_mgr.note_tx_inv_broadcast then peer_mgr:note_tx_inv_broadcast() end
+    end)
   end
 
   return txid_hex_bc, "payjoin", nil

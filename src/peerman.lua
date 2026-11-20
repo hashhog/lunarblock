@@ -379,7 +379,9 @@ end
 -- peer re-requests elsewhere instead of waiting out GETDATA_TX_INTERVAL.
 --
 -- @param item table {type=, hash=hash256}
--- @param deps table {mempool=Mempool, get_block=function(hash)->block|nil,
+-- @param deps table {mempool=Mempool, last_inv_sequence=number (the
+--   requesting peer's PeerManager:get_last_inv_sequence; tx items are served
+--   only when entry.sequence < it), get_block=function(hash)->block|nil,
 --   block_depth=function(hash)->number|nil (tip_height - block height;
 --   nil/absent = unknown, treated as too deep -> full block)}
 -- @return command string|nil, payload string|nil, status string:
@@ -402,6 +404,17 @@ function M.getdata_response(item, deps)
       end
     end
     if not entry then return nil, nil, "notfound" end
+    -- Core FindTxForGetData / CTxMemPool::info_for_relay: serve a mempool
+    -- tx only if it entered the pool before the last inv round sent to this
+    -- peer (entry sequence < the peer's m_last_inv_sequence).  Otherwise any
+    -- peer could fetch a tx by hash the moment it arrived, before the Poisson
+    -- trickle announced it to them, which defeats the trickle's timing
+    -- privacy.  A caller that supplies no sequence serves nothing.
+    local last_inv_seq = deps.last_inv_sequence
+    if type(last_inv_seq) ~= "number" or type(entry.sequence) ~= "number"
+       or entry.sequence >= last_inv_seq then
+      return nil, nil, "notfound"
+    end
     -- A peer asked for it: no longer awaiting initial broadcast
     -- (net_processing.cpp:2548 RemoveUnbroadcastTx).
     if deps.mempool.remove_unbroadcast and entry.txid then
@@ -3737,6 +3750,26 @@ function PeerManager:broadcast(command, payload, filter_fn)
   end
 end
 
+--- Record that a tx inv was just sent directly to every established peer
+-- (the broadcast("inv", ...) calls in sendrawtransaction, submitpackage and
+-- the payjoin sender, which bypass the trickle).  Core sets
+-- m_last_inv_sequence = GetSequence() after every tx inv round, so the txs
+-- just announced are served on the peer's getdata (FindTxForGetData).
+-- Without this the peers would draw `notfound` for a tx we had just
+-- announced to them, unless a trickle round happened to run in between.
+function PeerManager:note_tx_inv_broadcast()
+  if not (self._peer_trickle and self.mempool and self.mempool.get_sequence) then
+    return
+  end
+  local seq = self.mempool:get_sequence()
+  for _, p in ipairs(self.peer_list) do
+    if p.state == peer_mod.STATE.ESTABLISHED then
+      local trickle = self._peer_trickle[p.ip .. ":" .. p.port]
+      if trickle then trickle.last_inv_sequence = seq end
+    end
+  end
+end
+
 --- Announce a newly connected block to all established peers.
 -- Per BIP-130, peers that previously sent a `sendheaders` message expect
 -- header announces (`headers` with one entry); other peers get the legacy
@@ -3988,6 +4021,10 @@ function PeerManager:_init_peer_trickle(p)
     inv_known = {},                              -- hashes we've already sent (rolling set, see M.inv_known_add)
     inv_known_prev = {},                         -- previous generation of inv_known
     inv_known_count = 0,                         -- inserts into the current generation
+    -- Core TxRelay::m_last_inv_sequence (starts at 1): the mempool sequence
+    -- at our last inv round to this peer. getdata for a tx is answered only
+    -- when the tx's entry sequence is below it (FindTxForGetData).
+    last_inv_sequence = 1,
     next_send_time = socket.gettime() + M.poisson_delay(interval),
   }
 end
@@ -4353,6 +4390,18 @@ function PeerManager:get_peer_inv_queue(p)
   return trickle and trickle.inv_queue
 end
 
+--- The mempool sequence at the last inv round sent to a peer (Core
+-- TxRelay::m_last_inv_sequence), or nil when the peer has no trickle state
+-- (not yet established, or gone).  getdata serves a mempool tx to this peer
+-- only when the tx's entry sequence is below this value.
+-- @param p Peer
+-- @return number|nil
+function PeerManager:get_last_inv_sequence(p)
+  local key = p.ip .. ":" .. p.port
+  local trickle = self._peer_trickle and self._peer_trickle[key]
+  return trickle and trickle.last_inv_sequence
+end
+
 --- Get the next trickle send time for a peer (for testing).
 -- @param p Peer: peer to check
 -- @return number|nil: next send time or nil if not found
@@ -4410,6 +4459,14 @@ function PeerManager:_process_trickle()
         end
         if #batch > 0 then
           p:send_message("inv", p2p.serialize_inv(batch))
+        end
+
+        -- Core SendMessages: "Ensure we'll respond to GETDATA requests for
+        -- anything we've just announced" -- every tx now in the mempool
+        -- becomes servable to this peer (net_processing.cpp
+        -- m_last_inv_sequence = m_mempool.GetSequence()).
+        if self.mempool and self.mempool.get_sequence then
+          trickle.last_inv_sequence = self.mempool:get_sequence()
         end
 
         -- Move the unsent tail to the front in one pass (table.remove(queue, 1)
