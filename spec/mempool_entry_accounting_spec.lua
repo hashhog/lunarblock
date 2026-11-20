@@ -283,7 +283,9 @@ describe("mempool entry accounting (Core v31.1 entryToJSON)", function()
       local peerman = require("lunarblock.peerman")
       local p2p = require("lunarblock.p2p")
       local cmd, _, status = peerman.getdata_response(
-        { type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid_of(tx) }, { mempool = mp })
+        { type = p2p.INV_TYPE.MSG_WITNESS_TX, hash = txid_of(tx) },
+        -- the tx counts as announced to this peer (announced-only gate)
+        { mempool = mp, last_inv_sequence = math.huge })
       assert.equal("tx", cmd)
       assert.equal("served", status)
       assert.is_false(mp:is_unbroadcast(h))

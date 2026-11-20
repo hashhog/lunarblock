@@ -78,8 +78,11 @@ describe("getdata serving decision (Core ProcessGetData parity)", function()
   end)
 
   local function ask(type_, hash, get_block)
+    -- last_inv_sequence = math.huge: every mempool tx counts as announced to
+    -- this peer, so these cases test the lookup and serialization only. The
+    -- announced-only gate is covered by spec/getdata_tx_announced_only_spec.lua.
     return peerman.getdata_response({ type = type_, hash = hash },
-      { mempool = mp, get_block = get_block })
+      { mempool = mp, get_block = get_block, last_inv_sequence = math.huge })
   end
 
   it("MSG_WTX: looks the tx up by WTXID and serves it WITH witness", function()
