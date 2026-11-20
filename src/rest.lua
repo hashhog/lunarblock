@@ -401,6 +401,45 @@ function M.new(config)
   return self
 end
 
+--- Height of `hash` on the active chain, or nil if it is not on it.
+-- The in-memory header index (chain_state.header_index, the HeaderChain that
+-- main.lua attaches before the REST server starts) knows each header's
+-- height, so confirm the active chain holds this hash there with ONE
+-- HEIGHT_INDEX read; if another block (or none) is active at that height the
+-- hash is not on the active chain, and a block hash has only one height, so
+-- the answer is nil without any scan.  Only when the header index cannot
+-- answer (none attached, or it does not know the hash) fall back to a single
+-- scan of HEIGHT_INDEX from genesis -- the pre-fix behaviour, which on
+-- mainnet is ~970k iterator steps on the single main loop.
+local function active_height_of(self, hash)
+  local storage = self.storage
+  local hc = self.chain_state and self.chain_state.header_index
+  if hc and hc.get_header and storage.get_hash_by_height then
+    local ok, entry = pcall(hc.get_header, hc, hash)
+    if ok and type(entry) == "table" and type(entry.height) == "number" then
+      local hh = storage.get_hash_by_height(entry.height)
+      if hh and hh.bytes == hash.bytes then return entry.height end
+      return nil
+    end
+  end
+  local iter = storage.iterator and storage.iterator("height")
+  if not iter then return nil end
+  local found = nil
+  iter.seek_to_first()
+  while iter.valid() do
+    local v = iter.value()
+    if v and #v == 32 and v == hash.bytes then
+      local k = iter.key()
+      found = k:byte(1) * 16777216 + k:byte(2) * 65536
+            + k:byte(3) * 256 + k:byte(4)
+      break
+    end
+    iter.next()
+  end
+  iter.destroy()
+  return found
+end
+
 --------------------------------------------------------------------------------
 -- REST Endpoint Handlers
 --------------------------------------------------------------------------------
@@ -432,23 +471,8 @@ function RESTServer:handle_block(hash_hex, format, notxdetails)
     -- Build JSON response
     local block_height = nil
 
-    -- Try to find block height
-    if self.storage.iterator then
-      local iter = self.storage.iterator("height")
-      if iter then
-        iter.seek_to_first()
-        while iter.valid() do
-          local v = iter.value()
-          if v and #v == 32 and v == hash.bytes then
-            local k = iter.key()
-            block_height = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
-            break
-          end
-          iter.next()
-        end
-        iter.destroy()
-      end
-    end
+    -- Height on the active chain (one header-index lookup, not a scan).
+    block_height = active_height_of(self, hash)
 
     -- Calculate confirmations
     local confirmations = 1
@@ -741,41 +765,22 @@ function RESTServer:handle_headers(count_str, hash_hex, format)
   local hash = types.hash256_from_hex(hash_hex)
   local headers = {}
 
-  -- Get headers starting from hash
-  local current_hash = hash
-  for _ = 1, count do
-    local header = self.storage.get_header(current_hash)
-    if not header then break end
-    headers[#headers + 1] = header
-
-    -- Get next header (need to find it via height index)
-    local block_height = nil
-    if self.storage.iterator then
-      local iter = self.storage.iterator("height")
-      if iter then
-        iter.seek_to_first()
-        while iter.valid() do
-          local v = iter.value()
-          if v and #v == 32 and v == current_hash.bytes then
-            local k = iter.key()
-            block_height = k:byte(1) * 16777216 + k:byte(2) * 65536 + k:byte(3) * 256 + k:byte(4)
-            break
-          end
-          iter.next()
-        end
-        iter.destroy()
+  -- Core rest_headers (rest.cpp): look the start block up ONCE, then step
+  -- along the active chain (ActiveChain().Next()). Here: resolve the start
+  -- height once and step by height through the height index, so a request
+  -- costs O(count) reads instead of one height-index scan per header.
+  local first = self.storage.get_header(hash)
+  if first then
+    headers[1] = first
+    local start_height = count > 1 and active_height_of(self, hash) or nil
+    if start_height and self.storage.get_hash_by_height then
+      for h = start_height + 1, start_height + count - 1 do
+        local next_hash = self.storage.get_hash_by_height(h)
+        if not next_hash then break end
+        local header = self.storage.get_header(next_hash)
+        if not header then break end
+        headers[#headers + 1] = header
       end
-    end
-
-    if block_height and self.storage.get_hash_by_height then
-      local next_hash = self.storage.get_hash_by_height(block_height + 1)
-      if next_hash then
-        current_hash = next_hash
-      else
-        break
-      end
-    else
-      break
     end
   end
 
@@ -1213,25 +1218,8 @@ local function walk_filters_forward(self, start_hash, count)
   local results = {}
   if not self.storage then return results end
 
-  -- Find starting height via the height index iterator.
-  local start_height = nil
-  if self.storage.iterator then
-    local iter = self.storage.iterator("height")
-    if iter then
-      iter.seek_to_first()
-      while iter.valid() do
-        local v = iter.value()
-        if v and #v == 32 and v == start_hash.bytes then
-          local k = iter.key()
-          start_height = k:byte(1) * 16777216 + k:byte(2) * 65536
-                       + k:byte(3) * 256 + k:byte(4)
-          break
-        end
-        iter.next()
-      end
-      iter.destroy()
-    end
-  end
+  -- Find starting height once (header-index lookup, scan only as fallback).
+  local start_height = active_height_of(self, start_hash)
 
   if not start_height then return results end
 
