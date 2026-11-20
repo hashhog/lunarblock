@@ -1924,13 +1924,30 @@ end
 
 --- Ancestor oracle for get_next_work_required: the candidate's own lineage
 --- first, the pinned pre-base anchor only as a narrow, hash-gated fallback.
+---
+--- The testnet min-difficulty walk-back (consensus.get_next_work_required)
+--- asks for height-1, height-2, ... in turn.  Walking from `parent` on every
+--- call made a run of n powLimit headers cost ~n^2/2 prev_hash hops (~2M for
+--- n=2014) on the event loop.  Core steps pindex->pprev once per step
+--- (pow.cpp:32-35), so the oracle keeps a cursor: the last entry it resolved
+--- from the parent's own lineage.  A request at or below the cursor walks on
+--- from it; anything else starts from `parent` again.  The cursor is only ever
+--- an entry reached by walking prev_hash from `parent`, so walking from it
+--- reaches exactly the entry walking from `parent` would.  Pinned pre-base
+--- anchors carry no prev_hash and never become the cursor.
 --- @param parent table: parent entry of the header being validated
 --- @return function: fn(height) -> ancestor entry or nil
 function HeaderChain:make_work_ancestor_fn(parent)
   local chain = self
+  local cursor = parent
   return function(h)
-    local e = get_ancestor_entry(chain.headers, parent, h)
-    if e then return e end
+    local from = parent
+    if cursor and h <= cursor.height then from = cursor end
+    local e = get_ancestor_entry(chain.headers, from, h)
+    if e then
+      cursor = e
+      return e
+    end
     return chain:resolve_pre_base_ancestor(parent, h)
   end
 end
