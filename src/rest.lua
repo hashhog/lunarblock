@@ -369,7 +369,6 @@ function M.new(config)
   self.port = config.rest_port or 8080
   self.server_socket = nil
   self.chain_state = config.chain_state
-  self.header_chain = config.header_chain
   self.mempool = config.mempool
   self.storage = config.storage
   self.network = config.network or consensus.networks.mainnet
@@ -406,20 +405,21 @@ end
 -- The in-memory header index (chain_state.header_index, the HeaderChain that
 -- main.lua attaches before the REST server starts) knows each header's
 -- height, so confirm the active chain holds this hash there with ONE
--- HEIGHT_INDEX read. Only when that cannot answer (no header index, header
--- unknown to it, or another block active at that height) fall back to a
--- single scan of HEIGHT_INDEX from genesis -- the pre-fix behaviour, which on
--- mainnet is ~970k iterator steps on the single main loop.  Same rule as
--- rpc.lua's active_height_of.
+-- HEIGHT_INDEX read; if another block (or none) is active at that height the
+-- hash is not on the active chain, and a block hash has only one height, so
+-- the answer is nil without any scan.  Only when the header index cannot
+-- answer (none attached, or it does not know the hash) fall back to a single
+-- scan of HEIGHT_INDEX from genesis -- the pre-fix behaviour, which on
+-- mainnet is ~970k iterator steps on the single main loop.
 local function active_height_of(self, hash)
   local storage = self.storage
-  local hc = self.header_chain
-    or (self.chain_state and self.chain_state.header_index)
+  local hc = self.chain_state and self.chain_state.header_index
   if hc and hc.get_header and storage.get_hash_by_height then
     local ok, entry = pcall(hc.get_header, hc, hash)
     if ok and type(entry) == "table" and type(entry.height) == "number" then
       local hh = storage.get_hash_by_height(entry.height)
       if hh and hh.bytes == hash.bytes then return entry.height end
+      return nil
     end
   end
   local iter = storage.iterator and storage.iterator("height")

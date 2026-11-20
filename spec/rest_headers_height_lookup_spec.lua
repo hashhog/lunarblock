@@ -156,7 +156,7 @@ describe("REST height lookup is O(count), not O(count x height)", function()
     -- active block there: only that header comes back (pre-fix behaviour,
     -- and Core returns nothing past a non-active block).
     local stale = types.hash256(string.rep("\xbb", 32))
-    local store = counting_store(math.huge)
+    local store, stats = counting_store(math.huge)
     local stale_header = header_at(START)
     stale_header.nonce = 777
     db.put_header(stale, stale_header)
@@ -167,8 +167,11 @@ describe("REST height lookup is O(count), not O(count x height)", function()
     })
     local resp = server:handle_headers("5", types.hash256_hex(stale), "bin")
     assert.equal(200, status_of(resp))
+    -- The header index knows this hash, so "not active" needs no scan.
+    assert.equal(0, stats.iterators)
     assert.equal(80, #body_of(resp))
     header_entries[stale.bytes] = nil
+    db.delete("headers", stale.bytes)
   end)
 
   it("handle_block JSON resolves height with no height-index scan", function()
