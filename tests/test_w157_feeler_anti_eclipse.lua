@@ -179,8 +179,8 @@ end)
 
 test("1-c: -connect mode -> feeler is a no-op", function()
   local pm, d = make_pm()
-  pm.config.connect = { "198.51.100.9:8333" }
-  pm:_add_to_new("198.51.100.7", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
+  pm.config.connect = { "93.184.100.9:8333" }
+  pm:_add_to_new("93.184.100.7", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
   local dialed = 0
   pm.connect_peer = function() dialed = dialed + 1; return true end
   local opened = pm:maybe_open_feeler()
@@ -195,36 +195,36 @@ end)
 print("\n--- 2: promote-on-success-ONLY ---")
 test("2-a: a feeler that reaches ESTABLISHED promotes NEW->TRIED on disconnect", function()
   local pm, d = make_pm()
-  pm:_add_to_new("198.51.100.7", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
+  pm:_add_to_new("93.184.100.7", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
   -- Build a real-ish feeler peer that completed its handshake.
-  local p = peer_mod.new("198.51.100.7", 8333, consensus.networks.regtest, 0)
+  local p = peer_mod.new("93.184.100.7", 8333, consensus.networks.regtest, 0)
   p.inbound = false
   p.is_feeler = true
   p.state = peer_mod.STATE.ESTABLISHED
-  pm.peers["198.51.100.7:8333"] = p
+  pm.peers["93.184.100.7:8333"] = p
   pm.peer_list[#pm.peer_list + 1] = p
   -- Disconnect drives the promotion (Core addrman.Good on feeler success).
   pm:disconnect_peer(p, "feeler")
-  expect_true(in_tried(pm, "198.51.100.7", 8333),
+  expect_true(in_tried(pm, "93.184.100.7", 8333),
     "ESTABLISHED feeler must be promoted NEW->TRIED")
-  expect_false(in_new(pm, "198.51.100.7", 8333),
+  expect_false(in_new(pm, "93.184.100.7", 8333),
     "address must have left the NEW table after promotion")
   rm_dir(d)
 end)
 
 test("2-b: FALSIFICATION — a feeler that NEVER reaches ESTABLISHED does NOT promote", function()
   local pm, d = make_pm()
-  pm:_add_to_new("198.51.100.8", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
-  local p = peer_mod.new("198.51.100.8", 8333, consensus.networks.regtest, 0)
+  pm:_add_to_new("93.184.100.8", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
+  local p = peer_mod.new("93.184.100.8", 8333, consensus.networks.regtest, 0)
   p.inbound = false
   p.is_feeler = true
   p.state = peer_mod.STATE.CONNECTING  -- handshake never completed
-  pm.peers["198.51.100.8:8333"] = p
+  pm.peers["93.184.100.8:8333"] = p
   pm.peer_list[#pm.peer_list + 1] = p
   pm:disconnect_peer(p, "feeler handshake failed")
-  expect_false(in_tried(pm, "198.51.100.8", 8333),
+  expect_false(in_tried(pm, "93.184.100.8", 8333),
     "failed-handshake feeler must NOT be promoted to TRIED")
-  expect_true(in_new(pm, "198.51.100.8", 8333),
+  expect_true(in_new(pm, "93.184.100.8", 8333),
     "address must REMAIN in the NEW table after a failed probe")
   rm_dir(d)
 end)
@@ -232,15 +232,15 @@ end)
 test("2-c: FALSIFICATION — a NOT-probed NEW entry stays NEW", function()
   local pm, d = make_pm()
   -- Two NEW entries; only one will be probed.
-  pm:_add_to_new("198.51.100.7", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
-  pm:_add_to_new("198.51.100.20", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.9")
+  pm:_add_to_new("93.184.100.7", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.1")
+  pm:_add_to_new("93.184.100.20", 8333, p2p.SERVICES.NODE_NETWORK, os.time(), "203.0.113.9")
   -- Promote ONLY .7 (simulate the success path directly).
-  pm:_move_to_tried("198.51.100.7", 8333)
-  expect_true(in_tried(pm, "198.51.100.7", 8333), ".7 promoted")
+  pm:_move_to_tried("93.184.100.7", 8333)
+  expect_true(in_tried(pm, "93.184.100.7", 8333), ".7 promoted")
   -- .20 was never probed -> must still be NEW, never TRIED.
-  expect_false(in_tried(pm, "198.51.100.20", 8333),
+  expect_false(in_tried(pm, "93.184.100.20", 8333),
     "un-probed entry must NOT be in TRIED")
-  expect_true(in_new(pm, "198.51.100.20", 8333),
+  expect_true(in_new(pm, "93.184.100.20", 8333),
     "un-probed entry must STAY in NEW")
   rm_dir(d)
 end)
@@ -296,18 +296,18 @@ test("3-b: feeler is OFF the outbound budget", function()
   -- A lone feeler peer must NOT be counted toward max_outbound.  We assert via
   -- get_outbound_counts (feeler excluded) and by checking maintain_connections
   -- still wants to open a real outbound when only a feeler is present.
-  local feeler = { ip = "198.51.100.7", port = 8333, inbound = false,
+  local feeler = { ip = "93.184.100.7", port = 8333, inbound = false,
     is_feeler = true, state = peer_mod.STATE.ESTABLISHED }
-  pm.peers["198.51.100.7:8333"] = feeler
+  pm.peers["93.184.100.7:8333"] = feeler
   pm.peer_list[1] = feeler
   local full, block = pm:get_outbound_counts()
   expect_eq(full, 0, "feeler must NOT count as a full-relay outbound")
   expect_eq(block, 0, "feeler must NOT count as a block-relay outbound")
 
   -- Now add a real (non-feeler) outbound and confirm it IS counted.
-  local real = { ip = "198.51.100.40", port = 8333, inbound = false,
+  local real = { ip = "93.184.100.40", port = 8333, inbound = false,
     state = peer_mod.STATE.ESTABLISHED }
-  pm.peers["198.51.100.40:8333"] = real
+  pm.peers["93.184.100.40:8333"] = real
   pm.peer_list[2] = real
   full = pm:get_outbound_counts()
   expect_eq(full, 1, "a non-feeler outbound IS counted (feeler still excluded)")
@@ -546,7 +546,7 @@ print("\n--- 6: sendtxrcncl off by default (BIP330 -txreconciliation) ---")
 -- (not inbound, ver.relay) are satisfied — leaving txreconciliation_enabled
 -- as the sole discriminator.
 local function drive_outbound_handshake(enable_recon)
-  local p = peer_mod.new("198.51.100.30", 8333, consensus.networks.regtest, 0)
+  local p = peer_mod.new("93.184.100.30", 8333, consensus.networks.regtest, 0)
   p.inbound = false
   p.txreconciliation_enabled = enable_recon and true or false
   local sent = {}
@@ -566,7 +566,7 @@ local function sent_has(sent, cmd)
 end
 
 test("6-a: default Peer has txreconciliation_enabled = false (Core DEFAULT_TXRECONCILIATION_ENABLE)", function()
-  local p = peer_mod.new("198.51.100.31", 8333, consensus.networks.regtest, 0)
+  local p = peer_mod.new("93.184.100.31", 8333, consensus.networks.regtest, 0)
   expect_false(p.txreconciliation_enabled,
     "txreconciliation must default OFF to match Core")
 end)
@@ -592,7 +592,7 @@ end)
 test("6-d: even with txreconciliation ON, an INBOUND peer does not announce", function()
   -- Core only announces on non-inbound (outbound) full-relay peers; verify the
   -- other gate conditions still hold when the master flag is on.
-  local p = peer_mod.new("198.51.100.32", 8333, consensus.networks.regtest, 0)
+  local p = peer_mod.new("93.184.100.32", 8333, consensus.networks.regtest, 0)
   p.inbound = true
   p.txreconciliation_enabled = true
   local sent = {}

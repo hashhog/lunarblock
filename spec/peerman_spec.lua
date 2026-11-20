@@ -71,34 +71,34 @@ describe("peerman", function()
 
     it("adds new addresses", function()
       local pm = peerman.new(test_network, nil, nil)
-      local added = pm:add_known_address("192.168.1.1", 8333)
+      local added = pm:add_known_address("93.184.1.1", 8333)
       assert.is_true(added)
       assert.equals(1, pm:get_known_address_count())
     end)
 
     it("rejects duplicate addresses", function()
       local pm = peerman.new(test_network, nil, nil)
-      pm:add_known_address("192.168.1.1", 8333)
-      local added = pm:add_known_address("192.168.1.1", 8333)
+      pm:add_known_address("93.184.1.1", 8333)
+      local added = pm:add_known_address("93.184.1.1", 8333)
       assert.is_false(added)
       assert.equals(1, pm:get_known_address_count())
     end)
 
     it("tracks multiple addresses", function()
       local pm = peerman.new(test_network, nil, nil)
-      pm:add_known_address("192.168.1.1", 8333)
-      pm:add_known_address("192.168.1.2", 8333)
-      pm:add_known_address("192.168.1.3", 8334)
+      pm:add_known_address("93.184.1.1", 8333)
+      pm:add_known_address("93.184.1.2", 8333)
+      pm:add_known_address("93.184.1.3", 8334)
       assert.equals(3, pm:get_known_address_count())
     end)
 
     it("stores address metadata", function()
       local pm = peerman.new(test_network, nil, nil)
       local now = os.time()
-      pm:add_known_address("10.0.0.1", 8333, p2p.SERVICES.NODE_WITNESS, now)
-      local info = pm.known_addresses["10.0.0.1:8333"]
+      pm:add_known_address("11.0.0.1", 8333, p2p.SERVICES.NODE_WITNESS, now)
+      local info = pm.known_addresses["11.0.0.1:8333"]
       assert.is_not_nil(info)
-      assert.equals("10.0.0.1", info.ip)
+      assert.equals("11.0.0.1", info.ip)
       assert.equals(8333, info.port)
       assert.equals(p2p.SERVICES.NODE_WITNESS, info.services)
       assert.equals(now, info.timestamp)
@@ -108,41 +108,41 @@ describe("peerman", function()
 
     it("selects candidates excluding connected peers", function()
       local pm = peerman.new(test_network, nil, nil)
-      pm:add_known_address("192.168.1.1", 8333)
-      pm:add_known_address("192.168.1.2", 8333)
+      pm:add_known_address("93.184.1.1", 8333)
+      pm:add_known_address("93.184.1.2", 8333)
 
       -- Simulate connected peer
-      pm.peers["192.168.1.1:8333"] = {}
+      pm.peers["93.184.1.1:8333"] = {}
 
       local candidate = pm:select_peer_to_connect()
       assert.is_not_nil(candidate)
-      assert.equals("192.168.1.2", candidate.ip)
+      assert.equals("93.184.1.2", candidate.ip)
     end)
 
     it("selects candidates excluding banned peers", function()
       local pm = peerman.new(test_network, nil, nil)
-      pm:add_known_address("192.168.1.1", 8333)
-      pm:add_known_address("192.168.1.2", 8333)
+      pm:add_known_address("93.184.1.1", 8333)
+      pm:add_known_address("93.184.1.2", 8333)
 
       -- Ban first peer
-      pm.banned["192.168.1.1"] = os.time() + 3600
+      pm.banned["93.184.1.1"] = os.time() + 3600
 
       local candidate = pm:select_peer_to_connect()
       assert.is_not_nil(candidate)
-      assert.equals("192.168.1.2", candidate.ip)
+      assert.equals("93.184.1.2", candidate.ip)
     end)
 
     it("selects candidates excluding recently tried peers", function()
       local pm = peerman.new(test_network, nil, nil)
-      pm:add_known_address("192.168.1.1", 8333)
-      pm:add_known_address("192.168.1.2", 8333)
+      pm:add_known_address("93.184.1.1", 8333)
+      pm:add_known_address("93.184.1.2", 8333)
 
       -- Mark first as recently tried
-      pm.known_addresses["192.168.1.1:8333"].last_try = os.time()
+      pm.known_addresses["93.184.1.1:8333"].last_try = os.time()
 
       local candidate = pm:select_peer_to_connect()
       assert.is_not_nil(candidate)
-      assert.equals("192.168.1.2", candidate.ip)
+      assert.equals("93.184.1.2", candidate.ip)
     end)
 
     it("returns nil when no candidates available", function()
@@ -1405,7 +1405,7 @@ describe("peerman", function()
 
       it("adds addresses to new table", function()
         local pm = peerman.new(test_network, nil, nil)
-        local added = pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        local added = pm:_add_to_new("93.184.1.1", 8333, 1, os.time(), "10.0.0.1")
         assert.is_true(added)
         local stats = pm:get_addrman_stats()
         assert.equals(1, stats.new_count)
@@ -1413,9 +1413,9 @@ describe("peerman", function()
 
       it("tracks multiple addresses", function()
         local pm = peerman.new(test_network, nil, nil)
-        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
-        pm:_add_to_new("192.168.1.2", 8333, 1, os.time(), "10.0.0.2")
-        pm:_add_to_new("192.168.1.3", 8333, 1, os.time(), "10.0.0.3")
+        pm:_add_to_new("93.184.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_add_to_new("93.184.1.2", 8333, 1, os.time(), "10.0.0.2")
+        pm:_add_to_new("93.184.1.3", 8333, 1, os.time(), "10.0.0.3")
         local stats = pm:get_addrman_stats()
         assert.equals(3, stats.new_count)
       end)
@@ -1424,8 +1424,8 @@ describe("peerman", function()
         local pm = peerman.new(test_network, nil, nil)
         local old_time = os.time() - 1000
         local new_time = os.time()
-        pm:_add_to_new("192.168.1.1", 8333, 1, old_time, "10.0.0.1")
-        pm:_add_to_new("192.168.1.1", 8333, 1, new_time, "10.0.0.1")
+        pm:_add_to_new("93.184.1.1", 8333, 1, old_time, "10.0.0.1")
+        pm:_add_to_new("93.184.1.1", 8333, 1, new_time, "10.0.0.1")
         local stats = pm:get_addrman_stats()
         -- Should still be 1 address (just updated)
         assert.equals(1, stats.new_count)
@@ -1437,12 +1437,12 @@ describe("peerman", function()
 
       it("moves addresses from new to tried", function()
         local pm = peerman.new(test_network, nil, nil)
-        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_add_to_new("93.184.1.1", 8333, 1, os.time(), "10.0.0.1")
         local stats1 = pm:get_addrman_stats()
         assert.equals(1, stats1.new_count)
         assert.equals(0, stats1.tried_count)
 
-        pm:_move_to_tried("192.168.1.1", 8333)
+        pm:_move_to_tried("93.184.1.1", 8333)
         local stats2 = pm:get_addrman_stats()
         assert.equals(0, stats2.new_count)
         assert.equals(1, stats2.tried_count)
@@ -1451,7 +1451,7 @@ describe("peerman", function()
       it("tracks multiple tried addresses", function()
         local pm = peerman.new(test_network, nil, nil)
         for i = 1, 5 do
-          local ip = "192.168." .. i .. ".1"
+          local ip = "93.184." .. i .. ".1"
           pm:_add_to_new(ip, 8333, 1, os.time(), "10.0.0.1")
           pm:_move_to_tried(ip, 8333)
         end
@@ -1461,10 +1461,10 @@ describe("peerman", function()
 
       it("updates last_success for repeated successful connections", function()
         local pm = peerman.new(test_network, nil, nil)
-        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
-        pm:_move_to_tried("192.168.1.1", 8333)
+        pm:_add_to_new("93.184.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_move_to_tried("93.184.1.1", 8333)
         -- Move again (simulating reconnect)
-        pm:_move_to_tried("192.168.1.1", 8333)
+        pm:_move_to_tried("93.184.1.1", 8333)
         local stats = pm:get_addrman_stats()
         -- Should still be just 1 tried entry
         assert.equals(1, stats.tried_count)
@@ -1482,30 +1482,30 @@ describe("peerman", function()
 
       it("selects from new table", function()
         local pm = peerman.new(test_network, nil, nil)
-        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_add_to_new("93.184.1.1", 8333, 1, os.time(), "10.0.0.1")
         local addr = pm:_select_address()
         assert.is_not_nil(addr)
-        assert.equals("192.168.1.1", addr.ip)
+        assert.equals("93.184.1.1", addr.ip)
         assert.equals(8333, addr.port)
       end)
 
       it("selects from tried table", function()
         local pm = peerman.new(test_network, nil, nil)
-        pm:_move_to_tried("192.168.1.1", 8333)
+        pm:_move_to_tried("93.184.1.1", 8333)
         local addr = pm:_select_address()
         assert.is_not_nil(addr)
-        assert.equals("192.168.1.1", addr.ip)
+        assert.equals("93.184.1.1", addr.ip)
       end)
 
       it("can be restricted to new table only", function()
         local pm = peerman.new(test_network, nil, nil)
-        pm:_add_to_new("192.168.1.1", 8333, 1, os.time(), "10.0.0.1")
-        pm:_move_to_tried("192.168.1.2", 8333)
+        pm:_add_to_new("93.184.1.1", 8333, 1, os.time(), "10.0.0.1")
+        pm:_move_to_tried("93.184.1.2", 8333)
         -- Select only from new
         local found_new = false
         for _ = 1, 50 do
           local addr = pm:_select_address(true)
-          if addr and addr.ip == "192.168.1.1" then
+          if addr and addr.ip == "93.184.1.1" then
             found_new = true
             break
           end
@@ -1534,7 +1534,7 @@ describe("peerman", function()
 
       -- Simulate established outbound peer
       local mock_peer = {
-        ip = "192.168.1.1",
+        ip = "93.184.1.1",
         port = 8333,
         inbound = false,
         state = peer_mod.STATE.ESTABLISHED,
@@ -1544,7 +1544,7 @@ describe("peerman", function()
         end,
       }
       pm.peer_list[1] = mock_peer
-      pm.peers["192.168.1.1:8333"] = mock_peer
+      pm.peers["93.184.1.1:8333"] = mock_peer
 
       -- Stop should save anchors
       pm:stop()
@@ -1554,29 +1554,29 @@ describe("peerman", function()
       assert.is_not_nil(f)
       local content = f:read("*all")
       f:close()
-      assert.truthy(content:find("192.168.1.1:8333"))
+      assert.truthy(content:find("93.184.1.1:8333"))
     end)
 
     it("loads anchors on startup", function()
       -- Create anchors file
       local f = io.open(test_dir .. "/anchors.dat", "w")
-      f:write("192.168.1.1:8333\n")
-      f:write("192.168.1.2:8334\n")
+      f:write("93.184.1.1:8333\n")
+      f:write("93.184.1.2:8334\n")
       f:close()
 
       local pm = peerman.new(test_network, nil, {data_dir = test_dir})
       local anchors = pm:get_anchors()
 
       assert.equals(2, #anchors)
-      assert.equals("192.168.1.1", anchors[1].ip)
+      assert.equals("93.184.1.1", anchors[1].ip)
       assert.equals(8333, anchors[1].port)
-      assert.equals("192.168.1.2", anchors[2].ip)
+      assert.equals("93.184.1.2", anchors[2].ip)
       assert.equals(8334, anchors[2].port)
     end)
 
     it("deletes anchors file after loading (Bitcoin Core behavior)", function()
       local f = io.open(test_dir .. "/anchors.dat", "w")
-      f:write("192.168.1.1:8333\n")
+      f:write("93.184.1.1:8333\n")
       f:close()
 
       peerman.new(test_network, nil, {data_dir = test_dir})
@@ -1592,7 +1592,7 @@ describe("peerman", function()
       -- Simulate 5 established outbound peers
       for i = 1, 5 do
         local mock_peer = {
-          ip = "192.168.1." .. i,
+          ip = "93.184.1." .. i,
           port = 8333,
           inbound = false,
           state = peer_mod.STATE.ESTABLISHED,
@@ -1602,7 +1602,7 @@ describe("peerman", function()
           end,
         }
         pm.peer_list[i] = mock_peer
-        pm.peers["192.168.1." .. i .. ":8333"] = mock_peer
+        pm.peers["93.184.1." .. i .. ":8333"] = mock_peer
       end
 
       pm:stop()
@@ -1620,7 +1620,7 @@ describe("peerman", function()
       -- First session: establish peer and shutdown
       local pm1 = peerman.new(test_network, nil, {data_dir = test_dir})
       local mock_peer = {
-        ip = "192.168.1.1",
+        ip = "93.184.1.1",
         port = 8333,
         inbound = false,
         state = peer_mod.STATE.ESTABLISHED,
@@ -1630,14 +1630,14 @@ describe("peerman", function()
         end,
       }
       pm1.peer_list[1] = mock_peer
-      pm1.peers["192.168.1.1:8333"] = mock_peer
+      pm1.peers["93.184.1.1:8333"] = mock_peer
       pm1:stop()
 
       -- Second session: should load anchor
       local pm2 = peerman.new(test_network, nil, {data_dir = test_dir})
       local anchors = pm2:get_anchors()
       assert.equals(1, #anchors)
-      assert.equals("192.168.1.1", anchors[1].ip)
+      assert.equals("93.184.1.1", anchors[1].ip)
     end)
 
   end)
@@ -1688,13 +1688,13 @@ describe("peerman", function()
 
     it("rejects same-subnet peer in connect_peer", function()
       local pm = peerman.new(test_network, nil, nil)
-      pm:add_known_address("192.168.1.1", 8333)
-      pm:add_known_address("192.168.1.2", 8333)
+      pm:add_known_address("93.184.1.1", 8333)
+      pm:add_known_address("93.184.1.2", 8333)
 
-      -- Simulate connected peer from 192.168.1.x
-      pm:_add_outbound_group("192.168.1.1")
+      -- Simulate connected peer from 93.184.1.x
+      pm:_add_outbound_group("93.184.1.1")
 
-      local ok, err = pm:connect_peer("192.168.1.2", 8333)
+      local ok, err = pm:connect_peer("93.184.1.2", 8333)
       assert.is_false(ok)
       assert.equals("same /16 subnet as existing peer", err)
     end)
@@ -1702,20 +1702,19 @@ describe("peerman", function()
     it("filters candidates in select_peer_to_connect", function()
       local pm = peerman.new(test_network, nil, nil)
       -- Add addresses from same subnet
-      pm:add_known_address("192.168.1.1", 8333)
-      pm:add_known_address("192.168.1.2", 8333)
-      pm:add_known_address("192.168.1.3", 8333)
+      pm:add_known_address("93.184.1.1", 8333)
+      pm:add_known_address("93.184.1.2", 8333)
+      pm:add_known_address("93.184.1.3", 8333)
       -- Add address from different subnet
-      pm:add_known_address("10.0.0.1", 8333)
+      pm:add_known_address("11.0.0.1", 8333)
 
-      -- Simulate connected peer from 192.168.1.x
-      pm:_add_outbound_group("192.168.1.1")
+      -- Simulate connected peer from 93.184.1.x
+      pm:_add_outbound_group("93.184.1.1")
 
       -- Should only select from different subnet
       local candidate = pm:select_peer_to_connect()
-      if candidate then
-        assert.equals("10.0.0.1", candidate.ip)
-      end
+      assert.is_not_nil(candidate)
+      assert.equals("11.0.0.1", candidate.ip)
     end)
 
   end)
@@ -2207,9 +2206,9 @@ describe("peerman", function()
         pm._try_new_outbound_peer = true
 
         -- Add 2 known addresses (at target)
-        pm:add_known_address("192.168.1.1", 8333)
-        pm:add_known_address("192.168.2.1", 8333)
-        pm:add_known_address("192.168.3.1", 8333)
+        pm:add_known_address("93.184.1.1", 8333)
+        pm:add_known_address("93.184.2.1", 8333)
+        pm:add_known_address("93.184.3.1", 8333)
 
         -- Note: We can't fully test maintain_connections without real sockets
         -- but we can verify the target calculation logic

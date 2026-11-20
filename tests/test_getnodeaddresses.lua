@@ -123,7 +123,7 @@ end)
 -- ---------------------------------------------------------------------------
 test("G2: single IPv4, default count -> 1 object, exact shape/types", function()
   local server, pm = build_server()
-  pm:add_known_address("203.0.113.7", 8333,
+  pm:add_known_address("93.184.113.7", 8333,
     bit.bor(p2p.SERVICES.NODE_NETWORK, p2p.SERVICES.NODE_WITNESS), 1700000000)
   local ok, result = call_gna(server, {})
   expect_true(ok, "call failed: " .. tostring(result))
@@ -153,7 +153,7 @@ test("G2: single IPv4, default count -> 1 object, exact shape/types", function()
 
   -- Values.
   expect_eq(o.time, 1700000000, "time value")
-  expect_eq(o.address, "203.0.113.7", "address literal")
+  expect_eq(o.address, "93.184.113.7", "address literal")
   expect_eq(o.port, 8333, "port value")
   expect_eq(o.network, "ipv4", "network classification")
 
@@ -169,7 +169,7 @@ end)
 -- ---------------------------------------------------------------------------
 test("G3: raw-JSON key order is time,services,address,port,network", function()
   local server, pm = build_server()
-  pm:add_known_address("198.51.100.4", 18333, p2p.SERVICES.NODE_NETWORK, 1699999999)
+  pm:add_known_address("93.184.100.4", 18333, p2p.SERVICES.NODE_NETWORK, 1699999999)
   local ok, result = call_gna(server, {})
   expect_true(ok, "call failed: " .. tostring(result))
   local _, raw = decode(result)
@@ -198,7 +198,7 @@ end)
 test("G4: services emitted as integer (1033), not hex", function()
   local server, pm = build_server()
   -- 0x409 = 1033 = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED.
-  pm:add_known_address("192.0.2.1", 8333, 0x409, 1700000001)
+  pm:add_known_address("93.184.2.1", 8333, 0x409, 1700000001)
   local ok, result = call_gna(server, {})
   expect_true(ok, "call failed: " .. tostring(result))
   local arr, raw = decode(result)
@@ -215,9 +215,9 @@ end)
 -- ---------------------------------------------------------------------------
 test("G5: count==0 returns all injected", function()
   local server, pm = build_server()
-  pm:add_known_address("203.0.113.1", 8333, p2p.SERVICES.NODE_NETWORK, 1700000010)
-  pm:add_known_address("203.0.113.2", 8333, p2p.SERVICES.NODE_NETWORK, 1700000011)
-  pm:add_known_address("203.0.113.3", 8333, p2p.SERVICES.NODE_NETWORK, 1700000012)
+  pm:add_known_address("93.184.113.1", 8333, p2p.SERVICES.NODE_NETWORK, 1700000010)
+  pm:add_known_address("93.184.113.2", 8333, p2p.SERVICES.NODE_NETWORK, 1700000011)
+  pm:add_known_address("93.184.113.3", 8333, p2p.SERVICES.NODE_NETWORK, 1700000012)
   local ok, result = call_gna(server, { 0 })
   expect_true(ok, "call failed: " .. tostring(result))
   local arr = decode(result)
@@ -241,7 +241,7 @@ end)
 -- ---------------------------------------------------------------------------
 test("G7: network filter 'IPV4' (mixed case) matches IPv4 entries", function()
   local server, pm = build_server()
-  pm:add_known_address("203.0.113.20", 8333, p2p.SERVICES.NODE_NETWORK, 1700000020)
+  pm:add_known_address("93.184.113.20", 8333, p2p.SERVICES.NODE_NETWORK, 1700000020)
   local ok, result = call_gna(server, { 0, "IPV4" })
   expect_true(ok, "call failed: " .. tostring(result))
   local arr = decode(result)
@@ -275,7 +275,7 @@ end)
 test("G9: network='onion' filters to only the .onion entry", function()
   local server, pm = build_server()
   -- One IPv4 + one onion (seeded directly so we can set addr_str/network_id).
-  pm:add_known_address("203.0.113.30", 8333, p2p.SERVICES.NODE_NETWORK, 1700000030)
+  pm:add_known_address("93.184.113.30", 8333, p2p.SERVICES.NODE_NETWORK, 1700000030)
   pm.known_addresses["onion:9001"] = {
     ip         = "onion",
     addr_str   = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
@@ -306,7 +306,7 @@ end)
 test("G10: count caps result to min(count, total)", function()
   local server, pm = build_server()
   for i = 1, 5 do
-    pm:add_known_address("203.0.113." .. (100 + i), 8333,
+    pm:add_known_address("93.184.113." .. (100 + i), 8333,
       p2p.SERVICES.NODE_NETWORK, 1700000100 + i)
   end
   -- count=2 < total=5 -> exactly 2.

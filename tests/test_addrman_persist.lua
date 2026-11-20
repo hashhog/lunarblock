@@ -82,10 +82,10 @@ local now = os.time()
 
 local pm1 = peerman.new(NET, nil, { data_dir = dir })
 
--- Populate across 4 distinct /16 source groups (a = 10..13) so entries land in
+-- Populate across 4 distinct /16 source groups (a = 14..17) so entries land in
 -- MULTIPLE new buckets; recent timestamps so none are IsTerrible-pruned.
 local expected_addrs = {}
-for a = 10, 13 do
+for a = 14, 17 do
   local src = a .. ".0.0.254"          -- distinct /16 per a => distinct src group
   for d = 1, 6 do
     local ip = a .. ".0.0." .. d
@@ -95,7 +95,7 @@ for a = 10, 13 do
 end
 
 -- Promote a few to tried (exercise both classifications).
-local tried_addrs = { "10.0.0.1", "11.0.0.2", "12.0.0.3" }
+local tried_addrs = { "14.0.0.1", "15.0.0.2", "16.0.0.3" }
 for _, ip in ipairs(tried_addrs) do
   pm1:_move_to_tried(ip, PORT)
 end

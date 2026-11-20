@@ -742,49 +742,169 @@ local function _is_local_addr(ip)
   return false
 end
 
---- Check if an IPv4 address string is routable on the public internet.
--- Mirrors Bitcoin Core CNetAddr::IsRoutable() for IPv4.
--- Rejects: RFC1918 private, RFC2544 benchmarking, RFC3927 link-local,
---          RFC6598 CGN, RFC5737 documentation, loopback (0.0.0.0/8,
---          127.0.0.0/8), and the unspecified/broadcast address.
--- IPv6 and non-IP addresses (Tor .onion, I2P, CJDNS) are passed through
--- as routable — their validity is checked elsewhere.
--- Reference: bitcoin-core/src/netaddress.cpp CNetAddr::IsRoutable()
--- @param ip string: IPv4 address string (e.g. "1.2.3.4") or nil/non-IPv4
--- @return boolean: true if the address is routable
-local function _is_routable(ip)
-  if not ip then return false end
-  -- Only apply IPv4 private-range filter here; IPv6 / overlay addrs pass.
-  local a, b, c = ip:match("^(%d+)%.(%d+)%.(%d+)%.")
-  if not a then
-    -- Not a dotted-decimal IPv4 string — treat as non-IPv4 (pass through).
-    return true
-  end
-  a, b, c = tonumber(a), tonumber(b), tonumber(c)
-  -- 0.0.0.0/8 — unspecified / "this network"
-  if a == 0 then return false end
-  -- 127.0.0.0/8 — loopback (IsLocal)
-  if a == 127 then return false end
-  -- 10.0.0.0/8 — RFC1918 private
+--------------------------------------------------------------------------------
+-- Routability (Bitcoin Core CNetAddr::IsRoutable, netaddress.cpp)
+--------------------------------------------------------------------------------
+-- Core refuses every address that is not IsRoutable() at the single addrman
+-- insertion point (AddrManImpl::AddSingle), so it is never stored, dialled or
+-- gossiped.  IsRoutable is
+--   IsValid() && !(RFC1918 || RFC2544 || RFC3927 || RFC4862 || RFC6598 ||
+--                  RFC5737 || RFC4193 || RFC4843 || RFC7343 || IsLocal() ||
+--                  IsInternal())
+-- with IsValid() rejecting ::, 2001:db8::/32 (RFC3849), internal addresses,
+-- 0.0.0.0 and 255.255.255.255.  The checks below work on the raw bytes, as
+-- Core does, so the textual spelling of an IPv6 address cannot matter.
+
+local IPV4_IN_IPV6_PREFIX = string.rep("\0", 10) .. "\xff\xff"
+local TORV2_IN_IPV6_PREFIX = "\xfd\x87\xd8\x7e\xeb\x43"
+local INTERNAL_IN_IPV6_PREFIX = "\xfd\x6b\x88\xc0\x87\x24"
+local IPV6_ANY = string.rep("\0", 16)
+local IPV6_LOOPBACK = string.rep("\0", 15) .. "\1"
+
+--- IsRoutable for 4 IPv4 bytes.
+local function _ipv4_bytes_routable(bytes)
+  if #bytes ~= 4 then return false end
+  local a, b, c, d = bytes:byte(1, 4)
+  -- IsLocal: 0.0.0.0/8 and 127.0.0.0/8 (also covers IsValid's INADDR_ANY)
+  if a == 0 or a == 127 then return false end
+  -- IsValid: INADDR_NONE
+  if a == 255 and b == 255 and c == 255 and d == 255 then return false end
+  -- RFC1918
   if a == 10 then return false end
-  -- 172.16.0.0/12 — RFC1918 private
-  if a == 172 and b >= 16 and b <= 31 then return false end
-  -- 192.168.0.0/16 — RFC1918 private
   if a == 192 and b == 168 then return false end
-  -- 169.254.0.0/16 — RFC3927 link-local (also IsRFC3927)
-  if a == 169 and b == 254 then return false end
-  -- 198.18.0.0/15 — RFC2544 benchmarking
+  if a == 172 and b >= 16 and b <= 31 then return false end
+  -- RFC2544 198.18.0.0/15
   if a == 198 and (b == 18 or b == 19) then return false end
-  -- 100.64.0.0/10 — RFC6598 shared address (CGN)
+  -- RFC3927 169.254.0.0/16
+  if a == 169 and b == 254 then return false end
+  -- RFC6598 100.64.0.0/10
   if a == 100 and b >= 64 and b <= 127 then return false end
-  -- 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 — RFC5737 documentation
+  -- RFC5737 documentation
   if a == 192 and b == 0 and c == 2 then return false end
   if a == 198 and b == 51 and c == 100 then return false end
   if a == 203 and b == 0 and c == 113 then return false end
-  -- 255.255.255.255 / 240.0.0.0/4 broadcast/reserved
-  if a >= 240 then return false end
   return true
 end
+
+--- IsRoutable for 16 IPv6 bytes (an address Core keeps as NET_IPV6).
+local function _ipv6_bytes_routable(bytes)
+  if #bytes ~= 16 then return false end
+  if bytes == IPV6_ANY then return false end            -- IsValid: ::
+  if bytes == IPV6_LOOPBACK then return false end       -- IsLocal: ::1
+  if bytes:sub(1, 6) == INTERNAL_IN_IPV6_PREFIX then    -- IsInternal
+    return false
+  end
+  local b1, b2, b3, b4 = bytes:byte(1, 4)
+  -- RFC3849 documentation 2001:db8::/32 (IsValid)
+  if b1 == 0x20 and b2 == 0x01 and b3 == 0x0d and b4 == 0xb8 then
+    return false
+  end
+  -- RFC4862 link-local fe80::/64
+  if bytes:sub(1, 8) == "\xfe\x80\0\0\0\0\0\0" then return false end
+  -- RFC4193 unique-local fc00::/7
+  if b1 == 0xfc or b1 == 0xfd then return false end
+  -- RFC4843 ORCHID 2001:10::/28 and RFC7343 ORCHIDv2 2001:20::/28
+  if b1 == 0x20 and b2 == 0x01 and b3 == 0x00 then
+    local hi = math.floor(b4 / 16)
+    if hi == 1 or hi == 2 then return false end
+  end
+  return true
+end
+
+--- Core CNetAddr::IsRoutable for a BIP155 (network id, raw bytes) pair.
+-- An IPv6 entry carrying the IPv4-in-IPv6 or TORv2-in-IPv6 prefix is
+-- unserialized by Core as !IsValid() (netaddress.h UnserializeV2Stream), so
+-- it is not routable.  Tor v3 and I2P are routable whenever well-formed;
+-- CJDNS needs its fc prefix (IsValid's HasCJDNSPrefix).
+-- @param network_id number: p2p.NET_ID value
+-- @param bytes string: raw address bytes
+-- @return boolean
+local function _is_routable_addr(network_id, bytes)
+  if type(bytes) ~= "string" then return false end
+  if network_id == p2p.NET_ID.IPV4 then
+    return _ipv4_bytes_routable(bytes)
+  elseif network_id == p2p.NET_ID.IPV6 then
+    if #bytes ~= 16 then return false end
+    if bytes:sub(1, 12) == IPV4_IN_IPV6_PREFIX then return false end
+    if bytes:sub(1, 6) == TORV2_IN_IPV6_PREFIX then return false end
+    return _ipv6_bytes_routable(bytes)
+  elseif network_id == p2p.NET_ID.TORV3 or network_id == p2p.NET_ID.I2P then
+    return #bytes == 32
+  elseif network_id == p2p.NET_ID.CJDNS then
+    return #bytes == 16 and bytes:byte(1) == 0xfc
+  end
+  return false
+end
+
+--- Core DecodeBase32 without padding (util/strencodings.cpp): RFC 4648
+-- alphabet, either case, and ConvertBits<5, 8, false> semantics -- fewer than
+-- 5 leftover bits, all zero.
+-- @return string|nil: decoded bytes, or nil if invalid
+local function _b32decode(str)
+  local out, acc, bits = {}, 0, 0
+  for i = 1, #str do
+    local c = str:byte(i)
+    local v
+    if c >= 97 and c <= 122 then v = c - 97          -- a-z
+    elseif c >= 65 and c <= 90 then v = c - 65       -- A-Z
+    elseif c >= 50 and c <= 55 then v = c - 50 + 26  -- 2-7
+    else return nil end
+    acc = acc * 32 + v
+    bits = bits + 5
+    if bits >= 8 then
+      bits = bits - 8
+      local byte = math.floor(acc / 2 ^ bits)
+      out[#out + 1] = string.char(byte)
+      acc = acc - byte * 2 ^ bits
+    end
+  end
+  if bits >= 5 or acc ~= 0 then return nil end
+  return table.concat(out)
+end
+
+--- Core CNetAddr::SetTor / SetI2P structure check for an overlay name.
+-- Tor: "<56 base32>.onion" decoding to pubkey(32) || checksum(2) || version
+-- 0x03.  The 2-byte checksum is SHA3-256 based and is NOT verified here
+-- (lunarblock has no SHA3); every other condition is Core's.  I2P: exactly 52
+-- base32 characters + ".b32.i2p" (suffix any case) decoding to 32 bytes.
+-- @return boolean|nil: true/false for an overlay name, nil if not one
+local function _overlay_name_valid(name)
+  if name:sub(-6) == ".onion" then
+    local body = name:sub(1, -7)
+    if #body ~= 56 then return false end
+    local b = _b32decode(body)
+    return b ~= nil and #b == 35 and b:byte(35) == 3
+  end
+  if #name > 8 and name:sub(-8):lower() == ".b32.i2p" then
+    if #name ~= 60 then return false end
+    local b = _b32decode(name:sub(1, 52))
+    return b ~= nil and #b == 32
+  end
+  if name:lower():match("%.i2p$") then return false end
+  return nil
+end
+
+--- Core CNetAddr::IsRoutable for an address literal as stored here.
+-- IPv4 and IPv6 literals (any spelling, including the uncompressed form the
+-- addr decoder produces) are parsed to bytes first; an IPv4-mapped IPv6
+-- literal is that IPv4 address, as in Core's addr (v1) decoding.  Tor v3 and
+-- I2P names are routable when they pass Core's SetTor / SetI2P structure
+-- checks (_overlay_name_valid).  Anything else, nil or unparsable, is not.
+-- @param ip string: address literal (no port)
+-- @return boolean: true if the address is routable
+local function _is_routable(ip)
+  if type(ip) ~= "string" or ip == "" then return false end
+  local overlay = _overlay_name_valid(ip)
+  if overlay ~= nil then return overlay end
+  local info = M.parse_ip(ip)
+  if not info then return false end
+  if info.family == "ipv4" then return _ipv4_bytes_routable(info.bytes) end
+  -- addr (v1): TORv2-in-IPv6 is unserialized as !IsValid() (SetLegacyIPv6)
+  if info.bytes:sub(1, 6) == TORV2_IN_IPV6_PREFIX then return false end
+  return _ipv6_bytes_routable(info.bytes)
+end
+
+M.is_routable_addr = _is_routable_addr
 
 -- Export for spec access
 M.is_routable = _is_routable
@@ -1360,6 +1480,8 @@ end
 -- @param src_ip string: source IP that told us about this address
 -- @return boolean: true if added
 function PeerManager:_add_to_new(ip, port, services, timestamp, src_ip)
+  -- Core AddrManImpl::AddSingle: `if (!addr.IsRoutable()) return false;`
+  if not _is_routable(ip) then return false end
   local key = ip .. ":" .. port
   local info = self._addr_info[key]
 
@@ -1439,6 +1561,9 @@ end
 -- @param port number: port number
 -- @return boolean: true if moved to tried
 function PeerManager:_move_to_tried(ip, port)
+  -- A non-routable address is never in Core's addrman, so Good_() finds no
+  -- entry and does nothing (a manual 127.0.0.1 peer is not promoted).
+  if not _is_routable(ip) then return false end
   local key = ip .. ":" .. port
   local info = self._addr_info[key]
 
@@ -1588,7 +1713,8 @@ function PeerManager:_select_for_feeler()
     attempts = attempts + 1
     -- new_only = true: never falls through to the TRIED table.
     local addr = self:_select_address(true)
-    if addr and not self.peers[addr.ip .. ":" .. addr.port] then
+    if addr and _is_routable(addr.ip)
+        and not self.peers[addr.ip .. ":" .. addr.port] then
       return addr
     end
   end
@@ -1878,7 +2004,8 @@ function PeerManager:_deserialize_addrman(snap)
   -- and a new-table entry for the same addr is suppressed by in_tried).
   for _, e in ipairs(snap.tried or {}) do
     if loaded >= cap then break end
-    if type(e.ip) == "string" and type(e.port) == "number" then
+    if type(e.ip) == "string" and type(e.port) == "number"
+        and _is_routable(e.ip) then
       local key2 = e.ip .. ":" .. e.port
       local b, p = e.bucket, e.pos
       if in_range(b, p, M.ADDRMAN.TRIED_BUCKET_COUNT)
@@ -1910,7 +2037,8 @@ function PeerManager:_deserialize_addrman(snap)
   -- _add_to_new path (re-buckets from source, respects all guards).
   for _, e in ipairs(snap.new or {}) do
     if loaded >= cap then break end
-    if type(e.ip) == "string" and type(e.port) == "number" then
+    if type(e.ip) == "string" and type(e.port) == "number"
+        and _is_routable(e.ip) then
       local key2 = e.ip .. ":" .. e.port
       local info = self._addr_info[key2]
       if not (info and info.in_tried) then
@@ -2097,7 +2225,13 @@ function PeerManager:_load_anchors()
     local ip, port_str = line:match("^([^:]+):(%d+)$")
     if ip and port_str then
       local port = tonumber(port_str)
-      if port then
+      -- Anchors are redialled automatically at startup.  Core's anchors are
+      -- block-relay-only automatic connections drawn from addrman, so they
+      -- are routable by construction (ThreadOpenConnections itself only skips
+      -- !IsValid() ones and our own addresses).  Refuse non-routable entries
+      -- here so a manual 127.0.0.1 peer or an address that entered before the
+      -- addrman gate is not auto-dialled.
+      if port and _is_routable(ip) then
         self._anchors[#self._anchors + 1] = {ip = ip, port = port}
       end
     end
@@ -2116,7 +2250,8 @@ function PeerManager:_save_anchors()
 
   -- Collect block-relay-only outbound peers
   for _, p in ipairs(self.peer_list) do
-    if not p.inbound and p.state == peer_mod.STATE.ESTABLISHED then
+    if not p.inbound and p.state == peer_mod.STATE.ESTABLISHED
+        and _is_routable(p.ip) then
       -- In a full implementation, we'd check if this is a block-relay-only connection
       -- For now, just save outbound peers
       if #anchors_to_save < M.ADDRMAN.MAX_ANCHORS then
@@ -2206,7 +2341,7 @@ function PeerManager:discover_from_dns()
     local results = socket.dns.getaddrinfo(seed)
     if results then
       for _, addr in ipairs(results) do
-        if addr.family == "inet" then
+        if addr.family == "inet" and _is_routable(addr.addr) then
           local port = self.network.default_port or self.network.port or 8333
           local key = addr.addr .. ":" .. port
           if not self.known_addresses[key] then
@@ -2240,6 +2375,8 @@ end
 -- @param timestamp number: unix timestamp (optional)
 -- @return boolean: true if address was added (new)
 function PeerManager:add_known_address(ip, port, services, timestamp)
+  -- Same gate as _add_to_new (Core AddSingle refuses !IsRoutable()).
+  if not _is_routable(ip) then return false end
   local key = ip .. ":" .. port
   if self.known_addresses[key] then
     return false
@@ -2567,6 +2704,7 @@ function PeerManager:select_peer_to_connect()
     if addr then
       local key = addr.ip .. ":" .. addr.port
       if not self.peers[key]
+         and _is_routable(addr.ip)
          and (not self.banned[addr.ip] or self.banned[addr.ip] <= now)
          and self:_check_outbound_diversity(addr.ip) then
         -- Check last_try from known_addresses
@@ -2581,7 +2719,10 @@ function PeerManager:select_peer_to_connect()
   -- Fall back to known_addresses
   local candidates = {}
   for key, info in pairs(self.known_addresses) do
+    -- Never auto-dial a non-routable entry (one stored before the insertion
+    -- gate existed); manual dials (addnode / --connect) do not come here.
     if not self.peers[key]
+       and _is_routable(info.ip)
        and (not self.banned[info.ip] or self.banned[info.ip] <= now)
        and (now - info.last_try) > 60
        and self:_check_outbound_diversity(info.ip) then
@@ -2957,8 +3098,12 @@ function PeerManager:handle_addrv2(peer, payload)
   local now = os.time()
   local src_ip = peer and peer.ip or "unknown"
   for _, addr in ipairs(addresses) do
-    -- Skip invalid addresses
-    if not addr.valid then
+    -- Skip invalid addresses, and refuse non-routable ones BEFORE any
+    -- insertion (Core AddrManImpl::AddSingle: !IsRoutable() -> not added).
+    -- Checked on the raw BIP155 bytes so 10.0.0.1, ::1, fe80::/64 and an
+    -- IPv4-in-IPv6 entry never reach known_addresses or the addrman.
+    if not addr.valid
+        or not _is_routable_addr(addr.network_id, addr.addr_bytes) then
       goto continue
     end
     -- Core net_processing.cpp:5678-5680: clamp timestamps that are pre-2001
@@ -2986,10 +3131,9 @@ function PeerManager:handle_addrv2(peer, payload)
           last_try = 0,
         }
       end
-      -- Only add to connection pool if it's a routable IP address.
-      -- _is_routable rejects RFC1918/loopback/link-local for IPv4;
-      -- non-IPv4 overlay addresses (Tor/I2P/CJDNS) pass through.
-      if addr.ip and _is_routable(addr.ip) then
+      -- Only IP entries go to the bucketed addrman (routability was checked
+      -- above); overlay addresses (Tor/I2P/CJDNS) carry no ip here.
+      if addr.ip then
         self:_add_to_new(addr.ip, addr.port, addr.services, ts, src_ip)
       end
     end

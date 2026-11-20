@@ -2160,17 +2160,9 @@ local function main()
   -- causing all peers to be banned — now fixed).
   peer_manager.banned = {}
 
-  -- Legacy dev bootstrap: connect to a local Bitcoin Core directly. The
-  -- 127.0.0.1:48332 target is a stale dev default (fails everywhere else), and
-  -- when --connect is given that pins the real peer below, so skip this.
-  if not args.connect then
-    local bootstrap_ok, bootstrap_err = peer_manager:connect_peer("127.0.0.1", 48332, true)
-    if bootstrap_ok then
-      print("Bootstrap: connected to Bitcoin Core at 127.0.0.1:48332")
-    else
-      print("Bootstrap: failed to connect to Bitcoin Core: " .. tostring(bootstrap_err))
-    end
-  end
+  -- No automatic loopback dial at startup: Core only auto-dials addresses
+  -- drawn from addrman, which never holds a non-routable one (AddSingle).  A
+  -- local peer is reached through --connect / addnode, which are manual.
 
   -- Core MaybePunishNodeForBlock parity (net_processing.cpp): only genuinely
   -- consensus-INVALID header content is ban-worthy. A header that merely doesn't
