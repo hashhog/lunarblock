@@ -3200,7 +3200,8 @@ end
 --      disconnect pool by ConnectTip -> removeForBlock; `confirmed` (txid_hex
 --      set) is that filter here.
 --   2. A tx that does not make it back in is removeRecursive'd: its
---      in-mempool children go too (remove_spenders_of).
+--      in-mempool children go too (remove_spenders_of).  The coinbase never
+--      goes back in, so the in-pool spenders of its outputs always go.
 --   3. A re-added tx with children already in the pool is linked to them
 --      (UpdateTransactionsFromBlock).  Linking can merge clusters that were
 --      each within the limit; TxGraphImpl::Trim then keeps the
@@ -3221,10 +3222,16 @@ function Mempool:update_for_reorg(disconnected, confirmed)
   for b = #(disconnected or {}), 1, -1 do
     local block = disconnected[b]
     if block and block.transactions then
-      for i = 2, #block.transactions do  -- [1] is the coinbase
+      for i = 1, #block.transactions do
         local tx = block.transactions[i]
         local txid_hex = types.hash256_hex(validation.compute_txid(tx))
-        if not confirmed[txid_hex] then
+        if i == 1 then
+          -- The coinbase never re-enters the pool (Core: IsCoinBase()
+          -- short-circuits AcceptToMemoryPool), so it is removeRecursive'd:
+          -- every in-pool spender of its outputs, which no longer exist,
+          -- goes with its descendants.
+          pcall(self.remove_spenders_of, self, tx, "reorg")
+        elseif not confirmed[txid_hex] then
           local ok, accepted = pcall(self.accept_transaction, self, tx, true,
             { bypass_limits = true })
           if ok and accepted then
@@ -3265,8 +3272,8 @@ end
 -- BIP-68-non-final tx -> an invalid block.
 --
 -- An entry with an input that resolves neither to a coin nor to a mempool
--- parent is left alone here (its inputs were just confirmed/spent by the
--- new chain; on_block_connected removes it as confirmed/conflicting).
+-- parent is removed too (Core: no lock points can be computed for it), e.g.
+-- a spender of a coinbase whose block was disconnected.
 -- @return number: entries evicted (including descendants)
 function Mempool:remove_for_reorg()
   local cs = self.chain_state
@@ -3291,7 +3298,11 @@ function Mempool:remove_for_reorg()
       elseif self.entries[types.hash256_hex(inp.prev_out.hash)] then
         heights[i] = next_height
       else
-        return nil  -- unresolved: not ours to judge here
+        -- Core: CalculateLockPointsAtTip returns nullopt when a coin is in
+        -- neither the UTXO view nor the pool, and the filter removes the
+        -- entry.  Conflicts with the connected blocks were already removed
+        -- by on_block_connected (removeForBlock) before this runs.
+        return false
       end
     end
     if tx.version >= 2 and tip_height >= csv_height then
@@ -3315,7 +3326,7 @@ function Mempool:remove_for_reorg()
   local before = self.tx_count
   for _, txid_hex in ipairs(ids) do
     local entry = self.entries[txid_hex]
-    if entry and still_valid(entry) == false then
+    if entry and not still_valid(entry) then
       self:remove_transaction(txid_hex, "reorg")
     end
   end
