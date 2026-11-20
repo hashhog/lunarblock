@@ -156,58 +156,131 @@ local function make_active_get_block_mtp(chain_state, tip_mtp)
 end
 M._make_active_get_block_mtp = make_active_get_block_mtp
 
--- Cluster mempool: union-find for tracking transaction clusters
+-- Cluster mempool: transaction clusters as disjoint sets.
+--
+--   uf_parent[txid]  -> root (representative) of txid's set.  Every member
+--                       points straight at its root, so uf_find is one lookup.
+--   uf_members[root] -> { txid = true, ... }, every member of that set.
+--   uf_rank[root]    -> member count of that set (union by size).
+--
+-- Invariant: a key exists only for a transaction that is in the mempool.
+-- uf_find never inserts, and uf_remove deletes the removed txid's key and
+-- re-splits the rest of its set along the remaining in-pool spends_from
+-- edges.  That is what Core's TxGraph does: RemoveTransaction drops the node
+-- completely and the cluster splits into its remaining connected components
+-- (txgraph.cpp ApplyRemovals / Split).  The previous pointer-chasing
+-- union-find deleted only the removed txid's own key, and uf_find re-rooted
+-- any missing parent it walked onto as a new key, so a replaced or confirmed
+-- tx that a survivor pointed at came back as a key with no entry and was
+-- never deleted again: the table grew with uptime, and its sets never split.
+--
+-- Work is bounded by the cluster: a union moves the smaller set's members,
+-- a removal re-links the members of the removed tx's own set.
 local uf_parent = {}
 local uf_rank = {}
+local uf_members = {}
 
 local function uf_find(x)
   if x == nil then return nil end
-  -- Path-compression walk.  If a parent entry was removed (uf_parent[x] == nil
-  -- but x itself is non-nil) the node became an orphan root; re-anchor it.
-  while uf_parent[x] ~= nil and uf_parent[x] ~= x do
-    local grandparent = uf_parent[uf_parent[x]]
-    if grandparent ~= nil then
-      uf_parent[x] = grandparent  -- path compression
-    end
-    x = uf_parent[x]
+  local r = uf_parent[x]
+  if r == nil then return x end
+  -- Members point at their root; follow without writing in case a caller
+  -- registered a node by hand (the specs do) and left an extra hop.
+  while uf_parent[r] ~= nil and uf_parent[r] ~= r do r = uf_parent[r] end
+  return r
+end
+
+-- Members of `root`'s set, creating the set record for a registered or
+-- about-to-be-linked root.  Only uf_union calls this, and only with live
+-- txids, so it never brings back a removed one.
+local function uf_members_of(root)
+  local m = uf_members[root]
+  if m == nil then
+    m = { [root] = true }
+    uf_members[root] = m
+    uf_parent[root] = root
+    uf_rank[root] = 1
   end
-  -- Re-root an orphaned node so future calls are O(1).
-  if uf_parent[x] == nil then
-    uf_parent[x] = x
-    uf_rank[x] = uf_rank[x] or 0
-  end
-  return x
+  return m
+end
+
+-- Read-only view of `root`'s members (never inserts).
+local function uf_members_read(root)
+  local m = uf_members[root]
+  if m then return m end
+  if root ~= nil and uf_parent[root] == root then return { [root] = true } end
+  return {}
+end
+
+local function uf_add(x)
+  if uf_parent[x] ~= nil then return end
+  uf_parent[x] = x
+  uf_members[x] = { [x] = true }
+  uf_rank[x] = 1
 end
 
 local function uf_union(a, b)
   a, b = uf_find(a), uf_find(b)
-  if a == b then return end
-  if (uf_rank[a] or 0) < (uf_rank[b] or 0) then a, b = b, a end
-  uf_parent[b] = a
-  if (uf_rank[a] or 0) == (uf_rank[b] or 0) then uf_rank[a] = (uf_rank[a] or 0) + 1 end
+  if a == nil or b == nil or a == b then return end
+  local ma, mb = uf_members_of(a), uf_members_of(b)
+  -- Keep the larger set's root; on a tie the first argument's root wins.
+  if (uf_rank[a] or 1) < (uf_rank[b] or 1) then a, b, ma, mb = b, a, mb, ma end
+  local n = uf_rank[a] or 1
+  for m in pairs(mb) do
+    uf_parent[m] = a
+    ma[m] = true
+    n = n + 1
+  end
+  uf_members[b] = nil
+  uf_rank[b] = nil
+  uf_rank[a] = n
 end
 
--- Snapshot the union-find key set.
---
--- LATENT-UB FIX: every cluster walk below calls uf_find() on each key, and
--- uf_find() can INSERT into uf_parent — the orphan re-root path at the bottom
--- of uf_find (`uf_parent[x] = x` when uf_parent[x] was nil).  That path is
--- live, not theoretical: Mempool:remove_transaction does `uf_parent[txid] = nil`
--- (see "Cluster mempool: remove from union-find" below) WITHOUT re-parenting
--- that node's children, so any child whose parent pointer still names the
--- removed txid walks onto a nil-parent node and re-roots it.
---
--- The Lua 5.1 / LuaJIT manual is explicit that `next` — and therefore `pairs` —
--- has UNDEFINED behaviour if the traversal assigns to a field that was not
--- already present in the table.  (Assigning to EXISTING fields, which is all
--- uf_find's path-compression step does, is explicitly allowed.)  Iterating
--- `pairs(uf_parent)` while uf_find may insert into uf_parent was therefore
--- undefined: LuaJIT can revisit keys, skip keys, or raise
--- "invalid key to 'next'" once the insert triggers a table rehash.
---
--- Fix: snapshot the key set into a plain array FIRST (this loop calls nothing
--- and so cannot mutate the table), then iterate the array.  Callers must never
--- iterate uf_parent directly.
+-- Remove `x` and split what is left of its set into the components that are
+-- still linked.  `entries` is the mempool's entries table (x already gone
+-- from it); `pending` is the reorg refill's set of parent..child edges whose
+-- union is deferred to _finalize_reorg_cluster_links, which are not links
+-- yet.  Only edges between members of x's old set are followed, so this
+-- splits and never merges.  A member with no entry in `entries` (another
+-- mempool instance's tx) is kept as its own singleton.
+local function uf_remove(x, entries, pending)
+  local r = uf_parent[x]
+  uf_parent[x] = nil
+  uf_rank[x] = nil
+  if r == nil then return end
+  local members = uf_members[r]
+  uf_members[r] = nil
+  uf_rank[r] = nil
+  uf_members[x] = nil
+  if members == nil then return end
+  members[x] = nil
+  local list, n = {}, 0
+  for m in pairs(members) do
+    n = n + 1
+    list[n] = m
+  end
+  for i = 1, n do
+    local m = list[i]
+    uf_parent[m] = m
+    uf_members[m] = { [m] = true }
+    uf_rank[m] = 1
+  end
+  for i = 1, n do
+    local m = list[i]
+    local e = entries and entries[m]
+    if e then
+      for _, p in pairs(e.spends_from or {}) do
+        if members[p] and not (pending and pending[p .. m]) then
+          uf_union(m, p)
+        end
+      end
+    end
+  end
+end
+
+-- Snapshot the union-find key set (every registered transaction).  Nothing in
+-- this module walks the whole key set any more: the cluster helpers below walk
+-- uf_members[root].  Kept for callers that want the full set.
 local function uf_snapshot_keys()
   local keys, n = {}, 0
   for txid in pairs(uf_parent) do
@@ -275,20 +348,16 @@ end
 -- `entries` must be the mempool's current entries table.  Both the count and
 -- the weight are scoped to transactions that are actually resident there,
 -- because Core's TxGraph holds exactly the mempool's transactions and nothing
--- else.  That scoping matters here and is not cosmetic: uf_find's orphan
--- re-root path can RESURRECT a removed txid as a union-find root (a removed
--- parent whose child still points at it gets `uf_parent[y] = y` written back),
--- so an un-scoped count would charge the cluster for transactions that left the
--- mempool and would reject at fewer than 64 live transactions.
+-- else (the union-find is module-level, so another mempool instance's
+-- transactions can share a set in tests).
 --
--- With `entries` nil the walk degrades to the legacy union-find node count,
--- which is what the exported get_cluster_size(root) has always reported.
+-- With `entries` nil the walk is the union-find member count, which is what
+-- the exported get_cluster_size(root) has always reported.  The walk visits
+-- only `root`'s members, never the whole key set.
 local function get_cluster_stats(root, entries)
-  local keys, n = uf_snapshot_keys()
   local count, weight = 0, 0
-  for i = 1, n do
-    local txid = keys[i]
-    if uf_find(txid) == root then
+  for txid in pairs(uf_members_read(root)) do
+    if uf_parent[txid] == root then
       if entries == nil then
         count = count + 1
       else
@@ -398,11 +467,9 @@ end
 -- because Σ⌈vsizeᵢ⌉ is what an operator-facing vbyte figure means; it is
 -- deliberately NOT the value compared against a limit (see MAX_CLUSTER_WEIGHT).
 local function get_cluster_vsize(root, entries)
-  local keys, n = uf_snapshot_keys()
   local vsize_total = 0
-  for i = 1, n do
-    local txid = keys[i]
-    if uf_find(txid) == root then
+  for txid in pairs(uf_members_read(root)) do
+    if uf_parent[txid] == root then
       local e = entries and entries[txid]
       if e then
         vsize_total = vsize_total + (e.vsize or 0)
@@ -413,11 +480,9 @@ local function get_cluster_vsize(root, entries)
 end
 
 local function get_cluster_txids(root)
-  local keys, n = uf_snapshot_keys()
   local txids = {}
-  for i = 1, n do
-    local txid = keys[i]
-    if uf_find(txid) == root then txids[#txids + 1] = txid end
+  for txid in pairs(uf_members_read(root)) do
+    if uf_parent[txid] == root then txids[#txids + 1] = txid end
   end
   return txids
 end
@@ -493,8 +558,10 @@ end
 -- Export cluster mempool utilities for external use
 M.uf_parent = uf_parent
 M.uf_rank = uf_rank
+M.uf_members = uf_members
 M.uf_find = uf_find
 M.uf_union = uf_union
+M.uf_remove = uf_remove
 -- Cluster limits (policy/policy.h:72-74, kernel/mempool_limits.h:20-22,
 -- txmempool.cpp:181).  MAX_CLUSTER_WEIGHT is the ENFORCED size bound;
 -- MAX_CLUSTER_VSIZE is the vbyte figure it is derived from, kept for display
@@ -2305,8 +2372,7 @@ function Mempool:accept_transaction(tx, allow_rbf, opts)
   end
 
   -- Cluster mempool: register in union-find and merge with parent clusters
-  uf_parent[txid_hex] = txid_hex
-  uf_rank[txid_hex] = 0
+  uf_add(txid_hex)
   for parent_hex in pairs(direct_parents) do
     uf_union(txid_hex, parent_hex)
   end
@@ -2514,9 +2580,9 @@ function Mempool:remove_transaction(txid_hex, reason)
     if self.wtxid_index[wtxid_hex] == txid_hex then self.wtxid_index[wtxid_hex] = nil end
   end
 
-  -- Cluster mempool: remove from union-find
-  uf_parent[txid_hex] = nil
-  uf_rank[txid_hex] = nil
+  -- Cluster mempool: drop the node and split what is left of its cluster
+  -- (TxGraph::RemoveTransaction).  No key may outlive its entry.
+  uf_remove(txid_hex, self.entries, self._pending_link_set)
 
   -- Invoke callback if registered (for ZMQ notifications, etc.)
   -- Note: txid_hex is the hex string; callers needing bytes should convert
@@ -3118,13 +3184,11 @@ function Mempool:_finalize_reorg_cluster_links()
     gunion(proot(live[i][1]), proot(live[i][2]))
   end
 
+  -- Members of every set a live link touches (gp's keys are those roots).
   local by_root = {}
-  local keys, nkeys = uf_snapshot_keys()
-  for i = 1, nkeys do
-    local txid = keys[i]
-    if self.entries[txid] then
-      local r = proot(txid)
-      if gp[r] then
+  for r in pairs(gp) do
+    for txid in pairs(uf_members_read(r)) do
+      if self.entries[txid] and uf_parent[txid] == r then
         local list = by_root[r]
         if not list then list = {}; by_root[r] = list end
         list[#list + 1] = txid
