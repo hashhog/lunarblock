@@ -946,14 +946,48 @@ end
 -- OP_1NEGATE, OP_RESERVED, and OP_1 through OP_16.
 -- Note: OP_RESERVED is considered push-only per Bitcoin Core, but execution
 -- of OP_RESERVED fails, so it's irrelevant for P2SH validation.
+-- A script that ends mid-push (a PUSHDATA length or payload running past the
+-- end, e.g. the single byte 0x4d) is NOT push-only: Core's IsPushOnly
+-- (script/script.cpp:266-281) returns false as soon as GetOp fails.  This
+-- used to call parse_script, which assert()s on a truncated push; the raise
+-- escaped IsStandardTx (testmempoolaccept -> RPC -32603) and, via
+-- validation.extract_p2sh_redeem_script, connect_block's sigop-cost pass,
+-- where it is outside the script xpcall and is not a block verdict.  Walk the
+-- ops the way GetOp does instead, without building the op list.
 -- @param script_bytes string: The raw script bytes
 -- @return boolean: true if script contains only push operations
 function M.is_push_only(script_bytes)
-  local ops = M.parse_script(script_bytes)
-  for _, op in ipairs(ops) do
-    if op.opcode > M.OP.OP_16 then
+  local pos = 1
+  local len = #script_bytes
+  while pos <= len do
+    local opcode = script_bytes:byte(pos)
+    pos = pos + 1
+    -- A non-push opcode carries no payload, so GetOp cannot fail on it.
+    if opcode > 0x60 then              -- OP_16
       return false
     end
+    local data_len = 0
+    if opcode <= 0x4b then             -- OP_0 (0 bytes) / direct push of N bytes
+      data_len = opcode
+    elseif opcode == 0x4c then         -- OP_PUSHDATA1
+      if pos > len then return false end
+      data_len = script_bytes:byte(pos)
+      pos = pos + 1
+    elseif opcode == 0x4d then         -- OP_PUSHDATA2
+      if pos + 1 > len then return false end
+      local b1, b2 = script_bytes:byte(pos, pos + 1)
+      data_len = b1 + b2 * 256
+      pos = pos + 2
+    elseif opcode == 0x4e then         -- OP_PUSHDATA4
+      if pos + 3 > len then return false end
+      local b1, b2, b3, b4 = script_bytes:byte(pos, pos + 3)
+      data_len = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+      pos = pos + 4
+    end                                -- OP_1NEGATE..OP_16: no payload
+    if pos + data_len - 1 > len then
+      return false
+    end
+    pos = pos + data_len
   end
   return true
 end
