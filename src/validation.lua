@@ -814,7 +814,9 @@ function M.extract_p2sh_redeem_script(script_sig)
     return nil
   end
 
-  -- Check if scriptSig is push-only
+  -- Check if scriptSig is push-only.  A scriptSig ending mid-push is not
+  -- push-only, so it returns nil here (Core GetSigOpCount(scriptSig) returns
+  -- 0 when GetOp fails) and parse_script below only sees a script that walks.
   if not script.is_push_only(script_sig) then
     return nil
   end
