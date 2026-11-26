@@ -1,0 +1,23 @@
+# Recorded 2026-11-26T10:25:48Z: output of
+#   python3 -I replay.py <bitcoind v31.1> <blocks dir> <scratch dir>
+# on the 8 regtest chains that spec/psweep_multisig_findanddelete_empty_sig_spec.lua
+# dumps with FAD_DUMP_DIR set, run on this branch (spec blob ddf8c188bf8a, src tree 1d31f6de33e0).
+# txid/wtxid fields are stripped from the testmempoolaccept lines.
+bitcoind sha256: 986e63b3c8770f08d0059820ad3dd085d1ab9e1bea23946c243f858a06888a08
+Bitcoin Core daemon version v31.1.0 bitcoind
+fad_ctrl         height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_ctrl         submitblock(h=105) -> null ; getblockcount -> 105 (setup errors: 0)
+fad_ctrlbad      height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_ctrlbad      submitblock(h=105) -> block-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element) ; getblockcount -> 104 (setup errors: 0)
+fad_input1_bare  height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_input1_bare  submitblock(h=105) -> block-script-verify-flag-failed (Non-canonical DER signature) ; getblockcount -> 104 (setup errors: 0)
+fad_input1_p2sh  height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_input1_p2sh  submitblock(h=105) -> block-script-verify-flag-failed (Non-canonical DER signature) ; getblockcount -> 104 (setup errors: 0)
+fad_mirror_bare  height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_mirror_bare  submitblock(h=105) -> null ; getblockcount -> 105 (setup errors: 0)
+fad_mirror_p2sh  height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_mirror_p2sh  submitblock(h=105) -> null ; getblockcount -> 105 (setup errors: 0)
+fad_p2wsh_del    height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_p2wsh_del    submitblock(h=105) -> null ; getblockcount -> 105 (setup errors: 0)
+fad_p2wsh_full   height 104, testmempoolaccept: [{"allowed":false,"reject-reason":"scriptpubkey","reject-details":"scriptpubkey"}]
+fad_p2wsh_full   submitblock(h=105) -> block-script-verify-flag-failed (Non-canonical DER signature) ; getblockcount -> 104 (setup errors: 0)
