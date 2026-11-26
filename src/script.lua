@@ -486,10 +486,7 @@ function M.build_script(ops)
 end
 
 -- Minimal push-encoding of `data` as a CScript pushdata, matching
--- Core's `CScript() << vchSig` (the operand of FindAndDelete in
--- EvalChecksigPreTapscript / OP_CHECKMULTISIG). Mirrors
--- validation.serialize_push_data so the bytes searched for are identical
--- to those the legacy sighash FindAndDelete removes.
+-- Core's `CScript() << data`. Mirrors validation.serialize_push_data.
 local function serialize_push_bytes(data)
   local len = #data
   if len <= 75 then
@@ -510,17 +507,19 @@ end
 -- Count occurrences of the push-encoded signature `sig` inside `script_code`
 -- WITHOUT mutating it. This is the `FindAndDelete(scriptCode, CScript() << vchSig)`
 -- return value (the number of deletions) used purely for the
--- SCRIPT_VERIFY_CONST_SCRIPTCODE consensus check
--- (interpreter.cpp:330-332 / 1146-1148). The actual signature removal for
--- the legacy sighash still happens in validation.find_and_delete.
+-- SCRIPT_VERIFY_CONST_SCRIPTCODE check (interpreter.cpp:330-332 / 1146-1148).
+-- It is validation.find_and_delete's own count, so it is opcode-aligned,
+-- byte-exact (NUL-safe) and counts an empty sig (pattern 00) like Core.  The
+-- old Lua-pattern gsub returned 0 for an empty sig, matched inside push data,
+-- and a NUL in the needle truncated the pattern.  validation requires this
+-- module, so it is loaded lazily.
+local validation_mod
 local function findanddelete_count(script_code, sig)
-  if not sig or #sig == 0 or not script_code or #script_code == 0 then
+  if not sig or not script_code or #script_code == 0 then
     return 0
   end
-  local needle = serialize_push_bytes(sig)
-  -- Lua's gsub returns (result, n); the second return is the match count.
-  local pattern = needle:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1")
-  local _, n = script_code:gsub(pattern, "")
+  validation_mod = validation_mod or require("lunarblock.validation")
+  local _, n = validation_mod.find_and_delete(script_code, sig)
   return n
 end
 

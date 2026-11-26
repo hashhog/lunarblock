@@ -1019,20 +1019,27 @@ end
 -- as a terminator), so a `02 21 00 ...` signature was only partially deleted,
 -- corrupting the scriptCode and the sighash (NULLFAIL on every FindAndDelete
 -- script_tests / tx_valid vector).
+--
+-- An EMPTY signature is not skipped: Core searches for `CScript() << vchSig`,
+-- which for an empty vchSig is the single byte 00 (AppendDataSize(0)), so it
+-- deletes every opcode-aligned OP_0.  In OP_CHECKMULTISIG that changes the
+-- shared scriptCode the other, non-empty signatures are hashed over
+-- (interpreter.cpp:1141-1150).
 -- @param script_bytes string: The script bytes
 -- @param sig_bytes string: The signature bytes (without push opcode)
 -- @return string: Script with signature removed
+-- @return number: Number of occurrences removed (Core's nFound)
 function M.find_and_delete(script_bytes, sig_bytes)
-  if not sig_bytes or #sig_bytes == 0 then
-    return script_bytes
+  if not sig_bytes then
+    return script_bytes, 0
   end
 
   -- The signature is push-encoded in the script: [push_opcode] [data]
   local b = serialize_push_data(sig_bytes)
   local blen = #b
   local slen = #script_bytes
-  if blen == 0 or slen < blen then
-    return script_bytes
+  if slen < blen then
+    return script_bytes, 0
   end
 
   local parts = {}
@@ -1062,9 +1069,9 @@ function M.find_and_delete(script_bytes, sig_bytes)
     if pc2 <= slen then
       parts[#parts + 1] = script_bytes:sub(pc2, slen)
     end
-    return table.concat(parts)
+    return table.concat(parts), found
   end
-  return script_bytes
+  return script_bytes, 0
 end
 
 --- Remove all OP_CODESEPARATOR (0xab) opcodes from a script.
@@ -2578,11 +2585,9 @@ function M.make_sig_checker(tx, input_index, prev_output_value, prev_script_pubk
       -- OP_CHECKMULTISIG (legacy): FindAndDelete EVERY signature from the
       -- scriptCode up front, then build the sighash without a further
       -- per-sig FindAndDelete (sig_bytes=nil), matching Core's single shared
-      -- scriptCode.
+      -- scriptCode.  Empty sigs included: each deletes every OP_0.
       for _, s in ipairs(all_sigs) do
-        if s and #s > 0 then
-          script_code = M.find_and_delete(script_code, s)
-        end
+        script_code = M.find_and_delete(script_code, s)
       end
       sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, nil)
     else
@@ -2927,10 +2932,9 @@ function M.make_collecting_sig_checker(tx, input_index, prev_output_value, prev_
     elseif all_sigs then
       -- OP_CHECKMULTISIG (legacy): FindAndDelete every signature up front
       -- (Core interpreter.cpp:1142-1167), then hash without per-sig FAD.
+      -- Empty sigs included: each deletes every OP_0.
       for _, s in ipairs(all_sigs) do
-        if s and #s > 0 then
-          script_code = M.find_and_delete(script_code, s)
-        end
+        script_code = M.find_and_delete(script_code, s)
       end
       sighash = M.signature_hash_legacy(tx, input_index, script_code, hash_type, nil)
     else
